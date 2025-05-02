@@ -1,0 +1,22 @@
+name: Add label
+description: Add specified label to pull request.
+inputs:
+  label:
+    description: Label to add to the pull request.
+    required: true
+    type: string
+
+runs:
+  using: composite
+  steps:
+    - name: Verify event
+      if: ${{ github.event_name != 'pull_request' }}
+      shell: bash
+      run: |
+        echo "Error: This action can only be used on pull request events."
+        exit 1
+
+    - name: Add label
+      shell: bash
+      run: |
+        gh pr edit "${{ github.event.number }}" --add-label "${{ inputs.label }}"

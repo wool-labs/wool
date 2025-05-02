@@ -1,0 +1,61 @@
+name: Label pull request
+
+on:
+  pull_request:
+    branches:
+      - master
+      - main
+      - release
+    types:
+      - opened
+      - reopened
+    paths:
+      - src/**
+      - pyproject.toml
+    
+jobs:
+  add-code-change-label:
+    name: Add code-change label
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    if: ${{ github.head_ref != 'release' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/get-wool-labs-app-token
+        id: get-wool-labs-app-token
+        with:
+          app-id: ${{ secrets.WOOL_LABS_APP_ID }}
+          app-installation-id: ${{ secrets.WOOL_LABS_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.WOOL_LABS_PRIVATE_KEY }}
+      - name: Add label
+        env:
+          GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
+        uses: ./.github/actions/add-label
+        with:
+          label: code-change
+
+  add-release-label:
+    name: Add release label
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    if: ${{ github.base_ref == 'master' && github.head_ref == 'release' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/get-wool-labs-app-token
+        id: get-wool-labs-app-token
+        with:
+          app-id: ${{ secrets.WOOL_LABS_APP_ID }}
+          app-installation-id: ${{ secrets.WOOL_LABS_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.WOOL_LABS_PRIVATE_KEY }}
+      - name: Add label
+        env:
+          GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
+        uses: ./.github/actions/add-label
+        with:
+          label: release
