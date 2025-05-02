@@ -1,0 +1,49 @@
+name: Label pull request
+
+on:
+  pull_request:
+    branches:
+      - master
+      - main
+      - release
+    types:
+      - opened
+      - reopened
+    paths:
+      - src/**
+      - pyproject.toml
+    
+jobs:
+  add-code-change-label:
+    name: Add code-change label
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    if: ${{ github.head_ref != 'release' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Add label
+        env:
+          GH_TOKEN: ${{ secrets.MY_TOKEN }}
+        uses: ./.github/actions/add-label
+        with:
+          label: code-change
+
+  add-release-label:
+    name: Add release label
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    if: ${{ github.base_ref == 'master' && github.head_ref == 'release' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Add label
+        env:
+          GH_TOKEN: ${{ secrets.MY_TOKEN }}
+        uses: ./.github/actions/add-label
+        with:
+          label: release
