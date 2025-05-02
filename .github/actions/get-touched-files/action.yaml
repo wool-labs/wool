@@ -1,0 +1,31 @@
+name: Get touched files
+description: Get a list of files that have been modified in a pull request.
+inputs:
+  pathspec:
+    description: 'Optional pathspec(s) to filter files. E.g., "src/**" will only get files in the src directory.'
+    required: false
+    type: string
+outputs:
+  touched:
+    description: 'List of files that have been modified in a pull request.'
+    value: ${{ steps.get-touched-files.outputs.touched }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Get touched files
+      id: get-touched-files
+      shell: bash
+      run: |
+        eval "pathspec=('${{ inputs.pathspec }}')"
+        echo "pathspec: '${pathspec[@]}'"
+        touched=$(git diff --name-only HEAD origin/master -- ${pathspec[@]})
+        touched=$(echo "$touched" | tr '\n' ' ' | xargs)
+        echo "touched: '$touched'"
+        echo "touched=$touched" >> $GITHUB_OUTPUT

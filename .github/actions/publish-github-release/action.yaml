@@ -1,0 +1,42 @@
+name: Publish release to GitHub
+description: Publish the target version to GitHub.
+
+inputs:
+  version:
+    required: true
+    type: string
+
+runs:
+  using: composite
+  steps:
+    - name: Download distribution artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: dist-${{ inputs.version }}
+        path: dist-${{ inputs.version }}/
+
+    - name: Sign the artifacts with Sigstore
+      uses: sigstore/gh-action-sigstore-python@v3.0.0
+      with:
+        inputs: ./dist-${{ inputs.version }}/*.tar.gz ./dist-${{ inputs.version }}/*.whl
+
+    - name: Create GitHub release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        if [[ "${{ inputs.version }}" == *rc* ]]; then
+          prerelease_flag="--prerelease"
+        else
+          prerelease_flag=""
+        fi
+        gh release create ${{ inputs.version }} --verify-tag \
+          --repo ${{ github.repository }} \
+          --generate-notes \
+          $prerelease_flag
+ 
+    - name: Upload artifact signatures to GitHub release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh release upload ${{ inputs.version }} dist-${{ inputs.version }}/** --repo ${{ github.repository }}
