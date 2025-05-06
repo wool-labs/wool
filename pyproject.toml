@@ -13,11 +13,11 @@ name = "wool"
 readme = "README.md"
 requires-python = ">=3.10"
 
+[project.entry-points."wool.cli.plugins"]
+locking = "wool.locking._cli"
+
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
-
-[project.scripts]
-wool = "wool._cli:cli"
 
 [tool.ruff]
 line-length = 79

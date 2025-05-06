@@ -1,7 +1,9 @@
 import logging
 from contextvars import ContextVar
+from importlib.metadata import entry_points
 from typing import Final, Literal
 
+from wool._cli import cli
 from wool._client import NullClient, WoolClient
 from wool._future import WoolFuture
 from wool._logging import __log_format__
@@ -37,9 +39,11 @@ __all__ = [
     "WoolTaskEventCallback",
     "WoolPool",
     "WoolClient",
-    "current_task",
     "__log_format__",
     "__log_level__",
+    "__wool_client__",
+    "cli",
+    "current_task",
     "task",
 ]
 
@@ -51,3 +55,12 @@ for symbol in __all__:
             attribute.__module__ = __name__
     except AttributeError:
         pass
+
+
+for plugin in entry_points(group="wool.cli.plugins"):
+    try:
+        plugin.load()
+        logging.info(f"Loaded CLI plugin {plugin.name}")
+    except Exception as e:
+        logging.error(f"Failed to load CLI plugin {plugin.name}: {e}")
+        continue

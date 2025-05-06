@@ -16,8 +16,10 @@ def test_public():
         "WoolTaskEventCallback",
         "WoolPool",
         "WoolClient",
-        "current_task",
         "__log_format__",
         "__log_level__",
+        "__wool_client__",
+        "cli",
+        "current_task",
         "task",
     }

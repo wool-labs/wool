@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import logging
 from contextlib import contextmanager
+from importlib.metadata import entry_points
 from multiprocessing import cpu_count
 from time import perf_counter
 
