@@ -147,7 +147,7 @@ def pool(): ...
     "-m",
     multiple=True,
     type=str,
-    help="Python module containing workerpool task definnitions to be executed by this pool.",
+    help="Python module containing workerpool task definitions to be executed by this pool.",
 )
 def up(host, port, authkey, breadth, modules):
     for module in modules:
