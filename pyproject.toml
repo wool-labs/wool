@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
+requires = ["setuptools>=64", "setuptools-scm>=8"]
 
 [project]
 name = "wool"
@@ -24,3 +24,7 @@ line-length = 79
 
 [tool.ruff.lint.isort]
 known-first-party = ["wool"]
+
+[tool.setuptools_scm]
+local_scheme = "dirty-tag"
+version_scheme = "release-branch-semver"
