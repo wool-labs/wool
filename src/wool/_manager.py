@@ -96,7 +96,7 @@ def put(task: WoolTask) -> WoolFuture:
         with queue_lock():
             queue().put(task, block=False)
             future = futures()[task.id] = WoolFuture()
-            logging.debug(f"Pushed task {task.id} to queue: {task.tag})")
+            logging.debug(f"Pushed task {task.id} to queue: {task.tag}")
             return future
     except Exception as e:
         logging.exception(e)
