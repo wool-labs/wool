@@ -3,7 +3,6 @@
 # ...except for
 !/.gitignore
 !/.github
-!/.vscode
 
 # /.github/.githubrc
 *.code-workspace
