@@ -143,7 +143,7 @@ def client(
 
 
 # PUBLIC
-def curent_client() -> WoolClient | None:
+def current_client() -> WoolClient | None:
     return wool.__wool_client__.get()
 
 
