@@ -22,22 +22,6 @@ runs:
       uses: sigstore/gh-action-sigstore-python@v3.0.0
       with:
         inputs: ./${{ inputs.source }}-dist-${{ inputs.version }}/*.tar.gz ./${{ inputs.source }}-dist-${{ inputs.version }}/*.whl
-
-    - name: Create GitHub release
-      shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        if [[ "${{ inputs.version }}" == *rc* ]]; then
-          prerelease_flag="--prerelease"
-        else
-          prerelease_flag=""
-        fi
-        gh release create ${{ inputs.version }} \
-          --title ${{ inputs.source }}-${{ inputs.version }} \
-          --repo ${{ github.repository }} \
-          --generate-notes \
-          $prerelease_flag
  
     - name: Upload artifact signatures to GitHub release
       shell: bash

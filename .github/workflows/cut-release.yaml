@@ -101,6 +101,24 @@ jobs:
           source: ${{ matrix.source }}
           version: ${{ needs.cut-release.outputs.version }}
       
+  create-github-release:  
+    name: Create GitHub release
+    needs: cut-release
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ needs.cut-release.outputs.version }}" == *rc* ]]; then
+            prerelease_flag="--prerelease"
+          else
+            prerelease_flag=""
+          fi
+          gh release create ${{ needs.cut-release.outputs.version }} \
+            --repo ${{ github.repository }} \
+            --generate-notes \
+            $prerelease_flag
+
   publish-github-release:
     name: Publish release to GitHub
     needs:

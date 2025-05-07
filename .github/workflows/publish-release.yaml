@@ -72,6 +72,24 @@ jobs:
         with:
           source: ${{ matrix.source }}
           version: ${{ needs.tag-version.outputs.version }}
+
+  create-github-release:  
+    name: Create GitHub release
+    needs: tag-version
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ needs.tag-version.outputs.version }}" == *rc* ]]; then
+            prerelease_flag="--prerelease"
+          else
+            prerelease_flag=""
+          fi
+          gh release create ${{ needs.tag-version.outputs.version }} \
+            --repo ${{ github.repository }} \
+            --generate-notes \
+            $prerelease_flag
       
   publish-github-release:
     name: Publish release to GitHub
