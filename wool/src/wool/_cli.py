@@ -18,12 +18,24 @@ DEFAULT_PORT = 48800
 
 # PUBLIC
 class WoolPoolCommand(click.core.Command):
-    def __init__(self, *args, default_host="localhost", default_port=0, default_authkey=b"", **kwargs):
+    def __init__(
+        self,
+        *args,
+        default_host="localhost",
+        default_port=0,
+        default_authkey=b"",
+        **kwargs,
+    ):
         params = kwargs.pop("params", [])
         params = [
             click.Option(["--host", "-h"], type=str, default=default_host),
             click.Option(["--port", "-p"], type=int, default=default_port),
-            click.Option(["--authkey", "-a"], type=str, default=default_authkey, callback=to_bytes),
+            click.Option(
+                ["--authkey", "-a"],
+                type=str,
+                default=default_authkey,
+                callback=to_bytes,
+            ),
             *params,
         ]
         super().__init__(*args, params=params, **kwargs)

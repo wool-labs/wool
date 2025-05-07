@@ -47,7 +47,12 @@ def task(fn: C) -> C:
     """
 
     @wraps(fn)
-    def wrapper(*args, __wool_remote__: bool = False, __wool_client__: WoolClient | None = None, **kwargs) -> Coroutine:
+    def wrapper(
+        *args,
+        __wool_remote__: bool = False,
+        __wool_client__: WoolClient | None = None,
+        **kwargs,
+    ) -> Coroutine:
         # Handle static and class methods in a picklable way.
         parent, function = resolve(fn)
         assert parent is not None
