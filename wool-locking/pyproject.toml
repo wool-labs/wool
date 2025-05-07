@@ -4,10 +4,7 @@ requires = ["setuptools>=64", "setuptools-scm>=8"]
 
 [project]
 authors = [{ name = "Conrad Bzura", email = "conrad@wool.io" }]
-classifiers = [
-    "Intended Audience :: Developers",
-    "Framework :: Wool :: Plugin",
-]
+classifiers = ["Intended Audience :: Developers"]
 dependencies = ["click", "wool"]
 description = "A Wool plugin for distributed locking."
 dynamic = ["version"]
