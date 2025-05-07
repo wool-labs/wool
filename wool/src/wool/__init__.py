@@ -48,6 +48,15 @@ __all__ = [
     "task",
 ]
 
+for symbol in __all__:
+    attribute = globals().get(symbol)
+    try:
+        if attribute and "wool" in attribute.__module__.split("."):
+            # Set the module to reflect imports of the symbol
+            attribute.__module__ = __name__
+    except AttributeError:
+        continue
+
 for plugin in entry_points(group="wool.cli.plugins"):
     try:
         plugin.load()

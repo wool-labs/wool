@@ -25,7 +25,9 @@ runs:
 
     - name: Build distribution artifacts
       shell: bash
-      run: uv build ${{ inputs.source }} --out-dir ${{ inputs.source }}-dist-${{ inputs.version }}
+      run: |
+        ln -s ../.git ./${{ inputs.source }}
+        uv build ${{ inputs.source }} --out-dir ${{ inputs.source }}-dist-${{ inputs.version }}
 
     - name: Store distribution artifacts
       uses: actions/upload-artifact@v4
