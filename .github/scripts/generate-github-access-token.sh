@@ -16,6 +16,7 @@ siging_key_path=${SIGNING_KEY_PATH?"Need to set SIGNING_KEY_PATH"}           # P
 header_template='{
     "typ": "JWT",
     "kid": "0001",
+    "iss": "https://gist.github.com/Nastaliss/7f8466f59072d744540190721a63672d"
 }'
 
 build_header() {

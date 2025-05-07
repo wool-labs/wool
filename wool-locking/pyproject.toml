@@ -1,0 +1,36 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+
+[project]
+authors = [{ name = "Conrad Bzura", email = "conrad@wool.io" }]
+classifiers = ["Intended Audience :: Developers"]
+dependencies = ["click", "wool"]
+description = "A Wool plugin for distributed locking."
+dynamic = ["version"]
+license = { file = "LICENSE" }
+maintainers = [{ email = "maintainers@wool.io" }]
+name = "wool-locking"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.entry-points."wool.cli.plugins"]
+locking = "wool.locking._cli"
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint.isort]
+known-first-party = ["wool"]
+
+[tool.setuptools.packages.find]
+where = ["src/"]
+include = ["wool.locking"]
+
+[tool.setuptools_scm]
+local_scheme = "dirty-tag"
+root = ".."
+version_scheme = "release-branch-semver"
