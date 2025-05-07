@@ -4,6 +4,10 @@ requires = ["setuptools>=64", "setuptools-scm>=8"]
 
 [project]
 authors = [{ name = "Conrad Bzura", email = "conrad@wool.io" }]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Framework :: Wool",
+]
 dependencies = ["annotated-types", "click", "debugpy"]
 description = "A Python framework for distributed multiprocessing."
 dynamic = ["version"]
