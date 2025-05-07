@@ -9,8 +9,10 @@ on:
     types:
       - closed
     paths:
-      - src/**
-      - pyproject.toml
+      - wool/src/**
+      - wool/pyproject.toml
+      - wool-locking/src/**
+      - wool-locking/pyproject.toml
 
 jobs:
   tag-version:
@@ -61,10 +63,14 @@ jobs:
     name: Build release
     needs: tag-version
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        source: [wool, wool-locking]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-release
         with:
+          source: ${{ matrix.source }}
           version: ${{ needs.tag-version.outputs.version }}
       
   publish-github-release:
@@ -76,10 +82,14 @@ jobs:
     permissions:
       contents: write
       id-token: write
+    strategy:
+      matrix:
+        source: [wool, wool-locking]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/publish-github-release
         with:
+          source: ${{ matrix.source }}
           version: ${{ needs.tag-version.outputs.version }}
 
   publish-pypi-release:
@@ -90,9 +100,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
+    strategy:
+      matrix:
+        source: [wool, wool-locking]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/publish-pypi-release
         with:
+          source: ${{ matrix.source }}
           version: ${{ needs.tag-version.outputs.version }}
           pypi-token: ${{ secrets.PYPI_TOKEN }}

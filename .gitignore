@@ -4,7 +4,6 @@
 !/.gitignore
 !/.github
 
-# /.github/.githubrc
 *.code-workspace
 *.egg-info
 *.task.json

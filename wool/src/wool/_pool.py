@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextvars import ContextVar
 from copy import copy
 from functools import partial, wraps
 from multiprocessing import Process, current_process
@@ -9,14 +10,16 @@ from multiprocessing.managers import Server
 from signal import Signals, signal
 from threading import Event, Lock, Thread, current_thread
 from time import sleep
-from typing import Callable, Coroutine
+from typing import TYPE_CHECKING, Callable, Coroutine
 from weakref import WeakSet
 
 import wool
 from wool._client import WoolClient
 from wool._manager import Manager
-from wool._task import AsyncCallable
 from wool._worker import Worker
+
+if TYPE_CHECKING:
+    from wool._task import AsyncCallable
 
 
 # PUBLIC
@@ -70,16 +73,20 @@ class WoolPool(Process):
 
     def __enter__(self):
         self.start()
-        self._outer_client = wool.__wool_client__.get()
-        wool.__wool_client__.set(self._client)
+        self._outer_client = self.client_context.get()
+        self.client_context.set(self._client)
 
     def __exit__(self, *_) -> None:
         assert self._outer_client
-        wool.__wool_client__.set(self._outer_client)
+        self.client_context.set(self._outer_client)
         self._outer_client = None
         assert self.pid
         self.stop()
         self.join()
+
+    @property
+    def client_context(self) -> ContextVar[WoolClient]:
+        return wool.__wool_client__
 
     @property
     def log_level(self) -> int:

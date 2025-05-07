@@ -1,6 +1,9 @@
 name: Build release
 description: Build distribution for the target version.
 inputs:
+  source:
+    required: true
+    type: string
   version:
     required: true
     type: string
@@ -22,10 +25,10 @@ runs:
 
     - name: Build distribution artifacts
       shell: bash
-      run: uv build --out-dir dist-${{ inputs.version }}
+      run: uv build ${{ inputs.source }} --out-dir ${{ inputs.source }}-dist-${{ inputs.version }}
 
     - name: Store distribution artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: dist-${{ inputs.version }}
-        path: dist-${{ inputs.version }}/
+        name: ${{ inputs.source }}-dist-${{ inputs.version }}
+        path: ${{ inputs.source }}-dist-${{ inputs.version }}/
