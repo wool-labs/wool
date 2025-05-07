@@ -5,6 +5,7 @@ import functools
 import logging
 import threading
 import time
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Callable, Coroutine, TypeVar
 from uuid import UUID
 from weakref import WeakValueDictionary
@@ -158,21 +159,26 @@ class WoolClient(BaseClient):
         super().__init__(address, authkey=authkey)
         self._outer_client: WoolClient | None = None
 
-    @command
-    def put(self, task: WoolTask) -> WoolFuture:
-        assert self._manager
-        return self._manager.put(task)
 
     def __enter__(self):
         if not self.connected:
             self.connect()
-        self._outer_client = wool.__wool_client__.get()
-        wool.__wool_client__.set(self)
+        self._outer_client = self.client_context.get()
+        self.client_context.set(self)
 
     def __exit__(self, *_):
         assert self._outer_client
-        wool.__wool_client__.set(self._outer_client)
+        self.client_context.set(self._outer_client)
         self._outer_client = None
+
+    @property
+    def client_context(self) -> ContextVar[WoolClient]:
+        return wool.__wool_client__
+
+    @command
+    def put(self, task: WoolTask) -> WoolFuture:
+        assert self._manager
+        return self._manager.put(task)
 
 
 # PUBLIC

@@ -2,6 +2,9 @@ name: Publish release to GitHub
 description: Publish the target version to GitHub.
 
 inputs:
+  source:
+    required: true
+    type: string
   version:
     required: true
     type: string
@@ -12,13 +15,13 @@ runs:
     - name: Download distribution artifacts
       uses: actions/download-artifact@v4
       with:
-        name: dist-${{ inputs.version }}
-        path: dist-${{ inputs.version }}/
+        name: ${{ inputs.source }}-dist-${{ inputs.version }}
+        path: ${{ inputs.source }}-dist-${{ inputs.version }}/
 
     - name: Sign the artifacts with Sigstore
       uses: sigstore/gh-action-sigstore-python@v3.0.0
       with:
-        inputs: ./dist-${{ inputs.version }}/*.tar.gz ./dist-${{ inputs.version }}/*.whl
+        inputs: ./${{ inputs.source }}-dist-${{ inputs.version }}/*.tar.gz ./${{ inputs.source }}-dist-${{ inputs.version }}/*.whl
 
     - name: Create GitHub release
       shell: bash
@@ -30,7 +33,8 @@ runs:
         else
           prerelease_flag=""
         fi
-        gh release create ${{ inputs.version }} --verify-tag \
+        gh release create ${{ inputs.version }} \
+          --title ${{ inputs.source }}-${{ inputs.version }} \
           --repo ${{ github.repository }} \
           --generate-notes \
           $prerelease_flag
@@ -39,4 +43,4 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
-      run: gh release upload ${{ inputs.version }} dist-${{ inputs.version }}/** --repo ${{ github.repository }}
+      run: gh release upload ${{ inputs.version }} ${{ inputs.source }}-dist-${{ inputs.version }}/** --repo ${{ github.repository }}
