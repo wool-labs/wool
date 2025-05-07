@@ -21,7 +21,13 @@ class WoolLogFilter(logging.Filter):
         return True
 
 
-__log_format__: str = f"{grey(italic('pid:'))}%(process)-8d {grey(italic('process:'))}%(processName)-12s {grey(italic('thread:'))}%(threadName)-20s %(levelname)12s %(message)-60s {grey(italic('%(ref)s'))}"
+__log_format__: str = (
+    f"{grey(italic('pid:'))}%(process)-8d "
+    f"{grey(italic('process:'))}%(processName)-12s "
+    f"{grey(italic('thread:'))}%(threadName)-20s "
+    "%(levelname)12s %(message)-60s "
+    f"{grey(italic('%(ref)s'))}"
+)
 
 formatter: logging.Formatter = logging.Formatter(__log_format__)
 
