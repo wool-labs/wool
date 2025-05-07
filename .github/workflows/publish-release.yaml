@@ -9,8 +9,10 @@ on:
     types:
       - closed
     paths:
-      - src/**
-      - pyproject.toml
+      - wool/src/**
+      - wool/pyproject.toml
+      - wool-locking/src/**
+      - wool-locking/pyproject.toml
 
 jobs:
   tag-version:
