@@ -159,7 +159,6 @@ class WoolClient(BaseClient):
         super().__init__(address, authkey=authkey)
         self._outer_client: WoolClient | None = None
 
-
     def __enter__(self):
         if not self.connected:
             self.connect()
