@@ -32,4 +32,5 @@ include = ["wool"]
 
 [tool.setuptools_scm]
 local_scheme = "dirty-tag"
+root = ".."
 version_scheme = "release-branch-semver"
