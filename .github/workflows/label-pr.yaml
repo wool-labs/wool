@@ -10,8 +10,10 @@ on:
       - opened
       - reopened
     paths:
-      - */src/**
-      - */pyproject.toml
+      - wool/src/**
+      - wool/pyproject.toml
+      - wool-locking/src/**
+      - wool-locking/pyproject.toml
     
 jobs:
   add-code-change-label:
