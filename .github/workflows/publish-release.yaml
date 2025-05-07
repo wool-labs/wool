@@ -9,8 +9,8 @@ on:
     types:
       - closed
     paths:
-      - src/**
-      - pyproject.toml
+      - */src/**
+      - */pyproject.toml
 
 jobs:
   tag-version:

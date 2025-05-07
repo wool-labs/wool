@@ -12,8 +12,8 @@ on:
       - reopened
       - synchronize
     paths:
-      - src/**
-      - pyproject.toml
+      - */src/**
+      - */pyproject.toml
     
 jobs:
   merge-forbidden:
