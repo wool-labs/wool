@@ -33,7 +33,8 @@ runs:
         else
           prerelease_flag=""
         fi
-        gh release create ${{ inputs.version }} --verify-tag \
+        gh release create ${{ inputs.version }} \
+          --title ${{ inputs.source }}-${{ inputs.version }} \
           --repo ${{ github.repository }} \
           --generate-notes \
           $prerelease_flag
