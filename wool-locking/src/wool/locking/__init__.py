@@ -7,7 +7,6 @@ from wool.locking._pool import LockPool
 
 __lock_client__: Final[ContextVar[LockClient]] = ContextVar("__wool_client__")
 
-
 __all__ = [
     "LockClient",
     "LockPool",
@@ -22,4 +21,4 @@ for symbol in __all__:
             # Set the module to reflect imports of the symbol
             attribute.__module__ = __name__
     except AttributeError:
-        pass
+        continue
