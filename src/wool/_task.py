@@ -47,7 +47,7 @@ def task(fn: C) -> C:
     """
 
     @wraps(fn)
-    def wrapper(*args, __wool_remote__: bool = False, **kwargs) -> Coroutine:
+    def wrapper(*args, __wool_remote__: bool = False, __wool_client__: WoolClient | None = None, **kwargs) -> Coroutine:
         # Handle static and class methods in a picklable way.
         parent, function = resolve(fn)
         assert parent is not None
@@ -59,7 +59,7 @@ def task(fn: C) -> C:
         else:
             # Otherwise, submit the task to the pool.
             return _put(
-                wool.__wool_client__.get(),
+                __wool_client__ or wool.__wool_client__.get(),
                 wrapper.__module__,
                 wrapper.__qualname__,
                 function,
@@ -303,8 +303,3 @@ def resolve(method: Callable[P, R]) -> tuple[Any, Callable[P, R]]:
         parent = scope
         scope = getattr(scope, name)
     return parent, cast(Callable[P, R], scope)
-
-
-@task
-async def ping():
-    logging.debug("Ping!")

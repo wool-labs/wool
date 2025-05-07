@@ -2,7 +2,7 @@ import asyncio
 import importlib
 import logging
 from contextlib import contextmanager
-from importlib.metadata import entry_points
+from functools import partial
 from multiprocessing import cpu_count
 from time import perf_counter
 
@@ -11,16 +11,19 @@ import click
 import wool
 from wool._client import WoolClient
 from wool._pool import WoolPool
-from wool._task import ping as _ping
+from wool._task import task
+
+DEFAULT_PORT = 48800
 
 
-class WorkerPoolCommand(click.core.Command):
-    def __init__(self, *args, **kwargs):
+# PUBLIC
+class WoolPoolCommand(click.core.Command):
+    def __init__(self, *args, default_host="localhost", default_port=0, default_authkey=b"", **kwargs):
         params = kwargs.pop("params", [])
         params = [
-            click.Option(["--host", "-h"], type=str),
-            click.Option(["--port", "-p"], type=int),
-            click.Option(["--authkey", "-a"], type=str, callback=to_bytes),
+            click.Option(["--host", "-h"], type=str, default=default_host),
+            click.Option(["--port", "-p"], type=int, default=default_port),
+            click.Option(["--authkey", "-a"], type=str, default=default_authkey, callback=to_bytes),
             *params,
         ]
         super().__init__(*args, params=params, **kwargs)
@@ -47,7 +50,7 @@ def to_bytes(context: click.Context, parameter: click.Parameter, value: str):
         bytes: The converted value in bytes.
     """
     if value is None:
-        return value
+        return b""
     return value.encode("utf-8")
 
 
@@ -138,7 +141,7 @@ def cli(verbosity: int):
 def pool(): ...
 
 
-@pool.command(cls=WorkerPoolCommand)
+@pool.command(cls=partial(WoolPoolCommand, default_port=DEFAULT_PORT))
 @click.option(
     "--breadth", "-b", type=int, default=cpu_count(), callback=assert_nonzero
 )
@@ -153,15 +156,8 @@ def pool(): ...
 def up(host, port, authkey, breadth, modules):
     for module in modules:
         importlib.import_module(module)
-    if not host:
-        host = "localhost"
-    else:
-        raise NotImplementedError("Only localhost is supported for now")
-    if not port:
-        port = 0
     if not authkey:
         logging.warning("No authkey specified")
-        authkey = b""
     workerpool = WoolPool(
         address=(host, port),
         breadth=breadth,
@@ -172,7 +168,7 @@ def up(host, port, authkey, breadth, modules):
     workerpool.join()
 
 
-@pool.command(cls=WorkerPoolCommand)
+@pool.command(cls=partial(WoolPoolCommand, default_port=DEFAULT_PORT))
 @click.option(
     "--wait",
     "-w",
@@ -186,11 +182,11 @@ def down(host, port, authkey, wait):
         host = "localhost"
     if not authkey:
         authkey = b""
-    client = WoolClient(address=(host, port), authkey=authkey)
+    client = WoolClient(address=(host, port), authkey=authkey).connect()
     client.stop(wait=wait)
 
 
-@cli.command(cls=WorkerPoolCommand)
+@cli.command(cls=partial(WoolPoolCommand, default_port=DEFAULT_PORT))
 def ping(host, port, authkey):
     assert port
     if not host:
@@ -206,3 +202,8 @@ def ping(host, port, authkey):
 
     with WoolClient(address=(host, port), authkey=authkey):
         asyncio.get_event_loop().run_until_complete(_())
+
+
+@task
+async def _ping():
+    logging.debug("Ping!")

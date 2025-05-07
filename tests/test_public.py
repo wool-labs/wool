@@ -15,6 +15,7 @@ def test_public():
         "WoolTaskEvent",
         "WoolTaskEventCallback",
         "WoolPool",
+        "WoolPoolCommand",
         "WoolClient",
         "__log_format__",
         "__log_level__",

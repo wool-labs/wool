@@ -3,7 +3,7 @@ from contextvars import ContextVar
 from importlib.metadata import entry_points
 from typing import Final, Literal
 
-from wool._cli import cli
+from wool._cli import WoolPoolCommand, cli
 from wool._client import NullClient, WoolClient
 from wool._future import WoolFuture
 from wool._logging import __log_format__
@@ -39,6 +39,7 @@ __all__ = [
     "WoolTaskEventCallback",
     "WoolPool",
     "WoolClient",
+    "WoolPoolCommand",
     "__log_format__",
     "__log_level__",
     "__wool_client__",
@@ -46,16 +47,6 @@ __all__ = [
     "current_task",
     "task",
 ]
-
-for symbol in __all__:
-    attribute = globals().get(symbol)
-    try:
-        if attribute and "wool" in attribute.__module__.split("."):
-            # Set the module to reflect imports of the symbol
-            attribute.__module__ = __name__
-    except AttributeError:
-        pass
-
 
 for plugin in entry_points(group="wool.cli.plugins"):
     try:
