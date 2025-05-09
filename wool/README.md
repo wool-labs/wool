@@ -97,7 +97,7 @@ from tasks import sample_task
 
 # Execute the decorated function in an external worker pool
 async def main():
-    with wool.WoolClient(port=5050, authkey=b"deadbeef"):
+    with wool.PoolSession(port=5050, authkey=b"deadbeef"):
         result = await sample_task(1, 2)
         print(f"Result: {result}")
 

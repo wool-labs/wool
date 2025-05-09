@@ -8,12 +8,10 @@ from contextvars import Context, ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from sys import modules
-from time import perf_counter_ns
 from types import TracebackType
 from typing import (
     Any,
     Coroutine,
-    Literal,
     ParamSpec,
     Protocol,
     TypeVar,
@@ -22,9 +20,9 @@ from typing import (
 from uuid import UUID, uuid4
 
 import wool
+from wool._event import WoolTaskEvent
 from wool._future import WoolFuture
-from wool._pool import WoolClient
-from wool._typing import PassthroughDecorator
+from wool._pool import PoolSession
 
 AsyncCallable = Callable[..., Coroutine]
 C = TypeVar("C", bound=AsyncCallable)
@@ -50,7 +48,7 @@ def task(fn: C) -> C:
     def wrapper(
         *args,
         __wool_remote__: bool = False,
-        __wool_client__: WoolClient | None = None,
+        __wool_session__: PoolSession | None = None,
         **kwargs,
     ) -> Coroutine:
         # Handle static and class methods in a picklable way.
@@ -64,7 +62,7 @@ def task(fn: C) -> C:
         else:
             # Otherwise, submit the task to the pool.
             return _put(
-                __wool_client__ or wool.__wool_client__.get(),
+                __wool_session__ or wool.__wool_session__.get(),
                 wrapper.__module__,
                 wrapper.__qualname__,
                 function,
@@ -76,14 +74,15 @@ def task(fn: C) -> C:
 
 
 def _put(
-    client: WoolClient,
+    session: PoolSession,
     module: str,
     qualname: str,
     function: AsyncCallable,
     *args,
     **kwargs,
 ) -> Coroutine:
-    assert client.connected
+    if not session.connected:
+        session.connect()
 
     # Skip self argument if function is a method.
     _args = args[1:] if hasattr(function, "__self__") else args
@@ -105,18 +104,17 @@ def _put(
         kwargs=kwargs,
         tag=f"{module}.{qualname}({signature})",
     )
-    assert isinstance(client, WoolClient)
-    future: WoolFuture = client.put(task)
+    assert isinstance(session, PoolSession)
+    future: WoolFuture = session.put(task)
 
     async def coroutine(future):
         try:
             while not future.done():
                 await asyncio.sleep(0)
             else:
-                try:
-                    return future.result()
-                except Exception as e:
-                    raise Exception().with_traceback(e.__traceback__) from e
+                return future.result()
+        except ConnectionResetError as e:
+            raise asyncio.CancelledError from e
         except asyncio.CancelledError:
             logging.debug("Cancelling...")
             future.cancel()
@@ -163,7 +161,6 @@ class WoolTask:
 
     def __enter__(self) -> Callable[[], Coroutine]:
         logging.info(f"Entering {self.__class__.__name__} with ID {self.id}")
-        WoolTaskEvent("task-queued", task=self).emit()
         return self.run
 
     def __exit__(
@@ -207,56 +204,6 @@ class WoolTask:
                 return result
 
         return wrapper
-
-
-# PUBLIC
-class WoolTaskEvent:
-    """
-    Task events are emitted when a task is created, queued, started, stopped,
-    and completed. Tasks can be started and stopped multiple times by the event
-    loop. The cumulative time between start and stop events can be used to
-    determine a task's CPU utilization.
-    """
-
-    type: WoolTaskEventType
-    task: WoolTask
-
-    _handlers: dict[str, list[WoolTaskEventCallback]] = {}
-
-    def __init__(self, type: WoolTaskEventType, /, task: WoolTask) -> None:
-        self.type = type
-        self.task = task
-
-    @classmethod
-    def handler(
-        cls, *event_types: WoolTaskEventType
-    ) -> PassthroughDecorator[WoolTaskEventCallback]:
-        def _handler(
-            fn: WoolTaskEventCallback,
-        ) -> WoolTaskEventCallback:
-            for event_type in event_types:
-                cls._handlers.setdefault(event_type, []).append(fn)
-            return fn
-
-        return _handler
-
-    def emit(self):
-        logging.debug(f"Emitting {self.type} event for task {self.task.id}")
-        if handlers := self._handlers.get(self.type):
-            timestamp = perf_counter_ns()
-            for handler in handlers:
-                handler(self, timestamp)
-
-
-# PUBLIC
-WoolTaskEventType = Literal[
-    "task-created",
-    "task-queued",
-    "task-started",
-    "task-stopped",
-    "task-completed",
-]
-
 
 # PUBLIC
 class WoolTaskEventCallback(Protocol):

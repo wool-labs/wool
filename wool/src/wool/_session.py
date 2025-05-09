@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 def command(fn):
     @functools.wraps(fn)
-    def wrapper(self: BaseClient, *args, **kwargs):
+    def wrapper(self: BaseSession, *args, **kwargs):
         if not self.connected:
             raise RuntimeError("Client not connected to manager")
         assert self.manager
@@ -35,15 +35,14 @@ def command(fn):
             )
             self.connect()
             logging.debug(
-                f"Reconnected to manager at {self._address}. "
-                "Retrying command..."
+                f"Reconnected to manager at {self._address}. Retrying command..."
             )
             return fn(self, *args, **kwargs)
 
     return wrapper
 
 
-class BaseClient:
+class BaseSession:
     def __init__(
         self,
         address: tuple[str, int],
@@ -74,9 +73,7 @@ class BaseClient:
         if not interval > 0:
             raise ValueError("Interval must be a positive float")
         if not self._manager:
-            self._manager = Manager(
-                address=self._address, authkey=self._authkey
-            )
+            self._manager = Manager(address=self._address, authkey=self._authkey)
             attempts = threading.Semaphore(retries + 1)
             error = None
             i = 1
@@ -96,25 +93,26 @@ class BaseClient:
                 if error:
                     self._manager = None
                     raise error
-            logging.info(
-                f"Successfully connected to manager at {self._address}"
-            )
+            logging.info(f"Successfully connected to manager at {self._address}")
         else:
             logging.warning(f"Already connected to manager at {self._address}")
         return self
 
-    @command
     def stop(self, wait: bool = False) -> None:
         """Shut down the worker pool and close the connection to the manager."""
         assert self._manager
-        self._manager.stop(wait=wait)
-        self._manager = None
+        try:
+            self._manager.stop(wait=wait)
+        except ConnectionRefusedError:
+            logging.warning(f"Connection to manager at {self._address} refused.")
+        finally:
+            self._manager = None
 
 
-Self = TypeVar("Self", bound=BaseClient)
+Self = TypeVar("Self", bound=BaseSession)
 
 
-class WorkerClient(BaseClient):
+class WorkerSession(BaseSession):
     @command
     def futures(self) -> WeakValueDictionary[UUID, WoolFuture]:
         assert self.manager
@@ -125,31 +123,39 @@ class WorkerClient(BaseClient):
         assert self.manager
         return self.manager.queue()
 
+    def __enter__(self):
+        if not self.connected:
+            self.connect()
+        return self
+
+    def __exit__(self, *_):
+        pass
+
 
 # PUBLIC
-def client(
+def session(
     address: tuple[str, int],
     *,
     authkey: bytes | None = None,
 ) -> Callable[[AsyncCallable], AsyncCallable]:
-    def _client(fn: AsyncCallable) -> AsyncCallable:
+    def _session(fn: AsyncCallable) -> AsyncCallable:
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs) -> Coroutine:
-            with WoolClient(address, authkey=authkey):
+            with PoolSession(address, authkey=authkey):
                 return await fn(*args, **kwargs)
 
         return wrapper
 
-    return _client
+    return _session
 
 
 # PUBLIC
-def current_client() -> WoolClient | None:
-    return wool.__wool_client__.get()
+def current_client() -> PoolSession | None:
+    return wool.__wool_session__.get()
 
 
 # PUBLIC
-class WoolClient(BaseClient):
+class PoolSession(BaseSession):
     def __init__(
         self,
         address: tuple[str, int],
@@ -157,31 +163,30 @@ class WoolClient(BaseClient):
         authkey: bytes | None = None,
     ):
         super().__init__(address, authkey=authkey)
-        self._outer_client: WoolClient | None = None
+        self._outer_client: PoolSession | None = None
 
     def __enter__(self):
         if not self.connected:
             self.connect()
-        self._outer_client = self.client_context.get()
-        self.client_context.set(self)
+        self._outer_client = self.session.get()
+        self.session.set(self)
 
     def __exit__(self, *_):
-        assert self._outer_client
-        self.client_context.set(self._outer_client)
+        self.session.set(self._outer_client)
         self._outer_client = None
 
     @property
-    def client_context(self) -> ContextVar[WoolClient]:
-        return wool.__wool_client__
+    def session(self) -> ContextVar[PoolSession]:
+        return wool.__wool_session__
 
     @command
     def put(self, task: WoolTask) -> WoolFuture:
         assert self._manager
-        return self._manager.put(task)
+        return self._manager.put(task, worker=bool(wool.__wool_worker__))
 
 
 # PUBLIC
-class NullClient(WoolClient):
+class LocalSession(PoolSession):
     def __init__(self):
         pass
 
@@ -193,7 +198,7 @@ class NullClient(WoolClient):
     def connected(self) -> bool:
         return True
 
-    def connect(self, *args, **kwargs) -> NullClient:
+    def connect(self, *args, **kwargs) -> LocalSession:
         return self
 
     def put(self, wool_task: wool.WoolTask) -> WoolFuture:

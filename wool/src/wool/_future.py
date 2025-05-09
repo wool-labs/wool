@@ -50,7 +50,7 @@ class WoolFuture(Generic[T]):
             self._done = True
 
     def exception(self) -> BaseException | type[BaseException]:
-        if self._exception is not Undefined:
+        if self.done() and self._exception is not Undefined:
             return cast(BaseException | type[BaseException], self._exception)
         else:
             raise asyncio.InvalidStateError
@@ -89,12 +89,14 @@ async def poll(future: WoolFuture, task: concurrent.futures.Future) -> None:
 def fulfill(future: WoolFuture):
     def callback(task: concurrent.futures.Future):
         try:
-            future.set_result(task.result())
+            result = task.result()
         except concurrent.futures.CancelledError:
             if not future.cancelled():
                 future.cancel()
         except BaseException as e:
             logging.exception(e)
             future.set_exception(e)
+        else:
+            future.set_result(result)
 
     return callback

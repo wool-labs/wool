@@ -9,15 +9,15 @@ from time import perf_counter
 import click
 
 import wool
-from wool._client import WoolClient
-from wool._pool import WoolPool
+from wool._session import PoolSession
+from wool._pool import Pool
 from wool._task import task
 
 DEFAULT_PORT = 48800
 
 
 # PUBLIC
-class WoolPoolCommand(click.core.Command):
+class PoolCommand(click.core.Command):
     def __init__(
         self,
         *args,
@@ -153,7 +153,7 @@ def cli(verbosity: int):
 def pool(): ...
 
 
-@pool.command(cls=partial(WoolPoolCommand, default_port=DEFAULT_PORT))
+@pool.command(cls=partial(PoolCommand, default_port=DEFAULT_PORT))
 @click.option(
     "--breadth", "-b", type=int, default=cpu_count(), callback=assert_nonzero
 )
@@ -170,7 +170,7 @@ def up(host, port, authkey, breadth, modules):
         importlib.import_module(module)
     if not authkey:
         logging.warning("No authkey specified")
-    workerpool = WoolPool(
+    workerpool = Pool(
         address=(host, port),
         breadth=breadth,
         authkey=authkey,
@@ -180,7 +180,7 @@ def up(host, port, authkey, breadth, modules):
     workerpool.join()
 
 
-@pool.command(cls=partial(WoolPoolCommand, default_port=DEFAULT_PORT))
+@pool.command(cls=partial(PoolCommand, default_port=DEFAULT_PORT))
 @click.option(
     "--wait",
     "-w",
@@ -194,11 +194,11 @@ def down(host, port, authkey, wait):
         host = "localhost"
     if not authkey:
         authkey = b""
-    client = WoolClient(address=(host, port), authkey=authkey).connect()
+    client = PoolSession(address=(host, port), authkey=authkey).connect()
     client.stop(wait=wait)
 
 
-@cli.command(cls=partial(WoolPoolCommand, default_port=DEFAULT_PORT))
+@cli.command(cls=partial(PoolCommand, default_port=DEFAULT_PORT))
 def ping(host, port, authkey):
     assert port
     if not host:
@@ -208,11 +208,11 @@ def ping(host, port, authkey):
 
     async def _():
         with timer() as t:
-            await asyncio.create_task(_ping())
+            await _ping()
 
         print(f"Ping: {int((t() * 1000) + 0.5)} ms")
 
-    with WoolClient(address=(host, port), authkey=authkey):
+    with PoolSession(address=(host, port), authkey=authkey):
         asyncio.get_event_loop().run_until_complete(_())
 
 

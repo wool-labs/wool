@@ -4,18 +4,18 @@ from functools import partial
 import click
 
 import wool
-from wool.locking._pool import LockClient, LockPool
+from wool.locking._pool import LockPool, LockPoolSession
 
 DEFAULT_PORT = 48900
 
 
-@wool.cli.group()
+@wool.cli.group("lock-pool")
 def lock_pool():
     pass
 
 
 @lock_pool.command(
-    cls=partial(wool.WoolPoolCommand, default_port=DEFAULT_PORT)
+    cls=partial(wool.PoolCommand, default_port=DEFAULT_PORT)
 )
 def up(host, port, authkey):
     if not authkey:
@@ -30,7 +30,7 @@ def up(host, port, authkey):
 
 
 @lock_pool.command(
-    cls=partial(wool.WoolPoolCommand, default_port=DEFAULT_PORT)
+    cls=partial(wool.PoolCommand, default_port=DEFAULT_PORT)
 )
 @click.option(
     "--wait",
@@ -45,5 +45,5 @@ def down(host, port, authkey, wait):
         host = "localhost"
     if not authkey:
         authkey = b""
-    client = LockClient(address=(host, port), authkey=authkey).connect()
-    client.stop(wait=wait)
+    with LockPoolSession(address=(host, port), authkey=authkey) as client:
+        client.stop(wait=wait)

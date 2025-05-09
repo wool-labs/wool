@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import signal
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable, TypeVar, overload
 from uuid import UUID
 from weakref import WeakValueDictionary
 
+from wool._event import WoolTaskEvent
 from wool._future import WoolFuture
 from wool._queue import TaskQueue
 from wool._typing import PassthroughDecorator
@@ -22,8 +24,9 @@ if TYPE_CHECKING:
     from wool._task import WoolTask
 
 
-C = TypeVar("C", bound=Callable[..., Any])
+__stopped__ = False
 
+C = TypeVar("C", bound=Callable[..., Any])
 
 _manager_registry = {}
 
@@ -91,12 +94,14 @@ _task_futures: WeakValueDictionary[UUID, WoolFuture] = WeakValueDictionary()
 
 
 @register
-def put(task: WoolTask) -> WoolFuture:
+def put(task: WoolTask, worker: bool) -> WoolFuture:
+    if __stopped__ and not worker:
+        raise asyncio.InvalidStateError("Manager is stopped")
     try:
         with queue_lock():
             queue().put(task, block=False)
             future = futures()[task.id] = WoolFuture()
-            logging.debug(f"Pushed task {task.id} to queue: {task.tag}")
+            WoolTaskEvent("task-queued", task=task).emit()
             return future
     except Exception as e:
         logging.exception(e)
@@ -142,6 +147,8 @@ def queue_lock() -> Lock:
 
 @register
 def stop(wait: bool = True) -> None:
+    global __stopped__
+    __stopped__ = True
     os.kill(os.getpid(), signal.SIGINT if wait else signal.SIGTERM)
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from copy import copy
 from functools import partial, wraps
 from multiprocessing import Process, current_process
@@ -14,9 +14,9 @@ from typing import TYPE_CHECKING, Callable, Coroutine
 from weakref import WeakSet
 
 import wool
-from wool._client import WoolClient
+from wool._session import PoolSession
 from wool._manager import Manager
-from wool._worker import Worker
+from wool._worker import Scheduler, Worker
 
 if TYPE_CHECKING:
     from wool._task import AsyncCallable
@@ -33,7 +33,7 @@ def pool(
     def _pool(fn: AsyncCallable) -> AsyncCallable:
         @wraps(fn)
         async def wrapper(*args, **kwargs) -> Coroutine:
-            with WoolPool(
+            with Pool(
                 breadth=breadth,
                 address=address,
                 authkey=authkey,
@@ -47,7 +47,7 @@ def pool(
 
 
 # PUBLIC
-class WoolPool(Process):
+class Pool(Process):
     def __init__(
         self,
         address: tuple[str, int] = ("localhost", 5050),
@@ -68,25 +68,31 @@ class WoolPool(Process):
         self._breadth: int = breadth
         self._address: tuple[str, int] = address
         self._log_level: int = log_level
-        self._outer_client: WoolClient | None = None
-        self._client = WoolClient(address=self._address)
+        self._token: Token | None = None
+        self._session = self.session_type(address=self._address, authkey=self.authkey)
 
     def __enter__(self):
         self.start()
-        self._outer_client = self.client_context.get()
-        self.client_context.set(self._client)
+        self._session.connect()
+        self._token = self.session_context.set(self._session)
 
     def __exit__(self, *_) -> None:
-        assert self._outer_client
-        self.client_context.set(self._outer_client)
-        self._outer_client = None
+        self.session_context.reset(self._token)
         assert self.pid
         self.stop()
         self.join()
 
     @property
-    def client_context(self) -> ContextVar[WoolClient]:
-        return wool.__wool_client__
+    def session_type(self) -> type[PoolSession]:
+        return PoolSession
+
+    @property
+    def session_context(self) -> ContextVar[PoolSession]:
+        return wool.__wool_session__
+    
+    @property
+    def scheduler_type(self) -> type[Scheduler]:
+        return Scheduler
 
     @property
     def log_level(self) -> int:
@@ -143,6 +149,7 @@ class WoolPool(Process):
                     log_level=self.log_level,
                     id=i,
                     lock=self.lock,
+                    scheduler=self.scheduler_type,
                 )
                 worker_sentinel.start()
                 self._worker_sentinels.add(worker_sentinel)
@@ -176,9 +183,9 @@ class WoolPool(Process):
                         if worker_sentinel.is_alive():
                             worker_sentinel.stop(wait=wait)
         elif self.pid:
-            if not self._client.connected:
-                self._client.connect()
-            self._client.stop(wait=wait)
+            if not self._session.connected:
+                self._session.connect()
+            self._session.stop(wait=wait)
 
 
 class WorkerSentinel(Thread):
@@ -192,6 +199,7 @@ class WorkerSentinel(Thread):
         lock: Lock,
         cooldown: float = 1,
         log_level: int = logging.INFO,
+        scheduler: type[Scheduler] = Scheduler,
         **kwargs,
     ) -> None:
         self._address: tuple[str, int] = address
@@ -199,10 +207,9 @@ class WorkerSentinel(Thread):
         self._lock: Lock = lock
         self._cooldown: float = cooldown
         self._log_level: int = log_level
+        self._scheduler_type = scheduler
         self._stop_event: Event = Event()
-        super().__init__(
-            *args, name=f"{self.__class__.__name__}-{self.id}", **kwargs
-        )
+        super().__init__(*args, name=f"{self.__class__.__name__}-{self.id}", **kwargs)
 
     @property
     def worker(self) -> Worker | None:
@@ -243,6 +250,7 @@ class WorkerSentinel(Thread):
                 address=self._address,
                 name=f"Worker-{self.id}",
                 log_level=self.log_level,
+                scheduler=self._scheduler_type,
             )
             with self.lock:
                 if self._stop_event.is_set():
@@ -312,5 +320,5 @@ class ShutdownSentinel(Thread):
             logging.debug("Thread stopped")
 
 
-def stop(pool: WoolPool, wait: bool, *_):
+def stop(pool: Pool, wait: bool, *_):
     pool.stop(wait=wait)

@@ -20,8 +20,13 @@ locking = "wool.locking._cli"
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
 
+[tool.hatch.build.targets.sdist]
+sources = ["src"]
+include = ["wool"]
+
 [tool.hatch.build.targets.wheel]
-packages = ["src/wool"]
+sources = ["src"]
+include = ["wool"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

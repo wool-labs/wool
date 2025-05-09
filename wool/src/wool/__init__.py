@@ -3,11 +3,13 @@ from contextvars import ContextVar
 from importlib.metadata import entry_points
 from typing import Final, Literal
 
-from wool._cli import WoolPoolCommand, cli
-from wool._client import NullClient, WoolClient
+from tblib import pickling_support
+
+from wool._cli import PoolCommand, cli
+from wool._session import LocalSession, PoolSession
 from wool._future import WoolFuture
 from wool._logging import __log_format__
-from wool._pool import WoolPool
+from wool._pool import Pool
 from wool._task import (
     WoolTask,
     WoolTaskEvent,
@@ -16,7 +18,10 @@ from wool._task import (
     current_task,
     task,
 )
-from wool._worker import Worker
+from wool._worker import Scheduler, Worker
+
+
+pickling_support.install()
 
 # PUBLIC
 __log_format__: str = __log_format__
@@ -25,11 +30,11 @@ __log_format__: str = __log_format__
 __log_level__: int = logging.INFO
 
 # PUBLIC
-__wool_client__: Final[ContextVar[WoolClient]] = ContextVar(
-    "__wool_client__", default=NullClient()
+__wool_session__: Final[ContextVar[PoolSession]] = ContextVar(
+    "__wool_session__", default=LocalSession()
 )
 
-__wool_worker__: Worker | Literal[True] | None = None
+__wool_worker__: Worker | None = None
 
 __all__ = [
     "WoolTaskException",
@@ -37,12 +42,13 @@ __all__ = [
     "WoolTask",
     "WoolTaskEvent",
     "WoolTaskEventCallback",
-    "WoolPool",
-    "WoolClient",
-    "WoolPoolCommand",
+    "Pool",
+    "PoolSession",
+    "PoolCommand",
+    "Scheduler",
     "__log_format__",
     "__log_level__",
-    "__wool_client__",
+    "__wool_session__",
     "cli",
     "current_task",
     "task",
@@ -63,4 +69,4 @@ for plugin in entry_points(group="wool.cli.plugins"):
         logging.info(f"Loaded CLI plugin {plugin.name}")
     except Exception as e:
         logging.error(f"Failed to load CLI plugin {plugin.name}: {e}")
-        continue
+        raise
