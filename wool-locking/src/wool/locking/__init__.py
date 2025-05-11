@@ -1,11 +1,13 @@
 from contextvars import ContextVar
 from typing import Final
 
-from wool.locking._session import LockPoolSession
 from wool.locking._lock import lock
 from wool.locking._pool import LockPool
+from wool.locking._session import LockPoolSession
 
-__locking_session__: Final[ContextVar[LockPoolSession | None]] = ContextVar("__locking_session__", default=None)
+__locking_session__: Final[ContextVar[LockPoolSession | None]] = ContextVar(
+    "__locking_session__", default=None
+)
 
 __all__ = [
     "LockPool",

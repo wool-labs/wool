@@ -13,8 +13,8 @@ from time import sleep
 from typing import TYPE_CHECKING
 
 import wool
-from wool._session import PoolSession, WorkerSession
 from wool._future import fulfill, poll
+from wool._session import PoolSession, WorkerSession
 
 if TYPE_CHECKING:
     from wool._task import WoolTask

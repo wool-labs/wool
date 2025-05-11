@@ -14,9 +14,7 @@ def lock_pool():
     pass
 
 
-@lock_pool.command(
-    cls=partial(wool.PoolCommand, default_port=DEFAULT_PORT)
-)
+@lock_pool.command(cls=partial(wool.PoolCommand, default_port=DEFAULT_PORT))
 def up(host, port, authkey):
     if not authkey:
         logging.warning("No authkey specified")
@@ -29,9 +27,7 @@ def up(host, port, authkey):
     workerpool.join()
 
 
-@lock_pool.command(
-    cls=partial(wool.PoolCommand, default_port=DEFAULT_PORT)
-)
+@lock_pool.command(cls=partial(wool.PoolCommand, default_port=DEFAULT_PORT))
 @click.option(
     "--wait",
     "-w",

@@ -9,8 +9,8 @@ from time import perf_counter
 import click
 
 import wool
-from wool._session import PoolSession
 from wool._pool import Pool
+from wool._session import PoolSession
 from wool._task import task
 
 DEFAULT_PORT = 48800

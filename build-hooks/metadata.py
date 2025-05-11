@@ -1,6 +1,8 @@
 import os
 import sys
 
+import debugpy
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 from copy import copy
@@ -35,11 +37,11 @@ class WoolMetadataHook(MetadataHookInterface):
                 if (
                     requirement.name.startswith("wool")
                     and requirement.name in subpackages
+                    and not requirement.specifier
                 ):
-                    if not requirement.specifier:
-                        if version.local:
-                            requirement = f"{requirement.name} @ {{root:parent:uri}}/{requirement.name}"
-                        else:
-                            requirement.specifier &= f"=={version}"
-                        dependencies.remove(dependecy)
-                        dependencies.append(str(requirement))
+                    if version.local:
+                        requirement = f"{requirement.name} @ {{root:parent:uri}}/{requirement.name}"
+                    else:
+                        requirement.specifier &= f"=={version}"
+                    dependencies.remove(dependecy)
+                    dependencies.append(str(requirement))

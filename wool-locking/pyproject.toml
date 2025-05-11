@@ -1,6 +1,6 @@
 [build-system]
 build-backend = "hatchling.build"
-requires = ["debugpy", "hatchling", "packaging", "GitPython"]
+requires = ["debugpy", "hatchling", "packaging", "GitPython", "toml"]
 
 [project]
 authors = [{ name = "Conrad Bzura", email = "conrad@wool.io" }]
@@ -14,7 +14,7 @@ name = "wool-locking"
 readme = "README.md"
 requires-python = ">=3.10"
 
-[project.entry-points."wool.cli.plugins"]
+[project.entry-points.wool_cli_plugins]
 locking = "wool.locking._cli"
 
 [project.optional-dependencies]
@@ -31,11 +31,18 @@ include = ["wool"]
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.hatch.build.hooks.custom]
+path = "../build-hooks/build.py"
+
 [tool.hatch.metadata.hooks.custom]
 path = "../build-hooks/metadata.py"
 
 [tool.ruff]
 line-length = 79
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
 
 [tool.ruff.lint.isort]
 known-first-party = ["wool"]

@@ -15,7 +15,9 @@ def parse() -> str:
     """
     repo = git.Repo(search_parent_directories=True)
     if repo.bare:
-        raise RuntimeError(f"The repo at '{repo.working_dir}' cannot be empty!")
+        raise RuntimeError(
+            f"The repo at '{repo.working_dir}' cannot be empty!"
+        )
     head_commit = repo.head.commit
     try:
         tag = repo.tags[-1]

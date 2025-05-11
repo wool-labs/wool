@@ -1,6 +1,6 @@
 [build-system]
 build-backend = "hatchling.build"
-requires = ["debugpy", "hatchling", "packaging", "GitPython"]
+requires = ["debugpy", "hatchling", "packaging", "GitPython", "toml"]
 
 [project]
 authors = [{ name = "Conrad Bzura", email = "conrad@wool.io" }]
@@ -32,11 +32,18 @@ include = ["wool"]
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.hatch.build.hooks.custom]
+path = "../build-hooks/build.py"
+
 [tool.hatch.metadata.hooks.custom]
 path = "../build-hooks/metadata.py"
 
 [tool.ruff]
 line-length = 79
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
 
 [tool.ruff.lint.isort] 
 known-first-party = ["wool"]

@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Callable, Coroutine
 from weakref import WeakSet
 
 import wool
-from wool._session import PoolSession
 from wool._manager import Manager
+from wool._session import PoolSession
 from wool._worker import Scheduler, Worker
 
 if TYPE_CHECKING:
@@ -69,7 +69,9 @@ class Pool(Process):
         self._address: tuple[str, int] = address
         self._log_level: int = log_level
         self._token: Token | None = None
-        self._session = self.session_type(address=self._address, authkey=self.authkey)
+        self._session = self.session_type(
+            address=self._address, authkey=self.authkey
+        )
 
     def __enter__(self):
         self.start()
@@ -89,7 +91,7 @@ class Pool(Process):
     @property
     def session_context(self) -> ContextVar[PoolSession]:
         return wool.__wool_session__
-    
+
     @property
     def scheduler_type(self) -> type[Scheduler]:
         return Scheduler
@@ -209,7 +211,9 @@ class WorkerSentinel(Thread):
         self._log_level: int = log_level
         self._scheduler_type = scheduler
         self._stop_event: Event = Event()
-        super().__init__(*args, name=f"{self.__class__.__name__}-{self.id}", **kwargs)
+        super().__init__(
+            *args, name=f"{self.__class__.__name__}-{self.id}", **kwargs
+        )
 
     @property
     def worker(self) -> Worker | None:

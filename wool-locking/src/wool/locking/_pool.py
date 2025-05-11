@@ -16,7 +16,7 @@ class LockPool(wool.Pool):
     @property
     def session_context(self) -> ContextVar[LockPoolSession]:
         return wool.locking.__locking_session__
-    
+
     @property
     def scheduler_type(self) -> type[LockScheduler]:
         return LockScheduler

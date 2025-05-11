@@ -1,15 +1,15 @@
 import logging
 from contextvars import ContextVar
 from importlib.metadata import entry_points
-from typing import Final, Literal
+from typing import Final
 
 from tblib import pickling_support
 
 from wool._cli import PoolCommand, cli
-from wool._session import LocalSession, PoolSession
 from wool._future import WoolFuture
 from wool._logging import __log_format__
 from wool._pool import Pool
+from wool._session import LocalSession, PoolSession
 from wool._task import (
     WoolTask,
     WoolTaskEvent,
@@ -19,7 +19,6 @@ from wool._task import (
     task,
 )
 from wool._worker import Scheduler, Worker
-
 
 pickling_support.install()
 
@@ -63,7 +62,7 @@ for symbol in __all__:
     except AttributeError:
         continue
 
-for plugin in entry_points(group="wool.cli.plugins"):
+for plugin in entry_points(group="wool_cli_plugins"):
     try:
         plugin.load()
         logging.info(f"Loaded CLI plugin {plugin.name}")

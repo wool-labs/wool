@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from time import perf_counter_ns
-from typing import Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from wool._typing import PassthroughDecorator
 

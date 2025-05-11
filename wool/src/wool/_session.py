@@ -73,7 +73,9 @@ class BaseSession:
         if not interval > 0:
             raise ValueError("Interval must be a positive float")
         if not self._manager:
-            self._manager = Manager(address=self._address, authkey=self._authkey)
+            self._manager = Manager(
+                address=self._address, authkey=self._authkey
+            )
             attempts = threading.Semaphore(retries + 1)
             error = None
             i = 1
@@ -93,7 +95,9 @@ class BaseSession:
                 if error:
                     self._manager = None
                     raise error
-            logging.info(f"Successfully connected to manager at {self._address}")
+            logging.info(
+                f"Successfully connected to manager at {self._address}"
+            )
         else:
             logging.warning(f"Already connected to manager at {self._address}")
         return self
@@ -104,7 +108,9 @@ class BaseSession:
         try:
             self._manager.stop(wait=wait)
         except ConnectionRefusedError:
-            logging.warning(f"Connection to manager at {self._address} refused.")
+            logging.warning(
+                f"Connection to manager at {self._address} refused."
+            )
         finally:
             self._manager = None
 

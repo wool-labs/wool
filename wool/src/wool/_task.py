@@ -205,6 +205,7 @@ class WoolTask:
 
         return wrapper
 
+
 # PUBLIC
 class WoolTaskEventCallback(Protocol):
     def __call__(self, event: WoolTaskEvent, timestamp: Timestamp) -> None: ...
