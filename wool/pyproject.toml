@@ -41,9 +41,14 @@ path = "../build-hooks/metadata.py"
 [tool.ruff]
 line-length = 79
 
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
 [tool.ruff.format]
 quote-style = "double"
 docstring-code-format = true
 
 [tool.ruff.lint.isort] 
+combine-as-imports = false
+force-single-line = true
 known-first-party = ["wool"]

@@ -112,7 +112,10 @@ def debug(ctx, param, value):
     "-d",
     callback=debug,
     expose_value=False,
-    help="Run with debugger listening on the specified port. Execution will block until the debugger is attached.",
+    help=(
+        "Run with debugger listening on the specified port. Execution will "
+        "block until the debugger is attached."
+    ),
     is_eager=True,
     type=int,
 )
@@ -163,7 +166,10 @@ def pool(): ...
     "-m",
     multiple=True,
     type=str,
-    help="Python module containing workerpool task definitions to be executed by this pool.",
+    help=(
+        "Python module containing workerpool task definitions to be executed "
+        "by this pool."
+    ),
 )
 def up(host, port, authkey, breadth, modules):
     for module in modules:
@@ -194,8 +200,8 @@ def down(host, port, authkey, wait):
         host = "localhost"
     if not authkey:
         authkey = b""
-    client = PoolSession(address=(host, port), authkey=authkey).connect()
-    client.stop(wait=wait)
+    with PoolSession(address=(host, port), authkey=authkey) as client:
+        client.stop(wait=wait)
 
 
 @cli.command(cls=partial(PoolCommand, default_port=DEFAULT_PORT))

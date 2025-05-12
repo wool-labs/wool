@@ -3,9 +3,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
-from typing import Any, Generator, Generic, TypeVar, cast
+from typing import Any
+from typing import Generator
+from typing import Generic
+from typing import TypeVar
+from typing import cast
 
-from wool._utils import Undefined, UndefinedType
+from wool._utils import Undefined
+from wool._utils import UndefinedType
 
 T = TypeVar("T")
 
@@ -91,12 +96,13 @@ def fulfill(future: WoolFuture):
         try:
             result = task.result()
         except concurrent.futures.CancelledError:
-            if not future.cancelled():
+            if not future.done():
                 future.cancel()
         except BaseException as e:
             logging.exception(e)
             future.set_exception(e)
         else:
-            future.set_result(result)
+            if not future.done():
+                future.set_result(result)
 
     return callback

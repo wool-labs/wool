@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import threading
-from typing import Callable, Final, Generic, TypeVar
+from typing import Callable
+from typing import Final
+from typing import Generic
+from typing import TypeVar
 
 
 class UndefinedType:

@@ -7,8 +7,6 @@ import wool.locking
 
 
 class LockPoolSession(wool.PoolSession):
-    _outer_client: LockPoolSession | None = None
-
     @property
-    def session(self) -> ContextVar[LockPoolSession]:
+    def session(self) -> ContextVar[wool.PoolSession]:
         return wool.locking.__locking_session__

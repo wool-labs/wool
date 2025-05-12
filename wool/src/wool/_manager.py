@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
-import signal
 from functools import partial
-from multiprocessing.managers import (
-    BaseManager,
-    DictProxy,
-)
+from multiprocessing.managers import BaseManager
+from multiprocessing.managers import DictProxy
 from queue import Empty
+from threading import Event
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Callable, TypeVar, overload
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Callable
+from typing import TypeVar
+from typing import overload
 from uuid import UUID
 from weakref import WeakValueDictionary
 
@@ -23,8 +23,6 @@ from wool._typing import PassthroughDecorator
 if TYPE_CHECKING:
     from wool._task import WoolTask
 
-
-__stopped__ = False
 
 C = TypeVar("C", bound=Callable[..., Any])
 
@@ -44,6 +42,7 @@ def register(
     fn: C,
     /,
     *,
+    exposed: tuple[str, ...] | None = None,
     proxytype: None = None,
     method_to_typeid: None = None,
 ) -> C: ...
@@ -54,6 +53,7 @@ def register(
     fn: None = None,
     /,
     *,
+    exposed: tuple[str, ...] | None = None,
     proxytype: type | None = None,
     method_to_typeid: dict[str, str] | None = None,
 ) -> PassthroughDecorator[C]: ...
@@ -63,10 +63,13 @@ def register(
     fn: C | None = None,
     /,
     *,
+    exposed: tuple[str, ...] | None = None,
     proxytype: type | None = None,
     method_to_typeid: dict[str, str] | None = None,
 ) -> PassthroughDecorator[C] | C:
     kwargs = {}
+    if exposed is not None:
+        kwargs["exposed"] = exposed
     if proxytype is not None:
         kwargs["proxytype"] = proxytype
     if method_to_typeid is not None:
@@ -86,7 +89,7 @@ class FuturesProxy(DictProxy):
     }
 
 
-_task_queue: TaskQueue[WoolTask] = TaskQueue(1000, None)
+_task_queue: TaskQueue[WoolTask] = TaskQueue(100000, None)
 
 _task_queue_lock = Lock()
 
@@ -94,9 +97,7 @@ _task_futures: WeakValueDictionary[UUID, WoolFuture] = WeakValueDictionary()
 
 
 @register
-def put(task: WoolTask, worker: bool) -> WoolFuture:
-    if __stopped__ and not worker:
-        raise asyncio.InvalidStateError("Manager is stopped")
+def put(task: WoolTask) -> WoolFuture:
     try:
         with queue_lock():
             queue().put(task, block=False)
@@ -145,11 +146,18 @@ def queue_lock() -> Lock:
     return _task_queue_lock
 
 
-@register
-def stop(wait: bool = True) -> None:
-    global __stopped__
-    __stopped__ = True
-    os.kill(os.getpid(), signal.SIGINT if wait else signal.SIGTERM)
+_stop_event = Event()
+_wait_event = Event()
+
+
+@register(exposed=("is_set", "set", "clear", "wait"))
+def stopping() -> Event:
+    return _stop_event
+
+
+@register(exposed=("is_set", "set", "clear", "wait"))
+def waiting() -> Event:
+    return _wait_event
 
 
 class ManagerMeta(type):
@@ -169,4 +177,5 @@ class Manager(BaseManager, metaclass=ManagerMeta):
         futures = staticmethod(futures)
         queue = staticmethod(queue)
         queue_lock = staticmethod(queue_lock)
-        stop = staticmethod(stop)
+        stopping = staticmethod(stopping)
+        waiting = staticmethod(waiting)

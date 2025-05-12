@@ -1,7 +1,6 @@
 import os
 import sys
 
-import debugpy
 
 sys.path.insert(0, os.path.dirname(__file__))
 

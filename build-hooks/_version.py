@@ -113,7 +113,9 @@ class NumericVersionSegment(int):
         self.__NumericVersionSegment_format__: str = format
 
     def __repr__(self) -> str:
-        return f"<{type(self).__qualname__}: {repr(self.__NumericVersionSegment_value__)}>"
+        return (
+            f"<{type(self).__qualname__}: {repr(self.__NumericVersionSegment_value__)}>"
+        )
 
     def __lt__(self, value: int | AlphanumericVersionSegment) -> bool:
         if isinstance(value, AlphanumericVersionSegment):
@@ -152,9 +154,7 @@ class AlphanumericVersionSegment(str):
         '-alpha'
     """
 
-    def __new__(
-        cls, value: Optional[str], format: str, *, whitelist: str = ""
-    ):
+    def __new__(cls, value: Optional[str], format: str, *, whitelist: str = ""):
         if value == "":
             raise ValueError(f"{cls.__name__} cannot be an empty string")
         if value is None:
@@ -165,9 +165,7 @@ class AlphanumericVersionSegment(str):
             )
         return super().__new__(cls, value)
 
-    def __init__(
-        self, value: Optional[str], format: str, *, whitelist: str = ""
-    ):
+    def __init__(self, value: Optional[str], format: str, *, whitelist: str = ""):
         if value is None:
             value = ""
         self.__AlphanumericVersionSegment_value__: str = value
@@ -258,9 +256,9 @@ class PreReleaseVersionSegment:
                         that, AlphanumericVersionSegment
                     ):
                         return True
-                    elif isinstance(
-                        this, AlphanumericVersionSegment
-                    ) and isinstance(that, NumericVersionSegment):
+                    elif isinstance(this, AlphanumericVersionSegment) and isinstance(
+                        that, NumericVersionSegment
+                    ):
                         return False
                     else:
                         return this < that
@@ -269,9 +267,7 @@ class PreReleaseVersionSegment:
     def render(self) -> str:
         return (
             self.__PreReleaseVersionSegment_format__.format(
-                ".".join(
-                    v.render() for v in self.__PreReleaseVersionSegment_value__
-                )
+                ".".join(v.render() for v in self.__PreReleaseVersionSegment_value__)
             )
             if self.__PreReleaseVersionSegment_value__
             else ""
@@ -333,9 +329,7 @@ class VersionMeta(type):
 
     @property
     def segments(cls: type[Version]) -> dict[str, segment]:
-        return {
-            k: v for k, v in cls.__dict__.items() if isinstance(v, segment)
-        }
+        return {k: v for k, v in cls.__dict__.items() if isinstance(v, segment)}
 
 
 class Version(metaclass=VersionMeta):
@@ -420,9 +414,7 @@ class VersionParser(Generic[T]):
     def __init__(self, version_class: Type[T]):
         self.version_class = version_class
 
-    def __call__(
-        self, version: str, *, pattern: re.Pattern | None = None
-    ) -> T:
+    def __call__(self, version: str, *, pattern: re.Pattern | None = None) -> T:
         if pattern is not None:
             missing_capture_groups = set(
                 self.version_class.PATTERN.groupindex.keys()

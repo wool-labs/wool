@@ -5,20 +5,21 @@ from typing import Final
 
 from tblib import pickling_support
 
-from wool._cli import PoolCommand, cli
+from wool._cli import PoolCommand
+from wool._cli import cli
 from wool._future import WoolFuture
 from wool._logging import __log_format__
 from wool._pool import Pool
-from wool._session import LocalSession, PoolSession
-from wool._task import (
-    WoolTask,
-    WoolTaskEvent,
-    WoolTaskEventCallback,
-    WoolTaskException,
-    current_task,
-    task,
-)
-from wool._worker import Scheduler, Worker
+from wool._session import LocalSession
+from wool._session import PoolSession
+from wool._task import WoolTask
+from wool._task import WoolTaskEvent
+from wool._task import WoolTaskEventCallback
+from wool._task import WoolTaskException
+from wool._task import current_task
+from wool._task import task
+from wool._worker import Scheduler
+from wool._worker import Worker
 
 pickling_support.install()
 

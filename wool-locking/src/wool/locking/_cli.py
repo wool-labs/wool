@@ -4,7 +4,8 @@ from functools import partial
 import click
 
 import wool
-from wool.locking._pool import LockPool, LockPoolSession
+from wool.locking._pool import LockPool
+from wool.locking._pool import LockPoolSession
 
 DEFAULT_PORT = 48900
 

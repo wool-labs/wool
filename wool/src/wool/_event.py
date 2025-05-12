@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 from time import perf_counter_ns
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
+from typing import Literal
 
 from wool._typing import PassthroughDecorator
 
 if TYPE_CHECKING:
     from wool._task import WoolTask
-    from wool._typing import WoolTaskEventCallback
+    from wool._task import WoolTaskEventCallback
 
 
 # PUBLIC
@@ -43,7 +44,11 @@ class WoolTaskEvent:
         return _handler
 
     def emit(self):
-        logging.debug(f"Emitting {self.type} event for task {self.task.id}")
+        logging.debug(
+            f"Emitting {self.type} event for "
+            f"task {self.task.id} "
+            f"({self.task.callable.__qualname__})"
+        )
         if handlers := self._handlers.get(self.type):
             timestamp = perf_counter_ns()
             for handler in handlers:
@@ -54,6 +59,7 @@ class WoolTaskEvent:
 WoolTaskEventType = Literal[
     "task-created",
     "task-queued",
+    "task-scheduled",
     "task-started",
     "task-stopped",
     "task-completed",

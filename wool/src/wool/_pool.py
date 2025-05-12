@@ -2,24 +2,36 @@ from __future__ import annotations
 
 import logging
 import os
-from contextvars import ContextVar, Token
-from copy import copy
-from functools import partial, wraps
-from multiprocessing import Process, current_process
+from contextvars import ContextVar
+from contextvars import Token
+from functools import partial
+from functools import wraps
+from multiprocessing import Pipe
+from multiprocessing import Process
+from multiprocessing import current_process
 from multiprocessing.managers import Server
-from signal import Signals, signal
-from threading import Event, Lock, Thread, current_thread
-from time import sleep
-from typing import TYPE_CHECKING, Callable, Coroutine
-from weakref import WeakSet
+from signal import Signals
+from signal import signal
+from threading import Event
+from threading import Semaphore
+from threading import Thread
+from typing import TYPE_CHECKING
+from typing import Callable
+from typing import Coroutine
 
 import wool
 from wool._manager import Manager
 from wool._session import PoolSession
-from wool._worker import Scheduler, Worker
+from wool._worker import Scheduler
+from wool._worker import Worker
 
 if TYPE_CHECKING:
+    from wool._queue import TaskQueue
     from wool._task import AsyncCallable
+
+
+def _stop(pool: Pool, wait: bool, *_):
+    pool.stop(wait=wait)
 
 
 # PUBLIC
@@ -48,6 +60,9 @@ def pool(
 
 # PUBLIC
 class Pool(Process):
+    _wait_event: Event | None = None
+    _stop_event: Event | None = None
+
     def __init__(
         self,
         address: tuple[str, int] = ("localhost", 5050),
@@ -72,6 +87,7 @@ class Pool(Process):
         self._session = self.session_type(
             address=self._address, authkey=self.authkey
         )
+        self._get_ready, self._set_ready = Pipe(duplex=False)
 
     def __enter__(self):
         self.start()
@@ -79,9 +95,10 @@ class Pool(Process):
         self._token = self.session_context.set(self._session)
 
     def __exit__(self, *_) -> None:
+        assert self._token
         self.session_context.reset(self._token)
         assert self.pid
-        self.stop()
+        self.stop(wait=True)
         self.join()
 
     @property
@@ -110,6 +127,19 @@ class Pool(Process):
     def breadth(self) -> int:
         return self._breadth
 
+    @property
+    def waiting(self) -> bool | None:
+        return self._wait_event and self._wait_event.is_set()
+
+    @property
+    def stopping(self) -> bool | None:
+        return self._stop_event and self._stop_event.is_set()
+
+    def start(self) -> None:
+        super().start()
+        self._get_ready.recv()
+        self._get_ready.close()
+
     def run(self) -> None:
         if self.log_level:
             wool.__log_level__ = self.log_level
@@ -119,86 +149,129 @@ class Pool(Process):
 
         logging.debug("Thread started")
 
-        signal(Signals.SIGINT, partial(stop, self, True))
-        signal(Signals.SIGTERM, partial(stop, self, False))
+        signal(Signals.SIGINT, partial(_stop, self, False))
+        signal(Signals.SIGTERM, partial(_stop, self, True))
 
-        self.lock = Lock()
-        self._worker_sentinels = WeakSet()
-
-        self._manager = Manager(address=self._address, authkey=self.authkey)
-
-        server = self._manager.get_server()
-        server_thread = Thread(
-            target=server.serve_forever, name="ServerThread", daemon=True
+        self.manager_sentinel = ManagerSentinel(
+            address=self._address, authkey=self.authkey
         )
-        server_thread.start()
+        self.manager_sentinel.start()
 
-        self._manager.connect()
+        self._wait_event = self.manager_sentinel.waiting
+        self._stop_event = self.manager_sentinel.stopping
 
-        self._stop_event = Event()
-        shutdown_sentinel = ShutdownSentinel(
-            self._stop_event, server, self._worker_sentinels
-        )
-        shutdown_sentinel.start()
-
-        with self.lock:
-            for i in range(1, self.breadth + 1):
-                if self._stop_event.is_set():
-                    break
-                logging.debug(f"Spawning worker {i}...")
-                worker_sentinel = WorkerSentinel(
-                    address=self._address,
-                    log_level=self.log_level,
-                    id=i,
-                    lock=self.lock,
-                    scheduler=self.scheduler_type,
-                )
-                worker_sentinel.start()
-                self._worker_sentinels.add(worker_sentinel)
-
-        current_thread().name = "IdleSentinel"
-        while not self.idle() and not self._stop_event.is_set():
-            self._stop_event.wait(1)
-        else:
-            self.stop()
-
-        server_thread.join()
-        for worker_sentinel in self._worker_sentinels:
-            if worker_sentinel.is_alive():
-                worker_sentinel.join()
-        if shutdown_sentinel.is_alive():
-            shutdown_sentinel.join()
-
-    def idle(self):
-        assert self._manager
+        worker_sentinels = []
+        logging.info("Spawning workers...")
         try:
-            return self._manager.queue().idle()
+            for i in range(1, self.breadth + 1):
+                if not self._stop_event.is_set():
+                    worker_sentinel = WorkerSentinel(
+                        address=self._address,
+                        log_level=self.log_level,
+                        id=i,
+                        scheduler=self.scheduler_type,
+                    )
+                    worker_sentinel.start()
+                    worker_sentinels.append(worker_sentinel)
+            for worker_sentinel in worker_sentinels:
+                worker_sentinel.ready.wait()
+            self._set_ready.send(True)
+            self._set_ready.close()
+        except Exception:
+            logging.exception("Error in worker pool")
+            raise
+        finally:
+            while not self.idle and not self.stopping:
+                self._stop_event.wait(1)
+            else:
+                self.stop(wait=bool(self.idle or self.waiting))
+
+            logging.info("Stopping workers...")
+            for worker_sentinel in worker_sentinels:
+                if worker_sentinel.is_alive():
+                    worker_sentinel.stop(wait=self.waiting)
+            for worker_sentinel in worker_sentinels:
+                worker_sentinel.join()
+
+            logging.info("Stopping manager...")
+            if self.manager_sentinel.is_alive():
+                self.manager_sentinel.stop()
+                self.manager_sentinel.join()
+
+    @property
+    def idle(self):
+        assert self.manager_sentinel
+        try:
+            return self.manager_sentinel.idle
         except (ConnectionRefusedError, ConnectionResetError):
             return True
 
     def stop(self, *, wait: bool = True) -> None:
         if self.pid == current_process().pid:
-            with self.lock:
-                if self._stop_event and not self._stop_event.is_set():
-                    self._stop_event.set()
-                    for worker_sentinel in self._worker_sentinels:
-                        if worker_sentinel.is_alive():
-                            worker_sentinel.stop(wait=wait)
+            if wait and self.waiting is False:
+                assert self._wait_event
+                self._wait_event.set()
+            if self.stopping is False:
+                assert self._stop_event
+                self._stop_event.set()
         elif self.pid:
             if not self._session.connected:
                 self._session.connect()
             self._session.stop(wait=wait)
 
 
+class ManagerSentinel(Thread):
+    _wait_event: Event | None = None
+    _stop_event: Event | None = None
+    _queue: TaskQueue | None = None
+
+    def __init__(
+        self, address: tuple[str, int], authkey: bytes, *args, **kwargs
+    ) -> None:
+        self._manager: Manager = Manager(address=address, authkey=authkey)
+        self._server: Server = self._manager.get_server()
+        super().__init__(*args, name=self.__class__.__name__, **kwargs)
+
+    @property
+    def waiting(self) -> Event:
+        if not self._wait_event:
+            self._manager.connect()
+            self._wait_event = self._manager.waiting()
+        return self._wait_event
+
+    @property
+    def stopping(self) -> Event:
+        if not self._stop_event:
+            self._manager.connect()
+            self._stop_event = self._manager.stopping()
+        return self._stop_event
+
+    @property
+    def idle(self) -> bool | None:
+        if not self._queue:
+            self._manager.connect()
+            self._queue = self._manager.queue()
+        return self._queue.idle()
+
+    def run(self) -> None:
+        self._server.serve_forever()
+
+    def stop(self) -> None:
+        stop_event = getattr(self._server, "stop_event")
+        assert isinstance(stop_event, Event)
+        logging.debug("Stopping manager...")
+        stop_event.set()
+
+
 class WorkerSentinel(Thread):
     _worker: Worker | None = None
+    _semaphore: Semaphore = Semaphore(8)
 
     def __init__(
         self,
         address: tuple[str, int],
         *args,
         id: int,
-        lock: Lock,
         cooldown: float = 1,
         log_level: int = logging.INFO,
         scheduler: type[Scheduler] = Scheduler,
@@ -206,11 +279,12 @@ class WorkerSentinel(Thread):
     ) -> None:
         self._address: tuple[str, int] = address
         self._id: int = id
-        self._lock: Lock = lock
         self._cooldown: float = cooldown
         self._log_level: int = log_level
         self._scheduler_type = scheduler
         self._stop_event: Event = Event()
+        self._wait_event: Event = Event()
+        self._ready: Event = Event()
         super().__init__(
             *args, name=f"{self.__class__.__name__}-{self.id}", **kwargs
         )
@@ -224,8 +298,8 @@ class WorkerSentinel(Thread):
         return self._id
 
     @property
-    def lock(self) -> Lock:
-        return self._lock
+    def ready(self) -> Event:
+        return self._ready
 
     @property
     def cooldown(self) -> float:
@@ -241,11 +315,23 @@ class WorkerSentinel(Thread):
     def log_level(self) -> int:
         return self._log_level
 
+    @property
+    def waiting(self) -> bool:
+        return self._wait_event.is_set()
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop_event.is_set()
+
     @log_level.setter
     def log_level(self, value: int) -> None:
         if value < 0:
             raise ValueError("Log level must be non-negative")
         self._log_level = value
+
+    def start(self) -> None:
+        super().start()
+        # self._ready.wait()
 
     def run(self) -> None:
         logging.debug("Thread started")
@@ -256,14 +342,11 @@ class WorkerSentinel(Thread):
                 log_level=self.log_level,
                 scheduler=self._scheduler_type,
             )
-            with self.lock:
-                if self._stop_event.is_set():
-                    logging.debug("Worker interrupted before starting")
-                    break
+            with self._semaphore:
                 worker.start()
-                self._worker = worker
-                logging.info(f"Spawned worker process {worker.pid}")
-                sleep(0.05)
+            self._worker = worker
+            logging.info(f"Spawned worker process {worker.pid}")
+            self._ready.set()
             try:
                 worker.join()
             except Exception as e:
@@ -271,58 +354,14 @@ class WorkerSentinel(Thread):
             finally:
                 logging.info(f"Terminated worker process {worker.pid}")
                 self._worker = None
-            self._stop_event.wait(self.cooldown)
+                self._stop_event.wait(self.cooldown)
         logging.debug("Thread stopped")
 
     def stop(self, *, wait: bool = True) -> None:
-        if not self._stop_event.is_set():
+        logging.info(f"Stopping thread {self.name}...")
+        if wait and not self.waiting:
+            self._wait_event.set()
+        if not self.stopping:
             self._stop_event.set()
-        if self.worker:
-            self.worker.stop(wait=wait)
-
-
-class ShutdownSentinel(Thread):
-    def __init__(
-        self,
-        stop: Event,
-        server: Server,
-        worker_sentinels: WeakSet[WorkerSentinel],
-        *args,
-        **kwargs,
-    ) -> None:
-        self._stop_event: Event = stop
-        self._server: Server = server
-        self._worker_sentinels: WeakSet[WorkerSentinel] = worker_sentinels
-        super().__init__(*args, name="ShutdownSentinel", **kwargs)
-
-    @property
-    def stop(self) -> Event:
-        return self._stop_event
-
-    @property
-    def server(self) -> Server:
-        return self._server
-
-    @property
-    def worker_sentinels(self) -> WeakSet[WorkerSentinel]:
-        return self._worker_sentinels
-
-    def run(self) -> None:
-        logging.debug("Thread started")
-        try:
-            while not self._stop_event.is_set():
-                self._stop_event.wait(1)
-            else:
-                logging.debug("Stopping workers...")
-                for worker_sentinel in copy(self._worker_sentinels):
-                    worker_sentinel.join()
-                stop_event = getattr(self.server, "stop_event")
-                assert isinstance(stop_event, Event)
-                logging.debug("Stopping manager...")
-                stop_event.set()
-        finally:
-            logging.debug("Thread stopped")
-
-
-def stop(pool: Pool, wait: bool, *_):
-    pool.stop(wait=wait)
+        if self._worker:
+            self._worker.stop(wait=self._wait_event.is_set())

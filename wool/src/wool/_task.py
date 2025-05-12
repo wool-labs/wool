@@ -4,20 +4,20 @@ import asyncio
 import logging
 import traceback
 from collections.abc import Callable
-from contextvars import Context, ContextVar
+from contextvars import Context
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from sys import modules
 from types import TracebackType
-from typing import (
-    Any,
-    Coroutine,
-    ParamSpec,
-    Protocol,
-    TypeVar,
-    cast,
-)
-from uuid import UUID, uuid4
+from typing import Any
+from typing import Coroutine
+from typing import ParamSpec
+from typing import Protocol
+from typing import TypeVar
+from typing import cast
+from uuid import UUID
+from uuid import uuid4
 
 import wool
 from wool._event import WoolTaskEvent
@@ -107,7 +107,7 @@ def _put(
     assert isinstance(session, PoolSession)
     future: WoolFuture = session.put(task)
 
-    async def coroutine(future):
+    async def coroutine(future: WoolFuture):
         try:
             while not future.done():
                 await asyncio.sleep(0)
@@ -116,8 +116,9 @@ def _put(
         except ConnectionResetError as e:
             raise asyncio.CancelledError from e
         except asyncio.CancelledError:
-            logging.debug("Cancelling...")
-            future.cancel()
+            if not future.done():
+                logging.debug("Cancelling...")
+                future.cancel()
             raise
 
     return coroutine(future)
@@ -160,7 +161,7 @@ class WoolTask:
         WoolTaskEvent("task-created", task=self).emit()
 
     def __enter__(self) -> Callable[[], Coroutine]:
-        logging.info(f"Entering {self.__class__.__name__} with ID {self.id}")
+        logging.debug(f"Entering {self.__class__.__name__} with ID {self.id}")
         return self.run
 
     def __exit__(
@@ -169,7 +170,7 @@ class WoolTask:
         exception_value: Exception,
         exception_traceback: TracebackType,
     ):
-        logging.info(f"Exiting {self.__class__.__name__} with ID {self.id}")
+        logging.debug(f"Exiting {self.__class__.__name__} with ID {self.id}")
         if exception_value:
             this = asyncio.current_task()
             assert this

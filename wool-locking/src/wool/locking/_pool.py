@@ -1,5 +1,6 @@
 from contextvars import ContextVar
 
+import wool
 import wool.locking
 from wool.locking._session import LockPoolSession
 from wool.locking._worker import LockScheduler
@@ -14,7 +15,7 @@ class LockPool(wool.Pool):
         return LockPoolSession
 
     @property
-    def session_context(self) -> ContextVar[LockPoolSession]:
+    def session_context(self) -> ContextVar[wool.PoolSession]:
         return wool.locking.__locking_session__
 
     @property
