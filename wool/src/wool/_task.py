@@ -9,11 +9,15 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from sys import modules
+from types import ModuleType
 from types import TracebackType
-from typing import Any
 from typing import Coroutine
+from typing import Dict
 from typing import ParamSpec
 from typing import Protocol
+from typing import SupportsInt
+from typing import Tuple
+from typing import Type
 from typing import TypeVar
 from typing import cast
 from uuid import UUID
@@ -27,10 +31,10 @@ from wool._pool import WorkerPoolSession
 AsyncCallable = Callable[..., Coroutine]
 C = TypeVar("C", bound=AsyncCallable)
 
-Args = tuple
-Kwargs = dict
-Timeout = int
-Timestamp = int
+Args = Tuple
+Kwargs = Dict
+Timeout = SupportsInt
+Timestamp = SupportsInt
 
 
 def task(fn: C) -> C:
@@ -106,15 +110,6 @@ def task(fn: C) -> C:
         __wool_session__: WorkerPoolSession | None = None,
         **kwargs,
     ) -> Coroutine:
-        """
-        Wrapper function for the task decorator.
-
-        :param args: Positional arguments for the function.
-        :param __wool_remote__: Flag indicating if the task is remote.
-        :param __wool_session__: The session for the worker pool.
-        :param kwargs: Keyword arguments for the function.
-        :return: A coroutine representing the task execution.
-        """
         # Handle static and class methods in a picklable way.
         parent, function = resolve(fn)
         assert parent is not None
@@ -145,17 +140,6 @@ def _put(
     *args,
     **kwargs,
 ) -> Coroutine:
-    """
-    Submit a task to the worker pool.
-
-    :param session: The session to use for submitting the task.
-    :param module: The module containing the task function.
-    :param qualname: The qualified name of the task function.
-    :param function: The asynchronous function to execute.
-    :param args: Positional arguments for the task function.
-    :param kwargs: Keyword arguments for the task function.
-    :return: A coroutine representing the task execution.
-    """
     if not session.connected:
         session.connect()
 
@@ -182,13 +166,8 @@ def _put(
     assert isinstance(session, WorkerPoolSession)
     future: WoolFuture = session.put(task)
 
+    @wraps(function)
     async def coroutine(future: WoolFuture):
-        """
-        Coroutine to handle task execution.
-
-        :param future: The future representing the task.
-        :return: The result of the task execution.
-        """
         try:
             while not future.done():
                 await asyncio.sleep(0)
@@ -206,14 +185,6 @@ def _put(
 
 
 def _execute(fn: AsyncCallable, parent, *args, **kwargs):
-    """
-    Execute a task function with the given arguments.
-
-    :param fn: The asynchronous function to execute.
-    :param parent: The parent context or object.
-    :param args: Positional arguments for the function.
-    :param kwargs: Keyword arguments for the function.
-    """
     if isinstance(fn, classmethod):
         return fn.__func__(parent, *args, **kwargs)
     else:
@@ -305,11 +276,6 @@ class WoolTask:
             this.add_done_callback(self._finish, context=Context())
 
     def _finish(self, _):
-        """
-        Emit a "task-completed" event when the task finishes.
-
-        :param _: Placeholder for the callback argument.
-        """
         WoolTaskEvent("task-completed", task=self).emit()
 
     def run(self) -> Coroutine:
@@ -322,13 +288,6 @@ class WoolTask:
         return work(*self.args, **self.kwargs)
 
     def _with_task(self, fn: AsyncCallable) -> AsyncCallable:
-        """
-        Wrap the task's callable with context management.
-
-        :param fn: The asynchronous function to execute.
-        :return: The wrapped function.
-        """
-
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             with self:
@@ -371,13 +330,6 @@ _current_task: ContextVar[WoolTask | None] = ContextVar(
 
 
 def _run(fn):
-    """
-    Wrap the asyncio Handle._run method to emit task events.
-
-    :param fn: The original _run method.
-    :return: The wrapped _run method.
-    """
-
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
         if current_task := self._context.get(_current_task):
@@ -400,16 +352,14 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def resolve(method: Callable[P, R]) -> tuple[Any, Callable[P, R]]:
-    """
-    Make static and class methods picklable from within their decorators.
-
-    :param method: The method to resolve.
-    :return: A tuple containing the parent and the resolved method.
-    """
+def resolve(
+    method: Callable[P, R],
+) -> Tuple[Type | ModuleType | None, Callable[P, R]]:
     scope = modules[method.__module__]
     parent = None
     for name in method.__qualname__.split("."):
         parent = scope
         scope = getattr(scope, name)
+        assert scope
+    assert isinstance(parent, (Type, ModuleType))
     return parent, cast(Callable[P, R], scope)

@@ -144,12 +144,6 @@ class WoolFuture(Generic[T]):
 
 
 async def poll(future: WoolFuture, task: concurrent.futures.Future) -> None:
-    """
-    Poll the status of a WoolFuture and a concurrent.futures.Future.
-
-    :param future: The WoolFuture to poll.
-    :param task: The concurrent.futures.Future to poll.
-    """
     while True:
         if future.cancelled():
             task.cancel()
@@ -161,21 +155,7 @@ async def poll(future: WoolFuture, task: concurrent.futures.Future) -> None:
 
 
 def fulfill(future: WoolFuture):
-    """
-    Create a callback to fulfill a WoolFuture with the result or exception
-    of a concurrent.futures.Future.
-
-    :param future: The WoolFuture to fulfill.
-    :return: A callback function.
-    """
-
     def callback(task: concurrent.futures.Future):
-        """
-        Callback function to fulfill the WoolFuture.
-
-        :param task: The concurrent.futures.Future to retrieve the result or
-            exception from.
-        """
         try:
             result = task.result()
         except concurrent.futures.CancelledError:

@@ -94,10 +94,16 @@ WoolTaskEventType = Literal[
 Defines the types of events that can occur during the lifecycle of a Wool 
 task.
 
-- "task-created": Emitted when a task is created.
-- "task-queued": Emitted when a task is added to the queue.
-- "task-scheduled": Emitted when a task is scheduled for execution.
-- "task-started": Emitted when a task starts execution.
-- "task-stopped": Emitted when a task stops execution.
-- "task-completed": Emitted when a task completes execution.
+- "task-created": 
+    Emitted when a task is created.
+- "task-queued": 
+    Emitted when a task is added to the queue.
+- "task-scheduled": 
+    Emitted when a task is scheduled for execution in a worker's event loop.
+- "task-started": 
+    Emitted when a task starts execution.
+- "task-stopped": 
+    Emitted when a task stops execution.
+- "task-completed": 
+    Emitted when a task completes execution.
 """

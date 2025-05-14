@@ -26,26 +26,10 @@ if TYPE_CHECKING:
 
 
 def _noop(*_):
-    """
-    A no-operation function used as a signal handler.
-
-    :param _: Ignored arguments.
-    """
     pass
 
 
 class Scheduler(Thread):
-    """
-    A thread-based scheduler for managing and executing tasks in a worker
-    process.
-
-    :param address: The address of the worker pool.
-    :param loop: The asyncio event loop used for task execution.
-    :param stop_event: An event to signal the scheduler to stop.
-    :param ready: An event to signal when the scheduler is ready.
-    :param timeout: Timeout for task polling in seconds.
-    """
-
     def __init__(
         self,
         address: tuple[str, int],
@@ -65,17 +49,9 @@ class Scheduler(Thread):
 
     @property
     def session_context(self) -> ContextVar[WorkerPoolSession]:
-        """
-        Get the session context variable for the scheduler.
-
-        :return: The session context variable.
-        """
         return wool.__wool_session__
 
     def run(self) -> None:
-        """
-        Run the scheduler thread, managing task execution and polling.
-        """
         logging.debug("Thread started")
         self._worker_ready.wait()
         sleep(0.1)
@@ -95,12 +71,6 @@ class Scheduler(Thread):
     def _schedule_task(
         self, wool_task: WoolTask, loop: asyncio.AbstractEventLoop
     ) -> None:
-        """
-        Schedule a Wool task for execution in the event loop.
-
-        :param wool_task: The Wool task to be scheduled.
-        :param loop: The asyncio event loop.
-        """
         future = self.session.futures().setdefault(
             wool_task.id, wool.WoolFuture()
         )
@@ -111,14 +81,6 @@ class Scheduler(Thread):
 
 
 class Worker(Process):
-    """
-    A multiprocessing-based worker process for executing tasks.
-
-    :param address: The address of the worker pool.
-    :param log_level: Logging level for the worker.
-    :param scheduler: The scheduler type for the worker.
-    """
-
     def __init__(
         self,
         address: tuple[str, int],
@@ -136,25 +98,14 @@ class Worker(Process):
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
-        """
-        Get the asyncio event loop for the worker.
-
-        :return: The asyncio event loop.
-        """
         return asyncio.get_event_loop()
 
     def start(self):
-        """
-        Start the worker process and wait for it to be ready.
-        """
         super().start()
         self._get_ready.recv()
         self._get_ready.close()
 
     def run(self) -> None:
-        """
-        Run the worker process, managing the scheduler and event loop.
-        """
         signal(Signals.SIGINT, _noop)
         wool.__wool_worker__ = self
         self._set_stop.close()
@@ -199,11 +150,6 @@ class Worker(Process):
         logging.info("Thread stopped")
 
     def stop(self, wait: bool = True) -> None:
-        """
-        Stop the worker process.
-
-        :param wait: Whether to wait for the worker to stop gracefully.
-        """
         if self.pid == current_process().pid:
             if wait and not self._wait_event.is_set():
                 self._wait_event.set()
@@ -214,14 +160,6 @@ class Worker(Process):
 
 
 class ShutdownSentinel(Thread):
-    """
-    A thread-based sentinel for managing worker shutdown.
-
-    :param stop_event: An event to signal the sentinel to stop.
-    :param wait_event: An event to signal when the sentinel should wait.
-    :param loop: The asyncio event loop used for task management.
-    """
-
     def __init__(
         self,
         stop_event: Event,
@@ -236,39 +174,26 @@ class ShutdownSentinel(Thread):
         self._loop: asyncio.AbstractEventLoop = loop
 
     def run(self) -> None:
-        """
-        Run the shutdown sentinel, monitoring for stop signals and cleaning up
-        tasks.
-        """
         logging.debug("Thread started")
         self._stop_event.wait()
         logging.debug("Shutdown signal received")
         if not self._wait_event.is_set():
             logging.warning("Cancelling tasks...")
-            asyncio.run_coroutine_threadsafe(self.cancel_tasks(), self._loop)
+            asyncio.run_coroutine_threadsafe(self._cancel_tasks(), self._loop)
         if tasks := asyncio.all_tasks(self._loop):
             logging.info("Gathering tasks...")
             future = asyncio.run_coroutine_threadsafe(
-                self.gather(*tasks), self._loop
+                self._gather(*tasks), self._loop
             )
             while not future.done():
                 sleep(0.1)
         self._loop.call_soon_threadsafe(self._loop.stop)
         logging.debug("Thread stopped")
 
-    async def gather(self, *tasks: asyncio.Task) -> list:
-        """
-        Gather and await completion of all tasks.
-
-        :param tasks: The tasks to gather.
-        :return: A list of results or exceptions from the tasks.
-        """
+    async def _gather(self, *tasks: asyncio.Task) -> list:
         return await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def cancel_tasks(self):
-        """
-        Cancel all running tasks in the event loop.
-        """
+    async def _cancel_tasks(self):
         for task in asyncio.all_tasks(self._loop):
             if task == asyncio.current_task(self._loop):
                 continue
