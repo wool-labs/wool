@@ -15,10 +15,15 @@ if TYPE_CHECKING:
 # PUBLIC
 class WoolTaskEvent:
     """
-    Task events are emitted when a task is created, queued, started, stopped,
-    and completed. Tasks can be started and stopped multiple times by the event
-    loop. The cumulative time between start and stop events can be used to
-    determine a task's CPU utilization.
+    Represents an event related to a Wool task, such as creation, queuing, 
+    scheduling, starting, stopping, or completion.
+
+    Task events are emitted during the lifecycle of a task. These events can 
+    be used to track task execution and measure performance, such as CPU 
+    utilization.
+
+    :param type: The type of the task event.
+    :param task: The task associated with the event.
     """
 
     type: WoolTaskEventType
@@ -27,6 +32,12 @@ class WoolTaskEvent:
     _handlers: dict[str, list[WoolTaskEventCallback]] = {}
 
     def __init__(self, type: WoolTaskEventType, /, task: WoolTask) -> None:
+        """
+        Initialize a WoolTaskEvent instance.
+
+        :param type: The type of the task event.
+        :param task: The task associated with the event.
+        """
         self.type = type
         self.task = task
 
@@ -34,6 +45,12 @@ class WoolTaskEvent:
     def handler(
         cls, *event_types: WoolTaskEventType
     ) -> PassthroughDecorator[WoolTaskEventCallback]:
+        """
+        Register a handler function for specific task event types.
+
+        :param event_types: The event types to handle.
+        :return: A decorator to register the handler function.
+        """
         def _handler(
             fn: WoolTaskEventCallback,
         ) -> WoolTaskEventCallback:
@@ -44,6 +61,14 @@ class WoolTaskEvent:
         return _handler
 
     def emit(self):
+        """
+        Emit the task event, invoking all registered handlers for the event 
+        type.
+
+        Handlers are called with the event instance and a timestamp.
+
+        :raises Exception: If any handler raises an exception.
+        """
         logging.debug(
             f"Emitting {self.type} event for "
             f"task {self.task.id} "
@@ -64,3 +89,14 @@ WoolTaskEventType = Literal[
     "task-stopped",
     "task-completed",
 ]
+"""
+Defines the types of events that can occur during the lifecycle of a Wool 
+task.
+
+- "task-created": Emitted when a task is created.
+- "task-queued": Emitted when a task is added to the queue.
+- "task-scheduled": Emitted when a task is scheduled for execution.
+- "task-started": Emitted when a task starts execution.
+- "task-stopped": Emitted when a task stops execution.
+- "task-completed": Emitted when a task completes execution.
+"""

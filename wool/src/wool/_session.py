@@ -28,6 +28,13 @@ if TYPE_CHECKING:
 
 
 def command(fn):
+    """
+    Decorator to wrap a function with connection checks and automatic
+    reconnection logic.
+
+    :param fn: The function to wrap.
+    :return: The wrapped function.
+    """
     @functools.wraps(fn)
     def wrapper(self: BaseSession, *args, **kwargs):
         if not self.connected:
@@ -51,22 +58,45 @@ def command(fn):
 
 
 class BaseSession:
+    """
+    Base class for managing a session with a worker pool.
+
+    Provides methods to connect to the manager and shut down the worker pool.
+    """
+
     def __init__(
         self,
         address: tuple[str, int],
         *,
         authkey: bytes | None = None,
     ):
+        """
+        Initialize the session with the specified address and authentication 
+        key.
+
+        :param address: The address of the manager (host, port).
+        :param authkey: Optional authentication key for the manager.
+        """
         self._address: tuple[str, int] = address
         self._authkey: bytes | None = authkey
         self._manager: Manager | None = None
 
     @property
     def manager(self) -> Manager | None:
+        """
+        Get the manager instance for the session.
+
+        :return: The manager instance.
+        """
         return self._manager
 
     @property
     def connected(self) -> bool:
+        """
+        Check if the session is connected to the manager.
+
+        :return: True if connected, False otherwise.
+        """
         return self._manager is not None
 
     def connect(
@@ -75,7 +105,14 @@ class BaseSession:
         retries: Zero | Positive[int] = 2,
         interval: Positive[float] = 1,
     ) -> Self:
-        """Establish a connection to the manager at the specified address."""
+        """
+        Connect to the manager process for the worker pool.
+
+        :param retries: Number of retry attempts if the connection fails.
+        :param interval: Interval in seconds between retry attempts.
+        :return: The session instance.
+        :raises ConnectionError: If the connection fails after all retries.
+        """
         if retries < 0:
             raise ValueError("Retries must be a positive integer")
         if not interval > 0:
@@ -114,6 +151,10 @@ class BaseSession:
     def stop(self, wait: bool = True) -> None:
         """
         Shut down the worker pool and close the connection to the manager.
+
+        :param wait: Whether to wait for in-flight tasks to complete before 
+            shutting down.
+        :raises AssertionError: If the manager is not connected.
         """
         assert self._manager
         try:
@@ -133,11 +174,23 @@ Self = TypeVar("Self", bound=BaseSession)
 
 
 class WorkerSession(BaseSession):
+    """
+    A session for interacting with a worker pool.
+
+    Provides methods to retrieve task futures and interact with the task queue.
+    """
+
     _futures = None
     _queue = None
 
     @command
     def futures(self) -> WeakValueDictionary[UUID, WoolFuture]:
+        """
+        Retrieve the dictionary of task futures.
+
+        :return: A dictionary of task futures.
+        :raises AssertionError: If the manager is not connected.
+        """
         assert self.manager
         if not self._futures:
             self._futures = self.manager.futures()
@@ -145,17 +198,35 @@ class WorkerSession(BaseSession):
 
     @command
     def get(self, *args, **kwargs) -> WoolTask:
+        """
+        Retrieve a task from the task queue.
+
+        :param args: Additional positional arguments for the queue's `get` 
+            method.
+        :param kwargs: Additional keyword arguments for the queue's `get` 
+            method.
+        :return: The next task in the queue.
+        :raises AssertionError: If the manager is not connected.
+        """
         assert self.manager
         if not self._queue:
             self._queue = self.manager.queue()
         return self._queue.get(*args, **kwargs)
 
     def __enter__(self):
+        """
+        Enter the context of the worker session.
+
+        :return: The session instance.
+        """
         if not self.connected:
             self.connect()
         return self
 
     def __exit__(self, *_):
+        """
+        Exit the context of the worker session.
+        """
         pass
 
 
@@ -165,6 +236,13 @@ def session(
     *,
     authkey: bytes | None = None,
 ) -> Callable[[AsyncCallable], AsyncCallable]:
+    """
+    Decorator to execute a function within a worker pool session.
+
+    :param address: The address of the worker pool (host, port).
+    :param authkey: Optional authentication key for the worker pool.
+    :return: A decorator that wraps the function to execute within the session.
+    """
     def _session(fn: AsyncCallable) -> AsyncCallable:
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs) -> Coroutine:
@@ -178,11 +256,22 @@ def session(
 
 # PUBLIC
 def current_client() -> PoolSession | None:
+    """
+    Get the current client session.
+
+    :return: The current client session, or None if no session is active.
+    """
     return wool.__wool_session__.get()
 
 
 # PUBLIC
 class PoolSession(BaseSession):
+    """
+    A session for managing a pool of workers.
+
+    Provides methods to interact with the worker pool and manage tasks.
+    """
+
     _token: Token | None = None
 
     def __init__(
@@ -191,45 +280,102 @@ class PoolSession(BaseSession):
         *,
         authkey: bytes | None = None,
     ):
+        """
+        Initialize the pool session with the specified address and 
+        authentication key.
+
+        :param address: The address of the worker pool (host, port).
+        :param authkey: Optional authentication key for the worker pool.
+        """
         super().__init__(address, authkey=authkey)
 
     def __enter__(self):
+        """
+        Enter the context of the pool session.
+
+        :return: The session instance.
+        """
         if not self.connected:
             self.connect()
         self._token = self.session.set(self)
         return self
 
     def __exit__(self, *_):
+        """
+        Exit the context of the pool session.
+        """
         assert self._token
         self.session.reset(self._token)
 
     @property
     def session(self) -> ContextVar[PoolSession]:
+        """
+        Get the context variable for the pool session.
+
+        :return: The context variable for the pool session.
+        """
         return wool.__wool_session__
 
     @command
     def put(self, /, wool_task: WoolTask) -> WoolFuture:
+        """
+        Submit a task to the worker pool.
+
+        :param wool_task: The task to submit.
+        :return: A future representing the result of the task.
+        :raises AssertionError: If the manager is not connected.
+        """
         assert self._manager
         return self._manager.put(wool_task)
 
 
 # PUBLIC
 class LocalSession(PoolSession):
+    """
+    A session for managing local tasks without a worker pool.
+
+    Provides methods to execute tasks locally and retrieve their results.
+    """
+
     def __init__(self):
+        """
+        Initialize the local session.
+        """
         pass
 
     @property
     def manager(self) -> Manager | None:
+        """
+        Get the manager instance for the local session.
+
+        :return: None, as the local session does not use a manager.
+        """
         return None
 
     @property
     def connected(self) -> bool:
+        """
+        Check if the local session is connected.
+
+        :return: True, as the local session is always connected.
+        """
         return True
 
     def connect(self, *args, **kwargs) -> LocalSession:
+        """
+        Connect to the local session.
+
+        :return: The local session instance.
+        """
         return self
 
     def put(self, /, wool_task: wool.WoolTask) -> WoolFuture:
+        """
+        Execute a task locally and retrieve its result.
+
+        :param wool_task: The task to execute.
+        :return: A future representing the result of the task.
+        """
         wool_future = WoolFuture()
         loop = asyncio.get_event_loop()
         future = asyncio.run_coroutine_threadsafe(wool_task.run(), loop)

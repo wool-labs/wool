@@ -35,13 +35,12 @@ Timestamp = int
 
 def task(fn: C) -> C:
     """
-    A decorator to declare a function as remotely executed using a worker pool.
-    This decorator allows a function to be executed either locally or remotely
-    using a worker pool. If a worker pool is provided, the function will be
-    submitted to the pool for remote execution. If no pool is provided, the
-    function will be executed locally.
-    The decorator also handles the case where the function is being executed
-    within a worker, ensuring that it does not resubmit itself to the pool.
+    A decorator to declare an asynchronous function as remotely executable by a
+    worker pool. When the wrapped function is called, it is dispatched to the
+    worker pool associated with the current worker pool session.
+
+    :param fn: The function to be decorated.
+    :return: The decorated function.
     """
 
     @wraps(fn)
@@ -51,6 +50,15 @@ def task(fn: C) -> C:
         __wool_session__: PoolSession | None = None,
         **kwargs,
     ) -> Coroutine:
+        """
+        Wrapper function for the task decorator.
+
+        :param args: Positional arguments for the function.
+        :param __wool_remote__: Flag indicating if the task is remote.
+        :param __wool_session__: The session for the worker pool.
+        :param kwargs: Keyword arguments for the function.
+        :return: A coroutine representing the task execution.
+        """
         # Handle static and class methods in a picklable way.
         parent, function = resolve(fn)
         assert parent is not None
@@ -81,6 +89,17 @@ def _put(
     *args,
     **kwargs,
 ) -> Coroutine:
+    """
+    Submit a task to the worker pool.
+
+    :param session: The session to use for submitting the task.
+    :param module: The module containing the task function.
+    :param qualname: The qualified name of the task function.
+    :param function: The asynchronous function to execute.
+    :param args: Positional arguments for the task function.
+    :param kwargs: Keyword arguments for the task function.
+    :return: A coroutine representing the task execution.
+    """
     if not session.connected:
         session.connect()
 
@@ -108,6 +127,12 @@ def _put(
     future: WoolFuture = session.put(task)
 
     async def coroutine(future: WoolFuture):
+        """
+        Coroutine to handle task execution.
+
+        :param future: The future representing the task.
+        :return: The result of the task execution.
+        """
         try:
             while not future.done():
                 await asyncio.sleep(0)
@@ -125,6 +150,14 @@ def _put(
 
 
 def _execute(fn: AsyncCallable, parent, *args, **kwargs):
+    """
+    Execute a task function with the given arguments.
+
+    :param fn: The asynchronous function to execute.
+    :param parent: The parent context or object.
+    :param args: Positional arguments for the function.
+    :param kwargs: Keyword arguments for the function.
+    """
     if isinstance(fn, classmethod):
         return fn.__func__(parent, *args, **kwargs)
     else:
@@ -136,6 +169,8 @@ def current_task() -> WoolTask | None:
     """
     Get the current task from the context variable if we are inside a task
     context, otherwise return None.
+
+    :return: The current task or None if no task is active.
     """
     return _current_task.get()
 
@@ -143,6 +178,23 @@ def current_task() -> WoolTask | None:
 # PUBLIC
 @dataclass
 class WoolTask:
+    """
+    Represents a task to be executed in the worker pool.
+
+    :param id: The unique identifier for the task.
+    :param callable: The asynchronous function to execute.
+    :param args: Positional arguments for the function.
+    :param kwargs: Keyword arguments for the function.
+    :param timeout: The timeout for the task in seconds. 
+        Defaults to 0 (no timeout).
+    :param caller: The ID of the calling task, if any.
+    :param exception: The exception raised during task execution, if any.
+    :param filename: The filename where the task was defined.
+    :param function: The name of the function being executed.
+    :param line_no: The line number where the task was defined.
+    :param tag: An optional tag for the task.
+    """
+
     id: UUID
     callable: AsyncCallable
     args: Args
@@ -156,19 +208,29 @@ class WoolTask:
     tag: str | None = None
 
     def __post_init__(self, **kwargs):
+        """
+        Initialize the task and emit a "task-created" event.
+
+        :param kwargs: Additional keyword arguments.
+        """
         if caller := _current_task.get():
             self.caller = caller.id
         WoolTaskEvent("task-created", task=self).emit()
 
     def __enter__(self) -> Callable[[], Coroutine]:
+        """
+        Enter the context of the task.
+
+        :return: The task's run method.
+        """
         logging.debug(f"Entering {self.__class__.__name__} with ID {self.id}")
         return self.run
 
     def __exit__(
         self,
-        exception_type: type,
-        exception_value: Exception,
-        exception_traceback: TracebackType,
+        exception_type: type[BaseException] | None,
+        exception_value: BaseException | None,
+        exception_traceback: TracebackType | None,
     ):
         logging.debug(f"Exiting {self.__class__.__name__} with ID {self.id}")
         if exception_value:
@@ -187,13 +249,29 @@ class WoolTask:
             this.add_done_callback(self._finish, context=Context())
 
     def _finish(self, _):
+        """
+        Emit a "task-completed" event when the task finishes.
+
+        :param _: Placeholder for the callback argument.
+        """
         WoolTaskEvent("task-completed", task=self).emit()
 
     def run(self) -> Coroutine:
+        """
+        Execute the task's callable with its arguments.
+
+        :return: A coroutine representing the task execution.
+        """
         work = self._with_task(self.callable)
         return work(*self.args, **self.kwargs)
 
     def _with_task(self, fn: AsyncCallable) -> AsyncCallable:
+        """
+        Wrap the task's callable with context management.
+
+        :param fn: The asynchronous function to execute.
+        :return: The wrapped function.
+        """
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             with self:
@@ -209,12 +287,21 @@ class WoolTask:
 
 # PUBLIC
 class WoolTaskEventCallback(Protocol):
+    """
+    Protocol for WoolTaskEvent callback functions.
+    """
     def __call__(self, event: WoolTaskEvent, timestamp: Timestamp) -> None: ...
 
 
 # PUBLIC
 @dataclass
 class WoolTaskException:
+    """
+    Represents an exception raised during task execution.
+
+    :param type: The type of the exception.
+    :param traceback: The traceback of the exception.
+    """
     type: str
     traceback: list[str]
 
@@ -225,6 +312,12 @@ _current_task: ContextVar[WoolTask | None] = ContextVar(
 
 
 def _run(fn):
+    """
+    Wrap the asyncio Handle._run method to emit task events.
+
+    :param fn: The original _run method.
+    :return: The wrapped _run method.
+    """
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
         if current_task := self._context.get(_current_task):
@@ -250,6 +343,9 @@ R = TypeVar("R")
 def resolve(method: Callable[P, R]) -> tuple[Any, Callable[P, R]]:
     """
     Make static and class methods picklable from within their decorators.
+
+    :param method: The method to resolve.
+    :return: A tuple containing the parent and the resolved method.
     """
     scope = modules[method.__module__]
     parent = None

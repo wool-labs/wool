@@ -31,6 +31,12 @@ if TYPE_CHECKING:
 
 
 def _stop(pool: Pool, wait: bool, *_):
+    """
+    Stop the pool process.
+
+    :param pool: The pool instance to stop.
+    :param wait: Whether to wait for the pool to stop gracefully.
+    """
     pool.stop(wait=wait)
 
 
@@ -42,6 +48,16 @@ def pool(
     breadth: int = 0,
     log_level: int = logging.INFO,
 ) -> Callable[[AsyncCallable], AsyncCallable]:
+    """
+    Decorator to execute a function within a worker pool session.
+
+    :param address: The address of the worker pool (host, port).
+    :param authkey: Optional authentication key for the pool.
+    :param breadth: Number of worker processes in the pool. Defaults to CPU 
+        count.
+    :param log_level: Logging level for the pool.
+    :return: A decorator that wraps the function to execute within the pool.
+    """
     def _pool(fn: AsyncCallable) -> AsyncCallable:
         @wraps(fn)
         async def wrapper(*args, **kwargs) -> Coroutine:
@@ -60,6 +76,24 @@ def pool(
 
 # PUBLIC
 class Pool(Process):
+    """
+    A multiprocessing-based worker pool for executing asynchronous tasks. A 
+    pool consists of a single manager process and at least a single worker 
+    process. The manager process orchestrates its workers and serves client 
+    dispatch requests. The worker process(es) execute(s) dispatched tasks on a 
+    first-come, first-served basis.
+
+    The worker pool class is implemented as a context manager, allowing users 
+    to easily spawn ephemeral pools that live for the duration of a client 
+    application's execution.
+
+    :param address: The address of the worker pool (host, port).
+    :param authkey: Optional authentication key for the pool. If not specified,
+        the manager will inherit the authkey from the current process.
+    :param breadth: Number of worker processes in the pool. Defaults to CPU 
+        count.
+    :param log_level: Logging level for the pool.
+    """
     _wait_event: Event | None = None
     _stop_event: Event | None = None
 
@@ -90,11 +124,19 @@ class Pool(Process):
         self._get_ready, self._set_ready = Pipe(duplex=False)
 
     def __enter__(self):
+        """
+        Enter the context of the pool, starting the pool and connecting the 
+        session.
+        """
         self.start()
         self._session.connect()
         self._token = self.session_context.set(self._session)
 
     def __exit__(self, *_) -> None:
+        """
+        Exit the context of the pool, stopping the pool and disconnecting the 
+        session.
+        """
         assert self._token
         self.session_context.reset(self._token)
         assert self.pid
@@ -103,44 +145,90 @@ class Pool(Process):
 
     @property
     def session_type(self) -> type[PoolSession]:
+        """
+        Get the session type for the pool.
+
+        :return: The session type.
+        """
         return PoolSession
 
     @property
     def session_context(self) -> ContextVar[PoolSession]:
+        """
+        Get the session context variable for the pool.
+
+        :return: The session context variable.
+        """
         return wool.__wool_session__
 
     @property
     def scheduler_type(self) -> type[Scheduler]:
+        """
+        Get the scheduler type for the pool.
+
+        :return: The scheduler type.
+        """
         return Scheduler
 
     @property
     def log_level(self) -> int:
+        """
+        Get the logging level for the pool.
+
+        :return: The logging level.
+        """
         return self._log_level
 
     @log_level.setter
     def log_level(self, value: int) -> None:
+        """
+        Set the logging level for the pool.
+
+        :param value: The new logging level.
+        """
         if value < 0:
             raise ValueError("Log level must be non-negative")
         self._log_level = value
 
     @property
     def breadth(self) -> int:
+        """
+        Get the number of worker processes in the pool.
+
+        :return: The number of worker processes.
+        """
         return self._breadth
 
     @property
     def waiting(self) -> bool | None:
+        """
+        Check if the pool is in a waiting state.
+
+        :return: True if waiting, False otherwise, or None if undefined.
+        """
         return self._wait_event and self._wait_event.is_set()
 
     @property
     def stopping(self) -> bool | None:
+        """
+        Check if the pool is in a stopping state.
+
+        :return: True if stopping, False otherwise, or None if undefined.
+        """
         return self._stop_event and self._stop_event.is_set()
 
     def start(self) -> None:
+        """
+        Start the pool process and wait for it to be ready.
+        """
         super().start()
         self._get_ready.recv()
         self._get_ready.close()
 
     def run(self) -> None:
+        """
+        Run the pool process, managing workers and the manager process.
+        """
         if self.log_level:
             wool.__log_level__ = self.log_level
             logging.basicConfig(format=wool.__log_format__)
@@ -200,6 +288,11 @@ class Pool(Process):
 
     @property
     def idle(self):
+        """
+        Check if the pool is idle.
+
+        :return: True if idle, False otherwise.
+        """
         assert self.manager_sentinel
         try:
             return self.manager_sentinel.idle
@@ -207,6 +300,11 @@ class Pool(Process):
             return True
 
     def stop(self, *, wait: bool = True) -> None:
+        """
+        Stop the pool process.
+
+        :param wait: Whether to wait for the pool to stop gracefully.
+        """
         if self.pid == current_process().pid:
             if wait and self.waiting is False:
                 assert self._wait_event
@@ -221,6 +319,12 @@ class Pool(Process):
 
 
 class ManagerSentinel(Thread):
+    """
+    A thread-based sentinel for managing the worker pool.
+
+    :param address: The address of the manager (host, port).
+    :param authkey: Authentication key for the manager.
+    """
     _wait_event: Event | None = None
     _stop_event: Event | None = None
     _queue: TaskQueue | None = None
@@ -234,6 +338,11 @@ class ManagerSentinel(Thread):
 
     @property
     def waiting(self) -> Event:
+        """
+        Get the event indicating whether the manager is waiting.
+
+        :return: The waiting event.
+        """
         if not self._wait_event:
             self._manager.connect()
             self._wait_event = self._manager.waiting()
@@ -241,6 +350,11 @@ class ManagerSentinel(Thread):
 
     @property
     def stopping(self) -> Event:
+        """
+        Get the event indicating whether the manager is stopping.
+
+        :return: The stopping event.
+        """
         if not self._stop_event:
             self._manager.connect()
             self._stop_event = self._manager.stopping()
@@ -248,15 +362,26 @@ class ManagerSentinel(Thread):
 
     @property
     def idle(self) -> bool | None:
+        """
+        Check if the manager is idle.
+
+        :return: True if idle, False otherwise, or None if undefined.
+        """
         if not self._queue:
             self._manager.connect()
             self._queue = self._manager.queue()
         return self._queue.idle()
 
     def run(self) -> None:
+        """
+        Run the manager sentinel, serving requests indefinitely.
+        """
         self._server.serve_forever()
 
     def stop(self) -> None:
+        """
+        Stop the manager sentinel.
+        """
         stop_event = getattr(self._server, "stop_event")
         assert isinstance(stop_event, Event)
         logging.debug("Stopping manager...")
@@ -264,6 +389,15 @@ class ManagerSentinel(Thread):
 
 
 class WorkerSentinel(Thread):
+    """
+    A thread-based sentinel for managing a worker process.
+
+    :param address: The address of the worker pool (host, port).
+    :param id: The unique identifier for the worker.
+    :param cooldown: Cooldown time between worker restarts.
+    :param log_level: Logging level for the worker.
+    :param scheduler: The scheduler type for the worker.
+    """
     _worker: Worker | None = None
     _semaphore: Semaphore = Semaphore(8)
 
@@ -291,49 +425,99 @@ class WorkerSentinel(Thread):
 
     @property
     def worker(self) -> Worker | None:
+        """
+        Get the worker instance managed by this sentinel.
+
+        :return: The worker instance.
+        """
         return self._worker
 
     @property
     def id(self) -> int:
+        """
+        Get the unique identifier for the worker.
+
+        :return: The worker ID.
+        """
         return self._id
 
     @property
     def ready(self) -> Event:
+        """
+        Get the event indicating whether the worker is ready.
+
+        :return: The ready event.
+        """
         return self._ready
 
     @property
     def cooldown(self) -> float:
+        """
+        Get the cooldown time between worker restarts.
+
+        :return: The cooldown time.
+        """
         return self._cooldown
 
     @cooldown.setter
     def cooldown(self, value: float) -> None:
+        """
+        Set the cooldown time between worker restarts.
+
+        :param value: The new cooldown time.
+        """
         if value < 0:
             raise ValueError("Cooldown must be non-negative")
         self._cooldown = value
 
     @property
     def log_level(self) -> int:
+        """
+        Get the logging level for the worker.
+
+        :return: The logging level.
+        """
         return self._log_level
 
     @property
     def waiting(self) -> bool:
+        """
+        Check if the worker is in a waiting state.
+
+        :return: True if waiting, False otherwise.
+        """
         return self._wait_event.is_set()
 
     @property
     def stopping(self) -> bool:
+        """
+        Check if the worker is in a stopping state.
+
+        :return: True if stopping, False otherwise.
+        """
         return self._stop_event.is_set()
 
     @log_level.setter
     def log_level(self, value: int) -> None:
+        """
+        Set the logging level for the worker.
+
+        :param value: The new logging level.
+        """
         if value < 0:
             raise ValueError("Log level must be non-negative")
         self._log_level = value
 
     def start(self) -> None:
+        """
+        Start the worker sentinel thread.
+        """
         super().start()
-        # self._ready.wait()
 
     def run(self) -> None:
+        """
+        Run the worker sentinel, managing the worker process lifecycle.
+        """
         logging.debug("Thread started")
         while not self._stop_event.is_set():
             worker = Worker(
@@ -358,6 +542,11 @@ class WorkerSentinel(Thread):
         logging.debug("Thread stopped")
 
     def stop(self, *, wait: bool = True) -> None:
+        """
+        Stop the worker sentinel thread.
+
+        :param wait: Whether to wait for the worker to stop gracefully.
+        """
         logging.info(f"Stopping thread {self.name}...")
         if wait and not self.waiting:
             self._wait_event.set()
