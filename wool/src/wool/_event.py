@@ -8,12 +8,12 @@ from typing import Literal
 from wool._typing import PassthroughDecorator
 
 if TYPE_CHECKING:
-    from wool._task import WoolTask
-    from wool._task import WoolTaskEventCallback
+    from wool._task import Task
+    from wool._task import TaskEventCallback
 
 
 # PUBLIC
-class WoolTaskEvent:
+class TaskEvent:
     """
     Represents an event related to a Wool task, such as creation, queuing,
     scheduling, starting, stopping, or completion.
@@ -26,12 +26,12 @@ class WoolTaskEvent:
     :param task: The task associated with the event.
     """
 
-    type: WoolTaskEventType
-    task: WoolTask
+    type: TaskEventType
+    task: Task
 
-    _handlers: dict[str, list[WoolTaskEventCallback]] = {}
+    _handlers: dict[str, list[TaskEventCallback]] = {}
 
-    def __init__(self, type: WoolTaskEventType, /, task: WoolTask) -> None:
+    def __init__(self, type: TaskEventType, /, task: Task) -> None:
         """
         Initialize a WoolTaskEvent instance.
 
@@ -43,8 +43,8 @@ class WoolTaskEvent:
 
     @classmethod
     def handler(
-        cls, *event_types: WoolTaskEventType
-    ) -> PassthroughDecorator[WoolTaskEventCallback]:
+        cls, *event_types: TaskEventType
+    ) -> PassthroughDecorator[TaskEventCallback]:
         """
         Register a handler function for specific task event types.
 
@@ -53,8 +53,8 @@ class WoolTaskEvent:
         """
 
         def _handler(
-            fn: WoolTaskEventCallback,
-        ) -> WoolTaskEventCallback:
+            fn: TaskEventCallback,
+        ) -> TaskEventCallback:
             for event_type in event_types:
                 cls._handlers.setdefault(event_type, []).append(fn)
             return fn
@@ -82,7 +82,7 @@ class WoolTaskEvent:
 
 
 # PUBLIC
-WoolTaskEventType = Literal[
+TaskEventType = Literal[
     "task-created",
     "task-queued",
     "task-scheduled",

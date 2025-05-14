@@ -7,15 +7,15 @@ from tblib import pickling_support
 
 from wool._cli import WorkerPoolCommand
 from wool._cli import cli
-from wool._future import WoolFuture
+from wool._future import Future
 from wool._logging import __log_format__
 from wool._pool import WorkerPool
 from wool._session import LocalSession
 from wool._session import WorkerPoolSession
-from wool._task import WoolTask
-from wool._task import WoolTaskEvent
-from wool._task import WoolTaskEventCallback
-from wool._task import WoolTaskException
+from wool._task import Task
+from wool._task import TaskEvent
+from wool._task import TaskEventCallback
+from wool._task import TaskException
 from wool._task import current_task
 from wool._task import task
 from wool._worker import Scheduler
@@ -37,11 +37,11 @@ __wool_session__: Final[ContextVar[WorkerPoolSession]] = ContextVar(
 __wool_worker__: Worker | None = None
 
 __all__ = [
-    "WoolTaskException",
-    "WoolFuture",
-    "WoolTask",
-    "WoolTaskEvent",
-    "WoolTaskEventCallback",
+    "TaskException",
+    "Future",
+    "Task",
+    "TaskEvent",
+    "TaskEventCallback",
     "WorkerPool",
     "WorkerPoolSession",
     "WorkerPoolCommand",

@@ -15,13 +15,13 @@ from typing import overload
 from uuid import UUID
 from weakref import WeakValueDictionary
 
-from wool._event import WoolTaskEvent
-from wool._future import WoolFuture
+from wool._event import TaskEvent
+from wool._future import Future
 from wool._queue import TaskQueue
 from wool._typing import PassthroughDecorator
 
 if TYPE_CHECKING:
-    from wool._task import WoolTask
+    from wool._task import Task
 
 
 C = TypeVar("C", bound=Callable[..., Any])
@@ -89,20 +89,20 @@ class FuturesProxy(DictProxy):
     }
 
 
-_task_queue: TaskQueue[WoolTask] = TaskQueue(100000, None)
+_task_queue: TaskQueue[Task] = TaskQueue(100000, None)
 
 _task_queue_lock = Lock()
 
-_task_futures: WeakValueDictionary[UUID, WoolFuture] = WeakValueDictionary()
+_task_futures: WeakValueDictionary[UUID, Future] = WeakValueDictionary()
 
 
 @register
-def put(task: WoolTask) -> WoolFuture:
+def put(task: Task) -> Future:
     try:
         with queue_lock():
             queue().put(task, block=False)
-            future = futures()[task.id] = WoolFuture()
-            WoolTaskEvent("task-queued", task=task).emit()
+            future = futures()[task.id] = Future()
+            TaskEvent("task-queued", task=task).emit()
             return future
     except Exception as e:
         logging.exception(e)
@@ -110,7 +110,7 @@ def put(task: WoolTask) -> WoolFuture:
 
 
 @register
-def get() -> WoolTask | Empty | None:
+def get() -> Task | Empty | None:
     try:
         return queue().get(block=False)
     except Empty as e:

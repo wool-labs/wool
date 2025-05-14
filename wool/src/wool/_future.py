@@ -16,7 +16,7 @@ T = TypeVar("T")
 
 
 # PUBLIC
-class WoolFuture(Generic[T]):
+class Future(Generic[T]):
     """
     A future object representing the result of an asynchronous operation.
 
@@ -143,7 +143,7 @@ class WoolFuture(Generic[T]):
         return self._cancelled
 
 
-async def poll(future: WoolFuture, task: concurrent.futures.Future) -> None:
+async def poll(future: Future, task: concurrent.futures.Future) -> None:
     while True:
         if future.cancelled():
             task.cancel()
@@ -154,7 +154,7 @@ async def poll(future: WoolFuture, task: concurrent.futures.Future) -> None:
             await asyncio.sleep(0)
 
 
-def fulfill(future: WoolFuture):
+def fulfill(future: Future):
     def callback(task: concurrent.futures.Future):
         try:
             result = task.result()

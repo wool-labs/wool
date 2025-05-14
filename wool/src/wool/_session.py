@@ -15,14 +15,14 @@ from uuid import UUID
 from weakref import WeakValueDictionary
 
 import wool
-from wool._future import WoolFuture
+from wool._future import Future
 from wool._future import fulfill
 from wool._future import poll
 from wool._manager import Manager
 
 if TYPE_CHECKING:
     from wool._task import AsyncCallable
-    from wool._task import WoolTask
+    from wool._task import Task
     from wool._typing import Positive
     from wool._typing import Zero
 
@@ -185,7 +185,7 @@ class WorkerSession(BaseSession):
     _queue = None
 
     @command
-    def futures(self) -> WeakValueDictionary[UUID, WoolFuture]:
+    def futures(self) -> WeakValueDictionary[UUID, Future]:
         """
         Retrieve the dictionary of task futures.
 
@@ -198,7 +198,7 @@ class WorkerSession(BaseSession):
         return self._futures
 
     @command
-    def get(self, *args, **kwargs) -> WoolTask:
+    def get(self, *args, **kwargs) -> Task:
         """
         Retrieve a task from the task queue.
 
@@ -367,7 +367,7 @@ class WorkerPoolSession(BaseSession):
         return wool.__wool_session__
 
     @command
-    def put(self, /, wool_task: WoolTask) -> WoolFuture:
+    def put(self, /, wool_task: Task) -> Future:
         """
         Submit a task to the worker pool.
 
@@ -419,14 +419,14 @@ class LocalSession(WorkerPoolSession):
         """
         return self
 
-    def put(self, /, wool_task: wool.WoolTask) -> WoolFuture:
+    def put(self, /, wool_task: wool.Task) -> Future:
         """
         Execute a task locally and retrieve its result.
 
         :param wool_task: The task to execute.
         :return: A future representing the result of the task.
         """
-        wool_future = WoolFuture()
+        wool_future = Future()
         loop = asyncio.get_event_loop()
         future = asyncio.run_coroutine_threadsafe(wool_task.run(), loop)
         future.add_done_callback(fulfill(wool_future))

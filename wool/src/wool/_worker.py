@@ -15,14 +15,14 @@ from time import sleep
 from typing import TYPE_CHECKING
 
 import wool
-from wool._event import WoolTaskEvent
+from wool._event import TaskEvent
 from wool._future import fulfill
 from wool._future import poll
 from wool._session import WorkerPoolSession
 from wool._session import WorkerSession
 
 if TYPE_CHECKING:
-    from wool._task import WoolTask
+    from wool._task import Task
 
 
 def _noop(*_):
@@ -61,7 +61,7 @@ class Scheduler(Thread):
             )
             while not self._stop_event.is_set():
                 try:
-                    task: WoolTask = self.session.get(timeout=self._timeout)
+                    task: Task = self.session.get(timeout=self._timeout)
                 except Empty:
                     continue
                 else:
@@ -69,15 +69,13 @@ class Scheduler(Thread):
         logging.debug("Thread stopped")
 
     def _schedule_task(
-        self, wool_task: WoolTask, loop: asyncio.AbstractEventLoop
+        self, wool_task: Task, loop: asyncio.AbstractEventLoop
     ) -> None:
-        future = self.session.futures().setdefault(
-            wool_task.id, wool.WoolFuture()
-        )
+        future = self.session.futures().setdefault(wool_task.id, wool.Future())
         task = asyncio.run_coroutine_threadsafe(wool_task.run(), loop)
         task.add_done_callback(fulfill(future))
         asyncio.run_coroutine_threadsafe(poll(future, task), loop)
-        WoolTaskEvent("task-scheduled", task=wool_task).emit()
+        TaskEvent("task-scheduled", task=wool_task).emit()
 
 
 class Worker(Process):

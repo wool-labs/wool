@@ -24,8 +24,8 @@ from uuid import UUID
 from uuid import uuid4
 
 import wool
-from wool._event import WoolTaskEvent
-from wool._future import WoolFuture
+from wool._event import TaskEvent
+from wool._future import Future
 from wool._pool import WorkerPoolSession
 
 AsyncCallable = Callable[..., Coroutine]
@@ -37,6 +37,7 @@ Timeout = SupportsInt
 Timestamp = SupportsInt
 
 
+# PUBLIC
 def task(fn: C) -> C:
     """
     A decorator to declare an asynchronous function as remotely executable by a
@@ -111,7 +112,7 @@ def task(fn: C) -> C:
         **kwargs,
     ) -> Coroutine:
         # Handle static and class methods in a picklable way.
-        parent, function = resolve(fn)
+        parent, function = _resolve(fn)
         assert parent is not None
         assert callable(function)
 
@@ -156,7 +157,7 @@ def _put(
     # pool, so we set the `__wool_remote__` flag to true.
     kwargs["__wool_remote__"] = True
 
-    task = WoolTask(
+    task = Task(
         id=uuid4(),
         callable=function,
         args=args,
@@ -164,10 +165,10 @@ def _put(
         tag=f"{module}.{qualname}({signature})",
     )
     assert isinstance(session, WorkerPoolSession)
-    future: WoolFuture = session.put(task)
+    future: Future = session.put(task)
 
     @wraps(function)
-    async def coroutine(future: WoolFuture):
+    async def coroutine(future: Future):
         try:
             while not future.done():
                 await asyncio.sleep(0)
@@ -192,7 +193,7 @@ def _execute(fn: AsyncCallable, parent, *args, **kwargs):
 
 
 # PUBLIC
-def current_task() -> WoolTask | None:
+def current_task() -> Task | None:
     """
     Get the current task from the context variable if we are inside a task
     context, otherwise return None.
@@ -204,7 +205,7 @@ def current_task() -> WoolTask | None:
 
 # PUBLIC
 @dataclass
-class WoolTask:
+class Task:
     """
     Represents a task to be executed in the worker pool.
 
@@ -228,7 +229,7 @@ class WoolTask:
     kwargs: Kwargs
     timeout: Timeout = 0
     caller: UUID | None = None
-    exception: WoolTaskException | None = None
+    exception: TaskException | None = None
     filename: str | None = None
     function: str | None = None
     line_no: int | None = None
@@ -242,7 +243,7 @@ class WoolTask:
         """
         if caller := _current_task.get():
             self.caller = caller.id
-        WoolTaskEvent("task-created", task=self).emit()
+        TaskEvent("task-created", task=self).emit()
 
     def __enter__(self) -> Callable[[], Coroutine]:
         """
@@ -263,7 +264,7 @@ class WoolTask:
         if exception_value:
             this = asyncio.current_task()
             assert this
-            self.exception = WoolTaskException(
+            self.exception = TaskException(
                 exception_type.__qualname__,
                 traceback=[
                     y
@@ -276,7 +277,7 @@ class WoolTask:
             this.add_done_callback(self._finish, context=Context())
 
     def _finish(self, _):
-        WoolTaskEvent("task-completed", task=self).emit()
+        TaskEvent("task-completed", task=self).emit()
 
     def run(self) -> Coroutine:
         """
@@ -302,17 +303,8 @@ class WoolTask:
 
 
 # PUBLIC
-class WoolTaskEventCallback(Protocol):
-    """
-    Protocol for WoolTaskEvent callback functions.
-    """
-
-    def __call__(self, event: WoolTaskEvent, timestamp: Timestamp) -> None: ...
-
-
-# PUBLIC
 @dataclass
-class WoolTaskException:
+class TaskException:
     """
     Represents an exception raised during task execution.
 
@@ -324,7 +316,16 @@ class WoolTaskException:
     traceback: list[str]
 
 
-_current_task: ContextVar[WoolTask | None] = ContextVar(
+# PUBLIC
+class TaskEventCallback(Protocol):
+    """
+    Protocol for WoolTaskEvent callback functions.
+    """
+
+    def __call__(self, event: TaskEvent, timestamp: Timestamp) -> None: ...
+
+
+_current_task: ContextVar[Task | None] = ContextVar(
     "_current_task", default=None
 )
 
@@ -333,11 +334,11 @@ def _run(fn):
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
         if current_task := self._context.get(_current_task):
-            WoolTaskEvent("task-started", task=current_task).emit()
+            TaskEvent("task-started", task=current_task).emit()
             try:
                 result = fn(self, *args, **kwargs)
             finally:
-                WoolTaskEvent("task-stopped", task=current_task).emit()
+                TaskEvent("task-stopped", task=current_task).emit()
             return result
         else:
             return fn(self, *args, **kwargs)
@@ -352,7 +353,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def resolve(
+def _resolve(
     method: Callable[P, R],
 ) -> Tuple[Type | ModuleType | None, Callable[P, R]]:
     scope = modules[method.__module__]
