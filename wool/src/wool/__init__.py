@@ -10,8 +10,10 @@ from wool._cli import cli
 from wool._future import Future
 from wool._logging import __log_format__
 from wool._pool import WorkerPool
+from wool._pool import pool
 from wool._session import LocalSession
 from wool._session import WorkerPoolSession
+from wool._session import session
 from wool._task import Task
 from wool._task import TaskEvent
 from wool._task import TaskEventCallback
@@ -51,6 +53,8 @@ __all__ = [
     "__wool_session__",
     "cli",
     "current_task",
+    "pool",
+    "session",
     "task",
 ]
 

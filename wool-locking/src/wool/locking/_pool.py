@@ -1,7 +1,7 @@
+from __future__ import annotations
+
 import logging
 from contextvars import ContextVar
-from typing import Callable
-from typing import Coroutine
 
 import wool
 import wool.locking
@@ -12,12 +12,11 @@ from wool.locking._worker import LockScheduler
 # PUBLIC
 def pool(
     host: str = "localhost",
-    port: int = 48800,
+    port: int = 48900,
     *,
     authkey: bytes | None = None,
-    breadth: int = 0,
     log_level: int = logging.INFO,
-) -> Callable[[Callable[..., Coroutine]], Callable[..., Coroutine]]:
+) -> LockPool:
     """
     Convenience function to declare a lock pool context. Usage is identical to
     that of ``wool.pool``.
@@ -33,12 +32,7 @@ def pool(
 
     .. seealso:: `wool.pool`
     """
-    return LockPool(
-        address=(host, port),
-        authkey=authkey,
-        breadth=breadth,
-        log_level=log_level,
-    )
+    return LockPool(address=(host, port), authkey=authkey, log_level=log_level)
 
 
 # PUBLIC

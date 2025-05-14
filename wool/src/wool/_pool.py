@@ -16,7 +16,6 @@ from threading import Event
 from threading import Semaphore
 from threading import Thread
 from typing import TYPE_CHECKING
-from typing import Callable
 from typing import Coroutine
 
 import wool
@@ -42,7 +41,7 @@ def pool(
     authkey: bytes | None = None,
     breadth: int = 0,
     log_level: int = logging.INFO,
-) -> Callable[[AsyncCallable], AsyncCallable]:
+) -> WorkerPool:
     """
     Convenience function to declare a worker pool context.
 
@@ -137,6 +136,7 @@ class WorkerPool(Process):
 
     _wait_event: Event | None = None
     _stop_event: Event | None = None
+    _stopped: bool = False
 
     def __init__(
         self,
@@ -196,8 +196,14 @@ class WorkerPool(Process):
         assert self._token
         self.session_context.reset(self._token)
         assert self.pid
-        self.stop(wait=True)
-        self.join()
+        try:
+            self.stop(wait=True)
+        except ConnectionRefusedError:
+            logging.warning(
+                f"Connection to manager at {self._address} refused."
+            )
+        finally:
+            self.join()
 
     @property
     def session_type(self) -> type[WorkerPoolSession]:
@@ -362,15 +368,13 @@ class WorkerPool(Process):
         :param wait: Whether to wait for the pool to stop gracefully.
         """
         if self.pid == current_process().pid:
-            if wait and self.waiting is False:
+            if wait and self.waiting is False and self.stopping is False:
                 assert self._wait_event
                 self._wait_event.set()
             if self.stopping is False:
                 assert self._stop_event
                 self._stop_event.set()
         elif self.pid:
-            if not self._session.connected:
-                self._session.connect()
             self._session.stop(wait=wait)
 
 

@@ -8,7 +8,6 @@ import time
 from contextvars import ContextVar
 from contextvars import Token
 from typing import TYPE_CHECKING
-from typing import Callable
 from typing import Coroutine
 from typing import TypeVar
 from uuid import UUID
@@ -163,10 +162,6 @@ class BaseSession:
                 waiting.set()
             if not (stopped := self._manager.stopping()).is_set():
                 stopped.set()
-        except ConnectionRefusedError:
-            logging.warning(
-                f"Connection to manager at {self._address} refused."
-            )
         finally:
             self._manager = None
 
@@ -237,7 +232,7 @@ def session(
     port: int = 48800,
     *,
     authkey: bytes | None = None,
-) -> Callable[[AsyncCallable], AsyncCallable]:
+) -> WorkerPoolSession:
     """
     Convenience function to declare a worker pool session context.
 

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import Callable
-from typing import Coroutine
 
 import wool
 import wool.locking
@@ -11,10 +9,10 @@ import wool.locking
 # PUBLIC
 def session(
     host: str = "localhost",
-    port: int = 48800,
+    port: int = 48900,
     *,
     authkey: bytes | None = None,
-) -> Callable[[Callable[..., Coroutine]], Callable[..., Coroutine]]:
+) -> LockPoolSession:
     """
     Convenience function to declare a lock pool session context. Usage is
     identical to that of ``wool.session``.
