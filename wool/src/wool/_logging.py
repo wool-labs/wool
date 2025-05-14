@@ -24,16 +24,16 @@ def italic(text: str) -> str:
 
 class WoolLogFilter(logging.Filter):
     """
-    A logging filter that adds a reference to the source file and line number 
+    A logging filter that adds a reference to the source file and line number
     for log records.
 
-    The reference is relative to the current working directory if possible, 
+    The reference is relative to the current working directory if possible,
     otherwise it includes the basename of the file.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         """
-        Modify the log record to include a reference to the source file and 
+        Modify the log record to include a reference to the source file and
         line number.
 
         :param record: The log record to modify.

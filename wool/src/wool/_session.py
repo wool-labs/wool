@@ -35,6 +35,7 @@ def command(fn):
     :param fn: The function to wrap.
     :return: The wrapped function.
     """
+
     @functools.wraps(fn)
     def wrapper(self: BaseSession, *args, **kwargs):
         if not self.connected:
@@ -71,7 +72,7 @@ class BaseSession:
         authkey: bytes | None = None,
     ):
         """
-        Initialize the session with the specified address and authentication 
+        Initialize the session with the specified address and authentication
         key.
 
         :param address: The address of the manager (host, port).
@@ -152,7 +153,7 @@ class BaseSession:
         """
         Shut down the worker pool and close the connection to the manager.
 
-        :param wait: Whether to wait for in-flight tasks to complete before 
+        :param wait: Whether to wait for in-flight tasks to complete before
             shutting down.
         :raises AssertionError: If the manager is not connected.
         """
@@ -201,9 +202,9 @@ class WorkerSession(BaseSession):
         """
         Retrieve a task from the task queue.
 
-        :param args: Additional positional arguments for the queue's `get` 
+        :param args: Additional positional arguments for the queue's `get`
             method.
-        :param kwargs: Additional keyword arguments for the queue's `get` 
+        :param kwargs: Additional keyword arguments for the queue's `get`
             method.
         :return: The next task in the queue.
         :raises AssertionError: If the manager is not connected.
@@ -232,30 +233,23 @@ class WorkerSession(BaseSession):
 
 # PUBLIC
 def session(
-    address: tuple[str, int],
+    host: str = "localhost",
+    port: int = 48800,
     *,
     authkey: bytes | None = None,
 ) -> Callable[[AsyncCallable], AsyncCallable]:
     """
-    Decorator to execute a function within a worker pool session.
+    Convenience function to create a worker pool session.
 
     :param address: The address of the worker pool (host, port).
     :param authkey: Optional authentication key for the worker pool.
     :return: A decorator that wraps the function to execute within the session.
     """
-    def _session(fn: AsyncCallable) -> AsyncCallable:
-        @functools.wraps(fn)
-        async def wrapper(*args, **kwargs) -> Coroutine:
-            with PoolSession(address, authkey=authkey):
-                return await fn(*args, **kwargs)
-
-        return wrapper
-
-    return _session
+    return WorkerPoolSession((host, port), authkey=authkey)
 
 
 # PUBLIC
-def current_client() -> PoolSession | None:
+def current_client() -> WorkerPoolSession | None:
     """
     Get the current client session.
 
@@ -265,7 +259,7 @@ def current_client() -> PoolSession | None:
 
 
 # PUBLIC
-class PoolSession(BaseSession):
+class WorkerPoolSession(BaseSession):
     """
     A session for managing a pool of workers.
 
@@ -281,13 +275,28 @@ class PoolSession(BaseSession):
         authkey: bytes | None = None,
     ):
         """
-        Initialize the pool session with the specified address and 
+        Initialize the pool session with the specified address and
         authentication key.
 
         :param address: The address of the worker pool (host, port).
         :param authkey: Optional authentication key for the worker pool.
         """
         super().__init__(address, authkey=authkey)
+
+    def __call__(self, fn: AsyncCallable) -> AsyncCallable:
+        """
+        Decorator to execute a function within the context of the pool session.
+
+        :param fn: The function to wrap.
+        :return: The wrapped function.
+        """
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs) -> Coroutine:
+            with self:
+                return await fn(*args, **kwargs)
+
+        return wrapper
 
     def __enter__(self):
         """
@@ -308,7 +317,7 @@ class PoolSession(BaseSession):
         self.session.reset(self._token)
 
     @property
-    def session(self) -> ContextVar[PoolSession]:
+    def session(self) -> ContextVar[WorkerPoolSession]:
         """
         Get the context variable for the pool session.
 
@@ -330,7 +339,7 @@ class PoolSession(BaseSession):
 
 
 # PUBLIC
-class LocalSession(PoolSession):
+class LocalSession(WorkerPoolSession):
     """
     A session for managing local tasks without a worker pool.
 

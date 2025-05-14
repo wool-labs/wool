@@ -10,12 +10,12 @@ class TaskQueue(Queue, Generic[T]):
     """
     A task queue with support for tracking idle time.
 
-    TaskQueue extends the standard Python `Queue` to include functionality 
+    TaskQueue extends the standard Python `Queue` to include functionality
     for determining whether the queue has been idle for a specified duration.
 
-    :param maxsize: The maximum number of items allowed in the queue. Defaults 
+    :param maxsize: The maximum number of items allowed in the queue. Defaults
         to 0 (unlimited size).
-    :param maxidle: The maximum idle time in seconds before the queue is 
+    :param maxidle: The maximum idle time in seconds before the queue is
         considered idle. If None, idle time is not tracked.
     :raises ValueError: If `maxidle` is not positive.
     """
@@ -24,9 +24,9 @@ class TaskQueue(Queue, Generic[T]):
         """
         Initialize the TaskQueue.
 
-        :param maxsize: The maximum number of items allowed in the queue. 
+        :param maxsize: The maximum number of items allowed in the queue.
             Defaults to 0 (unlimited size).
-        :param maxidle: The maximum idle time in seconds before the queue is 
+        :param maxidle: The maximum idle time in seconds before the queue is
             considered idle. If None, idle time is not tracked.
         :raises ValueError: If `maxidle` is not positive.
         """
@@ -42,9 +42,9 @@ class TaskQueue(Queue, Generic[T]):
         Add an item to the queue.
 
         :param item: The item to add to the queue.
-        :param args: Additional positional arguments for the `Queue.put` 
+        :param args: Additional positional arguments for the `Queue.put`
             method.
-        :param kwargs: Additional keyword arguments for the `Queue.put` 
+        :param kwargs: Additional keyword arguments for the `Queue.put`
             method.
         """
         return super().put(item, *args, **kwargs)
@@ -53,12 +53,12 @@ class TaskQueue(Queue, Generic[T]):
         """
         Remove and return an item from the queue.
 
-        If the queue becomes empty after this operation, the `last_cleared` 
+        If the queue becomes empty after this operation, the `last_cleared`
         timestamp is updated.
 
-        :param args: Additional positional arguments for the `Queue.get` 
+        :param args: Additional positional arguments for the `Queue.get`
             method.
-        :param kwargs: Additional keyword arguments for the `Queue.get` 
+        :param kwargs: Additional keyword arguments for the `Queue.get`
             method.
         :return: The item removed from the queue.
         """
@@ -69,7 +69,7 @@ class TaskQueue(Queue, Generic[T]):
 
     def idle(self) -> bool:
         """
-        Check if the queue has been idle for longer than the specified 
+        Check if the queue has been idle for longer than the specified
         `maxidle` time.
 
         :return: True if the queue is idle, False otherwise.

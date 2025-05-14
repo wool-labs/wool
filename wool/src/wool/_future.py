@@ -20,8 +20,8 @@ class WoolFuture(Generic[T]):
     """
     A future object representing the result of an asynchronous operation.
 
-    WoolFuture provides methods to retrieve the result or exception of an 
-    asynchronous operation, set the result or exception, and await its 
+    WoolFuture provides methods to retrieve the result or exception of an
+    asynchronous operation, set the result or exception, and await its
     completion.
 
     :param T: The type of the result.
@@ -44,6 +44,7 @@ class WoolFuture(Generic[T]):
 
         :return: The result of the future.
         """
+
         async def _():
             while not self.done():
                 await asyncio.sleep(0)
@@ -90,7 +91,7 @@ class WoolFuture(Generic[T]):
         Retrieve the exception of the future, if any.
 
         :return: The exception of the future.
-        :raises asyncio.InvalidStateError: If the future is not yet completed 
+        :raises asyncio.InvalidStateError: If the future is not yet completed
             or has no exception.
         """
         if self.done() and self._exception is not Undefined:
@@ -161,17 +162,18 @@ async def poll(future: WoolFuture, task: concurrent.futures.Future) -> None:
 
 def fulfill(future: WoolFuture):
     """
-    Create a callback to fulfill a WoolFuture with the result or exception 
+    Create a callback to fulfill a WoolFuture with the result or exception
     of a concurrent.futures.Future.
 
     :param future: The WoolFuture to fulfill.
     :return: A callback function.
     """
+
     def callback(task: concurrent.futures.Future):
         """
         Callback function to fulfill the WoolFuture.
 
-        :param task: The concurrent.futures.Future to retrieve the result or 
+        :param task: The concurrent.futures.Future to retrieve the result or
             exception from.
         """
         try:

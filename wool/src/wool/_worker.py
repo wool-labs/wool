@@ -18,14 +18,14 @@ import wool
 from wool._event import WoolTaskEvent
 from wool._future import fulfill
 from wool._future import poll
-from wool._session import PoolSession
+from wool._session import WorkerPoolSession
 from wool._session import WorkerSession
 
 if TYPE_CHECKING:
     from wool._task import WoolTask
 
 
-def _noop(*_): 
+def _noop(*_):
     """
     A no-operation function used as a signal handler.
 
@@ -36,7 +36,7 @@ def _noop(*_):
 
 class Scheduler(Thread):
     """
-    A thread-based scheduler for managing and executing tasks in a worker 
+    A thread-based scheduler for managing and executing tasks in a worker
     process.
 
     :param address: The address of the worker pool.
@@ -45,6 +45,7 @@ class Scheduler(Thread):
     :param ready: An event to signal when the scheduler is ready.
     :param timeout: Timeout for task polling in seconds.
     """
+
     def __init__(
         self,
         address: tuple[str, int],
@@ -63,7 +64,7 @@ class Scheduler(Thread):
         self._worker_ready: Event = ready
 
     @property
-    def session_context(self) -> ContextVar[PoolSession]:
+    def session_context(self) -> ContextVar[WorkerPoolSession]:
         """
         Get the session context variable for the scheduler.
 
@@ -80,7 +81,7 @@ class Scheduler(Thread):
         sleep(0.1)
         with WorkerSession(address=self._address) as self.session:
             self.session_context.set(
-                PoolSession(address=self._address).connect()
+                WorkerPoolSession(address=self._address).connect()
             )
             while not self._stop_event.is_set():
                 try:
@@ -117,6 +118,7 @@ class Worker(Process):
     :param log_level: Logging level for the worker.
     :param scheduler: The scheduler type for the worker.
     """
+
     def __init__(
         self,
         address: tuple[str, int],
@@ -219,6 +221,7 @@ class ShutdownSentinel(Thread):
     :param wait_event: An event to signal when the sentinel should wait.
     :param loop: The asyncio event loop used for task management.
     """
+
     def __init__(
         self,
         stop_event: Event,
@@ -234,7 +237,7 @@ class ShutdownSentinel(Thread):
 
     def run(self) -> None:
         """
-        Run the shutdown sentinel, monitoring for stop signals and cleaning up 
+        Run the shutdown sentinel, monitoring for stop signals and cleaning up
         tasks.
         """
         logging.debug("Thread started")

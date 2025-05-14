@@ -21,7 +21,7 @@ from typing import Coroutine
 
 import wool
 from wool._manager import Manager
-from wool._session import PoolSession
+from wool._session import WorkerPoolSession
 from wool._worker import Scheduler
 from wool._worker import Worker
 
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from wool._task import AsyncCallable
 
 
-def _stop(pool: Pool, wait: bool, *_):
+def _stop(pool: WorkerPool, wait: bool, *_):
     """
     Stop the pool process.
 
@@ -42,58 +42,52 @@ def _stop(pool: Pool, wait: bool, *_):
 
 # PUBLIC
 def pool(
-    address: tuple[str, int],
+    host: str = "localhost",
+    port: int = 48800,
     *,
     authkey: bytes | None = None,
     breadth: int = 0,
     log_level: int = logging.INFO,
 ) -> Callable[[AsyncCallable], AsyncCallable]:
     """
-    Decorator to execute a function within a worker pool session.
+    Convenience function to create a worker pool.
 
     :param address: The address of the worker pool (host, port).
     :param authkey: Optional authentication key for the pool.
-    :param breadth: Number of worker processes in the pool. Defaults to CPU 
+    :param breadth: Number of worker processes in the pool. Defaults to CPU
         count.
     :param log_level: Logging level for the pool.
     :return: A decorator that wraps the function to execute within the pool.
     """
-    def _pool(fn: AsyncCallable) -> AsyncCallable:
-        @wraps(fn)
-        async def wrapper(*args, **kwargs) -> Coroutine:
-            with Pool(
-                breadth=breadth,
-                address=address,
-                authkey=authkey,
-                log_level=log_level,
-            ):
-                return await fn(*args, **kwargs)
-
-        return wrapper
-
-    return _pool
+    return WorkerPool(
+        address=(host, port),
+        authkey=authkey,
+        breadth=breadth,
+        log_level=log_level,
+    )
 
 
 # PUBLIC
-class Pool(Process):
+class WorkerPool(Process):
     """
-    A multiprocessing-based worker pool for executing asynchronous tasks. A 
-    pool consists of a single manager process and at least a single worker 
-    process. The manager process orchestrates its workers and serves client 
-    dispatch requests. The worker process(es) execute(s) dispatched tasks on a 
+    A multiprocessing-based worker pool for executing asynchronous tasks. A
+    pool consists of a single manager process and at least a single worker
+    process. The manager process orchestrates its workers and serves client
+    dispatch requests. The worker process(es) execute(s) dispatched tasks on a
     first-come, first-served basis.
 
-    The worker pool class is implemented as a context manager, allowing users 
-    to easily spawn ephemeral pools that live for the duration of a client 
-    application's execution.
+    The worker pool class is implemented as a context manager and decorator,
+    allowing users to easily spawn ephemeral pools that live for the duration
+    of a client application's execution and tightly couple functions to a pool.
 
     :param address: The address of the worker pool (host, port).
     :param authkey: Optional authentication key for the pool. If not specified,
         the manager will inherit the authkey from the current process.
-    :param breadth: Number of worker processes in the pool. Defaults to CPU 
+    :param breadth: Number of worker processes in the pool. Defaults to CPU
         count.
     :param log_level: Logging level for the pool.
     """
+
     _wait_event: Event | None = None
     _stop_event: Event | None = None
 
@@ -123,9 +117,24 @@ class Pool(Process):
         )
         self._get_ready, self._set_ready = Pipe(duplex=False)
 
+    def __call__(self, fn: AsyncCallable) -> AsyncCallable:
+        """
+        Decorate a function to be executed within the pool.
+
+        :param fn: The function to be executed.
+        :return: The wrapped function.
+        """
+
+        @wraps(fn)
+        async def wrapper(*args, **kwargs) -> Coroutine:
+            with self:
+                return await fn(*args, **kwargs)
+
+        return wrapper
+
     def __enter__(self):
         """
-        Enter the context of the pool, starting the pool and connecting the 
+        Enter the context of the pool, starting the pool and connecting the
         session.
         """
         self.start()
@@ -134,7 +143,7 @@ class Pool(Process):
 
     def __exit__(self, *_) -> None:
         """
-        Exit the context of the pool, stopping the pool and disconnecting the 
+        Exit the context of the pool, stopping the pool and disconnecting the
         session.
         """
         assert self._token
@@ -144,16 +153,16 @@ class Pool(Process):
         self.join()
 
     @property
-    def session_type(self) -> type[PoolSession]:
+    def session_type(self) -> type[WorkerPoolSession]:
         """
         Get the session type for the pool.
 
         :return: The session type.
         """
-        return PoolSession
+        return WorkerPoolSession
 
     @property
-    def session_context(self) -> ContextVar[PoolSession]:
+    def session_context(self) -> ContextVar[WorkerPoolSession]:
         """
         Get the session context variable for the pool.
 
@@ -325,6 +334,7 @@ class ManagerSentinel(Thread):
     :param address: The address of the manager (host, port).
     :param authkey: Authentication key for the manager.
     """
+
     _wait_event: Event | None = None
     _stop_event: Event | None = None
     _queue: TaskQueue | None = None
@@ -398,6 +408,7 @@ class WorkerSentinel(Thread):
     :param log_level: Logging level for the worker.
     :param scheduler: The scheduler type for the worker.
     """
+
     _worker: Worker | None = None
     _semaphore: Semaphore = Semaphore(8)
 

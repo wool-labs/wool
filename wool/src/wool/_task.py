@@ -22,7 +22,7 @@ from uuid import uuid4
 import wool
 from wool._event import WoolTaskEvent
 from wool._future import WoolFuture
-from wool._pool import PoolSession
+from wool._pool import WorkerPoolSession
 
 AsyncCallable = Callable[..., Coroutine]
 C = TypeVar("C", bound=AsyncCallable)
@@ -47,7 +47,7 @@ def task(fn: C) -> C:
     def wrapper(
         *args,
         __wool_remote__: bool = False,
-        __wool_session__: PoolSession | None = None,
+        __wool_session__: WorkerPoolSession | None = None,
         **kwargs,
     ) -> Coroutine:
         """
@@ -82,7 +82,7 @@ def task(fn: C) -> C:
 
 
 def _put(
-    session: PoolSession,
+    session: WorkerPoolSession,
     module: str,
     qualname: str,
     function: AsyncCallable,
@@ -123,7 +123,7 @@ def _put(
         kwargs=kwargs,
         tag=f"{module}.{qualname}({signature})",
     )
-    assert isinstance(session, PoolSession)
+    assert isinstance(session, WorkerPoolSession)
     future: WoolFuture = session.put(task)
 
     async def coroutine(future: WoolFuture):
@@ -185,7 +185,7 @@ class WoolTask:
     :param callable: The asynchronous function to execute.
     :param args: Positional arguments for the function.
     :param kwargs: Keyword arguments for the function.
-    :param timeout: The timeout for the task in seconds. 
+    :param timeout: The timeout for the task in seconds.
         Defaults to 0 (no timeout).
     :param caller: The ID of the calling task, if any.
     :param exception: The exception raised during task execution, if any.
@@ -272,6 +272,7 @@ class WoolTask:
         :param fn: The asynchronous function to execute.
         :return: The wrapped function.
         """
+
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             with self:
@@ -290,6 +291,7 @@ class WoolTaskEventCallback(Protocol):
     """
     Protocol for WoolTaskEvent callback functions.
     """
+
     def __call__(self, event: WoolTaskEvent, timestamp: Timestamp) -> None: ...
 
 
@@ -302,6 +304,7 @@ class WoolTaskException:
     :param type: The type of the exception.
     :param traceback: The traceback of the exception.
     """
+
     type: str
     traceback: list[str]
 
@@ -318,6 +321,7 @@ def _run(fn):
     :param fn: The original _run method.
     :return: The wrapped _run method.
     """
+
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
         if current_task := self._context.get(_current_task):

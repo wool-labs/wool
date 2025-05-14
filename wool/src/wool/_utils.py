@@ -51,7 +51,7 @@ A constant representing the undefined value.
 
 class PredicatedEvent(threading.Event):
     """
-    An event that is automatically set when a predicate function evaluates to 
+    An event that is automatically set when a predicate function evaluates to
     True.
 
     :param predicate: A callable that returns a boolean value.

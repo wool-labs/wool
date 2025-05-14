@@ -9,15 +9,15 @@ from time import perf_counter
 import click
 
 import wool
-from wool._pool import Pool
-from wool._session import PoolSession
+from wool._pool import WorkerPool
+from wool._session import WorkerPoolSession
 from wool._task import task
 
 DEFAULT_PORT = 48800
 
 
 # PUBLIC
-class PoolCommand(click.core.Command):
+class WorkerPoolCommand(click.core.Command):
     """
     Custom Click command class for worker pool commands.
 
@@ -25,6 +25,7 @@ class PoolCommand(click.core.Command):
     :param default_port: Default port number.
     :param default_authkey: Default authentication key.
     """
+
     def __init__(
         self,
         *args,
@@ -161,7 +162,7 @@ def pool():
     pass
 
 
-@pool.command(cls=partial(PoolCommand, default_port=DEFAULT_PORT))
+@pool.command(cls=partial(WorkerPoolCommand, default_port=DEFAULT_PORT))
 @click.option(
     "--breadth", "-b", type=int, default=cpu_count(), callback=assert_nonzero
 )
@@ -190,7 +191,7 @@ def up(host, port, authkey, breadth, modules):
         importlib.import_module(module)
     if not authkey:
         logging.warning("No authkey specified")
-    workerpool = Pool(
+    workerpool = WorkerPool(
         address=(host, port),
         breadth=breadth,
         authkey=authkey,
@@ -200,7 +201,7 @@ def up(host, port, authkey, breadth, modules):
     workerpool.join()
 
 
-@pool.command(cls=partial(PoolCommand, default_port=DEFAULT_PORT))
+@pool.command(cls=partial(WorkerPoolCommand, default_port=DEFAULT_PORT))
 @click.option(
     "--wait",
     "-w",
@@ -222,11 +223,11 @@ def down(host, port, authkey, wait):
         host = "localhost"
     if not authkey:
         authkey = b""
-    with PoolSession(address=(host, port), authkey=authkey) as client:
+    with WorkerPoolSession(address=(host, port), authkey=authkey) as client:
         client.stop(wait=wait)
 
 
-@cli.command(cls=partial(PoolCommand, default_port=DEFAULT_PORT))
+@cli.command(cls=partial(WorkerPoolCommand, default_port=DEFAULT_PORT))
 def ping(host, port, authkey):
     """
     Ping the worker pool to check connectivity.
@@ -247,7 +248,7 @@ def ping(host, port, authkey):
 
         print(f"Ping: {int((t() * 1000) + 0.5)} ms")
 
-    with PoolSession(address=(host, port), authkey=authkey):
+    with WorkerPoolSession(address=(host, port), authkey=authkey):
         asyncio.get_event_loop().run_until_complete(_())
 
 

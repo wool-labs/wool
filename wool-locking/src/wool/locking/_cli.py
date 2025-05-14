@@ -18,7 +18,9 @@ def lock_pool():
     pass
 
 
-@lock_pool.command(cls=partial(wool.PoolCommand, default_port=DEFAULT_PORT))
+@lock_pool.command(
+    cls=partial(wool.WorkerPoolCommand, default_port=DEFAULT_PORT)
+)
 def up(host, port, authkey):
     """
     Start a lock pool with the specified configuration.
@@ -38,7 +40,9 @@ def up(host, port, authkey):
     workerpool.join()
 
 
-@lock_pool.command(cls=partial(wool.PoolCommand, default_port=DEFAULT_PORT))
+@lock_pool.command(
+    cls=partial(wool.WorkerPoolCommand, default_port=DEFAULT_PORT)
+)
 @click.option(
     "--wait",
     "-w",

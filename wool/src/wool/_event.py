@@ -15,11 +15,11 @@ if TYPE_CHECKING:
 # PUBLIC
 class WoolTaskEvent:
     """
-    Represents an event related to a Wool task, such as creation, queuing, 
+    Represents an event related to a Wool task, such as creation, queuing,
     scheduling, starting, stopping, or completion.
 
-    Task events are emitted during the lifecycle of a task. These events can 
-    be used to track task execution and measure performance, such as CPU 
+    Task events are emitted during the lifecycle of a task. These events can
+    be used to track task execution and measure performance, such as CPU
     utilization.
 
     :param type: The type of the task event.
@@ -51,6 +51,7 @@ class WoolTaskEvent:
         :param event_types: The event types to handle.
         :return: A decorator to register the handler function.
         """
+
         def _handler(
             fn: WoolTaskEventCallback,
         ) -> WoolTaskEventCallback:
@@ -62,7 +63,7 @@ class WoolTaskEvent:
 
     def emit(self):
         """
-        Emit the task event, invoking all registered handlers for the event 
+        Emit the task event, invoking all registered handlers for the event
         type.
 
         Handlers are called with the event instance and a timestamp.

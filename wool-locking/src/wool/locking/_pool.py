@@ -1,4 +1,7 @@
+import logging
 from contextvars import ContextVar
+from typing import Callable
+from typing import Coroutine
 
 import wool
 import wool.locking
@@ -6,7 +9,35 @@ from wool.locking._session import LockPoolSession
 from wool.locking._worker import LockScheduler
 
 
-class LockPool(wool.Pool):
+# PUBLIC
+def pool(
+    host: str = "localhost",
+    port: int = 48800,
+    *,
+    authkey: bytes | None = None,
+    breadth: int = 0,
+    log_level: int = logging.INFO,
+) -> Callable[[Callable[..., Coroutine]], Callable[..., Coroutine]]:
+    """
+    Convenience function to create a lock pool.
+
+    :param address: The address of the worker pool (host, port).
+    :param authkey: Optional authentication key for the pool.
+    :param breadth: Number of worker processes in the pool. Defaults to CPU
+        count.
+    :param log_level: Logging level for the pool.
+    :return: A decorator that wraps the function to execute within the pool.
+    """
+    return LockPool(
+        address=(host, port),
+        authkey=authkey,
+        breadth=breadth,
+        log_level=log_level,
+    )
+
+
+# PUBLIC
+class LockPool(wool.WorkerPool):
     """
     A specialized worker pool for managing distributed locking tasks.
 
@@ -39,7 +70,7 @@ class LockPool(wool.Pool):
         return LockPoolSession
 
     @property
-    def session_context(self) -> ContextVar[wool.PoolSession]:
+    def session_context(self) -> ContextVar[wool.WorkerPoolSession]:
         """
         Get the context variable used to manage the session state.
 

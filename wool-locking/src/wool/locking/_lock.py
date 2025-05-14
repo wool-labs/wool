@@ -10,13 +10,14 @@ def lock(fn):
     """
     Decorator to execute a function within a lock session.
 
-    If no lock session is found in the current context, a local lock is used 
-    as a fallback. The function is executed as a Wool task within the lock 
+    If no lock session is found in the current context, a local lock is used
+    as a fallback. The function is executed as a Wool task within the lock
     session.
 
     :param fn: The function to decorate.
     :return: The decorated function.
     """
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         """

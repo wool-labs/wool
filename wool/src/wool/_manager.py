@@ -152,7 +152,7 @@ def get() -> WoolTask | Empty | None:
     """
     Retrieve a task from the task queue.
 
-    :return: The next task in the queue, or an Empty exception if the queue is 
+    :return: The next task in the queue, or an Empty exception if the queue is
         empty.
     """
     try:

@@ -16,7 +16,7 @@ class LockScheduler(wool.Scheduler):
     """
 
     @property
-    def session_context(self) -> ContextVar[wool.PoolSession]:
+    def session_context(self) -> ContextVar[wool.WorkerPoolSession]:
         """
         Get the context variable for the current locking session.
 

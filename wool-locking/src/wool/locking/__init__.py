@@ -6,7 +6,7 @@ from wool.locking._lock import lock
 from wool.locking._pool import LockPool
 from wool.locking._session import LockPoolSession
 
-__locking_session__: Final[ContextVar[wool.PoolSession]] = ContextVar(
+__locking_session__: Final[ContextVar[wool.WorkerPoolSession]] = ContextVar(
     "__locking_session__", default=wool.LocalSession()
 )
 

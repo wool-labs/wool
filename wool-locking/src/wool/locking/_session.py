@@ -1,12 +1,32 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+from typing import Callable
+from typing import Coroutine
 
 import wool
 import wool.locking
 
 
-class LockPoolSession(wool.PoolSession):
+# PUBLIC
+def session(
+    host: str = "localhost",
+    port: int = 48800,
+    *,
+    authkey: bytes | None = None,
+) -> Callable[[Callable[..., Coroutine]], Callable[..., Coroutine]]:
+    """
+    Convenience function to create a lock pool session.
+
+    :param address: The address of the worker pool (host, port).
+    :param authkey: Optional authentication key for the worker pool.
+    :return: A decorator that wraps the function to execute within the session.
+    """
+    return LockPoolSession((host, port), authkey=authkey)
+
+
+# PUBLIC
+class LockPoolSession(wool.WorkerPoolSession):
     """
     A session for managing distributed locking tasks within a `LockPool`.
 
@@ -18,7 +38,7 @@ class LockPoolSession(wool.PoolSession):
     """
 
     @property
-    def session(self) -> ContextVar[wool.PoolSession]:
+    def session(self) -> ContextVar[wool.WorkerPoolSession]:
         """
         Get the context variable for the current locking session.
 
