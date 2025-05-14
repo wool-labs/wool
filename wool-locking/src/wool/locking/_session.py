@@ -16,11 +16,15 @@ def session(
     authkey: bytes | None = None,
 ) -> Callable[[Callable[..., Coroutine]], Callable[..., Coroutine]]:
     """
-    Convenience function to create a lock pool session.
+    Convenience function to declare a lock pool session context. Usage is
+    identical to that of ``wool.session``.
 
-    :param address: The address of the worker pool (host, port).
+    :param host: The hostname of the worker pool.
+    :param port: The port of the worker pool.
     :param authkey: Optional authentication key for the worker pool.
     :return: A decorator that wraps the function to execute within the session.
+
+    .. seealso:: `wool.session`
     """
     return LockPoolSession((host, port), authkey=authkey)
 

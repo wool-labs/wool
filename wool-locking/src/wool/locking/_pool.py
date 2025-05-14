@@ -19,14 +19,19 @@ def pool(
     log_level: int = logging.INFO,
 ) -> Callable[[Callable[..., Coroutine]], Callable[..., Coroutine]]:
     """
-    Convenience function to create a lock pool.
+    Convenience function to declare a lock pool context. Usage is identical to
+    that of ``wool.pool``.
 
-    :param address: The address of the worker pool (host, port).
-    :param authkey: Optional authentication key for the pool.
-    :param breadth: Number of worker processes in the pool. Defaults to CPU
-        count.
-    :param log_level: Logging level for the pool.
-    :return: A decorator that wraps the function to execute within the pool.
+    :param host: The hostname of the worker pool. Defaults to "localhost".
+    :param port: The port of the worker pool. Defaults to 48800.
+    :param authkey: Optional authentication key for the worker pool.
+    :param breadth: Number of worker processes in the pool. Defaults to 0
+        (CPU count).
+    :param log_level: Logging level for the worker pool. Defaults to
+        logging.INFO.
+    :return: A decorator that wraps the function to execute within the session.
+
+    .. seealso:: `wool.pool`
     """
     return LockPool(
         address=(host, port),

@@ -239,11 +239,52 @@ def session(
     authkey: bytes | None = None,
 ) -> Callable[[AsyncCallable], AsyncCallable]:
     """
-    Convenience function to create a worker pool session.
+    Convenience function to declare a worker pool session context.
 
-    :param address: The address of the worker pool (host, port).
+    :param host: The hostname of the worker pool.
+    :param port: The port of the worker pool.
     :param authkey: Optional authentication key for the worker pool.
     :return: A decorator that wraps the function to execute within the session.
+
+    Usage:
+
+    .. code-block:: python
+
+        import wool
+
+
+        @wool.session(host="localhost", port=48800)
+        async def my_function(): ...
+
+    ...is functionally equivalent to...
+
+    .. code-block:: python
+
+        import wool
+
+
+        async def my_function():
+            with wool.session(host="localhost", port=48800):
+                ...
+
+    This can be used with the ``@wool.task`` decorator to declare a task that
+    is tightly coupled with the specified session:
+
+    .. code-block:: python
+
+        import wool
+
+
+        @wool.session(host="localhost", port=48800)
+        @wool.task
+        async def my_function(): ...
+
+    .. note::
+
+        The order of decorators matters. In order for invocations of the
+        declared task to be dispatched to the pool specified by
+        ``@wool.session``, the ``@wool.task`` decorator must be applied after
+        ``@wool.session``.
     """
     return WorkerPoolSession((host, port), authkey=authkey)
 

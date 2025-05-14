@@ -50,14 +50,67 @@ def pool(
     log_level: int = logging.INFO,
 ) -> Callable[[AsyncCallable], AsyncCallable]:
     """
-    Convenience function to create a worker pool.
+    Convenience function to declare a worker pool context.
 
-    :param address: The address of the worker pool (host, port).
-    :param authkey: Optional authentication key for the pool.
-    :param breadth: Number of worker processes in the pool. Defaults to CPU
-        count.
-    :param log_level: Logging level for the pool.
-    :return: A decorator that wraps the function to execute within the pool.
+    :param host: The hostname of the worker pool. Defaults to "localhost".
+    :param port: The port of the worker pool. Defaults to 48800.
+    :param authkey: Optional authentication key for the worker pool.
+    :param breadth: Number of worker processes in the pool. Defaults to 0
+        (CPU count).
+    :param log_level: Logging level for the worker pool. Defaults to
+        logging.INFO.
+    :return: A decorator that wraps the function to execute within the session.
+
+    Usage:
+
+    .. code-block:: python
+
+        import wool
+
+
+        @wool.pool(
+            host="localhost",
+            port=48800,
+            authkey=b"deadbeef",
+            breadth=4,
+        )
+        async def my_function(): ...
+
+    This is equivalent to:
+
+    .. code-block:: python
+
+        import wool
+
+
+        async def my_function():
+            with wool.pool(
+                host="localhost", port=48800, authkey=b"deadbeef", breadth=4
+            ):
+                ...
+
+    This decorator can also be combined with the ``@wool.task`` decorator to
+    declare a task that is tightly coupled with the specified pool:
+
+    .. code-block:: python
+
+        import wool
+
+
+        @wool.pool(
+            host="localhost",
+            port=48800,
+            authkey=b"deadbeef",
+            breadth=4,
+        )
+        @wool.task
+        async def my_function(): ...
+
+    .. note::
+
+        The order of decorators matters. To ensure that invocations of the
+        declared task are dispatched to the pool specified by ``@wool.pool``,
+        the ``@wool.task`` decorator must be applied after ``@wool.pool``.
     """
     return WorkerPool(
         address=(host, port),
