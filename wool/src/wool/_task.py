@@ -36,11 +36,67 @@ Timestamp = int
 def task(fn: C) -> C:
     """
     A decorator to declare an asynchronous function as remotely executable by a
-    worker pool. When the wrapped function is called, it is dispatched to the
-    worker pool associated with the current worker pool session.
+    worker pool. When the wrapped function is invoked, it is dispatched to the
+    worker pool associated with the current worker pool session context.
 
-    :param fn: The function to be decorated.
-    :return: The decorated function.
+    Tasks behave like coroutines, meaning they can be awaited as well as
+    cancelled.
+
+    :param fn: The task function.
+    :return: A Wool task declaration.
+
+    **Best practices and considerations for designing tasks:**
+
+    1. **Picklability**:
+        - Task arguments and return values must be picklable, as they are
+            serialized and transferred between processes. Avoid passing
+            unpicklable objects such as open file handles, database
+            connections, or lambda functions.
+        - Ensure that any custom objects used as arguments or return values
+            implement the necessary methods for pickling (e.g.,
+            ``__getstate__`` and ``__setstate__``).
+
+    2. **Synchronization**:
+        - Tasks are not guaranteed to execute on the same process between
+            invocations. Each invocation may run on a different worker process.
+        - Standard ``asyncio`` synchronization primitives (e.g.,
+            ``asyncio.Lock``) will not behave as expected in a multi-process
+            environment, as they are designed for single-process applications.
+            Use the specialized ``wool.locking`` synchronization primitives to
+            achieve inter-worker and inter-pool synchronization.
+
+    3. **Statelessness and idempotency**:
+        - Design tasks to be stateless and idemptoent. Avoid relying on global
+            variables or shared mutable state. This ensures predictable
+            behavior, avoids race conditions, and enables safe retries.
+
+    4. **Cancellation**:
+        - Task cancellation and propagation thereof mimics that of standard
+            Python coroutines.
+
+    5. **Error propagation**:
+        - Wool makes every effort to execute tasks transparently to the user,
+            and this includes error propagation. Unhandled exceptions raised
+            within a task will be propagated to the caller as they would
+            normally.
+
+    6. **Performance**:
+        - Minimize the size of arguments and return values to reduce
+            serialization overhead.
+        - For large datasets, consider using shared memory or passing
+            references (e.g., file paths) instead of transferring the entire
+            data.
+
+    **Usage**::
+
+    .. code-block:: python
+
+        import wool
+
+
+        @wool.task
+        async def my_task(...):
+            ...
     """
 
     @wraps(fn)
