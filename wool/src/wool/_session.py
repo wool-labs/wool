@@ -254,7 +254,7 @@ def session(
 
 
         @wool.session(host="localhost", port=48800)
-        async def my_function(): ...
+        async def foo(): ...
 
     ...is functionally equivalent to...
 
@@ -263,7 +263,7 @@ def session(
         import wool
 
 
-        async def my_function():
+        async def foo():
             with wool.session(host="localhost", port=48800):
                 ...
 
@@ -277,7 +277,7 @@ def session(
 
         @wool.session(host="localhost", port=48800)
         @wool.task
-        async def my_function(): ...
+        async def foo(): ...
 
     .. note::
 

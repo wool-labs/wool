@@ -95,7 +95,7 @@ def task(fn: C) -> C:
 
 
         @wool.task
-        async def my_task(...):
+        async def foo(...):
             ...
     """
 

@@ -74,7 +74,7 @@ def pool(
             authkey=b"deadbeef",
             breadth=4,
         )
-        async def my_function(): ...
+        async def foo(): ...
 
     This is equivalent to:
 
@@ -83,7 +83,7 @@ def pool(
         import wool
 
 
-        async def my_function():
+        async def foo():
             with wool.pool(
                 host="localhost", port=48800, authkey=b"deadbeef", breadth=4
             ):
@@ -104,7 +104,7 @@ def pool(
             breadth=4,
         )
         @wool.task
-        async def my_function(): ...
+        async def foo(): ...
 
     .. note::
 
