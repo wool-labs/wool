@@ -1,6 +1,7 @@
 from queue import Queue
 from time import time
-from typing import Generic, TypeVar
+from typing import Generic
+from typing import TypeVar
 
 T = TypeVar("T")
 

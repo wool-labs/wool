@@ -9,15 +9,23 @@ from time import perf_counter
 import click
 
 import wool
-from wool._client import WoolClient
-from wool._pool import WoolPool
+from wool._pool import WorkerPool
+from wool._session import WorkerPoolSession
 from wool._task import task
 
 DEFAULT_PORT = 48800
 
 
 # PUBLIC
-class WoolPoolCommand(click.core.Command):
+class WorkerPoolCommand(click.core.Command):
+    """
+    Custom Click command class for worker pool commands.
+
+    :param default_host: Default host address.
+    :param default_port: Default port number.
+    :param default_authkey: Default authentication key.
+    """
+
     def __init__(
         self,
         *args,
@@ -43,7 +51,11 @@ class WoolPoolCommand(click.core.Command):
 
 @contextmanager
 def timer():
-    """Context manager to measure the execution time of a code block."""
+    """
+    Context manager to measure the execution time of a code block.
+
+    :return: A function to retrieve the elapsed time.
+    """
     start = end = perf_counter()
     yield lambda: end - start
     end = perf_counter()
@@ -53,13 +65,10 @@ def to_bytes(context: click.Context, parameter: click.Parameter, value: str):
     """
     Convert the given value to bytes.
 
-    Args:
-        context (click.Context): Click context.
-        parameter (click.Parameter): Click parameter.
-        value (str): Value to convert.
-
-    Returns:
-        bytes: The converted value in bytes.
+    :param context: Click context.
+    :param parameter: Click parameter.
+    :param value: Value to convert.
+    :return: The converted value in bytes.
     """
     if value is None:
         return b""
@@ -72,13 +81,10 @@ def assert_nonzero(
     """
     Assert that the given value is non-zero.
 
-    Args:
-        context (click.Context): Click context.
-        parameter (click.Parameter): Click parameter.
-        value (int): Value to check.
-
-    Returns:
-        int: The original value if it is non-zero.
+    :param context: Click context.
+    :param parameter: Click parameter.
+    :param value: Value to check.
+    :return: The original value if it is non-zero.
     """
     if value is None:
         return value
@@ -88,12 +94,11 @@ def assert_nonzero(
 
 def debug(ctx, param, value):
     """
-    Enable debugging with debugpy.
+    Enable debugging mode with a specified port.
 
-    Args:
-        ctx (click.Context): Click context.
-        param (click.Parameter): Click parameter.
-        value (bool): Flag value indicating whether to enable debugging.
+    :param ctx: The Click context object.
+    :param param: The parameter being handled.
+    :param value: The port number for the debugger.
     """
     if not value or ctx.resilient_parsing:
         return
@@ -112,7 +117,10 @@ def debug(ctx, param, value):
     "-d",
     callback=debug,
     expose_value=False,
-    help="Run with debugger listening on the specified port. Execution will block until the debugger is attached.",
+    help=(
+        "Run with debugger listening on the specified port. Execution will "
+        "block until the debugger is attached."
+    ),
     is_eager=True,
     type=int,
 )
@@ -128,10 +136,7 @@ def cli(verbosity: int):
     """
     CLI command group with options for verbosity, debugging, and version.
 
-    Args:
-        verbosity (int): Verbosity level for logging.
-        debug (bool): Flag to enable debugging.
-        version (bool): Flag to display the version and exit.
+    :param verbosity: Verbosity level for logging.
     """
     match verbosity:
         case 4:
@@ -150,10 +155,14 @@ def cli(verbosity: int):
 
 
 @cli.group()
-def pool(): ...
+def pool():
+    """
+    CLI command group for managing worker pools.
+    """
+    pass
 
 
-@pool.command(cls=partial(WoolPoolCommand, default_port=DEFAULT_PORT))
+@pool.command(cls=partial(WorkerPoolCommand, default_port=DEFAULT_PORT))
 @click.option(
     "--breadth", "-b", type=int, default=cpu_count(), callback=assert_nonzero
 )
@@ -163,14 +172,26 @@ def pool(): ...
     "-m",
     multiple=True,
     type=str,
-    help="Python module containing workerpool task definitions to be executed by this pool.",
+    help=(
+        "Python module containing workerpool task definitions to be executed "
+        "by this pool."
+    ),
 )
 def up(host, port, authkey, breadth, modules):
+    """
+    Start a worker pool with the specified configuration.
+
+    :param host: The host address for the worker pool.
+    :param port: The port number for the worker pool.
+    :param authkey: The authentication key for the worker pool.
+    :param breadth: The number of worker processes in the pool.
+    :param modules: Python modules containing task definitions.
+    """
     for module in modules:
         importlib.import_module(module)
     if not authkey:
         logging.warning("No authkey specified")
-    workerpool = WoolPool(
+    workerpool = WorkerPool(
         address=(host, port),
         breadth=breadth,
         authkey=authkey,
@@ -180,7 +201,7 @@ def up(host, port, authkey, breadth, modules):
     workerpool.join()
 
 
-@pool.command(cls=partial(WoolPoolCommand, default_port=DEFAULT_PORT))
+@pool.command(cls=partial(WorkerPoolCommand, default_port=DEFAULT_PORT))
 @click.option(
     "--wait",
     "-w",
@@ -189,17 +210,32 @@ def up(host, port, authkey, breadth, modules):
     help="Wait for in-flight tasks to complete before shutting down.",
 )
 def down(host, port, authkey, wait):
+    """
+    Shut down the worker pool.
+
+    :param host: The host address of the worker pool.
+    :param port: The port number of the worker pool.
+    :param authkey: The authentication key for the worker pool.
+    :param wait: Whether to wait for in-flight tasks to complete.
+    """
     assert port
     if not host:
         host = "localhost"
     if not authkey:
         authkey = b""
-    client = WoolClient(address=(host, port), authkey=authkey).connect()
-    client.stop(wait=wait)
+    with WorkerPoolSession(address=(host, port), authkey=authkey) as client:
+        client.stop(wait=wait)
 
 
-@cli.command(cls=partial(WoolPoolCommand, default_port=DEFAULT_PORT))
+@cli.command(cls=partial(WorkerPoolCommand, default_port=DEFAULT_PORT))
 def ping(host, port, authkey):
+    """
+    Ping the worker pool to check connectivity.
+
+    :param host: The host address of the worker pool.
+    :param port: The port number of the worker pool.
+    :param authkey: The authentication key for the worker pool.
+    """
     assert port
     if not host:
         host = "localhost"
@@ -208,14 +244,19 @@ def ping(host, port, authkey):
 
     async def _():
         with timer() as t:
-            await asyncio.create_task(_ping())
+            await _ping()
 
         print(f"Ping: {int((t() * 1000) + 0.5)} ms")
 
-    with WoolClient(address=(host, port), authkey=authkey):
+    with WorkerPoolSession(address=(host, port), authkey=authkey):
         asyncio.get_event_loop().run_until_complete(_())
 
 
 @task
 async def _ping():
+    """
+    Asynchronous task to log a ping message.
+
+    :return: None
+    """
     logging.debug("Ping!")
