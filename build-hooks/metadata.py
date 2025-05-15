@@ -31,8 +31,8 @@ class WoolMetadataHook(MetadataHookInterface):
             metadata["dependencies"],
             *metadata["optional-dependencies"].values(),
         ):
-            for dependecy in copy(dependencies):
-                requirement = Requirement(dependecy)
+            for dependency in copy(dependencies):
+                requirement = Requirement(dependency)
                 if (
                     requirement.name.startswith("wool")
                     and requirement.name in subpackages
@@ -42,5 +42,5 @@ class WoolMetadataHook(MetadataHookInterface):
                         requirement = f"{requirement.name} @ {{root:parent:uri}}/{requirement.name}"
                     else:
                         requirement.specifier &= f"=={version}"
-                    dependencies.remove(dependecy)
+                    dependencies.remove(dependency)
                     dependencies.append(str(requirement))
