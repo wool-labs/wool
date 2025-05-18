@@ -285,7 +285,7 @@ def session(
 
 
 # PUBLIC
-def current_session() -> WorkerPoolSession | None:
+def current_session() -> WorkerPoolSession:
     """
     Get the current client session.
 
