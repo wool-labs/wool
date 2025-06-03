@@ -5,7 +5,7 @@ requires = ["debugpy", "hatchling", "packaging", "GitPython", "toml"]
 [project]
 authors = [{ name = "Conrad Bzura", email = "conrad@wool.io" }]
 classifiers = ["Intended Audience :: Developers"]
-dependencies = ["annotated-types", "click", "debugpy", "protobuf", "tblib"]
+dependencies = ["annotated-types", "click", "debugpy", "protobuf", "shortuuid", "tblib"]
 description = "A Python framework for distributed multiprocessing."
 dynamic = ["version"]
 license = { file = "../LICENSE" }
