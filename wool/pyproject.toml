@@ -21,6 +21,13 @@ locking = ["wool-locking"]
 [project.scripts]
 wool = "wool._cli:cli"
 
+[tool.hatch.build.hooks.protobuf]
+dependencies = ["hatch-protobuf"]
+generate_grpc = false
+generate_pyi = true
+output_path = "src/wool/_protobuf"
+proto_paths = ["protobuf"]
+
 [tool.hatch.build.targets.sdist]
 sources = ["src"]
 include = ["wool"]
