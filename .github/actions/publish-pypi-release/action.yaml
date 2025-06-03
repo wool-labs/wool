@@ -2,6 +2,9 @@ name: Publish release to PyPI
 description: Publish the target version to PyPI.
 
 inputs:
+  source:
+    required: true
+    type: string
   version:
     required: true
     type: string
@@ -15,8 +18,8 @@ runs:
     - name: Download distribution artifacts
       uses: actions/download-artifact@v4
       with:
-        name: dist-${{ inputs.version }}
-        path: dist-${{ inputs.version }}/
+        name: ${{ inputs.source }}-dist-${{ inputs.version }}
+        path: ${{ inputs.source }}-dist-${{ inputs.version }}/
 
     - name: Install uv
       uses: astral-sh/setup-uv@v5
@@ -24,4 +27,4 @@ runs:
     - name: Upload distribution to PyPI
       shell: bash
       run: |
-        .github/scripts/publish-distribution.sh --source dist-${{ inputs.version }} ${{ inputs.pypi-token }}
+        .github/scripts/publish-distribution.sh --source ${{ inputs.source }}-dist-${{ inputs.version }} ${{ inputs.pypi-token }}
