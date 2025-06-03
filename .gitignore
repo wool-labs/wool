@@ -1,8 +1,9 @@
 # Ignore all files with prefix "."...
 .*
 # ...except for
-!/.gitignore
 !/.github
+!/.gitignore
+!.gitkeep
 
 *.code-workspace
 *.egg-info
