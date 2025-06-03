@@ -1,8 +1,6 @@
 <a href="https://github.com/abdenlab/oxbow"><img align="center" src="./assets/woolly-transparent-bg-2048.png"></img></a>
 
-# Wool
-
-Wool is a native Python package for transparently executing tasks in a horizontally scalable, distributed network of agnostic worker processes. Any picklable async function or method can be converted into a task with a simple decorator and a client connection.
+**Wool** is a native Python package for transparently executing tasks in a horizontally scalable, distributed network of agnostic worker processes. Any picklable async function or method can be converted into a task with a simple decorator and a client connection.
 
 ## Installation
 
