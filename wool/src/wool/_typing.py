@@ -1,4 +1,8 @@
-from typing import Annotated, Callable, Literal, SupportsInt, TypeVar
+from typing import Annotated
+from typing import Callable
+from typing import Literal
+from typing import SupportsInt
+from typing import TypeVar
 
 from annotated_types import Gt
 

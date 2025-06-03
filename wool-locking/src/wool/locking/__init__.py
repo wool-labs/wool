@@ -1,18 +1,18 @@
 from contextvars import ContextVar
 from typing import Final
 
-from wool.locking._client import LockClient
+import wool
 from wool.locking._lock import lock
 from wool.locking._pool import LockPool
+from wool.locking._pool import pool
+from wool.locking._session import LockPoolSession
+from wool.locking._session import session
 
-__lock_client__: Final[ContextVar[LockClient]] = ContextVar("__wool_client__")
+__locking_session__: Final[ContextVar[wool.WorkerPoolSession]] = ContextVar(
+    "__locking_session__", default=wool.LocalSession()
+)
 
-__all__ = [
-    "LockClient",
-    "LockPool",
-    "lock",
-    "__lock_client__",
-]
+__all__ = ["LockPool", "LockPoolSession", "lock", "pool", "session"]
 
 for symbol in __all__:
     attribute = globals().get(symbol)

@@ -12,6 +12,13 @@ def italic(text: str) -> str:
 
 class WoolLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
+        """
+        Modify the log record to include a reference to the source file and
+        line number.
+
+        :param record: The log record to modify.
+        :return: True to indicate the record should be logged.
+        """
         pathname: str = record.pathname
         cwd: str = os.getcwd()
         if pathname.startswith(cwd):
