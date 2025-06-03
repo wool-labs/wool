@@ -23,10 +23,10 @@ from typing import cast
 from uuid import UUID
 from uuid import uuid4
 
-import wool
 from wool._event import TaskEvent
 from wool._future import Future
 from wool._pool import WorkerPoolSession
+from wool._session import current_session
 
 AsyncCallable = Callable[..., Coroutine]
 C = TypeVar("C", bound=AsyncCallable)
@@ -122,7 +122,7 @@ def task(fn: C) -> C:
         else:
             # Otherwise, submit the task to the pool.
             return _put(
-                __wool_session__ or wool.__wool_session__.get(),
+                __wool_session__ or current_session(),
                 wrapper.__module__,
                 wrapper.__qualname__,
                 function,
