@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package wool._mempool._metadata;
 
-message _Metadata {
+message _MetadataMessage {
   string ref = 1;
   bool mutable = 2;
   int64 size = 3;

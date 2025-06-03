@@ -3,11 +3,29 @@ import hashlib
 import mmap
 import os
 import pathlib
+import shutil
+from collections import namedtuple
 from contextlib import asynccontextmanager
+from dataclasses import asdict
+from dataclasses import fields
+from types import MappingProxyType
 
 import shortuuid
 
-from wool._mempool._metadata import Metadata
+from wool._mempool._metadata import MetadataMessage
+
+Metadata = namedtuple(
+    "Metadata",
+    [field.name for field in fields(MetadataMessage)],
+)
+
+
+class MetadataMapping:
+    def __init__(self, mapping) -> None:
+        self._mapping = MappingProxyType(mapping)
+
+    def __getitem__(self, key: str) -> Metadata:
+        return Metadata(**asdict(self._mapping[key]))
 
 
 class MemoryPool:
@@ -20,10 +38,14 @@ class MemoryPool:
         os.makedirs(self._lockdir, exist_ok=True)
         self._files = {}
         self._mmaps = {}
-        self._metadata: dict[str, Metadata] = {}
+        self._metadata: dict[str, MetadataMessage] = {}
 
     @property
-    def path(self):
+    def metadata(self) -> MetadataMapping:
+        return MetadataMapping(self._metadata)
+
+    @property
+    def path(self) -> pathlib.Path:
         return self._path
 
     async def map(self):
@@ -32,85 +54,81 @@ class MemoryPool:
                 async with self._reflock(ref):
                     self._map(ref)
 
-    async def put(self, dump, *, mutable=False):
-        async with self._reflock(ref := str(shortuuid.uuid())):
+    async def put(
+        self, dump: bytes, *, mutable: bool = False, ref: str | None = None
+    ) -> str:
+        async with self._reflock(ref := ref or str(shortuuid.uuid())):
             self._put(ref, dump, mutable=mutable, exist_ok=False)
             return ref
 
-    async def post(self, ref, dump):
+    async def post(self, ref: str, dump: bytes):
         async with self._reflock(ref):
             if ref not in self._mmaps:
                 self._map(ref)
             metamap, dumpmap = self._mmaps[ref]
             metamap.seek(0)
             metadata = self._metadata.setdefault(
-                ref, Metadata.loads(metamap.read())
+                ref, MetadataMessage.loads(metamap.read())
             )
             if not metadata.mutable:
                 raise ValueError("Cannot modify an immutable reference")
             if (size := len(dump)) != metadata.size:
-                _, dumpfile = self._files[ref]
                 try:
                     dumpmap.resize(size)
-                    dumpmap.seek(0)
-                    dumpmap.write(dump)
-                    dumpmap.flush()
+                    self._post(ref, dump, metadata)
                 except SystemError:
-                    dumpmap.close()
-                    dumpfile.close()
                     self._put(ref, dump, mutable=True, exist_ok=True)
                 return True
             elif hashlib.md5(dump).digest() != metadata.md5:
-                _, dumpmap = self._mmaps[ref]
-                dumpmap.seek(0)
-                dumpmap.write(dump)
-                dumpmap.flush()
+                self._post(ref, dump, metadata)
                 return True
             else:
                 return False
 
-    async def get(self, ref):
+    async def get(self, ref: str) -> bytes:
         async with self._reflock(ref):
             if ref not in self._mmaps:
                 self._map(ref)
             metamap, dumpmap = self._mmaps[ref]
             metamap.seek(0)
-            metadata = Metadata.loads(metamap.read())
+            metadata = MetadataMessage.loads(metamap.read())
             cached_metadata = self._metadata.setdefault(ref, metadata)
-            if (
-                metadata.mutable
-                and metadata.size != cached_metadata.size
-            ):
+            if metadata.mutable and metadata.size != cached_metadata.size:
                 # Dump size has changed, so we need to re-map it
                 self._map(ref)
             dumpmap.seek(0)
             return dumpmap.read()
 
-    async def delete(self, ref):
+    async def delete(self, ref: str):
         async with self._reflock(ref):
-            metamap, dumpmap = self._mmaps.pop(ref, (None, None))
-            metafile, dumpfile = self._files.pop(ref, (None, None))
+            if ref not in self._mmaps:
+                self._map(ref)
+            metamap, dumpmap = self._mmaps.pop(ref)
+            metafile, dumpfile = self._files.pop(ref)
+            if ref in self._metadata:
+                del self._metadata[ref]
             if metamap:
                 metamap.close()
             if dumpmap:
                 dumpmap.close()
             if metafile:
-                metapath = metafile.name
                 metafile.close()
-                try:
-                    os.remove(metapath)
-                except FileNotFoundError:
-                    pass
             if dumpfile:
-                dumppath = dumpfile.name
                 dumpfile.close()
-                try:
-                    os.remove(dumppath)
-                except FileNotFoundError:
-                    pass
+            try:
+                shutil.rmtree(self.path / ref)
+            except FileNotFoundError:
+                pass
 
-    def _put(self, ref, dump, *, mutable=False, exist_ok=False):
-        metadata = Metadata(
+    def _put(
+        self,
+        ref: str,
+        dump: bytes,
+        *,
+        mutable: bool = False,
+        exist_ok: bool = False,
+    ):
+        metadata = MetadataMessage(
             ref=ref,
             mutable=mutable,
             size=len(dump),
@@ -129,7 +147,18 @@ class MemoryPool:
         self._map(ref)
         self._metadata[ref] = metadata
 
-    def _map(self, ref):
+    def _post(self, ref: str, dump: bytes, metadata: MetadataMessage):
+        metamap, dumpmap = self._mmaps[ref]
+        metadata.size = len(dump)
+        metadata.md5 = hashlib.md5(dump).digest()
+        metamap.seek(0)
+        metamap.write(metadata.dumps())
+        metamap.flush()
+        dumpmap.seek(0)
+        dumpmap.write(dump)
+        dumpmap.flush()
+
+    def _map(self, ref: str):
         refpath = pathlib.Path(self._path, f"{ref}")
         metafile = open(refpath / "meta", "r+b")
         metamap = mmap.mmap(metafile.fileno(), 0, flags=mmap.MAP_SHARED)
@@ -141,24 +170,24 @@ class MemoryPool:
         if cached_dumpfile:
             cached_dumpfile.close()
         cached_metamap, cached_dumpmap = self._mmaps.pop(ref, (None, None))
-        if cached_metamap:
+        if cached_metamap is not None and not cached_metamap.closed:
             cached_metamap.close()
-        if cached_dumpmap:
+        if cached_dumpmap is not None and not cached_dumpmap.closed:
             cached_dumpmap.close()
         self._files[ref] = (metafile, dumpfile)
         self._mmaps[ref] = (metamap, dumpmap)
 
-    def _lockpath(self, ref):
+    def _lockpath(self, ref: str):
         return pathlib.Path(self._lockdir, f"{ref}.lock")
 
-    def _acquire(self, ref):
+    def _acquire(self, ref: str):
         try:
             os.symlink(f"{ref}", self._lockpath(ref))
             return True
         except FileExistsError:
             return False
 
-    def _release(self, ref):
+    def _release(self, ref: str):
         try:
             if os.path.islink(lock_path := self._lockpath(ref)):
                 os.unlink(lock_path)
@@ -166,7 +195,7 @@ class MemoryPool:
             pass
 
     @asynccontextmanager
-    async def _reflock(self, ref):
+    async def _reflock(self, ref: str):
         try:
             while not self._acquire(ref):
                 await asyncio.sleep(0)

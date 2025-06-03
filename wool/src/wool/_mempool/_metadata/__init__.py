@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 
 try:
-    from wool._mempool._metadata._metadata_pb2 import _Metadata
+    from wool._mempool._metadata._metadata_pb2 import _MetadataMessage
 except ImportError:
     logging.error(
         "Failed to import _Metadata. Ensure protocol buffers are compiled."
@@ -13,15 +13,15 @@ except ImportError:
 
 
 @dataclass
-class Metadata:
+class MetadataMessage:
     ref: str
     mutable: bool
     size: int
     md5: bytes
 
     @classmethod
-    def loads(cls, data: bytes) -> Metadata:
-        (metadata := _Metadata()).ParseFromString(data)
+    def loads(cls, data: bytes) -> MetadataMessage:
+        (metadata := _MetadataMessage()).ParseFromString(data)
         return cls(
             ref=metadata.ref,
             mutable=metadata.mutable,
@@ -30,9 +30,9 @@ class Metadata:
         )
 
     def dumps(self) -> bytes:
-        return _Metadata(
+        return _MetadataMessage(
             ref=self.ref, mutable=self.mutable, size=self.size, md5=self.md5
         ).SerializeToString()
 
 
-__all__ = ["Metadata"]
+__all__ = ["MetadataMessage"]
