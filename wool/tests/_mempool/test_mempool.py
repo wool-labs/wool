@@ -32,6 +32,14 @@ class TestMemoryPool:
                 assert MetadataMessage.loads(metamap.read()).ref == ref
                 dumpmap.seek(0)
                 assert dumpmap.read() == f"Ad {ref}".encode()
+        try:
+            await mempool.map("foo")
+        except FileNotFoundError:
+            pass
+        else:
+            assert False, (
+                "Expected FileNotFoundError when mapping a non-existent ref"
+            )
 
     @pytest.mark.parametrize("mutable", [True, False])
     @pytest.mark.asyncio
