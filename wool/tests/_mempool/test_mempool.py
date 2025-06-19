@@ -1,28 +1,14 @@
 import hashlib
-import pathlib
-import shutil
-import tempfile
 
 import pytest
-import pytest_asyncio
 
 from wool._mempool import MemoryPool
 from wool._mempool._metadata import MetadataMessage
 
 
-@pytest_asyncio.fixture
-async def seed():
-    mempath = pathlib.Path(tempfile.mkdtemp())
-    mempool = MemoryPool(mempath)
-    await mempool.put(b"Ad meliora", mutable=True, ref="meliora")
-    await mempool.put(b"Ad aevum", mutable=False, ref="aevum")
-    yield mempool
-    shutil.rmtree(mempath)
-
-
 class TestMemoryPool:
     @pytest.mark.asyncio
-    async def test_map(self, seed):
+    async def test_map(self, seed: MemoryPool):
         mempool = MemoryPool(seed.path)
         for _ in range(2):
             await mempool.map()
@@ -32,10 +18,18 @@ class TestMemoryPool:
                 assert MetadataMessage.loads(metamap.read()).ref == ref
                 dumpmap.seek(0)
                 assert dumpmap.read() == f"Ad {ref}".encode()
+        try:
+            await mempool.map("foo")
+        except FileNotFoundError:
+            pass
+        else:
+            assert False, (
+                "Expected FileNotFoundError when mapping a non-existent ref"
+            )
 
     @pytest.mark.parametrize("mutable", [True, False])
     @pytest.mark.asyncio
-    async def test_put(self, seed, mutable):
+    async def test_put(self, seed: MemoryPool, mutable: bool):
         await (mempool := MemoryPool(seed.path)).map()
         prior = None
         for _ in range(2):
@@ -132,7 +126,7 @@ class TestMemoryPool:
             )
 
     @pytest.mark.asyncio
-    async def test_get(self, seed):
+    async def test_get(self, seed: MemoryPool):
         # Non-existent ref
         try:
             await seed.get("foo")

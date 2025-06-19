@@ -15,7 +15,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "ruff"]
+dev = ["pytest", "pytest-asyncio", "pytest-grpc-aio", "ruff"]
 locking = ["wool-locking"]
 
 [project.scripts]
@@ -23,7 +23,7 @@ wool = "wool._cli:cli"
 
 [tool.hatch.build.hooks.protobuf]
 dependencies = ["hatch-protobuf"]
-generate_grpc = false
+generate_grpc = true
 generate_pyi = true
 output_path = "src/wool/_protobuf"
 proto_paths = ["protobuf"]
@@ -44,6 +44,9 @@ path = "../build-hooks/build.py"
 
 [tool.hatch.metadata.hooks.custom]
 path = "../build-hooks/metadata.py"
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "session"
 
 [tool.ruff]
 line-length = 79
