@@ -6,32 +6,23 @@ import mmap
 import os
 import pathlib
 import shutil
-from collections import namedtuple
 from contextlib import asynccontextmanager
-from dataclasses import asdict
-from dataclasses import fields
-from types import MappingProxyType
+from typing import BinaryIO
 from typing import Self
 
 import shortuuid
 
 from wool._mempool._metadata import MetadataMessage
 
-Metadata = namedtuple(
-    "Metadata",
-    [field.name for field in fields(MetadataMessage)],
-)
-
-
-class MetadataMapping:
-    def __init__(self, mapping) -> None:
-        self._mapping = MappingProxyType(mapping)
-
-    def __getitem__(self, key: str) -> Metadata:
-        return Metadata(**asdict(self._mapping[key]))
-
 
 class SharedObject:
+    _id: str
+    _mempool: MemoryPool
+    _file: BinaryIO
+    _mmap: mmap.mmap
+    _size: int
+    _md5: bytes
+
     def __init__(self, id: str, *, mempool: MemoryPool):
         self._id = id
         self._mempool = mempool
@@ -53,7 +44,7 @@ class SharedObject:
     @property
     def metadata(self) -> SharedObjectMetadata:
         return SharedObjectMetadata(self.id, mempool=self._mempool)
-    
+
     @property
     def mmap(self) -> mmap.mmap:
         return self._mmap
@@ -79,6 +70,10 @@ class SharedObject:
 
 
 class SharedObjectMetadata:
+    _id: str
+    _mempool: MemoryPool
+    _file: BinaryIO
+    _mmap: mmap.mmap
     _instances: dict[str, SharedObjectMetadata] = {}
 
     def __new__(cls, id: str, *, mempool: MemoryPool):
@@ -114,7 +109,7 @@ class SharedObjectMetadata:
     @property
     def md5(self) -> bytes:
         return self._metadata.md5
-    
+
     @property
     def mmap(self) -> mmap.mmap:
         return self._mmap
@@ -180,7 +175,7 @@ class MemoryPool:
             self._put(ref, dump, mutable=mutable, exist_ok=False)
             return ref
 
-    async def post(self, ref: str, dump: bytes):
+    async def post(self, ref: str, dump: bytes) -> bool:
         async with self._delete_lock(ref):
             pass
         async with self._reference_lock(ref):
@@ -267,10 +262,10 @@ class MemoryPool:
             obj.mmap.close()
         self._objects[ref] = SharedObject(id=ref, mempool=self)
 
-    def _lockpath(self, key: str):
+    def _lockpath(self, key: str) -> pathlib.Path:
         return pathlib.Path(self._lockdir, f"{key}.lock")
 
-    def _acquire(self, key: str):
+    def _acquire(self, key: str) -> bool:
         try:
             os.symlink(f"{key}", self._lockpath(key))
             return True

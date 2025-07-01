@@ -1,5 +1,4 @@
 import asyncio
-import pickle
 from contextlib import contextmanager
 from time import perf_counter
 from unittest.mock import MagicMock
@@ -161,48 +160,47 @@ class TestMemoryPoolService:
     ):
         reference = Reference.new("meliora", mempool=seed)
 
-        request = proto.Request(
+        request = proto.AcquireRequest(
             session=proto.Session(id=session.id),
             reference=proto.Reference(id=reference.id),
         )
-        response: proto.Response = await grpc_aio_stub.acquire(request)
-        assert response.dump == b""
+        await grpc_aio_stub.acquire(request)
         assert session.id in Session.sessions
         assert reference in session.references
 
     async def test_put(
         self, grpc_aio_stub: MemoryPoolStub, session: Session, seed: MemoryPool
     ):
-        request = proto.Put(
+        request = proto.PutRequest(
             session=proto.Session(id=session.id),
             dump=b"test_data",
             mutable=False,
         )
-        response: proto.Response = await grpc_aio_stub.put(request)
-        await seed.map(pickle.loads(response.dump))
-        assert pickle.loads(response.dump) in seed
+        response: proto.PutResponse = await grpc_aio_stub.put(request)
+        await seed.map(response.reference.id)
+        assert response.reference.id in seed
 
     async def test_post(
         self, grpc_aio_stub: MemoryPoolStub, session: Session, seed: MemoryPool
     ):
         reference = Reference.new("meliora", mempool=seed)
-        request = proto.Post(
+        request = proto.PostRequest(
             session=proto.Session(id=session.id),
             reference=proto.Reference(id=reference.id),
             dump=b"updated_data",
         )
-        response: proto.Response = await grpc_aio_stub.post(request)
-        assert pickle.loads(response.dump) is True
+        response: proto.PostResponse = await grpc_aio_stub.post(request)
+        assert response.updated is True
 
     async def test_get(
         self, grpc_aio_stub: MemoryPoolStub, session: Session, seed: MemoryPool
     ):
         reference = Reference.new("meliora", mempool=seed)
-        request = proto.Request(
+        request = proto.GetRequest(
             session=proto.Session(id=session.id),
             reference=proto.Reference(id=reference.id),
         )
-        response: proto.Response = await grpc_aio_stub.get(request)
+        response: proto.GetResponse = await grpc_aio_stub.get(request)
         assert response.dump == b"Ad meliora"
 
     async def test_release(
@@ -211,7 +209,7 @@ class TestMemoryPoolService:
         reference = Reference.new("meliora", mempool=seed)
         session.references.add(reference)
 
-        request = proto.Request(
+        request = proto.ReleaseRequest(
             session=proto.Session(id=session.id),
             reference=proto.Reference(id=reference.id),
         )

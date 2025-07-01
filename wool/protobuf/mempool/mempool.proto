@@ -3,41 +3,71 @@ syntax = "proto3";
 package wool._protobuf.mempool;
 
 service MemoryPool {
-    rpc acquire (Request) returns (Response);
-    rpc put (Put) returns (Response);
-    rpc post (Post) returns (Response);
-    rpc get (Request) returns (Response);
-    rpc release (Request) returns (Response);
     rpc session (SessionRequest) returns (stream SessionResponse);
+    rpc acquire (AcquireRequest) returns (AcquireResponse);
+    rpc put (PutRequest) returns (PutResponse);
+    rpc post (PostRequest) returns (PostResponse);
+    rpc get (GetRequest) returns (GetResponse);
+    rpc release (ReleaseRequest) returns (ReleaseResponse);
 }
 
-message Request {
+message SessionRequest {
+}
+
+message SessionResponse {
+    oneof response {
+        Session session = 1;
+        Event event = 2;
+    }
+}
+
+message AcquireRequest {
     Reference reference = 1;
     Session session = 2;
 }
 
-message Reference {
-    string id = 1;
+message AcquireResponse {
 }
 
-message Put {
+message PutRequest {
     Session session = 1;
     bool mutable = 2;
     bytes dump = 3;
 }
 
-message Post {
+message PutResponse {
+    Reference reference = 1;
+}
+
+message PostRequest {
     Session session = 1;
     Reference reference = 2;
     bytes dump = 3;
 }
 
-message Response {
-    bool success = 1;
-    bytes dump = 2;
+message PostResponse {
+    bool updated = 1;
 }
 
-message SessionRequest {
+message GetRequest {
+    Reference reference = 1;
+    Session session = 2;
+}
+
+message GetResponse {
+    bytes dump = 1;
+}
+
+message ReleaseRequest {
+    Reference reference = 1;
+    Session session = 2;
+}
+
+message ReleaseResponse {
+}
+
+message Reference {
+    string id = 1;
 }
 
 message Session {
@@ -47,11 +77,4 @@ message Session {
 message Event {
     Reference reference = 1;
     string event_type = 2;
-}
-
-message SessionResponse {
-    oneof response {
-        Session session = 1;
-        Event event = 2;
-    }
 }
