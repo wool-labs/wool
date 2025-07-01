@@ -160,7 +160,6 @@ class MemoryPoolService(rpc.MemoryPoolServicer):
     async def get(
         self, request: proto.Request, context: ServicerContext
     ) -> proto.Response:
-        await self._mempool.map(request.reference.id)
         dump = await self._mempool.get(request.reference.id)
         return proto.Response(dump=dump)
 

@@ -9,12 +9,16 @@ from wool._mempool._service import MemoryPoolService
 
 @pytest_asyncio.fixture(scope="function")
 async def seed():
-    mempool = MemoryPool()
-    await mempool.put(b"Ad meliora", mutable=True, ref="meliora")
-    await mempool.put(b"Ad aevum", mutable=False, ref="aevum")
-    yield mempool
-    shutil.rmtree(mempool.path)
-    del mempool
+    mempool = None
+    try:
+        mempool = MemoryPool()
+        await mempool.put(b"Ad meliora", mutable=True, ref="meliora")
+        await mempool.put(b"Ad aevum", mutable=False, ref="aevum")
+        yield mempool
+    finally:
+        if mempool:
+            shutil.rmtree(mempool.path)
+            del mempool
 
 
 @pytest.fixture(scope="session")
