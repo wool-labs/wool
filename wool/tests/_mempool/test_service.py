@@ -10,7 +10,6 @@ from wool._mempool import MemoryPool
 from wool._mempool._service import Reference
 from wool._mempool._service import Session
 from wool._protobuf.mempool import mempool_pb2 as proto
-from wool._protobuf.mempool.mempool_pb2_grpc import MemoryPoolStub
 
 
 @contextmanager
@@ -121,18 +120,11 @@ class TestMemoryPoolService:
     async def test_session(self, grpc_aio_stub):
         async with grpc_aio_stub() as stub:
             call = stub.session(proto.SessionRequest())
-            try:
-                response: proto.SessionResponse = await call.read()
-            except Exception as e:
-                raise e
+            response: proto.SessionResponse = await call.read()
             assert response.session.id in Session.sessions
             call.cancel()
-            try:
+            with pytest.raises(asyncio.CancelledError):
                 await call.read()
-            except asyncio.CancelledError:
-                pass
-            else:
-                assert False, "Expected CancelledError"
             with timer() as elapsed:
                 while elapsed() < 1:
                     await asyncio.sleep(0)
@@ -199,10 +191,15 @@ class TestMemoryPoolService:
         async with grpc_aio_stub() as stub:
             reference = Reference.new("meliora", mempool=seed)
             session.references.add(reference)
-
             request = proto.ReleaseRequest(
                 session=proto.Session(id=session.id),
                 reference=proto.Reference(id=reference.id),
+            )
+            await stub.acquire(
+                proto.AcquireRequest(
+                    session=proto.Session(id=session.id),
+                    reference=proto.Reference(id=reference.id),
+                )
             )
             await stub.release(request)
             assert reference not in session.references

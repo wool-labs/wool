@@ -53,11 +53,16 @@ class Reference:
         WeakValueDictionary()
     )
     _to_delete: Final[set[str]] = set()
+    _initialized: bool = False
+
+    @classmethod
+    def get(cls, id: str) -> Reference | None:
+        return cls._references.get(id)
 
     @classmethod
     def new(cls, id: str, *, mempool: MemoryPool) -> Reference:
         if id in cls._references:
-            raise ValueError(f"Session {id} already exists")
+            raise ValueError(f"Reference {id} already exists")
         return cls(id, mempool=mempool)
 
     def __new__(cls, id: str, *, mempool: MemoryPool):
@@ -68,10 +73,12 @@ class Reference:
         return super().__new__(cls)
 
     def __init__(self, id: str, *, mempool: MemoryPool):
-        self.id = id
-        self.mempool = mempool
-        self.sessions = WeakSet()
-        self._references[id] = self
+        if not self._initialized:
+            self.id = id
+            self.mempool = mempool
+            self.sessions = WeakSet()
+            self._references[id] = self
+            self._initialized = True
 
     def __eq__(self, other) -> bool:
         if isinstance(other, Reference):
@@ -120,12 +127,25 @@ class MemoryPoolService(rpc.MemoryPoolServicer):
     ) -> proto.AcquireResponse:
         if not (session := Session.get(request.session.id)):
             raise ValueError(f"Session {request.session.id} not found")
+        if not (reference := Reference.get(request.reference.id)):
+            raise ValueError(f"Reference {request.reference.id} not found")
+        session.references.add(reference)
+        reference.sessions.add(session)
+        return proto.AcquireResponse()
+
+    async def map(
+        self, request: proto.AcquireRequest, context: ServicerContext
+    ) -> proto.AcquireResponse:
+        if not (session := Session.get(request.session.id)):
+            raise ValueError(f"Session {request.session.id} not found")
         await self._mempool.map(request.reference.id)
-        session.references.add(
-            Reference(
-                id=request.reference.id,
-                mempool=self._mempool,
-            )
+        reference = Reference(request.reference.id, mempool=self._mempool)
+        await self.acquire(
+            proto.AcquireRequest(
+                session=proto.Session(id=session.id),
+                reference=proto.Reference(id=reference.id),
+            ),
+            context,
         )
         return proto.AcquireResponse()
 
@@ -138,19 +158,48 @@ class MemoryPoolService(rpc.MemoryPoolServicer):
             id=await self._mempool.put(request.dump, mutable=request.mutable),
             mempool=self._mempool,
         )
-        session.references.add(
-            Reference(
-                id=reference.id,
-                mempool=self._mempool,
-            )
+        await self.acquire(
+            proto.AcquireRequest(
+                session=proto.Session(id=session.id),
+                reference=proto.Reference(id=reference.id),
+            ),
+            context,
         )
         return proto.PutResponse(reference=proto.Reference(id=reference.id))
+
+    async def get(
+        self, request: proto.GetRequest, context: ServicerContext
+    ) -> proto.GetResponse:
+        if not (session := Session.get(request.session.id)):
+            raise ValueError(f"Session {request.session.id} not found")
+        if not (reference := Reference.get(request.reference.id)):
+            raise ValueError(f"Reference {request.reference.id} not found")
+        if reference not in session.references:
+            await self.acquire(
+                proto.AcquireRequest(
+                    session=proto.Session(id=session.id),
+                    reference=proto.Reference(id=reference.id),
+                ),
+                context,
+            )
+        dump = await self._mempool.get(reference.id)
+        return proto.GetResponse(dump=dump)
 
     async def post(
         self, request: proto.PostRequest, context: ServicerContext
     ) -> proto.PostResponse:
         if not (session := Session.get(request.session.id)):
             raise ValueError(f"Session {request.session.id} not found")
+        if not (reference := Reference.get(request.reference.id)):
+            raise ValueError(f"Reference {request.reference.id} not found")
+        if reference not in session.references:
+            await self.acquire(
+                proto.AcquireRequest(
+                    session=proto.Session(id=session.id),
+                    reference=proto.Reference(id=reference.id),
+                ),
+                context,
+            )
         updated = await self._mempool.post(request.reference.id, request.dump)
         if updated:
             for session in Reference(
@@ -164,22 +213,13 @@ class MemoryPoolService(rpc.MemoryPoolServicer):
                     await session.queue.put(proto.SessionResponse(event=event))
         return proto.PostResponse(updated=updated)
 
-    async def get(
-        self, request: proto.GetRequest, context: ServicerContext
-    ) -> proto.GetResponse:
-        if not Session.get(request.session.id):
-            raise ValueError(f"Session {request.session.id} not found")
-        dump = await self._mempool.get(request.reference.id)
-        return proto.GetResponse(dump=dump)
-
     async def release(
         self, request: proto.ReleaseRequest, context: ServicerContext
     ) -> proto.ReleaseResponse:
         if not (session := Session.get(request.session.id)):
             raise ValueError(f"Session {request.session.id} not found")
-        reference = Reference(
-            id=request.reference.id,
-            mempool=self._mempool,
-        )
+        if not (reference := Reference.get(request.reference.id)):
+            raise ValueError(f"Reference {request.reference.id} not found")
         session.references.remove(reference)
+        reference.sessions.remove(session)
         return proto.ReleaseResponse()
