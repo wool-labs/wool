@@ -8,7 +8,11 @@ import pathlib
 import shutil
 from contextlib import asynccontextmanager
 from typing import BinaryIO
-from typing import Self
+
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 import shortuuid
 
