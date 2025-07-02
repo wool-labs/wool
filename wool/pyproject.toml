@@ -15,7 +15,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "pytest-grpc-aio", "ruff"]
+dev = ["pytest", "pytest-asyncio", "pytest-grpc-aio~=0.2.0", "ruff"]
 locking = ["wool-locking"]
 
 [project.scripts]
@@ -44,9 +44,6 @@ path = "../build-hooks/build.py"
 
 [tool.hatch.metadata.hooks.custom]
 path = "../build-hooks/metadata.py"
-
-[tool.pytest.ini_options]
-asyncio_default_fixture_loop_scope = "session"
 
 [tool.ruff]
 line-length = 79

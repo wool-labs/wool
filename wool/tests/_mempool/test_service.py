@@ -5,7 +5,6 @@ from unittest.mock import MagicMock
 from weakref import WeakSet
 
 import pytest
-import pytest_asyncio
 
 from wool._mempool import MemoryPool
 from wool._mempool._service import Reference
@@ -16,22 +15,8 @@ from wool._protobuf.mempool.mempool_pb2_grpc import MemoryPoolStub
 
 @contextmanager
 def timer():
-    """
-    Context manager to measure the execution time of a code block.
-
-    :return: A function to retrieve the elapsed time.
-    """
     start = perf_counter()
     yield lambda: perf_counter() - start
-
-
-@pytest_asyncio.fixture(scope="session")
-async def event_loop():
-    loop = asyncio.get_event_loop()
-    yield loop
-    await asyncio.gather(
-        *(t for t in asyncio.all_tasks() if t is not asyncio.current_task())
-    )
 
 
 @pytest.fixture(scope="function")
@@ -133,85 +118,91 @@ class TestMemoryPoolService:
         Session.sessions.clear()
         Reference._references.clear()
 
-    async def test_session(self, grpc_aio_stub: MemoryPoolStub):
-        call = grpc_aio_stub.session(proto.SessionRequest())
-        try:
-            response: proto.SessionResponse = await call.read()
-        except Exception as e:
-            raise e
-        assert response.session.id in Session.sessions
-        call.cancel()
-        try:
-            await call.read()
-        except asyncio.CancelledError:
-            pass
-        else:
-            assert False, "Expected CancelledError"
-        with timer() as elapsed:
-            while elapsed() < 1:
-                await asyncio.sleep(0)
-                if response.session.id not in Session.sessions:
-                    break
+    async def test_session(self, grpc_aio_stub):
+        async with grpc_aio_stub() as stub:
+            call = stub.session(proto.SessionRequest())
+            try:
+                response: proto.SessionResponse = await call.read()
+            except Exception as e:
+                raise e
+            assert response.session.id in Session.sessions
+            call.cancel()
+            try:
+                await call.read()
+            except asyncio.CancelledError:
+                pass
             else:
-                assert False, "Session was not deleted in time"
+                assert False, "Expected CancelledError"
+            with timer() as elapsed:
+                while elapsed() < 1:
+                    await asyncio.sleep(0)
+                    if response.session.id not in Session.sessions:
+                        break
+                else:
+                    assert False, "Session was not deleted in time"
 
     async def test_acquire(
-        self, grpc_aio_stub: MemoryPoolStub, session: Session, seed: MemoryPool
+        self, grpc_aio_stub, session: Session, seed: MemoryPool
     ):
-        reference = Reference.new("meliora", mempool=seed)
+        async with grpc_aio_stub() as stub:
+            reference = Reference.new("meliora", mempool=seed)
 
-        request = proto.AcquireRequest(
-            session=proto.Session(id=session.id),
-            reference=proto.Reference(id=reference.id),
-        )
-        await grpc_aio_stub.acquire(request)
-        assert session.id in Session.sessions
-        assert reference in session.references
+            request = proto.AcquireRequest(
+                session=proto.Session(id=session.id),
+                reference=proto.Reference(id=reference.id),
+            )
+            await stub.acquire(request)
+            assert session.id in Session.sessions
+            assert reference in session.references
 
     async def test_put(
-        self, grpc_aio_stub: MemoryPoolStub, session: Session, seed: MemoryPool
+        self, grpc_aio_stub, session: Session, seed: MemoryPool
     ):
-        request = proto.PutRequest(
-            session=proto.Session(id=session.id),
-            dump=b"test_data",
-            mutable=False,
-        )
-        response: proto.PutResponse = await grpc_aio_stub.put(request)
-        await seed.map(response.reference.id)
-        assert response.reference.id in seed
+        async with grpc_aio_stub() as stub:
+            request = proto.PutRequest(
+                session=proto.Session(id=session.id),
+                dump=b"test_data",
+                mutable=False,
+            )
+            response: proto.PutResponse = await stub.put(request)
+            await seed.map(response.reference.id)
+            assert response.reference.id in seed
 
     async def test_post(
-        self, grpc_aio_stub: MemoryPoolStub, session: Session, seed: MemoryPool
+        self, grpc_aio_stub, session: Session, seed: MemoryPool
     ):
-        reference = Reference.new("meliora", mempool=seed)
-        request = proto.PostRequest(
-            session=proto.Session(id=session.id),
-            reference=proto.Reference(id=reference.id),
-            dump=b"updated_data",
-        )
-        response: proto.PostResponse = await grpc_aio_stub.post(request)
-        assert response.updated is True
+        async with grpc_aio_stub() as stub:
+            reference = Reference.new("meliora", mempool=seed)
+            request = proto.PostRequest(
+                session=proto.Session(id=session.id),
+                reference=proto.Reference(id=reference.id),
+                dump=b"updated_data",
+            )
+            response: proto.PostResponse = await stub.post(request)
+            assert response.updated is True
 
     async def test_get(
-        self, grpc_aio_stub: MemoryPoolStub, session: Session, seed: MemoryPool
+        self, grpc_aio_stub, session: Session, seed: MemoryPool
     ):
-        reference = Reference.new("meliora", mempool=seed)
-        request = proto.GetRequest(
-            session=proto.Session(id=session.id),
-            reference=proto.Reference(id=reference.id),
-        )
-        response: proto.GetResponse = await grpc_aio_stub.get(request)
-        assert response.dump == b"Ad meliora"
+        async with grpc_aio_stub() as stub:
+            reference = Reference.new("meliora", mempool=seed)
+            request = proto.GetRequest(
+                session=proto.Session(id=session.id),
+                reference=proto.Reference(id=reference.id),
+            )
+            response: proto.GetResponse = await stub.get(request)
+            assert response.dump == b"Ad meliora"
 
     async def test_release(
-        self, grpc_aio_stub: MemoryPoolStub, session: Session, seed: MemoryPool
+        self, grpc_aio_stub, session: Session, seed: MemoryPool
     ):
-        reference = Reference.new("meliora", mempool=seed)
-        session.references.add(reference)
+        async with grpc_aio_stub() as stub:
+            reference = Reference.new("meliora", mempool=seed)
+            session.references.add(reference)
 
-        request = proto.ReleaseRequest(
-            session=proto.Session(id=session.id),
-            reference=proto.Reference(id=reference.id),
-        )
-        await grpc_aio_stub.release(request)
-        assert reference not in session.references
+            request = proto.ReleaseRequest(
+                session=proto.Session(id=session.id),
+                reference=proto.Reference(id=reference.id),
+            )
+            await stub.release(request)
+            assert reference not in session.references
