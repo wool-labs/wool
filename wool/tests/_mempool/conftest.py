@@ -1,4 +1,4 @@
-import shutil
+import tempfile
 
 import pytest
 import pytest_asyncio
@@ -11,17 +11,17 @@ from wool._mempool._service import MemoryPoolService
 async def seed():
     mempool = None
     try:
-        mempool = MemoryPool()
-        await mempool.put(b"Ad meliora", mutable=True, ref="meliora")
-        await mempool.put(b"Ad aevum", mutable=False, ref="aevum")
-        yield mempool
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mempool = MemoryPool(path=tmpdir)
+            await mempool.put(b"Ad meliora", mutable=True, ref="meliora")
+            await mempool.put(b"Ad aevum", mutable=False, ref="aevum")
+            yield mempool
     finally:
         if mempool:
-            shutil.rmtree(mempool.path)
             del mempool
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 def grpc_add_to_server():
     from wool._protobuf.mempool.mempool_pb2_grpc import (
         add_MemoryPoolServicer_to_server,
@@ -30,12 +30,12 @@ def grpc_add_to_server():
     return add_MemoryPoolServicer_to_server
 
 
-@pytest.fixture(scope="session")
-def grpc_servicer():
-    return MemoryPoolService()
+@pytest.fixture(scope="function")
+def grpc_servicer(seed):
+    return MemoryPoolService(mempool=seed)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 def grpc_stub_cls():
     from wool._protobuf.mempool.mempool_pb2_grpc import MemoryPoolStub
 

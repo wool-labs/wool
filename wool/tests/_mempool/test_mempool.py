@@ -19,14 +19,8 @@ class TestMemoryPool:
                 dumpmap = mempool._objects[ref].mmap
                 dumpmap.seek(0)
                 assert dumpmap.read() == f"Ad {ref}".encode()
-        try:
+        with pytest.raises(FileNotFoundError):
             await mempool.map("foo")
-        except FileNotFoundError:
-            pass
-        else:
-            assert False, (
-                "Expected FileNotFoundError when mapping a non-existent ref"
-            )
 
     @pytest.mark.parametrize("mutable", [True, False])
     @pytest.mark.asyncio
@@ -53,15 +47,8 @@ class TestMemoryPool:
                 dump = dumpmap.read()
                 assert dump == dumpfile.read()
                 assert dump == expected
-            try:
+            with pytest.raises(FileExistsError):
                 await mempool.put(dump, mutable=mutable, ref=ref)
-            except FileExistsError:
-                pass
-            else:
-                assert False, (
-                    "Expected FileExistsError to be raised when putting an "
-                    "existent reference."
-                )
 
     @pytest.mark.parametrize(
         "dump", [b"Ad meliora", b"Carpe diem", b"Ad meliora"[::-1]]
@@ -85,14 +72,8 @@ class TestMemoryPool:
         ref = "aevum"
         mempool = MemoryPool(seed.path)
         await mempool.map()
-        try:
-            assert not await mempool.post(ref, dump)
-        except ValueError:
-            pass
-        else:
-            assert False, (
-                "Expected ValueError when posting to an immutable reference"
-            )
+        with pytest.raises(ValueError):
+            await mempool.post(ref, dump)
 
     @pytest.mark.parametrize(
         "dump", [b"Ad meliora", b"Carpe diem", b"Ad meliora"[::-1]]
@@ -116,26 +97,14 @@ class TestMemoryPool:
     ):
         ref = "aevum"
         mempool = MemoryPool(seed.path)
-        try:
-            assert not await mempool.post(ref, dump)
-        except ValueError:
-            pass
-        else:
-            assert False, (
-                "Expected ValueError when posting to an immutable reference"
-            )
+        with pytest.raises(ValueError):
+            await mempool.post(ref, dump)
 
     @pytest.mark.asyncio
     async def test_get(self, seed: MemoryPool):
         # Non-existent ref
-        try:
+        with pytest.raises(FileNotFoundError):
             await seed.get("foo")
-        except FileNotFoundError:
-            pass
-        else:
-            assert False, (
-                "Expected FileNotFoundError when getting a non-existent ref"
-            )
 
         # Existent ref, unmapped
         assert (
@@ -153,14 +122,8 @@ class TestMemoryPool:
     @pytest.mark.asyncio
     async def test_delete(self, seed):
         # Non-existent ref
-        try:
+        with pytest.raises(FileNotFoundError):
             await seed.delete("foo")
-        except FileNotFoundError:
-            pass
-        else:
-            assert False, (
-                "Expected FileNotFoundError when getting a non-existent ref"
-            )
 
         # Existent ref, unmapped
         await (mempool := MemoryPool(seed.path)).delete("meliora")

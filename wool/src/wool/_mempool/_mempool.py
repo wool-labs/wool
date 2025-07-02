@@ -158,30 +158,32 @@ class MemoryPool:
 
     async def map(self, ref: str | None = None):
         if ref is not None and ref not in self._objects:
-            async with self._delete_lock(ref):
-                pass
+            if self._locked(f"delete-{ref}"):
+                raise RuntimeError(
+                    f"Reference {ref} is currently locked for deletion"
+                )
             async with self._reference_lock(ref):
                 self._map(ref)
         else:
             for entry in os.scandir(self._path):
                 if entry.is_dir() and (ref := entry.name) != "locks":
-                    async with self._delete_lock(ref):
-                        pass
-                    async with self._reference_lock(ref):
-                        self._map(ref)
+                    if not self._locked(f"delete-{ref}"):
+                        async with self._reference_lock(ref):
+                            self._map(ref)
 
     async def put(
         self, dump: bytes, *, mutable: bool = False, ref: str | None = None
     ) -> str:
-        async with self._delete_lock(ref := ref or str(shortuuid.uuid())):
-            pass
+        ref = ref or str(shortuuid.uuid())
         async with self._reference_lock(ref):
             self._put(ref, dump, mutable=mutable, exist_ok=False)
             return ref
 
     async def post(self, ref: str, dump: bytes) -> bool:
-        async with self._delete_lock(ref):
-            pass
+        if self._locked(f"delete-{ref}"):
+            raise RuntimeError(
+                f"Reference {ref} is currently locked for deletion"
+            )
         async with self._reference_lock(ref):
             if ref not in self._objects:
                 self._map(ref)
@@ -202,8 +204,10 @@ class MemoryPool:
                 return False
 
     async def get(self, ref: str) -> bytes:
-        async with self._delete_lock(ref):
-            pass
+        if self._locked(f"delete-{ref}"):
+            raise RuntimeError(
+                f"Reference {ref} is currently locked for deletion"
+            )
         async with self._reference_lock(ref):
             if ref not in self._objects:
                 self._map(ref)
@@ -263,7 +267,7 @@ class MemoryPool:
     def _map(self, ref: str):
         obj = self._objects.pop(ref, None)
         if obj:
-            obj.mmap.close()
+            obj.close()
         self._objects[ref] = SharedObject(id=ref, mempool=self)
 
     def _lockpath(self, key: str) -> pathlib.Path:
@@ -282,6 +286,9 @@ class MemoryPool:
                 os.unlink(lock_path)
         except FileNotFoundError:
             pass
+
+    def _locked(self, key: str) -> bool:
+        return os.path.islink(self._lockpath(key))
 
     @asynccontextmanager
     async def _reference_lock(self, ref: str):
