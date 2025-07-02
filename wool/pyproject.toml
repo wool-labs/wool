@@ -5,7 +5,16 @@ requires = ["debugpy", "hatchling", "packaging", "GitPython", "toml"]
 [project]
 authors = [{ name = "Conrad Bzura", email = "conrad@wool.io" }]
 classifiers = ["Intended Audience :: Developers"]
-dependencies = ["annotated-types", "click", "debugpy", "grpcio", "protobuf", "shortuuid", "tblib"]
+dependencies = [
+    "annotated-types",
+    "click",
+    "debugpy",
+    "grpcio",
+    "protobuf",
+    "shortuuid",
+    "tblib",
+    "typing-extensions",
+]
 description = "A Python framework for distributed multiprocessing."
 dynamic = ["version"]
 license = { file = "../LICENSE" }
@@ -55,7 +64,7 @@ select = ["E", "F", "I"]
 quote-style = "double"
 docstring-code-format = true
 
-[tool.ruff.lint.isort] 
+[tool.ruff.lint.isort]
 combine-as-imports = false
 force-single-line = true
 known-first-party = ["wool"]
