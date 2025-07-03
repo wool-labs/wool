@@ -1,11 +1,25 @@
 [build-system]
+
 build-backend = "hatchling.build"
 requires = ["debugpy", "hatchling", "packaging", "GitPython", "toml"]
 
 [project]
 authors = [{ name = "Conrad Bzura", email = "conrad@wool.io" }]
-classifiers = ["Intended Audience :: Developers"]
-dependencies = ["annotated-types", "click", "debugpy", "protobuf", "shortuuid", "tblib"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "annotated-types",
+    "click",
+    "debugpy",
+    "grpcio",
+    "protobuf",
+    "shortuuid",
+    "tblib",
+    "typing-extensions",
+]
 description = "A Python framework for distributed multiprocessing."
 dynamic = ["version"]
 license = { file = "../LICENSE" }
@@ -15,7 +29,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "ruff"]
+dev = ["pytest", "pytest-asyncio", "pytest-grpc-aio~=0.2.0", "ruff"]
 locking = ["wool-locking"]
 
 [project.scripts]
@@ -23,7 +37,7 @@ wool = "wool._cli:cli"
 
 [tool.hatch.build.hooks.protobuf]
 dependencies = ["hatch-protobuf"]
-generate_grpc = false
+generate_grpc = true
 generate_pyi = true
 output_path = "src/wool/_protobuf"
 proto_paths = ["protobuf"]
@@ -55,7 +69,7 @@ select = ["E", "F", "I"]
 quote-style = "double"
 docstring-code-format = true
 
-[tool.ruff.lint.isort] 
+[tool.ruff.lint.isort]
 combine-as-imports = false
 force-single-line = true
 known-first-party = ["wool"]

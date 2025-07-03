@@ -4,9 +4,7 @@ import logging
 from dataclasses import dataclass
 
 try:
-    from wool._protobuf._mempool._metadata._metadata_pb2 import (
-        _MetadataMessage,
-    )
+    from wool._protobuf.mempool.metadata.metadata_pb2 import _MetadataMessage
 except ImportError:
     logging.error(
         "Failed to import _MetadataMessage. "
