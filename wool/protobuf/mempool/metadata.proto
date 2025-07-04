@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package wool._mempool.metadata;
+package wool._protobuf.mempool;
 
 message _MetadataMessage {
     string ref = 1;
