@@ -9,7 +9,7 @@ import pytest
 from wool._mempool import MemoryPool
 from wool._mempool._service import Reference
 from wool._mempool._service import Session
-from wool._protobuf.mempool import mempool_pb2 as proto
+from wool._protobuf.mempool import service_pb2 as proto
 
 
 @contextmanager

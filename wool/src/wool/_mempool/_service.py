@@ -10,8 +10,8 @@ import shortuuid
 from grpc.aio import ServicerContext
 
 from wool._mempool import MemoryPool
-from wool._protobuf.mempool import mempool_pb2 as proto
-from wool._protobuf.mempool import mempool_pb2_grpc as rpc
+from wool._protobuf.mempool import service_pb2 as proto
+from wool._protobuf.mempool import service_pb2_grpc as rpc
 
 
 class Session:

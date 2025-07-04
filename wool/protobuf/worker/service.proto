@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package wool._protobuf.worker;
+
+service Worker {
+    rpc put (stream ClientMessage) returns (stream ServiceMessage);
+}
+
+message ClientMessage {
+    oneof message {
+        Task task = 1;
+        Response response = 2;
+    }
+}
+
+message ServiceMessage {
+    oneof message {
+        Future future = 1;
+        Response response = 2;
+    }
+}
+
+message Response {
+    bool ack = 1;
+}
+
+message Task {
+    string id = 1;
+}
+
+message Future {
+    string id = 1;
+}

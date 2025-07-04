@@ -23,7 +23,7 @@ async def seed():
 
 @pytest.fixture(scope="function")
 def grpc_add_to_server():
-    from wool._protobuf.mempool.mempool_pb2_grpc import (
+    from wool._protobuf.mempool.service_pb2_grpc import (
         add_MemoryPoolServicer_to_server,
     )
 
@@ -37,6 +37,6 @@ def grpc_servicer(seed):
 
 @pytest.fixture(scope="function")
 def grpc_stub_cls():
-    from wool._protobuf.mempool.mempool_pb2_grpc import MemoryPoolStub
+    from wool._protobuf.mempool.service_pb2_grpc import MemoryPoolStub
 
     return MemoryPoolStub
