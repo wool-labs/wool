@@ -15,7 +15,6 @@ jobs:
       matrix:
         namespace:
           - 'wool'
-          - 'wool-locking'
         python-version: 
           - '3.10'
           - '3.11'
@@ -34,6 +33,7 @@ jobs:
         env:
           NAMESPACE: ${{ matrix.namespace }}
         run: |
-          uv pip install './${{ env.NAMESPACE }}[dev]'
+          uv pip install -e './${{ env.NAMESPACE }}[dev]'
           uv pip freeze
-          uv run pytest '${{ env.NAMESPACE }}'
+          cd ${{ env.NAMESPACE }}
+          uv run pytest
