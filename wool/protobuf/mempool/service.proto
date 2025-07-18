@@ -5,6 +5,7 @@ package wool._protobuf.mempool;
 service MemoryPool {
     rpc session (SessionRequest) returns (stream SessionResponse);
     rpc acquire (AcquireRequest) returns (AcquireResponse);
+    rpc map (AcquireRequest) returns (AcquireResponse);
     rpc put (PutRequest) returns (PutResponse);
     rpc post (PostRequest) returns (PostResponse);
     rpc get (GetRequest) returns (GetResponse);
