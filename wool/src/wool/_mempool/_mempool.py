@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import mmap
 import os
 import pathlib
 import shutil
 from contextlib import asynccontextmanager
+from mmap import mmap
 from typing import BinaryIO
 
 try:
@@ -23,7 +23,7 @@ class SharedObject:
     _id: str
     _mempool: MemoryPool
     _file: BinaryIO
-    _mmap: mmap.mmap
+    _mmap: mmap
     _size: int
     _md5: bytes
 
@@ -31,7 +31,7 @@ class SharedObject:
         self._id = id
         self._mempool = mempool
         self._file = open(self._path / "dump", "r+b")
-        self._mmap = mmap.mmap(self._file.fileno(), 0)
+        self._mmap = mmap(self._file.fileno(), 0)
         self._size = self.metadata.size
         self._md5 = self.metadata.md5
 
@@ -50,7 +50,7 @@ class SharedObject:
         return SharedObjectMetadata(self.id, mempool=self._mempool)
 
     @property
-    def mmap(self) -> mmap.mmap:
+    def mmap(self) -> mmap:
         return self._mmap
 
     @property
@@ -67,7 +67,7 @@ class SharedObject:
             self._mmap.close()
             self._file.close()
             self._file = open(self._path / "dump", "r+b")
-            self._mmap = mmap.mmap(self._file.fileno(), 0)
+            self._mmap = mmap(self._file.fileno(), 0)
             self._size = self.metadata.size
             self._md5 = self.metadata.md5
         return self
@@ -77,7 +77,7 @@ class SharedObjectMetadata:
     _id: str
     _mempool: MemoryPool
     _file: BinaryIO
-    _mmap: mmap.mmap
+    _mmap: mmap
     _instances: dict[str, SharedObjectMetadata] = {}
 
     def __new__(cls, id: str, *, mempool: MemoryPool):
@@ -89,7 +89,7 @@ class SharedObjectMetadata:
         self._id = id
         self._mempool = mempool
         self._file = open(self._path / "meta", "r+b")
-        self._mmap = mmap.mmap(self._file.fileno(), 0)
+        self._mmap = mmap(self._file.fileno(), 0)
         self._instances[id] = self
 
     def __del__(self):
@@ -115,7 +115,7 @@ class SharedObjectMetadata:
         return self._metadata.md5
 
     @property
-    def mmap(self) -> mmap.mmap:
+    def mmap(self) -> mmap:
         return self._mmap
 
     @property
