@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import logging
+from dataclasses import asdict
 from dataclasses import dataclass
 
 try:
-    from wool._protobuf.mempool.metadata.metadata_pb2 import _MetadataMessage
-except ImportError:
-    logging.error(
-        "Failed to import _MetadataMessage. "
-        "Ensure protocol buffers are compiled."
-    )
-    raise
+    from wool._protobuf.mempool import metadata_pb2 as pb
+except ImportError as e:
+    from wool._protobuf import ProtobufImportError
+
+    raise ProtobufImportError(e) from e
 
 
 @dataclass
@@ -22,7 +20,7 @@ class MetadataMessage:
 
     @classmethod
     def loads(cls, data: bytes) -> MetadataMessage:
-        (metadata := _MetadataMessage()).ParseFromString(data)
+        (metadata := pb.MetadataMessage()).ParseFromString(data)
         return cls(
             ref=metadata.ref,
             mutable=metadata.mutable,
@@ -31,9 +29,7 @@ class MetadataMessage:
         )
 
     def dumps(self) -> bytes:
-        return _MetadataMessage(
-            ref=self.ref, mutable=self.mutable, size=self.size, md5=self.md5
-        ).SerializeToString()
+        return pb.MetadataMessage(**asdict(self)).SerializeToString()
 
 
 __all__ = ["MetadataMessage"]
