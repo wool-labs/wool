@@ -93,6 +93,40 @@ def patch_signal_handlers():
 
 
 class TestSignalHandlers:
+    def test_worker_process_sigterm_handler(self, mocker: MockerFixture):
+        """Test SIGTERM signal handler when loop is running.
+
+        Given:
+            A running event loop and service
+        When:
+            SIGTERM signal handler is triggered
+        Then:
+            It should call loop.call_soon_threadsafe with service._stop(timeout=0)
+        """
+        # Arrange
+        mock_loop = mocker.MagicMock()
+        mock_loop.is_running.return_value = True
+        mock_loop.call_soon_threadsafe = mocker.MagicMock()
+
+        mock_service = mocker.MagicMock()
+        mock_service._stop = mocker.AsyncMock()
+
+        mocker.patch.object(svc.asyncio, "get_running_loop", return_value=mock_loop)
+
+        captured_handler = None
+
+        # Act
+        with svc._signal_handlers(mock_service):
+            # Capture the signal handler that was installed
+            captured_handler = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+        # Now call the handler outside the context to test the behavior
+        if captured_handler and callable(captured_handler):
+            captured_handler(signal.SIGTERM, None)
+
+        # Assert
+        mock_loop.call_soon_threadsafe.assert_called_once()
+
     def test_signal_handlers_sigterm_loop_not_running(
         self, mock_worker_service, patch_signal_handlers, mocker: MockerFixture
     ):
@@ -111,6 +145,40 @@ class TestSignalHandlers:
             current_handler = signal.signal(signal.SIGTERM, signal.SIG_DFL)
             # The handler should be installed
             assert current_handler != signal.SIG_DFL
+
+    def test_worker_process_sigint_handler(self, mocker: MockerFixture):
+        """Test SIGINT signal handler when loop is running.
+
+        Given:
+            A running event loop and service
+        When:
+            SIGINT signal handler is triggered
+        Then:
+            It should call loop.call_soon_threadsafe with service._stop(timeout=None)
+        """
+        # Arrange
+        mock_loop = mocker.MagicMock()
+        mock_loop.is_running.return_value = True
+        mock_loop.call_soon_threadsafe = mocker.MagicMock()
+
+        mock_service = mocker.MagicMock()
+        mock_service._stop = mocker.AsyncMock()
+
+        mocker.patch.object(svc.asyncio, "get_running_loop", return_value=mock_loop)
+
+        captured_handler = None
+
+        # Act
+        with svc._signal_handlers(mock_service):
+            # Capture the signal handler that was installed
+            captured_handler = signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+        # Now call the handler outside the context to test the behavior
+        if captured_handler and callable(captured_handler):
+            captured_handler(signal.SIGINT, None)
+
+        # Assert
+        mock_loop.call_soon_threadsafe.assert_called_once()
 
     def test_signal_handlers_sigint_loop_not_running(self, mocker: MockerFixture):
         """Test SIGINT signal handler installs and restores correctly.
@@ -280,6 +348,88 @@ class TestLanWorker:
 
         # Act
         result = worker.address
+
+        # Assert
+        assert result is None
+
+    def test_info_property_when_worker_not_started(self, mocker: MockerFixture):
+        """Test LocalWorker info property returns None when worker not started.
+
+        Given:
+            A LocalWorker that has not been started
+        When:
+            The info property is accessed
+        Then:
+            It should return None
+        """
+        # Arrange
+        mock_registry = mocker.MagicMock()
+        worker = svc.LocalWorker(registry_service=mock_registry)
+
+        # Act
+        result = worker.info
+
+        # Assert
+        assert result is None
+
+    def test_extra_property_returns_extra_data(self, mocker: MockerFixture):
+        """Test LocalWorker extra property returns extra data.
+
+        Given:
+            A LocalWorker with extra keyword arguments
+        When:
+            The extra property is accessed
+        Then:
+            It should return the extra data dictionary
+        """
+        # Arrange
+        mock_registry = mocker.MagicMock()
+        worker = svc.LocalWorker(
+            "tag1", registry_service=mock_registry, key1="value1", key2="value2"
+        )
+
+        # Act
+        result = worker.extra
+
+        # Assert
+        assert result == {"key1": "value1", "key2": "value2"}
+
+    def test_host_property_when_worker_not_started(self, mocker: MockerFixture):
+        """Test LocalWorker host property returns None when worker not started.
+
+        Given:
+            A LocalWorker that has not been started
+        When:
+            The host property is accessed
+        Then:
+            It should return None
+        """
+        # Arrange
+        mock_registry = mocker.MagicMock()
+        worker = svc.LocalWorker(registry_service=mock_registry)
+
+        # Act
+        result = worker.host
+
+        # Assert
+        assert result is None
+
+    def test_port_property_when_worker_not_started(self, mocker: MockerFixture):
+        """Test LocalWorker port property returns None when worker not started.
+
+        Given:
+            A LocalWorker that has not been started
+        When:
+            The port property is accessed
+        Then:
+            It should return None
+        """
+        # Arrange
+        mock_registry = mocker.MagicMock()
+        worker = svc.LocalWorker(registry_service=mock_registry)
+
+        # Act
+        result = worker.port
 
         # Assert
         assert result is None
@@ -595,6 +745,7 @@ class TestLanWorker:
             await worker._stop()
 
     @pytest.mark.asyncio
+    @pytest.mark.dependency(name="test_start_executes_successfully")
     async def test_start_executes_successfully(self, mocker: MockerFixture):
         """Test LocalWorker start method executes successfully.
 
@@ -611,17 +762,20 @@ class TestLanWorker:
         mock_lan_registry_service.start = mocker.AsyncMock()
 
         worker = svc.LocalWorker(registry_service=mock_lan_registry_service)
-        worker._start = mocker.AsyncMock()  # Mock the abstract method
+        mock_start = mocker.patch.object(
+            worker, "_start", new_callable=mocker.AsyncMock
+        )  # Mock the abstract method
 
         # Act
         await worker.start()
 
         # Assert
         mock_lan_registry_service.start.assert_called_once()
-        worker._start.assert_called_once()
+        mock_start.assert_called_once()
         assert worker._started is True
 
     @pytest.mark.asyncio
+    @pytest.mark.dependency(depends=["test_start_executes_successfully"])
     async def test_stop_executes_successfully(self, mocker: MockerFixture):
         """Test LocalWorker stop method executes successfully.
 
@@ -634,17 +788,25 @@ class TestLanWorker:
         """
         # Arrange
         mock_lan_registry_service = mocker.MagicMock()
+        mock_lan_registry_service.start = mocker.AsyncMock()
         mock_lan_registry_service.stop = mocker.AsyncMock()
 
         worker = svc.LocalWorker(registry_service=mock_lan_registry_service)
-        worker._stop = mocker.AsyncMock()  # Mock the abstract method
-        worker._started = True  # Simulate started state
+        mock_start = mocker.patch.object(worker, "_start", new_callable=mocker.AsyncMock)
+        mock_stop = mocker.patch.object(
+            worker, "_stop", new_callable=mocker.AsyncMock
+        )  # Mock the abstract method
+
+        # Actually start the worker first
+        await worker.start()
 
         # Act
         await worker.stop()
 
         # Assert
-        worker._stop.assert_called_once()
+        mock_start.assert_called_once()
+        mock_stop.assert_called_once()
+        mock_lan_registry_service.start.assert_called_once()
         mock_lan_registry_service.stop.assert_called_once()
 
 
@@ -831,6 +993,39 @@ class TestWorkerProcess:
         with pytest.raises(ValueError, match="Port must be a positive integer"):
             svc.WorkerProcess(port=-1)
 
+    def test_init_raises_error_for_blank_host(self):
+        """Test WorkerProcess initialization raises error for blank host.
+
+        Given:
+            An empty host string
+        When:
+            WorkerProcess is initialized
+        Then:
+            It should raise ValueError with "Host must be a non-blank string"
+        """
+        # Act & Assert
+        with pytest.raises(ValueError, match="Host must be a non-blank string"):
+            svc.WorkerProcess(host="")
+
+    def test_host_property_returns_host(self):
+        """Test WorkerProcess host property returns the configured host.
+
+        Given:
+            A WorkerProcess with a specific host
+        When:
+            The host property is accessed
+        Then:
+            It should return the configured host
+        """
+        # Arrange
+        process = svc.WorkerProcess(host="192.168.1.100")
+
+        # Act
+        result = process.host
+
+        # Assert
+        assert result == "192.168.1.100"
+
     def test_address_property_with_port(self, mocker: MockerFixture):
         """Test WorkerProcess address property returns formatted address.
 
@@ -870,6 +1065,39 @@ class TestWorkerProcess:
         # Assert
         assert result is None
 
+    def test_worker_process_startup_timeout(self, mocker: MockerFixture):
+        """Test WorkerProcess start method timeout handling.
+
+        Given:
+            A WorkerProcess instance with pipe that times out
+        When:
+            start() is called and pipe.poll() returns False (timeout)
+        Then:
+            It should terminate, join, and raise RuntimeError
+        """
+        # Arrange
+        mock_super_start = mocker.patch("multiprocessing.Process.start")
+        mock_terminate = mocker.patch("multiprocessing.Process.terminate")
+        mock_join = mocker.patch("multiprocessing.Process.join")
+
+        mock_get_port = mocker.MagicMock()
+        mock_get_port.poll.return_value = False  # Simulate timeout
+
+        process = svc.WorkerProcess()
+        process._get_port = mock_get_port
+
+        # Act & Assert
+        with pytest.raises(
+            RuntimeError, match="Worker process failed to start within 10 seconds"
+        ):
+            process.start()
+
+        # Assert
+        mock_super_start.assert_called_once()
+        mock_terminate.assert_called_once()
+        mock_join.assert_called_once()
+        mock_get_port.poll.assert_called_once_with(timeout=10)
+
     def test_start(self, mocker: MockerFixture):
         """Test WorkerProcess start method initializes process and port.
 
@@ -883,6 +1111,7 @@ class TestWorkerProcess:
         # Arrange
         mock_super_start = mocker.patch("multiprocessing.Process.start")
         mock_get_port = mocker.MagicMock()
+        mock_get_port.poll.return_value = True  # Simulate successful start
         mock_get_port.recv.return_value = 50051
         mock_get_port.close = mocker.MagicMock()
 
@@ -957,6 +1186,127 @@ class TestWorkerProcess:
 
         # Assert
         assert process.address == "127.0.0.1:8080"
+
+    @pytest.mark.asyncio
+    async def test_worker_process_startup_failure(self, mocker: MockerFixture):
+        """Test WorkerProcess proxy factory startup failure handling.
+
+        Given:
+            A WorkerProxy that is not started and proxy.start() fails
+        When:
+            proxy_factory is called with the proxy
+        Then:
+            It should try to start the proxy and propagate the exception
+        """
+        # Arrange
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.started = False
+        mock_proxy.start = mocker.AsyncMock(side_effect=RuntimeError("Start failed"))
+
+        process = svc.WorkerProcess()
+
+        # Extract the proxy_factory function by mocking the run method
+        proxy_factory = None
+
+        def capture_proxy_factory(*args, factory=None, **kwargs):
+            nonlocal proxy_factory
+            # Find the ResourcePool call and extract the factory
+            if factory:
+                proxy_factory = factory
+
+        mocker.patch.object(svc, "ResourcePool", side_effect=capture_proxy_factory)
+        mocker.patch.object(svc.asyncio, "run")
+
+        # Call run to set up the proxy_factory
+        process.run()
+
+        # Act & Assert
+        assert proxy_factory is not None
+        with pytest.raises(RuntimeError, match="Start failed"):
+            await proxy_factory(mock_proxy)
+
+        mock_proxy.start.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_worker_process_proxy_factory_already_started(
+        self, mocker: MockerFixture
+    ):
+        """Test WorkerProcess proxy factory when proxy is already started.
+
+        Given:
+            A WorkerProxy that is already started
+        When:
+            proxy_factory is called with the proxy
+        Then:
+            It should return the proxy without calling start
+        """
+        # Arrange
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.started = True
+        mock_proxy.start = mocker.AsyncMock()
+
+        process = svc.WorkerProcess()
+
+        # Extract the proxy_factory function by mocking the run method
+        proxy_factory = None
+
+        def capture_proxy_factory(*args, factory=None, **kwargs):
+            nonlocal proxy_factory
+            if factory:
+                proxy_factory = factory
+
+        mocker.patch.object(svc, "ResourcePool", side_effect=capture_proxy_factory)
+        mocker.patch.object(svc.asyncio, "run")
+
+        # Call run to set up the proxy_factory
+        process.run()
+
+        # Act
+        assert proxy_factory is not None
+        result = await proxy_factory(mock_proxy)
+
+        # Assert
+        assert result == mock_proxy
+        mock_proxy.start.assert_not_called()  # Should not call start when already started
+
+    @pytest.mark.asyncio
+    async def test_worker_process_run_method(self, mocker: MockerFixture):
+        """Test WorkerProcess proxy finalizer exception handling.
+
+        Given:
+            A WorkerProxy that raises exception during stop
+        When:
+            proxy_finalizer is called with the proxy
+        Then:
+            It should catch and suppress the exception
+        """
+        # Arrange
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.stop = mocker.AsyncMock(side_effect=RuntimeError("Stop failed"))
+
+        process = svc.WorkerProcess()
+
+        # Extract the proxy_finalizer function by mocking the run method
+        proxy_finalizer = None
+
+        def capture_proxy_finalizer(*args, **kwargs):
+            nonlocal proxy_finalizer
+            # Find the ResourcePool call and extract the finalizer
+            if "finalizer" in kwargs:
+                proxy_finalizer = kwargs["finalizer"]
+
+        mocker.patch.object(svc, "ResourcePool", side_effect=capture_proxy_finalizer)
+        mocker.patch.object(svc.asyncio, "run")
+
+        # Call run to set up the proxy_finalizer
+        process.run()
+
+        # Act - should not raise exception
+        assert proxy_finalizer is not None
+        await proxy_finalizer(mock_proxy)  # Should not raise
+
+        # Assert
+        mock_proxy.stop.assert_called_once()
 
     def test_run_method_calls_serve_with_asyncio_run(self, mocker: MockerFixture):
         """Test WorkerProcess run method calls _serve with asyncio.run.
@@ -1536,3 +1886,431 @@ class TestWorkerService:
 
         # Assert
         mock_current_task.cancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestWithTimeoutContextManager:
+    """Test the with_timeout context manager utility function."""
+
+    async def test_wait_for_context_manager_timeout(self, mocker: MockerFixture):
+        """Test with_timeout context manager when timeout occurs during entry.
+
+        Given:
+            A context manager and asyncio.wait_for that raises TimeoutError
+        When:
+            with_timeout is used with a timeout
+        Then:
+            It should call asyncio.wait_for with the timeout and propagate TimeoutError
+        """
+        # Arrange
+        mock_context = mocker.MagicMock()
+        mock_context.__aenter__ = mocker.AsyncMock()
+        mock_context.__aexit__ = mocker.AsyncMock()
+
+        mock_wait_for = mocker.patch.object(
+            svc.asyncio, "wait_for", side_effect=asyncio.TimeoutError()
+        )
+
+        # Act & Assert
+        with pytest.raises(asyncio.TimeoutError):
+            async with svc.with_timeout(mock_context, timeout=0.5):
+                pass
+
+        # Verify asyncio.wait_for was called once with the correct timeout
+        mock_wait_for.assert_called_once()
+        call_args = mock_wait_for.call_args
+        assert call_args[1]["timeout"] == 0.5
+
+    async def test_wait_for_context_manager_exception(self, mocker: MockerFixture):
+        """Test with_timeout context manager when exception occurs inside context.
+
+        Given:
+            A context manager where an exception occurs inside the context
+        When:
+            with_timeout is used and exception is raised
+        Then:
+            It should properly call __aexit__ with exception info and re-raise
+        """
+        # Arrange
+        mock_context = mocker.MagicMock()
+        mock_context.__aenter__ = mocker.AsyncMock()
+        mock_context.__aexit__ = mocker.AsyncMock()
+
+        test_exception = ValueError("Test exception")
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="Test exception"):
+            async with svc.with_timeout(mock_context, timeout=1.0):
+                raise test_exception
+
+        # Assert __aexit__ was called with correct exception info
+        mock_context.__aexit__.assert_called_once()
+        call_args = mock_context.__aexit__.call_args[0]
+        assert call_args[0] is ValueError  # exception_type
+        assert call_args[1] == test_exception  # exception_value
+        assert call_args[2] is not None  # exception_traceback
+
+
+@pytest.mark.asyncio
+class TestDispatchStream:
+    """Test the DispatchStream class."""
+
+    async def test_dispatch_stream_init_and_aiter(self, mocker: MockerFixture):
+        """Test DispatchStream initialization and __aiter__.
+
+        Given:
+            A gRPC dispatch call stream
+        When:
+            DispatchStream is initialized
+        Then:
+            It should store the stream and create an async iterator
+        """
+        # Arrange
+        mock_stream = mocker.MagicMock()
+
+        # Act
+        dispatch_stream = svc.DispatchStream(mock_stream)
+        async_iter = dispatch_stream.__aiter__()
+
+        # Assert
+        assert dispatch_stream._stream is mock_stream
+        assert async_iter is dispatch_stream
+
+    async def test_dispatch_stream_anext_with_result(self, mocker: MockerFixture):
+        """Test DispatchStream __anext__ with result response.
+
+        Given:
+            A DispatchStream with a response containing a result
+        When:
+            __anext__ is called
+        Then:
+            It should return the unpickled result
+        """
+        # Arrange
+        mock_stream = mocker.MagicMock()
+        mock_response = mocker.MagicMock()
+        mock_response.HasField.side_effect = lambda field: field == "result"
+        mock_response.result.dump = cloudpickle.dumps("test_result")
+
+        mock_iter = mocker.AsyncMock()
+        mock_iter.__anext__ = mocker.AsyncMock(return_value=mock_response)
+
+        mocker.patch.object(svc, "aiter", return_value=mock_iter)
+
+        dispatch_stream = svc.DispatchStream(mock_stream)
+
+        # Act
+        result = await dispatch_stream.__anext__()
+
+        # Assert
+        assert result == "test_result"
+
+    async def test_dispatch_stream_anext_with_exception(self, mocker: MockerFixture):
+        """Test DispatchStream __anext__ with exception response.
+
+        Given:
+            A DispatchStream with a response containing an exception
+        When:
+            __anext__ is called
+        Then:
+            It should raise the unpickled exception
+        """
+        # Arrange
+        mock_stream = mocker.MagicMock()
+        mock_response = mocker.MagicMock()
+        mock_response.HasField.side_effect = lambda field: field == "exception"
+        test_exception = ValueError("Test exception")
+        mock_response.exception.dump = cloudpickle.dumps(test_exception)
+
+        mock_iter = mocker.AsyncMock()
+        mock_iter.__anext__ = mocker.AsyncMock(return_value=mock_response)
+
+        mocker.patch.object(svc, "aiter", return_value=mock_iter)
+
+        dispatch_stream = svc.DispatchStream(mock_stream)
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="Test exception"):
+            await dispatch_stream.__anext__()
+
+    async def test_dispatch_stream_anext_with_unexpected_response(
+        self, mocker: MockerFixture
+    ):
+        """Test DispatchStream __anext__ with unexpected response.
+
+        Given:
+            A DispatchStream with a response that has no result or exception
+        When:
+            __anext__ is called
+        Then:
+            It should raise RuntimeError
+        """
+        # Arrange
+        mock_stream = mocker.MagicMock()
+        mock_response = mocker.MagicMock()
+        mock_response.HasField.return_value = False  # No result or exception field
+
+        mock_iter = mocker.AsyncMock()
+        mock_iter.__anext__ = mocker.AsyncMock(return_value=mock_response)
+
+        mocker.patch.object(svc, "aiter", return_value=mock_iter)
+
+        dispatch_stream = svc.DispatchStream(mock_stream)
+
+        # Act & Assert
+        with pytest.raises(RuntimeError, match="Received unexpected response"):
+            await dispatch_stream.__anext__()
+
+    async def test_dispatch_stream_handle_exception_success(self, mocker: MockerFixture):
+        """Test DispatchStream _handle_exception when cancel succeeds.
+
+        Given:
+            A DispatchStream and an exception
+        When:
+            _handle_exception is called and cancel succeeds
+        Then:
+            It should cancel the stream and re-raise the original exception
+        """
+        # Arrange
+        mock_stream = mocker.MagicMock()
+        mock_stream.cancel = mocker.MagicMock()
+
+        dispatch_stream = svc.DispatchStream(mock_stream)
+        test_exception = ValueError("Original exception")
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="Original exception"):
+            await dispatch_stream._handle_exception(test_exception)
+
+        mock_stream.cancel.assert_called_once()
+
+    async def test_dispatch_stream_handle_exception_cancel_fails(
+        self, mocker: MockerFixture
+    ):
+        """Test DispatchStream _handle_exception when cancel fails.
+
+        Given:
+            A DispatchStream and an exception
+        When:
+            _handle_exception is called and cancel raises an exception
+        Then:
+            It should raise the cancel exception with the original as cause
+        """
+        # Arrange
+        mock_stream = mocker.MagicMock()
+        cancel_exception = RuntimeError("Cancel failed")
+        mock_stream.cancel = mocker.MagicMock(side_effect=cancel_exception)
+
+        dispatch_stream = svc.DispatchStream(mock_stream)
+        original_exception = ValueError("Original exception")
+
+        # Act & Assert
+        with pytest.raises(RuntimeError, match="Cancel failed") as exc_info:
+            await dispatch_stream._handle_exception(original_exception)
+
+        assert exc_info.value.__cause__ is original_exception
+        mock_stream.cancel.assert_called_once()
+
+
+@pytest.mark.asyncio
+class TestWorkerClient:
+    """Test the WorkerClient class."""
+
+    async def test_worker_client_init(self, mocker: MockerFixture):
+        """Test WorkerClient initialization.
+
+        Given:
+            A worker address
+        When:
+            WorkerClient is initialized
+        Then:
+            It should create a gRPC channel and stub with semaphore
+        """
+        # Arrange
+        mock_channel = mocker.MagicMock()
+        mock_grpc_channel = mocker.patch.object(
+            svc.grpc.aio, "insecure_channel", return_value=mock_channel
+        )
+        mock_stub = mocker.MagicMock()
+        mocker.patch.object(svc.pb.worker, "WorkerStub", return_value=mock_stub)
+
+        # Act
+        client = svc.WorkerClient("192.168.1.100:50051")
+
+        # Assert
+        mock_grpc_channel.assert_called_once_with("192.168.1.100:50051")
+        assert client._channel is mock_channel
+        assert client._stub is mock_stub
+        assert hasattr(client, "_semaphore")
+
+    async def test_worker_client_stop(self, mocker: MockerFixture):
+        """Test WorkerClient stop method.
+
+        Given:
+            A WorkerClient instance
+        When:
+            stop is called
+        Then:
+            It should close the gRPC channel
+        """
+        # Arrange
+        mock_channel = mocker.MagicMock()
+        mock_channel.close = mocker.AsyncMock()
+        mocker.patch.object(svc.grpc.aio, "insecure_channel", return_value=mock_channel)
+
+        client = svc.WorkerClient("192.168.1.100:50051")
+
+        # Act
+        await client.stop()
+
+        # Assert
+        mock_channel.close.assert_called_once()
+
+    async def test_worker_client_dispatch_successful_flow(self, mocker: MockerFixture):
+        """Test WorkerClient dispatch with successful flow.
+
+        Given:
+            A WorkerClient and a WoolTask
+        When:
+            dispatch is called and receives proper Ack response
+        Then:
+            It should yield results from DispatchStream
+        """
+        # Arrange
+        mock_channel = mocker.MagicMock()
+        mocker.patch.object(svc.grpc.aio, "insecure_channel", return_value=mock_channel)
+        mock_stub = mocker.MagicMock()
+        mocker.patch.object(svc.pb.worker, "WorkerStub", return_value=mock_stub)
+
+        # Mock the task
+        mock_task = mocker.MagicMock(spec=WoolTask)
+        mock_protobuf = mocker.MagicMock()
+        mock_task.to_protobuf.return_value = mock_protobuf
+
+        # Mock the dispatch call
+        mock_call = mocker.AsyncMock()
+        mock_stub.dispatch.return_value = mock_call
+
+        # Mock first response with Ack field
+        mock_ack_response = mocker.MagicMock()
+        mock_ack_response.HasField.side_effect = lambda field: field == "ack"
+
+        # Mock anext and aiter
+        mock_aiter = mocker.AsyncMock()
+        mock_anext_coroutine = mocker.AsyncMock(return_value=mock_ack_response)
+        mocker.patch.object(svc, "anext", return_value=mock_anext_coroutine)
+        mocker.patch.object(svc, "aiter", return_value=mock_aiter)
+
+        # Mock asyncio.wait_for to return the awaited response
+        mocker.patch.object(svc.asyncio, "wait_for", return_value=mock_ack_response)
+
+        # Mock DispatchStream to return async iterator
+        class MockDispatchStream:
+            def __init__(self, call):
+                self.call = call
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    if not hasattr(self, "_values"):
+                        self._values = iter(["result1", "result2"])
+                    return next(self._values)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        mocker.patch.object(svc, "DispatchStream", MockDispatchStream)
+
+        # Mock with_timeout context manager
+        mock_semaphore = mocker.AsyncMock()
+        client = svc.WorkerClient("192.168.1.100:50051")
+        client._semaphore = mock_semaphore
+
+        # Act
+        results = []
+        async for result in client.dispatch(mock_task):
+            results.append(result)
+
+        # Assert
+        assert results == ["result1", "result2"]
+        mock_task.to_protobuf.assert_called_once()
+        mock_stub.dispatch.assert_called_once_with(mock_protobuf)
+
+    async def test_worker_client_dispatch_no_ack_response(self, mocker: MockerFixture):
+        """Test WorkerClient dispatch when response has no Ack field.
+
+        Given:
+            A WorkerClient and a WoolTask
+        When:
+            dispatch is called but first response has no Ack field
+        Then:
+            It should raise UnexpectedResponse and cancel the call
+        """
+        # Arrange
+        mock_channel = mocker.MagicMock()
+        mocker.patch.object(svc.grpc.aio, "insecure_channel", return_value=mock_channel)
+        mock_stub = mocker.MagicMock()
+        mocker.patch.object(svc.pb.worker, "WorkerStub", return_value=mock_stub)
+
+        mock_task = mocker.MagicMock(spec=WoolTask)
+        mock_protobuf = mocker.MagicMock()
+        mock_task.to_protobuf.return_value = mock_protobuf
+
+        # Mock the dispatch call with cancel method
+        mock_call = mocker.AsyncMock()
+        mock_call.cancel = mocker.MagicMock()
+        mock_stub.dispatch.return_value = mock_call
+
+        # Mock first response without Ack field
+        mock_response = mocker.MagicMock()
+        mock_response.HasField.return_value = False  # No "ack" field
+
+        mocker.patch.object(svc.asyncio, "wait_for", return_value=mock_response)
+
+        client = svc.WorkerClient("192.168.1.100:50051")
+        client._semaphore = mocker.AsyncMock()
+
+        # Act & Assert
+        with pytest.raises(svc.UnexpectedResponse, match="Expected Ack response"):
+            async for _ in client.dispatch(mock_task):
+                pass
+
+        # Verify call was cancelled
+        mock_call.cancel.assert_called_once()
+
+    async def test_worker_client_dispatch_call_cancel_fails(self, mocker: MockerFixture):
+        """Test WorkerClient dispatch when call cancellation fails.
+
+        Given:
+            A WorkerClient and a WoolTask
+        When:
+            dispatch fails and call.cancel() raises an exception
+        Then:
+            It should suppress the cancel exception and re-raise original
+        """
+        # Arrange - copy the successful test setup exactly
+        mock_channel = mocker.MagicMock()
+        mocker.patch.object(svc.grpc.aio, "insecure_channel", return_value=mock_channel)
+        mock_stub = mocker.MagicMock()
+        mocker.patch.object(svc.pb.worker, "WorkerStub", return_value=mock_stub)
+
+        # Mock the task
+        mock_task = mocker.MagicMock(spec=WoolTask)
+        mock_protobuf = mocker.MagicMock()
+        mock_task.to_protobuf.return_value = mock_protobuf
+
+        mock_call = mocker.AsyncMock(
+            __aiter__=mocker.MagicMock(side_effect=TimeoutError)
+        )
+        mock_call.cancel = mocker.MagicMock(side_effect=RuntimeError("Cancel failed"))
+        mock_stub.dispatch.return_value = mock_call
+
+        client = svc.WorkerClient("192.168.1.100:50051")
+
+        # Act & Assert - consume the async generator to trigger dispatch
+        with pytest.raises(TimeoutError):
+            async for _ in client.dispatch(mock_task):
+                pass  # This should never execute
+
+        mock_call.cancel.assert_called_once()
