@@ -1153,7 +1153,7 @@ class LocalDiscoveryService(DiscoveryService):
 
     async def _monitor_shared_memory(self) -> None:
         """Monitor shared memory for changes and emit events."""
-        poll_interval = 0.1  # 100ms polling interval
+        poll_interval = 0.1
 
         while not self._stop_event.is_set():
             try:
@@ -1189,14 +1189,7 @@ class LocalDiscoveryService(DiscoveryService):
                     continue  # Continue polling
 
             except Exception:
-                # Continue monitoring on errors
-                try:
-                    await asyncio.wait_for(
-                        self._stop_event.wait(), timeout=poll_interval
-                    )
-                    break
-                except asyncio.TimeoutError:
-                    continue
+                continue
 
     async def _detect_changes(self, current_workers: Dict[str, WorkerInfo]) -> None:
         """Detect and emit events for worker changes."""

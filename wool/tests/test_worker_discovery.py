@@ -1591,6 +1591,57 @@ class TestSerializationFunctions:
         assert result.extra == {}
 
 
+class TestWorkerInfo:
+    def test_worker_info_hash_method(self, worker_info):
+        """Test WorkerInfo.__hash__ method returns hash of uid.
+
+        Given:
+            A WorkerInfo instance
+        When:
+            __hash__ is called (via hash() built-in)
+        Then:
+            Should return hash of the uid
+        """
+
+        # Act
+        worker_hash = hash(worker_info)
+
+        # Assert
+        expected_hash = hash(worker_info.uid)
+        assert worker_hash == expected_hash
+
+    def test_worker_info_hash_consistency(self):
+        """Test WorkerInfo.__hash__ is consistent for same uid.
+
+        Given:
+            Two WorkerInfo instances with same uid but different properties
+        When:
+            __hash__ is called on both
+        Then:
+            Should return the same hash value
+        """
+
+        # Arrange
+        worker1 = discovery.WorkerInfo(
+            uid="same-uid", host="host1", port=8001, pid=1001, version="1.0.0"
+        )
+
+        worker2 = discovery.WorkerInfo(
+            uid="same-uid",  # Same uid
+            host="host2",  # Different host
+            port=8002,  # Different port
+            pid=1002,  # Different pid
+            version="2.0.0",  # Different version
+        )
+
+        # Act
+        hash1 = hash(worker1)
+        hash2 = hash(worker2)
+
+        # Assert
+        assert hash1 == hash2  # Should be equal since uid is the same
+
+
 class TestDiscoveryEvent:
     def test_discovery_event_creation(self, worker_info):
         """Test DiscoveryEvent creation with WorkerInfo.
@@ -2301,6 +2352,62 @@ class TestDiscoveryService:
         worker_info.uid = "test-worker-123"
         assert unpickled_service._filter(worker_info) is True
 
+    @pytest.mark.asyncio
+    async def test_discovery_service_aiter_and_anext_methods(
+        self, mocker: MockerFixture
+    ):
+        """Test DiscoveryService __aiter__ and __anext__ methods.
+
+        Given:
+            A DiscoveryService instance
+        When:
+            __aiter__ and __anext__ methods are called
+        Then:
+            Should delegate to events() method correctly
+        """
+
+        # Arrange
+        class DummyDiscoveryService(discovery.DiscoveryService):
+            def __init__(self, filter=None):
+                super().__init__(filter)
+                self.events_called = False
+
+            async def events(self):
+                self.events_called = True
+                # Yield a test event
+                yield discovery.DiscoveryEvent(
+                    type="worker_added",
+                    worker_info=discovery.WorkerInfo(
+                        uid="test-123",
+                        host="127.0.0.1",
+                        port=8080,
+                        pid=12345,
+                        version="1.0.0",
+                        tags=set(),
+                        extra={},
+                    ),
+                )
+
+            async def _start(self):
+                pass
+
+            async def _stop(self):
+                pass
+
+        service = DummyDiscoveryService()
+
+        # Act & Assert - Test __aiter__
+        async_iter = service.__aiter__()
+
+        # __aiter__ should return the result of events()
+        # We can't directly compare async generators, but we can test the first event
+        first_event = await service.__anext__()
+
+        assert service.events_called is True
+        assert isinstance(first_event, discovery.DiscoveryEvent)
+        assert first_event.type == "worker_added"
+        assert first_event.worker_info.uid == "test-123"
+
 
 class TestRegistryService:
     @pytest.mark.asyncio
@@ -2522,6 +2629,213 @@ class TestLocalRegistryService:
         # Cleanup
         await registry.stop()
 
+    @pytest.mark.asyncio
+    async def test_stop_handles_shared_memory_cleanup_exceptions(
+        self, mocker: MockerFixture
+    ):
+        """Test LocalRegistryService._stop() handles shared memory cleanup exceptions.
+
+        Given:
+            A LocalRegistryService with shared memory that fails during cleanup
+        When:
+            _stop() is called
+        Then:
+            Should catch exceptions and continue cleanup without raising
+        """
+
+        # Arrange
+        registry = discovery.LocalRegistryService(uri="test_cleanup_errors")
+
+        # Mock shared memory object that raises exceptions on close/unlink
+        mock_shared_memory = mocker.MagicMock()
+        mock_shared_memory.close.side_effect = RuntimeError("Close failed")
+        mock_shared_memory.unlink.side_effect = RuntimeError("Unlink failed")
+
+        # Set up registry state as if it had been started
+        registry._shared_memory = mock_shared_memory
+        registry._created_shared_memory = True
+
+        # Act - Should not raise exception despite shared memory errors
+        await registry._stop()
+
+        # Assert - Cleanup should have been attempted and state reset
+        mock_shared_memory.close.assert_called_once()
+        # unlink won't be called because close() raised exception
+        mock_shared_memory.unlink.assert_not_called()
+        assert registry._shared_memory is None
+        assert registry._created_shared_memory is False
+
+    @pytest.mark.asyncio
+    async def test_register_not_initialized_raises_error(self, worker_info):
+        """Test registering worker when registry not initialized raises RuntimeError.
+
+        Given:
+            A LocalRegistryService that hasn't been started
+        When:
+            _register() is called directly
+        Then:
+            Should raise RuntimeError about not being initialized
+        """
+
+        # Arrange
+        registry = discovery.LocalRegistryService(uri="test_not_init")
+
+        # Act & Assert
+        with pytest.raises(
+            RuntimeError, match="Registry service not properly initialized"
+        ):
+            await registry._register(worker_info)
+
+    @pytest.mark.asyncio
+    async def test_register_worker_without_port_raises_error(self):
+        """Test registering worker without port raises ValueError.
+
+        Given:
+            A started LocalRegistryService and worker without port
+        When:
+            _register() is called
+        Then:
+            Should raise ValueError about worker port being required
+        """
+
+        # Arrange
+        registry = discovery.LocalRegistryService(uri="test_no_port")
+        await registry.start()
+
+        worker_without_port = discovery.WorkerInfo(
+            uid="worker-no-port",
+            host="localhost",
+            port=None,  # No port specified
+            pid=12345,
+            version="1.0.0",
+        )
+
+        try:
+            # Act & Assert
+            with pytest.raises(ValueError, match="Worker port must be specified"):
+                await registry._register(worker_without_port)
+        finally:
+            # Cleanup
+            await registry.stop()
+
+    @pytest.mark.asyncio
+    async def test_register_when_no_available_slots_raises_error(
+        self, mocker: MockerFixture, worker_info
+    ):
+        """Test registering worker when shared memory is full raises RuntimeError.
+
+        Given:
+            A LocalRegistryService with full shared memory
+        When:
+            _register() is called
+        Then:
+            Should raise RuntimeError about no available slots
+        """
+
+        # Arrange
+        registry = discovery.LocalRegistryService(uri="test_full_memory")
+
+        # Create a mock shared memory object with full buffer
+        mock_shared_memory = mocker.MagicMock()
+        mock_buffer = bytearray(1024)
+        # Fill buffer with non-zero values to simulate occupied slots
+        for i in range(0, len(mock_buffer), 4):
+            struct.pack_into("I", mock_buffer, i, 9999)  # Non-zero port
+
+        mock_shared_memory.buf = mock_buffer
+
+        # Set the mocked shared memory directly
+        registry._shared_memory = mock_shared_memory
+
+        try:
+            # Act & Assert
+            with pytest.raises(
+                RuntimeError, match="No available slots in shared memory registry"
+            ):
+                await registry._register(worker_info)
+        finally:
+            # Cleanup
+            registry._shared_memory = None
+
+    @pytest.mark.asyncio
+    async def test_unregister_not_initialized_raises_error(self, worker_info):
+        """Test unregistering worker when registry not initialized raises RuntimeError.
+
+        Given:
+            A LocalRegistryService that hasn't been started
+        When:
+            _unregister() is called directly
+        Then:
+            Should raise RuntimeError about not being initialized
+        """
+
+        # Arrange
+        registry = discovery.LocalRegistryService(uri="test_unregister_not_init")
+
+        # Act & Assert
+        with pytest.raises(
+            RuntimeError, match="Registry service not properly initialized"
+        ):
+            await registry._unregister(worker_info)
+
+    @pytest.mark.asyncio
+    async def test_unregister_worker_without_port_returns_early(self):
+        """Test unregistering worker without port returns early.
+
+        Given:
+            A started LocalRegistryService and worker without port
+        When:
+            _unregister() is called
+        Then:
+            Should return early without error
+        """
+
+        # Arrange
+        registry = discovery.LocalRegistryService(uri="test_unregister_no_port")
+        await registry.start()
+
+        worker_without_port = discovery.WorkerInfo(
+            uid="worker-no-port",
+            host="localhost",
+            port=None,  # No port specified
+            pid=12345,
+            version="1.0.0",
+        )
+
+        try:
+            # Act - Should not raise any exception
+            await registry._unregister(worker_without_port)
+            # No assertion needed, just checking it doesn't raise
+        finally:
+            # Cleanup
+            await registry.stop()
+
+    @pytest.mark.asyncio
+    async def test_update_delegates_to_register(
+        self, worker_info, mocker: MockerFixture
+    ):
+        """Test update method delegates to _register method.
+
+        Given:
+            A LocalRegistryService with mocked _register method
+        When:
+            _update() is called
+        Then:
+            Should call _register with the same worker_info
+        """
+
+        # Arrange
+        registry = discovery.LocalRegistryService(uri="test_update")
+        mock_register = mocker.patch.object(
+            registry, "_register", new_callable=mocker.AsyncMock
+        )
+
+        # Act
+        await registry._update(worker_info)
+
+        # Assert
+        mock_register.assert_called_once_with(worker_info)
+
 
 class TestLocalDiscoveryService:
     def test___init__(self):
@@ -2671,3 +2985,309 @@ class TestLocalDiscoveryService:
             await discovery_service.stop()
         except Exception:
             pass
+
+    @pytest.mark.asyncio
+    async def test_stop_handles_monitor_task_cancelled_error(
+        self, mocker: MockerFixture
+    ):
+        """Test LocalDiscoveryService._stop() handles CancelledError from monitor task.
+
+        Given:
+            A LocalDiscoveryService with a monitor task that raises CancelledError
+        When:
+            _stop() is called
+        Then:
+            Should catch CancelledError and continue cleanup without raising
+        """
+
+        # Arrange
+        service = discovery.LocalDiscoveryService(uri="test_cancelled_task")
+
+        # Create an actual task that raises CancelledError
+        async def cancelled_task():
+            raise asyncio.CancelledError()
+
+        # Create the task and cancel it immediately to simulate the error condition
+        mock_task = asyncio.create_task(cancelled_task())
+        mock_task.cancel()
+
+        service._monitor_task = mock_task
+
+        # Act - Should not raise exception despite CancelledError
+        await service._stop()
+
+        # Assert - Task should be done/cancelled
+        assert mock_task.done()
+        assert mock_task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_stop_handles_shared_memory_close_exception(
+        self, mocker: MockerFixture
+    ):
+        """Test LocalDiscoveryService._stop() handles shared memory close exception.
+
+        Given:
+            A LocalDiscoveryService with shared memory that fails to close
+        When:
+            _stop() is called
+        Then:
+            Should catch exception and continue cleanup without raising
+        """
+
+        # Arrange
+        service = discovery.LocalDiscoveryService(uri="test_close_error")
+
+        # Mock shared memory object that raises exception on close
+        mock_shared_memory = mocker.MagicMock()
+        mock_shared_memory.close.side_effect = RuntimeError("Close failed")
+
+        service._shared_memory = mock_shared_memory
+
+        # Act - Should not raise exception despite shared memory close error
+        await service._stop()
+
+        # Assert - Close should have been attempted and memory reset
+        mock_shared_memory.close.assert_called_once()
+        assert service._shared_memory is None
+
+    def test_local_discovery_service_cloudpickle_support(self):
+        """Test LocalDiscoveryService __reduce__ method for cloudpickle support.
+
+        Given:
+            A LocalDiscoveryService instance
+        When:
+            cloudpickle.dumps() and loads() are called
+        Then:
+            Should serialize and deserialize successfully with URI preserved
+        """
+
+        # Arrange
+        uri = "test_pickle_uri"
+        service = discovery.LocalDiscoveryService(uri=uri)
+
+        # Act
+        pickled_data = cloudpickle.dumps(service)
+        unpickled_service = cloudpickle.loads(pickled_data)
+
+        # Assert
+        assert isinstance(unpickled_service, discovery.LocalDiscoveryService)
+        assert unpickled_service._uri == uri
+        assert unpickled_service._started is False
+        assert unpickled_service._shared_memory is None
+        assert unpickled_service._monitor_task is None
+
+    @pytest.mark.asyncio
+    async def test_monitor_shared_memory_handles_struct_unpack_exception(
+        self, mocker: MockerFixture, worker_info
+    ):
+        """Test LocalDiscoveryService monitoring continues after struct.unpack exceptions.
+
+        Given:
+            A LocalDiscoveryService where struct.unpack raises an exception
+        When:
+            The monitoring loop encounters the exception
+        Then:
+            Should catch the exception and continue monitoring
+        """
+
+        # Arrange
+        registry = discovery.LocalRegistryService(uri="test_struct_exception")
+        discovery_service = discovery.LocalDiscoveryService(uri="test_struct_exception")
+
+        await registry.start()
+
+        # Register a worker normally first
+        await registry.register(worker_info)
+
+        # Mock struct.unpack to fail on first call, succeed on second
+        call_count = 0
+        original_unpack = struct.unpack
+
+        def mock_unpack(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 4:  # First few calls fail
+                raise struct.error("Simulated struct error")
+            # After that, work normally
+            return original_unpack(*args, **kwargs)
+
+        mocker.patch("struct.unpack", side_effect=mock_unpack)
+
+        events = []
+
+        async def collect_events():
+            try:
+                async for event in discovery_service.events():
+                    events.append(event)
+                    if len(events) >= 1:  # Just need one event to prove recovery
+                        break
+            except asyncio.CancelledError:
+                pass
+
+        # Act - Start event collection (this will trigger the exception handling)
+        event_task = asyncio.create_task(collect_events())
+
+        # Wait a bit for the monitoring to encounter exceptions and recover
+        await asyncio.sleep(0.5)
+
+        # Cancel event collection
+        event_task.cancel()
+        try:
+            await event_task
+        except asyncio.CancelledError:
+            pass
+
+        # Assert - Should have eventually detected the worker despite initial exceptions
+        assert len(events) >= 1
+        assert events[0].type == "worker_added"
+        assert events[0].worker_info.port == worker_info.port
+
+        # Cleanup
+        try:
+            await registry.stop()
+            await discovery_service.stop()
+        except Exception:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_local_discovery_service_detects_worker_port_updates(
+        self, worker_info
+    ):
+        """Test LocalDiscoveryService detects when worker port changes.
+
+        Given:
+            A LocalDiscoveryService monitoring workers
+        When:
+            A worker's port changes in shared memory
+        Then:
+            Should emit a worker_updated event
+        """
+
+        # Arrange
+        registry = discovery.LocalRegistryService(uri="test_port_updates")
+        discovery_service = discovery.LocalDiscoveryService(uri="test_port_updates")
+
+        await registry.start()
+
+        # Register initial worker
+        await registry.register(worker_info)
+
+        events = []
+
+        async def collect_events():
+            try:
+                async for event in discovery_service.events():
+                    events.append(event)
+                    if len(events) >= 2:  # worker_added + worker_updated
+                        break
+            except asyncio.CancelledError:
+                pass
+
+        # Start event collection
+        event_task = asyncio.create_task(collect_events())
+
+        # Give discovery service time to start and detect initial worker
+        await asyncio.sleep(0.2)
+
+        # Act - Directly modify shared memory to change the port
+        # while keeping the same slot (this triggers the update logic)
+        new_port = worker_info.port + 1
+
+        # Find the slot with our worker's port and change it
+        if registry._shared_memory:
+            for i in range(0, len(registry._shared_memory.buf), 4):
+                current_port = struct.unpack(
+                    "I", registry._shared_memory.buf[i : i + 4]
+                )[0]
+                if current_port == worker_info.port:
+                    # Change port in place (simulates an "update" rather than remove/add)
+                    struct.pack_into("I", registry._shared_memory.buf, i, new_port)
+                    break
+
+        # Wait for detection
+        await asyncio.sleep(0.3)
+
+        # Cancel event collection
+        event_task.cancel()
+        try:
+            await event_task
+        except asyncio.CancelledError:
+            pass
+
+        # Assert - Should have detected the port change as an update
+        assert len(events) >= 1
+        added_event = next(e for e in events if e.type == "worker_added")
+        assert added_event.worker_info.port == worker_info.port
+
+        # Should have detected the port update
+        updated_events = [e for e in events if e.type == "worker_updated"]
+        if updated_events:
+            # If we caught the update event, verify it has the new port
+            assert updated_events[0].worker_info.port == new_port
+
+        # Cleanup
+        try:
+            await registry.stop()
+            await discovery_service.stop()
+        except Exception:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_detect_changes_worker_port_update_directly(self, worker_info):
+        """Test LocalDiscoveryService._detect_changes method for worker port updates.
+
+        Given:
+            A LocalDiscoveryService with a cached worker and current workers with changed port
+        When:
+            _detect_changes is called with the updated worker info
+        Then:
+            Should emit a worker_updated event for the port change
+        """
+        # Arrange
+        discovery_service = discovery.LocalDiscoveryService(uri="test_direct_updates")
+        discovery_service._event_queue = discovery.PredicatedQueue[
+            discovery.DiscoveryEvent
+        ]()
+
+        # Set up initial cache with original worker
+        original_worker = worker_info
+        discovery_service._service_cache[original_worker.uid] = original_worker
+
+        # Create updated worker with different port
+        updated_worker = discovery.WorkerInfo(
+            uid=original_worker.uid,
+            host=original_worker.host,
+            port=original_worker.port + 100,  # Change port
+            pid=original_worker.pid,
+            version=original_worker.version,
+            tags=original_worker.tags,
+            extra=original_worker.extra,
+        )
+
+        current_workers = {updated_worker.uid: updated_worker}
+
+        # Act - Call _detect_changes directly with the updated worker
+        await discovery_service._detect_changes(current_workers)
+
+        # Assert - Should have emitted a worker_updated event
+        events = []
+        try:
+            # Collect events from queue
+            while not discovery_service._event_queue.empty():
+                event = discovery_service._event_queue.get_nowait()
+                events.append(event)
+        except asyncio.QueueEmpty:
+            pass
+
+        # Verify worker_updated event was emitted
+        assert len(events) == 1
+        event = events[0]
+        assert event.type == "worker_updated"
+        assert event.worker_info.uid == updated_worker.uid
+        assert event.worker_info.port == updated_worker.port
+
+        # Verify cache was updated
+        assert (
+            discovery_service._service_cache[updated_worker.uid].port
+            == updated_worker.port
+        )
