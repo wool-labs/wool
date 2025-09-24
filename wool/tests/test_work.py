@@ -83,6 +83,11 @@ async def pickable_callable():
     pass
 
 
+# Global function for testing line 140 coverage (not a pytest test function)
+async def function_for_line_140_coverage():
+    return "test"
+
+
 @work
 async def dummy_work_function(x: int, y: int) -> int:
     """Test decorated function."""
@@ -1213,6 +1218,65 @@ class TestContextVariableIntegration:
 
 class TestWorkDecorator:
     """Test the work decorator functionality."""
+
+    def test_task_decorator_non_coroutine_function(self):
+        """Test work decorator validation with non-coroutine function.
+
+        Given:
+            A regular (non-async) function
+        When:
+            work decorator is applied to it
+        Then:
+            It should raise ValueError with "Expected a coroutine function" message
+        """
+        # Arrange & Act & Assert
+        with pytest.raises(ValueError, match="Expected a coroutine function"):
+
+            @work
+            def non_async_function():
+                return "not async"
+
+    @pytest.mark.asyncio
+    async def test_task_wrapper_invalid_function_type(self, mocker: MockerFixture):
+        """Test work decorator wrapper with invalid function type during dispatch.
+
+        Given:
+            A work decorated function where inspect.iscoroutinefunction is mocked to
+            return False
+        When:
+            The wrapper is called with dispatch enabled
+        Then:
+            It should raise ValueError with "Expected a coroutine function" message
+        """
+        # Arrange
+        mock_proxy = MagicMock(spec=WorkerProxy)
+        token = wool.__proxy__.set(mock_proxy)
+
+        async def mock_stream():
+            yield "test_result"
+
+        mocker.patch("wool._work._dispatch", return_value=mock_stream())
+
+        decorated_func = work(function_for_line_140_coverage)
+
+        try:
+            original_iscoroutinefunction = mocker.patch(
+                "wool._work.inspect.iscoroutinefunction"
+            )
+            call_count = 0
+
+            def mock_iscoroutinefunction(fn):
+                nonlocal call_count
+                call_count += 1
+                return call_count != 1
+
+            original_iscoroutinefunction.side_effect = mock_iscoroutinefunction
+
+            # Act & Assert - this should trigger line 140
+            with pytest.raises(ValueError, match="Expected a coroutine function"):
+                await decorated_func()
+        finally:
+            wool.__proxy__.reset(token)
 
     def test_work_decorator_preserves_original_function_metadata(self):
         """Test work decorator preserves original function metadata.
