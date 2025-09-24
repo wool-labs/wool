@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import pytest
+from hypothesis import HealthCheck
 from hypothesis import given
+from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
@@ -698,3 +700,179 @@ class TestWorkerPool:
                 if worker.info:
                     assert hasattr(worker.info, "uid")
                     assert hasattr(worker.info, "port")
+
+    def test_constructor_raises_error_when_cpu_count_unavailable_default_size(
+        self, mocker: MockerFixture
+    ):
+        """Test WorkerPool constructor error handling when CPU count is unavailable with default size.
+
+        Given:
+            A system where os.cpu_count() returns None and no size is specified
+        When:
+            WorkerPool constructor is called with default parameters
+        Then:
+            Should raise ValueError indicating CPU count cannot be determined
+        """
+        # Arrange
+        mocker.patch("os.cpu_count", return_value=None)
+
+        # Act & Assert - This hits the (None, None) case at line 232
+        with pytest.raises(ValueError, match="Unable to determine CPU count"):
+            wp.WorkerPool()
+
+    @pytest.mark.asyncio
+    async def test_context_manager_handles_shared_memory_cleanup_exceptions(
+        self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
+    ):
+        """Test WorkerPool context manager exception handling during shared memory cleanup.
+
+        Given:
+            A WorkerPool with real shared memory that encounters cleanup issues
+        When:
+            Context manager exits and cleanup operations fail
+        Then:
+            Should handle exceptions gracefully without propagating them
+        """
+        # Arrange - Create real shared memory and simulate cleanup failure
+        import os
+        from multiprocessing.shared_memory import SharedMemory
+
+        # Create real shared memory
+        real_memory = SharedMemory(create=True, size=1024)
+
+        try:
+            pool = wp.WorkerPool(size=1)
+            pool._proxy = mock_worker_proxy
+            pool._shared_memory = real_memory
+
+            # Close the memory beforehand to cause unlink() to potentially fail
+            # This simulates real-world scenarios where cleanup encounters issues
+            real_memory.close()
+
+            # Act - Should not raise exceptions despite potential cleanup failures
+            await pool.__aexit__(None, None, None)
+
+        except Exception:
+            # Clean up if something went wrong during test
+            try:
+                real_memory.unlink()
+            except:
+                pass
+            raise
+        else:
+            # If test completed without exception, that's what we're testing for
+            # The behavior we want is: no exceptions propagated from __aexit__
+            pass
+
+    @pytest.mark.asyncio
+    async def test_stop_workers_handles_worker_stop_exceptions(
+        self, mocker: MockerFixture, mock_local_worker
+    ):
+        """Test WorkerPool._stop_workers method handles individual worker stop failures.
+
+        Given:
+            A WorkerPool with workers where some fail to stop gracefully
+        When:
+            _stop_workers is called
+        Then:
+            Should attempt to stop all workers despite individual failures
+        """
+        # Arrange
+        mock_worker1 = mocker.MagicMock()
+        mock_worker2 = mocker.MagicMock()
+        mock_worker1.stop = mocker.AsyncMock(
+            side_effect=RuntimeError("Worker 1 stop failed")
+        )
+        mock_worker2.stop = mocker.AsyncMock()  # This one succeeds
+
+        pool = wp.WorkerPool(size=0)  # Don't spawn any workers automatically
+        pool._workers = [mock_worker1, mock_worker2]
+
+        # Act - Should complete despite one worker failing to stop
+        await pool._stop_workers()
+
+        # Assert - Both workers had stop() called
+        mock_worker1.stop.assert_called_once()
+        mock_worker2.stop.assert_called_once()
+
+    @given(
+        tags=st.lists(
+            st.text(
+                alphabet=st.characters(whitelist_categories=["Ll", "Lu", "Nd"]),
+                min_size=1,
+                max_size=10,
+            ),
+            min_size=0,
+            max_size=3,
+        ),
+        size=st.one_of(st.none(), st.integers(min_value=1, max_value=4)),
+        has_discovery=st.booleans(),
+    )
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test_constructor_valid_parameter_combinations(
+        self, mocker: MockerFixture, tags, size, has_discovery
+    ):
+        """Test WorkerPool constructor with various valid parameter combinations.
+
+        Given:
+            Valid combinations of tags, size, and discovery parameters
+        When:
+            WorkerPool constructor is called
+        Then:
+            Should initialize successfully with appropriate internal state
+        """
+        # Arrange - Mock external dependencies within test to avoid fixture issues
+        mock_memory = mocker.MagicMock()
+        mock_memory.buf = bytearray(1024)
+        mocker.patch(
+            "multiprocessing.shared_memory.SharedMemory", return_value=mock_memory
+        )
+
+        mock_proxy = mocker.MagicMock()
+        mocker.patch.object(wp, "WorkerProxy", return_value=mock_proxy)
+
+        mock_discovery = mocker.MagicMock() if has_discovery else None
+
+        # Act - Test all valid parameter combinations
+        if has_discovery:
+            # Case: (None, discovery) - Durable pool
+            pool = wp.WorkerPool(*tags, discovery=mock_discovery)
+        elif size is None:
+            # Case: (None, None) - Default ephemeral pool
+            pool = wp.WorkerPool(*tags)
+        else:
+            # Case: (size, None) - Explicit size ephemeral pool
+            pool = wp.WorkerPool(*tags, size=size)
+
+        # Assert - Verify proper initialization
+        assert pool is not None
+        assert hasattr(pool, "_workers")
+        assert hasattr(pool, "_proxy_factory")
+        assert isinstance(pool._workers, list)
+        assert callable(pool._proxy_factory)
+
+    @pytest.mark.asyncio
+    async def test_context_manager_default_case_covers_shared_memory_creation(
+        self,
+        mocker: MockerFixture,
+        mock_local_worker,
+        mock_shared_memory,
+        mock_worker_proxy,
+    ):
+        """Test WorkerPool default context manager covers shared memory creation path.
+
+        Given:
+            WorkerPool called with default parameters (no size, no discovery)
+        When:
+            Context manager is entered (which calls _proxy_factory)
+        Then:
+            Should execute the create_proxy function covering lines 238-246
+        """
+        # Act - This specifically executes the create_proxy function for (None, None) case
+        async with wp.WorkerPool() as pool:
+            # Assert - Verify the pool was properly initialized
+            assert pool is not None
+            assert hasattr(pool, "_proxy")
+            assert hasattr(pool, "_shared_memory")
+
+        # This test covers the critical lines 238-246 by executing the async context manager

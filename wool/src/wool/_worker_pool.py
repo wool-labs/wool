@@ -301,14 +301,12 @@ class WorkerPool:
 
     async def __aexit__(self, *args):
         """Stops all workers and tears down the pool and its services."""
-        await self._stop_workers()
-        await self._proxy.__aexit__(*args)
-        if self._shared_memory is not None:
-            try:
-                self._shared_memory.close()
-                self._shared_memory.unlink()  # Actually remove the shared memory block
-            except Exception:
-                pass
+        try:
+            await self._stop_workers()
+            await self._proxy.__aexit__(*args)
+        finally:
+            if self._shared_memory is not None:
+                self._shared_memory.unlink()
 
     async def _spawn_workers(
         self, uri, *tags: str, size: int, factory: WorkerFactory | None
