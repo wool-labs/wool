@@ -1024,3 +1024,84 @@ class TestResource:
         with pytest.raises(RuntimeError, match="Cannot re-acquire a resource"):
             async with resource_acquisition:
                 pass
+
+    @pytest.mark.asyncio
+    async def test_resource_context_acquire_exception(self):
+        """Test Resource context manager handles acquire exceptions properly.
+
+        Given:
+            A Resource instance from a pool that fails during acquire
+        When:
+            Entering the context manager
+        Then:
+            Should propagate the exception and set _acquired to False
+        """
+        # Arrange
+        mock_pool = AsyncMock()
+        mock_pool.acquire.side_effect = RuntimeError("Acquire failed")
+
+        from wool._resource_pool import Resource
+
+        resource = Resource(pool=mock_pool, key="test-key")
+
+        # Act & Assert
+        with pytest.raises(RuntimeError, match="Acquire failed"):
+            async with resource:
+                pass
+
+        # Verify _acquired was set to False during exception handling
+        assert resource._acquired is False
+
+    @pytest.mark.asyncio
+    async def test_resource_context_release_not_acquired(self):
+        """Test Resource release when not acquired raises RuntimeError.
+
+        Given:
+            A Resource instance that was never acquired
+        When:
+            Attempting to exit context without entering properly
+        Then:
+            Should raise RuntimeError indicating resource was not acquired
+        """
+        # Arrange
+        mock_pool = AsyncMock()
+        from wool._resource_pool import Resource
+
+        resource = Resource(pool=mock_pool, key="test-key")
+
+        # Act & Assert - manually call __aexit__ without calling __aenter__
+        with pytest.raises(
+            RuntimeError, match="Cannot release a resource that was not acquired"
+        ):
+            await resource.__aexit__(None, None, None)
+
+    @pytest.mark.asyncio
+    async def test_resource_context_release_already_released(self):
+        """Test Resource release when already released raises RuntimeError.
+
+        Given:
+            A Resource instance that was already released
+        When:
+            Attempting to exit context again after normal usage
+        Then:
+            Should raise RuntimeError indicating resource was already released
+        """
+        # Arrange
+        mock_pool = AsyncMock()
+        mock_resource = Mock()
+        mock_pool.acquire.return_value = mock_resource
+
+        from wool._resource_pool import Resource
+
+        resource = Resource(pool=mock_pool, key="test-key")
+
+        # Use normally once (which sets _released = True)
+        async with resource:
+            pass
+
+        # Act & Assert - manually call __aexit__ again
+        with pytest.raises(
+            RuntimeError,
+            match="Cannot release a resource that has already been released",
+        ):
+            await resource.__aexit__(None, None, None)
