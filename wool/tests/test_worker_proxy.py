@@ -11,21 +11,21 @@ from wool import _protobuf as pb
 from wool._resource_pool import Resource
 from wool._work import WoolTask
 from wool._worker import WorkerClient
-from wool._worker_discovery import Discovery
 from wool._worker_discovery import DiscoveryEvent
-from wool._worker_discovery import LanDiscovery
-from wool._worker_discovery import LocalDiscovery
+from wool._worker_discovery import DiscoveryService
+from wool._worker_discovery import LanDiscoveryService
+from wool._worker_discovery import LocalDiscoveryService
 from wool._worker_discovery import WorkerInfo
 
 
 @pytest.fixture
 def mock_lan_discovery_service(mocker: MockerFixture):
-    """Create a mock :py:class:`LanDiscovery` for testing.
+    """Create a mock :py:class:`LanDiscoveryService` for testing.
 
     Provides a mock discovery service with async methods and started state
     tracking for use in worker proxy tests.
     """
-    mock_lan_discovery_service = mocker.MagicMock(spec=LanDiscovery)
+    mock_lan_discovery_service = mocker.MagicMock(spec=LanDiscoveryService)
     mock_lan_discovery_service.started = False
     mock_lan_discovery_service.start = mocker.AsyncMock()
     mock_lan_discovery_service.stop = mocker.AsyncMock()
@@ -35,12 +35,12 @@ def mock_lan_discovery_service(mocker: MockerFixture):
 
 @pytest.fixture
 def mock_discovery_service(mocker: MockerFixture):
-    """Create a mock :py:class:`Discovery` for testing.
+    """Create a mock :py:class:`DiscoveryService` for testing.
 
     Provides a generic mock discovery service with async methods for use in
     worker proxy tests that don't require LAN-specific functionality.
     """
-    mock_discovery_service = mocker.MagicMock(spec=Discovery)
+    mock_discovery_service = mocker.MagicMock(spec=DiscoveryService)
     mock_discovery_service.started = False
     mock_discovery_service.start = mocker.AsyncMock()
     mock_discovery_service.stop = mocker.AsyncMock()
@@ -56,7 +56,7 @@ def mock_load_balancer_factory(mocker: MockerFixture):
     the load balancer instance. Used for testing factory-based load balancer
     creation patterns.
     """
-    mock_load_balancer_factory = mocker.MagicMock()
+    mock_load_balancer_factory = mocker.MagicMock(spec=wp.LoadBalancerFactory)
     mock_load_balancer = mocker.MagicMock(spec=wp.LoadBalancerLike)
     mock_load_balancer.dispatch = mocker.AsyncMock()
     mock_load_balancer._workers = {}
@@ -291,13 +291,13 @@ class TestWorkerProxy:
         **When:**
             :py:class:`WorkerProxy` is initialized.
         **Then:**
-            It should create :py:class:`LocalDiscovery` and use
+            It should create :py:class:`LocalDiscoveryService` and use
             :py:class:`RoundRobinLoadBalancer`.
         """
         # Arrange
         mock_local_discovery_service = mocker.MagicMock()
         mocker.patch.object(
-            wp, "LocalDiscovery", return_value=mock_local_discovery_service
+            wp, "LocalDiscoveryService", return_value=mock_local_discovery_service
         )
 
         # Act
@@ -454,7 +454,7 @@ class TestWorkerProxy:
         mock_factory, mock_load_balancer = mock_load_balancer_factory
         mock_local_discovery_service = mocker.MagicMock()
         mocker.patch.object(
-            wp, "LocalDiscovery", return_value=mock_local_discovery_service
+            wp, "LocalDiscoveryService", return_value=mock_local_discovery_service
         )
 
         # Act
@@ -677,7 +677,7 @@ class TestWorkerProxy:
         # Arrange
         # Use real objects instead of mocks for cloudpickle test
 
-        discovery_service = LocalDiscovery("test-pool")
+        discovery_service = LocalDiscoveryService("test-pool")
         proxy = wp.WorkerProxy(
             discovery=discovery_service, loadbalancer=wp.RoundRobinLoadBalancer
         )
@@ -712,7 +712,7 @@ class TestWorkerProxy:
         # Arrange
         # Use real objects instead of mocks for cloudpickle test
 
-        discovery_service = LocalDiscovery("test-pool")
+        discovery_service = LocalDiscoveryService("test-pool")
         proxy = wp.WorkerProxy(discovery=discovery_service)
 
         # Act & Assert
@@ -743,7 +743,7 @@ class TestWorkerProxy:
             deserialized proxy in an unstarted state and preserved ID.
         """
         # Arrange
-        # Use real objects - this creates a LocalDiscovery internally
+        # Use real objects - this creates a LocalDiscoveryService internally
         proxy = wp.WorkerProxy("pool-1")
 
         # Act & Assert
@@ -1330,7 +1330,7 @@ class TestRoundRobinLoadBalancerEdgeCases:
     async def test_dispatch_with_workers_handles_transient_errors(
         self, mocker: MockerFixture
     ):
-        """Test RoundRobinLoadBalancer dispatch with workers that fail with transient
+        """Test RoundRobinLoadBalancer dispatch with workers that fail with transient 
         errors.
 
         Given:
@@ -1338,7 +1338,7 @@ class TestRoundRobinLoadBalancerEdgeCases:
         When:
             dispatch is called and all workers fail
         Then:
-            Should try all workers and raise NoWorkersAvailable with transient
+            Should try all workers and raise NoWorkersAvailable with transient 
             error message
         """
         # Arrange
@@ -1478,7 +1478,7 @@ class TestWorkerProxyConstructorEdgeCases:
                 uid="worker-1", host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
             )
         ]
-        discovery = LocalDiscovery("test-pool")
+        discovery = LocalDiscoveryService("test-pool")
 
         # Act & Assert
         with pytest.raises(ValueError, match="Must specify exactly one of"):

@@ -13,10 +13,7 @@ from multiprocessing import Process
 from multiprocessing.connection import Connection
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import AsyncContextManager
 from typing import AsyncIterator
-from typing import Awaitable
-from typing import ContextManager
 from typing import Final
 from typing import Generic
 from typing import Protocol
@@ -34,16 +31,18 @@ from wool import _protobuf as pb
 from wool._resource_pool import ResourcePool
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
-from wool._worker_discovery import Factory
-from wool._worker_discovery import RegistrarLike
+from wool._worker_discovery import RegistryServiceLike
 from wool._worker_discovery import WorkerInfo
 
 if TYPE_CHECKING:
     from wool._worker_proxy import WorkerProxy
 
+_ip_address: str | None = None
+_EXTERNAL_DNS_SERVER: Final[str] = "8.8.8.8"  # Google DNS for IP detection
+
 
 @contextmanager
-def _signal_handlers(service: WorkerService):
+def _signal_handlers(service: "WorkerService"):
     """Context manager for setting up signal handlers for graceful shutdown.
 
     Installs SIGTERM and SIGINT handlers that gracefully shut down the worker
@@ -81,8 +80,13 @@ def _signal_handlers(service: WorkerService):
         signal.signal(signal.SIGINT, old_sigint)
 
 
+_T_RegistryService = TypeVar(
+    "_T_RegistryService", bound=RegistryServiceLike, covariant=True
+)
+
+
 # public
-class Worker(ABC):
+class Worker(ABC, Generic[_T_RegistryService]):
     """Abstract base class for worker implementations in the wool framework.
 
     Workers are individual processes that execute distributed tasks within
@@ -90,40 +94,36 @@ class Worker(ABC):
     a discovery service to be found by client sessions.
 
     This class defines the core interface that all worker implementations
-    must provide, including lifecycle management and registrar service
+    must provide, including lifecycle management and registry service
     integration for peer-to-peer discovery.
 
     :param tags:
         Capability tags associated with this worker for filtering and
         selection by client sessions.
-    :param registrar:
-        Service instance or factory for worker registration and discovery
-        within the distributed pool. Can be provided as:
-
-        - **Instance**: Direct registrar service object
-        - **Factory function**: Function returning a registrar service instance
-        - **Context manager factory**: Function returning a context manager
-            that yields a registrar service
+    :param registry_service:
+        Service instance for worker registration and discovery within
+        the distributed pool.
     :param extra:
         Additional arbitrary metadata as key-value pairs.
     """
 
     _info: WorkerInfo | None = None
     _started: bool = False
-    _registrar: RegistrarLike | Factory[RegistrarLike]
-    _registrar_service: RegistrarLike | None = None
-    _registrar_context: Any | None = None
+    _registry_service: RegistryServiceLike
     _uid: Final[str]
     _tags: Final[set[str]]
     _extra: Final[dict[str, Any]]
 
     def __init__(
-        self, *tags: str, registrar: RegistrarLike | Factory[RegistrarLike], **extra: Any
+        self,
+        *tags: str,
+        registry_service: _T_RegistryService,
+        **extra: Any,
     ):
         self._uid = f"worker-{uuid.uuid4().hex}"
         self._tags = set(tags)
         self._extra = extra
-        self._registrar = registrar
+        self._registry_service = registry_service
 
     @property
     def uid(self) -> str:
@@ -167,21 +167,14 @@ class Worker(ABC):
 
         This method is a final implementation that calls the abstract
         `_start` method to initialize the worker process and register
-        it with the registrar service.
+        it with the registry service.
         """
         if self._started:
             raise RuntimeError("Worker has already been started")
-
-        self._registrar_service, self._registrar_context = await self._enter_context(
-            self._registrar
-        )
-        if not isinstance(self._registrar_service, RegistrarLike):
-            raise ValueError("Registrar factory must return a RegistrarLike instance")
-
+        if self._registry_service:
+            await self._registry_service.start()
         await self._start()
         self._started = True
-        assert self._info
-        await self._registrar_service.register(self._info)
 
     @final
     async def stop(self):
@@ -189,23 +182,13 @@ class Worker(ABC):
 
         This method is a final implementation that calls the abstract
         `_stop` method to gracefully shut down the worker process and
-        unregister it from the registrar service.
+        unregister it from the registry service.
         """
         if not self._started:
             raise RuntimeError("Worker has not been started")
-        try:
-            if not self._info:
-                raise RuntimeError("Cannot unregister - worker has no info")
-            assert self._registrar_service is not None
-            await self._registrar_service.unregister(self._info)
-        finally:
-            try:
-                await self._stop()
-            finally:
-                await self._exit_context(self._registrar_context)
-                self._registrar_service = None
-                self._registrar_context = None
-                self._started = False
+        await self._stop()
+        if self._registry_service:
+            await self._registry_service.stop()
 
     @abstractmethod
     async def _start(self):
@@ -225,36 +208,10 @@ class Worker(ABC):
         """
         ...
 
-    async def _enter_context(self, factory):
-        """Enter context for factory objects, handling different factory types."""
-        ctx = None
-        if isinstance(factory, ContextManager):
-            ctx = factory
-            obj = ctx.__enter__()
-        elif isinstance(factory, AsyncContextManager):
-            ctx = factory
-            obj = await ctx.__aenter__()
-        elif callable(factory):
-            return await self._enter_context(factory())
-        elif isinstance(factory, Awaitable):
-            obj = await factory
-        else:
-            obj = factory
-        return obj, ctx
-
-    async def _exit_context(
-        self, ctx: AsyncContextManager | ContextManager | None, *args
-    ):
-        """Exit context for context managers."""
-        if isinstance(ctx, AsyncContextManager):
-            await ctx.__aexit__(*args)
-        elif isinstance(ctx, ContextManager):
-            ctx.__exit__(*args)
-
 
 # public
-class WorkerFactory(Protocol):
-    """Protocol for creating worker instances with registrar integration.
+class WorkerFactory(Generic[_T_RegistryService], Protocol):
+    """Protocol for creating worker instances with registry integration.
 
     Defines the callable interface for worker factory implementations
     that can create :py:class:`Worker` instances configured with specific
@@ -264,7 +221,7 @@ class WorkerFactory(Protocol):
     worker processes with consistent configuration.
     """
 
-    def __call__(self, *tags: str, **_) -> Worker:
+    def __call__(self, *tags: str, **_) -> Worker[_T_RegistryService]:
         """Create a new worker instance.
 
         :param tags:
@@ -278,12 +235,12 @@ class WorkerFactory(Protocol):
 
 
 # public
-class LocalWorker(Worker):
+class LocalWorker(Worker[_T_RegistryService]):
     """Local worker implementation that runs tasks in a separate process.
 
     :py:class:`LocalWorker` creates and manages a dedicated worker process
     that hosts a gRPC server for executing distributed wool tasks. Each
-    worker automatically registers itself with the provided registrar service
+    worker automatically registers itself with the provided registry service
     for discovery by client sessions.
 
     The worker process runs independently and can handle multiple concurrent
@@ -293,8 +250,8 @@ class LocalWorker(Worker):
     :param tags:
         Capability tags to associate with this worker for filtering
         and selection by client sessions.
-    :param registrar:
-        Service instance or factory for worker registration and discovery.
+    :param registry_service:
+        Service instance for worker registration and discovery.
     :param extra:
         Additional arbitrary metadata as key-value pairs.
     """
@@ -306,10 +263,10 @@ class LocalWorker(Worker):
         *tags: str,
         host: str = "127.0.0.1",
         port: int = 0,
-        registrar: RegistrarLike | Factory[RegistrarLike],
+        registry_service: _T_RegistryService,
         **extra: Any,
     ):
-        super().__init__(*tags, registrar=registrar, **extra)
+        super().__init__(*tags, registry_service=registry_service, **extra)
         self._worker_process = WorkerProcess(host=host, port=port)
 
     @property
@@ -342,9 +299,9 @@ class LocalWorker(Worker):
     async def _start(self):
         """Start the worker process and register it with the pool.
 
-        Initializes the registrar service, starts the worker process
+        Initializes the registry service, starts the worker process
         with its gRPC server, and registers the worker's network
-        address with the registrar for discovery by client sessions.
+        address with the registry for discovery by client sessions.
         """
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._worker_process.start)
@@ -367,15 +324,21 @@ class LocalWorker(Worker):
             tags=self._tags,
             extra=self._extra,
         )
+        await self._registry_service.register(self._info)
 
     async def _stop(self):
         """Stop the worker process and unregister it from the pool.
 
-        Unregisters the worker from the registrar service, gracefully
+        Unregisters the worker from the registry service, gracefully
         shuts down the worker process using SIGINT, and cleans up
-        the registrar service. If graceful shutdown fails, the process
+        the registry service. If graceful shutdown fails, the process
         is forcefully terminated.
         """
+        if not self._info:
+            raise RuntimeError("Cannot unregister - worker has no info")
+
+        await self._registry_service.unregister(self._info)
+
         if not self._worker_process.is_alive():
             return
         try:

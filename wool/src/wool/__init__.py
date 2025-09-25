@@ -19,10 +19,10 @@ from wool._work import routine
 from wool._work import work
 from wool._worker import Worker
 from wool._worker import WorkerService
-from wool._worker_discovery import Discovery
-from wool._worker_discovery import LanDiscovery
-from wool._worker_discovery import LanRegistrar
-from wool._worker_discovery import Registrar
+from wool._worker_discovery import DiscoveryService
+from wool._worker_discovery import LanDiscoveryService
+from wool._worker_discovery import LanRegistryService
+from wool._worker_discovery import RegistryService
 from wool._worker_pool import WorkerPool
 from wool._worker_proxy import WorkerProxy
 
@@ -61,13 +61,13 @@ __proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar
 )
 
 __all__ = [
-    "LanDiscovery",
-    "LanRegistrar",
+    "LanDiscoveryService",
+    "LanRegistryService",
     "Worker",
-    "Discovery",
+    "DiscoveryService",
     "WorkerPool",
     "WorkerProxy",
-    "Registrar",
+    "RegistryService",
     "WorkerService",
     "WoolTask",
     "WoolTaskEvent",
