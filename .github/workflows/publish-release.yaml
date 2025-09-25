@@ -20,7 +20,7 @@ jobs:
   tag-version:
     name: Tag version
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.merged == true }}
+    if: ${{ github.event.pull_request.merged == true || github.event.inputs.version != '' }}
     permissions:
       contents: write
     outputs:
