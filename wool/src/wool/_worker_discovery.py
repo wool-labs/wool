@@ -322,12 +322,18 @@ class Reducible(Protocol):
 
 
 # public
-class ReducibleAsyncIteratorLike(Reducible, AsyncIterator[_T_co], Protocol):
+class ReducibleAsyncIteratorLike(Reducible, Protocol, Generic[_T_co]):
     """Protocol for async iterators that yield discovery events.
 
     Implementations must be pickleable via __reduce__ to support
     task-specific session contexts in distributed environments.
     """
+
+    def __aiter__(self) -> ReducibleAsyncIteratorLike[_T_co]:
+        ...
+
+    def __anext__(self) -> Awaitable[_T_co]:
+        ...
 
 
 # public
