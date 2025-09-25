@@ -1,105 +1,12 @@
 import logging
 from typing import Final
 
-import debugpy
 import pytest
-
-import wool
-from wool import _worker
-from wool._protobuf.worker import WorkerStub
-from wool._protobuf.worker import add_WorkerServicer_to_server
-from wool._resource_pool import ResourcePool
-from wool._worker import WorkerService
 
 logger = logging.getLogger(__name__)
 
 _automark = True
 _ignore_unknown = True
-
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_configure(config):
-    if config.getoption("--wait-for-debugger"):
-        print("Waiting for debugger to attach...")
-        debugpy.listen(("0.0.0.0", 5678))
-        debugpy.wait_for_client()
-        print("Debugger attached.")
-    global _automark, _ignore_unknown
-    _automark = config.getini("automark_dependency")
-    _ignore_unknown = config.getoption("--ignore-unknown-dependency")
-    config.addinivalue_line(
-        "markers",
-        "dependency(name=None, depends=[]): "
-        "mark a test to be used as a dependency for "
-        "other tests or to depend on other tests.",
-    )
-
-
-def pytest_addoption(parser):
-    parser.addini(
-        "automark_dependency",
-        "Add the dependency marker to all tests automatically",
-        type="bool",
-        default=True,
-    )
-    parser.addoption(
-        "--ignore-unknown-dependency",
-        action="store_true",
-        default=True,
-        help="ignore dependencies whose outcome is not known",
-    )
-    parser.addoption(
-        "-D",
-        "--wait-for-debugger",
-        action="store_true",
-        default=False,
-        help="Wait for a debugpy client to attach before running tests",
-    )
-
-
-@pytest.fixture
-def mock_worker_proxy_cache(mocker):
-    mock_pool = mocker.MagicMock(spec=ResourcePool)
-    mock_proxy = mocker.MagicMock()  # This will be returned by the context manager
-    mock_pool.acquire.return_value.__aenter__ = mocker.AsyncMock(return_value=mock_proxy)
-    mock_pool.acquire.return_value.__aexit__ = mocker.AsyncMock(return_value=False)
-
-    # Store original context var
-
-    # Set the mock pool in the context var
-    token = wool.__proxy_pool__.set(mock_pool)
-
-    yield mock_pool
-
-    # Restore original context var
-    wool.__proxy_pool__.reset(token)
-
-
-@pytest.fixture
-def pool_uri():
-    return "wiley-coyote"
-
-
-@pytest.fixture(scope="function")
-def mock_worker_thread(mocker):
-    mock = mocker.patch.object(_worker, "WorkerThread", autospec=True)
-    mock.return_value._loop = mocker.MagicMock()
-    return mock
-
-
-@pytest.fixture(scope="function")
-def grpc_add_to_server():
-    return add_WorkerServicer_to_server
-
-
-@pytest.fixture(scope="function")
-def grpc_servicer():
-    return WorkerService()
-
-
-@pytest.fixture(scope="function")
-def grpc_stub_cls():
-    return WorkerStub
 
 
 class DependencyItemStatus:
@@ -214,8 +121,35 @@ def depends(request, other, scope="module"):
     manager.check_dependencies(other, item)
 
 
+def pytest_addoption(parser):
+    parser.addini(
+        "automark_dependency",
+        "Add the dependency marker to all tests automatically",
+        type="bool",
+        default=False,
+    )
+    parser.addoption(
+        "--ignore-unknown-dependency",
+        action="store_true",
+        default=False,
+        help="ignore dependencies whose outcome is not known",
+    )
+
+
+def pytest_configure(config):
+    global _automark, _ignore_unknown
+    _automark = config.getini("automark_dependency")
+    _ignore_unknown = config.getoption("--ignore-unknown-dependency")
+    config.addinivalue_line(
+        "markers",
+        "dependency(name=None, depends=[]): "
+        "mark a test to be used as a dependency for "
+        "other tests or to depend on other tests.",
+    )
+
+
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
-def pytest_runtest_makereport(item, call):
+def pytest_runtest_makereport(item, _):
     """Store the test outcome if this item is marked "dependency"."""
     outcome = yield
     marker = item.get_closest_marker("dependency")

@@ -12,8 +12,6 @@ on:
     paths:
       - wool/src/**
       - wool/pyproject.toml
-      - wool-locking/src/**
-      - wool-locking/pyproject.toml
     
 jobs:
   add-code-change-label:
