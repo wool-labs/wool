@@ -1,4 +1,6 @@
+import os
 import pathlib
+import re
 
 import toml
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
@@ -22,6 +24,25 @@ class EditableInstallHook(BuildHookInterface):
     """
 
     def initialize(self, version: str, build_data: dict) -> None:
+        for root, _, filenames in os.walk(
+            pathlib.Path(self.root) / "src" / "wool" / "_protobuf"
+        ):
+            for filename in filenames:
+                if filename.endswith("_pb2_grpc.py"):
+                    filepath = os.path.join(root, filename)
+                    with open(filepath, "r") as file:
+                        content = file.read()
+
+                    updated_content = re.sub(
+                        r"^import (\w+_pb2) as (\w+__pb2)",
+                        r"from . import \1 as \2",
+                        content,
+                        flags=re.MULTILINE,
+                    )
+
+                    with open(filepath, "w") as file:
+                        file.write(updated_content)
+
         wool, repo = (
             (root := pathlib.Path(self.root)) / "src" / "wool",
             root.parent,

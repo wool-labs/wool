@@ -11,8 +11,6 @@ on:
     paths:
       - wool/src/**
       - wool/pyproject.toml
-      - wool-locking/src/**
-      - wool-locking/pyproject.toml
 
 jobs:
   tag-version:
@@ -65,7 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        source: [wool, wool-locking]
+        source: [wool]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-release
@@ -102,7 +100,7 @@ jobs:
       id-token: write
     strategy:
       matrix:
-        source: [wool, wool-locking]
+        source: [wool]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/publish-github-release
@@ -120,7 +118,7 @@ jobs:
       id-token: write
     strategy:
       matrix:
-        source: [wool, wool-locking]
+        source: [wool]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/publish-pypi-release
