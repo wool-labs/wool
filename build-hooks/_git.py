@@ -4,7 +4,8 @@ from _version import parser
 
 @parser("git")
 def parse() -> str:
-    """Parses the current git repository to generate a version string.
+    """
+    Parses the current git repository to generate a version string.
 
     Returns:
         A version string based on the latest tag, commit hash, and uncommitted
