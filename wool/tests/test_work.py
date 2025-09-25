@@ -1260,17 +1260,10 @@ class TestWorkDecorator:
         decorated_func = work(function_for_line_140_coverage)
 
         try:
+            # Use a simple return_value instead of side_effect to avoid recursion
             original_iscoroutinefunction = mocker.patch(
-                "wool._work.inspect.iscoroutinefunction"
+                "wool._work.inspect.iscoroutinefunction", return_value=False
             )
-            call_count = 0
-
-            def mock_iscoroutinefunction(fn):
-                nonlocal call_count
-                call_count += 1
-                return call_count != 1
-
-            original_iscoroutinefunction.side_effect = mock_iscoroutinefunction
 
             # Act & Assert - this should trigger line 140
             with pytest.raises(ValueError, match="Expected a coroutine function"):

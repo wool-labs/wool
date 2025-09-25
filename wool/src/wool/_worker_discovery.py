@@ -329,11 +329,9 @@ class ReducibleAsyncIteratorLike(Reducible, Protocol, Generic[_T_co]):
     task-specific session contexts in distributed environments.
     """
 
-    def __aiter__(self) -> ReducibleAsyncIteratorLike[_T_co]:
-        ...
+    def __aiter__(self) -> ReducibleAsyncIteratorLike[_T_co]: ...
 
-    def __anext__(self) -> Awaitable[_T_co]:
-        ...
+    def __anext__(self) -> Awaitable[_T_co]: ...
 
 
 # public

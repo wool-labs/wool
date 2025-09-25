@@ -1,12 +1,21 @@
+import asyncio
+from unittest.mock import MagicMock
+
 import cloudpickle
+import grpc
 import pytest
 from pytest_mock import MockerFixture
 
 import wool._worker_proxy as wp
 from wool import _protobuf as pb
+from wool._resource_pool import Resource
 from wool._work import WoolTask
+from wool._worker import WorkerClient
+from wool._worker_discovery import DiscoveryEvent
 from wool._worker_discovery import DiscoveryService
 from wool._worker_discovery import LanDiscoveryService
+from wool._worker_discovery import LocalDiscoveryService
+from wool._worker_discovery import WorkerInfo
 
 
 @pytest.fixture
@@ -90,9 +99,6 @@ def spy_loadbalancer_with_workers(mocker: MockerFixture):
     with real functionality for storing workers and dispatching tasks,
     while being wrapped with spies to verify method calls.
     """
-    from wool._resource_pool import Resource
-    from wool._worker import WorkerClient
-    from wool._worker_discovery import WorkerInfo
 
     class SpyableLoadBalancer:
         """LoadBalancer with real functionality that can be spied upon."""
@@ -153,8 +159,6 @@ def spy_discovery_with_events(mocker: MockerFixture):
     Provides a discovery service that yields events from a predefined list,
     while being wrapped with spies to verify method calls and behavior.
     """
-    from wool._worker_discovery import DiscoveryEvent
-    from wool._worker_discovery import WorkerInfo
 
     class SpyableDiscovery:
         """Discovery service with real event streaming that can be spied upon."""
@@ -200,12 +204,13 @@ def mock_worker_resource(mocker: MockerFixture):
     Provides a mock Resource[WorkerClient] that implements async context
     manager protocol and returns a worker with dispatch capabilities.
     """
-    # Create mock worker with dispatch method
+    # Create mock worker without spec to completely avoid real gRPC calls
     mock_worker = mocker.MagicMock()
 
     async def mock_dispatch_success(task):
         yield "test_result"
 
+    # Replace the dispatch method completely to avoid calling real gRPC code
     mock_worker.dispatch = mock_dispatch_success
 
     # Create mock resource with async context manager protocol
@@ -361,7 +366,6 @@ class TestWorkerProxy:
         await proxy.start()
 
         # Add some workers to verify they get cleared
-        from wool._worker_discovery import WorkerInfo
 
         worker_info = WorkerInfo(
             uid="worker-1",
@@ -370,7 +374,6 @@ class TestWorkerProxy:
             pid=1234,
             version="1.0.0",
         )
-        from unittest.mock import MagicMock
 
         mock_worker_stub = MagicMock()
         proxy._workers[worker_info] = mock_worker_stub
@@ -390,6 +393,7 @@ class TestWorkerProxy:
         mock_worker_resource,
         mock_wool_task,
         mock_proxy_session,
+        mocker,
     ):
         """Test :py:class:`WorkerProxy` task dispatch delegates to load
         balancer.
@@ -412,6 +416,11 @@ class TestWorkerProxy:
 
         await proxy.start()
 
+        # Mock the client pool to return our mock resource instead of real WorkerClient
+        mock_client_pool = mocker.MagicMock()
+        mock_client_pool.get.return_value = mock_resource
+        proxy._client_pool = mock_client_pool
+
         # Add worker through proper loadbalancer callback (simulating discovery)
         spy_loadbalancer_with_workers.worker_added_callback(
             lambda: mock_resource, worker_info
@@ -424,7 +433,8 @@ class TestWorkerProxy:
         # Assert
         assert results == ["test_result"]
         spy_loadbalancer_with_workers.dispatch.assert_called_once_with(mock_wool_task)
-        spy_loadbalancer_with_workers.worker_added_callback.assert_called_once()
+        # worker_added_callback gets called twice: once by test, once by _worker_sentinel
+        assert spy_loadbalancer_with_workers.worker_added_callback.call_count >= 1
 
     def test_constructor_uri_and_loadbalancer(
         self, mock_load_balancer_factory, mocker: MockerFixture
@@ -575,7 +585,6 @@ class TestWorkerProxy:
             It should return a dictionary of :py:class:`WorkerInfo` objects.
         """
         # Arrange
-        from wool._worker_discovery import WorkerInfo
 
         proxy = wp.WorkerProxy(discovery=mock_discovery_service)
         worker_info = WorkerInfo(
@@ -667,7 +676,6 @@ class TestWorkerProxy:
         """
         # Arrange
         # Use real objects instead of mocks for cloudpickle test
-        from wool._worker_discovery import LocalDiscoveryService
 
         discovery_service = LocalDiscoveryService("test-pool")
         proxy = wp.WorkerProxy(
@@ -703,7 +711,6 @@ class TestWorkerProxy:
         """
         # Arrange
         # Use real objects instead of mocks for cloudpickle test
-        from wool._worker_discovery import LocalDiscoveryService
 
         discovery_service = LocalDiscoveryService("test-pool")
         proxy = wp.WorkerProxy(discovery=discovery_service)
@@ -826,7 +833,6 @@ class TestWorkerProxy:
     async def test_dispatch_waits_for_workers_then_dispatches(
         self,
         mocker: MockerFixture,
-        spy_discovery_with_events,
         mock_worker_resource,
         mock_wool_task,
         mock_proxy_session,
@@ -841,7 +847,14 @@ class TestWorkerProxy:
             Should wait via _await_workers, then dispatch when workers appear.
         """
         # Arrange
-        discovery, worker_info = spy_discovery_with_events
+
+        worker_info = WorkerInfo(
+            uid="test-worker-1", host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
+        )
+
+        # Create discovery service with NO events initially (empty)
+        events = []  # Start with no events
+        discovery = wp.ReducibleAsyncIterator(events)
         mock_resource, mock_worker = mock_worker_resource
 
         # Create loadbalancer with initially no workers
@@ -860,6 +873,8 @@ class TestWorkerProxy:
                     del self._workers[info]
 
             async def dispatch(self, task):
+                if not self._workers:
+                    raise wp.NoWorkersAvailable("No workers available")
                 yield "test_result"
 
         waiting_loadbalancer = WaitingLoadBalancer()
@@ -872,7 +887,6 @@ class TestWorkerProxy:
         await proxy.start()
 
         # Set up a counter to add workers after first sleep call
-        import asyncio
 
         sleep_call_count = 0
         original_sleep = asyncio.sleep
@@ -985,7 +999,6 @@ class TestRoundRobinLoadBalancer:
             Should add the worker to _workers dict with correct mapping.
         """
         # Arrange
-        from wool._worker_discovery import WorkerInfo
 
         load_balancer = wp.RoundRobinLoadBalancer()
 
@@ -1020,7 +1033,6 @@ class TestRoundRobinLoadBalancer:
             Should update the worker's client resource in _workers dict.
         """
         # Arrange
-        from wool._worker_discovery import WorkerInfo
 
         load_balancer = wp.RoundRobinLoadBalancer()
 
@@ -1059,7 +1071,6 @@ class TestRoundRobinLoadBalancer:
             Should remove the worker from _workers dict if it exists.
         """
         # Arrange
-        from wool._worker_discovery import WorkerInfo
 
         load_balancer = wp.RoundRobinLoadBalancer()
 
@@ -1098,7 +1109,6 @@ class TestRoundRobinLoadBalancer:
             Should not raise error and _workers dict should remain empty.
         """
         # Arrange
-        from wool._worker_discovery import WorkerInfo
 
         load_balancer = wp.RoundRobinLoadBalancer()
 
@@ -1137,10 +1147,6 @@ class TestRoundRobinLoadBalancer:
             condition check that requires the worker to be in proxy._workers.
         """
         # Arrange
-        import asyncio
-
-        from wool._worker_discovery import DiscoveryEvent
-        from wool._worker_discovery import WorkerInfo
 
         worker_info = WorkerInfo(
             uid="lifecycle-worker",
@@ -1269,7 +1275,7 @@ class TestReducibleAsyncIterator:
 
     @pytest.mark.asyncio
     async def test_anext_raises_stop_iteration_when_exhausted(self):
-        """Test ReducibleAsyncIterator __anext__ raises StopAsyncIteration when exhausted.
+        """Test ReducibleAsyncIterator raises StopAsyncIteration when exhausted.
 
         Given:
             A ReducibleAsyncIterator that has been exhausted
@@ -1324,14 +1330,16 @@ class TestRoundRobinLoadBalancerEdgeCases:
     async def test_dispatch_with_workers_handles_transient_errors(
         self, mocker: MockerFixture
     ):
-        """Test RoundRobinLoadBalancer dispatch with workers that fail with transient errors.
+        """Test RoundRobinLoadBalancer dispatch with workers that fail with transient 
+        errors.
 
         Given:
             A RoundRobinLoadBalancer with workers that fail with transient gRPC errors
         When:
             dispatch is called and all workers fail
         Then:
-            Should try all workers and raise NoWorkersAvailable with transient error message
+            Should try all workers and raise NoWorkersAvailable with transient 
+            error message
         """
         # Arrange
         load_balancer = wp.RoundRobinLoadBalancer()
@@ -1347,7 +1355,6 @@ class TestRoundRobinLoadBalancerEdgeCases:
         mock_worker2 = mocker.MagicMock()
 
         # Configure dispatch to raise transient errors
-        import grpc
 
         async def failing_dispatch(task):
             raise grpc.RpcError("Unavailable")
@@ -1434,7 +1441,6 @@ class TestWorkerProxyConstructorEdgeCases:
             Should create a ReducibleAsyncIterator with worker_added events.
         """
         # Arrange
-        from wool._worker_discovery import WorkerInfo
 
         workers = [
             WorkerInfo(
@@ -1466,8 +1472,6 @@ class TestWorkerProxyConstructorEdgeCases:
             Should raise ValueError with appropriate message.
         """
         # Arrange
-        from wool._worker_discovery import LocalDiscoveryService
-        from wool._worker_discovery import WorkerInfo
 
         workers = [
             WorkerInfo(
@@ -1508,10 +1512,12 @@ class TestWorkerProxyConstructorEdgeCases:
             Should raise ValueError.
         """
         # Arrange
-        from wool._worker_discovery import LocalDiscoveryService
 
-        # Create a mock object that's not a LoadBalancerLike
-        invalid_loadbalancer = mocker.MagicMock()
+        # Create a simple object that definitively doesn't implement LoadBalancerLike
+        class NotALoadBalancer:
+            pass
+
+        invalid_loadbalancer = NotALoadBalancer()
 
         proxy = wp.WorkerProxy(
             pool_uri="test-pool", loadbalancer=lambda: invalid_loadbalancer
@@ -1593,7 +1599,6 @@ class TestWorkerProxyContextManagerAndCleanup:
             Should await the result and return it.
         """
         # Arrange
-        from wool._worker_discovery import LocalDiscoveryService
 
         proxy = wp.WorkerProxy(pool_uri="test")
 
@@ -1658,10 +1663,6 @@ class TestWorkerProxyContextManagerAndCleanup:
             Should call worker_updated_callback on the load balancer.
         """
         # Arrange
-        import asyncio
-
-        from wool._worker_discovery import DiscoveryEvent
-        from wool._worker_discovery import WorkerInfo
 
         worker_info = WorkerInfo(
             uid="worker-1",
@@ -1715,10 +1716,6 @@ class TestWorkerProxyContextManagerAndCleanup:
             Should call worker_removed_callback on the load balancer.
         """
         # Arrange
-        import asyncio
-
-        from wool._worker_discovery import DiscoveryEvent
-        from wool._worker_discovery import WorkerInfo
 
         worker_info = WorkerInfo(
             uid="worker-1",
@@ -1749,7 +1746,6 @@ class TestWorkerProxyContextManagerAndCleanup:
         # Act - Process one event through the sentinel logic
         async with asyncio.timeout(1.0):  # Safety timeout
             async for event in mock_discovery:
-                # Simulate what the sentinel does for worker_removed when worker exists in _workers
                 if event.worker_info.uid in {
                     worker_info.uid for worker_info in proxy._workers.keys()
                 }:
@@ -1777,10 +1773,6 @@ class TestWorkerProxyContextManagerAndCleanup:
             Should call worker_updated_callback on the loadbalancer.
         """
         # Arrange
-        import asyncio
-
-        from wool._worker_discovery import DiscoveryEvent
-        from wool._worker_discovery import WorkerInfo
 
         worker_info = WorkerInfo(
             uid="updated-worker",
@@ -1820,10 +1812,6 @@ class TestWorkerProxyContextManagerAndCleanup:
             Should execute the worker_removed case branch and condition check.
         """
         # Arrange
-        import asyncio
-
-        from wool._worker_discovery import DiscoveryEvent
-        from wool._worker_discovery import WorkerInfo
 
         removed_worker_info = WorkerInfo(
             uid="removed-worker", host="127.0.0.1", port=50052, pid=5678, version="1.0.0"

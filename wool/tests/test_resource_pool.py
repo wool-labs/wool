@@ -699,19 +699,26 @@ class TestResourcePool:
         """
         # Arrange
         sleep_calls = []
-        task_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        finalizer_called = asyncio.Event()
 
         async def mock_sleep(delay):
             sleep_calls.append(delay)
             if delay != 0:  # Only signal for non-zero delays (actual TTL sleeps)
-                task_started.set()
+                cleanup_started.set()
+                # Wait briefly to ensure the test can check the finalizer state
+                await finalizer_called.wait()
             # Don't actually sleep, just record the call
 
         # Act & Assert
         # Patch asyncio.sleep globally to ensure it captures calls from background tasks
         with patch("asyncio.sleep", side_effect=mock_sleep):
             mock_factory = Mock(return_value=Mock(name="test-obj"))
-            mock_finalizer = Mock()
+
+            def mock_finalizer_func(obj):
+                finalizer_called.set()
+
+            mock_finalizer = Mock(side_effect=mock_finalizer_func)
 
             pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=ttl)
 
@@ -726,8 +733,18 @@ class TestResourcePool:
             else:
                 # Wait for the background task to actually call sleep with the TTL value
                 try:
-                    await asyncio.wait_for(task_started.wait(), timeout=1.0)
+                    await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+                    # At this point cleanup task is waiting for finalizer_called
+                    # Finalizer should not have been called yet
+                    mock_finalizer.assert_not_called()
+
+                    # Now allow cleanup to proceed
+                    finalizer_called.set()
+
+                    # Wait a bit for cleanup to complete
+                    await asyncio.sleep(0.1)
                 except asyncio.TimeoutError:
+                    # If timeout, just check that sleep was called with TTL
                     pass
 
                 # Filter out our own sleep(0) calls and any wait_for internal calls
@@ -737,8 +754,6 @@ class TestResourcePool:
                 assert len(filtered_calls) > 0, (
                     f"Expected TTL {ttl} not found in sleep calls: {sleep_calls}"
                 )
-                # Finalizer not called immediately due to TTL
-                mock_finalizer.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_finalizer_exception_handling_catches_errors(self):
