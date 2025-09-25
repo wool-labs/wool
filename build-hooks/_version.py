@@ -4,8 +4,8 @@ import enum
 import functools
 import re
 from typing import (
+    TYPE_CHECKING,
     Callable,
-    Final,
     Generic,
     MutableSequence,
     Optional,
@@ -13,6 +13,11 @@ from typing import (
     TypeVar,
     overload,
 )
+
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 __version_parsers__: dict = {}
 
@@ -324,11 +329,11 @@ segment = type("segment", (property,), {})
 
 class VersionMeta(type):
     @property
-    def parse(cls: type[Version]) -> VersionParser:
+    def parse(cls: Self) -> VersionParser[Self]:
         return VersionParser(cls)
 
     @property
-    def segments(cls: type[Version]) -> dict[str, segment]:
+    def segments(cls: Self) -> dict[str, segment]:
         return {k: v for k, v in cls.__dict__.items() if isinstance(v, segment)}
 
 
@@ -454,7 +459,7 @@ class PythonicVersion(Version):
         '1.1.0'
     """
 
-    PATTERN: Final[re.Pattern] = re.compile(
+    PATTERN: re.Pattern = re.compile(
         r"v?"
         r"((?P<epoch>\d+)(?:!))?"
         r"(?P<major_release>\d+)?"
@@ -466,6 +471,9 @@ class PythonicVersion(Version):
         r"((?:\+)(?P<local_identifier>[a-zA-Z0-9.]+))?"
         r"$"
     )
+
+    if TYPE_CHECKING:
+        parse: VersionParser[PythonicVersion]
 
     def __init__(
         self,
@@ -614,7 +622,7 @@ class SemanticVersion(Version):
         '1.1.0'
     """
 
-    PATTERN: Final[re.Pattern] = re.compile(
+    PATTERN: re.Pattern = re.compile(
         r"^v?"
         r"(?P<major_release>0|[1-9]\d*)"
         r"\.(?P<minor_release>0|[1-9]\d*)"

@@ -24,7 +24,7 @@ jobs:
         id: get-touched-files
         uses: ./.github/actions/get-touched-files
         with:
-          pathspec: 'wool/src/ wool/pyproject.toml wool-locking/src/ wool-locking/pyproject.toml'
+          pathspec: 'wool/src/ wool/pyproject.toml'
       - name: Fail if code hasn't changed
         if: ${{ ! steps.get-touched-files.outputs.touched }}
         run: |
@@ -93,7 +93,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        source: [wool, wool-locking]
+        source: [wool]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-release
@@ -130,7 +130,7 @@ jobs:
       id-token: write
     strategy:
       matrix:
-        source: [wool, wool-locking]
+        source: [wool]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/publish-github-release
@@ -148,7 +148,7 @@ jobs:
       id-token: write
     strategy:
       matrix:
-        source: [wool, wool-locking]
+        source: [wool]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/publish-pypi-release
