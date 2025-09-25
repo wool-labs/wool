@@ -1,6 +1,6 @@
-# Wool
+<a href="https://github.com/abdenlab/oxbow"><img align="center" src="./assets/woolly-transparent-bg-2048.png"></img></a>
 
-Wool is a native Python package for transparently executing tasks in a horizontally scalable, distributed network of agnostic worker processes. Any picklable async function or method can be converted into a task with a simple decorator and a client connection.
+**Wool** is a Python framework for transparently scheduling and executing tasks in a horizontally scalable, distributed network of agnostic worker processes. Any picklable async function or method can be converted into a task with a simple decorator and a client connection.
 
 ## Installation
 
@@ -9,7 +9,7 @@ Wool is a native Python package for transparently executing tasks in a horizonta
 To install the package using pip, run the following command:
 
 ```sh
-[uv] pip install --pre wool
+pip install --pre wool
 ```
 
 ### Cloning from GitHub
@@ -19,101 +19,81 @@ To install the package by cloning from GitHub, run the following commands:
 ```sh
 git clone https://github.com/wool-labs/wool.git
 cd wool
-[uv] pip install ./wool
+pip install ./wool
 ```
 
-## Usage
+## Features
 
-### CLI Commands
+- **Simple decorator-based API** - Just decorate async functions with `@wool.work` to make them distributable
+- **Automatic worker discovery** - Workers register themselves and are discovered automatically
+- **Multiple discovery backends** - Local (shared memory), LAN (Zeroconf/mDNS), or custom implementations
+- **Load balancing** - Built-in round-robin with support for custom strategies
+- **Process isolation** - Each worker runs in its own process with separate memory
+- **Fault tolerance** - Automatic failover when workers become unavailable
+- **Zero configuration** - Works out of the box for common use cases
 
-Wool provides a command-line interface (CLI) for managing the worker pool.
+## Quick Start
 
-To list the available commands:
+### 1. Task Declaration
 
-```sh
-wool --help
-```
-
-#### Start the Worker Pool
-
-To start the worker pool, use the `up` command:
-
-```sh
-wool pool up --host <host> --port <port> --authkey <authkey> --breadth <breadth> --module <module>
-```
-
-- `--host`: The host address (default: `localhost`).
-- `--port`: The port number (default: `0`).
-- `--authkey`: The authentication key (default: `b""`).
-- `--breadth`: The number of worker processes (default: number of CPU cores).
-- `--module`: Python module containing Wool task definitions to be executed by this pool (optional, can be specified multiple times).
-
-#### Stop the Worker Pool
-
-To stop the worker pool, use the `down` command:
-
-```sh
-wool pool down --host <host> --port <port> --authkey <authkey> --wait
-```
-
-- `--host`: The host address (default: `localhost`).
-- `--port`: The port number (required).
-- `--authkey`: The authentication key (default: `b""`).
-- `--wait`: Wait for in-flight tasks to complete before shutting down.
-
-#### Ping the Worker Pool
-
-To ping the worker pool, use the `ping` command:
-
-```sh
-wool ping --host <host> --port <port> --authkey <authkey>
-```
-
-- `--host`: The host address (default: `localhost`).
-- `--port`: The port number (required).
-- `--authkey`: The authentication key (default: `b""`).
-
-### Sample Python Application
-
-Below is an example of how to create a Wool client connection, decorate an async function using the `task` decorator, and execute the function remotely:
-
-Module defining remote tasks:
-`tasks.py`
 ```python
-import asyncio, wool
+import wool
 
-# Decorate an async function using the `task` decorator
-@wool.task
-async def sample_task(x, y):
-    await asyncio.sleep(1)
-    return x + y
+@wool.work
+async def fibonacci(n: int) -> int:
+    if n <= 1:
+        return n
+    return await fibonacci(n - 1) + await fibonacci(n - 2)
 ```
 
-Module executing remote workflow:
-`main.py`
-```python
-import asyncio, wool
-from tasks import sample_task
+### 2. Ephemeral Pool (Local Workers)
 
-# Execute the decorated function in an external worker pool
+```python
+import asyncio
+import wool
+
 async def main():
-    with wool.PoolSession(port=5050, authkey=b"deadbeef"):
-        result = await sample_task(1, 2)
+    # Spawn local workers that are automatically cleaned up
+    async with wool.WorkerPool(size=4):
+        result = await fibonacci(10)
         print(f"Result: {result}")
 
-asyncio.new_event_loop().run_until_complete(main())
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-To run the demo, first start a worker pool specifying the module defining the tasks to be executed:
-```bash
-wool pool up --port 5050 --authkey deadbeef --breadth 1 --module tasks
+### 3. Durable Pool (Remote Workers)
+
+```python
+import asyncio
+import wool
+
+async def main():
+    # Connect to existing workers on the network
+    discovery = wool.LanDiscoveryService(filter=lambda w: "production" in w.tags)
+    
+    async with wool.WorkerPool(discovery=discovery):
+        result = await fibonacci(10)
+        print(f"Result: {result}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-Next, in a separate terminal, execute the application defined in `main.py` and, finally, stop the worker pool:
-```bash
-python main.py
-wool pool down --port 5050 --authkey deadbeef
-```
+### Performance optimization
+
+- Minimize the size of arguments and return values to reduce serialization overhead.
+- For large datasets, consider using shared memory or passing references (e.g., file paths) instead of transferring the entire data.
+- Profile tasks to identify and optimize performance bottlenecks.
+
+### Task cancellation
+
+- Handle task cancellations gracefully by cleaning up resources and rolling back partial changes.
+- Use `asyncio.CancelledError` to detect and respond to cancellations.
+
+### Error propagation
+
+- Wool propagates exceptions raised within tasks to the caller. Use this feature to handle errors centrally in your application.
 
 ## License
 
