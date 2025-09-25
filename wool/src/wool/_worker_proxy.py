@@ -223,10 +223,6 @@ class RoundRobinLoadBalancer:
         if info in self._workers:
             del self._workers[info]
 
-    @staticmethod
-    async def _next_response(call):
-        return await asyncio.wait_for(anext(aiter(call)), timeout=3)
-
 
 # public
 class WorkerProxy:
@@ -394,16 +390,16 @@ class WorkerProxy:
         if self._started:
             raise RuntimeError("Proxy already started")
 
-        (self._loadbalancer_obj, self._loadbalancer_ctx) = await self._enter_context(
+        (self._loadbalancer_service, self._loadbalancer_ctx) = await self._enter_context(
             self._loadbalancer
         )
-        if not isinstance(self._loadbalancer_obj, LoadBalancerLike):
+        if not isinstance(self._loadbalancer_service, LoadBalancerLike):
             raise ValueError
 
-        self._discovery_obj, self._discovery_ctx = await self._enter_context(
+        self._discovery_service, self._discovery_ctx = await self._enter_context(
             self._discovery
         )
-        if not isinstance(self._discovery_obj, AsyncIterator):
+        if not isinstance(self._discovery_service, AsyncIterator):
             raise ValueError
 
         self._proxy_token = wool.__proxy__.set(self)
@@ -461,8 +457,8 @@ class WorkerProxy:
 
         await asyncio.wait_for(self._await_workers(), 60)
 
-        assert isinstance(self._loadbalancer_obj, LoadBalancerLike)
-        async for result in self._loadbalancer_obj.dispatch(task):
+        assert isinstance(self._loadbalancer_service, LoadBalancerLike)
+        async for result in self._loadbalancer_service.dispatch(task):
             yield result
 
     async def _enter_context(self, factory):
@@ -490,23 +486,23 @@ class WorkerProxy:
             ctx.__exit__(*args)
 
     async def _await_workers(self):
-        while not self._loadbalancer_obj._workers:
+        while not self._loadbalancer_service._workers:
             await asyncio.sleep(0)
 
     async def _worker_sentinel(self):
-        assert isinstance(self._discovery_obj, AsyncIterator)
-        assert isinstance(self._loadbalancer_obj, LoadBalancerLike)
-        async for event in self._discovery_obj:
+        assert isinstance(self._discovery_service, AsyncIterator)
+        assert isinstance(self._loadbalancer_service, LoadBalancerLike)
+        async for event in self._discovery_service:
             match event.type:
                 case "worker_added":
-                    self._loadbalancer_obj.worker_added_callback(
+                    self._loadbalancer_service.worker_added_callback(
                         lambda: self._client_pool.get(
                             f"{event.worker_info.host}:{event.worker_info.port}",
                         ),
                         event.worker_info,
                     )
                 case "worker_updated":
-                    self._loadbalancer_obj.worker_updated_callback(
+                    self._loadbalancer_service.worker_updated_callback(
                         lambda: self._client_pool.get(
                             f"{event.worker_info.host}:{event.worker_info.port}",
                         ),
@@ -514,11 +510,6 @@ class WorkerProxy:
                     )
                 case "worker_removed":
                     if event.worker_info.uid in self._workers:
-                        self._loadbalancer_obj.worker_removed_callback(event.worker_info)
-
-
-async def _release_channel(channel):
-    try:
-        await channel.release()
-    except Exception:
-        pass
+                        self._loadbalancer_service.worker_removed_callback(
+                            event.worker_info
+                        )
