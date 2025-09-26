@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import os
 import uuid
-from functools import partial
 from multiprocessing.shared_memory import SharedMemory
 from typing import AsyncIterator
 from typing import Final
@@ -16,9 +15,9 @@ from wool._worker import WorkerFactory
 from wool._worker_discovery import DiscoveryEvent
 from wool._worker_discovery import Factory
 from wool._worker_discovery import LocalDiscoveryService
-from wool._worker_discovery import LocalRegistryService
+from wool._worker_discovery import LocalRegistrarService
 from wool._worker_discovery import ReducibleAsyncIteratorLike
-from wool._worker_discovery import RegistryServiceLike
+from wool._worker_discovery import RegistrarServiceLike
 from wool._worker_proxy import LoadBalancerFactory
 from wool._worker_proxy import LoadBalancerLike
 from wool._worker_proxy import RoundRobinLoadBalancer
@@ -65,12 +64,12 @@ class WorkerPool:
     .. code-block:: python
 
         from wool import WorkerPool, LocalWorker
-        from wool._worker_discovery import LocalRegistryService
+        from wool._worker_discovery import LocalRegistrarService
         from functools import partial
 
         # Custom worker factory with specific tags
         worker_factory = partial(
-            LocalWorker, registry_service=LocalRegistryService("my-pool")
+            LocalWorker, registrar_service=LocalRegistrarService("my-pool")
         )
 
         async with WorkerPool(
@@ -186,7 +185,7 @@ class WorkerPool:
         self,
         *tags: str,
         size: int = 0,
-        worker: WorkerFactory[RegistryServiceLike] = LocalWorker[LocalRegistryService],
+        worker: WorkerFactory[RegistrarServiceLike] = LocalWorker[LocalRegistrarService],
         loadbalancer: LoadBalancerLike | LoadBalancerFactory = RoundRobinLoadBalancer,
     ):
         """
@@ -289,7 +288,7 @@ class WorkerPool:
     async def __aenter__(self) -> WorkerPool:
         """Starts the worker pool and its services, returning a session.
 
-        This method starts the worker registry, creates a client session,
+        This method starts the worker registrar, creates a client session,
         launches all worker processes, and registers them.
 
         :returns:
@@ -332,6 +331,6 @@ class WorkerPool:
 
     def _default_worker_factory(self, uri):
         def factory(*tags, **_):
-            return LocalWorker(*tags, registry_service=LocalRegistryService(uri))
+            return LocalWorker(*tags, registrar_service=LocalRegistrarService(uri))
 
         return factory

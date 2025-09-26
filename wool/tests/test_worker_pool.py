@@ -16,19 +16,19 @@ from pytest_mock import MockerFixture
 
 import wool._worker_pool as wp
 from wool._worker import LocalWorker
-from wool._worker_discovery import LanRegistryService
+from wool._worker_discovery import LanRegistrarService
 
 
 @pytest.fixture
-def mock_local_registry_service(mocker: MockerFixture):
-    """Create a mock :py:class:`LocalRegistryService` for test isolation."""
-    mock_registry = mocker.MagicMock(spec=LanRegistryService)
-    mock_registry.start = mocker.AsyncMock()
-    mock_registry.stop = mocker.AsyncMock()
-    mock_registry.register = mocker.AsyncMock()
-    mock_registry.unregister = mocker.AsyncMock()
-    mocker.patch.object(wp, "LocalRegistryService", return_value=mock_registry)
-    return mock_registry
+def mock_local_registrar_service(mocker: MockerFixture):
+    """Create a mock :py:class:`LocalRegistrarService` for test isolation."""
+    mock_registrar = mocker.MagicMock(spec=LanRegistrarService)
+    mock_registrar.start = mocker.AsyncMock()
+    mock_registrar.stop = mocker.AsyncMock()
+    mock_registrar.register = mocker.AsyncMock()
+    mock_registrar.unregister = mocker.AsyncMock()
+    mocker.patch.object(wp, "LocalRegistrarService", return_value=mock_registrar)
+    return mock_registrar
 
 
 @pytest.fixture
@@ -191,7 +191,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test WorkerPool async context manager lifecycle.
 
@@ -219,7 +219,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test context manager cleanup when user code raises exception.
 
@@ -247,7 +247,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test context manager when worker startup fails.
 
@@ -276,7 +276,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test context manager handles various exceptions gracefully.
 
@@ -304,7 +304,7 @@ class TestWorkerPool:
         mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test context manager with custom worker factory.
 
@@ -364,7 +364,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test context manager with multiple workers.
 
@@ -391,7 +391,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test that worker information is properly maintained.
 
@@ -545,7 +545,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test context manager under concurrent operations.
 
@@ -576,7 +576,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test context manager with custom load balancer.
 
@@ -603,7 +603,7 @@ class TestWorkerPool:
         mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
         mocker: MockerFixture,
     ):
         """Test cleanup when some workers fail during startup.
@@ -646,7 +646,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test that pool startup completes within reasonable time.
 
@@ -676,7 +676,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar_service,
     ):
         """Test worker info collection after startup completes.
 
@@ -867,41 +867,41 @@ class TestWorkerPool:
             assert hasattr(pool, "_proxy")
             assert hasattr(pool, "_shared_memory")
 
-    def test_default_worker_factory_creates_separate_registry_instances(
+    def test_default_worker_factory_creates_separate_registrar_instances(
         self, mocker: MockerFixture
     ):
-        """Test default worker factory creates separate registry instances.
+        """Test default worker factory creates separate registrar instances.
 
         Given:
             A WorkerPool instance with default worker factory
         When:
             Multiple workers are created using the default factory
         Then:
-            Each worker should get its own LocalRegistryService instance
+            Each worker should get its own LocalRegistrarService instance
         """
         # Arrange
         pool = wp.WorkerPool(size=0)
         uri = "test-pool-123"
 
-        # Track all LocalRegistryService instances created
-        registry_instances = []
+        # Track all LocalRegistrarService instances created
+        registrar_instances = []
 
-        def mock_local_registry_service(pool_uri):
+        def mock_local_registrar_service(pool_uri):
             instance = mocker.MagicMock()
             instance.pool_uri = pool_uri
-            registry_instances.append(instance)
+            registrar_instances.append(instance)
             return instance
 
         mocker.patch.object(
-            wp, "LocalRegistryService", side_effect=mock_local_registry_service
+            wp, "LocalRegistrarService", side_effect=mock_local_registrar_service
         )
 
-        # Mock LocalWorker to capture the registry_service parameter
+        # Mock LocalWorker to capture the registrar_service parameter
         created_workers = []
 
-        def mock_local_worker(*tags, registry_service=None, **kwargs):
+        def mock_local_worker(*tags, registrar_service=None, **kwargs):
             worker = mocker.MagicMock()
-            worker.registry_service = registry_service
+            worker.registrar_service = registrar_service
             worker.tags = set(tags)
             worker.kwargs = kwargs
             created_workers.append(worker)
@@ -919,25 +919,25 @@ class TestWorkerPool:
 
         # Assert
         assert len(created_workers) == 3
-        assert len(registry_instances) == 3
+        assert len(registrar_instances) == 3
 
-        # Verify each worker gets a separate registry instance
+        # Verify each worker gets a separate registrar instance
         assert (
-            created_workers[0].registry_service
-            is not created_workers[1].registry_service
+            created_workers[0].registrar_service
+            is not created_workers[1].registrar_service
         )
         assert (
-            created_workers[1].registry_service
-            is not created_workers[2].registry_service
+            created_workers[1].registrar_service
+            is not created_workers[2].registrar_service
         )
         assert (
-            created_workers[0].registry_service
-            is not created_workers[2].registry_service
+            created_workers[0].registrar_service
+            is not created_workers[2].registrar_service
         )
 
-        # Verify all registry instances have the correct URI
-        for registry in registry_instances:
-            assert registry.pool_uri == uri
+        # Verify all registrar instances have the correct URI
+        for registrar in registrar_instances:
+            assert registrar.pool_uri == uri
 
         # Verify workers were created with correct tags
         assert created_workers[0].tags == {"tag1", "tag2"}

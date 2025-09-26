@@ -24,12 +24,12 @@ def test_public_api_completeness():
     # Arrange
     expected_public_api = [
         "LanDiscoveryService",
-        "LanRegistryService",
+        "LanRegistrarService",
         "Worker",
         "DiscoveryService",
         "WorkerPool",
         "WorkerProxy",
-        "RegistryService",
+        "RegistrarService",
         "WorkerService",
         "WoolTask",
         "WoolTaskEvent",

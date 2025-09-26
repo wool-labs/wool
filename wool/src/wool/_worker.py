@@ -31,7 +31,7 @@ from wool import _protobuf as pb
 from wool._resource_pool import ResourcePool
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
-from wool._worker_discovery import RegistryServiceLike
+from wool._worker_discovery import RegistrarServiceLike
 from wool._worker_discovery import WorkerInfo
 
 if TYPE_CHECKING:
@@ -80,13 +80,13 @@ def _signal_handlers(service: "WorkerService"):
         signal.signal(signal.SIGINT, old_sigint)
 
 
-_T_RegistryService = TypeVar(
-    "_T_RegistryService", bound=RegistryServiceLike, covariant=True
+_T_RegistrarService = TypeVar(
+    "_T_RegistrarService", bound=RegistrarServiceLike, covariant=True
 )
 
 
 # public
-class Worker(ABC, Generic[_T_RegistryService]):
+class Worker(ABC, Generic[_T_RegistrarService]):
     """Abstract base class for worker implementations in the wool framework.
 
     Workers are individual processes that execute distributed tasks within
@@ -94,13 +94,13 @@ class Worker(ABC, Generic[_T_RegistryService]):
     a discovery service to be found by client sessions.
 
     This class defines the core interface that all worker implementations
-    must provide, including lifecycle management and registry service
+    must provide, including lifecycle management and registrar service
     integration for peer-to-peer discovery.
 
     :param tags:
         Capability tags associated with this worker for filtering and
         selection by client sessions.
-    :param registry_service:
+    :param registrar_service:
         Service instance for worker registration and discovery within
         the distributed pool.
     :param extra:
@@ -109,7 +109,7 @@ class Worker(ABC, Generic[_T_RegistryService]):
 
     _info: WorkerInfo | None = None
     _started: bool = False
-    _registry_service: RegistryServiceLike
+    _registrar_service: RegistrarServiceLike
     _uid: Final[str]
     _tags: Final[set[str]]
     _extra: Final[dict[str, Any]]
@@ -117,13 +117,13 @@ class Worker(ABC, Generic[_T_RegistryService]):
     def __init__(
         self,
         *tags: str,
-        registry_service: _T_RegistryService,
+        registrar_service: _T_RegistrarService,
         **extra: Any,
     ):
         self._uid = f"worker-{uuid.uuid4().hex}"
         self._tags = set(tags)
         self._extra = extra
-        self._registry_service = registry_service
+        self._registrar_service = registrar_service
 
     @property
     def uid(self) -> str:
@@ -167,12 +167,12 @@ class Worker(ABC, Generic[_T_RegistryService]):
 
         This method is a final implementation that calls the abstract
         `_start` method to initialize the worker process and register
-        it with the registry service.
+        it with the registrar service.
         """
         if self._started:
             raise RuntimeError("Worker has already been started")
-        if self._registry_service:
-            await self._registry_service.start()
+        if self._registrar_service:
+            await self._registrar_service.start()
         await self._start()
         self._started = True
 
@@ -182,13 +182,13 @@ class Worker(ABC, Generic[_T_RegistryService]):
 
         This method is a final implementation that calls the abstract
         `_stop` method to gracefully shut down the worker process and
-        unregister it from the registry service.
+        unregister it from the registrar service.
         """
         if not self._started:
             raise RuntimeError("Worker has not been started")
         await self._stop()
-        if self._registry_service:
-            await self._registry_service.stop()
+        if self._registrar_service:
+            await self._registrar_service.stop()
 
     @abstractmethod
     async def _start(self):
@@ -210,8 +210,8 @@ class Worker(ABC, Generic[_T_RegistryService]):
 
 
 # public
-class WorkerFactory(Generic[_T_RegistryService], Protocol):
-    """Protocol for creating worker instances with registry integration.
+class WorkerFactory(Generic[_T_RegistrarService], Protocol):
+    """Protocol for creating worker instances with registrar integration.
 
     Defines the callable interface for worker factory implementations
     that can create :py:class:`Worker` instances configured with specific
@@ -221,7 +221,7 @@ class WorkerFactory(Generic[_T_RegistryService], Protocol):
     worker processes with consistent configuration.
     """
 
-    def __call__(self, *tags: str, **_) -> Worker[_T_RegistryService]:
+    def __call__(self, *tags: str, **_) -> Worker[_T_RegistrarService]:
         """Create a new worker instance.
 
         :param tags:
@@ -235,12 +235,12 @@ class WorkerFactory(Generic[_T_RegistryService], Protocol):
 
 
 # public
-class LocalWorker(Worker[_T_RegistryService]):
+class LocalWorker(Worker[_T_RegistrarService]):
     """Local worker implementation that runs tasks in a separate process.
 
     :py:class:`LocalWorker` creates and manages a dedicated worker process
     that hosts a gRPC server for executing distributed wool tasks. Each
-    worker automatically registers itself with the provided registry service
+    worker automatically registers itself with the provided registrar service
     for discovery by client sessions.
 
     The worker process runs independently and can handle multiple concurrent
@@ -250,7 +250,7 @@ class LocalWorker(Worker[_T_RegistryService]):
     :param tags:
         Capability tags to associate with this worker for filtering
         and selection by client sessions.
-    :param registry_service:
+    :param registrar_service:
         Service instance for worker registration and discovery.
     :param extra:
         Additional arbitrary metadata as key-value pairs.
@@ -263,10 +263,10 @@ class LocalWorker(Worker[_T_RegistryService]):
         *tags: str,
         host: str = "127.0.0.1",
         port: int = 0,
-        registry_service: _T_RegistryService,
+        registrar_service: _T_RegistrarService,
         **extra: Any,
     ):
-        super().__init__(*tags, registry_service=registry_service, **extra)
+        super().__init__(*tags, registrar_service=registrar_service, **extra)
         self._worker_process = WorkerProcess(host=host, port=port)
 
     @property
@@ -299,9 +299,9 @@ class LocalWorker(Worker[_T_RegistryService]):
     async def _start(self):
         """Start the worker process and register it with the pool.
 
-        Initializes the registry service, starts the worker process
+        Initializes the registrar service, starts the worker process
         with its gRPC server, and registers the worker's network
-        address with the registry for discovery by client sessions.
+        address with the registrar for discovery by client sessions.
         """
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._worker_process.start)
@@ -324,20 +324,20 @@ class LocalWorker(Worker[_T_RegistryService]):
             tags=self._tags,
             extra=self._extra,
         )
-        await self._registry_service.register(self._info)
+        await self._registrar_service.register(self._info)
 
     async def _stop(self):
         """Stop the worker process and unregister it from the pool.
 
-        Unregisters the worker from the registry service, gracefully
+        Unregisters the worker from the registrar service, gracefully
         shuts down the worker process using SIGINT, and cleans up
-        the registry service. If graceful shutdown fails, the process
+        the registrar service. If graceful shutdown fails, the process
         is forcefully terminated.
         """
         try:
             if not self._info:
                 raise RuntimeError("Cannot unregister - worker has no info")
-            await self._registry_service.unregister(self._info)
+            await self._registrar_service.unregister(self._info)
         finally:
             if not self._worker_process.is_alive():
                 return
