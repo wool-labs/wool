@@ -48,6 +48,52 @@ def mock_service_info(mocker: MockerFixture):
     return mocker.patch.object(discovery, "ServiceInfo", autospec=True)
 
 
+@pytest.fixture
+def dummy_discovery_service():
+    """Fixture providing a dummy DiscoveryService for testing async iteration."""
+
+    class DummyDiscoveryService(discovery.DiscoveryService):
+        def __init__(self, filter=None):
+            super().__init__(filter)
+            self.events_called = False
+
+        async def events(self):
+            self.events_called = True
+            # Yield test events
+            yield discovery.DiscoveryEvent(
+                type="worker_added",
+                worker_info=discovery.WorkerInfo(
+                    uid="test-123",
+                    host="127.0.0.1",
+                    port=8080,
+                    pid=12345,
+                    version="1.0.0",
+                    tags=set(),
+                    extra={},
+                ),
+            )
+            yield discovery.DiscoveryEvent(
+                type="worker_removed",
+                worker_info=discovery.WorkerInfo(
+                    uid="test-456",
+                    host="127.0.0.1",
+                    port=8081,
+                    pid=12346,
+                    version="1.0.0",
+                    tags=set(),
+                    extra={},
+                ),
+            )
+
+        async def _start(self):
+            pass
+
+        async def _stop(self):
+            pass
+
+    return DummyDiscoveryService
+
+
 class TestLanRegistryService:
     def test_init_sets_default_values(self, mock_async_zeroconf):
         """Test LanRegistryService initialization with default values.
@@ -2353,51 +2399,48 @@ class TestDiscoveryService:
         assert unpickled_service._filter(worker_info) is True
 
     @pytest.mark.asyncio
-    async def test_discovery_service_aiter_and_anext_methods(
-        self, mocker: MockerFixture
-    ):
-        """Test DiscoveryService __aiter__ and __anext__ methods.
+    async def test_discovery_service_async_iteration(self, dummy_discovery_service):
+        """Test DiscoveryService async iteration with async for loop.
 
         Given:
             A DiscoveryService instance
         When:
-            __aiter__ and __anext__ methods are called
+            Used in an async for loop
         Then:
-            Should delegate to events() method correctly
+            Should delegate to events() method and yield events correctly
         """
-
         # Arrange
-        class DummyDiscoveryService(discovery.DiscoveryService):
-            def __init__(self, filter=None):
-                super().__init__(filter)
-                self.events_called = False
-
-            async def events(self):
-                self.events_called = True
-                # Yield a test event
-                yield discovery.DiscoveryEvent(
-                    type="worker_added",
-                    worker_info=discovery.WorkerInfo(
-                        uid="test-123",
-                        host="127.0.0.1",
-                        port=8080,
-                        pid=12345,
-                        version="1.0.0",
-                        tags=set(),
-                        extra={},
-                    ),
-                )
-
-            async def _start(self):
-                pass
-
-            async def _stop(self):
-                pass
-
-        service = DummyDiscoveryService()
+        service = dummy_discovery_service()
+        events_received = []
 
         # Act
-        first_event = await service.__anext__()
+        async for event in service:
+            events_received.append(event)
+
+        # Assert
+        assert service.events_called is True
+        assert len(events_received) == 2
+        assert events_received[0].type == "worker_added"
+        assert events_received[0].worker_info.uid == "test-123"
+        assert events_received[1].type == "worker_removed"
+        assert events_received[1].worker_info.uid == "test-456"
+
+    @pytest.mark.asyncio
+    async def test_discovery_service_anext_function(self, dummy_discovery_service):
+        """Test DiscoveryService with anext() function.
+
+        Given:
+            A DiscoveryService instance
+        When:
+            anext() function is called on it
+        Then:
+            Should delegate to events() method and return next event
+        """
+        # Arrange
+        service = dummy_discovery_service()
+
+        # Act
+        first_event = await anext(service)
 
         # Assert
         assert service.events_called is True
