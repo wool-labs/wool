@@ -27,9 +27,9 @@ from wool._resource_pool import Resource
 from wool._resource_pool import ResourcePool
 from wool._worker import WorkerClient
 from wool._worker_discovery import DiscoveryEvent
+from wool._worker_discovery import DiscoveryLike
 from wool._worker_discovery import Factory
-from wool._worker_discovery import LocalDiscoveryService
-from wool._worker_discovery import ReducibleAsyncIteratorLike
+from wool._worker_discovery import LocalDiscovery
 from wool._worker_discovery import WorkerInfo
 
 if TYPE_CHECKING:
@@ -106,6 +106,7 @@ class NoWorkersAvailable(Exception):
     """
 
 
+# public
 @runtime_checkable
 class LoadBalancerLike(Protocol):
     """Protocol for load balancer v2 that directly dispatches tasks.
@@ -122,17 +123,14 @@ class LoadBalancerLike(Protocol):
     def dispatch(self, task: WoolTask) -> AsyncIterator: ...
 
     def worker_added_callback(
-        self, client: Resource[WorkerClient], info: WorkerInfo
+        self, client: Callable[[], Resource[WorkerClient]], info: WorkerInfo
     ): ...
 
     def worker_updated_callback(
-        self, client: Resource[WorkerClient], info: WorkerInfo
+        self, client: Callable[[], Resource[WorkerClient]], info: WorkerInfo
     ): ...
 
     def worker_removed_callback(self, info: WorkerInfo): ...
-
-
-LoadBalancerFactory: TypeAlias = Factory[LoadBalancerLike]
 
 
 DispatchCall: TypeAlias = grpc.aio.UnaryStreamCall[pb.task.Task, pb.worker.Response]
@@ -213,10 +211,14 @@ class RoundRobinLoadBalancer:
             f"All {len(self._workers)} workers failed with transient errors"
         )
 
-    def worker_added_callback(self, client: Resource[WorkerClient], info: WorkerInfo):
+    def worker_added_callback(
+        self, client: Callable[[], Resource[WorkerClient]], info: WorkerInfo
+    ):
         self._workers[info] = client
 
-    def worker_updated_callback(self, client: Resource[WorkerClient], info: WorkerInfo):
+    def worker_updated_callback(
+        self, client: Callable[[], Resource[WorkerClient]], info: WorkerInfo
+    ):
         self._workers[info] = client
 
     def worker_removed_callback(self, info: WorkerInfo):
@@ -251,15 +253,12 @@ class WorkerProxy:
         Load balancer implementation or factory for task distribution.
     """
 
-    _discovery: (
-        ReducibleAsyncIteratorLike[DiscoveryEvent]
-        | Factory[AsyncIterator[DiscoveryEvent]]
-    )
+    _discovery: DiscoveryLike | Factory[DiscoveryLike]
     _discovery_manager: (
-        AsyncContextManager[AsyncIterator[DiscoveryEvent]]
-        | ContextManager[AsyncIterator[DiscoveryEvent]]
+        AsyncContextManager[DiscoveryLike] | ContextManager[DiscoveryLike]
     )
-    _loadbalancer = LoadBalancerLike | LoadBalancerFactory
+
+    _loadbalancer = LoadBalancerLike | Factory[LoadBalancerLike]
     _loadbalancer_manager: (
         AsyncContextManager[LoadBalancerLike] | ContextManager[LoadBalancerLike]
     )
@@ -268,11 +267,10 @@ class WorkerProxy:
     def __init__(
         self,
         *,
-        discovery: (
-            ReducibleAsyncIteratorLike[DiscoveryEvent]
-            | Factory[AsyncIterator[DiscoveryEvent]]
-        ),
-        loadbalancer: LoadBalancerLike | LoadBalancerFactory = RoundRobinLoadBalancer,
+        discovery: DiscoveryLike | Factory[DiscoveryLike],
+        loadbalancer: (
+            LoadBalancerLike | Factory[LoadBalancerLike]
+        ) = RoundRobinLoadBalancer,
     ): ...
 
     @overload
@@ -280,7 +278,8 @@ class WorkerProxy:
         self,
         *,
         workers: Sequence[WorkerInfo],
-        loadbalancer: LoadBalancerLike | LoadBalancerFactory = RoundRobinLoadBalancer,
+        loadbalancer: LoadBalancerLike
+        | Factory[LoadBalancerLike] = RoundRobinLoadBalancer,
     ): ...
 
     @overload
@@ -288,20 +287,18 @@ class WorkerProxy:
         self,
         pool_uri: str,
         *tags: str,
-        loadbalancer: LoadBalancerLike | LoadBalancerFactory = RoundRobinLoadBalancer,
+        loadbalancer: LoadBalancerLike
+        | Factory[LoadBalancerLike] = RoundRobinLoadBalancer,
     ): ...
 
     def __init__(
         self,
         pool_uri: str | None = None,
         *tags: str,
-        discovery: (
-            ReducibleAsyncIteratorLike[DiscoveryEvent]
-            | Factory[AsyncIterator[DiscoveryEvent]]
-            | None
-        ) = None,
+        discovery: (DiscoveryLike | Factory[DiscoveryLike] | None) = None,
         workers: Sequence[WorkerInfo] | None = None,
-        loadbalancer: LoadBalancerLike | LoadBalancerFactory = RoundRobinLoadBalancer,
+        loadbalancer: LoadBalancerLike
+        | Factory[LoadBalancerLike] = RoundRobinLoadBalancer,
     ):
         if not (pool_uri or discovery or workers):
             raise ValueError(
@@ -316,7 +313,7 @@ class WorkerProxy:
 
         match (pool_uri, discovery, workers):
             case (pool_uri, None, None) if pool_uri is not None:
-                self._discovery = LocalDiscoveryService(
+                self._discovery = LocalDiscovery(
                     pool_uri, filter=lambda w: bool({pool_uri, *tags} & w.tags)
                 )
             case (None, discovery, None) if discovery is not None:
@@ -399,7 +396,7 @@ class WorkerProxy:
         self._discovery_service, self._discovery_ctx = await self._enter_context(
             self._discovery
         )
-        if not isinstance(self._discovery_service, AsyncIterator):
+        if not isinstance(self._discovery_service, DiscoveryLike):
             raise ValueError
 
         self._proxy_token = wool.__proxy__.set(self)
@@ -463,16 +460,16 @@ class WorkerProxy:
 
     async def _enter_context(self, factory):
         ctx = None
-        if callable(factory):
-            obj = factory()
-            if isinstance(obj, ContextManager):
-                ctx = obj
-                obj = obj.__enter__()
-            elif isinstance(obj, AsyncContextManager):
-                ctx = obj
-                obj = await obj.__aenter__()
-            elif isinstance(obj, Awaitable):
-                obj = await obj
+        if isinstance(factory, ContextManager):
+            ctx = factory
+            obj = ctx.__enter__()
+        elif isinstance(factory, AsyncContextManager):
+            ctx = factory
+            obj = await ctx.__aenter__()
+        elif callable(factory):
+            return await self._enter_context(factory())
+        elif isinstance(factory, Awaitable):
+            obj = await factory
         else:
             obj = factory
         return obj, ctx
