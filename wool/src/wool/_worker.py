@@ -13,7 +13,10 @@ from multiprocessing import Process
 from multiprocessing.connection import Connection
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import AsyncContextManager
 from typing import AsyncIterator
+from typing import Awaitable
+from typing import ContextManager
 from typing import Final
 from typing import Generic
 from typing import Protocol
@@ -31,6 +34,7 @@ from wool import _protobuf as pb
 from wool._resource_pool import ResourcePool
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
+from wool._worker_discovery import Factory
 from wool._worker_discovery import RegistrarLike
 from wool._worker_discovery import WorkerInfo
 
@@ -93,20 +97,29 @@ class Worker(ABC):
         Capability tags associated with this worker for filtering and
         selection by client sessions.
     :param registrar:
-        Service instance for worker registration and discovery within
-        the distributed pool.
+        Service instance or factory for worker registration and discovery
+        within the distributed pool. Can be provided as:
+
+        - **Instance**: Direct registrar service object
+        - **Factory function**: Function returning a registrar service instance
+        - **Context manager factory**: Function returning a context manager
+            that yields a registrar service
     :param extra:
         Additional arbitrary metadata as key-value pairs.
     """
 
     _info: WorkerInfo | None = None
     _started: bool = False
-    _registrar: RegistrarLike
+    _registrar: RegistrarLike | Factory[RegistrarLike]
+    _registrar_service: RegistrarLike | None = None
+    _registrar_context: Any | None = None
     _uid: Final[str]
     _tags: Final[set[str]]
     _extra: Final[dict[str, Any]]
 
-    def __init__(self, *tags: str, registrar: RegistrarLike, **extra: Any):
+    def __init__(
+        self, *tags: str, registrar: RegistrarLike | Factory[RegistrarLike], **extra: Any
+    ):
         self._uid = f"worker-{uuid.uuid4().hex}"
         self._tags = set(tags)
         self._extra = extra
@@ -158,10 +171,17 @@ class Worker(ABC):
         """
         if self._started:
             raise RuntimeError("Worker has already been started")
-        if self._registrar:
-            await self._registrar.start()
+
+        self._registrar_service, self._registrar_context = await self._enter_context(
+            self._registrar
+        )
+        if not isinstance(self._registrar_service, RegistrarLike):
+            raise ValueError("Registrar factory must return a RegistrarLike instance")
+
         await self._start()
         self._started = True
+        assert self._info
+        await self._registrar_service.register(self._info)
 
     @final
     async def stop(self):
@@ -173,9 +193,19 @@ class Worker(ABC):
         """
         if not self._started:
             raise RuntimeError("Worker has not been started")
-        await self._stop()
-        if self._registrar:
-            await self._registrar.stop()
+        try:
+            if not self._info:
+                raise RuntimeError("Cannot unregister - worker has no info")
+            assert self._registrar_service is not None
+            await self._registrar_service.unregister(self._info)
+        finally:
+            try:
+                await self._stop()
+            finally:
+                await self._exit_context(self._registrar_context)
+                self._registrar_service = None
+                self._registrar_context = None
+                self._started = False
 
     @abstractmethod
     async def _start(self):
@@ -194,6 +224,32 @@ class Worker(ABC):
         shutdown of their worker process and cleanup of resources.
         """
         ...
+
+    async def _enter_context(self, factory):
+        """Enter context for factory objects, handling different factory types."""
+        ctx = None
+        if isinstance(factory, ContextManager):
+            ctx = factory
+            obj = ctx.__enter__()
+        elif isinstance(factory, AsyncContextManager):
+            ctx = factory
+            obj = await ctx.__aenter__()
+        elif callable(factory):
+            return await self._enter_context(factory())
+        elif isinstance(factory, Awaitable):
+            obj = await factory
+        else:
+            obj = factory
+        return obj, ctx
+
+    async def _exit_context(
+        self, ctx: AsyncContextManager | ContextManager | None, *args
+    ):
+        """Exit context for context managers."""
+        if isinstance(ctx, AsyncContextManager):
+            await ctx.__aexit__(*args)
+        elif isinstance(ctx, ContextManager):
+            ctx.__exit__(*args)
 
 
 # public
@@ -238,7 +294,7 @@ class LocalWorker(Worker):
         Capability tags to associate with this worker for filtering
         and selection by client sessions.
     :param registrar:
-        Service instance for worker registration and discovery.
+        Service instance or factory for worker registration and discovery.
     :param extra:
         Additional arbitrary metadata as key-value pairs.
     """
@@ -250,7 +306,7 @@ class LocalWorker(Worker):
         *tags: str,
         host: str = "127.0.0.1",
         port: int = 0,
-        registrar: RegistrarLike,
+        registrar: RegistrarLike | Factory[RegistrarLike],
         **extra: Any,
     ):
         super().__init__(*tags, registrar=registrar, **extra)
@@ -311,7 +367,6 @@ class LocalWorker(Worker):
             tags=self._tags,
             extra=self._extra,
         )
-        await self._registrar.register(self._info)
 
     async def _stop(self):
         """Stop the worker process and unregister it from the pool.
@@ -321,20 +376,15 @@ class LocalWorker(Worker):
         the registrar service. If graceful shutdown fails, the process
         is forcefully terminated.
         """
+        if not self._worker_process.is_alive():
+            return
         try:
-            if not self._info:
-                raise RuntimeError("Cannot unregister - worker has no info")
-            await self._registrar.unregister(self._info)
-        finally:
-            if not self._worker_process.is_alive():
-                return
-            try:
-                if self._worker_process.pid:
-                    os.kill(self._worker_process.pid, signal.SIGINT)
-                    self._worker_process.join()
-            except OSError:
-                if self._worker_process.is_alive():
-                    self._worker_process.kill()
+            if self._worker_process.pid:
+                os.kill(self._worker_process.pid, signal.SIGINT)
+                self._worker_process.join()
+        except OSError:
+            if self._worker_process.is_alive():
+                self._worker_process.kill()
 
 
 class WorkerProcess(Process):

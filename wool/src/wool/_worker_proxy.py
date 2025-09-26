@@ -30,7 +30,6 @@ from wool._worker_discovery import DiscoveryEvent
 from wool._worker_discovery import DiscoveryLike
 from wool._worker_discovery import Factory
 from wool._worker_discovery import LocalDiscovery
-from wool._worker_discovery import Reducible
 from wool._worker_discovery import WorkerInfo
 
 if TYPE_CHECKING:
@@ -107,6 +106,7 @@ class NoWorkersAvailable(Exception):
     """
 
 
+# public
 @runtime_checkable
 class LoadBalancerLike(Protocol):
     """Protocol for load balancer v2 that directly dispatches tasks.
@@ -396,7 +396,7 @@ class WorkerProxy:
         self._discovery_service, self._discovery_ctx = await self._enter_context(
             self._discovery
         )
-        if not isinstance(self._discovery_service, AsyncIterator):
+        if not isinstance(self._discovery_service, DiscoveryLike):
             raise ValueError
 
         self._proxy_token = wool.__wool_proxy__.set(self)
@@ -460,16 +460,16 @@ class WorkerProxy:
 
     async def _enter_context(self, factory):
         ctx = None
-        if callable(factory):
-            obj = factory()
-            if isinstance(obj, ContextManager):
-                ctx = obj
-                obj = obj.__enter__()
-            elif isinstance(obj, AsyncContextManager):
-                ctx = obj
-                obj = await obj.__aenter__()
-            elif isinstance(obj, Awaitable):
-                obj = await obj
+        if isinstance(factory, ContextManager):
+            ctx = factory
+            obj = ctx.__enter__()
+        elif isinstance(factory, AsyncContextManager):
+            ctx = factory
+            obj = await ctx.__aenter__()
+        elif callable(factory):
+            return await self._enter_context(factory())
+        elif isinstance(factory, Awaitable):
+            obj = await factory
         else:
             obj = factory
         return obj, ctx

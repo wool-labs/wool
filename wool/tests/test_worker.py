@@ -12,15 +12,19 @@ from wool._work import WoolTask
 from wool._worker_discovery import WorkerInfo
 
 
+class MockRegistrar:
+    """Mock registrar service that implements RegistrarLike protocol."""
+
+    def __init__(self, mocker):
+        self.register = mocker.AsyncMock()
+        self.unregister = mocker.AsyncMock()
+        self.update = mocker.AsyncMock()
+
+
 @pytest.fixture
 def mock_registrar(mocker):
     """Create a mock registrar service with common async methods."""
-    mock_service = mocker.AsyncMock()
-    mock_service.start = mocker.AsyncMock()
-    mock_service.stop = mocker.AsyncMock()
-    mock_service.register = mocker.AsyncMock()
-    mock_service.unregister = mocker.AsyncMock()
-    return mock_service
+    return MockRegistrar(mocker)
 
 
 @pytest.fixture
@@ -40,7 +44,10 @@ def mock_worker_process(mocker):
 def configured_local_worker(mock_registrar, mock_worker_process, mocker):
     """Create a LocalWorker with mocked dependencies."""
     mocker.patch.object(svc, "WorkerProcess", return_value=mock_worker_process)
-    return svc.LocalWorker("test-uid", "tag1", "tag2", registrar=mock_registrar)
+    worker = svc.LocalWorker("tag1", "tag2", registrar=mock_registrar)
+    # Set up the _registrar_service that would normally be set by start()
+    worker._registrar_service = mock_registrar
+    return worker
 
 
 @pytest.fixture
@@ -242,7 +249,7 @@ class TestSignalHandlers:
             assert current_handler != signal.SIG_DFL
 
 
-class TestLanWorker:
+class TestLocalWorker:
     def test_init_creates_registrar_and_worker_process(self, mocker: MockerFixture):
         """Test :py:class:`LocalWorker` initialization creates registrar service
         and worker process.
@@ -431,39 +438,33 @@ class TestLanWorker:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_start_initializes_components_and_registers(
+    async def test_start_initializes_worker_process(
         self, configured_local_worker, mock_registrar, mock_worker_process
     ):
         """Test :py:class:`LocalWorker` :py:meth:`_start` method initializes
-        components and registers.
+        worker process.
 
         Given:
-            A :py:class:`LocalWorker` instance with mocked registrar service and
-            worker process
+            A :py:class:`LocalWorker` instance with mocked worker process
         When:
             :py:meth:`_start` is called
         Then:
-            It should start registrar service, start worker process, and register
-            with registrar using the worker address and properties
+            It should start worker process and create WorkerInfo
         """
         # Act
         await configured_local_worker._start()
 
         # Assert
-        mock_registrar.start.assert_not_called()
         # Verify that worker process start was called (via run_in_executor)
         mock_worker_process.start.assert_called_once()
-        mock_registrar.register.assert_called_once()
-        # Check the call arguments - should be called with WorkerInfo object
-        call_args = mock_registrar.register.call_args
-        worker_info = call_args[0][0]
-        assert isinstance(worker_info, WorkerInfo)
-        assert worker_info.uid.startswith("worker-")
-        assert worker_info.host == "192.168.1.100"
-        assert worker_info.port == 50051
-        assert worker_info.pid == 12345
-        assert "tag1" in worker_info.tags
-        assert "tag2" in worker_info.tags
+        # Verify WorkerInfo was created
+        assert configured_local_worker._info is not None
+        assert configured_local_worker._info.uid.startswith("worker-")
+        assert configured_local_worker._info.host == "192.168.1.100"
+        assert configured_local_worker._info.port == 50051
+        assert configured_local_worker._info.pid == 12345
+        assert "tag1" in configured_local_worker._info.tags
+        assert "tag2" in configured_local_worker._info.tags
 
     @pytest.mark.asyncio
     async def test_stop_performs_graceful_shutdown_when_process_alive(
@@ -476,12 +477,11 @@ class TestLanWorker:
         """Test LocalWorker _stop method performs graceful shutdown.
 
         Given:
-            A running LocalWorker instance with an alive process
+            A LocalWorker instance with an alive process
         When:
             _stop() is called and process responds to SIGINT
         Then:
-            It should unregister from registrar, send SIGINT signal, join the
-            process, and stop the registrar service
+            It should send SIGINT signal and join the process
         """
         # Arrange
         await configured_local_worker._start()  # Need to start first to set _info
@@ -491,20 +491,9 @@ class TestLanWorker:
         await configured_local_worker._stop()
 
         # Assert
-        # Check that unregister was called with WorkerInfo object
-        mock_registrar.unregister.assert_called_once()
-        call_args = mock_registrar.unregister.call_args
-        worker_info = call_args[0][0]
-        assert isinstance(worker_info, WorkerInfo)
-        assert worker_info.uid.startswith("worker-")
-        assert worker_info.host == "192.168.1.100"
-        assert worker_info.port == 50051
-        assert worker_info.pid == 12345
-        assert "tag1" in worker_info.tags
-        assert "tag2" in worker_info.tags
+        # Check that the worker process was gracefully stopped
         mock_os_kill.assert_called_once_with(12345, svc.signal.SIGINT)
         mock_worker_process.join.assert_called_once()
-        mock_registrar.stop.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stop_returns_early_when_process_not_alive(
@@ -517,13 +506,11 @@ class TestLanWorker:
         When:
             _stop() is called
         Then:
-            It should unregister from registrar and return early without
-            attempting to kill the process or stop the registrar
+            It should return early without attempting to kill the process
         """
         # Arrange
         mock_lan_registrar = mocker.MagicMock()
         mock_lan_registrar.unregister = mocker.AsyncMock()
-        mock_lan_registrar.stop = mocker.AsyncMock()
 
         mock_worker_process = mocker.MagicMock()
         mock_worker_process.address = "192.168.1.100:50051"
@@ -534,8 +521,9 @@ class TestLanWorker:
         mock_os_kill = mocker.patch.object(svc.os, "kill")
 
         worker = svc.LocalWorker(registrar=mock_lan_registrar)
+        # Set up the _registrar_service that would normally be set by start()
+        worker._registrar_service = mock_lan_registrar
         # Need to manually set up _info for this test since process is dead
-
         worker._info = WorkerInfo(
             uid=worker.uid,
             host="192.168.1.100",
@@ -549,20 +537,9 @@ class TestLanWorker:
         await worker._stop()
 
         # Assert
-        # Check that unregister was called with WorkerInfo object
-        mock_lan_registrar.unregister.assert_called_once()
-        call_args = mock_lan_registrar.unregister.call_args
-        worker_info = call_args[0][0]
-        assert isinstance(worker_info, WorkerInfo)
-        assert worker_info.uid.startswith("worker-")
-        assert worker_info.host == "192.168.1.100"
-        assert worker_info.port == 50051
-        assert worker_info.pid == 0  # PID is 0 when process is not alive
+        # Check that no process operations were attempted
         mock_os_kill.assert_not_called()
         mock_worker_process.join.assert_not_called()
-        # NOTE: registrar.stop() is not called when process is not alive
-        # (early return at line 289)
-        mock_lan_registrar.stop.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stop_force_kills_when_graceful_shutdown_fails(
@@ -582,7 +559,6 @@ class TestLanWorker:
         mock_lan_registrar = mocker.MagicMock()
         mock_lan_registrar.register = mocker.AsyncMock()
         mock_lan_registrar.unregister = mocker.AsyncMock()
-        mock_lan_registrar.stop = mocker.AsyncMock()
 
         mock_worker_process = mocker.MagicMock()
         mock_worker_process.address = "192.168.1.100:50051"
@@ -599,6 +575,8 @@ class TestLanWorker:
         mocker.patch.object(svc.os, "kill", side_effect=OSError("Process not found"))
 
         worker = svc.LocalWorker(registrar=mock_lan_registrar)
+        # Set up the _registrar_service that would normally be set by start()
+        worker._registrar_service = mock_lan_registrar
         await worker._start()  # Need to start first to set _info
 
         # Act
@@ -608,40 +586,22 @@ class TestLanWorker:
         mock_worker_process.kill.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_stop_with_unregister_exception_still_stops_process(
+    async def test_stop_processes_worker_shutdown_independently(
         self, mocker: MockerFixture
     ):
-        """Test LocalWorker _stop method handles unregister exception properly.
+        """Test LocalWorker _stop method handles worker process shutdown.
 
         Given:
-            A LocalWorker instance where registrar unregister raises an exception
+            A LocalWorker instance with a running process
         When:
-            _stop() is called and unregister fails
+            _stop() is called
         Then:
-            It should execute the finally block to stop the worker process
+            It should handle the worker process shutdown logic independently
         """
-        # First, test a basic try/finally to verify the behavior works in isolation
-        finally_executed = False
-
-        async def test_try_finally():
-            nonlocal finally_executed
-            try:
-                raise RuntimeError("Test exception")
-            finally:
-                finally_executed = True
-
-        with pytest.raises(RuntimeError):
-            await test_try_finally()
-        assert finally_executed, "Finally block should execute even with exception"
-
-        # Now test the actual LocalWorker behavior
         # Arrange
         mock_lan_registrar = mocker.MagicMock()
         mock_lan_registrar.register = mocker.AsyncMock()
-        mock_lan_registrar.unregister = mocker.AsyncMock(
-            side_effect=RuntimeError("Registrar service failed")
-        )
-        mock_lan_registrar.stop = mocker.AsyncMock()
+        mock_lan_registrar.unregister = mocker.AsyncMock()
 
         mock_worker_process = mocker.MagicMock()
         mock_worker_process.address = "192.168.1.100:50051"
@@ -655,16 +615,15 @@ class TestLanWorker:
         mock_os_kill = mocker.patch.object(svc.os, "kill")
 
         worker = svc.LocalWorker(registrar=mock_lan_registrar)
+        # Set up the _registrar_service that would normally be set by start()
+        worker._registrar_service = mock_lan_registrar
         await worker._start()  # Need to start first to set _info
 
-        # Act & Assert - Test the behavior
-        with pytest.raises(RuntimeError, match="Registrar service failed"):
-            await worker._stop()
+        # Act
+        await worker._stop()
 
         # Assert
-        # Verify unregister was called and failed
-        mock_lan_registrar.unregister.assert_called_once()
-        # Verify that finally block executed (cleanup should happen)
+        # Verify worker process shutdown was handled
         mock_worker_process.is_alive.assert_called_once()
         mock_os_kill.assert_called_once_with(12345, svc.signal.SIGINT)
         mock_worker_process.join.assert_called_once()
@@ -682,7 +641,6 @@ class TestLanWorker:
         """
         # Arrange
         mock_lan_registrar = mocker.MagicMock()
-        mock_lan_registrar.start = mocker.AsyncMock()
 
         worker = svc.LocalWorker(registrar=mock_lan_registrar)
         worker._started = True  # Simulate already started
@@ -727,7 +685,6 @@ class TestLanWorker:
         """
         # Arrange
         mock_lan_registrar = mocker.MagicMock()
-        mock_lan_registrar.start = mocker.AsyncMock()
 
         mock_worker_process = mocker.MagicMock()
         mock_worker_process.address = None  # No address
@@ -757,7 +714,6 @@ class TestLanWorker:
         """
         # Arrange
         mock_lan_registrar = mocker.MagicMock()
-        mock_lan_registrar.start = mocker.AsyncMock()
 
         mock_worker_process = mocker.MagicMock()
         mock_worker_process.address = "192.168.1.100:50051"
@@ -774,18 +730,15 @@ class TestLanWorker:
             await worker._start()
 
     @pytest.mark.asyncio
-    async def test_stop_raises_error_when_no_address(self, mocker: MockerFixture):
-        """Test LocalWorker stop raises error when worker process has no
-        address.
+    async def test_stop_safely_handles_no_worker_info(self, mocker: MockerFixture):
+        """Test LocalWorker _stop safely handles case when no WorkerInfo exists.
 
         Given:
-            A LocalWorker with mocked WorkerProcess that returns None for
-            address
+            A LocalWorker with no WorkerInfo (_info is None)
         When:
-            stop() is called
+            _stop() is called
         Then:
-            It should raise RuntimeError with "Cannot unregister - worker has
-            no address"
+            It should handle the case gracefully without errors
         """
         # Arrange
         mock_lan_registrar = mocker.MagicMock()
@@ -793,13 +746,16 @@ class TestLanWorker:
 
         mock_worker_process = mocker.MagicMock()
         mock_worker_process.address = None  # No address
+        mock_worker_process.is_alive.return_value = False  # Process not alive
         mocker.patch.object(svc, "WorkerProcess", return_value=mock_worker_process)
 
         worker = svc.LocalWorker(registrar=mock_lan_registrar)
+        # Don't call _start(), so _info remains None
 
-        # Act & Assert
-        with pytest.raises(RuntimeError, match="Cannot unregister - worker has no info"):
-            await worker._stop()
+        # Act - should not raise any exception
+        await worker._stop()
+
+        # Assert - no additional assertions needed, the test passes if no exception is raised
 
     @pytest.mark.asyncio
     @pytest.mark.dependency(name="test_start_executes_successfully")
@@ -811,25 +767,32 @@ class TestLanWorker:
         When:
             start() is called
         Then:
-            It should start registrar service, call _start, and set _started
-            flag
+            It should set up registrar context, call _start, register with
+            registrar, and set _started flag
         """
         # Arrange
-        mock_lan_registrar = mocker.MagicMock()
-        mock_lan_registrar.start = mocker.AsyncMock()
+        mock_lan_registrar = MockRegistrar(mocker)
+        mock_worker_process = mocker.MagicMock()
+        mock_worker_process.address = "192.168.1.100:50051"
+        mock_worker_process.pid = 12345
+        mock_worker_process.start = mocker.MagicMock()
+        mocker.patch.object(svc, "WorkerProcess", return_value=mock_worker_process)
 
         worker = svc.LocalWorker(registrar=mock_lan_registrar)
-        mock_start = mocker.patch.object(
-            worker, "_start", new_callable=mocker.AsyncMock
-        )  # Mock the abstract method
 
         # Act
         await worker.start()
 
         # Assert
-        mock_lan_registrar.start.assert_called_once()
-        mock_start.assert_called_once()
+        # Check that registrar lifecycle was handled
         assert worker._started is True
+        assert worker._registrar_service is mock_lan_registrar
+        mock_lan_registrar.register.assert_called_once()
+        # Verify WorkerInfo was passed to register
+        call_args = mock_lan_registrar.register.call_args
+        worker_info = call_args[0][0]
+        assert isinstance(worker_info, WorkerInfo)
+        assert worker_info.uid.startswith("worker-")
 
     @pytest.mark.asyncio
     @pytest.mark.dependency(depends=["test_start_executes_successfully"])
@@ -841,34 +804,68 @@ class TestLanWorker:
         When:
             stop() is called
         Then:
-            It should call _stop and stop registrar service
+            It should unregister from registrar, call _stop, clean up context,
+            and reset _started flag
         """
         # Arrange
-        mock_lan_registrar = mocker.MagicMock()
-        mock_lan_registrar.start = mocker.AsyncMock()
-        mock_lan_registrar.stop = mocker.AsyncMock()
+        mock_lan_registrar = MockRegistrar(mocker)
+        mock_worker_process = mocker.MagicMock()
+        mock_worker_process.address = "192.168.1.100:50051"
+        mock_worker_process.pid = 12345
+        mock_worker_process.start = mocker.MagicMock()
+        mock_worker_process.is_alive.return_value = True
+        mock_worker_process.join = mocker.MagicMock()
+        mocker.patch.object(svc, "WorkerProcess", return_value=mock_worker_process)
+        mocker.patch.object(svc.os, "kill")
 
         worker = svc.LocalWorker(registrar=mock_lan_registrar)
-        mock_start = mocker.patch.object(worker, "_start", new_callable=mocker.AsyncMock)
-        mock_stop = mocker.patch.object(
-            worker, "_stop", new_callable=mocker.AsyncMock
-        )  # Mock the abstract method
 
         # Actually start the worker first
         await worker.start()
+        assert worker._started is True
 
         # Act
         await worker.stop()
 
         # Assert
-        mock_start.assert_called_once()
-        mock_stop.assert_called_once()
-        mock_lan_registrar.start.assert_called_once()
-        mock_lan_registrar.stop.assert_called_once()
+        # Check that registrar lifecycle was handled
+        mock_lan_registrar.unregister.assert_called_once()
+        assert worker._started is False
+        assert worker._registrar_service is None
+        assert worker._registrar_context is None
 
 
 class TestLocalWorkerEdgeCases:
     """Test edge cases and error conditions for LocalWorker."""
+
+    @pytest.mark.asyncio
+    async def test_start_with_invalid_registrar_factory_return(
+        self, mocker: MockerFixture
+    ):
+        """Test LocalWorker start when registrar factory returns invalid type.
+
+        Given:
+            A registrar factory that returns a non-RegistrarLike object
+        When:
+            start() is called
+        Then:
+            It should raise ValueError with appropriate message
+        """
+        # Arrange
+        # Create a factory that returns a plain object (not RegistrarLike)
+        invalid_object = object()  # This will definitely fail isinstance check
+
+        # Use a simple lambda to avoid MagicMock callable interference
+        def invalid_factory():
+            return invalid_object
+
+        worker = svc.LocalWorker(registrar=invalid_factory)
+
+        # Act & Assert
+        with pytest.raises(
+            ValueError, match="Registrar factory must return a RegistrarLike instance"
+        ):
+            await worker.start()
 
     @pytest.mark.asyncio
     async def test_start_with_registrar_failure(
@@ -881,21 +878,20 @@ class TestLocalWorkerEdgeCases:
         When:
             start() is called
         Then:
-            Should handle registrar failure gracefully
+            Should propagate the registrar failure exception
         """
         # Arrange
-        mock_registrar = mocker.AsyncMock()
-        mock_registrar.start = mocker.AsyncMock()
+        mock_registrar = MockRegistrar(mocker)
         mock_registrar.register = mocker.AsyncMock(
             side_effect=RuntimeError("Registrar failed")
         )
 
         mocker.patch.object(svc, "WorkerProcess", return_value=mock_worker_process)
-        worker = svc.LocalWorker("test-uid", registrar=mock_registrar)
+        worker = svc.LocalWorker(registrar=mock_registrar)
 
         # Act & Assert
         with pytest.raises(RuntimeError, match="Registrar failed"):
-            await worker._start()
+            await worker.start()
 
     @pytest.mark.asyncio
     async def test_stop_with_os_kill_permission_error(
@@ -943,7 +939,7 @@ class TestLocalWorkerEdgeCases:
         """
         # Arrange
         mocker.patch.object(svc, "WorkerProcess", return_value=mock_worker_process)
-        worker = svc.LocalWorker("test-uid", registrar=mock_registrar)
+        worker = svc.LocalWorker(registrar=mock_registrar)
 
         # Act
         await worker.start()  # First call should succeed
@@ -972,7 +968,7 @@ class TestLocalWorkerEdgeCases:
         mock_worker_process.start = mocker.MagicMock()
         mocker.patch.object(svc, "WorkerProcess", return_value=mock_worker_process)
 
-        worker = svc.LocalWorker("test-uid", registrar=mock_registrar)
+        worker = svc.LocalWorker(registrar=mock_registrar)
 
         # Act & Assert
         with pytest.raises(ValueError):
@@ -989,7 +985,7 @@ class TestLocalWorkerEdgeCases:
             Should reflect the changes (tags are mutable)
         """
         # Arrange
-        worker = svc.LocalWorker("test-uid", "tag1", "tag2", registrar=mock_registrar)
+        worker = svc.LocalWorker("tag1", "tag2", registrar=mock_registrar)
         original_tags = worker.tags.copy()
 
         # Act
@@ -998,6 +994,290 @@ class TestLocalWorkerEdgeCases:
         # Assert
         assert "additional_tag" in worker.tags
         assert len(worker.tags) == len(original_tags) + 1
+
+    @pytest.mark.asyncio
+    async def test_stop_raises_error_when_started_but_no_info(
+        self, mocker: MockerFixture
+    ):
+        """Test Worker stop raises error when started but has no WorkerInfo.
+
+        Given:
+            A Worker that has _started=True but _info=None (abnormal state)
+        When:
+            stop() is called
+        Then:
+            It should raise RuntimeError with "Cannot unregister - worker has no info"
+        """
+        # Arrange
+        mock_registrar = MockRegistrar(mocker)
+        worker = svc.LocalWorker(registrar=mock_registrar)
+
+        # Manually set the worker to started state without going through start()
+        worker._started = True
+        worker._registrar_service = mock_registrar
+        worker._registrar_context = None
+        # Deliberately leave _info as None to trigger the error condition
+
+        # Act & Assert
+        with pytest.raises(RuntimeError, match="Cannot unregister - worker has no info"):
+            await worker.stop()
+
+
+class TestWorkerContextHandling:
+    """Test Worker base class context handling methods."""
+
+    @pytest.mark.asyncio
+    async def test_enter_context_with_sync_context_manager(
+        self, mock_registrar, mocker: MockerFixture
+    ):
+        """Test _enter_context with synchronous context manager factory.
+
+        Given:
+            A factory function that returns a synchronous context manager
+        When:
+            _enter_context is called
+        Then:
+            It should call the factory, enter the context manager and return the result
+        """
+        # Arrange
+        from contextlib import contextmanager
+
+        @contextmanager
+        def sync_context():
+            yield mock_registrar
+
+        # Create a factory function that returns a context manager
+        def factory():
+            return sync_context()
+
+        worker = svc.LocalWorker(registrar=mock_registrar)
+
+        # Act
+        obj, ctx = await worker._enter_context(factory)
+
+        # Assert
+        assert obj is mock_registrar
+        assert ctx is not None
+
+    @pytest.mark.asyncio
+    async def test_enter_context_with_async_context_manager(
+        self, mock_registrar, mocker: MockerFixture
+    ):
+        """Test _enter_context with asynchronous context manager factory.
+
+        Given:
+            A factory function that returns an asynchronous context manager
+        When:
+            _enter_context is called
+        Then:
+            It should call the factory, enter the async context manager and return the result
+        """
+        # Arrange
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def async_context():
+            yield mock_registrar
+
+        # Create a factory function that returns an async context manager
+        def factory():
+            return async_context()
+
+        worker = svc.LocalWorker(registrar=mock_registrar)
+
+        # Act
+        obj, ctx = await worker._enter_context(factory)
+
+        # Assert
+        assert obj is mock_registrar
+        assert ctx is not None
+
+    @pytest.mark.asyncio
+    async def test_enter_context_with_direct_sync_context_manager(
+        self, mock_registrar, mocker: MockerFixture
+    ):
+        """Test _enter_context with direct synchronous context manager.
+
+        Given:
+            A synchronous context manager instance directly
+        When:
+            _enter_context is called
+        Then:
+            It should enter the context manager and return the result
+        """
+        # Arrange
+        from contextlib import contextmanager
+
+        @contextmanager
+        def sync_context():
+            yield mock_registrar
+
+        # Pass the context manager directly, not a factory
+        ctx_manager = sync_context()
+        worker = svc.LocalWorker(registrar=mock_registrar)
+
+        # Act
+        obj, ctx = await worker._enter_context(ctx_manager)
+
+        # Assert
+        assert obj is mock_registrar
+        assert ctx is ctx_manager
+
+    @pytest.mark.asyncio
+    async def test_enter_context_with_direct_async_context_manager(
+        self, mock_registrar, mocker: MockerFixture
+    ):
+        """Test _enter_context with direct asynchronous context manager.
+
+        Given:
+            An asynchronous context manager instance directly
+        When:
+            _enter_context is called
+        Then:
+            It should enter the async context manager and return the result
+        """
+        # Arrange
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def async_context():
+            yield mock_registrar
+
+        # Pass the async context manager directly, not a factory
+        ctx_manager = async_context()
+        worker = svc.LocalWorker(registrar=mock_registrar)
+
+        # Act
+        obj, ctx = await worker._enter_context(ctx_manager)
+
+        # Assert
+        assert obj is mock_registrar
+        assert ctx is ctx_manager
+
+    @pytest.mark.asyncio
+    async def test_enter_context_with_awaitable_factory(
+        self, mock_registrar, mocker: MockerFixture
+    ):
+        """Test _enter_context with factory that returns an awaitable.
+
+        Given:
+            A factory that returns an awaitable object
+        When:
+            _enter_context is called
+        Then:
+            It should await the result and return it
+        """
+
+        # Arrange
+        async def async_factory_result():
+            return mock_registrar
+
+        # Use a simple lambda instead of MagicMock to avoid context manager interference
+        def factory():
+            return async_factory_result()
+
+        worker = svc.LocalWorker(registrar=mock_registrar)
+
+        # Act
+        obj, ctx = await worker._enter_context(factory)
+
+        # Assert
+        assert obj is mock_registrar
+        assert ctx is None
+
+    @pytest.mark.asyncio
+    async def test_exit_context_with_sync_context_manager(
+        self, mock_registrar, mocker: MockerFixture
+    ):
+        """Test _exit_context with synchronous context manager.
+
+        Given:
+            A synchronous context manager
+        When:
+            _exit_context is called with exception info
+        Then:
+            It should call the context manager's __exit__ method
+        """
+        # Arrange
+        from contextlib import contextmanager
+
+        exit_called = False
+
+        @contextmanager
+        def sync_context():
+            nonlocal exit_called
+            try:
+                yield mock_registrar
+            finally:
+                exit_called = True
+
+        ctx = sync_context()
+        # Enter the context to get it into the right state
+        ctx.__enter__()
+
+        worker = svc.LocalWorker(registrar=mock_registrar)
+
+        # Act
+        await worker._exit_context(ctx, Exception, ValueError("test"), None)
+
+        # Assert - the context manager's __exit__ should have been called
+        # We verify this by checking that the finally block was executed
+        assert exit_called
+
+    @pytest.mark.asyncio
+    async def test_exit_context_with_async_context_manager(
+        self, mock_registrar, mocker: MockerFixture
+    ):
+        """Test _exit_context with asynchronous context manager.
+
+        Given:
+            An asynchronous context manager
+        When:
+            _exit_context is called with exception info
+        Then:
+            It should call the context manager's __aexit__ method
+        """
+        # Arrange
+        mock_context = mocker.MagicMock()
+        mock_context.__aexit__ = mocker.AsyncMock()
+        worker = svc.LocalWorker(registrar=mock_registrar)
+
+        # Act
+        await worker._exit_context(mock_context, Exception, ValueError("test"), None)
+
+        # Assert
+        mock_context.__aexit__.assert_called_once_with(Exception, mocker.ANY, None)
+
+    @pytest.mark.asyncio
+    async def test_enter_context_with_registrar_as_async_context_manager(
+        self, mock_registrar, mocker: MockerFixture
+    ):
+        """Test _enter_context with Registrar used as async context manager.
+
+        Given:
+            A Registrar instance that implements async context manager protocol
+        When:
+            _enter_context is called with the Registrar instance
+        Then:
+            It should enter the async context manager and return the registrar object
+        """
+        # Arrange
+        from wool._worker_discovery import Registrar
+
+        # Create a mock Registrar that behaves like an async context manager
+        mock_registrar_ctx = mocker.MagicMock(spec=Registrar)
+        mock_registrar_ctx.__aenter__ = mocker.AsyncMock(return_value=mock_registrar_ctx)
+        mock_registrar_ctx.__aexit__ = mocker.AsyncMock()
+
+        worker = svc.LocalWorker(registrar=mock_registrar)
+
+        # Act
+        obj, ctx = await worker._enter_context(mock_registrar_ctx)
+
+        # Assert
+        assert obj is mock_registrar_ctx
+        assert ctx is mock_registrar_ctx
+        mock_registrar_ctx.__aenter__.assert_called_once()
 
 
 class TestWorkerProcess:

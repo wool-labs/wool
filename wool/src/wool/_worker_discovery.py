@@ -22,6 +22,7 @@ from typing import Dict
 from typing import Generic
 from typing import Literal
 from typing import Protocol
+from typing import Self
 from typing import Tuple
 from typing import TypeAlias
 from typing import TypeVar
@@ -314,6 +315,7 @@ class Reducible(Protocol):
 
 
 # public
+@runtime_checkable
 class DiscoveryLike(Protocol):
     """Protocol for async iterators that yield discovery events.
 
@@ -327,17 +329,21 @@ class DiscoveryLike(Protocol):
 
 
 # public
-class ReducibleDiscoveryLike(Reducible, DiscoveryLike, Protocol): ...
-
-
-# public
 @runtime_checkable
-class Factory(Protocol, Generic[_T_co]):
+class _Factory(Protocol, Generic[_T_co]):
     def __call__(
         self,
     ) -> (
         _T_co | Awaitable[_T_co] | AsyncContextManager[_T_co] | ContextManager[_T_co]
     ): ...
+
+
+Factory: TypeAlias = (
+    Awaitable[_T_co]
+    | AsyncContextManager[_T_co]
+    | ContextManager[_T_co]
+    | _Factory[_T_co]
+)
 
 
 # public
@@ -457,6 +463,7 @@ _T_DiscoveryLike = TypeVar("_T_DiscoveryLike", bound=Discovery)
 
 
 # public
+@runtime_checkable
 class RegistrarLike(Protocol):
     """Abstract base class for a service where workers can register themselves.
 
@@ -485,6 +492,13 @@ class Registrar(Generic[_T_DiscoveryLike], ABC):
     def __init__(self):
         self._started = False
         self._stopped = False
+
+    async def __aenter__(self) -> Self:
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_):
+        await self.stop()
 
     async def start(self) -> None:
         """Starts the registrar service, making it ready to accept registrations.

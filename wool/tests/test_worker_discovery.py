@@ -2502,6 +2502,62 @@ class TestRegistrar:
         with pytest.raises(RuntimeError, match="Registrar service already stopped"):
             await service.update(worker_info)
 
+    @pytest.mark.asyncio
+    async def test_registrar_async_context_manager(self, worker_info):
+        """Test Registrar as async context manager.
+
+        Given:
+            A Registrar implementation
+        When:
+            Used as an async context manager with async with
+        Then:
+            It should automatically start on enter and stop on exit
+        """
+        # Arrange
+        # Create a concrete implementation for testing
+        class DummyRegistrar(discovery.Registrar):
+            def __init__(self):
+                super().__init__()
+                self.start_called = False
+                self.stop_called = False
+
+            async def _start(self):
+                self.start_called = True
+
+            async def _stop(self):
+                self.stop_called = True
+
+            async def _register(self, worker_info):
+                pass
+
+            async def _unregister(self, worker_info):
+                pass
+
+            async def _update(self, worker_info):
+                pass
+
+        service = DummyRegistrar()
+
+        # Act & Assert
+        # Initially not started
+        assert not service._started
+        assert not service.start_called
+        assert not service.stop_called
+
+        async with service as context_service:
+            # Should be started inside context
+            assert service._started
+            assert service.start_called
+            assert not service.stop_called
+            assert context_service is service
+
+            # Should be able to perform operations
+            await service.register(worker_info)
+
+        # Should be stopped after exiting context
+        assert service._stopped
+        assert service.stop_called
+
 
 class TestLocalRegistrar:
     @pytest.mark.asyncio
