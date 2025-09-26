@@ -539,7 +539,6 @@ class TestLanWorker:
 
         worker = svc.LocalWorker(registry_service=mock_lan_registry_service)
         # Need to manually set up _info for this test since process is dead
-        from wool._worker_discovery import WorkerInfo
 
         worker._info = WorkerInfo(
             uid=worker.uid,
@@ -611,6 +610,68 @@ class TestLanWorker:
 
         # Assert
         mock_worker_process.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_with_unregister_exception_still_stops_process(
+        self, mocker: MockerFixture
+    ):
+        """Test LocalWorker _stop method handles unregister exception properly.
+
+        Given:
+            A LocalWorker instance where registry unregister raises an exception
+        When:
+            _stop() is called and unregister fails
+        Then:
+            It should execute the finally block to stop the worker process
+        """
+        # First, test a basic try/finally to verify the behavior works in isolation
+        finally_executed = False
+
+        async def test_try_finally():
+            nonlocal finally_executed
+            try:
+                raise RuntimeError("Test exception")
+            finally:
+                finally_executed = True
+
+        with pytest.raises(RuntimeError):
+            await test_try_finally()
+        assert finally_executed, "Finally block should execute even with exception"
+
+        # Now test the actual LocalWorker behavior
+        # Arrange
+        mock_lan_registry_service = mocker.MagicMock()
+        mock_lan_registry_service.register = mocker.AsyncMock()
+        mock_lan_registry_service.unregister = mocker.AsyncMock(
+            side_effect=RuntimeError("Registry service failed")
+        )
+        mock_lan_registry_service.stop = mocker.AsyncMock()
+
+        mock_worker_process = mocker.MagicMock()
+        mock_worker_process.address = "192.168.1.100:50051"
+        mock_worker_process.is_alive.return_value = True
+        mock_worker_process.pid = 12345
+        mock_worker_process.start = mocker.MagicMock()
+        mock_worker_process.join = mocker.MagicMock()
+        mock_worker_process.kill = mocker.MagicMock()
+        mocker.patch.object(svc, "WorkerProcess", return_value=mock_worker_process)
+
+        mock_os_kill = mocker.patch.object(svc.os, "kill")
+
+        worker = svc.LocalWorker(registry_service=mock_lan_registry_service)
+        await worker._start()  # Need to start first to set _info
+
+        # Act & Assert - Test the behavior
+        with pytest.raises(RuntimeError, match="Registry service failed"):
+            await worker._stop()
+
+        # Assert
+        # Verify unregister was called and failed
+        mock_lan_registry_service.unregister.assert_called_once()
+        # Verify that finally block executed (cleanup should happen)
+        mock_worker_process.is_alive.assert_called_once()
+        mock_os_kill.assert_called_once_with(12345, svc.signal.SIGINT)
+        mock_worker_process.join.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_start_raises_error_when_already_started(self, mocker: MockerFixture):
@@ -1267,7 +1328,7 @@ class TestWorkerProcess:
 
         # Assert
         assert result == mock_proxy
-        mock_proxy.start.assert_not_called()  # Should not call start when already started
+        mock_proxy.start.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_worker_process_run_method(self, mocker: MockerFixture):
