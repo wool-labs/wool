@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package wool._protobuf.worker;
+
+import "task.proto";
+
+service Worker {
+    rpc dispatch (task.Task) returns (stream Response);
+    rpc stop (StopRequest) returns (Void);
+}
+
+message Response {
+    oneof payload {
+        Ack ack = 1;
+        Nack nack = 2;
+        task.Result result = 3;
+        task.Exception exception = 4;
+    }
+}
+
+message Ack {
+    // Acknowledgment that the task was received and processing started
+}
+
+message Nack {
+    // Negative acknowledgment indicating the task was rejected
+    string reason = 1;
+}
+
+message StopRequest {
+    int32 wait = 1;
+}
+
+message Void {}
