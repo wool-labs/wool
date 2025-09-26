@@ -67,12 +67,12 @@ def mock_worker_proxy_cache(mocker):
     # Store original context var
 
     # Set the mock pool in the context var
-    token = wool.__wool_proxy_pool__.set(mock_pool)
+    token = wool.__proxy_pool__.set(mock_pool)
 
     yield mock_pool
 
     # Restore original context var
-    wool.__wool_proxy_pool__.reset(token)
+    wool.__proxy_pool__.reset(token)
 
 
 @pytest.fixture

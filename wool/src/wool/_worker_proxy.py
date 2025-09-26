@@ -399,7 +399,7 @@ class WorkerProxy:
         if not isinstance(self._discovery_service, DiscoveryLike):
             raise ValueError
 
-        self._proxy_token = wool.__wool_proxy__.set(self)
+        self._proxy_token = wool.__proxy__.set(self)
         self._client_pool = ResourcePool(
             factory=client_factory, finalizer=client_finalizer, ttl=60
         )
@@ -418,7 +418,7 @@ class WorkerProxy:
         await self._exit_context(self._discovery_ctx, *args)
         await self._exit_context(self._loadbalancer_ctx, *args)
 
-        wool.__wool_proxy__.reset(self._proxy_token)
+        wool.__proxy__.reset(self._proxy_token)
         if self._sentinel_task:
             self._sentinel_task.cancel()
             try:

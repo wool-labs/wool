@@ -124,7 +124,7 @@ def work(fn: C) -> C:
         assert callable(function)
 
         if _do_dispatch.get():
-            proxy = wool.__wool_proxy__.get()
+            proxy = wool.__proxy__.get()
             assert proxy
             stream = _dispatch(
                 proxy,
@@ -347,16 +347,16 @@ class WoolTask:
         :raises RuntimeError:
             If no proxy is available for task execution.
         """
-        proxy_pool = wool.__wool_proxy_pool__.get()
+        proxy_pool = wool.__proxy_pool__.get()
         assert proxy_pool
         async with proxy_pool.get(self.proxy) as proxy:
             # Set the proxy in context variable for nested task dispatch
-            token = wool.__wool_proxy__.set(proxy)
+            token = wool.__proxy__.set(proxy)
             try:
                 work = self._with_self(self.callable)
                 return await work(*self.args, **self.kwargs)
             finally:
-                wool.__wool_proxy__.reset(token)
+                wool.__proxy__.reset(token)
 
     def _finish(self, _):
         WoolTaskEvent("task-completed", task=self).emit()

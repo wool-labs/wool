@@ -509,7 +509,7 @@ class WorkerProcess(Process):
             except Exception:
                 pass
 
-        wool.__wool_proxy_pool__.set(
+        wool.__proxy_pool__.set(
             ResourcePool(factory=proxy_factory, finalizer=proxy_finalizer, ttl=60)
         )
         asyncio.run(self._serve())
@@ -693,7 +693,7 @@ class WorkerService(pb.worker.WorkerServicer):
 
         # Clean up the session cache to prevent issues during shutdown
         try:
-            proxy_pool = wool.__wool_proxy_pool__.get()
+            proxy_pool = wool.__proxy_pool__.get()
             assert proxy_pool
             await proxy_pool.clear()
         finally:

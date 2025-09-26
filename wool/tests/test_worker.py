@@ -1964,7 +1964,7 @@ class TestWorkerService:
         """
         # Arrange
         mock_proxy_pool = mocker.patch.object(
-            svc.wool, "__wool_proxy_pool__", mocker.MagicMock()
+            svc.wool, "__proxy_pool__", mocker.MagicMock()
         )
         mock_proxy_pool.get.return_value = mocker.AsyncMock()
 
@@ -2002,7 +2002,7 @@ class TestWorkerService:
         """
         # Arrange
         mock_proxy_pool = mocker.patch.object(
-            svc.wool, "__wool_proxy_pool__", mocker.MagicMock()
+            svc.wool, "__proxy_pool__", mocker.MagicMock()
         )
         mock_proxy_pool.get.return_value = mocker.AsyncMock()
 
@@ -2037,7 +2037,7 @@ class TestWorkerService:
         """
         # Arrange
         mock_proxy_pool = mocker.patch.object(
-            svc.wool, "__wool_proxy_pool__", mocker.MagicMock()
+            svc.wool, "__proxy_pool__", mocker.MagicMock()
         )
         mock_proxy_pool.get.return_value = mocker.AsyncMock()
 
@@ -2071,7 +2071,7 @@ class TestWorkerService:
         """
         # Arrange
         mock_proxy_pool = mocker.patch.object(
-            svc.wool, "__wool_proxy_pool__", mocker.MagicMock()
+            svc.wool, "__proxy_pool__", mocker.MagicMock()
         )
         mock_proxy_pool.get.return_value = mocker.AsyncMock()
 

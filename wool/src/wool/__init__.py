@@ -54,12 +54,12 @@ try:
 except PackageNotFoundError:
     __version__ = "unknown"
 
-__wool_proxy__: Final[ContextVar[WorkerProxy | None]] = ContextVar(
-    "__wool_proxy__", default=None
+__proxy__: Final[ContextVar[WorkerProxy | None]] = ContextVar(
+    "__proxy__", default=None
 )
 
-__wool_proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar(
-    "__wool_proxy_pool__", default=None
+__proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar(
+    "__proxy_pool__", default=None
 )
 
 __all__ = [

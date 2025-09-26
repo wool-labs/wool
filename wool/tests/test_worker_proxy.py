@@ -229,7 +229,7 @@ def mock_proxy_session(mocker: MockerFixture):
     and session token handling in wool proxy scenarios.
     """
     mock_proxy_token = mocker.MagicMock()
-    mock_proxy_session = mocker.patch.object(wp.wool, "__wool_proxy__")
+    mock_proxy_session = mocker.patch.object(wp.wool, "__proxy__")
     mock_proxy_session.set.return_value = mock_proxy_token
     return mock_proxy_session
 
