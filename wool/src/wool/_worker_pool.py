@@ -312,7 +312,7 @@ class WorkerPool:
         self, uri, *tags: str, size: int, factory: WorkerFactory | None
     ):
         if factory is None:
-            factory = partial(LocalWorker, registry_service=LocalRegistryService(uri))
+            factory = self._default_worker_factory(uri)
 
         tasks = []
         for _ in range(size):
@@ -329,3 +329,9 @@ class WorkerPool:
         """Sends a stop command to all workers and unregisters them."""
         tasks = [asyncio.create_task(worker.stop()) for worker in self._workers]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _default_worker_factory(self, uri):
+        def factory(*tags, **_):
+            return LocalWorker(*tags, registry_service=LocalRegistryService(uri))
+
+        return factory
