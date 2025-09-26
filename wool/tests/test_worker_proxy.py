@@ -1330,7 +1330,7 @@ class TestRoundRobinLoadBalancerEdgeCases:
     async def test_dispatch_with_workers_handles_transient_errors(
         self, mocker: MockerFixture
     ):
-        """Test RoundRobinLoadBalancer dispatch with workers that fail with transient 
+        """Test RoundRobinLoadBalancer dispatch with workers that fail with transient
         errors.
 
         Given:
@@ -1338,7 +1338,7 @@ class TestRoundRobinLoadBalancerEdgeCases:
         When:
             dispatch is called and all workers fail
         Then:
-            Should try all workers and raise NoWorkersAvailable with transient 
+            Should try all workers and raise NoWorkersAvailable with transient
             error message
         """
         # Arrange

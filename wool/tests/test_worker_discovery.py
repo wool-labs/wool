@@ -2396,13 +2396,10 @@ class TestDiscoveryService:
 
         service = DummyDiscoveryService()
 
-        # Act & Assert - Test __aiter__
-        async_iter = service.__aiter__()
-
-        # __aiter__ should return the result of events()
-        # We can't directly compare async generators, but we can test the first event
+        # Act
         first_event = await service.__anext__()
 
+        # Assert
         assert service.events_called is True
         assert isinstance(first_event, discovery.DiscoveryEvent)
         assert first_event.type == "worker_added"
@@ -3080,7 +3077,7 @@ class TestLocalDiscoveryService:
     async def test_monitor_shared_memory_handles_struct_unpack_exception(
         self, mocker: MockerFixture, worker_info
     ):
-        """Test LocalDiscoveryService monitoring continues after struct.unpack exceptions.
+        """Test LocalDiscoveryService monitoring continues after exceptions.
 
         Given:
             A LocalDiscoveryService where struct.unpack raises an exception
@@ -3237,7 +3234,8 @@ class TestLocalDiscoveryService:
         """Test LocalDiscoveryService._detect_changes method for worker port updates.
 
         Given:
-            A LocalDiscoveryService with a cached worker and current workers with changed port
+            A LocalDiscoveryService with a cached worker and current workers with
+            changed port
         When:
             _detect_changes is called with the updated worker info
         Then:
