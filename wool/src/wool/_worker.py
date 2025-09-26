@@ -334,20 +334,20 @@ class LocalWorker(Worker[_T_RegistryService]):
         the registry service. If graceful shutdown fails, the process
         is forcefully terminated.
         """
-        if not self._info:
-            raise RuntimeError("Cannot unregister - worker has no info")
-
-        await self._registry_service.unregister(self._info)
-
-        if not self._worker_process.is_alive():
-            return
         try:
-            if self._worker_process.pid:
-                os.kill(self._worker_process.pid, signal.SIGINT)
-                self._worker_process.join()
-        except OSError:
-            if self._worker_process.is_alive():
-                self._worker_process.kill()
+            if not self._info:
+                raise RuntimeError("Cannot unregister - worker has no info")
+            await self._registry_service.unregister(self._info)
+        finally:
+            if not self._worker_process.is_alive():
+                return
+            try:
+                if self._worker_process.pid:
+                    os.kill(self._worker_process.pid, signal.SIGINT)
+                    self._worker_process.join()
+            except OSError:
+                if self._worker_process.is_alive():
+                    self._worker_process.kill()
 
 
 class WorkerProcess(Process):
