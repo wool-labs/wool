@@ -12,8 +12,8 @@ from hypothesis import strategies as st
 from hypothesis.strategies import composite
 
 import wool
-from wool._worker_discovery import LanDiscoveryService
-from wool._worker_discovery import LanRegistrarService
+from wool._worker_discovery import LanDiscovery
+from wool._worker_discovery import LanRegistrar
 from wool._worker_discovery import WorkerInfo
 
 
@@ -67,7 +67,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
     """End-to-end integration tests for service registration and discovery.
 
     These integration tests verify the interaction between
-    :py:class:`LanRegistrarService` and :py:class:`LanDiscoveryService`
+    :py:class:`LanRegistrar` and :py:class:`LanDiscovery`
     components work together correctly for worker lifecycle management.
     """
 
@@ -78,8 +78,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         """Test that worker registration triggers discovery events.
 
         GIVEN
-            A :py:class:`LanRegistrarService` and
-            :py:class:`LanDiscoveryService` are running
+            A :py:class:`LanRegistrar` and
+            :py:class:`LanDiscovery` are running
         WHEN
             A worker is registered in the registrar
         THEN
@@ -92,8 +92,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         discovery_future = asyncio.Future()
         removal_future = asyncio.Future()
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
         await mock_registrar.start()
 
@@ -141,7 +141,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         """Test that discovery service filters workers by tag criteria.
 
         GIVEN
-            A :py:class:`LanDiscoveryService` configured with tag filtering
+            A :py:class:`LanDiscovery` configured with tag filtering
         WHEN
             Workers with different tags are registered
         THEN
@@ -161,8 +161,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         def mock_filter_production_workers(worker_info: WorkerInfo) -> bool:
             return "production" in worker_info.tags
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService(filter=mock_filter_production_workers)
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery(filter=mock_filter_production_workers)
 
         await mock_registrar.start()
 
@@ -201,8 +201,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         """Test that discovery service detects multiple registered workers.
 
         GIVEN
-            A :py:class:`LanRegistrarService` and
-            :py:class:`LanDiscoveryService` are running
+            A :py:class:`LanRegistrar` and
+            :py:class:`LanDiscovery` are running
         WHEN
             Multiple workers are registered simultaneously
         THEN
@@ -220,8 +220,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         ]
         expected_worker_count = len(mock_workers)
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
         await mock_registrar.start()
 
@@ -285,8 +285,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         discovered_events = []
         original_worker = create_mock_worker_info(worker_address)
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
         await mock_registrar.start()
 
@@ -338,7 +338,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         discovered_events = []
         discovery_timeout_reached = False
 
-        mock_discovery = LanDiscoveryService()
+        mock_discovery = LanDiscovery()
         # Intentionally NOT starting any registrar service
 
         async def collect_events():
@@ -375,8 +375,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         discovered_events = []
         timeout_occurred = False
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
         mock_worker = create_mock_worker_info(worker_address)
 
         await mock_registrar.start()
@@ -434,8 +434,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             extra={},
         )
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
         await mock_registrar.start()
 
@@ -493,8 +493,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 port = s.getsockname()[1]
                 all_workers.append(create_mock_worker_info(f"localhost:{port}"))
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
         await mock_registrar.start()
 
@@ -583,9 +583,9 @@ class TestServiceRegistrationAndDiscoveryIntegration:
 
         expected_worker_count = len(workers_with_tags)
 
-        mock_registrar = LanRegistrarService()
+        mock_registrar = LanRegistrar()
         # No filter provided - should discover all workers
-        mock_discovery = LanDiscoveryService(filter=None)
+        mock_discovery = LanDiscovery(filter=None)
 
         await mock_registrar.start()
 
@@ -669,8 +669,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         # Expected: workers 0 (production+web) and 1 (production+api)
         expected_discovered_count = 2
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService(filter=complex_filter)
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery(filter=complex_filter)
 
         await mock_registrar.start()
 
@@ -746,8 +746,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             port = s.getsockname()[1]
             worker_for_recovery = create_mock_worker_info(f"localhost:{port}")
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
         await mock_registrar.start()
 
@@ -775,7 +775,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             initial_task.cancel()
 
             # Phase 3: Simulate recovery with new discovery instance
-            mock_discovery_recovery = LanDiscoveryService()
+            mock_discovery_recovery = LanDiscovery()
 
             async def collect_recovery_events():
                 async for event in mock_discovery_recovery.events():
@@ -835,8 +835,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             extra={"update_time": "2023-11-01"},  # Different extra
         )
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
         await mock_registrar.start()
 
@@ -903,8 +903,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             extra={"update_time": "2023-11-01"},
         )
 
-        mock_registrar = LanRegistrarService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
         await mock_registrar.start()
 

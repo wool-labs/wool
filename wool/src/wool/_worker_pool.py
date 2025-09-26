@@ -5,20 +5,16 @@ import hashlib
 import os
 import uuid
 from multiprocessing.shared_memory import SharedMemory
-from typing import AsyncIterator
 from typing import Final
 from typing import overload
 
 from wool._worker import LocalWorker
 from wool._worker import Worker
 from wool._worker import WorkerFactory
-from wool._worker_discovery import DiscoveryEvent
+from wool._worker_discovery import DiscoveryLike
 from wool._worker_discovery import Factory
-from wool._worker_discovery import LocalDiscoveryService
-from wool._worker_discovery import LocalRegistrarService
-from wool._worker_discovery import ReducibleAsyncIteratorLike
-from wool._worker_discovery import RegistrarServiceLike
-from wool._worker_proxy import LoadBalancerFactory
+from wool._worker_discovery import LocalDiscovery
+from wool._worker_discovery import LocalRegistrar
 from wool._worker_proxy import LoadBalancerLike
 from wool._worker_proxy import RoundRobinLoadBalancer
 from wool._worker_proxy import WorkerProxy
@@ -64,13 +60,11 @@ class WorkerPool:
     .. code-block:: python
 
         from wool import WorkerPool, LocalWorker
-        from wool._worker_discovery import LocalRegistrarService
+        from wool._worker_discovery import LocalRegistrar
         from functools import partial
 
         # Custom worker factory with specific tags
-        worker_factory = partial(
-            LocalWorker, registrar_service=LocalRegistrarService("my-pool")
-        )
+        worker_factory = partial(LocalWorker, registrar=LocalRegistrar("my-pool"))
 
         async with WorkerPool(
             "gpu-capable",
@@ -85,10 +79,10 @@ class WorkerPool:
     .. code-block:: python
 
         from wool import WorkerPool
-        from wool._worker_discovery import LanDiscoveryService
+        from wool._worker_discovery import LanDiscovery
 
         # Connect to existing workers on the network
-        discovery = LanDiscoveryService(filter=lambda w: "production" in w.tags)
+        discovery = LanDiscovery(filter=lambda w: "production" in w.tags)
 
         async with WorkerPool(discovery=discovery) as pool:
             results = await gather_metrics()
@@ -157,15 +151,15 @@ class WorkerPool:
         Examples::
 
             # Direct instance
-            discovery=LanDiscoveryService(filter=lambda w: "prod" in w.tags)
+            discovery=LanDiscovery(filter=lambda w: "prod" in w.tags)
 
             # Instance factory
-            discovery=lambda: LocalDiscoveryService("pool-123")
+            discovery=lambda: LocalDiscovery("pool-123")
 
             # Context manager factory
             @asynccontextmanager
             async def discovery():
-                service = await DatabaseDiscoveryService.create(connection_string)
+                service = await DatabaseDiscovery.create(connection_string)
                 try:
                     ...
                     yield service
@@ -185,8 +179,10 @@ class WorkerPool:
         self,
         *tags: str,
         size: int = 0,
-        worker: WorkerFactory[RegistrarServiceLike] = LocalWorker[LocalRegistrarService],
-        loadbalancer: LoadBalancerLike | LoadBalancerFactory = RoundRobinLoadBalancer,
+        worker: WorkerFactory = LocalWorker,
+        loadbalancer: (
+            LoadBalancerLike | Factory[LoadBalancerLike]
+        ) = RoundRobinLoadBalancer,
     ):
         """
         Create an ephemeral pool of workers, spawning the specified quantity of workers
@@ -198,11 +194,10 @@ class WorkerPool:
     def __init__(
         self,
         *,
-        discovery: (
-            ReducibleAsyncIteratorLike[DiscoveryEvent]
-            | Factory[AsyncIterator[DiscoveryEvent]]
-        ),
-        loadbalancer: LoadBalancerLike | LoadBalancerFactory = RoundRobinLoadBalancer,
+        discovery: DiscoveryLike | Factory[DiscoveryLike],
+        loadbalancer: (
+            LoadBalancerLike | Factory[LoadBalancerLike]
+        ) = RoundRobinLoadBalancer,
     ):
         """
         Connect to an existing pool of workers discovered by the specified discovery
@@ -215,12 +210,10 @@ class WorkerPool:
         *tags: str,
         size: int | None = None,
         worker: WorkerFactory | None = None,
-        loadbalancer: LoadBalancerLike | LoadBalancerFactory = RoundRobinLoadBalancer,
-        discovery: (
-            ReducibleAsyncIteratorLike[DiscoveryEvent]
-            | Factory[AsyncIterator[DiscoveryEvent]]
-            | None
-        ) = None,
+        discovery: DiscoveryLike | Factory[DiscoveryLike] | None = None,
+        loadbalancer: (
+            LoadBalancerLike | Factory[LoadBalancerLike]
+        ) = RoundRobinLoadBalancer,
     ):
         self._workers = []
 
@@ -243,7 +236,7 @@ class WorkerPool:
                         self._shared_memory.buf[i] = 0
                     await self._spawn_workers(uri, *tags, size=size, factory=worker)
                     return WorkerProxy(
-                        discovery=LocalDiscoveryService(uri),
+                        discovery=LocalDiscovery(uri),
                         loadbalancer=loadbalancer,
                     )
 
@@ -268,7 +261,7 @@ class WorkerPool:
                         self._shared_memory.buf[i] = 0
                     await self._spawn_workers(uri, *tags, size=size, factory=worker)
                     return WorkerProxy(
-                        discovery=LocalDiscoveryService(uri),
+                        discovery=LocalDiscovery(uri),
                         loadbalancer=loadbalancer,
                     )
 
@@ -331,6 +324,6 @@ class WorkerPool:
 
     def _default_worker_factory(self, uri):
         def factory(*tags, **_):
-            return LocalWorker(*tags, registrar_service=LocalRegistrarService(uri))
+            return LocalWorker(*tags, registrar=LocalRegistrar(uri))
 
         return factory

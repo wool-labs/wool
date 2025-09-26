@@ -31,14 +31,11 @@ from wool import _protobuf as pb
 from wool._resource_pool import ResourcePool
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
-from wool._worker_discovery import RegistrarServiceLike
+from wool._worker_discovery import RegistrarLike
 from wool._worker_discovery import WorkerInfo
 
 if TYPE_CHECKING:
     from wool._worker_proxy import WorkerProxy
-
-_ip_address: str | None = None
-_EXTERNAL_DNS_SERVER: Final[str] = "8.8.8.8"  # Google DNS for IP detection
 
 
 @contextmanager
@@ -80,13 +77,8 @@ def _signal_handlers(service: "WorkerService"):
         signal.signal(signal.SIGINT, old_sigint)
 
 
-_T_RegistrarService = TypeVar(
-    "_T_RegistrarService", bound=RegistrarServiceLike, covariant=True
-)
-
-
 # public
-class Worker(ABC, Generic[_T_RegistrarService]):
+class Worker(ABC):
     """Abstract base class for worker implementations in the wool framework.
 
     Workers are individual processes that execute distributed tasks within
@@ -100,7 +92,7 @@ class Worker(ABC, Generic[_T_RegistrarService]):
     :param tags:
         Capability tags associated with this worker for filtering and
         selection by client sessions.
-    :param registrar_service:
+    :param registrar:
         Service instance for worker registration and discovery within
         the distributed pool.
     :param extra:
@@ -109,21 +101,16 @@ class Worker(ABC, Generic[_T_RegistrarService]):
 
     _info: WorkerInfo | None = None
     _started: bool = False
-    _registrar_service: RegistrarServiceLike
+    _registrar: RegistrarLike
     _uid: Final[str]
     _tags: Final[set[str]]
     _extra: Final[dict[str, Any]]
 
-    def __init__(
-        self,
-        *tags: str,
-        registrar_service: _T_RegistrarService,
-        **extra: Any,
-    ):
+    def __init__(self, *tags: str, registrar: RegistrarLike, **extra: Any):
         self._uid = f"worker-{uuid.uuid4().hex}"
         self._tags = set(tags)
         self._extra = extra
-        self._registrar_service = registrar_service
+        self._registrar = registrar
 
     @property
     def uid(self) -> str:
@@ -171,8 +158,8 @@ class Worker(ABC, Generic[_T_RegistrarService]):
         """
         if self._started:
             raise RuntimeError("Worker has already been started")
-        if self._registrar_service:
-            await self._registrar_service.start()
+        if self._registrar:
+            await self._registrar.start()
         await self._start()
         self._started = True
 
@@ -187,8 +174,8 @@ class Worker(ABC, Generic[_T_RegistrarService]):
         if not self._started:
             raise RuntimeError("Worker has not been started")
         await self._stop()
-        if self._registrar_service:
-            await self._registrar_service.stop()
+        if self._registrar:
+            await self._registrar.stop()
 
     @abstractmethod
     async def _start(self):
@@ -210,7 +197,7 @@ class Worker(ABC, Generic[_T_RegistrarService]):
 
 
 # public
-class WorkerFactory(Generic[_T_RegistrarService], Protocol):
+class WorkerFactory(Protocol):
     """Protocol for creating worker instances with registrar integration.
 
     Defines the callable interface for worker factory implementations
@@ -221,7 +208,7 @@ class WorkerFactory(Generic[_T_RegistrarService], Protocol):
     worker processes with consistent configuration.
     """
 
-    def __call__(self, *tags: str, **_) -> Worker[_T_RegistrarService]:
+    def __call__(self, *tags: str, **_) -> Worker:
         """Create a new worker instance.
 
         :param tags:
@@ -235,7 +222,7 @@ class WorkerFactory(Generic[_T_RegistrarService], Protocol):
 
 
 # public
-class LocalWorker(Worker[_T_RegistrarService]):
+class LocalWorker(Worker):
     """Local worker implementation that runs tasks in a separate process.
 
     :py:class:`LocalWorker` creates and manages a dedicated worker process
@@ -250,7 +237,7 @@ class LocalWorker(Worker[_T_RegistrarService]):
     :param tags:
         Capability tags to associate with this worker for filtering
         and selection by client sessions.
-    :param registrar_service:
+    :param registrar:
         Service instance for worker registration and discovery.
     :param extra:
         Additional arbitrary metadata as key-value pairs.
@@ -263,10 +250,10 @@ class LocalWorker(Worker[_T_RegistrarService]):
         *tags: str,
         host: str = "127.0.0.1",
         port: int = 0,
-        registrar_service: _T_RegistrarService,
+        registrar: RegistrarLike,
         **extra: Any,
     ):
-        super().__init__(*tags, registrar_service=registrar_service, **extra)
+        super().__init__(*tags, registrar=registrar, **extra)
         self._worker_process = WorkerProcess(host=host, port=port)
 
     @property
@@ -324,7 +311,7 @@ class LocalWorker(Worker[_T_RegistrarService]):
             tags=self._tags,
             extra=self._extra,
         )
-        await self._registrar_service.register(self._info)
+        await self._registrar.register(self._info)
 
     async def _stop(self):
         """Stop the worker process and unregister it from the pool.
@@ -337,7 +324,7 @@ class LocalWorker(Worker[_T_RegistrarService]):
         try:
             if not self._info:
                 raise RuntimeError("Cannot unregister - worker has no info")
-            await self._registrar_service.unregister(self._info)
+            await self._registrar.unregister(self._info)
         finally:
             if not self._worker_process.is_alive():
                 return
@@ -472,7 +459,7 @@ class WorkerProcess(Process):
             except Exception:
                 pass
 
-        wool.__proxy_pool__.set(
+        wool.__wool_proxy_pool__.set(
             ResourcePool(factory=proxy_factory, finalizer=proxy_finalizer, ttl=60)
         )
         asyncio.run(self._serve())
@@ -656,7 +643,7 @@ class WorkerService(pb.worker.WorkerServicer):
 
         # Clean up the session cache to prevent issues during shutdown
         try:
-            proxy_pool = wool.__proxy_pool__.get()
+            proxy_pool = wool.__wool_proxy_pool__.get()
             assert proxy_pool
             await proxy_pool.clear()
         finally:

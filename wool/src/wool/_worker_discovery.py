@@ -11,7 +11,6 @@ from abc import abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from dataclasses import field
-from typing import TYPE_CHECKING
 from typing import Any
 from typing import AsyncContextManager
 from typing import AsyncIterator
@@ -29,18 +28,12 @@ from typing import TypeVar
 from typing import final
 from typing import runtime_checkable
 
-if TYPE_CHECKING:
-    pass
-
 from zeroconf import IPVersion
 from zeroconf import ServiceInfo
 from zeroconf import ServiceListener
 from zeroconf import Zeroconf
 from zeroconf.asyncio import AsyncServiceBrowser
 from zeroconf.asyncio import AsyncZeroconf
-
-if TYPE_CHECKING:
-    pass
 
 
 # public
@@ -314,7 +307,6 @@ class DiscoveryEvent:
 _T_co = TypeVar("_T_co", covariant=True)
 
 
-# public
 class Reducible(Protocol):
     """Protocol for objects that support pickling via __reduce__."""
 
@@ -322,16 +314,20 @@ class Reducible(Protocol):
 
 
 # public
-class ReducibleAsyncIteratorLike(Reducible, Protocol, Generic[_T_co]):
+class DiscoveryLike(Protocol):
     """Protocol for async iterators that yield discovery events.
 
     Implementations must be pickleable via __reduce__ to support
     task-specific session contexts in distributed environments.
     """
 
-    def __aiter__(self) -> ReducibleAsyncIteratorLike[_T_co]: ...
+    def __aiter__(self) -> DiscoveryLike: ...
 
-    def __anext__(self) -> Awaitable[_T_co]: ...
+    def __anext__(self) -> Awaitable[DiscoveryEvent]: ...
+
+
+# public
+class ReducibleDiscoveryLike(Reducible, DiscoveryLike, Protocol): ...
 
 
 # public
@@ -345,7 +341,7 @@ class Factory(Protocol, Generic[_T_co]):
 
 
 # public
-class DiscoveryService(ABC):
+class Discovery(ABC):
     """Abstract base class for discovering worker services.
 
     When started, implementations should discover all existing services that
@@ -457,20 +453,16 @@ class DiscoveryService(ABC):
         ...
 
 
-_T_DiscoveryServiceLike = TypeVar("_T_DiscoveryServiceLike", bound=DiscoveryService)
+_T_DiscoveryLike = TypeVar("_T_DiscoveryLike", bound=Discovery)
 
 
 # public
-class RegistrarServiceLike(Protocol):
+class RegistrarLike(Protocol):
     """Abstract base class for a service where workers can register themselves.
 
     Provides the interface for worker registration, unregistration, and
     property updates within a distributed worker pool system.
     """
-
-    async def start(self) -> None: ...
-
-    async def stop(self) -> None: ...
 
     async def register(self, worker_info: WorkerInfo) -> None: ...
 
@@ -480,7 +472,7 @@ class RegistrarServiceLike(Protocol):
 
 
 # public
-class RegistrarService(Generic[_T_DiscoveryServiceLike], ABC):
+class Registrar(Generic[_T_DiscoveryLike], ABC):
     """Abstract base class for a service where workers can register themselves.
 
     Provides the interface for worker registration, unregistration, and
@@ -609,7 +601,7 @@ class RegistrarService(Generic[_T_DiscoveryServiceLike], ABC):
 
 
 # public
-class LanDiscoveryService(DiscoveryService):
+class LanDiscovery(Discovery):
     """Implements worker discovery on the local network using Zeroconf.
 
     This service browses the local network for DNS-SD services and delivers
@@ -705,12 +697,12 @@ class LanDiscoveryService(DiscoveryService):
 
         def add_service(self, zc: Zeroconf, type_: str, name: str):
             """Called by Zeroconf when a service is added."""
-            if type_ == LanRegistrarService.service_type:
+            if type_ == LanRegistrar.service_type:
                 asyncio.create_task(self._handle_add_service(type_, name))
 
         def remove_service(self, zc: Zeroconf, type_: str, name: str):
             """Called by Zeroconf when a service is removed."""
-            if type_ == LanRegistrarService.service_type:
+            if type_ == LanRegistrar.service_type:
                 if worker := self._service_cache.pop(name, None):
                     asyncio.create_task(
                         self._event_queue.put(
@@ -720,7 +712,7 @@ class LanDiscoveryService(DiscoveryService):
 
         def update_service(self, zc: Zeroconf, type_, name):
             """Called by Zeroconf when a service is updated."""
-            if type_ == LanRegistrarService.service_type:
+            if type_ == LanRegistrar.service_type:
                 asyncio.create_task(self._handle_update_service(type_, name))
 
         async def _handle_add_service(self, type_: str, name: str):
@@ -787,11 +779,11 @@ class LanDiscoveryService(DiscoveryService):
 
 
 # public
-class LanRegistrarService(RegistrarService[LanDiscoveryService]):
+class LanRegistrar(Registrar[LanDiscovery]):
     """Implements a worker registrar using Zeroconf to advertise on the LAN.
 
     This service registers workers by publishing a DNS-SD service record on
-    the local network, allowing :class:`LanDiscoveryService` to find them.
+    the local network, allowing :class:`LanDiscovery` to find them.
     """
 
     aiozc: AsyncZeroconf | None
@@ -971,11 +963,11 @@ def _deserialize_worker_info(info: ServiceInfo) -> WorkerInfo:
 
 
 # public
-class LocalRegistrarService(RegistrarService):
+class LocalRegistrar(Registrar):
     """Implements a worker registrar using shared memory for local pools.
 
     This service registers workers by writing their information to a shared memory
-    block, allowing LocalDiscoveryService instances to find them efficiently.
+    block, allowing LocalDiscovery instances to find them efficiently.
     The registrar stores worker ports as integers in a simple array format,
     providing fast local discovery without network overhead.
 
@@ -1084,7 +1076,7 @@ class LocalRegistrarService(RegistrarService):
 
 
 # public
-class LocalDiscoveryService(DiscoveryService):
+class LocalDiscovery(Discovery):
     """Implements worker discovery using shared memory for local pools.
 
     This service reads worker ports from a shared memory block and

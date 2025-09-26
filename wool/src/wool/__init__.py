@@ -19,10 +19,10 @@ from wool._work import routine
 from wool._work import work
 from wool._worker import Worker
 from wool._worker import WorkerService
-from wool._worker_discovery import DiscoveryService
-from wool._worker_discovery import LanDiscoveryService
-from wool._worker_discovery import LanRegistrarService
-from wool._worker_discovery import RegistrarService
+from wool._worker_discovery import Discovery
+from wool._worker_discovery import LanDiscovery
+from wool._worker_discovery import LanRegistrar
+from wool._worker_discovery import Registrar
 from wool._worker_pool import WorkerPool
 from wool._worker_proxy import WorkerProxy
 
@@ -54,20 +54,22 @@ try:
 except PackageNotFoundError:
     __version__ = "unknown"
 
-__proxy__: Final[ContextVar[WorkerProxy | None]] = ContextVar("__proxy__", default=None)
+__wool_proxy__: Final[ContextVar[WorkerProxy | None]] = ContextVar(
+    "__wool_proxy__", default=None
+)
 
-__proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar(
-    "__proxy_pool__", default=None
+__wool_proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar(
+    "__wool_proxy_pool__", default=None
 )
 
 __all__ = [
-    "LanDiscoveryService",
-    "LanRegistrarService",
+    "LanDiscovery",
+    "LanRegistrar",
     "Worker",
-    "DiscoveryService",
+    "Discovery",
     "WorkerPool",
     "WorkerProxy",
-    "RegistrarService",
+    "Registrar",
     "WorkerService",
     "WoolTask",
     "WoolTaskEvent",

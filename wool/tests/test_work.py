@@ -689,7 +689,7 @@ class TestWoolTask:
         """
         # Arrange
         mock_worker_proxy = MagicMock(spec=WorkerProxy)
-        token = wool.__proxy__.set(mock_worker_proxy)
+        token = wool.__wool_proxy__.set(mock_worker_proxy)
 
         try:
             # Act
@@ -704,7 +704,7 @@ class TestWoolTask:
             # Assert
             assert task.proxy == mock_worker_proxy
         finally:
-            wool.__proxy__.reset(token)
+            wool.__wool_proxy__.reset(token)
 
     def test_wool_task_proxy_none_when_no_context(self):
         """Test WoolTask proxy is None when no proxy in context.
@@ -741,7 +741,7 @@ class TestWoolTask:
         # Arrange
         mock_context_proxy = MagicMock(spec=WorkerProxy)
         mock_explicit_proxy = MagicMock(spec=WorkerProxy)
-        token = wool.__proxy__.set(mock_context_proxy)
+        token = wool.__wool_proxy__.set(mock_context_proxy)
 
         try:
             # Act
@@ -757,7 +757,7 @@ class TestWoolTask:
             assert task.proxy == mock_explicit_proxy
             assert task.proxy != mock_context_proxy
         finally:
-            wool.__proxy__.reset(token)
+            wool.__wool_proxy__.reset(token)
 
     @pytest.mark.asyncio
     async def test_wool_task_run_with_proxy_context(self, mock_worker_proxy_cache):
@@ -1005,14 +1005,14 @@ class TestWoolTaskEdgeCases:
 
         failing_proxy = MagicMock(spec=WorkerProxy)
         failing_proxy.dispatch = MagicMock(return_value=failing_generator())
-        token = wool.__proxy__.set(failing_proxy)
+        token = wool.__wool_proxy__.set(failing_proxy)
 
         try:
             # Act & Assert
             with pytest.raises(RuntimeError, match="Proxy dispatch failed"):
                 await dummy_work_function(1, 2)
         finally:
-            wool.__proxy__.reset(token)
+            wool.__wool_proxy__.reset(token)
 
     def test_protobuf_deserialization_with_corrupted_data(self):
         """Test protobuf deserialization with corrupted data.
@@ -1250,7 +1250,7 @@ class TestWorkDecorator:
         """
         # Arrange
         mock_proxy = MagicMock(spec=WorkerProxy)
-        token = wool.__proxy__.set(mock_proxy)
+        token = wool.__wool_proxy__.set(mock_proxy)
 
         async def mock_stream():
             yield "test_result"
@@ -1269,7 +1269,7 @@ class TestWorkDecorator:
             with pytest.raises(ValueError, match="Expected a coroutine function"):
                 await decorated_func()
         finally:
-            wool.__proxy__.reset(token)
+            wool.__wool_proxy__.reset(token)
 
     def test_work_decorator_preserves_original_function_metadata(self):
         """Test work decorator preserves original function metadata.
@@ -1301,7 +1301,7 @@ class TestWorkDecorator:
         """
         # Arrange
         mock_worker_proxy = MagicMock(spec=WorkerProxy)
-        token = wool.__proxy__.set(mock_worker_proxy)
+        token = wool.__wool_proxy__.set(mock_worker_proxy)
 
         async def mock_async_generator():
             yield "dispatched_result"
@@ -1324,7 +1324,7 @@ class TestWorkDecorator:
             )
             assert result == "dispatched_result"
         finally:
-            wool.__proxy__.reset(token)
+            wool.__wool_proxy__.reset(token)
 
     @pytest.mark.asyncio
     async def test_work_decorator_works_with_instance_methods(
@@ -1341,7 +1341,7 @@ class TestWorkDecorator:
         """
         # Arrange
         mock_proxy = MagicMock(spec=WorkerProxy)
-        token = wool.__proxy__.set(mock_proxy)
+        token = wool.__wool_proxy__.set(mock_proxy)
 
         async def mock_async_generator():
             yield "method_result"
@@ -1365,7 +1365,7 @@ class TestWorkDecorator:
             assert args[5] == 5  # method argument
             assert result == "method_result"
         finally:
-            wool.__proxy__.reset(token)
+            wool.__wool_proxy__.reset(token)
 
     @pytest.mark.asyncio
     async def test_work_decorator_handles_keyword_arguments(self, mocker: MockerFixture):
@@ -1380,7 +1380,7 @@ class TestWorkDecorator:
         """
         # Arrange
         mock_proxy = MagicMock(spec=WorkerProxy)
-        token = wool.__proxy__.set(mock_proxy)
+        token = wool.__wool_proxy__.set(mock_proxy)
 
         async def mock_async_generator():
             yield "kwargs_result"
@@ -1403,7 +1403,7 @@ class TestWorkDecorator:
             )
             assert result == "kwargs_result"
         finally:
-            wool.__proxy__.reset(token)
+            wool.__wool_proxy__.reset(token)
 
     @pytest.mark.asyncio
     async def test_work_decorator_raises_assertion_when_no_proxy_available(self):
@@ -1417,7 +1417,7 @@ class TestWorkDecorator:
             Should raise AssertionError
         """
         # Arrange
-        assert wool.__proxy__.get() is None
+        assert wool.__wool_proxy__.get() is None
 
         # Act & Assert
         with pytest.raises(AssertionError):
@@ -1517,7 +1517,7 @@ class TestWorkDecorator:
             yield "metadata_result"
 
         mock_proxy.dispatch = MagicMock(return_value=mock_async_generator())
-        token = wool.__proxy__.set(mock_proxy)
+        token = wool.__wool_proxy__.set(mock_proxy)
 
         try:
             # Act
@@ -1530,7 +1530,7 @@ class TestWorkDecorator:
             assert task_arg.args == (42, 84)
             assert f"{__name__}.dummy_work_function(42, 84)" in task_arg.tag
         finally:
-            wool.__proxy__.reset(token)
+            wool.__wool_proxy__.reset(token)
 
     @pytest.mark.asyncio
     async def test_work_decorator_executes_classmethod_locally_when_do_dispatch_false(
@@ -1578,7 +1578,7 @@ class TestWorkDecorator:
             yield "method_result"
 
         mock_proxy.dispatch = MagicMock(return_value=mock_async_generator())
-        token = wool.__proxy__.set(mock_proxy)
+        token = wool.__wool_proxy__.set(mock_proxy)
 
         try:
             instance = DummyWorkClass()
@@ -1594,7 +1594,7 @@ class TestWorkDecorator:
             assert "DummyWorkClass.instance_method(" in task_arg.tag
             assert str(instance) in task_arg.tag
         finally:
-            wool.__proxy__.reset(token)
+            wool.__wool_proxy__.reset(token)
 
     @pytest.mark.asyncio
     async def test_work_decorator_handles_mixed_arguments_correctly(
@@ -1616,7 +1616,7 @@ class TestWorkDecorator:
             yield "mixed_result"
 
         mock_proxy.dispatch = MagicMock(return_value=mock_async_generator())
-        token = wool.__proxy__.set(mock_proxy)
+        token = wool.__wool_proxy__.set(mock_proxy)
 
         try:
             # Act
@@ -1630,7 +1630,7 @@ class TestWorkDecorator:
             assert task_arg.kwargs["y"] == 20
             assert "dummy_work_function(10, y=20)" in task_arg.tag
         finally:
-            wool.__proxy__.reset(token)
+            wool.__wool_proxy__.reset(token)
 
     def test_resolve_function_returns_correct_module_and_function(self):
         """Test _resolve function returns correct module and function.
