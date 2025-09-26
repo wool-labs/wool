@@ -1,4 +1,6 @@
 import git
+
+from _version import PythonicVersion
 from _version import parser
 
 
@@ -19,8 +21,8 @@ def parse() -> str:
         raise RuntimeError(f"The repo at '{repo.working_dir}' cannot be empty!")
     head_commit = repo.head.commit
     try:
-        tag = repo.tags[-1]
-    except IndexError:
+        tag = max(repo.tags, key=lambda t: PythonicVersion.parse(str(t)))
+    except ValueError:
         tag_name = "0"
         tag_commit = None
     else:
