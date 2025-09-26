@@ -11,7 +11,6 @@ from abc import abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from dataclasses import field
-from typing import TYPE_CHECKING
 from typing import Any
 from typing import AsyncContextManager
 from typing import AsyncIterator
@@ -23,14 +22,12 @@ from typing import Dict
 from typing import Generic
 from typing import Literal
 from typing import Protocol
+from typing import Self
 from typing import Tuple
 from typing import TypeAlias
 from typing import TypeVar
 from typing import final
 from typing import runtime_checkable
-
-if TYPE_CHECKING:
-    pass
 
 from zeroconf import IPVersion
 from zeroconf import ServiceInfo
@@ -38,9 +35,6 @@ from zeroconf import ServiceListener
 from zeroconf import Zeroconf
 from zeroconf.asyncio import AsyncServiceBrowser
 from zeroconf.asyncio import AsyncZeroconf
-
-if TYPE_CHECKING:
-    pass
 
 
 # public
@@ -314,7 +308,6 @@ class DiscoveryEvent:
 _T_co = TypeVar("_T_co", covariant=True)
 
 
-# public
 class Reducible(Protocol):
     """Protocol for objects that support pickling via __reduce__."""
 
@@ -322,21 +315,22 @@ class Reducible(Protocol):
 
 
 # public
-class ReducibleAsyncIteratorLike(Reducible, Protocol, Generic[_T_co]):
+@runtime_checkable
+class DiscoveryLike(Protocol):
     """Protocol for async iterators that yield discovery events.
 
     Implementations must be pickleable via __reduce__ to support
     task-specific session contexts in distributed environments.
     """
 
-    def __aiter__(self) -> ReducibleAsyncIteratorLike[_T_co]: ...
+    def __aiter__(self) -> DiscoveryLike: ...
 
-    def __anext__(self) -> Awaitable[_T_co]: ...
+    def __anext__(self) -> Awaitable[DiscoveryEvent]: ...
 
 
 # public
 @runtime_checkable
-class Factory(Protocol, Generic[_T_co]):
+class _Factory(Protocol, Generic[_T_co]):
     def __call__(
         self,
     ) -> (
@@ -344,8 +338,16 @@ class Factory(Protocol, Generic[_T_co]):
     ): ...
 
 
+Factory: TypeAlias = (
+    Awaitable[_T_co]
+    | AsyncContextManager[_T_co]
+    | ContextManager[_T_co]
+    | _Factory[_T_co]
+)
+
+
 # public
-class DiscoveryService(ABC):
+class Discovery(ABC):
     """Abstract base class for discovering worker services.
 
     When started, implementations should discover all existing services that
@@ -358,7 +360,7 @@ class DiscoveryService(ABC):
         - Workers updated to satisfy the filter should trigger worker-added events
         - Workers updated to no longer satisfy the filter should trigger
           worker-removed events
-        - Tracked workers removed from the registry entirely should always
+        - Tracked workers removed from the registrar entirely should always
           trigger worker-removed
 
     :param filter:
@@ -436,7 +438,7 @@ class DiscoveryService(ABC):
         """Yields discovery events as they occur.
 
         Returns an asynchronous iterator that yields discovery events for
-        workers being added, updated, or removed from the registry. Events
+        workers being added, updated, or removed from the registrar. Events
         are filtered according to the filter function provided during
         initialization.
 
@@ -457,20 +459,17 @@ class DiscoveryService(ABC):
         ...
 
 
-_T_DiscoveryServiceLike = TypeVar("_T_DiscoveryServiceLike", bound=DiscoveryService)
+_T_DiscoveryLike = TypeVar("_T_DiscoveryLike", bound=Discovery)
 
 
 # public
-class RegistryServiceLike(Protocol):
+@runtime_checkable
+class RegistrarLike(Protocol):
     """Abstract base class for a service where workers can register themselves.
 
     Provides the interface for worker registration, unregistration, and
     property updates within a distributed worker pool system.
     """
-
-    async def start(self) -> None: ...
-
-    async def stop(self) -> None: ...
 
     async def register(self, worker_info: WorkerInfo) -> None: ...
 
@@ -480,7 +479,7 @@ class RegistryServiceLike(Protocol):
 
 
 # public
-class RegistryService(Generic[_T_DiscoveryServiceLike], ABC):
+class Registrar(Generic[_T_DiscoveryLike], ABC):
     """Abstract base class for a service where workers can register themselves.
 
     Provides the interface for worker registration, unregistration, and
@@ -494,19 +493,26 @@ class RegistryService(Generic[_T_DiscoveryServiceLike], ABC):
         self._started = False
         self._stopped = False
 
+    async def __aenter__(self) -> Self:
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_):
+        await self.stop()
+
     async def start(self) -> None:
-        """Starts the registry service, making it ready to accept registrations.
+        """Starts the registrar service, making it ready to accept registrations.
 
         :raises RuntimeError:
             If the service has already been started.
         """
         if self._started:
-            raise RuntimeError("Registry service already started")
+            raise RuntimeError("Registrar service already started")
         await asyncio.wait_for(self._start(), timeout=60)
         self._started = True
 
     async def stop(self) -> None:
-        """Stops the registry service and cleans up any resources.
+        """Stops the registrar service and cleans up any resources.
 
         :raises RuntimeError:
             If the service has not been started.
@@ -514,18 +520,18 @@ class RegistryService(Generic[_T_DiscoveryServiceLike], ABC):
         if self._stopped:
             return
         if not self._started:
-            raise RuntimeError("Registry service not started")
+            raise RuntimeError("Registrar service not started")
         await self._stop()
         self._stopped = True
 
     @abstractmethod
     async def _start(self) -> None:
-        """Starts the registry service, making it ready to accept registrations."""
+        """Starts the registrar service, making it ready to accept registrations."""
         ...
 
     @abstractmethod
     async def _stop(self) -> None:
-        """Stops the registry service and cleans up any resources."""
+        """Stops the registrar service and cleans up any resources."""
         ...
 
     async def register(
@@ -538,12 +544,12 @@ class RegistryService(Generic[_T_DiscoveryServiceLike], ABC):
             The :class:`~wool._worker_discovery.WorkerInfo` instance containing all
             worker details.
         :raises RuntimeError:
-            If the registry service is not running.
+            If the registrar service is not running.
         """
         if not self._started:
-            raise RuntimeError("Registry service not started - call start() first")
+            raise RuntimeError("Registrar service not started - call start() first")
         if self._stopped:
-            raise RuntimeError("Registry service already stopped")
+            raise RuntimeError("Registrar service already stopped")
         await self._register(worker_info)
 
     @abstractmethod
@@ -566,12 +572,12 @@ class RegistryService(Generic[_T_DiscoveryServiceLike], ABC):
             The :class:`~wool._worker_discovery.WorkerInfo` instance of the worker to
             unregister.
         :raises RuntimeError:
-            If the registry service is not running.
+            If the registrar service is not running.
         """
         if not self._started:
-            raise RuntimeError("Registry service not started - call start() first")
+            raise RuntimeError("Registrar service not started - call start() first")
         if self._stopped:
-            raise RuntimeError("Registry service already stopped")
+            raise RuntimeError("Registrar service already stopped")
         await self._unregister(worker_info)
 
     @abstractmethod
@@ -590,12 +596,12 @@ class RegistryService(Generic[_T_DiscoveryServiceLike], ABC):
         :param worker_info:
             The updated :class:`~wool._worker_discovery.WorkerInfo` instance.
         :raises RuntimeError:
-            If the registry service is not running.
+            If the registrar service is not running.
         """
         if not self._started:
-            raise RuntimeError("Registry service not started - call start() first")
+            raise RuntimeError("Registrar service not started - call start() first")
         if self._stopped:
-            raise RuntimeError("Registry service already stopped")
+            raise RuntimeError("Registrar service already stopped")
         await self._update(worker_info)
 
     @abstractmethod
@@ -609,7 +615,7 @@ class RegistryService(Generic[_T_DiscoveryServiceLike], ABC):
 
 
 # public
-class LanDiscoveryService(DiscoveryService):
+class LanDiscovery(Discovery):
     """Implements worker discovery on the local network using Zeroconf.
 
     This service browses the local network for DNS-SD services and delivers
@@ -705,12 +711,12 @@ class LanDiscoveryService(DiscoveryService):
 
         def add_service(self, zc: Zeroconf, type_: str, name: str):
             """Called by Zeroconf when a service is added."""
-            if type_ == LanRegistryService.service_type:
+            if type_ == LanRegistrar.service_type:
                 asyncio.create_task(self._handle_add_service(type_, name))
 
         def remove_service(self, zc: Zeroconf, type_: str, name: str):
             """Called by Zeroconf when a service is removed."""
-            if type_ == LanRegistryService.service_type:
+            if type_ == LanRegistrar.service_type:
                 if worker := self._service_cache.pop(name, None):
                     asyncio.create_task(
                         self._event_queue.put(
@@ -720,7 +726,7 @@ class LanDiscoveryService(DiscoveryService):
 
         def update_service(self, zc: Zeroconf, type_, name):
             """Called by Zeroconf when a service is updated."""
-            if type_ == LanRegistryService.service_type:
+            if type_ == LanRegistrar.service_type:
                 asyncio.create_task(self._handle_update_service(type_, name))
 
         async def _handle_add_service(self, type_: str, name: str):
@@ -787,11 +793,11 @@ class LanDiscoveryService(DiscoveryService):
 
 
 # public
-class LanRegistryService(RegistryService[LanDiscoveryService]):
-    """Implements a worker registry using Zeroconf to advertise on the LAN.
+class LanRegistrar(Registrar[LanDiscovery]):
+    """Implements a worker registrar using Zeroconf to advertise on the LAN.
 
     This service registers workers by publishing a DNS-SD service record on
-    the local network, allowing :class:`LanDiscoveryService` to find them.
+    the local network, allowing :class:`LanDiscovery` to find them.
     """
 
     aiozc: AsyncZeroconf | None
@@ -824,10 +830,10 @@ class LanRegistryService(RegistryService[LanDiscoveryService]):
             The :class:`~wool._worker_discovery.WorkerInfo` instance containing all
             worker details.
         :raises RuntimeError:
-            If the registry service is not properly initialized.
+            If the registrar service is not properly initialized.
         """
         if self.aiozc is None:
-            raise RuntimeError("Registry service not properly initialized")
+            raise RuntimeError("Registrar service not properly initialized")
         address = f"{worker_info.host}:{worker_info.port}"
         ip_address, port = self._resolve_address(address)
         service_name = f"{worker_info.uid}.{self.service_type}"
@@ -848,10 +854,10 @@ class LanRegistryService(RegistryService[LanDiscoveryService]):
             The :class:`~wool._worker_discovery.WorkerInfo` instance of the worker to
             unregister.
         :raises RuntimeError:
-            If the registry service is not properly initialized.
+            If the registrar service is not properly initialized.
         """
         if self.aiozc is None:
-            raise RuntimeError("Registry service not properly initialized")
+            raise RuntimeError("Registrar service not properly initialized")
         service = self.services[worker_info.uid]
         await self.aiozc.async_unregister_service(service)
         del self.services[worker_info.uid]
@@ -866,12 +872,12 @@ class LanRegistryService(RegistryService[LanDiscoveryService]):
         :param worker_info:
             The updated :class:`~wool._worker_discovery.WorkerInfo` instance.
         :raises RuntimeError:
-            If the registry service is not properly initialized.
+            If the registrar service is not properly initialized.
         :raises Exception:
             If the Zeroconf service update fails.
         """
         if self.aiozc is None:
-            raise RuntimeError("Registry service not properly initialized")
+            raise RuntimeError("Registrar service not properly initialized")
 
         service = self.services[worker_info.uid]
         new_properties = _serialize_worker_info(worker_info)
@@ -971,12 +977,12 @@ def _deserialize_worker_info(info: ServiceInfo) -> WorkerInfo:
 
 
 # public
-class LocalRegistryService(RegistryService):
-    """Implements a worker registry using shared memory for local pools.
+class LocalRegistrar(Registrar):
+    """Implements a worker registrar using shared memory for local pools.
 
     This service registers workers by writing their information to a shared memory
-    block, allowing LocalDiscoveryService instances to find them efficiently.
-    The registry stores worker ports as integers in a simple array format,
+    block, allowing LocalDiscovery instances to find them efficiently.
+    The registrar stores worker ports as integers in a simple array format,
     providing fast local discovery without network overhead.
 
     :param uri:
@@ -1018,7 +1024,7 @@ class LocalRegistryService(RegistryService):
         if self._shared_memory:
             try:
                 self._shared_memory.close()
-                # Unlink the shared memory if this registry created it
+                # Unlink the shared memory if this registrar created it
                 if self._created_shared_memory:
                     self._shared_memory.unlink()
             except Exception:
@@ -1033,10 +1039,10 @@ class LocalRegistryService(RegistryService):
             The :class:`~wool._worker_discovery.WorkerInfo` instance containing all
             worker details. Only the port is stored in shared memory.
         :raises RuntimeError:
-            If the registry service is not properly initialized.
+            If the registrar service is not properly initialized.
         """
         if self._shared_memory is None:
-            raise RuntimeError("Registry service not properly initialized")
+            raise RuntimeError("Registrar service not properly initialized")
 
         if worker_info.port is None:
             raise ValueError("Worker port must be specified")
@@ -1048,7 +1054,7 @@ class LocalRegistryService(RegistryService):
                 struct.pack_into("I", self._shared_memory.buf, i, worker_info.port)
                 break
         else:
-            raise RuntimeError("No available slots in shared memory registry")
+            raise RuntimeError("No available slots in shared memory registrar")
 
     async def _unregister(self, worker_info: WorkerInfo) -> None:
         """Unregister a worker by removing its port from shared memory.
@@ -1057,10 +1063,10 @@ class LocalRegistryService(RegistryService):
             The :class:`~wool._worker_discovery.WorkerInfo` instance of the worker to
             unregister.
         :raises RuntimeError:
-            If the registry service is not properly initialized.
+            If the registrar service is not properly initialized.
         """
         if self._shared_memory is None:
-            raise RuntimeError("Registry service not properly initialized")
+            raise RuntimeError("Registrar service not properly initialized")
 
         if worker_info.port is None:
             return
@@ -1075,7 +1081,7 @@ class LocalRegistryService(RegistryService):
     async def _update(self, worker_info: WorkerInfo) -> None:
         """Update a worker's properties in shared memory.
 
-        For the simple port-based registry, update is the same as register.
+        For the simple port-based registrar, update is the same as register.
 
         :param worker_info:
             The updated :class:`~wool._worker_discovery.WorkerInfo` instance.
@@ -1084,7 +1090,7 @@ class LocalRegistryService(RegistryService):
 
 
 # public
-class LocalDiscoveryService(DiscoveryService):
+class LocalDiscovery(Discovery):
     """Implements worker discovery using shared memory for local pools.
 
     This service reads worker ports from a shared memory block and
@@ -1172,8 +1178,8 @@ class LocalDiscoveryService(DiscoveryService):
                                 uid=f"worker-{port}",
                                 host="localhost",
                                 port=port,
-                                pid=0,  # Not available in simple registry
-                                version="unknown",  # Not available in simple registry
+                                pid=0,  # Not available in simple registrar
+                                version="unknown",  # Not available in simple registrar
                                 tags=set(),
                                 extra={},
                             )
@@ -1211,7 +1217,7 @@ class LocalDiscoveryService(DiscoveryService):
                 event = DiscoveryEvent(type="worker_removed", worker_info=worker_info)
                 await self._event_queue.put(event)
 
-        # Find updated workers (minimal for port-only registry)
+        # Find updated workers (minimal for port-only registrar)
         for uid, worker_info in current_workers.items():
             if uid in self._service_cache:
                 old_worker = self._service_cache[uid]
