@@ -5,7 +5,7 @@ requires = [
     "debugpy",
     "hatchling",
     "packaging",
-    "GitPython",
+    "gitpython",
     "toml",
     "typing-extensions",
 ]
