@@ -1,4 +1,4 @@
-<a href="https://github.com/abdenlab/oxbow"><img align="center" src="./assets/woolly-transparent-bg-2048.png"></img></a>
+![](https://raw.githubusercontent.com/wool-labs/wool/refs/heads/main/assets/woolly-transparent-bg-2048.png)
 
 **Wool** is a Python framework for transparently scheduling and executing tasks in a horizontally scalable, distributed network of agnostic worker processes. Any picklable async function or method can be converted into a task with a simple decorator and a client connection.
 
