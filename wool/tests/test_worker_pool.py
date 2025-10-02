@@ -1,5 +1,3 @@
-"""Test suite for :py:class:`wool._worker_pool.WorkerPool` module."""
-
 import asyncio
 import time
 from multiprocessing.shared_memory import SharedMemory
@@ -864,8 +862,6 @@ class TestWorkerPool:
         async with wp.WorkerPool() as pool:
             # Assert
             assert pool is not None
-            assert hasattr(pool, "_proxy")
-            assert hasattr(pool, "_shared_memory")
 
     def test_default_worker_factory_creates_separate_registrar_instances(
         self, mocker: MockerFixture

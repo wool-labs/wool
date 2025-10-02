@@ -991,46 +991,28 @@ class LocalRegistrar(Registrar):
 
     _shared_memory: multiprocessing.shared_memory.SharedMemory | None = None
     _uri: str
-    _created_shared_memory: bool = False
 
     def __init__(self, uri: str):
         super().__init__()
         self._uri = uri
-        self._created_shared_memory = False
 
     async def _start(self) -> None:
         """Initialize shared memory for worker registration."""
         if self._shared_memory is None:
             # Try to connect to existing shared memory first, create if it doesn't exist
             shared_memory_name = hashlib.sha256(self._uri.encode()).hexdigest()[:12]
-            try:
-                self._shared_memory = multiprocessing.shared_memory.SharedMemory(
-                    name=shared_memory_name
-                )
-            except FileNotFoundError:
-                # Create new shared memory if it doesn't exist
-                self._shared_memory = multiprocessing.shared_memory.SharedMemory(
-                    name=shared_memory_name,
-                    create=True,
-                    size=1024,  # 1024 bytes = 256 worker slots (4 bytes per port)
-                )
-                self._created_shared_memory = True
-                # Initialize all slots to 0 (empty)
-                for i in range(len(self._shared_memory.buf)):
-                    self._shared_memory.buf[i] = 0
+            self._shared_memory = multiprocessing.shared_memory.SharedMemory(
+                name=shared_memory_name
+            )
 
     async def _stop(self) -> None:
         """Clean up shared memory resources."""
         if self._shared_memory:
             try:
                 self._shared_memory.close()
-                # Unlink the shared memory if this registrar created it
-                if self._created_shared_memory:
-                    self._shared_memory.unlink()
             except Exception:
                 pass
             self._shared_memory = None
-            self._created_shared_memory = False
 
     async def _register(self, worker_info: WorkerInfo) -> None:
         """Register a worker by writing its port to shared memory.
@@ -1138,7 +1120,6 @@ class LocalDiscovery(Discovery):
     async def _start(self) -> None:
         """Starts monitoring shared memory for worker registrations."""
         if self._shared_memory is None:
-            # Try to connect to existing shared memory first
             self._shared_memory = multiprocessing.shared_memory.SharedMemory(
                 name=hashlib.sha256(self._uri.encode()).hexdigest()[:12]
             )
@@ -1172,7 +1153,9 @@ class LocalDiscovery(Discovery):
                 # Read current state from shared memory
                 if self._shared_memory:
                     for i in range(0, len(self._shared_memory.buf), 4):
-                        port = struct.unpack("I", self._shared_memory.buf[i : i + 4])[0]
+                        port = struct.unpack(
+                            "I", bytes(self._shared_memory.buf[i : i + 4])
+                        )[0]
                         if port > 0:  # Active worker
                             worker_info = WorkerInfo(
                                 uid=f"worker-{port}",

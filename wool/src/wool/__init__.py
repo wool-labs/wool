@@ -54,9 +54,7 @@ try:
 except PackageNotFoundError:
     __version__ = "unknown"
 
-__proxy__: Final[ContextVar[WorkerProxy | None]] = ContextVar(
-    "__proxy__", default=None
-)
+__proxy__: Final[ContextVar[WorkerProxy | None]] = ContextVar("__proxy__", default=None)
 
 __proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar(
     "__proxy_pool__", default=None
