@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 
 @contextmanager
-def _signal_handlers(service: "WorkerService"):
+def _signal_handlers(service: WorkerService):
     """Context manager for setting up signal handlers for graceful shutdown.
 
     Installs SIGTERM and SIGINT handlers that gracefully shut down the worker

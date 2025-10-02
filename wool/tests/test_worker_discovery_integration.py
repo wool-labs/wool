@@ -1,5 +1,3 @@
-"""Integration tests for wool._worker_discovery module."""
-
 import asyncio
 import socket
 import string
