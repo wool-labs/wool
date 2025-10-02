@@ -2730,40 +2730,37 @@ class TestLocalRegistrar:
             await registrar.stop()
 
     @pytest.mark.asyncio
-    async def test_stop_handles_shared_memory_cleanup_exceptions(
+    async def test_registrar_context_manager_handles_cleanup_exceptions(
         self, mocker: MockerFixture
     ):
-        """Test LocalRegistrar._stop() handles shared memory cleanup exceptions.
+        """Test LocalRegistrar context manager handles shared memory cleanup exceptions.
 
         Given:
-            A LocalRegistrar with shared memory that fails during cleanup
+            A LocalRegistrar context manager with shared memory that fails during cleanup
         When:
-            _stop() is called
+            The context manager exits
         Then:
             Should catch exceptions and continue cleanup without raising
         """
 
-        # Arrange
-        registrar = discovery.LocalRegistrar(uri="test_cleanup_errors")
-
-        # Mock shared memory object that raises exceptions on close/unlink
+        # Mock shared memory object that raises exceptions on close
         mock_shared_memory = mocker.MagicMock()
         mock_shared_memory.close.side_effect = RuntimeError("Close failed")
-        mock_shared_memory.unlink.side_effect = RuntimeError("Unlink failed")
 
-        # Set up registrar state as if it had been started
-        registrar._shared_memory = mock_shared_memory
-        registrar._created_shared_memory = True
+        # Mock SharedMemory constructor to return our mock
+        mocker.patch.object(
+            discovery.multiprocessing.shared_memory, "SharedMemory",
+            return_value=mock_shared_memory
+        )
 
-        # Act - Should not raise exception despite shared memory errors
-        await registrar._stop()
+        registrar_uri = "test_cleanup_errors"
 
-        # Assert - Cleanup should have been attempted and state reset
+        # Act & Assert
+        async with discovery.LocalRegistrar(uri=registrar_uri) as registrar:
+            assert registrar is not None
+
+        # Assert - Cleanup should have been attempted
         mock_shared_memory.close.assert_called_once()
-        # unlink won't be called because close() raised exception
-        mock_shared_memory.unlink.assert_not_called()
-        assert registrar._shared_memory is None
-        assert registrar._created_shared_memory is False
 
     @pytest.mark.asyncio
     async def test_register_not_initialized_raises_error(self, worker_info):

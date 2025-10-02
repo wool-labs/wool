@@ -1010,7 +1010,6 @@ class LocalRegistrar(Registrar):
         if self._shared_memory:
             try:
                 self._shared_memory.close()
-                # Unlink the shared memory if this registrar created it
             except Exception:
                 pass
             self._shared_memory = None
