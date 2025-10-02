@@ -49,6 +49,33 @@ def mock_service_info(mocker: MockerFixture):
 
 
 @pytest.fixture
+def shared_memory_factory():
+    """Fixture that provides a context manager factory for shared memory in LocalRegistrar tests.
+
+    Returns a function that returns a context manager for SharedMemory instances.
+    The context manager handles cleanup automatically.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def create_shared_memory(uri: str):
+        shared_memory_name = hashlib.sha256(uri.encode()).hexdigest()[:12]
+        shared_memory = multiprocessing.shared_memory.SharedMemory(
+            name=shared_memory_name, create=True, size=1024
+        )
+        try:
+            # Initialize all slots to 0 (empty)
+            for i in range(1024):
+                shared_memory.buf[i] = 0
+            yield shared_memory
+        finally:
+            shared_memory.close()
+            shared_memory.unlink()
+
+    return create_shared_memory
+
+
+@pytest.fixture
 def dummy_discovery_service():
     """Fixture providing a dummy Discovery for testing async iteration."""
 
@@ -2513,6 +2540,7 @@ class TestRegistrar:
         Then:
             It should automatically start on enter and stop on exit
         """
+
         # Arrange
         # Create a concrete implementation for testing
         class DummyRegistrar(discovery.Registrar):
@@ -2579,7 +2607,7 @@ class TestLocalRegistrar:
             await registrar.register(worker_info)
 
     @pytest.mark.asyncio
-    async def test_start_creates_shared_memory(self, worker_info):
+    async def test_start_creates_shared_memory(self, worker_info, shared_memory_factory):
         """Test LocalRegistrar start enables worker registration.
 
         Given:
@@ -2590,20 +2618,22 @@ class TestLocalRegistrar:
             Should be ready to accept worker registrations
         """
         # Arrange
-        registrar = discovery.LocalRegistrar(uri="test_registrar_123")
+        registrar_uri = "test_registrar_123"
+        with shared_memory_factory(registrar_uri):
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
 
-        # Act
-        await registrar.start()
+            # Act
+            await registrar.start()
 
-        # Assert - Test behavior: registrar should now accept registrations
-        # This should not raise an exception
-        await registrar.register(worker_info)
+            # Assert - Test behavior: registrar should now accept registrations
+            # This should not raise an exception
+            await registrar.register(worker_info)
 
-        # Cleanup
-        await registrar.stop()
+            # Cleanup
+            await registrar.stop()
 
     @pytest.mark.asyncio
-    async def test_register(self, worker_info):
+    async def test_register(self, worker_info, shared_memory_factory):
         """Test worker registration writes port to shared memory.
 
         Given:
@@ -2615,29 +2645,22 @@ class TestLocalRegistrar:
         """
         # Arrange
         registrar_uri = "test_registrar_456"
-        registrar = discovery.LocalRegistrar(uri=registrar_uri)
-        await registrar.start()
+        with shared_memory_factory(registrar_uri) as shared_memory:
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            await registrar.start()
 
-        # Act
-        await registrar.register(worker_info)
+            # Act
+            await registrar.register(worker_info)
 
-        # Assert - Check that port was written to first slot using public API
-        # Use same hash-based naming as LocalRegistrar
-        shared_memory_name = hashlib.sha256(registrar_uri.encode()).hexdigest()[:12]
-        shared_memory = multiprocessing.shared_memory.SharedMemory(
-            name=shared_memory_name
-        )
-        try:
+            # Assert - Check that port was written to first slot
             stored_port = struct.unpack("I", shared_memory.buf[0:4])[0]
             assert stored_port == worker_info.port
-        finally:
-            shared_memory.close()
 
-        # Cleanup
-        await registrar.stop()
+            # Cleanup
+            await registrar.stop()
 
     @pytest.mark.asyncio
-    async def test_unregister(self, worker_info):
+    async def test_unregister(self, worker_info, shared_memory_factory):
         """Test worker unregistration removes port from shared memory.
 
         Given:
@@ -2649,40 +2672,27 @@ class TestLocalRegistrar:
         """
         # Arrange
         registrar_uri = "test_registrar_789"
-        registrar = discovery.LocalRegistrar(uri=registrar_uri)
-        await registrar.start()
-        await registrar.register(worker_info)
+        with shared_memory_factory(registrar_uri) as shared_memory:
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            await registrar.start()
+            await registrar.register(worker_info)
 
-        # Verify port was registered using public API
-        shared_memory_name = hashlib.sha256(registrar_uri.encode()).hexdigest()[:12]
-        shared_memory = multiprocessing.shared_memory.SharedMemory(
-            name=shared_memory_name
-        )
-        try:
+            # Verify port was registered
             stored_port = struct.unpack("I", shared_memory.buf[0:4])[0]
             assert stored_port == worker_info.port
-        finally:
-            shared_memory.close()
 
-        # Act
-        await registrar.unregister(worker_info)
+            # Act
+            await registrar.unregister(worker_info)
 
-        # Assert - Port should be cleared (set to 0) using public API
-        shared_memory_name = hashlib.sha256(registrar_uri.encode()).hexdigest()[:12]
-        shared_memory = multiprocessing.shared_memory.SharedMemory(
-            name=shared_memory_name
-        )
-        try:
+            # Assert - Port should be cleared (set to 0)
             stored_port = struct.unpack("I", shared_memory.buf[0:4])[0]
             assert stored_port == 0
-        finally:
-            shared_memory.close()
 
-        # Cleanup
-        await registrar.stop()
+            # Cleanup
+            await registrar.stop()
 
     @pytest.mark.asyncio
-    async def test_register_multiple_workers(self, worker_info):
+    async def test_register_multiple_workers(self, worker_info, shared_memory_factory):
         """Test registering multiple workers uses different slots.
 
         Given:
@@ -2694,72 +2704,63 @@ class TestLocalRegistrar:
         """
         # Arrange
         registrar_uri = "test_registrar_multi"
-        registrar = discovery.LocalRegistrar(uri=registrar_uri)
-        await registrar.start()
+        with shared_memory_factory(registrar_uri) as shared_memory:
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            await registrar.start()
 
-        worker2 = discovery.WorkerInfo(
-            uid="worker-2",
-            host="localhost",
-            port=48801,
-            pid=12346,
-            version="1.0.0",
-        )
+            worker2 = discovery.WorkerInfo(
+                uid="worker-2",
+                host="localhost",
+                port=48801,
+                pid=12346,
+                version="1.0.0",
+            )
 
-        # Act
-        await registrar.register(worker_info)
-        await registrar.register(worker2)
+            # Act
+            await registrar.register(worker_info)
+            await registrar.register(worker2)
 
-        # Assert - Check both ports are stored using public API
-        shared_memory_name = hashlib.sha256(registrar_uri.encode()).hexdigest()[:12]
-        shared_memory = multiprocessing.shared_memory.SharedMemory(
-            name=shared_memory_name
-        )
-        try:
+            # Assert - Check both ports are stored
             stored_port1 = struct.unpack("I", shared_memory.buf[0:4])[0]
             stored_port2 = struct.unpack("I", shared_memory.buf[4:8])[0]
             assert stored_port1 == worker_info.port
             assert stored_port2 == worker2.port
-        finally:
-            shared_memory.close()
 
-        # Cleanup
-        await registrar.stop()
+            # Cleanup
+            await registrar.stop()
 
     @pytest.mark.asyncio
-    async def test_stop_handles_shared_memory_cleanup_exceptions(
+    async def test_registrar_context_manager_handles_cleanup_exceptions(
         self, mocker: MockerFixture
     ):
-        """Test LocalRegistrar._stop() handles shared memory cleanup exceptions.
+        """Test LocalRegistrar context manager handles shared memory cleanup exceptions.
 
         Given:
-            A LocalRegistrar with shared memory that fails during cleanup
+            A LocalRegistrar context manager with shared memory that fails during cleanup
         When:
-            _stop() is called
+            The context manager exits
         Then:
             Should catch exceptions and continue cleanup without raising
         """
 
-        # Arrange
-        registrar = discovery.LocalRegistrar(uri="test_cleanup_errors")
-
-        # Mock shared memory object that raises exceptions on close/unlink
+        # Mock shared memory object that raises exceptions on close
         mock_shared_memory = mocker.MagicMock()
         mock_shared_memory.close.side_effect = RuntimeError("Close failed")
-        mock_shared_memory.unlink.side_effect = RuntimeError("Unlink failed")
 
-        # Set up registrar state as if it had been started
-        registrar._shared_memory = mock_shared_memory
-        registrar._created_shared_memory = True
+        # Mock SharedMemory constructor to return our mock
+        mocker.patch.object(
+            discovery.multiprocessing.shared_memory, "SharedMemory",
+            return_value=mock_shared_memory
+        )
 
-        # Act - Should not raise exception despite shared memory errors
-        await registrar._stop()
+        registrar_uri = "test_cleanup_errors"
 
-        # Assert - Cleanup should have been attempted and state reset
+        # Act & Assert
+        async with discovery.LocalRegistrar(uri=registrar_uri) as registrar:
+            assert registrar is not None
+
+        # Assert - Cleanup should have been attempted
         mock_shared_memory.close.assert_called_once()
-        # unlink won't be called because close() raised exception
-        mock_shared_memory.unlink.assert_not_called()
-        assert registrar._shared_memory is None
-        assert registrar._created_shared_memory is False
 
     @pytest.mark.asyncio
     async def test_register_not_initialized_raises_error(self, worker_info):
@@ -2783,7 +2784,9 @@ class TestLocalRegistrar:
             await registrar._register(worker_info)
 
     @pytest.mark.asyncio
-    async def test_register_worker_without_port_raises_error(self):
+    async def test_register_worker_without_port_raises_error(
+        self, shared_memory_factory
+    ):
         """Test registering worker without port raises ValueError.
 
         Given:
@@ -2795,22 +2798,23 @@ class TestLocalRegistrar:
         """
 
         # Arrange
-        registrar = discovery.LocalRegistrar(uri="test_no_port")
-        await registrar.start()
+        registrar_uri = "test_no_port"
+        with shared_memory_factory(registrar_uri):
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            await registrar.start()
 
-        worker_without_port = discovery.WorkerInfo(
-            uid="worker-no-port",
-            host="localhost",
-            port=None,  # No port specified
-            pid=12345,
-            version="1.0.0",
-        )
+            worker_without_port = discovery.WorkerInfo(
+                uid="worker-no-port",
+                host="localhost",
+                port=None,  # No port specified
+                pid=12345,
+                version="1.0.0",
+            )
 
-        try:
             # Act & Assert
             with pytest.raises(ValueError, match="Worker port must be specified"):
                 await registrar._register(worker_without_port)
-        finally:
+
             # Cleanup
             await registrar.stop()
 
@@ -2875,7 +2879,9 @@ class TestLocalRegistrar:
             await registrar._unregister(worker_info)
 
     @pytest.mark.asyncio
-    async def test_unregister_worker_without_port_returns_early(self):
+    async def test_unregister_worker_without_port_returns_early(
+        self, shared_memory_factory
+    ):
         """Test unregistering worker without port returns early.
 
         Given:
@@ -2887,22 +2893,23 @@ class TestLocalRegistrar:
         """
 
         # Arrange
-        registrar = discovery.LocalRegistrar(uri="test_unregister_no_port")
-        await registrar.start()
+        registrar_uri = "test_unregister_no_port"
+        with shared_memory_factory(registrar_uri):
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            await registrar.start()
 
-        worker_without_port = discovery.WorkerInfo(
-            uid="worker-no-port",
-            host="localhost",
-            port=None,  # No port specified
-            pid=12345,
-            version="1.0.0",
-        )
+            worker_without_port = discovery.WorkerInfo(
+                uid="worker-no-port",
+                host="localhost",
+                port=None,  # No port specified
+                pid=12345,
+                version="1.0.0",
+            )
 
-        try:
             # Act - Should not raise any exception
             await registrar._unregister(worker_without_port)
             # No assertion needed, just checking it doesn't raise
-        finally:
+
             # Cleanup
             await registrar.stop()
 
@@ -3011,7 +3018,9 @@ class TestLocalDiscovery:
             shared_memory.unlink()
 
     @pytest.mark.asyncio
-    async def test_worker_discovery_integration(self, worker_info):
+    async def test_worker_discovery_integration(
+        self, worker_info, shared_memory_factory
+    ):
         """Test full integration between LocalRegistrar and LocalDiscovery.
 
         Given:
@@ -3023,64 +3032,65 @@ class TestLocalDiscovery:
         """
         # Arrange
         registrar_name = "test_integration_abc"
-        registrar = discovery.LocalRegistrar(uri=registrar_name)
-        discovery_service = discovery.LocalDiscovery(uri=registrar_name)
+        with shared_memory_factory(registrar_name):
+            registrar = discovery.LocalRegistrar(uri=registrar_name)
+            discovery_service = discovery.LocalDiscovery(uri=registrar_name)
 
-        await registrar.start()
+            await registrar.start()
 
-        events = []
+            events = []
 
-        async def collect_events():
+            async def collect_events():
+                try:
+                    async for event in discovery_service.events():
+                        events.append(event)
+                        if len(events) >= 2:  # worker_added, worker_removed
+                            break
+                except asyncio.CancelledError:
+                    pass
+
+            # Start event collection
+            event_task = asyncio.create_task(collect_events())
+
+            # Give discovery service time to start
+            await asyncio.sleep(0.2)
+
+            # Act - Register worker
+            await registrar.register(worker_info)
+            await asyncio.sleep(0.2)  # Wait for discovery to detect
+
+            # Unregister worker
+            await registrar.unregister(worker_info)
+            await asyncio.sleep(0.2)  # Wait for discovery to detect
+
+            # Cancel event collection
+            event_task.cancel()
             try:
-                async for event in discovery_service.events():
-                    events.append(event)
-                    if len(events) >= 2:  # worker_added, worker_removed
-                        break
+                await event_task
             except asyncio.CancelledError:
                 pass
 
-        # Start event collection
-        event_task = asyncio.create_task(collect_events())
+            # Assert - Check events were generated
+            assert len(events) >= 2  # At least added and removed
 
-        # Give discovery service time to start
-        await asyncio.sleep(0.2)
+            # Check worker_added event
+            added_events = [e for e in events if e.type == "worker_added"]
+            assert len(added_events) >= 1
+            added_event = added_events[0]
+            assert added_event.worker_info.port == worker_info.port
+            assert added_event.worker_info.host == "localhost"
 
-        # Act - Register worker
-        await registrar.register(worker_info)
-        await asyncio.sleep(0.2)  # Wait for discovery to detect
+            # Check worker_removed event
+            removed_events = [e for e in events if e.type == "worker_removed"]
+            assert len(removed_events) >= 1
+            assert removed_events[0].worker_info.port == worker_info.port
 
-        # Unregister worker
-        await registrar.unregister(worker_info)
-        await asyncio.sleep(0.2)  # Wait for discovery to detect
-
-        # Cancel event collection
-        event_task.cancel()
-        try:
-            await event_task
-        except asyncio.CancelledError:
-            pass
-
-        # Assert - Check events were generated
-        assert len(events) >= 2  # At least added and removed
-
-        # Check worker_added event
-        added_events = [e for e in events if e.type == "worker_added"]
-        assert len(added_events) >= 1
-        added_event = added_events[0]
-        assert added_event.worker_info.port == worker_info.port
-        assert added_event.worker_info.host == "localhost"
-
-        # Check worker_removed event
-        removed_events = [e for e in events if e.type == "worker_removed"]
-        assert len(removed_events) >= 1
-        assert removed_events[0].worker_info.port == worker_info.port
-
-        # Cleanup
-        try:
-            await registrar.stop()
-            await discovery_service.stop()
-        except Exception:
-            pass
+            # Cleanup
+            try:
+                await registrar.stop()
+                await discovery_service.stop()
+            except Exception:
+                pass
 
     @pytest.mark.asyncio
     async def test_stop_handles_monitor_task_cancelled_error(
@@ -3174,7 +3184,7 @@ class TestLocalDiscovery:
 
     @pytest.mark.asyncio
     async def test_monitor_shared_memory_handles_struct_unpack_exception(
-        self, mocker: MockerFixture, worker_info
+        self, mocker: MockerFixture, worker_info, shared_memory_factory
     ):
         """Test LocalDiscovery monitoring continues after exceptions.
 
@@ -3187,67 +3197,69 @@ class TestLocalDiscovery:
         """
 
         # Arrange
-        registrar = discovery.LocalRegistrar(uri="test_struct_exception")
-        discovery_service = discovery.LocalDiscovery(uri="test_struct_exception")
+        registrar_uri = "test_struct_exception"
+        with shared_memory_factory(registrar_uri):
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            discovery_service = discovery.LocalDiscovery(uri=registrar_uri)
 
-        await registrar.start()
+            await registrar.start()
 
-        # Register a worker normally first
-        await registrar.register(worker_info)
+            # Register a worker normally first
+            await registrar.register(worker_info)
 
-        # Mock struct.unpack to fail on first call, succeed on second
-        call_count = 0
-        original_unpack = struct.unpack
+            # Mock struct.unpack to fail on first call, succeed on second
+            call_count = 0
+            original_unpack = struct.unpack
 
-        def mock_unpack(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 4:  # First few calls fail
-                raise struct.error("Simulated struct error")
-            # After that, work normally
-            return original_unpack(*args, **kwargs)
+            def mock_unpack(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count <= 4:  # First few calls fail
+                    raise struct.error("Simulated struct error")
+                # After that, work normally
+                return original_unpack(*args, **kwargs)
 
-        mocker.patch("struct.unpack", side_effect=mock_unpack)
+            mocker.patch("struct.unpack", side_effect=mock_unpack)
 
-        events = []
+            events = []
 
-        async def collect_events():
+            async def collect_events():
+                try:
+                    async for event in discovery_service.events():
+                        events.append(event)
+                        if len(events) >= 1:  # Just need one event to prove recovery
+                            break
+                except asyncio.CancelledError:
+                    pass
+
+            # Act - Start event collection (this will trigger the exception handling)
+            event_task = asyncio.create_task(collect_events())
+
+            # Wait a bit for the monitoring to encounter exceptions and recover
+            await asyncio.sleep(0.5)
+
+            # Cancel event collection
+            event_task.cancel()
             try:
-                async for event in discovery_service.events():
-                    events.append(event)
-                    if len(events) >= 1:  # Just need one event to prove recovery
-                        break
+                await event_task
             except asyncio.CancelledError:
                 pass
 
-        # Act - Start event collection (this will trigger the exception handling)
-        event_task = asyncio.create_task(collect_events())
+            # Assert - Should have eventually detected the worker despite initial exceptions
+            assert len(events) >= 1
+            assert events[0].type == "worker_added"
+            assert events[0].worker_info.port == worker_info.port
 
-        # Wait a bit for the monitoring to encounter exceptions and recover
-        await asyncio.sleep(0.5)
-
-        # Cancel event collection
-        event_task.cancel()
-        try:
-            await event_task
-        except asyncio.CancelledError:
-            pass
-
-        # Assert - Should have eventually detected the worker despite initial exceptions
-        assert len(events) >= 1
-        assert events[0].type == "worker_added"
-        assert events[0].worker_info.port == worker_info.port
-
-        # Cleanup
-        try:
-            await registrar.stop()
-            await discovery_service.stop()
-        except Exception:
-            pass
+            # Cleanup
+            try:
+                await registrar.stop()
+                await discovery_service.stop()
+            except Exception:
+                pass
 
     @pytest.mark.asyncio
     async def test_local_discovery_service_detects_worker_port_updates(
-        self, worker_info
+        self, worker_info, shared_memory_factory
     ):
         """Test LocalDiscovery detects when worker port changes.
 
@@ -3260,73 +3272,75 @@ class TestLocalDiscovery:
         """
 
         # Arrange
-        registrar = discovery.LocalRegistrar(uri="test_port_updates")
-        discovery_service = discovery.LocalDiscovery(uri="test_port_updates")
+        registrar_uri = "test_port_updates"
+        with shared_memory_factory(registrar_uri):
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            discovery_service = discovery.LocalDiscovery(uri=registrar_uri)
 
-        await registrar.start()
+            await registrar.start()
 
-        # Register initial worker
-        await registrar.register(worker_info)
+            # Register initial worker
+            await registrar.register(worker_info)
 
-        events = []
+            events = []
 
-        async def collect_events():
-            try:
-                async for event in discovery_service.events():
-                    events.append(event)
-                    if len(events) >= 2:  # worker_added + worker_updated
+            async def collect_events():
+                try:
+                    async for event in discovery_service.events():
+                        events.append(event)
+                        if len(events) >= 2:  # worker_added + worker_updated
+                            break
+                except asyncio.CancelledError:
+                    pass
+
+            # Start event collection
+            event_task = asyncio.create_task(collect_events())
+
+            # Give discovery service time to start and detect initial worker
+            await asyncio.sleep(0.2)
+
+            # Act - Directly modify shared memory to change the port
+            # while keeping the same slot (this triggers the update logic)
+            new_port = worker_info.port + 1
+
+            # Find the slot with our worker's port and change it
+            if registrar._shared_memory:
+                for i in range(0, len(registrar._shared_memory.buf), 4):
+                    current_port = struct.unpack(
+                        "I", registrar._shared_memory.buf[i : i + 4]
+                    )[0]
+                    if current_port == worker_info.port:
+                        # Change port in place (simulates an "update" rather than remove/add)
+                        struct.pack_into("I", registrar._shared_memory.buf, i, new_port)
                         break
+
+            # Wait for detection
+            await asyncio.sleep(0.3)
+
+            # Cancel event collection
+            event_task.cancel()
+            try:
+                await event_task
             except asyncio.CancelledError:
                 pass
 
-        # Start event collection
-        event_task = asyncio.create_task(collect_events())
+            # Assert - Should have detected the port change as an update
+            assert len(events) >= 1
+            added_event = next(e for e in events if e.type == "worker_added")
+            assert added_event.worker_info.port == worker_info.port
 
-        # Give discovery service time to start and detect initial worker
-        await asyncio.sleep(0.2)
+            # Should have detected the port update
+            updated_events = [e for e in events if e.type == "worker_updated"]
+            if updated_events:
+                # If we caught the update event, verify it has the new port
+                assert updated_events[0].worker_info.port == new_port
 
-        # Act - Directly modify shared memory to change the port
-        # while keeping the same slot (this triggers the update logic)
-        new_port = worker_info.port + 1
-
-        # Find the slot with our worker's port and change it
-        if registrar._shared_memory:
-            for i in range(0, len(registrar._shared_memory.buf), 4):
-                current_port = struct.unpack(
-                    "I", registrar._shared_memory.buf[i : i + 4]
-                )[0]
-                if current_port == worker_info.port:
-                    # Change port in place (simulates an "update" rather than remove/add)
-                    struct.pack_into("I", registrar._shared_memory.buf, i, new_port)
-                    break
-
-        # Wait for detection
-        await asyncio.sleep(0.3)
-
-        # Cancel event collection
-        event_task.cancel()
-        try:
-            await event_task
-        except asyncio.CancelledError:
-            pass
-
-        # Assert - Should have detected the port change as an update
-        assert len(events) >= 1
-        added_event = next(e for e in events if e.type == "worker_added")
-        assert added_event.worker_info.port == worker_info.port
-
-        # Should have detected the port update
-        updated_events = [e for e in events if e.type == "worker_updated"]
-        if updated_events:
-            # If we caught the update event, verify it has the new port
-            assert updated_events[0].worker_info.port == new_port
-
-        # Cleanup
-        try:
-            await registrar.stop()
-            await discovery_service.stop()
-        except Exception:
-            pass
+            # Cleanup
+            try:
+                await registrar.stop()
+                await discovery_service.stop()
+            except Exception:
+                pass
 
     @pytest.mark.asyncio
     async def test_detect_changes_worker_port_update_directly(self, worker_info):
