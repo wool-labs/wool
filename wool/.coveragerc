@@ -1,0 +1,10 @@
+[run]
+source = src/wool
+omit = 
+    src/wool/__init__.py
+    src/wool/_protobuf/*
+
+[report]
+show_missing = true
+precision = 2
+fail_under = 100
