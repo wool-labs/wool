@@ -3,14 +3,16 @@ from __future__ import annotations
 import enum
 import functools
 import re
-from typing import TYPE_CHECKING
-from typing import Callable
-from typing import Generic
-from typing import MutableSequence
-from typing import Optional
-from typing import Type
-from typing import TypeVar
-from typing import overload
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Generic,
+    MutableSequence,
+    Optional,
+    Type,
+    TypeVar,
+    overload,
+)
 
 try:
     from typing import Self

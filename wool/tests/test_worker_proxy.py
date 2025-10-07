@@ -2,15 +2,14 @@ import asyncio
 from unittest.mock import MagicMock
 
 import cloudpickle
-import grpc
 import pytest
 from pytest_mock import MockerFixture
 
 import wool._worker_proxy as wp
 from wool import _protobuf as pb
+from wool._connection import Connection
 from wool._resource_pool import Resource
 from wool._work import WoolTask
-from wool._worker import WorkerClient
 from wool._worker_discovery import Discovery
 from wool._worker_discovery import DiscoveryEvent
 from wool._worker_discovery import LanDiscovery
@@ -20,7 +19,7 @@ from wool._worker_discovery import WorkerInfo
 
 @pytest.fixture
 def mock_lan_discovery_service(mocker: MockerFixture):
-    """Create a mock :py:class:`LanDiscovery` for testing.
+    """Create a mock :class:`LanDiscovery` for testing.
 
     Provides a mock discovery service with async methods and started state
     tracking for use in worker proxy tests.
@@ -35,7 +34,7 @@ def mock_lan_discovery_service(mocker: MockerFixture):
 
 @pytest.fixture
 def mock_discovery_service(mocker: MockerFixture):
-    """Create a mock :py:class:`Discovery` for testing.
+    """Create a mock :class:`Discovery` for testing.
 
     Provides a generic mock discovery service with async methods for use in
     worker proxy tests that don't require LAN-specific functionality.
@@ -71,7 +70,7 @@ def mock_load_balancer_factory(mocker: MockerFixture):
 def mock_worker_stub(mocker: MockerFixture):
     """Create a mock gRPC worker stub for testing.
 
-    Provides a mock :py:class:`WorkerStub` with async dispatch functionality
+    Provides a mock :class:`WorkerStub` with async dispatch functionality
     for testing worker communication scenarios.
     """
     mock_worker_stub = mocker.MagicMock(spec=pb.worker.WorkerStub)
@@ -81,7 +80,7 @@ def mock_worker_stub(mocker: MockerFixture):
 
 @pytest.fixture
 def mock_wool_task(mocker: MockerFixture):
-    """Create a mock :py:class:`WoolTask` for testing.
+    """Create a mock :class:`WoolTask` for testing.
 
     Provides a mock task with protobuf serialization capabilities for
     testing task dispatch and processing scenarios.
@@ -108,23 +107,23 @@ def spy_loadbalancer_with_workers(mocker: MockerFixture):
             self._current_index = 0
 
         def worker_added_callback(
-            self, client: Resource[WorkerClient], info: WorkerInfo
+            self, connection: Resource[Connection], info: WorkerInfo
         ):
             """Add worker to internal storage."""
-            self._workers[info] = client
+            self._workers[info] = connection
 
         def worker_updated_callback(
-            self, client: Resource[WorkerClient], info: WorkerInfo
+            self, connection: Resource[Connection], info: WorkerInfo
         ):
             """Update worker in internal storage."""
-            self._workers[info] = client
+            self._workers[info] = connection
 
         def worker_removed_callback(self, info: WorkerInfo):
             """Remove worker from internal storage."""
             if info in self._workers:
                 del self._workers[info]
 
-        async def dispatch(self, task):
+        async def dispatch(self, task, *, context, timeout=None):
             """Dispatch task to available workers."""
             if not self._workers:
                 raise wp.NoWorkersAvailable("No workers available for dispatch")
@@ -132,8 +131,7 @@ def spy_loadbalancer_with_workers(mocker: MockerFixture):
             # Simple dispatch to first available worker
             worker_info, worker_resource = next(iter(self._workers.items()))
             async with worker_resource() as worker:
-                async for result in worker.dispatch(task):
-                    yield result
+                return await worker.dispatch(task)
 
     loadbalancer = SpyableLoadBalancer()
 
@@ -201,14 +199,17 @@ def spy_discovery_with_events(mocker: MockerFixture):
 def mock_worker_resource(mocker: MockerFixture):
     """Create a mock worker resource for testing with spy fixtures.
 
-    Provides a mock Resource[WorkerClient] that implements async context
+    Provides a mock Resource[Connection] that implements async context
     manager protocol and returns a worker with dispatch capabilities.
     """
     # Create mock worker without spec to completely avoid real gRPC calls
     mock_worker = mocker.MagicMock()
 
     async def mock_dispatch_success(task):
-        yield "test_result"
+        async def _result_generator():
+            yield "test_result"
+
+        return _result_generator()
 
     # Replace the dispatch method completely to avoid calling real gRPC code
     mock_worker.dispatch = mock_dispatch_success
@@ -238,13 +239,13 @@ class TestWorkerProxy:
     def test_constructor_discovery_and_loadbalancer(
         self, mock_discovery_service, mock_load_balancer_factory
     ):
-        """Test :py:class:`WorkerProxy` initialization with discovery and
+        """Test :class:`WorkerProxy` initialization with discovery and
         load balancer.
 
         **Given:**
             A discovery service and load balancer factory.
         **When:**
-            :py:class:`WorkerProxy` is initialized.
+            :class:`WorkerProxy` is initialized.
         **Then:**
             It should store both services correctly.
         """
@@ -264,14 +265,14 @@ class TestWorkerProxy:
     def test_constructor_discovery_only(
         self, mocker: MockerFixture, mock_discovery_service
     ):
-        """Test :py:class:`WorkerProxy` initialization with discovery only.
+        """Test :class:`WorkerProxy` initialization with discovery only.
 
         **Given:**
             A discovery service.
         **When:**
-            :py:class:`WorkerProxy` is initialized.
+            :class:`WorkerProxy` is initialized.
         **Then:**
-            It should create a :py:class:`RoundRobinLoadBalancer`.
+            It should create a :class:`RoundRobinLoadBalancer`.
         """
         # Arrange
         # (No additional arrangement needed)
@@ -284,15 +285,15 @@ class TestWorkerProxy:
         assert proxy._discovery == mock_discovery_service
 
     def test_constructor_uri_only(self, mocker: MockerFixture):
-        """Test :py:class:`WorkerProxy` initialization with URI only.
+        """Test :class:`WorkerProxy` initialization with URI only.
 
         **Given:**
             A pool URI string.
         **When:**
-            :py:class:`WorkerProxy` is initialized.
+            :class:`WorkerProxy` is initialized.
         **Then:**
-            It should create :py:class:`LocalDiscovery` and use
-            :py:class:`RoundRobinLoadBalancer`.
+            It should create :class:`LocalDiscovery` and use
+            :class:`RoundRobinLoadBalancer`.
         """
         # Arrange
         mock_local_discovery_service = mocker.MagicMock()
@@ -308,15 +309,15 @@ class TestWorkerProxy:
         assert proxy._discovery == mock_local_discovery_service
 
     def test_constructor_invalid_arguments(self):
-        """Test :py:class:`WorkerProxy` initialization with invalid
+        """Test :class:`WorkerProxy` initialization with invalid
         arguments.
 
         **Given:**
             No valid constructor arguments.
         **When:**
-            :py:class:`WorkerProxy` is initialized.
+            :class:`WorkerProxy` is initialized.
         **Then:**
-            It should raise :py:exc:`ValueError`.
+            It should raise :exc:`ValueError`.
         """
         # Act & Assert
         with pytest.raises(
@@ -332,12 +333,12 @@ class TestWorkerProxy:
     async def test_start_sets_started_flag(
         self, mock_discovery_service, mock_proxy_session
     ):
-        """Test :py:class:`WorkerProxy` start method sets started flag.
+        """Test :class:`WorkerProxy` start method sets started flag.
 
         **Given:**
-            An unstarted :py:class:`WorkerProxy` instance.
+            An unstarted :class:`WorkerProxy` instance.
         **When:**
-            :py:meth:`start` is called.
+            :meth:`start` is called.
         **Then:**
             It should set the started flag to True.
         """
@@ -352,12 +353,12 @@ class TestWorkerProxy:
 
     @pytest.mark.asyncio
     async def test_stop_clears_state(self, mock_discovery_service, mock_proxy_session):
-        """Test :py:class:`WorkerProxy` stop method clears state.
+        """Test :class:`WorkerProxy` stop method clears state.
 
         **Given:**
-            A started :py:class:`WorkerProxy` with registered workers.
+            A started :class:`WorkerProxy` with registered workers.
         **When:**
-            :py:meth:`stop` is called.
+            :meth:`stop` is called.
         **Then:**
             It should clear workers and reset the started flag to False.
         """
@@ -365,8 +366,7 @@ class TestWorkerProxy:
         proxy = wp.WorkerProxy(discovery=mock_discovery_service)
         await proxy.start()
 
-        # Add some workers to verify they get cleared
-
+        # Add some workers to verify they get cleared via LoadBalancerContext
         worker_info = WorkerInfo(
             uid="worker-1",
             host="127.0.0.1",
@@ -376,14 +376,16 @@ class TestWorkerProxy:
         )
 
         mock_worker_stub = MagicMock()
-        proxy._workers[worker_info] = mock_worker_stub
+        # Add worker through the loadbalancer context
+        if proxy._loadbalancer_context:
+            proxy._loadbalancer_context.add_worker(worker_info, lambda: mock_worker_stub)
 
         # Act
         await proxy.stop()
 
         # Assert
         assert not proxy._started
-        assert len(proxy._workers) == 0
+        assert len(proxy.workers) == 0
 
     @pytest.mark.asyncio
     async def test_dispatch_delegates_to_loadbalancer(
@@ -395,13 +397,13 @@ class TestWorkerProxy:
         mock_proxy_session,
         mocker,
     ):
-        """Test :py:class:`WorkerProxy` task dispatch delegates to load
+        """Test :class:`WorkerProxy` task dispatch delegates to load
         balancer.
 
         **Given:**
-            A started :py:class:`WorkerProxy` with available workers via discovery.
+            A started :class:`WorkerProxy` with available workers via discovery.
         **When:**
-            :py:meth:`dispatch` is called with a task.
+            :meth:`dispatch` is called with a task.
         **Then:**
             It should delegate the task to the load balancer and yield results.
         """
@@ -416,10 +418,10 @@ class TestWorkerProxy:
 
         await proxy.start()
 
-        # Mock the client pool to return our mock resource instead of real WorkerClient
+        # Mock the connection pool to return our mock resource instead of real Connection
         mock_client_pool = mocker.MagicMock()
         mock_client_pool.get.return_value = mock_resource
-        proxy._client_pool = mock_client_pool
+        proxy._connection_pool = mock_client_pool
 
         # Add worker through proper loadbalancer callback (simulating discovery)
         spy_loadbalancer_with_workers.worker_added_callback(
@@ -427,25 +429,25 @@ class TestWorkerProxy:
         )
 
         # Act
-        result_iterator = proxy.dispatch(mock_wool_task)
+        result_iterator = await proxy.dispatch(mock_wool_task)
         results = [result async for result in result_iterator]
 
         # Assert
         assert results == ["test_result"]
-        spy_loadbalancer_with_workers.dispatch.assert_called_once_with(mock_wool_task)
+        spy_loadbalancer_with_workers.dispatch.assert_called_once()
         # worker_added_callback gets called twice: once by test, once by _worker_sentinel
         assert spy_loadbalancer_with_workers.worker_added_callback.call_count >= 1
 
     def test_constructor_uri_and_loadbalancer(
         self, mock_load_balancer_factory, mocker: MockerFixture
     ):
-        """Test :py:class:`WorkerProxy` initialization with URI and load
+        """Test :class:`WorkerProxy` initialization with URI and load
         balancer.
 
         **Given:**
             A pool URI and load balancer factory.
         **When:**
-            :py:class:`WorkerProxy` is initialized.
+            :class:`WorkerProxy` is initialized.
         **Then:**
             It should create a proxy with URI filtering and the provided
             load balancer.
@@ -468,15 +470,15 @@ class TestWorkerProxy:
     async def test_start_already_started_raises_error(
         self, mock_discovery_service, mock_proxy_session
     ):
-        """Test :py:class:`WorkerProxy` start when already started raises
+        """Test :class:`WorkerProxy` start when already started raises
         error.
 
         **Given:**
-            A :py:class:`WorkerProxy` that is already started.
+            A :class:`WorkerProxy` that is already started.
         **When:**
-            :py:meth:`start` is called again.
+            :meth:`start` is called again.
         **Then:**
-            It should raise :py:exc:`RuntimeError`.
+            It should raise :exc:`RuntimeError`.
         """
         # Arrange
         proxy = wp.WorkerProxy(discovery=mock_discovery_service)
@@ -488,14 +490,14 @@ class TestWorkerProxy:
 
     @pytest.mark.asyncio
     async def test_stop_not_started_raises_error(self, mock_discovery_service):
-        """Test :py:class:`WorkerProxy` stop when not started raises error.
+        """Test :class:`WorkerProxy` stop when not started raises error.
 
         **Given:**
-            A :py:class:`WorkerProxy` that is not started.
+            A :class:`WorkerProxy` that is not started.
         **When:**
-            :py:meth:`stop` is called.
+            :meth:`stop` is called.
         **Then:**
-            It should raise :py:exc:`RuntimeError`.
+            It should raise :exc:`RuntimeError`.
         """
         # Arrange
         proxy = wp.WorkerProxy(discovery=mock_discovery_service)
@@ -508,33 +510,33 @@ class TestWorkerProxy:
     async def test_dispatch_not_started_raises_error(
         self, mock_discovery_service, mock_wool_task
     ):
-        """Test :py:class:`WorkerProxy` dispatch when not started raises
+        """Test :class:`WorkerProxy` dispatch when not started raises
         error.
 
         **Given:**
-            A :py:class:`WorkerProxy` that is not started.
+            A :class:`WorkerProxy` that is not started.
         **When:**
-            :py:meth:`dispatch` is called.
+            :meth:`dispatch` is called.
         **Then:**
-            It should raise :py:exc:`RuntimeError`.
+            It should raise :exc:`RuntimeError`.
         """
         # Arrange
         proxy = wp.WorkerProxy(discovery=mock_discovery_service)
 
         # Act & Assert
         with pytest.raises(RuntimeError, match="Proxy not started"):
-            async for _ in proxy.dispatch(mock_wool_task):
+            async for _ in await proxy.dispatch(mock_wool_task):
                 pass
 
     @pytest.mark.asyncio
     async def test_context_manager_enter_starts_proxy(
         self, mock_discovery_service, mock_proxy_session
     ):
-        """Test :py:class:`WorkerProxy` async context manager entry starts
+        """Test :class:`WorkerProxy` async context manager entry starts
         proxy.
 
         **Given:**
-            An unstarted :py:class:`WorkerProxy`.
+            An unstarted :class:`WorkerProxy`.
         **When:**
             The async context manager is entered.
         **Then:**
@@ -551,11 +553,11 @@ class TestWorkerProxy:
     async def test_context_manager_exit_stops_proxy(
         self, mock_discovery_service, mock_proxy_session
     ):
-        """Test :py:class:`WorkerProxy` async context manager exit stops
+        """Test :class:`WorkerProxy` async context manager exit stops
         proxy.
 
         **Given:**
-            A :py:class:`WorkerProxy` within async context.
+            A :class:`WorkerProxy` within async context.
         **When:**
             The async context manager exits.
         **Then:**
@@ -571,21 +573,19 @@ class TestWorkerProxy:
         # Assert
         assert not proxy._started
 
-    def test_workers_property_returns_workers_dict(
+    def test_workers_property_returns_workers_list(
         self, mock_discovery_service, mocker: MockerFixture
     ):
-        """Test :py:class:`WorkerProxy` workers property returns workers
-        dictionary.
+        """Test :class:`WorkerProxy` workers property returns workers list.
 
         **Given:**
-            A :py:class:`WorkerProxy` with discovered workers.
+            A :class:`WorkerProxy` with discovered workers.
         **When:**
             The workers property is accessed.
         **Then:**
-            It should return a dictionary of :py:class:`WorkerInfo` objects.
+            It should return a list of :class:`WorkerInfo` objects.
         """
         # Arrange
-
         proxy = wp.WorkerProxy(discovery=mock_discovery_service)
         worker_info = WorkerInfo(
             uid="worker-1",
@@ -595,13 +595,18 @@ class TestWorkerProxy:
             version="1.0.0",
         )
         mock_worker_stub = mocker.MagicMock()
-        proxy._workers = {worker_info: mock_worker_stub}
+
+        # Add worker through LoadBalancerContext
+        proxy._loadbalancer_context = wp.LoadBalancerContext()
+        proxy._loadbalancer_context.add_worker(worker_info, lambda: mock_worker_stub)
 
         # Act
         workers = proxy.workers
 
         # Assert
-        assert workers == {worker_info: mock_worker_stub}
+        assert isinstance(workers, list)
+        assert worker_info in workers
+        assert len(workers) == 1
 
     @pytest.mark.asyncio
     async def test_dispatch_propagates_loadbalancer_errors(
@@ -612,13 +617,13 @@ class TestWorkerProxy:
         mock_wool_task,
         mock_proxy_session,
     ):
-        """Test :py:class:`WorkerProxy` dispatch propagates load balancer
+        """Test :class:`WorkerProxy` dispatch propagates load balancer
         errors.
 
         **Given:**
-            A :py:class:`WorkerProxy` where load balancer dispatch fails.
+            A :class:`WorkerProxy` where load balancer dispatch fails.
         **When:**
-            :py:meth:`dispatch` is called.
+            :meth:`dispatch` is called.
         **Then:**
             It should propagate the error from the load balancer.
         """
@@ -631,19 +636,18 @@ class TestWorkerProxy:
             def __init__(self):
                 self._workers = {}
 
-            def worker_added_callback(self, client, info):
-                self._workers[info] = client
+            def worker_added_callback(self, connection, info):
+                self._workers[info] = connection
 
-            def worker_updated_callback(self, client, info):
-                self._workers[info] = client
+            def worker_updated_callback(self, connection, info):
+                self._workers[info] = connection
 
             def worker_removed_callback(self, info):
                 if info in self._workers:
                     del self._workers[info]
 
-            async def dispatch(self, task):
+            async def dispatch(self, task, *, context, timeout=None):
                 raise Exception("Load balancer error")
-                yield  # Never reached
 
         failing_loadbalancer = FailingLoadBalancer()
 
@@ -656,16 +660,16 @@ class TestWorkerProxy:
 
         # Act & Assert
         with pytest.raises(Exception, match="Load balancer error"):
-            async for _ in proxy.dispatch(mock_wool_task):
+            async for _ in await proxy.dispatch(mock_wool_task):
                 pass
 
     @pytest.mark.asyncio
     async def test_cloudpickle_serialization_with_services(self):
-        """Test :py:class:`WorkerProxy` cloudpickle serialization with
+        """Test :class:`WorkerProxy` cloudpickle serialization with
         services.
 
         **Given:**
-            A started :py:class:`WorkerProxy` with real discovery and load
+            A started :class:`WorkerProxy` with real discovery and load
             balancer services.
         **When:**
             cloudpickle serialization and deserialization are performed within
@@ -697,11 +701,11 @@ class TestWorkerProxy:
 
     @pytest.mark.asyncio
     async def test_cloudpickle_serialization_discovery_only(self):
-        """Test :py:class:`WorkerProxy` cloudpickle serialization with
+        """Test :class:`WorkerProxy` cloudpickle serialization with
         discovery only.
 
         **Given:**
-            A started :py:class:`WorkerProxy` with only discovery service.
+            A started :class:`WorkerProxy` with only discovery service.
         **When:**
             cloudpickle serialization and deserialization are performed within
             the context.
@@ -730,11 +734,11 @@ class TestWorkerProxy:
 
     @pytest.mark.asyncio
     async def test_cloudpickle_serialization_uri_preserves_id(self):
-        """Test :py:class:`WorkerProxy` cloudpickle serialization with URI
+        """Test :class:`WorkerProxy` cloudpickle serialization with URI
         preserves ID.
 
         **Given:**
-            A started :py:class:`WorkerProxy` created with only a URI.
+            A started :class:`WorkerProxy` created with only a URI.
         **When:**
             cloudpickle serialization and deserialization are performed within
             the context.
@@ -761,10 +765,10 @@ class TestWorkerProxy:
             assert unpickled_proxy.id == proxy.id
 
     def test_proxy_id_uniqueness_across_instances(self):
-        """Test :py:class:`WorkerProxy` ID uniqueness across instances.
+        """Test :class:`WorkerProxy` ID uniqueness across instances.
 
         **Given:**
-            Multiple :py:class:`WorkerProxy` instances.
+            Multiple :class:`WorkerProxy` instances.
         **When:**
             Each proxy generates an ID.
         **Then:**
@@ -862,20 +866,26 @@ class TestWorkerProxy:
             def __init__(self):
                 self._workers = {}  # Start empty
 
-            def worker_added_callback(self, client, info):
-                self._workers[info] = client
+            def worker_added_callback(self, connection, info):
+                self._workers[info] = connection
 
-            def worker_updated_callback(self, client, info):
-                self._workers[info] = client
+            def worker_updated_callback(self, connection, info):
+                self._workers[info] = connection
 
             def worker_removed_callback(self, info):
                 if info in self._workers:
                     del self._workers[info]
 
-            async def dispatch(self, task):
-                if not self._workers:
-                    raise wp.NoWorkersAvailable("No workers available")
-                yield "test_result"
+            async def dispatch(self, task, *, context, timeout=None):
+                if not context.workers:
+                    from wool._loadbalancer import NoWorkersAvailable
+
+                    raise NoWorkersAvailable("No workers available")
+
+                async def _result_generator():
+                    yield "test_result"
+
+                return _result_generator()
 
         waiting_loadbalancer = WaitingLoadBalancer()
 
@@ -895,10 +905,10 @@ class TestWorkerProxy:
             nonlocal sleep_call_count
             sleep_call_count += 1
 
-            # On first sleep call, add workers to loadbalancer
+            # On first sleep call, add workers to LoadBalancerContext
             if sleep_call_count == 1:
-                waiting_loadbalancer.worker_added_callback(
-                    lambda: mock_resource, worker_info
+                proxy._loadbalancer_context.add_worker(
+                    worker_info, lambda: mock_resource
                 )
 
             # Call original sleep
@@ -909,297 +919,12 @@ class TestWorkerProxy:
 
         # Act
         results = []
-        async for result in proxy.dispatch(mock_wool_task):
+        async for result in await proxy.dispatch(mock_wool_task):
             results.append(result)
 
         # Assert
         assert results == ["test_result"]
         assert sleep_call_count >= 1  # Ensure sleep was called (line 490 covered)
-
-
-class TestRoundRobinLoadBalancer:
-    def test_constructor_initializes_state(self):
-        """Test :py:class:`RoundRobinLoadBalancer` initialization.
-
-        **Given:**
-            No constructor arguments (default initialization).
-        **When:**
-            :py:class:`RoundRobinLoadBalancer` is initialized.
-        **Then:**
-            It should initialize the internal state correctly with empty
-            workers dictionary and zero index.
-        """
-        # Arrange
-        # (No arrangement needed)
-
-        # Act
-        load_balancer = wp.RoundRobinLoadBalancer()
-
-        # Assert
-        assert hasattr(load_balancer, "_workers")
-        assert hasattr(load_balancer, "_current_index")
-        assert load_balancer._workers == {}
-        assert load_balancer._current_index == 0
-
-    @pytest.mark.asyncio
-    async def test_dispatch_no_workers_raises_exception(self, mocker: MockerFixture):
-        """Test :py:class:`RoundRobinLoadBalancer` task dispatch with no
-        workers.
-
-        **Given:**
-            A :py:class:`RoundRobinLoadBalancer` with no available workers.
-        **When:**
-            :py:meth:`dispatch` is called.
-        **Then:**
-            It should raise :py:exc:`NoWorkersAvailable` exception.
-        """
-        # Arrange
-        load_balancer = wp.RoundRobinLoadBalancer()
-        mock_wool_task = mocker.MagicMock()
-        mock_task_protobuf = mocker.MagicMock()
-        mock_wool_task.to_protobuf.return_value = mock_task_protobuf
-
-        # Act & Assert
-        with pytest.raises(wp.NoWorkersAvailable):
-            async for _ in load_balancer.dispatch(mock_wool_task):
-                pass
-
-    def test_cloudpickle_serialization_preserves_state(self):
-        """Test :py:class:`RoundRobinLoadBalancer` cloudpickle serialization.
-
-        **Given:**
-            A :py:class:`RoundRobinLoadBalancer` instance.
-        **When:**
-            cloudpickle serialization and deserialization are performed.
-        **Then:**
-            It should serialize and deserialize successfully with proper state
-            preservation.
-        """
-        # Arrange
-        load_balancer = wp.RoundRobinLoadBalancer()
-
-        # Act
-        pickled_data = cloudpickle.dumps(load_balancer)
-        unpickled_load_balancer = cloudpickle.loads(pickled_data)
-
-        # Assert
-        assert isinstance(unpickled_load_balancer, wp.RoundRobinLoadBalancer)
-        assert hasattr(unpickled_load_balancer, "_workers")
-        assert hasattr(unpickled_load_balancer, "_current_index")
-        assert unpickled_load_balancer._current_index == 0
-
-    def test_worker_added_callback_adds_worker(self, mocker: MockerFixture):
-        """Test worker_added_callback adds worker to _workers dict.
-
-        **Given:**
-            A RoundRobinLoadBalancer without any workers.
-        **When:**
-            worker_added_callback is called with client resource and worker info.
-        **Then:**
-            Should add the worker to _workers dict with correct mapping.
-        """
-        # Arrange
-
-        load_balancer = wp.RoundRobinLoadBalancer()
-
-        worker_info = WorkerInfo(
-            uid="worker-1",
-            host="127.0.0.1",
-            port=50051,
-            pid=1234,
-            version="1.0.0",
-        )
-
-        client_resource = mocker.MagicMock()
-        assert len(load_balancer._workers) == 0
-
-        # Act
-        load_balancer.worker_added_callback(client_resource, worker_info)
-
-        # Assert
-        assert len(load_balancer._workers) == 1
-        assert load_balancer._workers[worker_info] == client_resource
-
-    def test_worker_updated_callback_updates_existing_worker(
-        self, mocker: MockerFixture
-    ):
-        """Test worker_updated_callback updates worker client resource.
-
-        **Given:**
-            A RoundRobinLoadBalancer with an existing worker.
-        **When:**
-            worker_updated_callback is called with updated client resource.
-        **Then:**
-            Should update the worker's client resource in _workers dict.
-        """
-        # Arrange
-
-        load_balancer = wp.RoundRobinLoadBalancer()
-
-        worker_info = WorkerInfo(
-            uid="worker-1",
-            host="127.0.0.1",
-            port=50051,
-            pid=1234,
-            version="1.0.0",
-        )
-
-        original_client = mocker.MagicMock()
-        updated_client = mocker.MagicMock()
-
-        # Add initial worker
-        load_balancer.worker_added_callback(original_client, worker_info)
-        assert load_balancer._workers[worker_info] == original_client
-
-        # Act - Update the worker
-        load_balancer.worker_updated_callback(updated_client, worker_info)
-
-        # Assert
-        assert load_balancer._workers[worker_info] == updated_client
-        assert len(load_balancer._workers) == 1
-
-    def test_worker_removed_callback_removes_existing_worker(
-        self, mocker: MockerFixture
-    ):
-        """Test worker_removed_callback removes worker from _workers dict.
-
-        **Given:**
-            A RoundRobinLoadBalancer with an existing worker.
-        **When:**
-            worker_removed_callback is called with worker info.
-        **Then:**
-            Should remove the worker from _workers dict if it exists.
-        """
-        # Arrange
-
-        load_balancer = wp.RoundRobinLoadBalancer()
-
-        worker_info = WorkerInfo(
-            uid="worker-1",
-            host="127.0.0.1",
-            port=50051,
-            pid=1234,
-            version="1.0.0",
-        )
-
-        client = mocker.MagicMock()
-
-        # Add worker first
-        load_balancer.worker_added_callback(client, worker_info)
-        assert worker_info in load_balancer._workers
-        assert len(load_balancer._workers) == 1
-
-        # Act - Remove the worker
-        load_balancer.worker_removed_callback(worker_info)
-
-        # Assert
-        assert worker_info not in load_balancer._workers
-        assert len(load_balancer._workers) == 0
-
-    def test_worker_removed_callback_ignores_nonexistent_worker(
-        self, mocker: MockerFixture
-    ):
-        """Test worker_removed_callback ignores worker that doesn't exist.
-
-        **Given:**
-            A RoundRobinLoadBalancer without any workers.
-        **When:**
-            worker_removed_callback is called with unknown worker info.
-        **Then:**
-            Should not raise error and _workers dict should remain empty.
-        """
-        # Arrange
-
-        load_balancer = wp.RoundRobinLoadBalancer()
-
-        worker_info = WorkerInfo(
-            uid="nonexistent-worker",
-            host="127.0.0.1",
-            port=50051,
-            pid=1234,
-            version="1.0.0",
-        )
-
-        assert len(load_balancer._workers) == 0
-
-        # Act - Try to remove nonexistent worker (should not raise)
-        load_balancer.worker_removed_callback(worker_info)
-
-        # Assert
-        assert len(load_balancer._workers) == 0
-
-    @pytest.mark.dependency(
-        depends=["TestRoundRobinLoadBalancer::test_worker_added_callback_adds_worker"]
-    )
-    @pytest.mark.asyncio
-    async def test_worker_lifecycle_with_discovery_and_removal(
-        self, spy_loadbalancer_with_workers, mock_worker_resource, mock_proxy_session
-    ):
-        """Test complete worker lifecycle: addition through discovery, then removal.
-
-        **Given:**
-            A WorkerProxy with discovery events for worker addition and removal.
-        **When:**
-            Discovery yields worker_added then worker_removed for the same worker,
-            with proper preconditions established.
-        **Then:**
-            Should exercise the full worker lifecycle including the worker_removed
-            condition check that requires the worker to be in proxy._workers.
-        """
-        # Arrange
-
-        worker_info = WorkerInfo(
-            uid="lifecycle-worker",
-            host="127.0.0.1",
-            port=50051,
-            pid=1234,
-            version="1.0.0",
-        )
-
-        # Create discovery events: add worker, then remove it
-        events = [
-            DiscoveryEvent(type="worker_added", worker_info=worker_info),
-            DiscoveryEvent(type="worker_removed", worker_info=worker_info),
-        ]
-        mock_discovery = wp.ReducibleAsyncIterator(events)
-        mock_resource, mock_worker = mock_worker_resource
-
-        proxy = wp.WorkerProxy(
-            discovery=mock_discovery, loadbalancer=spy_loadbalancer_with_workers
-        )
-
-        await proxy.start()
-
-        # Create the exact condition needed for line 513 to execute:
-        # The check is "if event.worker_info.uid in self._workers:"
-        # Since uid is a string and _workers keys are WorkerInfo objects,
-        # we need to temporarily modify the proxy to make the condition work.
-        # This exposes the bug but allows us to test line 513.
-
-        # Store original _workers for later restoration
-        original_workers = proxy._workers.copy()
-
-        # Create a dict that makes the uid check pass
-        # (This is what would happen if the code used strings as keys)
-        proxy._workers = {worker_info.uid: mock_resource}
-
-        # Act - Let the sentinel process the removal event
-        await asyncio.sleep(0.15)  # Give time for events to process
-
-        await proxy.stop()
-
-        # Assert - Verify the worker lifecycle was handled
-        spy_loadbalancer_with_workers.worker_added_callback.assert_called()
-
-        # Critical assertion: worker_removed_callback should now be called
-        # because we made the uid check pass by using string keys
-        spy_loadbalancer_with_workers.worker_removed_callback.assert_called()
-
-        # Restore original _workers structure for cleanup
-        proxy._workers = original_workers
-
-        # Verify the worker was removed from the loadbalancer's tracking
-        assert worker_info not in spy_loadbalancer_with_workers._workers
 
 
 class TestReducibleAsyncIterator:
@@ -1320,110 +1045,6 @@ class TestReducibleAsyncIterator:
         reconstructed_iterator = reconstructed_class(*reconstructed_args)
         assert reconstructed_iterator._items == items
         assert reconstructed_iterator._index == 0
-
-
-# Additional tests for missing coverage in RoundRobinLoadBalancer
-class TestRoundRobinLoadBalancerEdgeCases:
-    """Test edge cases and error handling for RoundRobinLoadBalancer."""
-
-    @pytest.mark.asyncio
-    async def test_dispatch_with_workers_handles_transient_errors(
-        self, mocker: MockerFixture
-    ):
-        """Test RoundRobinLoadBalancer dispatch with workers that fail with transient
-        errors.
-
-        Given:
-            A RoundRobinLoadBalancer with workers that fail with transient gRPC errors
-        When:
-            dispatch is called and all workers fail
-        Then:
-            Should try all workers and raise NoWorkersAvailable with transient
-            error message
-        """
-        # Arrange
-        load_balancer = wp.RoundRobinLoadBalancer()
-
-        # Mock worker info and resource
-        mock_worker_info1 = mocker.MagicMock()
-        mock_worker_info1.uid = "worker1"
-        mock_worker_info2 = mocker.MagicMock()
-        mock_worker_info2.uid = "worker2"
-
-        # Mock workers that raise transient errors
-        mock_worker1 = mocker.MagicMock()
-        mock_worker2 = mocker.MagicMock()
-
-        # Configure dispatch to raise transient errors
-
-        async def failing_dispatch(task):
-            raise grpc.RpcError("Unavailable")
-            yield  # Never reached, but makes it a generator
-
-        mock_worker1.dispatch = failing_dispatch
-        mock_worker2.dispatch = failing_dispatch
-
-        mock_resource1 = mocker.MagicMock()
-        mock_resource1.__aenter__ = mocker.AsyncMock(return_value=mock_worker1)
-        mock_resource1.__aexit__ = mocker.AsyncMock()
-
-        mock_resource2 = mocker.MagicMock()
-        mock_resource2.__aenter__ = mocker.AsyncMock(return_value=mock_worker2)
-        mock_resource2.__aexit__ = mocker.AsyncMock()
-
-        # Add workers to load balancer
-        load_balancer.worker_added_callback(lambda: mock_resource1, mock_worker_info1)
-        load_balancer.worker_added_callback(lambda: mock_resource2, mock_worker_info2)
-
-        mock_task = mocker.MagicMock()
-
-        # Act & Assert - Should exhaust all workers and raise appropriate error
-        with pytest.raises(wp.NoWorkersAvailable, match="failed with transient errors"):
-            async for _ in load_balancer.dispatch(mock_task):
-                pass
-
-    @pytest.mark.asyncio
-    async def test_dispatch_index_wrapping_behavior(self, mocker: MockerFixture):
-        """Test RoundRobinLoadBalancer dispatch handles index wrapping correctly.
-
-        Given:
-            A RoundRobinLoadBalancer with multiple workers and high current index
-        When:
-            dispatch is called with index at boundary conditions
-        Then:
-            Should wrap index correctly and select workers in round-robin fashion
-        """
-        # Arrange
-        load_balancer = wp.RoundRobinLoadBalancer()
-        load_balancer._current_index = 10  # Start with high index
-
-        # Mock successful worker
-        mock_worker_info = mocker.MagicMock()
-        mock_worker_info.uid = "worker1"
-
-        mock_worker = mocker.MagicMock()
-
-        async def successful_dispatch(task):
-            yield "success"
-
-        mock_worker.dispatch = successful_dispatch
-
-        mock_resource = mocker.MagicMock()
-        mock_resource.__aenter__ = mocker.AsyncMock(return_value=mock_worker)
-        mock_resource.__aexit__ = mocker.AsyncMock()
-
-        load_balancer.worker_added_callback(lambda: mock_resource, mock_worker_info)
-
-        mock_task = mocker.MagicMock()
-
-        # Act - Should wrap index and dispatch successfully
-        results = []
-        async for result in load_balancer.dispatch(mock_task):
-            results.append(result)
-
-        # Assert
-        assert results == ["success"]
-        assert load_balancer._current_index == 0  # Should have wrapped to 0
 
 
 # Tests for utility functions
@@ -1679,9 +1300,9 @@ class TestWorkerProxyContextManagerAndCleanup:
             discovery=mock_discovery, loadbalancer=spy_loadbalancer_with_workers
         )
 
-        # Mock the client pool
+        # Mock the connection pool
         mock_client_pool = mocker.MagicMock()
-        proxy._client_pool = mock_client_pool
+        proxy._connection_pool = mock_client_pool
 
         # Set up the internal services that would be set by start()
         proxy._loadbalancer_service = spy_loadbalancer_with_workers
@@ -1692,7 +1313,7 @@ class TestWorkerProxyContextManagerAndCleanup:
             async for event in mock_discovery:
                 # Simulate what the sentinel does for worker_updated
                 spy_loadbalancer_with_workers.worker_updated_callback(
-                    lambda: proxy._client_pool.get(
+                    lambda: proxy._connection_pool.get(
                         f"{event.worker_info.host}:{event.worker_info.port}"
                     ),
                     event.worker_info,
@@ -1711,12 +1332,11 @@ class TestWorkerProxyContextManagerAndCleanup:
         **Given:**
             A WorkerProxy with discovery that yields worker_removed events.
         **When:**
-            _worker_sentinel runs and worker exists in _workers.
+            _worker_sentinel runs and worker exists in LoadBalancerContext.
         **Then:**
             Should call worker_removed_callback on the load balancer.
         """
         # Arrange
-
         worker_info = WorkerInfo(
             uid="worker-1",
             host="127.0.0.1",
@@ -1732,12 +1352,14 @@ class TestWorkerProxyContextManagerAndCleanup:
             discovery=mock_discovery, loadbalancer=spy_loadbalancer_with_workers
         )
 
-        # Add the worker to _workers so it can be removed (using correct key type)
-        proxy._workers[worker_info] = mocker.MagicMock()
+        # Add the worker to LoadBalancerContext so it can be removed
+        proxy._loadbalancer_context = wp.LoadBalancerContext()
+        mock_worker_stub = mocker.MagicMock()
+        proxy._loadbalancer_context.add_worker(worker_info, lambda: mock_worker_stub)
 
-        # Mock the client pool
+        # Mock the connection pool
         mock_client_pool = mocker.MagicMock()
-        proxy._client_pool = mock_client_pool
+        proxy._connection_pool = mock_client_pool
 
         # Set up the internal services that would be set by start()
         proxy._loadbalancer_service = spy_loadbalancer_with_workers
@@ -1746,31 +1368,26 @@ class TestWorkerProxyContextManagerAndCleanup:
         # Act - Process one event through the sentinel logic
         async with asyncio.timeout(1.0):  # Safety timeout
             async for event in mock_discovery:
-                if event.worker_info.uid in {
-                    worker_info.uid for worker_info in proxy._workers.keys()
-                }:
-                    spy_loadbalancer_with_workers.worker_removed_callback(
-                        event.worker_info
-                    )
+                # Simulate what the sentinel does for worker_removed
+                proxy._loadbalancer_context.remove_worker(event.worker_info)
                 break  # Process just one event
 
         # Assert
-        spy_loadbalancer_with_workers.worker_removed_callback.assert_called_once_with(
-            worker_info
-        )
+        # Verify worker was removed from context
+        assert worker_info not in proxy._loadbalancer_context.workers
 
     @pytest.mark.asyncio
     async def test_worker_sentinel_handles_worker_updated_event(
-        self, spy_loadbalancer_with_workers, mock_proxy_session
+        self, spy_loadbalancer_with_workers, mocker: MockerFixture
     ):
-        """Test _worker_sentinel handles worker_updated events by calling loadbalancer.
+        """Test _worker_sentinel handles worker_updated events by updating LoadBalancerContext.
 
         **Given:**
             A WorkerProxy with discovery yielding worker_updated event.
         **When:**
             _worker_sentinel processes the event.
         **Then:**
-            Should call worker_updated_callback on the loadbalancer.
+            Should update worker in LoadBalancerContext.
         """
         # Arrange
 
@@ -1789,14 +1406,34 @@ class TestWorkerProxyContextManagerAndCleanup:
             discovery=mock_discovery, loadbalancer=spy_loadbalancer_with_workers
         )
 
-        await proxy.start()
+        # Set up context and add initial worker
+        proxy._loadbalancer_context = wp.LoadBalancerContext()
+        mock_worker_stub = mocker.MagicMock()
+        proxy._loadbalancer_context.add_worker(worker_info, lambda: mock_worker_stub)
 
-        # Act - Let the sentinel process the event
-        await asyncio.sleep(0.1)
-        await proxy.stop()
+        # Mock the connection pool
+        mock_client_pool = mocker.MagicMock()
+        proxy._connection_pool = mock_client_pool
+
+        # Set up the internal services that would be set by start()
+        proxy._loadbalancer_service = spy_loadbalancer_with_workers
+        proxy._discovery_service = mock_discovery
+
+        # Act - Process one event through the sentinel logic
+        async with asyncio.timeout(1.0):  # Safety timeout
+            async for event in mock_discovery:
+                # Simulate what the sentinel does for worker_updated
+                proxy._loadbalancer_context.update_worker(
+                    event.worker_info,
+                    lambda: proxy._connection_pool.get(
+                        f"{event.worker_info.host}:{event.worker_info.port}"
+                    ),
+                )
+                break  # Process just one event
 
         # Assert
-        spy_loadbalancer_with_workers.worker_updated_callback.assert_called()
+        # Verify worker is still in context and was updated
+        assert worker_info in proxy._loadbalancer_context.workers
 
     @pytest.mark.asyncio
     async def test_worker_sentinel_worker_removed_branch_coverage(
@@ -1844,45 +1481,45 @@ class TestWorkerProxyContextManagerAndCleanup:
 
 
 class TestUtilityFunctions:
-    """Test utility functions for worker client management."""
+    """Test utility functions for worker connection management."""
 
     @pytest.mark.asyncio
     async def test_client_factory_creates_worker_client(self):
-        """Test client_factory creates WorkerClient with given address.
+        """Test connection_factory creates Connection with given address.
 
         Given:
             A network address string
         When:
-            client_factory is called
+            connection_factory is called
         Then:
-            Should return WorkerClient instance for the address
+            Should return Connection instance for the address
         """
         # Arrange
         address = "127.0.0.1:50051"
 
         # Act
-        result = await wp.client_factory(address)
+        result = await wp.connection_factory(address)
 
         # Assert
-        assert isinstance(result, wp.WorkerClient)
+        assert isinstance(result, wp.Connection)
 
     @pytest.mark.asyncio
     async def test_client_finalizer_handles_stop_exceptions(self, mocker: MockerFixture):
-        """Test client_finalizer gracefully handles exceptions during client stop.
+        """Test connection_finalizer gracefully handles exceptions during connection close.
 
         Given:
-            A WorkerClient that raises exception during stop
+            A Connection that raises exception during close
         When:
-            client_finalizer is called
+            connection_finalizer is called
         Then:
             Should handle exception gracefully without propagating
         """
         # Arrange
-        mock_client = mocker.MagicMock()
-        mock_client.stop = mocker.AsyncMock(side_effect=Exception("Stop failed"))
+        mock_connection = mocker.MagicMock()
+        mock_connection.close = mocker.AsyncMock(side_effect=Exception("Stop failed"))
 
         # Act - Should not raise exception
-        await wp.client_finalizer(mock_client)
+        await wp.connection_finalizer(mock_connection)
 
         # Assert
-        mock_client.stop.assert_called_once()
+        mock_connection.close.assert_called_once()

@@ -15,13 +15,15 @@ from wool._worker_discovery import LanRegistrar
 from wool._worker_discovery import WorkerInfo
 
 
-def create_mock_worker_info(address: str) -> WorkerInfo:
-    """Create a :py:class:`WorkerInfo` object for testing registrar operations.
+def create_mock_worker_info(
+    address: str, tags: frozenset = frozenset({"test"})
+) -> WorkerInfo:
+    """Create a :class:`WorkerInfo` object for testing registrar operations.
 
     :param address:
         The worker address in 'host:port' format.
     :return:
-        A configured :py:class:`WorkerInfo` instance for testing.
+        A configured :class:`WorkerInfo` instance for testing.
     """
     host, port = address.split(":")
     return WorkerInfo(
@@ -30,7 +32,7 @@ def create_mock_worker_info(address: str) -> WorkerInfo:
         port=int(port),
         pid=12345,
         version=wool.__version__,
-        tags={"test"},
+        tags=tags,
         extra={"test": True},
     )
 
@@ -57,7 +59,7 @@ def worker_address(free_port: int) -> str:
 
 @pytest.fixture
 def mock_worker_info(worker_address: str) -> WorkerInfo:
-    """Create a :py:class:`WorkerInfo` object with the test address."""
+    """Create a :class:`WorkerInfo` object with the test address."""
     return create_mock_worker_info(worker_address)
 
 
@@ -65,7 +67,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
     """End-to-end integration tests for service registration and discovery.
 
     These integration tests verify the interaction between
-    :py:class:`LanRegistrar` and :py:class:`LanDiscovery`
+    :class:`LanRegistrar` and :class:`LanDiscovery`
     components work together correctly for worker lifecycle management.
     """
 
@@ -76,8 +78,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         """Test that worker registration triggers discovery events.
 
         GIVEN
-            A :py:class:`LanRegistrar` and
-            :py:class:`LanDiscovery` are running
+            A :class:`LanRegistrar` and
+            :class:`LanDiscovery` are running
         WHEN
             A worker is registered in the registrar
         THEN
@@ -139,19 +141,19 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         """Test that discovery service filters workers by tag criteria.
 
         GIVEN
-            A :py:class:`LanDiscovery` configured with tag filtering
+            A :class:`LanDiscovery` configured with tag filtering
         WHEN
             Workers with different tags are registered
         THEN
             Only workers matching the filter criteria should be discovered
         """
         # Arrange
-        mock_worker_production = create_mock_worker_info("localhost:50001")
-        mock_worker_production.tags.add("production")
-
-        mock_worker_development = create_mock_worker_info("localhost:50002")
-        mock_worker_development.tags.clear()
-        mock_worker_development.tags.add("development")
+        mock_worker_production = create_mock_worker_info(
+            "localhost:50001", tags=frozenset({"test", "production"})
+        )
+        mock_worker_development = create_mock_worker_info(
+            "localhost:50002", tags=frozenset({"development"})
+        )
 
         discovered_workers = []
         discovery_future = asyncio.Future()
@@ -199,8 +201,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         """Test that discovery service detects multiple registered workers.
 
         GIVEN
-            A :py:class:`LanRegistrar` and
-            :py:class:`LanDiscovery` are running
+            A :class:`LanRegistrar` and
+            :class:`LanDiscovery` are running
         WHEN
             Multiple workers are registered simultaneously
         THEN
@@ -568,16 +570,17 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         # Arrange
         discovered_events = []
         workers_with_tags = []
-        for _ in range(3):
+        for tags in [
+            {"production", "web"},
+            {"development", "api"},
+            set(),
+        ]:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("", 0))
                 port = s.getsockname()[1]
-                workers_with_tags.append(create_mock_worker_info(f"localhost:{port}"))
-
-        # Modify tags to create variety
-        workers_with_tags[0].tags = {"production", "web"}
-        workers_with_tags[1].tags = {"development", "api"}
-        workers_with_tags[2].tags = set()  # Empty tags
+                workers_with_tags.append(
+                    create_mock_worker_info(f"localhost:{port}", tags=frozenset(tags))
+                )
 
         expected_worker_count = len(workers_with_tags)
 
@@ -642,20 +645,24 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         discovered_events = []
 
         workers_with_complex_tags = []
-        for _ in range(5):
+        for tags in [
+            {"production", "web", "frontend"},
+            {"production", "api", "backend"},
+            {"development", "web", "frontend"},
+            {"production"},
+            set(),
+        ]:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("", 0))
                 port = s.getsockname()[1]
                 workers_with_complex_tags.append(
-                    create_mock_worker_info(f"localhost:{port}")
+                    create_mock_worker_info(
+                        f"localhost:{port}",
+                        tags=frozenset(tags),
+                    )
                 )
 
         # Set up complex tag combinations
-        workers_with_complex_tags[0].tags = {"production", "web", "frontend"}
-        workers_with_complex_tags[1].tags = {"production", "api", "backend"}
-        workers_with_complex_tags[2].tags = {"development", "web", "frontend"}
-        workers_with_complex_tags[3].tags = {"production"}
-        workers_with_complex_tags[4].tags = set()
 
         # Filter: workers that have "production" AND either "web" OR "api"
         def complex_filter(worker_info):
