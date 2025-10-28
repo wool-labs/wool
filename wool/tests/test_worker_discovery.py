@@ -48,26 +48,99 @@ def mock_service_info(mocker: MockerFixture):
     return mocker.patch.object(discovery, "ServiceInfo", autospec=True)
 
 
-class TestLanRegistryService:
+@pytest.fixture
+def shared_memory_factory():
+    """Fixture that provides a context manager factory for shared memory in LocalRegistrar tests.
+
+    Returns a function that returns a context manager for SharedMemory instances.
+    The context manager handles cleanup automatically.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def create_shared_memory(uri: str):
+        shared_memory_name = hashlib.sha256(uri.encode()).hexdigest()[:12]
+        shared_memory = multiprocessing.shared_memory.SharedMemory(
+            name=shared_memory_name, create=True, size=1024
+        )
+        try:
+            # Initialize all slots to 0 (empty)
+            for i in range(1024):
+                shared_memory.buf[i] = 0
+            yield shared_memory
+        finally:
+            shared_memory.close()
+            shared_memory.unlink()
+
+    return create_shared_memory
+
+
+@pytest.fixture
+def dummy_discovery_service():
+    """Fixture providing a dummy Discovery for testing async iteration."""
+
+    class DummyDiscovery(discovery.Discovery):
+        def __init__(self, filter=None):
+            super().__init__(filter)
+            self.events_called = False
+
+        async def events(self):
+            self.events_called = True
+            # Yield test events
+            yield discovery.DiscoveryEvent(
+                type="worker_added",
+                worker_info=discovery.WorkerInfo(
+                    uid="test-123",
+                    host="127.0.0.1",
+                    port=8080,
+                    pid=12345,
+                    version="1.0.0",
+                    tags=set(),
+                    extra={},
+                ),
+            )
+            yield discovery.DiscoveryEvent(
+                type="worker_removed",
+                worker_info=discovery.WorkerInfo(
+                    uid="test-456",
+                    host="127.0.0.1",
+                    port=8081,
+                    pid=12346,
+                    version="1.0.0",
+                    tags=set(),
+                    extra={},
+                ),
+            )
+
+        async def _start(self):
+            pass
+
+        async def _stop(self):
+            pass
+
+    return DummyDiscovery
+
+
+class TestLanRegistrar:
     def test_init_sets_default_values(self, mock_async_zeroconf):
-        """Test LanRegistryService initialization with default values.
+        """Test LanRegistrar initialization with default values.
 
         Given:
             No parameters are provided
         When:
-            LanRegistryService is initialized
+            LanRegistrar is initialized
         Then:
             It should set correct default values and not create AsyncZeroconf
         """
         # Arrange & Act
-        registry = discovery.LanRegistryService()
+        registrar = discovery.LanRegistrar()
 
         # Assert
-        assert registry.aiozc is None
-        assert registry.services == {}
-        assert registry.service_type == "_wool._tcp.local."
-        assert registry._started is False
-        assert registry._stopped is False
+        assert registrar.aiozc is None
+        assert registrar.services == {}
+        assert registrar.service_type == "_wool._tcp.local."
+        assert registrar._started is False
+        assert registrar._stopped is False
         mock_async_zeroconf.assert_not_called()
 
     @pytest.mark.asyncio
@@ -81,14 +154,14 @@ class TestLanRegistryService:
         """Test worker registration creates service info and registers with Zeroconf.
 
         Given:
-            A started registry service and WorkerInfo instance
+            A started registrar service and WorkerInfo instance
         When:
             register() is called with WorkerInfo
         Then:
             ServiceInfo should be created and registered with AsyncZeroconf
         """
         # Arrange
-        registry = discovery.LanRegistryService()
+        registrar = discovery.LanRegistrar()
 
         mock_inet_pton = mocker.patch.object(
             socket,
@@ -100,10 +173,10 @@ class TestLanRegistryService:
             discovery, "_serialize_worker_info", return_value={"test": "data"}
         )
 
-        await registry.start()
+        await registrar.start()
 
         # Act
-        await registry.register(worker_info)
+        await registrar.register(worker_info)
 
         # Assert
         mock_async_zeroconf.assert_called_once()
@@ -122,33 +195,33 @@ class TestLanRegistryService:
         mock_async_register_service.assert_called_once_with(
             mock_service_info.return_value
         )
-        assert registry.services[worker_info.uid] == mock_service_info.return_value
+        assert registrar.services[worker_info.uid] == mock_service_info.return_value
 
     @pytest.mark.asyncio
-    async def test_unregister_removes_service_from_registry(
+    async def test_unregister_removes_service_from_registrar(
         self,
         mock_async_zeroconf,
         mock_service_info,
         worker_info,
     ):
         """Test worker unregistration removes service from AsyncZeroconf and
-        local registry.
+        local registrar.
 
         Given:
-            A started registry service with a registered worker
+            A started registrar service with a registered worker
         When:
             unregister() is called with the WorkerInfo
         Then:
             The service should be unregistered from AsyncZeroconf and
-            removed from local registry
+            removed from local registrar
         """
         # Arrange
-        registry = discovery.LanRegistryService()
-        registry.services[worker_info.uid] = mock_service_info.return_value
-        await registry.start()
+        registrar = discovery.LanRegistrar()
+        registrar.services[worker_info.uid] = mock_service_info.return_value
+        await registrar.start()
 
         # Act
-        await registry.unregister(worker_info)
+        await registrar.unregister(worker_info)
 
         # Assert
         mock_async_unregister_service = (
@@ -157,157 +230,157 @@ class TestLanRegistryService:
         mock_async_unregister_service.assert_called_once_with(
             mock_service_info.return_value
         )
-        assert worker_info.uid not in registry.services
+        assert worker_info.uid not in registrar.services
 
     @pytest.mark.asyncio
     async def test_start_already_started_raises_error(self, mock_async_zeroconf):
-        """Test starting an already started registry raises RuntimeError.
+        """Test starting an already started registrar raises RuntimeError.
 
         Given:
-            A registry service that has already been started
+            A registrar service that has already been started
         When:
             start() is called again
         Then:
             RuntimeError should be raised with appropriate message
         """
         # Arrange
-        registry = discovery.LanRegistryService()
-        await registry.start()
+        registrar = discovery.LanRegistrar()
+        await registrar.start()
 
         # Act & Assert
-        with pytest.raises(RuntimeError, match="Registry service already started"):
-            await registry.start()
+        with pytest.raises(RuntimeError, match="Registrar service already started"):
+            await registrar.start()
 
     @pytest.mark.asyncio
     async def test_stop_not_started(self):
-        """Test stopping a registry that hasn't been started raises
+        """Test stopping a registrar that hasn't been started raises
         RuntimeError.
 
         Given:
-            A registry service that has not been started
+            A registrar service that has not been started
         When:
             stop() is called
         Then:
             RuntimeError should be raised with appropriate message
         """
         # Arrange
-        registry = discovery.LanRegistryService()
+        registrar = discovery.LanRegistrar()
 
         # Act & Assert
         with pytest.raises(
             RuntimeError,
-            match="Registry service not started",
+            match="Registrar service not started",
         ):
-            await registry.stop()
+            await registrar.stop()
 
     @pytest.mark.asyncio
     async def test_register_not_started_raises_error(self, worker_info):
-        """Test registering worker before starting registry raises
+        """Test registering worker before starting registrar raises
         RuntimeError.
 
         Given:
-            A registry service that has not been started
+            A registrar service that has not been started
         When:
             register() is called with a WorkerInfo
         Then:
             RuntimeError should be raised with appropriate message
         """
         # Arrange
-        registry = discovery.LanRegistryService()
+        registrar = discovery.LanRegistrar()
 
         # Act & Assert
         with pytest.raises(
             RuntimeError,
-            match="Registry service not started - call start\\(\\) first",
+            match="Registrar service not started - call start\\(\\) first",
         ):
-            await registry.register(worker_info)
+            await registrar.register(worker_info)
 
     @pytest.mark.asyncio
     async def test_register_after_stopped_raises_error(
         self, mock_async_zeroconf, worker_info
     ):
-        """Test registering worker after stopping registry raises
+        """Test registering worker after stopping registrar raises
         RuntimeError.
 
         Given:
-            A registry service that has been started and then stopped
+            A registrar service that has been started and then stopped
         When:
             register() is called with a WorkerInfo
         Then:
             RuntimeError should be raised with appropriate message
         """
         # Arrange
-        registry = discovery.LanRegistryService()
-        await registry.start()
-        await registry.stop()
+        registrar = discovery.LanRegistrar()
+        await registrar.start()
+        await registrar.stop()
 
         # Act & Assert
-        with pytest.raises(RuntimeError, match="Registry service already stopped"):
-            await registry.register(worker_info)
+        with pytest.raises(RuntimeError, match="Registrar service already stopped"):
+            await registrar.register(worker_info)
 
     @pytest.mark.asyncio
     async def test_unregister_not_started_raises_error(self, worker_info):
-        """Test unregistering worker before starting registry raises
+        """Test unregistering worker before starting registrar raises
         RuntimeError.
 
         Given:
-            A registry service that has not been started
+            A registrar service that has not been started
         When:
             unregister() is called with a WorkerInfo
         Then:
             RuntimeError should be raised with appropriate message
         """
         # Arrange
-        registry = discovery.LanRegistryService()
+        registrar = discovery.LanRegistrar()
 
         # Act & Assert
         with pytest.raises(
             RuntimeError,
-            match="Registry service not started - call start\\(\\) first",
+            match="Registrar service not started - call start\\(\\) first",
         ):
-            await registry.unregister(worker_info)
+            await registrar.unregister(worker_info)
 
     @pytest.mark.asyncio
     async def test_unregister_after_stopped_raises_error(
         self, mock_async_zeroconf, worker_info
     ):
-        """Test unregistering worker after stopping registry raises
+        """Test unregistering worker after stopping registrar raises
         RuntimeError.
 
         Given:
-            A registry service that has been started and then stopped
+            A registrar service that has been started and then stopped
         When:
             unregister() is called with a WorkerInfo
         Then:
             RuntimeError should be raised with appropriate message
         """
         # Arrange
-        registry = discovery.LanRegistryService()
-        await registry.start()
-        await registry.stop()
+        registrar = discovery.LanRegistrar()
+        await registrar.start()
+        await registrar.stop()
 
         # Act & Assert
-        with pytest.raises(RuntimeError, match="Registry service already stopped"):
-            await registry.unregister(worker_info)
+        with pytest.raises(RuntimeError, match="Registrar service already stopped"):
+            await registrar.unregister(worker_info)
 
     @pytest.mark.asyncio
     async def test_stop_idempotent_operation(self, mock_async_zeroconf):
-        """Test that stopping a registry multiple times is safe.
+        """Test that stopping a registrar multiple times is safe.
 
         Given:
-            A registry service that has been started and stopped
+            A registrar service that has been started and stopped
         When:
             stop() is called again
         Then:
             No exception should be raised (idempotent operation)
         """
         # Arrange
-        registry = discovery.LanRegistryService()
-        await registry.start()
-        await registry.stop()
+        registrar = discovery.LanRegistrar()
+        await registrar.start()
+        await registrar.stop()
 
         # Act
-        await registry.stop()  # Should not raise
+        await registrar.stop()  # Should not raise
 
         # Assert - no exception should be raised
 
@@ -323,14 +396,14 @@ class TestLanRegistryService:
         AsyncZeroconf.
 
         Given:
-            A started registry service with a registered worker
+            A started registrar service with a registered worker
         When:
             update() is called with updated WorkerInfo
         Then:
             ServiceInfo should be updated and re-registered with AsyncZeroconf
         """
         # Arrange
-        registry = discovery.LanRegistryService()
+        registrar = discovery.LanRegistrar()
 
         # Set up existing service
         mock_existing_service = mocker.MagicMock()
@@ -340,16 +413,16 @@ class TestLanRegistryService:
         mock_existing_service.addresses = [b"\x7f\x00\x00\x01"]
         mock_existing_service.port = 48800
         mock_existing_service.server = "worker-test-123.local."
-        registry.services[worker_info.uid] = mock_existing_service
+        registrar.services[worker_info.uid] = mock_existing_service
 
         mock_serialize_worker_info = mocker.patch.object(
             discovery, "_serialize_worker_info", return_value={"new": "data"}
         )
 
-        await registry.start()
+        await registrar.start()
 
         # Act
-        await registry.update(worker_info)
+        await registrar.update(worker_info)
 
         # Assert
         mock_serialize_worker_info.assert_called_once_with(worker_info)
@@ -366,94 +439,94 @@ class TestLanRegistryService:
 
     @pytest.mark.asyncio
     async def test_register_with_aiozc_none_raises_error(self, worker_info):
-        """Test LanRegistryService _register() with aiozc=None.
+        """Test LanRegistrar _register() with aiozc=None.
 
         Given:
-            A started LanRegistryService with aiozc=None
+            A started LanRegistrar with aiozc=None
         When:
             _register() is called
         Then:
-            Should raise RuntimeError "Registry service not properly initialized"
+            Should raise RuntimeError "Registrar service not properly initialized"
         """
         # Arrange
-        registry = discovery.LanRegistryService()
-        await registry.start()
+        registrar = discovery.LanRegistrar()
+        await registrar.start()
 
         # Set aiozc to None to simulate initialization failure
-        registry.aiozc = None
+        registrar.aiozc = None
 
         # Act & Assert
         with pytest.raises(
-            RuntimeError, match="Registry service not properly initialized"
+            RuntimeError, match="Registrar service not properly initialized"
         ):
-            await registry._register(worker_info)
+            await registrar._register(worker_info)
 
-        await registry.stop()
+        await registrar.stop()
 
     @pytest.mark.asyncio
     async def test_unregister_with_aiozc_none_raises_error(self, worker_info):
-        """Test LanRegistryService _unregister() with aiozc=None.
+        """Test LanRegistrar _unregister() with aiozc=None.
 
         Given:
-            A started LanRegistryService with aiozc=None
+            A started LanRegistrar with aiozc=None
         When:
             _unregister() is called
         Then:
-            Should raise RuntimeError "Registry service not properly initialized"
+            Should raise RuntimeError "Registrar service not properly initialized"
         """
         # Arrange
-        registry = discovery.LanRegistryService()
-        await registry.start()
+        registrar = discovery.LanRegistrar()
+        await registrar.start()
 
         # Set aiozc to None to simulate initialization failure
-        registry.aiozc = None
+        registrar.aiozc = None
 
         # Act & Assert
         with pytest.raises(
-            RuntimeError, match="Registry service not properly initialized"
+            RuntimeError, match="Registrar service not properly initialized"
         ):
-            await registry._unregister(worker_info)
+            await registrar._unregister(worker_info)
 
-        await registry.stop()
+        await registrar.stop()
 
     @pytest.mark.asyncio
     async def test_update_with_aiozc_none_raises_error(self, worker_info):
-        """Test LanRegistryService _update() with aiozc=None.
+        """Test LanRegistrar _update() with aiozc=None.
 
         Given:
-            A started LanRegistryService with aiozc=None
+            A started LanRegistrar with aiozc=None
         When:
             _update() is called
         Then:
-            Should raise RuntimeError "Registry service not properly initialized"
+            Should raise RuntimeError "Registrar service not properly initialized"
         """
         # Arrange
-        registry = discovery.LanRegistryService()
-        await registry.start()
+        registrar = discovery.LanRegistrar()
+        await registrar.start()
 
         # Set aiozc to None to simulate initialization failure
-        registry.aiozc = None
+        registrar.aiozc = None
 
         # Act & Assert
         with pytest.raises(
-            RuntimeError, match="Registry service not properly initialized"
+            RuntimeError, match="Registrar service not properly initialized"
         ):
-            await registry._update(worker_info)
+            await registrar._update(worker_info)
 
-        await registry.stop()
+        await registrar.stop()
 
     def test_resolve_address_ipv4_fallback(self):
-        """Test LanRegistryService._resolve_address() IPv4 fallback handling.
+        """Test LanRegistrar._resolve_address() IPv4 fallback handling.
 
         Given:
-            A LanRegistryService with address that fails IPv4 parsing
+            A LanRegistrar with address that fails IPv4 parsing
         When:
             _resolve_address() is called with hostname
         Then:
             Should fall back through IPv4, IPv6, and hostname resolution
         """
         # Arrange
-        registry = discovery.LanRegistryService()
+        registrar = discovery.LanRegistrar()
 
         with pytest.MonkeyPatch().context() as m:
             # Mock socket functions to simulate IPv4 parsing failure, then success
@@ -478,23 +551,23 @@ class TestLanRegistryService:
             m.setattr(socket, "inet_aton", mock_inet_aton)
 
             # Act
-            result = registry._resolve_address("localhost:8080")
+            result = registrar._resolve_address("localhost:8080")
 
             # Assert
             assert result == (b"\x7f\x00\x00\x01", 8080)
 
     def test_resolve_address_ipv6_fallback(self):
-        """Test LanRegistryService._resolve_address() IPv6 fallback handling.
+        """Test LanRegistrar._resolve_address() IPv6 fallback handling.
 
         Given:
-            A LanRegistryService with IPv6 address
+            A LanRegistrar with IPv6 address
         When:
             _resolve_address() is called
         Then:
             Should handle IPv6 address parsing
         """
         # Arrange
-        registry = discovery.LanRegistryService()
+        registrar = discovery.LanRegistrar()
 
         with pytest.MonkeyPatch().context() as m:
             # Mock IPv4 to fail, IPv6 to succeed
@@ -507,23 +580,23 @@ class TestLanRegistryService:
             m.setattr(socket, "inet_pton", mock_inet_pton)
 
             # Act
-            result = registry._resolve_address("ipv6host:8080")
+            result = registrar._resolve_address("ipv6host:8080")
 
             # Assert
             assert result == (b"\x00" * 16, 8080)
 
     def test_resolve_address_hostname_fallback(self):
-        """Test LanRegistryService._resolve_address() hostname resolution fallback.
+        """Test LanRegistrar._resolve_address() hostname resolution fallback.
 
         Given:
-            A LanRegistryService with address that fails both IPv4 and IPv6 parsing
+            A LanRegistrar with address that fails both IPv4 and IPv6 parsing
         When:
             _resolve_address() is called
         Then:
             Should fall back to hostname resolution
         """
         # Arrange
-        registry = discovery.LanRegistryService()
+        registrar = discovery.LanRegistrar()
 
         with pytest.MonkeyPatch().context() as m:
             # Mock both IPv4 and IPv6 to fail, then hostname resolution
@@ -541,25 +614,25 @@ class TestLanRegistryService:
             m.setattr(socket, "inet_aton", mock_inet_aton)
 
             # Act
-            result = registry._resolve_address("example.com:9000")
+            result = registrar._resolve_address("example.com:9000")
 
             # Assert
             assert result == (b"\xc0\xa8\x01\x64", 9000)
 
 
-class TestLanDiscoveryService:
+class TestLanDiscovery:
     def test_init_sets_default_values(self, mock_async_zeroconf):
-        """Test LanDiscoveryService initialization with default values.
+        """Test LanDiscovery initialization with default values.
 
         Given:
             No parameters are provided
         When:
-            LanDiscoveryService is initialized
+            LanDiscovery is initialized
         Then:
             It should set correct default values and not create AsyncZeroconf
         """
         # Arrange & Act
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         # Assert
         assert lan_discovery_service._started is False
@@ -571,12 +644,12 @@ class TestLanDiscoveryService:
         mock_async_zeroconf.assert_not_called()
 
     def test_init_with_filter_sets_predicate(self, mock_async_zeroconf):
-        """Test LanDiscoveryService initialization with filter function.
+        """Test LanDiscovery initialization with filter function.
 
         Given:
             A filter function for WorkerInfo filtering
         When:
-            LanDiscoveryService is initialized with filter
+            LanDiscovery is initialized with filter
         Then:
             It should store the filter for use in discovery
         """
@@ -586,7 +659,7 @@ class TestLanDiscoveryService:
             return "test" in w.tags
 
         # Act
-        lan_discovery_service = discovery.LanDiscoveryService(filter=filter_func)
+        lan_discovery_service = discovery.LanDiscovery(filter=filter_func)
 
         # Assert
         assert lan_discovery_service._filter == filter_func
@@ -597,10 +670,10 @@ class TestLanDiscoveryService:
     async def test_start_creates_zeroconf_and_browser(
         self, mock_async_zeroconf, mock_async_service_browser
     ):
-        """Test starting LanDiscoveryService creates Zeroconf artifacts.
+        """Test starting LanDiscovery creates Zeroconf artifacts.
 
         Given:
-            A LanDiscoveryService instance
+            A LanDiscovery instance
         When:
             start() is called
         Then:
@@ -608,7 +681,7 @@ class TestLanDiscoveryService:
             properly
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         # Act
         await lan_discovery_service.start()
@@ -619,7 +692,7 @@ class TestLanDiscoveryService:
         args, kwargs = mock_async_service_browser.call_args
         assert args[0] == mock_async_zeroconf.return_value.zeroconf
         assert args[1] == "_wool._tcp.local."
-        assert isinstance(kwargs["listener"], discovery.LanDiscoveryService._Listener)
+        assert isinstance(kwargs["listener"], discovery.LanDiscovery._Listener)
         assert lan_discovery_service.browser == mock_async_service_browser.return_value
 
     @pytest.mark.asyncio
@@ -628,17 +701,17 @@ class TestLanDiscoveryService:
         mock_async_zeroconf,
         mock_async_service_browser,
     ):
-        """Test stopping LanDiscoveryService cancels browser and closes AsyncZeroconf.
+        """Test stopping LanDiscovery cancels browser and closes AsyncZeroconf.
 
         Given:
-            A started LanDiscoveryService instance
+            A started LanDiscovery instance
         When:
             stop() is called
         Then:
             The browser should be cancelled and AsyncZeroconf closed
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
         await lan_discovery_service.start()
 
         # Act
@@ -664,7 +737,7 @@ class TestLanDiscoveryService:
             RuntimeError should be raised with appropriate message
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
         await lan_discovery_service.start()
 
         # Act & Assert
@@ -683,7 +756,7 @@ class TestLanDiscoveryService:
             RuntimeError should be raised with appropriate message
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         # Act & Assert
         with pytest.raises(
@@ -697,14 +770,14 @@ class TestLanDiscoveryService:
         """Test that events() returns an async iterator over discovery events.
 
         Given:
-            A LanDiscoveryService with a mocked event queue
+            A LanDiscovery with a mocked event queue
         When:
             events() is called
         Then:
             It should return an async iterator that yields events from queue
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
         mock_discovery_event = discovery.DiscoveryEvent(
             type="worker_added", worker_info=worker_info
         )
@@ -736,7 +809,7 @@ class TestLanDiscoveryService:
         """Test that worker filter is correctly passed to listener.
 
         Given:
-            A LanDiscoveryService with a WorkerInfo filter
+            A LanDiscovery with a WorkerInfo filter
         When:
             start() is called
         Then:
@@ -747,7 +820,7 @@ class TestLanDiscoveryService:
         def filter_func(w):
             return "production" in w.tags
 
-        lan_discovery_service = discovery.LanDiscoveryService(filter=filter_func)
+        lan_discovery_service = discovery.LanDiscovery(filter=filter_func)
 
         # Act
         await lan_discovery_service.start()
@@ -762,20 +835,20 @@ class TestLanDiscoveryService:
     async def test_listener_update_service_creates_task(
         self, mock_async_zeroconf, mock_async_service_browser, mocker
     ):
-        """Test LanDiscoveryService._Listener update_service() Zeroconf callback.
+        """Test LanDiscovery._Listener update_service() Zeroconf callback.
 
         Given:
-            A LanDiscoveryService._Listener instance
+            A LanDiscovery._Listener instance
         When:
             update_service() Zeroconf callback is triggered
         Then:
             Should create async task for service update handling
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         # Create a real listener for testing
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,
@@ -806,23 +879,23 @@ class TestLanDiscoveryService:
     async def test_handle_add_service_with_no_service_info(
         self, mock_async_zeroconf, mock_async_service_browser
     ):
-        """Test LanDiscoveryService _handle_add_service() with no service info.
+        """Test LanDiscovery _handle_add_service() with no service info.
 
         Given:
-            A LanDiscoveryService where aiozc returns None for service info
+            A LanDiscovery where aiozc returns None for service info
         When:
             _handle_add_service() retrieves service info
         Then:
             Should return early when service info is None
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         # Mock async_get_service_info to return None
         mock_async_zeroconf.return_value.async_get_service_info.return_value = None
 
         # Create a real listener for testing
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,
@@ -845,17 +918,17 @@ class TestLanDiscoveryService:
         mock_service_info,
         mocker,
     ):
-        """Test LanDiscoveryService _handle_add_service() deserialization error.
+        """Test LanDiscovery _handle_add_service() deserialization error.
 
         Given:
-            A LanDiscoveryService with invalid service properties
+            A LanDiscovery with invalid service properties
         When:
             _handle_add_service() deserializes worker info
         Then:
             Should handle ValueError during deserialization
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         # Mock service info with invalid data
         mock_async_zeroconf.return_value.async_get_service_info.return_value = (
@@ -870,7 +943,7 @@ class TestLanDiscoveryService:
         )
 
         # Create a real listener for testing
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,
@@ -892,17 +965,17 @@ class TestLanDiscoveryService:
     async def test_handle_add_service_exception_handling(
         self, mock_async_zeroconf, mock_async_service_browser, mocker
     ):
-        """Test LanDiscoveryService _handle_add_service() exception handling.
+        """Test LanDiscovery _handle_add_service() exception handling.
 
         Given:
-            A LanDiscoveryService where service operations raise exceptions
+            A LanDiscovery where service operations raise exceptions
         When:
             _handle_add_service() processes service
         Then:
             Should handle general exceptions gracefully
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         # Mock async_get_service_info to raise an exception
         mock_async_zeroconf.return_value.async_get_service_info.side_effect = Exception(
@@ -910,7 +983,7 @@ class TestLanDiscoveryService:
         )
 
         # Create a real listener for testing
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,
@@ -934,10 +1007,10 @@ class TestLanDiscoveryService:
         mocker,
         worker_info,
     ):
-        """Test LanDiscoveryService _handle_update_service() complete scenarios.
+        """Test LanDiscovery _handle_update_service() complete scenarios.
 
         Given:
-            A LanDiscoveryService with various worker states
+            A LanDiscovery with various worker states
         When:
             _handle_update_service() processes all scenarios
         Then:
@@ -949,10 +1022,10 @@ class TestLanDiscoveryService:
         def test_filter(w):
             return "test" in w.tags
 
-        lan_discovery_service = discovery.LanDiscoveryService(filter=test_filter)
+        lan_discovery_service = discovery.LanDiscovery(filter=test_filter)
 
         # Create a real listener for testing
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=test_filter,
@@ -1019,19 +1092,19 @@ class TestLanDiscoveryService:
     async def test_add_service_type_filtering(
         self, mock_async_zeroconf, mock_async_service_browser
     ):
-        """Test LanDiscoveryService add_service() with incorrect service type.
+        """Test LanDiscovery add_service() with incorrect service type.
 
         Given:
-            A LanDiscoveryService._Listener instance
+            A LanDiscovery._Listener instance
         When:
             add_service() is called with non-wool service type
         Then:
             Should not create async task
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,
@@ -1051,21 +1124,21 @@ class TestLanDiscoveryService:
     async def test_remove_service_cache_operations(
         self, mock_async_zeroconf, mock_async_service_browser, worker_info
     ):
-        """Test LanDiscoveryService remove_service() cache operations.
+        """Test LanDiscovery remove_service() cache operations.
 
         Given:
-            A LanDiscoveryService._Listener with worker in cache
+            A LanDiscovery._Listener with worker in cache
         When:
             remove_service() is called
         Then:
             Should pop worker from cache and create removal event
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         service_name = "test-worker._wool._tcp.local."
         lan_discovery_service._service_cache[service_name] = worker_info
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,
@@ -1094,24 +1167,24 @@ class TestLanDiscoveryService:
         mock_service_info,
         worker_info,
     ):
-        """Test LanDiscoveryService _handle_add_service() predicate filtering.
+        """Test LanDiscovery _handle_add_service() predicate filtering.
 
         Given:
-            A LanDiscoveryService with predicate that filters out workers
+            A LanDiscovery with predicate that filters out workers
         When:
             _handle_add_service() processes worker that doesn't match predicate
         Then:
             Should not add worker to cache or generate event
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService(
+        lan_discovery_service = discovery.LanDiscovery(
             filter=lambda w: w.uid != worker_info.uid
         )
 
         mock_async_zeroconf.return_value.async_get_service_info.return_value = (
             mock_service_info.return_value
         )
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: w.uid != worker_info.uid,  # This will reject our worker
@@ -1133,20 +1206,20 @@ class TestLanDiscoveryService:
     async def test_handle_update_service_with_no_service_info(
         self, mock_async_zeroconf, mock_async_service_browser
     ):
-        """Test LanDiscoveryService _handle_update_service() when service info is None.
+        """Test LanDiscovery _handle_update_service() when service info is None.
 
         Given:
-            A LanDiscoveryService where async_get_service_info returns None
+            A LanDiscovery where async_get_service_info returns None
         When:
             _handle_update_service() is called
         Then:
             Should return early without processing
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         mock_async_zeroconf.return_value.async_get_service_info.return_value = None
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,
@@ -1169,17 +1242,17 @@ class TestLanDiscoveryService:
         mock_service_info,
         mocker,
     ):
-        """Test LanDiscoveryService _handle_update_service() deserialization error.
+        """Test LanDiscovery _handle_update_service() deserialization error.
 
         Given:
-            A LanDiscoveryService with service that can't be deserialized
+            A LanDiscovery with service that can't be deserialized
         When:
             _handle_update_service() tries to deserialize worker info
         Then:
             Should handle ValueError during deserialization
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         mock_async_zeroconf.return_value.async_get_service_info.return_value = (
             mock_service_info.return_value
@@ -1189,7 +1262,7 @@ class TestLanDiscoveryService:
             "_deserialize_worker_info",
             side_effect=ValueError("Invalid data"),
         )
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,
@@ -1209,22 +1282,22 @@ class TestLanDiscoveryService:
     async def test_handle_update_service_exception_handling(
         self, mock_async_zeroconf, mock_async_service_browser, mocker
     ):
-        """Test LanDiscoveryService _handle_update_service() general exception handling.
+        """Test LanDiscovery _handle_update_service() general exception handling.
 
         Given:
-            A LanDiscoveryService where service operations raise exceptions
+            A LanDiscovery where service operations raise exceptions
         When:
             _handle_update_service() processes service
         Then:
             Should handle general exceptions gracefully
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         mock_async_zeroconf.return_value.async_get_service_info.side_effect = Exception(
             "Network error"
         )
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,
@@ -1243,26 +1316,26 @@ class TestLanDiscoveryService:
     async def test_add_service_exact_type_match(
         self, mock_async_zeroconf, mock_async_service_browser
     ):
-        """Test LanDiscoveryService add_service() with exact service type match.
+        """Test LanDiscovery add_service() with exact service type match.
 
         Given:
-            A LanDiscoveryService._Listener instance
+            A LanDiscovery._Listener instance
         When:
-            add_service() is called with exact LanRegistryService.service_type string
+            add_service() is called with exact LanRegistrar.service_type string
         Then:
             Should create async task for service processing
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,
             service_cache=lan_discovery_service._service_cache,
         )
         mock_zeroconf_instance = MagicMock()
-        exact_service_type = discovery.LanRegistryService.service_type
+        exact_service_type = discovery.LanRegistrar.service_type
         assert exact_service_type == "_wool._tcp.local."  # Verify we have the right type
 
         # Act & Assert
@@ -1295,24 +1368,24 @@ class TestLanDiscoveryService:
         mock_service_info,
         worker_info,
     ):
-        """Test LanDiscoveryService _handle_add_service() complete success execution.
+        """Test LanDiscovery _handle_add_service() complete success execution.
 
         Given:
-            A LanDiscoveryService with all success conditions met
+            A LanDiscovery with all success conditions met
         When:
             _handle_add_service() executes without any failures
         Then:
             Should update cache and create event
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService(
+        lan_discovery_service = discovery.LanDiscovery(
             filter=lambda w: w.uid == worker_info.uid  # This will match
         )
 
         mock_async_zeroconf.return_value.async_get_service_info.return_value = (
             mock_service_info.return_value
         )
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: w.uid
@@ -1347,22 +1420,22 @@ class TestLanDiscoveryService:
             assert event.worker_info == worker_info
 
     def test_cloudpickle_serialization(self, mock_async_zeroconf):
-        """Test LanDiscoveryService is cloudpickleable.
+        """Test LanDiscovery is cloudpickleable.
 
         Given:
-            A LanDiscoveryService instance
+            A LanDiscovery instance
         When:
             cloudpickle.dumps() and cloudpickle.loads() are called
         Then:
             Should serialize and deserialize successfully
         """
-        service = discovery.LanDiscoveryService()
+        service = discovery.LanDiscovery()
 
         # Should not raise exception
         pickled_data = cloudpickle.dumps(service)
         unpickled_service = cloudpickle.loads(pickled_data)
 
-        assert isinstance(unpickled_service, discovery.LanDiscoveryService)
+        assert isinstance(unpickled_service, discovery.LanDiscovery)
         assert unpickled_service._started is False
         assert unpickled_service.service_type == "_wool._tcp.local."
         assert hasattr(unpickled_service, "_event_queue")
@@ -1372,10 +1445,10 @@ class TestLanDiscoveryService:
     def test_cloudpickle_serialization_with_filter(
         self, mock_async_zeroconf, worker_info
     ):
-        """Test LanDiscoveryService with filter is cloudpickleable.
+        """Test LanDiscovery with filter is cloudpickleable.
 
         Given:
-            A LanDiscoveryService instance with filter function
+            A LanDiscovery instance with filter function
         When:
             cloudpickle.dumps() and cloudpickle.loads() are called
         Then:
@@ -1385,13 +1458,13 @@ class TestLanDiscoveryService:
         def filter_func(w):
             return "test" in w.tags
 
-        service = discovery.LanDiscoveryService(filter=filter_func)
+        service = discovery.LanDiscovery(filter=filter_func)
 
         # Should not raise exception
         pickled_data = cloudpickle.dumps(service)
         unpickled_service = cloudpickle.loads(pickled_data)
 
-        assert isinstance(unpickled_service, discovery.LanDiscoveryService)
+        assert isinstance(unpickled_service, discovery.LanDiscovery)
         assert unpickled_service._started is False
         assert unpickled_service._filter is not None
         # Filter should be preserved - add "test" tag to the fixture worker
@@ -1402,17 +1475,17 @@ class TestLanDiscoveryService:
     async def test_handle_add_service_predicate_success_with_mocks(
         self, mock_async_zeroconf, mock_async_service_browser, worker_info, mocker
     ):
-        """Test LanDiscoveryService _handle_add_service() with mocked success conditions.
+        """Test LanDiscovery _handle_add_service() with mocked success conditions.
 
         Given:
-            A LanDiscoveryService with mocked components for complete success
+            A LanDiscovery with mocked components for complete success
         When:
             _handle_add_service() processes a worker that passes all checks
         Then:
             Should execute cache update, event creation, and event queuing
         """
         # Arrange
-        lan_discovery_service = discovery.LanDiscoveryService()
+        lan_discovery_service = discovery.LanDiscovery()
 
         mock_service_info_instance = MagicMock()
         mock_async_zeroconf.return_value.async_get_service_info.return_value = (
@@ -1421,7 +1494,7 @@ class TestLanDiscoveryService:
         mock_deserialize_worker_info = mocker.patch.object(
             discovery, "_deserialize_worker_info", return_value=worker_info
         )
-        listener = discovery.LanDiscoveryService._Listener(
+        listener = discovery.LanDiscovery._Listener(
             aiozc=mock_async_zeroconf.return_value,
             event_queue=lan_discovery_service._event_queue,
             predicate=lambda w: True,  # Always match
@@ -1467,7 +1540,7 @@ class TestSerializationFunctions:
         assert set(json.loads(result["tags"])) == {"test", "worker"}
         assert json.loads(result["extra"]) == {"region": "us-west-1"}
 
-    def test_serialize_worker_info_with_empty_collections(self, worker_info):
+    def test_serialize_worker_info_with_empty_collections(self):
         """Test serialization with empty tags and extra fields.
 
         Given:
@@ -1477,9 +1550,13 @@ class TestSerializationFunctions:
         Then:
             It should handle empty collections appropriately
         """
-        # Arrange - modify fixture to have empty collections
-        worker_info.tags = set()
-        worker_info.extra = {}
+        worker_info = discovery.WorkerInfo(
+            uid="worker-test-123",
+            host="127.0.0.1",
+            port=48800,
+            pid=12345,
+            version="1.0.0",
+        )
 
         # Act
         result = discovery._serialize_worker_info(worker_info)
@@ -1592,24 +1669,6 @@ class TestSerializationFunctions:
 
 
 class TestWorkerInfo:
-    def test_worker_info_hash_method(self, worker_info):
-        """Test WorkerInfo.__hash__ method returns hash of uid.
-
-        Given:
-            A WorkerInfo instance
-        When:
-            __hash__ is called (via hash() built-in)
-        Then:
-            Should return hash of the uid
-        """
-
-        # Act
-        worker_hash = hash(worker_info)
-
-        # Assert
-        expected_hash = hash(worker_info.uid)
-        assert worker_hash == expected_hash
-
     def test_worker_info_hash_consistency(self):
         """Test WorkerInfo.__hash__ is consistent for same uid.
 
@@ -2244,12 +2303,12 @@ class TestPredicatedQueue:
         assert any(f == mock_non_matching_future for f, _ in restored_getters)
 
 
-class TestDiscoveryService:
+class TestDiscovery:
     def test_discovery_service_started_property(self):
-        """Test DiscoveryService started property access.
+        """Test Discovery started property access.
 
         Given:
-            A DiscoveryService instance
+            A Discovery instance
         When:
             started property is accessed
         Then:
@@ -2258,7 +2317,7 @@ class TestDiscoveryService:
 
         # Arrange
         # Create a concrete implementation for testing
-        class DummyDiscoveryService(discovery.DiscoveryService):
+        class DummyDiscovery(discovery.Discovery):
             async def events(self):
                 if False:  # pragma: no cover
                     yield  # Make it an async generator
@@ -2269,7 +2328,7 @@ class TestDiscoveryService:
             async def _stop(self):
                 pass
 
-        service = DummyDiscoveryService()
+        service = DummyDiscovery()
 
         # Act & Assert
         # Initially not started
@@ -2280,10 +2339,10 @@ class TestDiscoveryService:
         assert service.started is True
 
     def test_discovery_service_cloudpickle(self):
-        """Test DiscoveryService is cloudpickleable.
+        """Test Discovery is cloudpickleable.
 
         Given:
-            A DiscoveryService instance
+            A Discovery instance
         When:
             cloudpickle.dumps() and cloudpickle.loads() are called
         Then:
@@ -2291,7 +2350,7 @@ class TestDiscoveryService:
         """
 
         # Create a concrete implementation for testing
-        class DummyDiscoveryService(discovery.DiscoveryService):
+        class DummyDiscovery(discovery.Discovery):
             async def events(self):
                 if False:  # pragma: no cover
                     yield  # Make it an async generator
@@ -2302,22 +2361,22 @@ class TestDiscoveryService:
             async def _stop(self):
                 pass
 
-        service = DummyDiscoveryService()
+        service = DummyDiscovery()
 
         # Should not raise exception
         pickled_data = cloudpickle.dumps(service)
         unpickled_service = cloudpickle.loads(pickled_data)
 
-        assert isinstance(unpickled_service, DummyDiscoveryService)
+        assert isinstance(unpickled_service, DummyDiscovery)
         assert unpickled_service._started is False
         assert hasattr(unpickled_service, "_service_cache")
         assert hasattr(unpickled_service, "_filter")
 
     def test_discovery_service_cloudpickle_with_filter(self, worker_info):
-        """Test DiscoveryService with filter is cloudpickleable.
+        """Test Discovery with filter is cloudpickleable.
 
         Given:
-            A DiscoveryService instance with filter function
+            A Discovery instance with filter function
         When:
             cloudpickle.dumps() and cloudpickle.loads() are called
         Then:
@@ -2325,7 +2384,7 @@ class TestDiscoveryService:
         """
 
         # Create a concrete implementation for testing
-        class DummyDiscoveryService(discovery.DiscoveryService):
+        class DummyDiscovery(discovery.Discovery):
             async def events(self):
                 if False:  # pragma: no cover
                     yield  # Make it an async generator
@@ -2339,83 +2398,81 @@ class TestDiscoveryService:
         def test_filter(w):
             return w.uid.startswith("test-")
 
-        service = DummyDiscoveryService(filter=test_filter)
+        service = DummyDiscovery(filter=test_filter)
 
-        # Should not raise exception
-        pickled_data = cloudpickle.dumps(service)
-        unpickled_service = cloudpickle.loads(pickled_data)
+        test_worker_info = discovery.WorkerInfo(
+            uid="test-worker-123",
+            host="127.0.0.1",
+            port=48800,
+            pid=12345,
+            version="1.0.0",
+        )
 
-        assert isinstance(unpickled_service, DummyDiscoveryService)
-        assert unpickled_service._started is False
-        assert unpickled_service._filter is not None
-        # Filter should be preserved - modify the fixture worker to match filter
-        worker_info.uid = "test-worker-123"
-        assert unpickled_service._filter(worker_info) is True
+        unpickled_service = cloudpickle.loads(cloudpickle.dumps(service))
+
+        assert isinstance(unpickled_service, DummyDiscovery)
+        assert unpickled_service.started is False
+        assert unpickled_service.filter is not None
+        assert unpickled_service.filter(test_worker_info)
 
     @pytest.mark.asyncio
-    async def test_discovery_service_aiter_and_anext_methods(
-        self, mocker: MockerFixture
-    ):
-        """Test DiscoveryService __aiter__ and __anext__ methods.
+    async def test_discovery_service_async_iteration(self, dummy_discovery_service):
+        """Test Discovery async iteration with async for loop.
 
         Given:
-            A DiscoveryService instance
+            A Discovery instance
         When:
-            __aiter__ and __anext__ methods are called
+            Used in an async for loop
         Then:
-            Should delegate to events() method correctly
+            Should delegate to events() method and yield events correctly
         """
-
         # Arrange
-        class DummyDiscoveryService(discovery.DiscoveryService):
-            def __init__(self, filter=None):
-                super().__init__(filter)
-                self.events_called = False
+        service = dummy_discovery_service()
+        events_received = []
 
-            async def events(self):
-                self.events_called = True
-                # Yield a test event
-                yield discovery.DiscoveryEvent(
-                    type="worker_added",
-                    worker_info=discovery.WorkerInfo(
-                        uid="test-123",
-                        host="127.0.0.1",
-                        port=8080,
-                        pid=12345,
-                        version="1.0.0",
-                        tags=set(),
-                        extra={},
-                    ),
-                )
+        # Act
+        async for event in service:
+            events_received.append(event)
 
-            async def _start(self):
-                pass
+        # Assert
+        assert service.events_called is True
+        assert len(events_received) == 2
+        assert events_received[0].type == "worker_added"
+        assert events_received[0].worker_info.uid == "test-123"
+        assert events_received[1].type == "worker_removed"
+        assert events_received[1].worker_info.uid == "test-456"
 
-            async def _stop(self):
-                pass
+    @pytest.mark.asyncio
+    async def test_discovery_service_anext_function(self, dummy_discovery_service):
+        """Test Discovery with anext() function.
 
-        service = DummyDiscoveryService()
+        Given:
+            A Discovery instance
+        When:
+            anext() function is called on it
+        Then:
+            Should delegate to events() method and return next event
+        """
+        # Arrange
+        service = dummy_discovery_service()
 
-        # Act & Assert - Test __aiter__
-        async_iter = service.__aiter__()
+        # Act
+        first_event = await anext(service)
 
-        # __aiter__ should return the result of events()
-        # We can't directly compare async generators, but we can test the first event
-        first_event = await service.__anext__()
-
+        # Assert
         assert service.events_called is True
         assert isinstance(first_event, discovery.DiscoveryEvent)
         assert first_event.type == "worker_added"
         assert first_event.worker_info.uid == "test-123"
 
 
-class TestRegistryService:
+class TestRegistrar:
     @pytest.mark.asyncio
-    async def test_registry_service_update_state_checks(self, worker_info):
-        """Test RegistryService update() method state validation.
+    async def test_registrar_update_state_checks(self, worker_info):
+        """Test Registrar update() method state validation.
 
         Given:
-            A RegistryService in various states
+            A Registrar in various states
         When:
             update() method state validation is tested
         Then:
@@ -2424,7 +2481,7 @@ class TestRegistryService:
 
         # Arrange
         # Create a concrete implementation for testing
-        class DummyRegistryService(discovery.RegistryService):
+        class DummyRegistrar(discovery.Registrar):
             async def _start(self):
                 pass
 
@@ -2440,12 +2497,12 @@ class TestRegistryService:
             async def _update(self, worker_info):
                 pass
 
-        service = DummyRegistryService()
+        service = DummyRegistrar()
 
         # Act & Assert - Test update when not started
         with pytest.raises(
             RuntimeError,
-            match="Registry service not started - call start\\(\\) first",
+            match="Registrar service not started - call start\\(\\) first",
         ):
             await service.update(worker_info)
 
@@ -2459,218 +2516,249 @@ class TestRegistryService:
         await service.stop()
 
         # Test update when stopped
-        with pytest.raises(RuntimeError, match="Registry service already stopped"):
+        with pytest.raises(RuntimeError, match="Registrar service already stopped"):
             await service.update(worker_info)
 
-
-class TestLocalRegistryService:
     @pytest.mark.asyncio
-    async def test_init_sets_default_values(self, worker_info):
-        """Test LocalRegistryService initialization.
+    async def test_registrar_async_context_manager(self, worker_info):
+        """Test Registrar as async context manager.
 
         Given:
-            A URI for the registry
+            A Registrar implementation
         When:
-            LocalRegistryService is initialized with the URI
+            Used as an async context manager with async with
+        Then:
+            It should automatically start on enter and stop on exit
+        """
+
+        # Arrange
+        # Create a concrete implementation for testing
+        class DummyRegistrar(discovery.Registrar):
+            def __init__(self):
+                super().__init__()
+                self.start_called = False
+                self.stop_called = False
+
+            async def _start(self):
+                self.start_called = True
+
+            async def _stop(self):
+                self.stop_called = True
+
+            async def _register(self, worker_info):
+                pass
+
+            async def _unregister(self, worker_info):
+                pass
+
+            async def _update(self, worker_info):
+                pass
+
+        service = DummyRegistrar()
+
+        # Act & Assert
+        # Initially not started
+        assert not service._started
+        assert not service.start_called
+        assert not service.stop_called
+
+        async with service as context_service:
+            # Should be started inside context
+            assert service._started
+            assert service.start_called
+            assert not service.stop_called
+            assert context_service is service
+
+            # Should be able to perform operations
+            await service.register(worker_info)
+
+        # Should be stopped after exiting context
+        assert service._stopped
+        assert service.stop_called
+
+
+class TestLocalRegistrar:
+    @pytest.mark.asyncio
+    async def test_init_sets_default_values(self, worker_info):
+        """Test LocalRegistrar initialization.
+
+        Given:
+            A URI for the registrar
+        When:
+            LocalRegistrar is initialized with the URI
         Then:
             Should initialize without errors but not be ready for registration
         """
         # Arrange & Act
-        registry = discovery.LocalRegistryService("test-registry-uri")
+        registrar = discovery.LocalRegistrar("test-registrar-uri")
 
-        # Assert - Test behavior: registry should not be ready for operations
-        with pytest.raises(RuntimeError, match="Registry service not started"):
-            await registry.register(worker_info)
+        # Assert - Test behavior: registrar should not be ready for operations
+        with pytest.raises(RuntimeError, match="Registrar service not started"):
+            await registrar.register(worker_info)
 
     @pytest.mark.asyncio
-    async def test_start_creates_shared_memory(self, worker_info):
-        """Test LocalRegistryService start enables worker registration.
+    async def test_start_creates_shared_memory(self, worker_info, shared_memory_factory):
+        """Test LocalRegistrar start enables worker registration.
 
         Given:
-            An unstarted LocalRegistryService
+            An unstarted LocalRegistrar
         When:
             start() is called
         Then:
             Should be ready to accept worker registrations
         """
         # Arrange
-        registry = discovery.LocalRegistryService(uri="test_registry_123")
+        registrar_uri = "test_registrar_123"
+        with shared_memory_factory(registrar_uri):
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
 
-        # Act
-        await registry.start()
+            # Act
+            await registrar.start()
 
-        # Assert - Test behavior: registry should now accept registrations
-        # This should not raise an exception
-        await registry.register(worker_info)
+            # Assert - Test behavior: registrar should now accept registrations
+            # This should not raise an exception
+            await registrar.register(worker_info)
 
-        # Cleanup
-        await registry.stop()
+            # Cleanup
+            await registrar.stop()
 
     @pytest.mark.asyncio
-    async def test_register(self, worker_info):
+    async def test_register(self, worker_info, shared_memory_factory):
         """Test worker registration writes port to shared memory.
 
         Given:
-            A started LocalRegistryService
+            A started LocalRegistrar
         When:
             register() is called with WorkerInfo
         Then:
             Worker port should be written to shared memory
         """
         # Arrange
-        registry_uri = "test_registry_456"
-        registry = discovery.LocalRegistryService(uri=registry_uri)
-        await registry.start()
+        registrar_uri = "test_registrar_456"
+        with shared_memory_factory(registrar_uri) as shared_memory:
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            await registrar.start()
 
-        # Act
-        await registry.register(worker_info)
+            # Act
+            await registrar.register(worker_info)
 
-        # Assert - Check that port was written to first slot using public API
-        # Use same hash-based naming as LocalRegistryService
-        shared_memory_name = hashlib.sha256(registry_uri.encode()).hexdigest()[:12]
-        shared_memory = multiprocessing.shared_memory.SharedMemory(
-            name=shared_memory_name
-        )
-        try:
+            # Assert - Check that port was written to first slot
             stored_port = struct.unpack("I", shared_memory.buf[0:4])[0]
             assert stored_port == worker_info.port
-        finally:
-            shared_memory.close()
 
-        # Cleanup
-        await registry.stop()
+            # Cleanup
+            await registrar.stop()
 
     @pytest.mark.asyncio
-    async def test_unregister(self, worker_info):
+    async def test_unregister(self, worker_info, shared_memory_factory):
         """Test worker unregistration removes port from shared memory.
 
         Given:
-            A started LocalRegistryService with registered worker
+            A started LocalRegistrar with registered worker
         When:
             unregister() is called
         Then:
             Worker port should be removed from shared memory
         """
         # Arrange
-        registry_uri = "test_registry_789"
-        registry = discovery.LocalRegistryService(uri=registry_uri)
-        await registry.start()
-        await registry.register(worker_info)
+        registrar_uri = "test_registrar_789"
+        with shared_memory_factory(registrar_uri) as shared_memory:
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            await registrar.start()
+            await registrar.register(worker_info)
 
-        # Verify port was registered using public API
-        shared_memory_name = hashlib.sha256(registry_uri.encode()).hexdigest()[:12]
-        shared_memory = multiprocessing.shared_memory.SharedMemory(
-            name=shared_memory_name
-        )
-        try:
+            # Verify port was registered
             stored_port = struct.unpack("I", shared_memory.buf[0:4])[0]
             assert stored_port == worker_info.port
-        finally:
-            shared_memory.close()
 
-        # Act
-        await registry.unregister(worker_info)
+            # Act
+            await registrar.unregister(worker_info)
 
-        # Assert - Port should be cleared (set to 0) using public API
-        shared_memory_name = hashlib.sha256(registry_uri.encode()).hexdigest()[:12]
-        shared_memory = multiprocessing.shared_memory.SharedMemory(
-            name=shared_memory_name
-        )
-        try:
+            # Assert - Port should be cleared (set to 0)
             stored_port = struct.unpack("I", shared_memory.buf[0:4])[0]
             assert stored_port == 0
-        finally:
-            shared_memory.close()
 
-        # Cleanup
-        await registry.stop()
+            # Cleanup
+            await registrar.stop()
 
     @pytest.mark.asyncio
-    async def test_register_multiple_workers(self, worker_info):
+    async def test_register_multiple_workers(self, worker_info, shared_memory_factory):
         """Test registering multiple workers uses different slots.
 
         Given:
-            A started LocalRegistryService
+            A started LocalRegistrar
         When:
             Multiple workers are registered
         Then:
             Should use different slots in shared memory
         """
         # Arrange
-        registry_uri = "test_registry_multi"
-        registry = discovery.LocalRegistryService(uri=registry_uri)
-        await registry.start()
+        registrar_uri = "test_registrar_multi"
+        with shared_memory_factory(registrar_uri) as shared_memory:
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            await registrar.start()
 
-        worker2 = discovery.WorkerInfo(
-            uid="worker-2",
-            host="localhost",
-            port=48801,
-            pid=12346,
-            version="1.0.0",
-        )
+            worker2 = discovery.WorkerInfo(
+                uid="worker-2",
+                host="localhost",
+                port=48801,
+                pid=12346,
+                version="1.0.0",
+            )
 
-        # Act
-        await registry.register(worker_info)
-        await registry.register(worker2)
+            # Act
+            await registrar.register(worker_info)
+            await registrar.register(worker2)
 
-        # Assert - Check both ports are stored using public API
-        shared_memory_name = hashlib.sha256(registry_uri.encode()).hexdigest()[:12]
-        shared_memory = multiprocessing.shared_memory.SharedMemory(
-            name=shared_memory_name
-        )
-        try:
+            # Assert - Check both ports are stored
             stored_port1 = struct.unpack("I", shared_memory.buf[0:4])[0]
             stored_port2 = struct.unpack("I", shared_memory.buf[4:8])[0]
             assert stored_port1 == worker_info.port
             assert stored_port2 == worker2.port
-        finally:
-            shared_memory.close()
 
-        # Cleanup
-        await registry.stop()
+            # Cleanup
+            await registrar.stop()
 
     @pytest.mark.asyncio
-    async def test_stop_handles_shared_memory_cleanup_exceptions(
+    async def test_registrar_context_manager_handles_cleanup_exceptions(
         self, mocker: MockerFixture
     ):
-        """Test LocalRegistryService._stop() handles shared memory cleanup exceptions.
+        """Test LocalRegistrar context manager handles shared memory cleanup exceptions.
 
         Given:
-            A LocalRegistryService with shared memory that fails during cleanup
+            A LocalRegistrar context manager with shared memory that fails during cleanup
         When:
-            _stop() is called
+            The context manager exits
         Then:
             Should catch exceptions and continue cleanup without raising
         """
 
-        # Arrange
-        registry = discovery.LocalRegistryService(uri="test_cleanup_errors")
-
-        # Mock shared memory object that raises exceptions on close/unlink
+        # Mock shared memory object that raises exceptions on close
         mock_shared_memory = mocker.MagicMock()
         mock_shared_memory.close.side_effect = RuntimeError("Close failed")
-        mock_shared_memory.unlink.side_effect = RuntimeError("Unlink failed")
 
-        # Set up registry state as if it had been started
-        registry._shared_memory = mock_shared_memory
-        registry._created_shared_memory = True
+        # Mock SharedMemory constructor to return our mock
+        mocker.patch.object(
+            discovery.multiprocessing.shared_memory,
+            "SharedMemory",
+            return_value=mock_shared_memory,
+        )
 
-        # Act - Should not raise exception despite shared memory errors
-        await registry._stop()
+        registrar_uri = "test_cleanup_errors"
 
-        # Assert - Cleanup should have been attempted and state reset
+        # Act & Assert
+        async with discovery.LocalRegistrar(uri=registrar_uri) as registrar:
+            assert registrar is not None
+
+        # Assert - Cleanup should have been attempted
         mock_shared_memory.close.assert_called_once()
-        # unlink won't be called because close() raised exception
-        mock_shared_memory.unlink.assert_not_called()
-        assert registry._shared_memory is None
-        assert registry._created_shared_memory is False
 
     @pytest.mark.asyncio
     async def test_register_not_initialized_raises_error(self, worker_info):
-        """Test registering worker when registry not initialized raises RuntimeError.
+        """Test registering worker when registrar not initialized raises RuntimeError.
 
         Given:
-            A LocalRegistryService that hasn't been started
+            A LocalRegistrar that hasn't been started
         When:
             _register() is called directly
         Then:
@@ -2678,20 +2766,22 @@ class TestLocalRegistryService:
         """
 
         # Arrange
-        registry = discovery.LocalRegistryService(uri="test_not_init")
+        registrar = discovery.LocalRegistrar(uri="test_not_init")
 
         # Act & Assert
         with pytest.raises(
-            RuntimeError, match="Registry service not properly initialized"
+            RuntimeError, match="Registrar service not properly initialized"
         ):
-            await registry._register(worker_info)
+            await registrar._register(worker_info)
 
     @pytest.mark.asyncio
-    async def test_register_worker_without_port_raises_error(self):
+    async def test_register_worker_without_port_raises_error(
+        self, shared_memory_factory
+    ):
         """Test registering worker without port raises ValueError.
 
         Given:
-            A started LocalRegistryService and worker without port
+            A started LocalRegistrar and worker without port
         When:
             _register() is called
         Then:
@@ -2699,24 +2789,25 @@ class TestLocalRegistryService:
         """
 
         # Arrange
-        registry = discovery.LocalRegistryService(uri="test_no_port")
-        await registry.start()
+        registrar_uri = "test_no_port"
+        with shared_memory_factory(registrar_uri):
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            await registrar.start()
 
-        worker_without_port = discovery.WorkerInfo(
-            uid="worker-no-port",
-            host="localhost",
-            port=None,  # No port specified
-            pid=12345,
-            version="1.0.0",
-        )
+            worker_without_port = discovery.WorkerInfo(
+                uid="worker-no-port",
+                host="localhost",
+                port=None,  # No port specified
+                pid=12345,
+                version="1.0.0",
+            )
 
-        try:
             # Act & Assert
             with pytest.raises(ValueError, match="Worker port must be specified"):
-                await registry._register(worker_without_port)
-        finally:
+                await registrar._register(worker_without_port)
+
             # Cleanup
-            await registry.stop()
+            await registrar.stop()
 
     @pytest.mark.asyncio
     async def test_register_when_no_available_slots_raises_error(
@@ -2725,7 +2816,7 @@ class TestLocalRegistryService:
         """Test registering worker when shared memory is full raises RuntimeError.
 
         Given:
-            A LocalRegistryService with full shared memory
+            A LocalRegistrar with full shared memory
         When:
             _register() is called
         Then:
@@ -2733,7 +2824,7 @@ class TestLocalRegistryService:
         """
 
         # Arrange
-        registry = discovery.LocalRegistryService(uri="test_full_memory")
+        registrar = discovery.LocalRegistrar(uri="test_full_memory")
 
         # Create a mock shared memory object with full buffer
         mock_shared_memory = mocker.MagicMock()
@@ -2745,24 +2836,24 @@ class TestLocalRegistryService:
         mock_shared_memory.buf = mock_buffer
 
         # Set the mocked shared memory directly
-        registry._shared_memory = mock_shared_memory
+        registrar._shared_memory = mock_shared_memory
 
         try:
             # Act & Assert
             with pytest.raises(
-                RuntimeError, match="No available slots in shared memory registry"
+                RuntimeError, match="No available slots in shared memory registrar"
             ):
-                await registry._register(worker_info)
+                await registrar._register(worker_info)
         finally:
             # Cleanup
-            registry._shared_memory = None
+            registrar._shared_memory = None
 
     @pytest.mark.asyncio
     async def test_unregister_not_initialized_raises_error(self, worker_info):
-        """Test unregistering worker when registry not initialized raises RuntimeError.
+        """Test unregistering worker when registrar not initialized raises RuntimeError.
 
         Given:
-            A LocalRegistryService that hasn't been started
+            A LocalRegistrar that hasn't been started
         When:
             _unregister() is called directly
         Then:
@@ -2770,20 +2861,22 @@ class TestLocalRegistryService:
         """
 
         # Arrange
-        registry = discovery.LocalRegistryService(uri="test_unregister_not_init")
+        registrar = discovery.LocalRegistrar(uri="test_unregister_not_init")
 
         # Act & Assert
         with pytest.raises(
-            RuntimeError, match="Registry service not properly initialized"
+            RuntimeError, match="Registrar service not properly initialized"
         ):
-            await registry._unregister(worker_info)
+            await registrar._unregister(worker_info)
 
     @pytest.mark.asyncio
-    async def test_unregister_worker_without_port_returns_early(self):
+    async def test_unregister_worker_without_port_returns_early(
+        self, shared_memory_factory
+    ):
         """Test unregistering worker without port returns early.
 
         Given:
-            A started LocalRegistryService and worker without port
+            A started LocalRegistrar and worker without port
         When:
             _unregister() is called
         Then:
@@ -2791,24 +2884,25 @@ class TestLocalRegistryService:
         """
 
         # Arrange
-        registry = discovery.LocalRegistryService(uri="test_unregister_no_port")
-        await registry.start()
+        registrar_uri = "test_unregister_no_port"
+        with shared_memory_factory(registrar_uri):
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            await registrar.start()
 
-        worker_without_port = discovery.WorkerInfo(
-            uid="worker-no-port",
-            host="localhost",
-            port=None,  # No port specified
-            pid=12345,
-            version="1.0.0",
-        )
+            worker_without_port = discovery.WorkerInfo(
+                uid="worker-no-port",
+                host="localhost",
+                port=None,  # No port specified
+                pid=12345,
+                version="1.0.0",
+            )
 
-        try:
             # Act - Should not raise any exception
-            await registry._unregister(worker_without_port)
+            await registrar._unregister(worker_without_port)
             # No assertion needed, just checking it doesn't raise
-        finally:
+
             # Cleanup
-            await registry.stop()
+            await registrar.stop()
 
     @pytest.mark.asyncio
     async def test_update_delegates_to_register(
@@ -2817,7 +2911,7 @@ class TestLocalRegistryService:
         """Test update method delegates to _register method.
 
         Given:
-            A LocalRegistryService with mocked _register method
+            A LocalRegistrar with mocked _register method
         When:
             _update() is called
         Then:
@@ -2825,50 +2919,50 @@ class TestLocalRegistryService:
         """
 
         # Arrange
-        registry = discovery.LocalRegistryService(uri="test_update")
+        registrar = discovery.LocalRegistrar(uri="test_update")
         mock_register = mocker.patch.object(
-            registry, "_register", new_callable=mocker.AsyncMock
+            registrar, "_register", new_callable=mocker.AsyncMock
         )
 
         # Act
-        await registry._update(worker_info)
+        await registrar._update(worker_info)
 
         # Assert
         mock_register.assert_called_once_with(worker_info)
 
 
-class TestLocalDiscoveryService:
+class TestLocalDiscovery:
     def test___init__(self):
-        """Test LocalDiscoveryService initialization.
+        """Test LocalDiscovery initialization.
 
         Given:
-            A LocalDiscoveryService is created
+            A LocalDiscovery is created
         When:
             Initialized with a URI
         Then:
             Should set correct default values
         """
         # Arrange & Act
-        service = discovery.LocalDiscoveryService(uri="wool_local_registry")
+        service = discovery.LocalDiscovery(uri="wool_local_registrar")
 
         # Assert
         assert service._shared_memory is None
-        assert service._uri == "wool_local_registry"
+        assert service._uri == "wool_local_registrar"
         assert service._monitor_task is None
         assert service._started is False
 
-    def test___init___with_registry_name(self):
-        """Test LocalDiscoveryService initialization with custom registry name.
+    def test___init___with_registrar_name(self):
+        """Test LocalDiscovery initialization with custom registrar name.
 
         Given:
-            A custom registry name
+            A custom registrar name
         When:
-            LocalDiscoveryService is initialized with the name
+            LocalDiscovery is initialized with the name
         Then:
-            Should use the provided registry name
+            Should use the provided registrar name
         """
         # Arrange & Act
-        service = discovery.LocalDiscoveryService(uri="custom_discovery")
+        service = discovery.LocalDiscovery(uri="custom_discovery")
 
         # Assert
         assert service._uri == "custom_discovery"
@@ -2876,7 +2970,7 @@ class TestLocalDiscoveryService:
 
     @pytest.mark.asyncio
     async def test_start(self):
-        """Test LocalDiscoveryService start connects to shared memory.
+        """Test LocalDiscovery start connects to shared memory.
 
         Given:
             An existing shared memory block
@@ -2897,7 +2991,7 @@ class TestLocalDiscoveryService:
             shared_memory.buf[i] = 0
 
         try:
-            service = discovery.LocalDiscoveryService(uri=uri)
+            service = discovery.LocalDiscovery(uri=uri)
 
             # Act
             await service.start()
@@ -2915,85 +3009,88 @@ class TestLocalDiscoveryService:
             shared_memory.unlink()
 
     @pytest.mark.asyncio
-    async def test_worker_discovery_integration(self, worker_info):
-        """Test full integration between LocalRegistryService and LocalDiscoveryService.
+    async def test_worker_discovery_integration(
+        self, worker_info, shared_memory_factory
+    ):
+        """Test full integration between LocalRegistrar and LocalDiscovery.
 
         Given:
-            A LocalRegistryService and LocalDiscoveryService sharing memory
+            A LocalRegistrar and LocalDiscovery sharing memory
         When:
             A worker is registered and unregistered
         Then:
             Discovery service should emit appropriate events
         """
         # Arrange
-        registry_name = "test_integration_abc"
-        registry = discovery.LocalRegistryService(uri=registry_name)
-        discovery_service = discovery.LocalDiscoveryService(uri=registry_name)
+        registrar_name = "test_integration_abc"
+        with shared_memory_factory(registrar_name):
+            registrar = discovery.LocalRegistrar(uri=registrar_name)
+            discovery_service = discovery.LocalDiscovery(uri=registrar_name)
 
-        await registry.start()
+            await registrar.start()
 
-        events = []
+            events = []
 
-        async def collect_events():
+            async def collect_events():
+                try:
+                    async for event in discovery_service.events():
+                        events.append(event)
+                        if len(events) >= 2:  # worker_added, worker_removed
+                            break
+                except asyncio.CancelledError:
+                    pass
+
+            # Start event collection
+            event_task = asyncio.create_task(collect_events())
+
+            # Give discovery service time to start
+            await asyncio.sleep(0.2)
+
+            # Act - Register worker
+            await registrar.register(worker_info)
+            await asyncio.sleep(0.2)  # Wait for discovery to detect
+
+            # Unregister worker
+            await registrar.unregister(worker_info)
+            await asyncio.sleep(0.2)  # Wait for discovery to detect
+
+            # Cancel event collection
+            event_task.cancel()
             try:
-                async for event in discovery_service.events():
-                    events.append(event)
-                    if len(events) >= 2:  # worker_added, worker_removed
-                        break
+                await event_task
             except asyncio.CancelledError:
                 pass
 
-        # Start event collection
-        event_task = asyncio.create_task(collect_events())
+            # Assert - Check events were generated
+            assert len(events) >= 2  # At least added and removed
 
-        # Give discovery service time to start
-        await asyncio.sleep(0.2)
+            # Check worker_added event
+            added_events = [e for e in events if e.type == "worker_added"]
+            assert len(added_events) >= 1
+            added_event = added_events[0]
+            assert added_event.worker_info.port == worker_info.port
+            assert added_event.worker_info.host == "localhost"
 
-        # Act - Register worker
-        await registry.register(worker_info)
-        await asyncio.sleep(0.2)  # Wait for discovery to detect
+            # Check worker_removed event
+            removed_events = [e for e in events if e.type == "worker_removed"]
+            assert len(removed_events) >= 1
+            assert removed_events[0].worker_info.port == worker_info.port
 
-        # Unregister worker
-        await registry.unregister(worker_info)
-        await asyncio.sleep(0.2)  # Wait for discovery to detect
-
-        # Cancel event collection
-        event_task.cancel()
-        try:
-            await event_task
-        except asyncio.CancelledError:
-            pass
-
-        # Assert - Check events were generated
-        assert len(events) >= 2  # At least added and removed
-
-        # Check worker_added event
-        added_events = [e for e in events if e.type == "worker_added"]
-        assert len(added_events) >= 1
-        added_event = added_events[0]
-        assert added_event.worker_info.port == worker_info.port
-        assert added_event.worker_info.host == "localhost"
-
-        # Check worker_removed event
-        removed_events = [e for e in events if e.type == "worker_removed"]
-        assert len(removed_events) >= 1
-        assert removed_events[0].worker_info.port == worker_info.port
-
-        # Cleanup
-        try:
-            await registry.stop()
-            await discovery_service.stop()
-        except Exception:
-            pass
+            # Cleanup
+            try:
+                await registrar.stop()
+                await discovery_service.stop()
+            except Exception:
+                pass
 
     @pytest.mark.asyncio
     async def test_stop_handles_monitor_task_cancelled_error(
         self, mocker: MockerFixture
     ):
-        """Test LocalDiscoveryService._stop() handles CancelledError from monitor task.
+        """Test LocalDiscovery._stop() handles CancelledError from monitor task.
 
         Given:
-            A LocalDiscoveryService with a monitor task that raises CancelledError
+            A LocalDiscovery with a monitor task that raises CancelledError
         When:
             _stop() is called
         Then:
@@ -3001,7 +3098,7 @@ class TestLocalDiscoveryService:
         """
 
         # Arrange
-        service = discovery.LocalDiscoveryService(uri="test_cancelled_task")
+        service = discovery.LocalDiscovery(uri="test_cancelled_task")
 
         # Create an actual task that raises CancelledError
         async def cancelled_task():
@@ -3024,10 +3121,10 @@ class TestLocalDiscoveryService:
     async def test_stop_handles_shared_memory_close_exception(
         self, mocker: MockerFixture
     ):
-        """Test LocalDiscoveryService._stop() handles shared memory close exception.
+        """Test LocalDiscovery._stop() handles shared memory close exception.
 
         Given:
-            A LocalDiscoveryService with shared memory that fails to close
+            A LocalDiscovery with shared memory that fails to close
         When:
             _stop() is called
         Then:
@@ -3035,7 +3132,7 @@ class TestLocalDiscoveryService:
         """
 
         # Arrange
-        service = discovery.LocalDiscoveryService(uri="test_close_error")
+        service = discovery.LocalDiscovery(uri="test_close_error")
 
         # Mock shared memory object that raises exception on close
         mock_shared_memory = mocker.MagicMock()
@@ -3051,10 +3148,10 @@ class TestLocalDiscoveryService:
         assert service._shared_memory is None
 
     def test_local_discovery_service_cloudpickle_support(self):
-        """Test LocalDiscoveryService __reduce__ method for cloudpickle support.
+        """Test LocalDiscovery __reduce__ method for cloudpickle support.
 
         Given:
-            A LocalDiscoveryService instance
+            A LocalDiscovery instance
         When:
             cloudpickle.dumps() and loads() are called
         Then:
@@ -3063,14 +3160,14 @@ class TestLocalDiscoveryService:
 
         # Arrange
         uri = "test_pickle_uri"
-        service = discovery.LocalDiscoveryService(uri=uri)
+        service = discovery.LocalDiscovery(uri=uri)
 
         # Act
         pickled_data = cloudpickle.dumps(service)
         unpickled_service = cloudpickle.loads(pickled_data)
 
         # Assert
-        assert isinstance(unpickled_service, discovery.LocalDiscoveryService)
+        assert isinstance(unpickled_service, discovery.LocalDiscovery)
         assert unpickled_service._uri == uri
         assert unpickled_service._started is False
         assert unpickled_service._shared_memory is None
@@ -3078,12 +3175,12 @@ class TestLocalDiscoveryService:
 
     @pytest.mark.asyncio
     async def test_monitor_shared_memory_handles_struct_unpack_exception(
-        self, mocker: MockerFixture, worker_info
+        self, mocker: MockerFixture, worker_info, shared_memory_factory
     ):
-        """Test LocalDiscoveryService monitoring continues after struct.unpack exceptions.
+        """Test LocalDiscovery monitoring continues after exceptions.
 
         Given:
-            A LocalDiscoveryService where struct.unpack raises an exception
+            A LocalDiscovery where struct.unpack raises an exception
         When:
             The monitoring loop encounters the exception
         Then:
@@ -3091,72 +3188,74 @@ class TestLocalDiscoveryService:
         """
 
         # Arrange
-        registry = discovery.LocalRegistryService(uri="test_struct_exception")
-        discovery_service = discovery.LocalDiscoveryService(uri="test_struct_exception")
+        registrar_uri = "test_struct_exception"
+        with shared_memory_factory(registrar_uri):
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            discovery_service = discovery.LocalDiscovery(uri=registrar_uri)
 
-        await registry.start()
+            await registrar.start()
 
-        # Register a worker normally first
-        await registry.register(worker_info)
+            # Register a worker normally first
+            await registrar.register(worker_info)
 
-        # Mock struct.unpack to fail on first call, succeed on second
-        call_count = 0
-        original_unpack = struct.unpack
+            # Mock struct.unpack to fail on first call, succeed on second
+            call_count = 0
+            original_unpack = struct.unpack
 
-        def mock_unpack(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 4:  # First few calls fail
-                raise struct.error("Simulated struct error")
-            # After that, work normally
-            return original_unpack(*args, **kwargs)
+            def mock_unpack(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count <= 4:  # First few calls fail
+                    raise struct.error("Simulated struct error")
+                # After that, work normally
+                return original_unpack(*args, **kwargs)
 
-        mocker.patch("struct.unpack", side_effect=mock_unpack)
+            mocker.patch("struct.unpack", side_effect=mock_unpack)
 
-        events = []
+            events = []
 
-        async def collect_events():
+            async def collect_events():
+                try:
+                    async for event in discovery_service.events():
+                        events.append(event)
+                        if len(events) >= 1:  # Just need one event to prove recovery
+                            break
+                except asyncio.CancelledError:
+                    pass
+
+            # Act - Start event collection (this will trigger the exception handling)
+            event_task = asyncio.create_task(collect_events())
+
+            # Wait a bit for the monitoring to encounter exceptions and recover
+            await asyncio.sleep(0.5)
+
+            # Cancel event collection
+            event_task.cancel()
             try:
-                async for event in discovery_service.events():
-                    events.append(event)
-                    if len(events) >= 1:  # Just need one event to prove recovery
-                        break
+                await event_task
             except asyncio.CancelledError:
                 pass
 
-        # Act - Start event collection (this will trigger the exception handling)
-        event_task = asyncio.create_task(collect_events())
+            # Assert - Should have eventually detected the worker despite initial exceptions
+            assert len(events) >= 1
+            assert events[0].type == "worker_added"
+            assert events[0].worker_info.port == worker_info.port
 
-        # Wait a bit for the monitoring to encounter exceptions and recover
-        await asyncio.sleep(0.5)
-
-        # Cancel event collection
-        event_task.cancel()
-        try:
-            await event_task
-        except asyncio.CancelledError:
-            pass
-
-        # Assert - Should have eventually detected the worker despite initial exceptions
-        assert len(events) >= 1
-        assert events[0].type == "worker_added"
-        assert events[0].worker_info.port == worker_info.port
-
-        # Cleanup
-        try:
-            await registry.stop()
-            await discovery_service.stop()
-        except Exception:
-            pass
+            # Cleanup
+            try:
+                await registrar.stop()
+                await discovery_service.stop()
+            except Exception:
+                pass
 
     @pytest.mark.asyncio
     async def test_local_discovery_service_detects_worker_port_updates(
-        self, worker_info
+        self, worker_info, shared_memory_factory
     ):
-        """Test LocalDiscoveryService detects when worker port changes.
+        """Test LocalDiscovery detects when worker port changes.
 
         Given:
-            A LocalDiscoveryService monitoring workers
+            A LocalDiscovery monitoring workers
         When:
             A worker's port changes in shared memory
         Then:
@@ -3164,87 +3263,90 @@ class TestLocalDiscoveryService:
         """
 
         # Arrange
-        registry = discovery.LocalRegistryService(uri="test_port_updates")
-        discovery_service = discovery.LocalDiscoveryService(uri="test_port_updates")
+        registrar_uri = "test_port_updates"
+        with shared_memory_factory(registrar_uri):
+            registrar = discovery.LocalRegistrar(uri=registrar_uri)
+            discovery_service = discovery.LocalDiscovery(uri=registrar_uri)
 
-        await registry.start()
+            await registrar.start()
 
-        # Register initial worker
-        await registry.register(worker_info)
+            # Register initial worker
+            await registrar.register(worker_info)
 
-        events = []
+            events = []
 
-        async def collect_events():
-            try:
-                async for event in discovery_service.events():
-                    events.append(event)
-                    if len(events) >= 2:  # worker_added + worker_updated
+            async def collect_events():
+                try:
+                    async for event in discovery_service.events():
+                        events.append(event)
+                        if len(events) >= 2:  # worker_added + worker_updated
+                            break
+                except asyncio.CancelledError:
+                    pass
+
+            # Start event collection
+            event_task = asyncio.create_task(collect_events())
+
+            # Give discovery service time to start and detect initial worker
+            await asyncio.sleep(0.2)
+
+            # Act - Directly modify shared memory to change the port
+            # while keeping the same slot (this triggers the update logic)
+            new_port = worker_info.port + 1
+
+            # Find the slot with our worker's port and change it
+            if registrar._shared_memory:
+                for i in range(0, len(registrar._shared_memory.buf), 4):
+                    current_port = struct.unpack(
+                        "I", registrar._shared_memory.buf[i : i + 4]
+                    )[0]
+                    if current_port == worker_info.port:
+                        # Change port in place (simulates an "update" rather than remove/add)
+                        struct.pack_into("I", registrar._shared_memory.buf, i, new_port)
                         break
+
+            # Wait for detection
+            await asyncio.sleep(0.3)
+
+            # Cancel event collection
+            event_task.cancel()
+            try:
+                await event_task
             except asyncio.CancelledError:
                 pass
 
-        # Start event collection
-        event_task = asyncio.create_task(collect_events())
+            # Assert - Should have detected the port change as an update
+            assert len(events) >= 1
+            added_event = next(e for e in events if e.type == "worker_added")
+            assert added_event.worker_info.port == worker_info.port
 
-        # Give discovery service time to start and detect initial worker
-        await asyncio.sleep(0.2)
+            # Should have detected the port update
+            updated_events = [e for e in events if e.type == "worker_updated"]
+            if updated_events:
+                # If we caught the update event, verify it has the new port
+                assert updated_events[0].worker_info.port == new_port
 
-        # Act - Directly modify shared memory to change the port
-        # while keeping the same slot (this triggers the update logic)
-        new_port = worker_info.port + 1
-
-        # Find the slot with our worker's port and change it
-        if registry._shared_memory:
-            for i in range(0, len(registry._shared_memory.buf), 4):
-                current_port = struct.unpack(
-                    "I", registry._shared_memory.buf[i : i + 4]
-                )[0]
-                if current_port == worker_info.port:
-                    # Change port in place (simulates an "update" rather than remove/add)
-                    struct.pack_into("I", registry._shared_memory.buf, i, new_port)
-                    break
-
-        # Wait for detection
-        await asyncio.sleep(0.3)
-
-        # Cancel event collection
-        event_task.cancel()
-        try:
-            await event_task
-        except asyncio.CancelledError:
-            pass
-
-        # Assert - Should have detected the port change as an update
-        assert len(events) >= 1
-        added_event = next(e for e in events if e.type == "worker_added")
-        assert added_event.worker_info.port == worker_info.port
-
-        # Should have detected the port update
-        updated_events = [e for e in events if e.type == "worker_updated"]
-        if updated_events:
-            # If we caught the update event, verify it has the new port
-            assert updated_events[0].worker_info.port == new_port
-
-        # Cleanup
-        try:
-            await registry.stop()
-            await discovery_service.stop()
-        except Exception:
-            pass
+            # Cleanup
+            try:
+                await registrar.stop()
+                await discovery_service.stop()
+            except Exception:
+                pass
 
     @pytest.mark.asyncio
     async def test_detect_changes_worker_port_update_directly(self, worker_info):
-        """Test LocalDiscoveryService._detect_changes method for worker port updates.
+        """Test LocalDiscovery._detect_changes method for worker port updates.
 
         Given:
-            A LocalDiscoveryService with a cached worker and current workers with changed port
+            A LocalDiscovery with a cached worker and current workers with
+            changed port
         When:
             _detect_changes is called with the updated worker info
         Then:
             Should emit a worker_updated event for the port change
         """
         # Arrange
-        discovery_service = discovery.LocalDiscoveryService(uri="test_direct_updates")
+        discovery_service = discovery.LocalDiscovery(uri="test_direct_updates")
         discovery_service._event_queue = discovery.PredicatedQueue[
             discovery.DiscoveryEvent
         ]()

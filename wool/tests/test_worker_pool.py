@@ -1,6 +1,6 @@
-"""Test suite for :py:class:`wool._worker_pool.WorkerPool` module."""
-
 import asyncio
+import time
+from multiprocessing.shared_memory import SharedMemory
 from typing import cast
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -14,19 +14,19 @@ from pytest_mock import MockerFixture
 
 import wool._worker_pool as wp
 from wool._worker import LocalWorker
-from wool._worker_discovery import LanRegistryService
+from wool._worker_discovery import LanRegistrar
 
 
 @pytest.fixture
-def mock_local_registry_service(mocker: MockerFixture):
-    """Create a mock :py:class:`LocalRegistryService` for test isolation."""
-    mock_registry = mocker.MagicMock(spec=LanRegistryService)
-    mock_registry.start = mocker.AsyncMock()
-    mock_registry.stop = mocker.AsyncMock()
-    mock_registry.register = mocker.AsyncMock()
-    mock_registry.unregister = mocker.AsyncMock()
-    mocker.patch.object(wp, "LocalRegistryService", return_value=mock_registry)
-    return mock_registry
+def mock_local_registrar(mocker: MockerFixture):
+    """Create a mock :class:`LocalRegistrar` for test isolation."""
+    mock_registrar = mocker.MagicMock(spec=LanRegistrar)
+    mock_registrar.start = mocker.AsyncMock()
+    mock_registrar.stop = mocker.AsyncMock()
+    mock_registrar.register = mocker.AsyncMock()
+    mock_registrar.unregister = mocker.AsyncMock()
+    mocker.patch.object(wp, "LocalRegistrar", return_value=mock_registrar)
+    return mock_registrar
 
 
 @pytest.fixture
@@ -65,9 +65,9 @@ def mock_local_worker(mocker: MockerFixture):
 
 @pytest.fixture
 def mock_discovery_service(mocker: MockerFixture):
-    """Mock LocalDiscoveryService for isolation from discovery behavior."""
+    """Mock LocalDiscovery for isolation from discovery behavior."""
     mock_discovery = mocker.MagicMock()
-    mocker.patch.object(wp, "LocalDiscoveryService", return_value=mock_discovery)
+    mocker.patch.object(wp, "LocalDiscovery", return_value=mock_discovery)
     return mock_discovery
 
 
@@ -78,7 +78,7 @@ def pool_config():
 
 
 class TestWorkerPool:
-    """Test suite for :py:class:`WorkerPool` constructor and lifecycle."""
+    """Test suite for :class:`WorkerPool` constructor and lifecycle."""
 
     def test_constructor_uses_cpu_count_as_default_size(self, mocker: MockerFixture):
         """Test WorkerPool constructor with default parameters.
@@ -189,7 +189,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test WorkerPool async context manager lifecycle.
 
@@ -217,7 +217,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test context manager cleanup when user code raises exception.
 
@@ -245,7 +245,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test context manager when worker startup fails.
 
@@ -274,7 +274,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test context manager handles various exceptions gracefully.
 
@@ -302,7 +302,7 @@ class TestWorkerPool:
         mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test context manager with custom worker factory.
 
@@ -362,7 +362,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test context manager with multiple workers.
 
@@ -389,7 +389,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test that worker information is properly maintained.
 
@@ -543,7 +543,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test context manager under concurrent operations.
 
@@ -574,7 +574,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test context manager with custom load balancer.
 
@@ -601,7 +601,7 @@ class TestWorkerPool:
         mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
         mocker: MockerFixture,
     ):
         """Test cleanup when some workers fail during startup.
@@ -644,7 +644,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test that pool startup completes within reasonable time.
 
@@ -656,8 +656,6 @@ class TestWorkerPool:
             Should complete within reasonable timeframe
         """
         # Arrange
-        import time
-
         start_time = time.time()
 
         # Act
@@ -676,7 +674,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registry_service,
+        mock_local_registrar,
     ):
         """Test worker info collection after startup completes.
 
@@ -704,7 +702,8 @@ class TestWorkerPool:
     def test_constructor_raises_error_when_cpu_count_unavailable_default_size(
         self, mocker: MockerFixture
     ):
-        """Test WorkerPool constructor error handling when CPU count is unavailable with default size.
+        """Test WorkerPool constructor error handling when CPU count is unavailable with
+        default size.
 
         Given:
             A system where os.cpu_count() returns None and no size is specified
@@ -724,7 +723,8 @@ class TestWorkerPool:
     async def test_context_manager_handles_shared_memory_cleanup_exceptions(
         self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
     ):
-        """Test WorkerPool context manager exception handling during shared memory cleanup.
+        """Test WorkerPool context manager exception handling during shared memory
+        cleanup.
 
         Given:
             A WorkerPool with real shared memory that encounters cleanup issues
@@ -734,8 +734,6 @@ class TestWorkerPool:
             Should handle exceptions gracefully without propagating them
         """
         # Arrange - Create real shared memory and simulate cleanup failure
-        import os
-        from multiprocessing.shared_memory import SharedMemory
 
         # Create real shared memory
         real_memory = SharedMemory(create=True, size=1024)
@@ -754,15 +752,7 @@ class TestWorkerPool:
 
         except Exception:
             # Clean up if something went wrong during test
-            try:
-                real_memory.unlink()
-            except:
-                pass
-            raise
-        else:
-            # If test completed without exception, that's what we're testing for
-            # The behavior we want is: no exceptions propagated from __aexit__
-            pass
+            real_memory.unlink()
 
     @pytest.mark.asyncio
     async def test_stop_workers_handles_worker_stop_exceptions(
@@ -868,11 +858,73 @@ class TestWorkerPool:
         Then:
             Should execute the create_proxy function covering lines 238-246
         """
-        # Act - This specifically executes the create_proxy function for (None, None) case
+        # Act
         async with wp.WorkerPool() as pool:
-            # Assert - Verify the pool was properly initialized
+            # Assert
             assert pool is not None
-            assert hasattr(pool, "_proxy")
-            assert hasattr(pool, "_shared_memory")
 
-        # This test covers the critical lines 238-246 by executing the async context manager
+    def test_default_worker_factory_creates_separate_registrar_instances(
+        self, mocker: MockerFixture
+    ):
+        """Test default worker factory creates separate registrar instances.
+
+        Given:
+            A WorkerPool instance with default worker factory
+        When:
+            Multiple workers are created using the default factory
+        Then:
+            Each worker should get its own LocalRegistrar instance
+        """
+        # Arrange
+        pool = wp.WorkerPool(size=0)
+        uri = "test-pool-123"
+
+        # Track all LocalRegistrar instances created
+        registrar_instances = []
+
+        def mock_local_registrar(pool_uri):
+            instance = mocker.MagicMock()
+            instance.pool_uri = pool_uri
+            registrar_instances.append(instance)
+            return instance
+
+        mocker.patch.object(wp, "LocalRegistrar", side_effect=mock_local_registrar)
+
+        # Mock LocalWorker to capture the registrar parameter
+        created_workers = []
+
+        def mock_local_worker(*tags, registrar=None, **kwargs):
+            worker = mocker.MagicMock()
+            worker.registrar = registrar
+            worker.tags = set(tags)
+            worker.kwargs = kwargs
+            created_workers.append(worker)
+            return worker
+
+        mocker.patch.object(wp, "LocalWorker", side_effect=mock_local_worker)
+
+        # Get the default factory
+        factory = pool._default_worker_factory(uri)
+
+        # Act - Create multiple workers using the factory
+        factory("tag1", "tag2")
+        factory("tag3", "tag4")
+        factory("tag5")
+
+        # Assert
+        assert len(created_workers) == 3
+        assert len(registrar_instances) == 3
+
+        # Verify each worker gets a separate registrar instance
+        assert created_workers[0].registrar is not created_workers[1].registrar
+        assert created_workers[1].registrar is not created_workers[2].registrar
+        assert created_workers[0].registrar is not created_workers[2].registrar
+
+        # Verify all registrar instances have the correct URI
+        for registrar in registrar_instances:
+            assert registrar.pool_uri == uri
+
+        # Verify workers were created with correct tags
+        assert created_workers[0].tags == {"tag1", "tag2"}
+        assert created_workers[1].tags == {"tag3", "tag4"}
+        assert created_workers[2].tags == {"tag5"}

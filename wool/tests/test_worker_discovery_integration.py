@@ -1,5 +1,3 @@
-"""Integration tests for wool._worker_discovery module."""
-
 import asyncio
 import socket
 import string
@@ -12,18 +10,20 @@ from hypothesis import strategies as st
 from hypothesis.strategies import composite
 
 import wool
-from wool._worker_discovery import LanDiscoveryService
-from wool._worker_discovery import LanRegistryService
+from wool._worker_discovery import LanDiscovery
+from wool._worker_discovery import LanRegistrar
 from wool._worker_discovery import WorkerInfo
 
 
-def create_mock_worker_info(address: str) -> WorkerInfo:
-    """Create a :py:class:`WorkerInfo` object for testing registry operations.
+def create_mock_worker_info(
+    address: str, tags: frozenset = frozenset({"test"})
+) -> WorkerInfo:
+    """Create a :class:`WorkerInfo` object for testing registrar operations.
 
     :param address:
         The worker address in 'host:port' format.
     :return:
-        A configured :py:class:`WorkerInfo` instance for testing.
+        A configured :class:`WorkerInfo` instance for testing.
     """
     host, port = address.split(":")
     return WorkerInfo(
@@ -32,7 +32,7 @@ def create_mock_worker_info(address: str) -> WorkerInfo:
         port=int(port),
         pid=12345,
         version=wool.__version__,
-        tags={"test"},
+        tags=tags,
         extra={"test": True},
     )
 
@@ -59,7 +59,7 @@ def worker_address(free_port: int) -> str:
 
 @pytest.fixture
 def mock_worker_info(worker_address: str) -> WorkerInfo:
-    """Create a :py:class:`WorkerInfo` object with the test address."""
+    """Create a :class:`WorkerInfo` object with the test address."""
     return create_mock_worker_info(worker_address)
 
 
@@ -67,7 +67,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
     """End-to-end integration tests for service registration and discovery.
 
     These integration tests verify the interaction between
-    :py:class:`LanRegistryService` and :py:class:`LanDiscoveryService`
+    :class:`LanRegistrar` and :class:`LanDiscovery`
     components work together correctly for worker lifecycle management.
     """
 
@@ -78,10 +78,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         """Test that worker registration triggers discovery events.
 
         GIVEN
-            A :py:class:`LanRegistryService` and
-            :py:class:`LanDiscoveryService` are running
+            A :class:`LanRegistrar` and
+            :class:`LanDiscovery` are running
         WHEN
-            A worker is registered in the registry
+            A worker is registered in the registrar
         THEN
             The discovery service should detect the worker addition and
             removal events
@@ -92,10 +92,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         discovery_future = asyncio.Future()
         removal_future = asyncio.Future()
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def process_events():
             async for event in mock_discovery.events():
@@ -112,10 +112,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
 
         try:
             # Act
-            await mock_registry.register(mock_worker_info)
+            await mock_registrar.register(mock_worker_info)
             discovered_worker = await asyncio.wait_for(discovery_future, timeout=5.0)
 
-            await mock_registry.unregister(mock_worker_info)
+            await mock_registrar.unregister(mock_worker_info)
             removed_worker = await asyncio.wait_for(removal_future, timeout=5.0)
 
             # Assert
@@ -134,26 +134,26 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 await event_task
             except asyncio.CancelledError:
                 pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
     async def test_discovery_filters_workers_by_tag_criteria(self):
         """Test that discovery service filters workers by tag criteria.
 
         GIVEN
-            A :py:class:`LanDiscoveryService` configured with tag filtering
+            A :class:`LanDiscovery` configured with tag filtering
         WHEN
             Workers with different tags are registered
         THEN
             Only workers matching the filter criteria should be discovered
         """
         # Arrange
-        mock_worker_production = create_mock_worker_info("localhost:50001")
-        mock_worker_production.tags.add("production")
-
-        mock_worker_development = create_mock_worker_info("localhost:50002")
-        mock_worker_development.tags.clear()
-        mock_worker_development.tags.add("development")
+        mock_worker_production = create_mock_worker_info(
+            "localhost:50001", tags=frozenset({"test", "production"})
+        )
+        mock_worker_development = create_mock_worker_info(
+            "localhost:50002", tags=frozenset({"development"})
+        )
 
         discovered_workers = []
         discovery_future = asyncio.Future()
@@ -161,10 +161,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         def mock_filter_production_workers(worker_info: WorkerInfo) -> bool:
             return "production" in worker_info.tags
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService(filter=mock_filter_production_workers)
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery(filter=mock_filter_production_workers)
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def process_events():
             async for event in mock_discovery.events():
@@ -177,8 +177,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
 
         try:
             # Act
-            await mock_registry.register(mock_worker_development)
-            await mock_registry.register(mock_worker_production)
+            await mock_registrar.register(mock_worker_development)
+            await mock_registrar.register(mock_worker_production)
 
             await asyncio.wait_for(discovery_future, timeout=5.0)
             await asyncio.sleep(1)  # Brief wait to ensure no extra discoveries
@@ -194,15 +194,15 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 await event_task
             except asyncio.CancelledError:
                 pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
     async def test_discovery_detects_multiple_workers_simultaneously(self):
         """Test that discovery service detects multiple registered workers.
 
         GIVEN
-            A :py:class:`LanRegistryService` and
-            :py:class:`LanDiscoveryService` are running
+            A :class:`LanRegistrar` and
+            :class:`LanDiscovery` are running
         WHEN
             Multiple workers are registered simultaneously
         THEN
@@ -220,10 +220,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         ]
         expected_worker_count = len(mock_workers)
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def process_events():
             nonlocal discovery_count
@@ -242,7 +242,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         try:
             # Act
             for mock_worker in mock_workers:
-                await mock_registry.register(mock_worker)
+                await mock_registrar.register(mock_worker)
 
             await asyncio.wait_for(all_discovered, timeout=10.0)
 
@@ -268,7 +268,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 await event_task
             except asyncio.CancelledError:
                 pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
     async def test_discovery_handles_worker_restart_scenario(self, worker_address: str):
@@ -285,10 +285,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         discovered_events = []
         original_worker = create_mock_worker_info(worker_address)
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def collect_events():
             async for event in mock_discovery.events():
@@ -300,11 +300,11 @@ class TestServiceRegistrationAndDiscoveryIntegration:
 
         try:
             # Act
-            await mock_registry.register(original_worker)
+            await mock_registrar.register(original_worker)
             await asyncio.sleep(0.2)  # Let registration propagate
 
             # Simulate worker stopping
-            await mock_registry.unregister(original_worker)
+            await mock_registrar.unregister(original_worker)
             await asyncio.wait_for(event_task, timeout=5.0)
 
             # Assert
@@ -321,16 +321,16 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 await event_task
             except asyncio.CancelledError:
                 pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
-    async def test_discovery_handles_registry_startup_failure(self):
-        """Test discovery service behavior when no registry services are available.
+    async def test_discovery_handles_registrar_startup_failure(self):
+        """Test discovery service behavior when no registrar services are available.
 
         Given:
             A discovery service is configured to monitor for workers
         When:
-            No registry services are running (simulating network partition)
+            No registrar services are running (simulating network partition)
         Then:
             It should handle the absence gracefully and not discover any workers
         """
@@ -338,8 +338,8 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         discovered_events = []
         discovery_timeout_reached = False
 
-        mock_discovery = LanDiscoveryService()
-        # Intentionally NOT starting any registry service
+        mock_discovery = LanDiscovery()
+        # Intentionally NOT starting any registrar service
 
         async def collect_events():
             nonlocal discovery_timeout_reached
@@ -375,11 +375,11 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         discovered_events = []
         timeout_occurred = False
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
         mock_worker = create_mock_worker_info(worker_address)
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def collect_events_with_timeout():
             nonlocal timeout_occurred
@@ -397,7 +397,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
 
             # Simulate delayed registration (longer than discovery timeout)
             await asyncio.sleep(DISCOVERY_TIMEOUT + 0.5)
-            await mock_registry.register(mock_worker)
+            await mock_registrar.register(mock_worker)
 
             await discovery_task
 
@@ -406,7 +406,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             assert len(discovered_events) == 0  # No events before timeout
 
         finally:
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
     async def test_discovery_handles_malformed_worker_info(self, worker_address: str):
@@ -434,10 +434,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             extra={},
         )
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def collect_events():
             async for event in mock_discovery.events():
@@ -451,12 +451,12 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             # Act
             # Try to register malformed worker first - should fail silently or be ignored
             try:
-                await mock_registry.register(malformed_worker)
+                await mock_registrar.register(malformed_worker)
             except Exception:
-                pass  # Registry may reject invalid data
+                pass  # Registrar may reject invalid data
 
             # Register valid worker
-            await mock_registry.register(valid_worker)
+            await mock_registrar.register(valid_worker)
             await asyncio.wait_for(event_task, timeout=3.0)
 
             # Assert
@@ -470,7 +470,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 await event_task
             except asyncio.CancelledError:
                 pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
     async def test_discovery_handles_rapid_worker_churn(self):
@@ -493,10 +493,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 port = s.getsockname()[1]
                 all_workers.append(create_mock_worker_info(f"localhost:{port}"))
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def collect_events():
             async for event in mock_discovery.events():
@@ -511,12 +511,12 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             # Act - Rapid registration and removal
             # Register all workers quickly
             for worker in all_workers:
-                await mock_registry.register(worker)
+                await mock_registrar.register(worker)
                 await asyncio.sleep(0.05)  # Brief delay to ensure ordering
 
             # Unregister all workers quickly
             for worker in all_workers:
-                await mock_registry.unregister(worker)
+                await mock_registrar.unregister(worker)
                 await asyncio.sleep(0.05)
 
             await asyncio.wait_for(event_task, timeout=10.0)
@@ -554,7 +554,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 await event_task
             except asyncio.CancelledError:
                 pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
     async def test_discovery_handles_empty_tag_filter(self):
@@ -570,24 +570,25 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         # Arrange
         discovered_events = []
         workers_with_tags = []
-        for _ in range(3):
+        for tags in [
+            {"production", "web"},
+            {"development", "api"},
+            set(),
+        ]:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("", 0))
                 port = s.getsockname()[1]
-                workers_with_tags.append(create_mock_worker_info(f"localhost:{port}"))
-
-        # Modify tags to create variety
-        workers_with_tags[0].tags = {"production", "web"}
-        workers_with_tags[1].tags = {"development", "api"}
-        workers_with_tags[2].tags = set()  # Empty tags
+                workers_with_tags.append(
+                    create_mock_worker_info(f"localhost:{port}", tags=frozenset(tags))
+                )
 
         expected_worker_count = len(workers_with_tags)
 
-        mock_registry = LanRegistryService()
+        mock_registrar = LanRegistrar()
         # No filter provided - should discover all workers
-        mock_discovery = LanDiscoveryService(filter=None)
+        mock_discovery = LanDiscovery(filter=None)
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def collect_events():
             async for event in mock_discovery.events():
@@ -601,7 +602,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         try:
             # Act
             for worker in workers_with_tags:
-                await mock_registry.register(worker)
+                await mock_registrar.register(worker)
                 await asyncio.sleep(0.05)
 
             await asyncio.wait_for(event_task, timeout=10.0)
@@ -627,7 +628,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 await event_task
             except asyncio.CancelledError:
                 pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
     async def test_discovery_handles_complex_tag_combinations(self):
@@ -644,20 +645,24 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         discovered_events = []
 
         workers_with_complex_tags = []
-        for _ in range(5):
+        for tags in [
+            {"production", "web", "frontend"},
+            {"production", "api", "backend"},
+            {"development", "web", "frontend"},
+            {"production"},
+            set(),
+        ]:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("", 0))
                 port = s.getsockname()[1]
                 workers_with_complex_tags.append(
-                    create_mock_worker_info(f"localhost:{port}")
+                    create_mock_worker_info(
+                        f"localhost:{port}",
+                        tags=frozenset(tags),
+                    )
                 )
 
         # Set up complex tag combinations
-        workers_with_complex_tags[0].tags = {"production", "web", "frontend"}
-        workers_with_complex_tags[1].tags = {"production", "api", "backend"}
-        workers_with_complex_tags[2].tags = {"development", "web", "frontend"}
-        workers_with_complex_tags[3].tags = {"production"}
-        workers_with_complex_tags[4].tags = set()
 
         # Filter: workers that have "production" AND either "web" OR "api"
         def complex_filter(worker_info):
@@ -669,10 +674,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         # Expected: workers 0 (production+web) and 1 (production+api)
         expected_discovered_count = 2
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService(filter=complex_filter)
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery(filter=complex_filter)
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def collect_events():
             async for event in mock_discovery.events():
@@ -686,7 +691,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
         try:
             # Act
             for worker in workers_with_complex_tags:
-                await mock_registry.register(worker)
+                await mock_registrar.register(worker)
                 await asyncio.sleep(0.05)
 
             await asyncio.wait_for(event_task, timeout=10.0)
@@ -725,14 +730,14 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 await event_task
             except asyncio.CancelledError:
                 pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
     async def test_discovery_handles_network_partition_recovery(self):
         """Test discovery service recovery after network partition simulation.
 
         Given:
-            A discovery service that loses connection to registry
+            A discovery service that loses connection to registrar
         When:
             Network connection is restored after partition
         Then:
@@ -746,10 +751,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             port = s.getsockname()[1]
             worker_for_recovery = create_mock_worker_info(f"localhost:{port}")
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         # Phase 1: Normal discovery
         async def collect_initial_events():
@@ -763,7 +768,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
 
         try:
             # Act - Phase 1: Register worker normally
-            await mock_registry.register(worker_for_recovery)
+            await mock_registrar.register(worker_for_recovery)
             await asyncio.wait_for(initial_task, timeout=5.0)
 
             # Assert Phase 1
@@ -775,7 +780,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             initial_task.cancel()
 
             # Phase 3: Simulate recovery with new discovery instance
-            mock_discovery_recovery = LanDiscoveryService()
+            mock_discovery_recovery = LanDiscovery()
 
             async def collect_recovery_events():
                 async for event in mock_discovery_recovery.events():
@@ -807,7 +812,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                     recovery_task.cancel()
                 except Exception:
                     pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
     async def test_discovery_worker_update_propagation(self, worker_address: str):
@@ -835,10 +840,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             extra={"update_time": "2023-11-01"},  # Different extra
         )
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def collect_events():
             async for event in mock_discovery.events():
@@ -850,11 +855,11 @@ class TestServiceRegistrationAndDiscoveryIntegration:
 
         try:
             # Act
-            await mock_registry.register(original_worker)
+            await mock_registrar.register(original_worker)
             await asyncio.sleep(0.2)  # Let registration propagate
 
             # Update worker properties
-            await mock_registry.update(updated_worker)
+            await mock_registrar.update(updated_worker)
             await asyncio.wait_for(event_task, timeout=5.0)
 
             # Assert
@@ -875,7 +880,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 await event_task
             except asyncio.CancelledError:
                 pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
     @pytest.mark.asyncio
     async def test_discovery_handles_worker_update_failure(self, worker_address: str):
@@ -903,10 +908,10 @@ class TestServiceRegistrationAndDiscoveryIntegration:
             extra={"update_time": "2023-11-01"},
         )
 
-        mock_registry = LanRegistryService()
-        mock_discovery = LanDiscoveryService()
+        mock_registrar = LanRegistrar()
+        mock_discovery = LanDiscovery()
 
-        await mock_registry.start()
+        await mock_registrar.start()
 
         async def collect_events():
             async for event in mock_discovery.events():
@@ -918,24 +923,24 @@ class TestServiceRegistrationAndDiscoveryIntegration:
 
         try:
             # Act
-            await mock_registry.register(original_worker)
+            await mock_registrar.register(original_worker)
             await asyncio.wait_for(event_task, timeout=3.0)
 
             # Assert initial state
             assert len(discovered_events) == 1
             assert discovered_events[0].type == "worker_added"
 
-            # Verify registry maintains consistent state even if update might fail
-            # (The registry should be robust enough to handle Zeroconf failures)
-            original_service_count = len(mock_registry.services)
+            # Verify registrar maintains consistent state even if update might fail
+            # (The registrar should be robust enough to handle Zeroconf failures)
+            original_service_count = len(mock_registrar.services)
 
             try:
-                await mock_registry.update(updated_worker)
+                await mock_registrar.update(updated_worker)
                 # If update succeeds, that's fine too
             except Exception:
-                # If update fails, verify registry state is still consistent
-                assert len(mock_registry.services) == original_service_count
-                assert original_worker.uid in mock_registry.services
+                # If update fails, verify registrar state is still consistent
+                assert len(mock_registrar.services) == original_service_count
+                assert original_worker.uid in mock_registrar.services
 
         finally:
             event_task.cancel()
@@ -943,7 +948,7 @@ class TestServiceRegistrationAndDiscoveryIntegration:
                 await event_task
             except asyncio.CancelledError:
                 pass
-            await mock_registry.stop()
+            await mock_registrar.stop()
 
 
 # Property-Based Testing Data Generation
