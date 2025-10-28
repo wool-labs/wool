@@ -30,6 +30,7 @@ from uuid import uuid4
 import cloudpickle
 
 import wool
+from wool import _context as ctx
 from wool import _protobuf as pb
 from wool._typing import PassthroughDecorator
 
@@ -171,7 +172,7 @@ def _dispatch(
         tag=f"{module}.{qualname}({signature})",
         proxy=proxy,
     )
-    return proxy.dispatch(task)
+    return proxy.dispatch(task, timeout=ctx.dispatch_timeout.get())
 
 
 async def _execute(fn: AsyncCallable, parent, *args, **kwargs):
@@ -187,7 +188,7 @@ async def _execute(fn: AsyncCallable, parent, *args, **kwargs):
 
 async def _stream_to_coroutine(stream):
     result = None
-    async for result in stream:
+    async for result in await stream:
         continue
     return result
 
@@ -412,7 +413,7 @@ class WoolTaskEvent:
     :param type:
         The type of task event (e.g., "task-created", "task-scheduled").
     :param task:
-        The :py:class:`WoolTask` instance associated with this event.
+        The :class:`WoolTask` instance associated with this event.
     """
 
     type: WoolTaskEventType
@@ -427,7 +428,7 @@ class WoolTaskEvent:
         :param type:
             The type of the task event.
         :param task:
-            The :py:class:`WoolTask` instance associated with the event.
+            The :class:`WoolTask` instance associated with the event.
         """
         self.type = type
         self.task = task
