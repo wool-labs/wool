@@ -1540,7 +1540,7 @@ class TestSerializationFunctions:
         assert set(json.loads(result["tags"])) == {"test", "worker"}
         assert json.loads(result["extra"]) == {"region": "us-west-1"}
 
-    def test_serialize_worker_info_with_empty_collections(self, worker_info):
+    def test_serialize_worker_info_with_empty_collections(self):
         """Test serialization with empty tags and extra fields.
 
         Given:
@@ -1550,9 +1550,13 @@ class TestSerializationFunctions:
         Then:
             It should handle empty collections appropriately
         """
-        # Arrange - modify fixture to have empty collections
-        worker_info.tags = set()
-        worker_info.extra = {}
+        worker_info = discovery.WorkerInfo(
+            uid="worker-test-123",
+            host="127.0.0.1",
+            port=48800,
+            pid=12345,
+            version="1.0.0",
+        )
 
         # Act
         result = discovery._serialize_worker_info(worker_info)
@@ -1665,24 +1669,6 @@ class TestSerializationFunctions:
 
 
 class TestWorkerInfo:
-    def test_worker_info_hash_method(self, worker_info):
-        """Test WorkerInfo.__hash__ method returns hash of uid.
-
-        Given:
-            A WorkerInfo instance
-        When:
-            __hash__ is called (via hash() built-in)
-        Then:
-            Should return hash of the uid
-        """
-
-        # Act
-        worker_hash = hash(worker_info)
-
-        # Assert
-        expected_hash = hash(worker_info.uid)
-        assert worker_hash == expected_hash
-
     def test_worker_info_hash_consistency(self):
         """Test WorkerInfo.__hash__ is consistent for same uid.
 
@@ -2414,16 +2400,20 @@ class TestDiscovery:
 
         service = DummyDiscovery(filter=test_filter)
 
-        # Should not raise exception
-        pickled_data = cloudpickle.dumps(service)
-        unpickled_service = cloudpickle.loads(pickled_data)
+        test_worker_info = discovery.WorkerInfo(
+            uid="test-worker-123",
+            host="127.0.0.1",
+            port=48800,
+            pid=12345,
+            version="1.0.0",
+        )
+
+        unpickled_service = cloudpickle.loads(cloudpickle.dumps(service))
 
         assert isinstance(unpickled_service, DummyDiscovery)
-        assert unpickled_service._started is False
-        assert unpickled_service._filter is not None
-        # Filter should be preserved - modify the fixture worker to match filter
-        worker_info.uid = "test-worker-123"
-        assert unpickled_service._filter(worker_info) is True
+        assert unpickled_service.started is False
+        assert unpickled_service.filter is not None
+        assert unpickled_service.filter(test_worker_info)
 
     @pytest.mark.asyncio
     async def test_discovery_service_async_iteration(self, dummy_discovery_service):
@@ -2749,8 +2739,9 @@ class TestLocalRegistrar:
 
         # Mock SharedMemory constructor to return our mock
         mocker.patch.object(
-            discovery.multiprocessing.shared_memory, "SharedMemory",
-            return_value=mock_shared_memory
+            discovery.multiprocessing.shared_memory,
+            "SharedMemory",
+            return_value=mock_shared_memory,
         )
 
         registrar_uri = "test_cleanup_errors"

@@ -28,7 +28,7 @@ message Nack {
 }
 
 message StopRequest {
-    int32 wait = 1;
+    float timeout = 1;
 }
 
 message Void {}

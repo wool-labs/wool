@@ -6,10 +6,7 @@ import pytest
 
 import wool
 from wool import _worker
-from wool._protobuf.worker import WorkerStub
-from wool._protobuf.worker import add_WorkerServicer_to_server
 from wool._resource_pool import ResourcePool
-from wool._worker import WorkerService
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +60,9 @@ def mock_worker_proxy_cache(mocker):
     mock_proxy = mocker.MagicMock()  # This will be returned by the context manager
     mock_pool.acquire.return_value.__aenter__ = mocker.AsyncMock(return_value=mock_proxy)
     mock_pool.acquire.return_value.__aexit__ = mocker.AsyncMock(return_value=False)
+    mock_pool.get.return_value.__aenter__ = mocker.AsyncMock(return_value=mock_proxy)
+    mock_pool.get.return_value.__aexit__ = mocker.AsyncMock(return_value=False)
+    mock_pool.clear = mocker.AsyncMock()
 
     # Store original context var
 
@@ -85,21 +85,6 @@ def mock_worker_thread(mocker):
     mock = mocker.patch.object(_worker, "WorkerThread", autospec=True)
     mock.return_value._loop = mocker.MagicMock()
     return mock
-
-
-@pytest.fixture(scope="function")
-def grpc_add_to_server():
-    return add_WorkerServicer_to_server
-
-
-@pytest.fixture(scope="function")
-def grpc_servicer():
-    return WorkerService()
-
-
-@pytest.fixture(scope="function")
-def grpc_stub_cls():
-    return WorkerStub
 
 
 class DependencyItemStatus:

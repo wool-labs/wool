@@ -1,31 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
 import uuid
 from typing import TYPE_CHECKING
 from typing import AsyncContextManager
 from typing import AsyncIterator
 from typing import Awaitable
-from typing import Callable
 from typing import ContextManager
-from typing import Final
 from typing import Generic
-from typing import Protocol
 from typing import Sequence
 from typing import TypeAlias
 from typing import TypeVar
 from typing import overload
-from typing import runtime_checkable
-
-import grpc
-import grpc.aio
 
 import wool
-from wool import _protobuf as pb
-from wool._resource_pool import Resource
+from wool._connection import Connection
+from wool._loadbalancer import LoadBalancerContext
+from wool._loadbalancer import LoadBalancerLike
+from wool._loadbalancer import RoundRobinLoadBalancer
 from wool._resource_pool import ResourcePool
-from wool._worker import WorkerClient
 from wool._worker_discovery import DiscoveryEvent
 from wool._worker_discovery import DiscoveryLike
 from wool._worker_discovery import Factory
@@ -67,163 +60,35 @@ class ReducibleAsyncIterator(Generic[T]):
         return (self.__class__, (self._items,))
 
 
-async def client_factory(address: str) -> WorkerClient:
-    """Factory function for creating gRPC channels.
+async def connection_factory(target: str) -> Connection:
+    """Factory function for creating worker connections.
 
-    Creates an insecure gRPC channel for the given address.
-    The address is passed as the key from ResourcePool.
+    Creates a connection to the specified worker target.
+    The target is passed as the key from ResourcePool.
 
-    :param address:
-        The network address (host:port) to create a channel for.
+    :param target:
+        The network target (host:port) to create a channel for.
     :returns:
-        A new gRPC channel for the address.
+        A new connection to the target.
     """
-    return WorkerClient(address)
+    return Connection(target)
 
 
-async def client_finalizer(client: WorkerClient) -> None:
+async def connection_finalizer(connection: Connection) -> None:
     """Finalizer function for gRPC channels.
 
-    Closes the gRPC client when it's being cleaned up from the resource pool.
+    Closes the gRPC connection when it's being cleaned up from the resource pool.
 
-    :param client:
-        The gRPC client to close.
+    :param connection:
+        The gRPC connection to close.
     """
     try:
-        await client.stop()
+        await connection.close()
     except Exception:
         pass
 
 
 WorkerUri: TypeAlias = str
-
-
-class NoWorkersAvailable(Exception):
-    """Raised when no workers are available for task dispatch.
-
-    This exception indicates that either no workers exist in the worker pool
-    or all available workers have been tried and failed with transient errors.
-    """
-
-
-# public
-@runtime_checkable
-class LoadBalancerLike(Protocol):
-    """Protocol for load balancer v2 that directly dispatches tasks.
-
-    This simplified protocol does not manage discovery services and instead
-    operates on a dynamic list of (worker_uri, WorkerInfo) tuples sorted by
-    worker_uri. It only defines a dispatch method that accepts a WoolTask and
-    returns a task result.
-
-    Expected constructor signature (see LoadBalancerV2Factory):
-        __init__(self, workers: list[tuple[str, WorkerInfo]])
-    """
-
-    def dispatch(self, task: WoolTask) -> AsyncIterator: ...
-
-    def worker_added_callback(
-        self, client: Callable[[], Resource[WorkerClient]], info: WorkerInfo
-    ): ...
-
-    def worker_updated_callback(
-        self, client: Callable[[], Resource[WorkerClient]], info: WorkerInfo
-    ): ...
-
-    def worker_removed_callback(self, info: WorkerInfo): ...
-
-
-DispatchCall: TypeAlias = grpc.aio.UnaryStreamCall[pb.task.Task, pb.worker.Response]
-
-
-class RoundRobinLoadBalancer:
-    """Round-robin load balancer for distributing tasks across workers.
-
-    Distributes tasks evenly across available workers using a simple round-robin
-    algorithm. Automatically handles worker failures by trying the next worker
-    when transient errors occur. Workers are dynamically managed through
-    callback methods for addition, updates, and removal.
-    """
-
-    TRANSIENT_ERRORS: Final = {
-        grpc.StatusCode.UNAVAILABLE,
-        grpc.StatusCode.DEADLINE_EXCEEDED,
-        grpc.StatusCode.RESOURCE_EXHAUSTED,
-    }
-
-    _current_index: int
-    _workers: dict[WorkerInfo, Callable[[], Resource[WorkerClient]]]
-
-    def __init__(self):
-        """Initialize the round-robin load balancer.
-
-        Sets up internal state for tracking workers and round-robin index.
-        Workers are managed dynamically through callback methods.
-        """
-        self._current_index = 0
-        self._workers = {}
-
-    async def dispatch(self, task: WoolTask) -> AsyncIterator:
-        """Dispatch a task to the next available worker using round-robin.
-
-        Tries all workers in one round-robin cycle. If a worker fails with a
-        transient error, continues to the next worker. Returns a streaming
-        result that automatically manages channel cleanup.
-
-        :param task:
-            The WoolTask to dispatch.
-        :returns:
-            A streaming dispatch result that yields worker responses.
-        :raises NoWorkersAvailable:
-            If no workers are available or all workers fail with transient errors.
-        """
-        # Track the first worker URI we try to detect when we've looped back
-        checkpoint = None
-
-        while self._workers:
-            self._current_index = self._current_index + 1
-            if self._current_index >= len(self._workers):
-                # Reset index if it's out of bounds
-                self._current_index = 0
-
-            worker_info, worker_resource = next(
-                itertools.islice(
-                    self._workers.items(), self._current_index, self._current_index + 1
-                )
-            )
-
-            # Check if we've looped back to the first worker we tried
-            if checkpoint is None:
-                checkpoint = worker_info.uid
-            elif worker_info.uid == checkpoint:
-                # We've tried all workers and looped back around
-                break
-
-            async with worker_resource() as worker:
-                async for result in worker.dispatch(task):
-                    yield result
-                return
-        else:
-            raise NoWorkersAvailable("No workers available for dispatch")
-
-        # If we get here, all workers failed with transient errors
-        raise NoWorkersAvailable(
-            f"All {len(self._workers)} workers failed with transient errors"
-        )
-
-    def worker_added_callback(
-        self, client: Callable[[], Resource[WorkerClient]], info: WorkerInfo
-    ):
-        self._workers[info] = client
-
-    def worker_updated_callback(
-        self, client: Callable[[], Resource[WorkerClient]], info: WorkerInfo
-    ):
-        self._workers[info] = client
-
-    def worker_removed_callback(self, info: WorkerInfo):
-        if info in self._workers:
-            del self._workers[info]
 
 
 # public
@@ -306,9 +171,8 @@ class WorkerProxy:
                 "sequence of workers"
             )
 
-        self._id: Final = uuid.uuid4()
+        self._id: uuid.UUID = uuid.uuid4()
         self._started = False
-        self._workers: dict[WorkerInfo, Resource[WorkerClient]] = {}
         self._loadbalancer = loadbalancer
 
         match (pool_uri, discovery, workers):
@@ -328,6 +192,7 @@ class WorkerProxy:
                     "pool_uri, discovery_event_stream, or workers"
                 )
         self._sentinel_task: asyncio.Task[None] | None = None
+        self._loadbalancer_context: LoadBalancerContext | None = None
 
     async def __aenter__(self):
         """Starts the proxy and sets it as the active context."""
@@ -374,9 +239,12 @@ class WorkerProxy:
         return self._started
 
     @property
-    def workers(self) -> dict[WorkerInfo, Resource[WorkerClient]]:
+    def workers(self) -> list[WorkerInfo]:
         """A list of the currently discovered worker gRPC stubs."""
-        return self._workers
+        if self._loadbalancer_context:
+            return list(self._loadbalancer_context.workers.keys())
+        else:
+            return []
 
     async def start(self) -> None:
         """Starts the proxy by initiating the worker discovery process.
@@ -387,22 +255,25 @@ class WorkerProxy:
         if self._started:
             raise RuntimeError("Proxy already started")
 
-        (self._loadbalancer_service, self._loadbalancer_ctx) = await self._enter_context(
-            self._loadbalancer
-        )
+        (
+            self._loadbalancer_service,
+            self._loadbalancer_context_manager,
+        ) = await self._enter_context(self._loadbalancer)
         if not isinstance(self._loadbalancer_service, LoadBalancerLike):
             raise ValueError
 
-        self._discovery_service, self._discovery_ctx = await self._enter_context(
-            self._discovery
-        )
+        (
+            self._discovery_service,
+            self._discovery_context_manager,
+        ) = await self._enter_context(self._discovery)
         if not isinstance(self._discovery_service, DiscoveryLike):
             raise ValueError
 
         self._proxy_token = wool.__proxy__.set(self)
-        self._client_pool = ResourcePool(
-            factory=client_factory, finalizer=client_finalizer, ttl=60
+        self._connection_pool = ResourcePool(
+            factory=connection_factory, finalizer=connection_finalizer, ttl=60
         )
+        self._loadbalancer_context = LoadBalancerContext()
         self._sentinel_task = asyncio.create_task(self._worker_sentinel())
         self._started = True
 
@@ -415,8 +286,8 @@ class WorkerProxy:
         if not self._started:
             raise RuntimeError("Proxy not started - call start() first")
 
-        await self._exit_context(self._discovery_ctx, *args)
-        await self._exit_context(self._loadbalancer_ctx, *args)
+        await self._exit_context(self._discovery_context_manager, *args)
+        await self._exit_context(self._loadbalancer_context_manager, *args)
 
         wool.__proxy__.reset(self._proxy_token)
         if self._sentinel_task:
@@ -426,12 +297,11 @@ class WorkerProxy:
             except asyncio.CancelledError:
                 pass
             self._sentinel_task = None
-        await self._client_pool.clear()
-
-        self._workers.clear()
+        await self._connection_pool.clear()
+        self._loadbalancer_context = None
         self._started = False
 
-    async def dispatch(self, task: WoolTask):
+    async def dispatch(self, task: WoolTask, *, timeout: float | None = None):
         """Dispatches a task to an available worker in the pool.
 
         This method selects a worker using a round-robin strategy. If no
@@ -439,7 +309,7 @@ class WorkerProxy:
         exception.
 
         :param task:
-            The :py:class:`WoolTask` object to be dispatched.
+            The :class:`WoolTask` object to be dispatched.
         :param timeout:
             Timeout in seconds for getting a worker.
         :returns:
@@ -455,8 +325,10 @@ class WorkerProxy:
         await asyncio.wait_for(self._await_workers(), 60)
 
         assert isinstance(self._loadbalancer_service, LoadBalancerLike)
-        async for result in self._loadbalancer_service.dispatch(task):
-            yield result
+        assert self._loadbalancer_context
+        return await self._loadbalancer_service.dispatch(
+            task, context=self._loadbalancer_context, timeout=timeout
+        )
 
     async def _enter_context(self, factory):
         ctx = None
@@ -483,30 +355,26 @@ class WorkerProxy:
             ctx.__exit__(*args)
 
     async def _await_workers(self):
-        while not self._loadbalancer_service._workers:
+        while not self._loadbalancer_context or not self._loadbalancer_context.workers:
             await asyncio.sleep(0)
 
     async def _worker_sentinel(self):
-        assert isinstance(self._discovery_service, AsyncIterator)
-        assert isinstance(self._loadbalancer_service, LoadBalancerLike)
+        assert self._loadbalancer_context
         async for event in self._discovery_service:
             match event.type:
                 case "worker_added":
-                    self._loadbalancer_service.worker_added_callback(
-                        lambda: self._client_pool.get(
+                    self._loadbalancer_context.add_worker(
+                        event.worker_info,
+                        lambda: self._connection_pool.get(
                             f"{event.worker_info.host}:{event.worker_info.port}",
                         ),
-                        event.worker_info,
                     )
                 case "worker_updated":
-                    self._loadbalancer_service.worker_updated_callback(
-                        lambda: self._client_pool.get(
+                    self._loadbalancer_context.update_worker(
+                        event.worker_info,
+                        lambda: self._connection_pool.get(
                             f"{event.worker_info.host}:{event.worker_info.port}",
                         ),
-                        event.worker_info,
                     )
                 case "worker_removed":
-                    if event.worker_info.uid in self._workers:
-                        self._loadbalancer_service.worker_removed_callback(
-                            event.worker_info
-                        )
+                    self._loadbalancer_context.remove_worker(event.worker_info)
