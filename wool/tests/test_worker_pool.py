@@ -19,7 +19,7 @@ from wool._worker_discovery import LanRegistrar
 
 @pytest.fixture
 def mock_local_registrar(mocker: MockerFixture):
-    """Create a mock :py:class:`LocalRegistrar` for test isolation."""
+    """Create a mock :class:`LocalRegistrar` for test isolation."""
     mock_registrar = mocker.MagicMock(spec=LanRegistrar)
     mock_registrar.start = mocker.AsyncMock()
     mock_registrar.stop = mocker.AsyncMock()
@@ -78,7 +78,7 @@ def pool_config():
 
 
 class TestWorkerPool:
-    """Test suite for :py:class:`WorkerPool` constructor and lifecycle."""
+    """Test suite for :class:`WorkerPool` constructor and lifecycle."""
 
     def test_constructor_uses_cpu_count_as_default_size(self, mocker: MockerFixture):
         """Test WorkerPool constructor with default parameters.

@@ -1001,10 +1001,13 @@ class TestWoolTaskEdgeCases:
         # Arrange
         async def failing_generator():
             raise RuntimeError("Proxy dispatch failed")
-            yield  # unreachable
+            yield
+
+        async def failing_coroutine():
+            return failing_generator()
 
         failing_proxy = MagicMock(spec=WorkerProxy)
-        failing_proxy.dispatch = MagicMock(return_value=failing_generator())
+        failing_proxy.dispatch = MagicMock(return_value=failing_coroutine())
         token = wool.__proxy__.set(failing_proxy)
 
         try:
@@ -1232,7 +1235,7 @@ class TestWorkDecorator:
         # Arrange & Act & Assert
         with pytest.raises(ValueError, match="Expected a coroutine function"):
 
-            @work
+            @work  # type: ignore
             def non_async_function():
                 return "not async"
 
@@ -1306,8 +1309,11 @@ class TestWorkDecorator:
         async def mock_async_generator():
             yield "dispatched_result"
 
+        async def mock_coroutine():
+            return mock_async_generator()
+
         mock_dispatch_function = mocker.patch("wool._work._dispatch")
-        mock_dispatch_function.return_value = mock_async_generator()
+        mock_dispatch_function.return_value = mock_coroutine()
 
         try:
             # Act
@@ -1346,8 +1352,11 @@ class TestWorkDecorator:
         async def mock_async_generator():
             yield "method_result"
 
+        async def mock_coroutine():
+            return mock_async_generator()
+
         mock_dispatch = mocker.patch("wool._work._dispatch")
-        mock_dispatch.return_value = mock_async_generator()
+        mock_dispatch.return_value = mock_coroutine()
 
         try:
             instance = DummyWorkClass()
@@ -1385,8 +1394,11 @@ class TestWorkDecorator:
         async def mock_async_generator():
             yield "kwargs_result"
 
+        async def mock_coroutine():
+            return mock_async_generator()
+
         mock_dispatch = mocker.patch("wool._work._dispatch")
-        mock_dispatch.return_value = mock_async_generator()
+        mock_dispatch.return_value = mock_coroutine()
 
         try:
             # Act
@@ -1516,7 +1528,10 @@ class TestWorkDecorator:
         async def mock_async_generator():
             yield "metadata_result"
 
-        mock_proxy.dispatch = MagicMock(return_value=mock_async_generator())
+        async def mock_coroutine():
+            return mock_async_generator()
+
+        mock_proxy.dispatch = MagicMock(return_value=mock_coroutine())
         token = wool.__proxy__.set(mock_proxy)
 
         try:
@@ -1577,7 +1592,10 @@ class TestWorkDecorator:
         async def mock_async_generator():
             yield "method_result"
 
-        mock_proxy.dispatch = MagicMock(return_value=mock_async_generator())
+        async def mock_coroutine():
+            return mock_async_generator()
+
+        mock_proxy.dispatch = MagicMock(return_value=mock_coroutine())
         token = wool.__proxy__.set(mock_proxy)
 
         try:
@@ -1615,7 +1633,10 @@ class TestWorkDecorator:
         async def mock_async_generator():
             yield "mixed_result"
 
-        mock_proxy.dispatch = MagicMock(return_value=mock_async_generator())
+        async def mock_coroutine():
+            return mock_async_generator()
+
+        mock_proxy.dispatch = MagicMock(return_value=mock_coroutine())
         token = wool.__proxy__.set(mock_proxy)
 
         try:

@@ -25,7 +25,7 @@ class Resource(Generic[T]):
     released again.
 
     :param pool:
-        The :py:class:`ResourcePool` this resource belongs to.
+        The :class:`ResourcePool` this resource belongs to.
     :param key:
         The cache key for this resource.
     """
@@ -185,7 +185,7 @@ class ResourcePool(Generic[T]):
             when not concurrently modifying the cache.
 
         :returns:
-            :py:class:`ResourcePool.Stats` containing current statistics.
+            :class:`ResourcePool.Stats` containing current statistics.
         """
         pending_cleanup = sum(
             1 for c in self.pending_cleanup.values() if c is not None and not c.done()
@@ -219,7 +219,7 @@ class ResourcePool(Generic[T]):
         :param key:
             The cache key.
         :returns:
-            :py:class:`Resource` that can be awaited or used with 'async with'.
+            :class:`Resource` that can be awaited or used with 'async with'.
         """
         return Resource(self, key)
 

@@ -41,7 +41,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
-    "pytest-grpc-aio~=0.2.0",
+    "pytest-grpc-aio~=0.3.0",
     "pytest-mock",
     "ruff",
 ]

@@ -300,11 +300,11 @@ class WorkerPool:
     async def __aenter__(self) -> WorkerPool:
         """Starts the worker pool and its services, returning a session.
 
-        This method starts the worker registrar, creates a client session,
+        This method starts the worker registrar, creates a connection,
         launches all worker processes, and registers them.
 
         :returns:
-            The :py:class:`WorkerPool` instance itself for method chaining.
+            The :class:`WorkerPool` instance itself for method chaining.
         """
         self._proxy_context = self._proxy_factory()
         await self._proxy_context.__aenter__()
