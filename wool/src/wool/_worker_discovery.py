@@ -11,7 +11,7 @@ from abc import abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from dataclasses import field
-from typing import Any
+from types import MappingProxyType
 from typing import AsyncContextManager
 from typing import AsyncIterator
 from typing import Awaitable
@@ -38,7 +38,7 @@ from zeroconf.asyncio import AsyncZeroconf
 
 
 # public
-@dataclass
+@dataclass(frozen=True)
 class WorkerInfo:
     """Properties and metadata for a worker instance.
 
@@ -56,21 +56,20 @@ class WorkerInfo:
     :param version:
         Version string of the worker software.
     :param tags:
-        Set of capability tags for worker filtering and selection.
+        Frozenset of capability tags for worker filtering and selection.
     :param extra:
-        Additional arbitrary metadata as key-value pairs.
+        Additional arbitrary metadata as immutable key-value pairs.
     """
 
     uid: str
-    host: str
-    port: int | None
-    pid: int
-    version: str
-    tags: set[str] = field(default_factory=set)
-    extra: dict[str, Any] = field(default_factory=dict)
-
-    def __hash__(self) -> int:
-        return hash(self.uid)
+    host: str = field(hash=False)
+    port: int | None = field(hash=False)
+    pid: int = field(hash=False)
+    version: str = field(hash=False)
+    tags: frozenset[str] = field(default_factory=frozenset, hash=False)
+    extra: MappingProxyType = field(
+        default_factory=lambda: MappingProxyType({}), hash=False
+    )
 
 
 # public
@@ -376,6 +375,7 @@ class Discovery(ABC):
         when unpickled to support task-specific session contexts.
     """
 
+    _filter: PredicateFunction[WorkerInfo] | None
     _started: bool
     _service_cache: Dict[str, WorkerInfo]
 
@@ -398,6 +398,11 @@ class Discovery(ABC):
     async def __anext__(self) -> DiscoveryEvent:
         """Delegate to the events async iterator."""
         return await anext(self.events())
+
+    @final
+    @property
+    def filter(self) -> PredicateFunction[WorkerInfo] | None:
+        return self._filter
 
     @final
     @property

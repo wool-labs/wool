@@ -2,9 +2,6 @@ from contextvars import ContextVar
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
 from typing import Final
-from typing import Generic
-from typing import TypeVar
-from typing import cast
 
 from tblib import pickling_support
 
@@ -27,26 +24,6 @@ from wool._worker_pool import WorkerPool
 from wool._worker_proxy import WorkerProxy
 
 pickling_support.install()
-
-
-SENTINEL = object()
-
-T = TypeVar("T")
-
-
-class GlobalVar(Generic[T]):
-    def __init__(self, default: T | None = None) -> None:
-        self._default = default
-        self._value = SENTINEL
-
-    def get(self) -> T | None:
-        if self._value is SENTINEL:
-            return self._default
-        else:
-            return cast(T, self._value)
-
-    def set(self, value: T):
-        self._value = value
 
 
 try:
