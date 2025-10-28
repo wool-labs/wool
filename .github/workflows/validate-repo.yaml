@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        secret_name: [MY_TOKEN, PYPI_TOKEN]
+        secret_name: [PYPI_TOKEN, WOOL_LABS_APP_ID, WOOL_LABS_INSTALLATION_ID, WOOL_LABS_PRIVATE_KEY]
     steps:
       - name: Check ${{ matrix.secret_name }} secret
         env:

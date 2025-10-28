@@ -11,14 +11,16 @@ on:
     paths:
       - wool/src/**
       - wool/pyproject.toml
-      - wool-locking/src/**
-      - wool-locking/pyproject.toml
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
 
 jobs:
   tag-version:
     name: Tag version
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.merged == true }}
+    if: ${{ github.event.pull_request.merged == true || github.event.inputs.version != '' }}
     permissions:
       contents: write
     outputs:
@@ -28,6 +30,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Determine version segment to bump
         id: determine-version-segment
+        if: ${{ github.event.inputs.version == '' }}
         run: |
           case ${{ github.base_ref }} in
             master)
@@ -51,23 +54,50 @@ jobs:
       - name: Create tag
         id: create-tag
         run: |
-          git fetch --unshallow
-          old_version=$(git describe --tags --abbrev=0)
-          new_version=$(.github/scripts/bump-version.sh ${{ steps.determine-version-segment.outputs.segment }} $old_version)
-          echo "Bumping $old_version to $new_version"
-          git tag $new_version
-          git push origin $new_version
+          if [[ "${{ github.event.inputs.version }}" != "" ]]; then
+            new_version="${{ github.event.inputs.version }}"
+            echo "Using manually specified version: $new_version"
+          else
+            git fetch --unshallow
+            old_version=$(git describe --tags --abbrev=0)
+            new_version=$(.github/scripts/bump-version.sh ${{ steps.determine-version-segment.outputs.segment }} $old_version)
+            git tag $new_version
+            git push origin $new_version
+            echo "Bumping $old_version to $new_version"
+          fi
           echo "version=$new_version" >> $GITHUB_OUTPUT
 
   build-release:
     name: Build release
     needs: tag-version
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        source: [wool]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-release
         with:
+          source: ${{ matrix.source }}
           version: ${{ needs.tag-version.outputs.version }}
+
+  create-github-release:  
+    name: Create GitHub release
+    needs: tag-version
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ needs.tag-version.outputs.version }}" == *rc* ]]; then
+            prerelease_flag="--prerelease"
+          else
+            prerelease_flag=""
+          fi
+          gh release create ${{ needs.tag-version.outputs.version }} \
+            --repo ${{ github.repository }} \
+            --generate-notes \
+            $prerelease_flag
       
   publish-github-release:
     name: Publish release to GitHub
@@ -78,10 +108,14 @@ jobs:
     permissions:
       contents: write
       id-token: write
+    strategy:
+      matrix:
+        source: [wool]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/publish-github-release
         with:
+          source: ${{ matrix.source }}
           version: ${{ needs.tag-version.outputs.version }}
 
   publish-pypi-release:
@@ -92,9 +126,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
+    strategy:
+      matrix:
+        source: [wool]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/publish-pypi-release
         with:
+          source: ${{ matrix.source }}
           version: ${{ needs.tag-version.outputs.version }}
           pypi-token: ${{ secrets.PYPI_TOKEN }}
