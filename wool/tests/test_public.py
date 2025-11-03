@@ -23,14 +23,20 @@ def test_public_api_completeness():
     """
     # Arrange
     expected_public_api = [
-        "LanDiscovery",
-        "LanRegistrar",
-        "Worker",
-        "Discovery",
-        "WorkerPool",
-        "WorkerProxy",
-        "Registrar",
-        "WorkerService",
+        # Connection
+        "Connection",
+        "RpcError",
+        "TransientRpcError",
+        "UnexpectedResponse",
+        # Context
+        "AppContext",
+        # Load balancing
+        "ConnectionResourceFactory",
+        "LoadBalancerContext",
+        "LoadBalancerLike",
+        "NoWorkersAvailable",
+        "RoundRobinLoadBalancer",
+        # Work
         "WoolTask",
         "WoolTaskEvent",
         "WoolTaskEventCallback",
@@ -39,6 +45,24 @@ def test_public_api_completeness():
         "routine",
         "work",
         "wool_current_task",
+        # Workers
+        "LocalWorker",
+        "Worker",
+        "WorkerFactory",
+        "WorkerPool",
+        "WorkerProxy",
+        "WorkerService",
+        # Discovery
+        "DiscoveryEvent",
+        "DiscoveryEventType",
+        "DiscoveryPublisherLike",
+        "DiscoverySubscriberLike",
+        "LanDiscovery",
+        "LocalDiscovery",
+        "PredicateFunction",
+        "WorkerInfo",
+        # Typing
+        "Factory",
     ]
 
     # Act
