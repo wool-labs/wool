@@ -1,25 +1,27 @@
 from __future__ import annotations
 
 import asyncio
-import atexit
-import hashlib
 import os
+import sys
 import uuid
 from contextlib import asynccontextmanager
-from multiprocessing.shared_memory import SharedMemory
+from typing import AsyncContextManager
+from typing import Awaitable
+from typing import ContextManager
+from typing import Coroutine
 from typing import Final
 from typing import overload
 
 from wool._worker import LocalWorker
 from wool._worker import Worker
 from wool._worker import WorkerFactory
-from wool._worker_discovery import DiscoveryLike
-from wool._worker_discovery import Factory
-from wool._worker_discovery import LocalDiscovery
-from wool._worker_discovery import LocalRegistrar
 from wool._worker_proxy import LoadBalancerLike
 from wool._worker_proxy import RoundRobinLoadBalancer
 from wool._worker_proxy import WorkerProxy
+from wool.core.discovery.base import DiscoveryLike
+from wool.core.discovery.base import DiscoveryPublisherLike
+from wool.core.discovery.local import LocalDiscovery
+from wool.core.typing import Factory
 
 
 # public
@@ -62,11 +64,10 @@ class WorkerPool:
     .. code-block:: python
 
         from wool import WorkerPool, LocalWorker
-        from wool._worker_discovery import LocalRegistrar
         from functools import partial
 
-        # Custom worker factory with specific tags
-        worker_factory = partial(LocalWorker, registrar=LocalRegistrar("my-pool"))
+        # Custom worker factory with specific configuration
+        worker_factory = partial(LocalWorker, host="0.0.0.0", port=50051)
 
         async with WorkerPool(
             "gpu-capable",
@@ -81,7 +82,6 @@ class WorkerPool:
     .. code-block:: python
 
         from wool import WorkerPool
-        from wool._worker_discovery import LanDiscovery
 
         # Connect to existing workers on the network
         discovery = LanDiscovery(filter=lambda w: "production" in w.tags)
@@ -173,7 +173,7 @@ class WorkerPool:
         If invalid configuration is provided or CPU count cannot be determined.
     """
 
-    _workers: Final[list[Worker]]
+    _workers: Final[dict[Worker, Coroutine]]
 
     @overload
     def __init__(
@@ -181,6 +181,7 @@ class WorkerPool:
         *tags: str,
         size: int = 0,
         worker: WorkerFactory = LocalWorker,
+        discovery: DiscoveryLike | Factory[DiscoveryLike] | None = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
@@ -216,38 +217,40 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
     ):
-        self._workers = []
+        self._workers = {}
 
         match (size, discovery):
-            case (None, None):
-                cpu_count = os.cpu_count()
-                if cpu_count is None:
-                    raise ValueError("Unable to determine CPU count")
-                size = cpu_count
-
-                uri = f"pool-{uuid.uuid4().hex}"
+            case (size, discovery) if size is not None and discovery is not None:
+                if size == 0:
+                    cpu_count = os.cpu_count()
+                    if cpu_count is None:
+                        raise ValueError("Unable to determine CPU count")
+                    size = cpu_count
+                elif size < 0:
+                    raise ValueError("Size must be non-negative")
 
                 @asynccontextmanager
                 async def create_proxy():
-                    shared_memory_size = (size + 1) * 4
-                    shared_memory = SharedMemory(
-                        name=hashlib.sha256(uri.encode()).hexdigest()[:12],
-                        create=True,
-                        size=shared_memory_size,
-                    )
-                    cleanup = atexit.register(lambda: shared_memory.unlink())
+                    discovery_svc, discovery_ctx = await self._enter_context(discovery)
+                    if not isinstance(discovery_svc, DiscoveryLike):
+                        raise TypeError(
+                            f"Expected DiscoveryLike, got: {type(discovery_svc)}"
+                        )
+
                     try:
-                        for i in range(shared_memory_size):
-                            shared_memory.buf[i] = 0
-                        await self._spawn_workers(uri, *tags, size=size, factory=worker)
-                        async with WorkerProxy(
-                            discovery=LocalDiscovery(uri),
-                            loadbalancer=loadbalancer,
+                        async with self._worker_context(
+                            *tags,
+                            size=size,
+                            factory=worker,
+                            publisher=discovery_svc.publisher,
                         ):
-                            yield
+                            async with WorkerProxy(
+                                discovery=discovery_svc.subscribe(_predicate(tags)),
+                                loadbalancer=loadbalancer,
+                            ):
+                                yield
                     finally:
-                        shared_memory.unlink()
-                        atexit.unregister(cleanup)
+                        await self._exit_context(discovery_ctx)
 
             case (size, None) if size is not None:
                 if size == 0:
@@ -258,39 +261,61 @@ class WorkerPool:
                 elif size < 0:
                     raise ValueError("Size must be non-negative")
 
-                uri = f"pool-{uuid.uuid4().hex}"
+                namespace = f"pool-{uuid.uuid4().hex}"
 
                 @asynccontextmanager
                 async def create_proxy():
-                    shared_memory_size = (size + 1) * 4
-                    shared_memory = SharedMemory(
-                        name=hashlib.sha256(uri.encode()).hexdigest()[:12],
-                        create=True,
-                        size=shared_memory_size,
-                    )
-                    cleanup = atexit.register(lambda: shared_memory.unlink())
-                    try:
-                        for i in range(shared_memory_size):
-                            shared_memory.buf[i] = 0
-                        await self._spawn_workers(uri, *tags, size=size, factory=worker)
+                    discovery = LocalDiscovery(namespace)
+                    async with self._worker_context(
+                        *tags,
+                        size=size,
+                        factory=worker,
+                        publisher=discovery.publisher,
+                    ):
                         async with WorkerProxy(
-                            discovery=LocalDiscovery(uri),
+                            discovery=discovery.subscribe(_predicate(tags)),
                             loadbalancer=loadbalancer,
                         ):
                             yield
-                    finally:
-                        shared_memory.unlink()
-                        atexit.unregister(cleanup)
 
             case (None, discovery) if discovery is not None:
 
                 @asynccontextmanager
                 async def create_proxy():
-                    async with WorkerProxy(
-                        discovery=discovery,
-                        loadbalancer=loadbalancer,
+                    discovery_svc, discovery_ctx = await self._enter_context(discovery)
+                    if not isinstance(discovery_svc, DiscoveryLike):
+                        raise ValueError
+                    try:
+                        async with WorkerProxy(
+                            discovery=discovery_svc.subscriber,
+                            loadbalancer=loadbalancer,
+                        ):
+                            yield
+                    finally:
+                        await self._exit_context(discovery_ctx)
+
+            case (None, None):
+                cpu_count = os.cpu_count()
+                if cpu_count is None:
+                    raise ValueError("Unable to determine CPU count")
+                size = cpu_count
+
+                namespace = f"pool-{uuid.uuid4().hex}"
+
+                @asynccontextmanager
+                async def create_proxy():
+                    discovery = LocalDiscovery(namespace)
+                    async with self._worker_context(
+                        *tags,
+                        size=size,
+                        factory=worker,
+                        publisher=discovery.publisher,
                     ):
-                        yield
+                        async with WorkerProxy(
+                            discovery=discovery.subscriber,
+                            loadbalancer=loadbalancer,
+                        ):
+                            yield
 
             case _:
                 raise RuntimeError
@@ -312,33 +337,74 @@ class WorkerPool:
 
     async def __aexit__(self, *args):
         """Stops all workers and tears down the pool and its services."""
-        await self._stop_workers()
         await self._proxy_context.__aexit__(*args)
 
-    async def _spawn_workers(
-        self, uri, *tags: str, size: int, factory: WorkerFactory | None
+    @asynccontextmanager
+    async def _worker_context(
+        self,
+        *tags: str,
+        size: int,
+        factory: WorkerFactory | None,
+        publisher: DiscoveryPublisherLike,
     ):
         if factory is None:
-            factory = self._default_worker_factory(uri)
+            factory = self._default_worker_factory()
+        publisher_svc, publisher_ctx = await self._enter_context(publisher)
+        if not isinstance(publisher_svc, DiscoveryPublisherLike):
+            raise ValueError
 
         tasks = []
         for _ in range(size):
             worker = factory(*tags)
-            task = asyncio.create_task(worker.start())
+
+            async def start(worker):
+                await worker.start()
+                await publisher.publish("worker-added", worker.info)
+
+            async def stop(worker):
+                await publisher.publish("worker-dropped", worker.info)
+                await worker.stop()
+
+            task = asyncio.create_task(start(worker))
             tasks.append(task)
-            self._workers.append(worker)
+            self._workers[worker] = stop(worker)
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            yield [w.info for w in self._workers if w.info]
+        finally:
+            tasks = [asyncio.create_task(stop) for stop in self._workers.values()]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self._exit_context(publisher_ctx)
 
-        return [w.info for w in self._workers if w.info]
-
-    async def _stop_workers(self):
-        """Sends a stop command to all workers and unregisters them."""
-        tasks = [asyncio.create_task(worker.stop()) for worker in self._workers]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    def _default_worker_factory(self, uri):
+    def _default_worker_factory(self):
         def factory(*tags, **_):
-            return LocalWorker(*tags, registrar=LocalRegistrar(uri))
+            return LocalWorker(*tags)
 
         return factory
+
+    async def _enter_context(self, factory):
+        ctx = None
+        if isinstance(factory, ContextManager):
+            ctx = factory
+            obj = ctx.__enter__()
+        elif isinstance(factory, AsyncContextManager):
+            ctx = factory
+            obj = await ctx.__aenter__()
+        elif callable(factory):
+            return await self._enter_context(factory())
+        elif isinstance(factory, Awaitable):
+            obj = await factory
+        else:
+            obj = factory
+        return obj, ctx
+
+    async def _exit_context(self, ctx: AsyncContextManager | ContextManager | None):
+        if isinstance(ctx, AsyncContextManager):
+            await ctx.__aexit__(*sys.exc_info())
+        elif isinstance(ctx, ContextManager):
+            ctx.__exit__(*sys.exc_info())
+
+
+def _predicate(tags):
+    return lambda w: bool(w.tags & set(tags)) if tags else True
