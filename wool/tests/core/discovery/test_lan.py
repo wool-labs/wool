@@ -344,7 +344,6 @@ class TestLanDiscoveryPublisher:
             await publisher.publish("worker-added", worker_info)
 
             # Verify it was added
-            service_name = f"{worker_info.uid}._wool._tcp.local."
             assert str(worker_info.uid) in publisher.services
 
             # Drop the worker
@@ -779,7 +778,7 @@ class TestLanDiscoverySubscriber:
                 task2.cancel()
                 try:
                     await asyncio.gather(task1, task2, return_exceptions=True)
-                except:
+                except Exception:
                     pass
 
         # Assert - both subscribers should have received events independently
@@ -928,7 +927,7 @@ class TestLanDiscoverySubscriber:
                     events.append(event)
                     await asyncio.sleep(0.3)
                     break
-            except:
+            except Exception:
                 pass
 
         # Act
@@ -1226,7 +1225,7 @@ class TestLanDiscoverySubscriber:
                     events.append(event)
                     await asyncio.sleep(0.5)
                     break
-            except:
+            except Exception:
                 pass
 
         # Act

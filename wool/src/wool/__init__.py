@@ -10,11 +10,6 @@ from wool._connection import RpcError
 from wool._connection import TransientRpcError
 from wool._connection import UnexpectedResponse
 from wool._context import AppContext
-from wool._loadbalancer import ConnectionResourceFactory
-from wool._loadbalancer import LoadBalancerContext
-from wool._loadbalancer import LoadBalancerLike
-from wool._loadbalancer import NoWorkersAvailable
-from wool._loadbalancer import RoundRobinLoadBalancer
 from wool._resource_pool import ResourcePool
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
@@ -37,6 +32,11 @@ from wool.core.discovery.base import PredicateFunction
 from wool.core.discovery.base import WorkerInfo
 from wool.core.discovery.lan import LanDiscovery
 from wool.core.discovery.local import LocalDiscovery
+from wool.core.loadbalancer.base import ConnectionResourceFactory
+from wool.core.loadbalancer.base import LoadBalancerContext
+from wool.core.loadbalancer.base import LoadBalancerLike
+from wool.core.loadbalancer.base import NoWorkersAvailable
+from wool.core.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.core.typing import Factory
 
 pickling_support.install()

@@ -111,7 +111,9 @@ def spy_loadbalancer_with_workers(mocker: MockerFixture):
         async def dispatch(self, task, *, context, timeout=None):
             """Dispatch task to available workers."""
             if not self._workers:
-                raise wp.NoWorkersAvailable("No workers available for dispatch")
+                from wool.core.loadbalancer.base import NoWorkersAvailable
+
+                raise NoWorkersAvailable("No workers available for dispatch")
 
             # Simple dispatch to first available worker
             worker_info, worker_resource = next(iter(self._workers.items()))
@@ -865,7 +867,7 @@ class TestWorkerProxy:
 
             async def dispatch(self, task, *, context, timeout=None):
                 if not context.workers:
-                    from wool._loadbalancer import NoWorkersAvailable
+                    from wool.core.loadbalancer.base import NoWorkersAvailable
 
                     raise NoWorkersAvailable("No workers available")
 
