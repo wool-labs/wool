@@ -17,7 +17,7 @@ from wool._loadbalancer import NoWorkersAvailable
 from wool._loadbalancer import RoundRobinLoadBalancer
 from wool._resource_pool import ResourcePool
 from wool._work import WoolTask
-from wool._worker_discovery import WorkerInfo
+from wool.core.discovery.base import WorkerInfo
 
 connection_pool = ResourcePool(Connection)
 
@@ -41,7 +41,7 @@ def loadbalancer_context(draw):
 
     for i in range(worker_count):
         worker_info = WorkerInfo(
-            uid=f"worker-{i}",
+            uid=uuid4(),
             host="localhost",
             port=50051 + i,
             pid=1000 + i,
@@ -82,7 +82,7 @@ class TestLoadBalancerContext:
 
         # Add a new worker
         worker = WorkerInfo(
-            uid="new-worker",
+            uid=uuid4(),
             host="localhost",
             port=60000,
             pid=9999,
@@ -182,7 +182,7 @@ class TestLoadBalancerContext:
 
         # Upsert a new worker
         new_worker = WorkerInfo(
-            uid="upserted-worker",
+            uid=uuid4(),
             host="localhost",
             port=60000,
             pid=9999,
@@ -362,9 +362,8 @@ class TestRoundRobinLoadBalancer:
         for i in range(worker_count):
             mock_connection = mocker.create_autospec(Connection, instance=True)
             mock_connection.dispatch = mocker.AsyncMock()
-            worker_id = f"worker-{i}"
             worker_info = WorkerInfo(
-                uid=worker_id,
+                uid=uuid4(),
                 host="localhost",
                 port=50051,
                 pid=1000 + i,
@@ -498,9 +497,8 @@ class TestRoundRobinLoadBalancer:
         for i in range(worker_count):
             mock_connection = mocker.create_autospec(Connection, instance=True)
             mock_connection.dispatch = mocker.AsyncMock()
-            worker_id = f"worker-{i}"
             worker_info = WorkerInfo(
-                uid=worker_id,
+                uid=uuid4(),
                 host="localhost",
                 port=50051,
                 pid=1000 + i,

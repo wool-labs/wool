@@ -9,9 +9,9 @@ from grpc import StatusCode
 from grpc.aio import ServicerContext
 
 import wool
-from wool import _protobuf as pb
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
+from wool.core import protobuf as pb
 
 
 class ReadOnlyEvent:
