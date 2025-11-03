@@ -8,7 +8,6 @@ import pytest
 from pytest_mock import MockerFixture
 
 import wool
-from wool import _protobuf as pb
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
 from wool._work import WoolTaskException
@@ -19,6 +18,7 @@ from wool._work import _resolve
 from wool._work import current_task
 from wool._work import work
 from wool._worker_proxy import WorkerProxy
+from wool.core import protobuf as pb
 
 
 def create_mock_proxy():

@@ -10,8 +10,8 @@ from typing import TypeVar
 import cloudpickle
 import grpc.aio
 
-from wool import _protobuf as pb
 from wool._work import WoolTask
+from wool.core import protobuf as pb
 
 _DispatchCall: TypeAlias = grpc.aio.UnaryStreamCall[pb.task.Task, pb.worker.Response]
 

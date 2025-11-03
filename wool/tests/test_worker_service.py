@@ -9,13 +9,13 @@ import pytest
 from grpc import StatusCode
 from pytest_mock import MockerFixture
 
-from wool import _protobuf as pb
-from wool._protobuf.worker import WorkerStub
-from wool._protobuf.worker import add_WorkerServicer_to_server
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
 from wool._worker_service import ReadOnlyEvent
 from wool._worker_service import WorkerService
+from wool.core import protobuf as pb
+from wool.core.protobuf.worker import WorkerStub
+from wool.core.protobuf.worker import add_WorkerServicer_to_server
 
 
 @pytest.fixture(scope="function")

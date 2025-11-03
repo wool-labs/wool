@@ -13,7 +13,7 @@ from typing import runtime_checkable
 from wool._connection import Connection
 from wool._connection import TransientRpcError
 from wool._resource_pool import Resource
-from wool._worker_discovery import WorkerInfo
+from wool.core.discovery.base import WorkerInfo
 
 if TYPE_CHECKING:
     from wool._work import WoolTask
