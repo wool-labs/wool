@@ -19,11 +19,11 @@ from wool._loadbalancer import LoadBalancerContext
 from wool._loadbalancer import LoadBalancerLike
 from wool._loadbalancer import RoundRobinLoadBalancer
 from wool._resource_pool import ResourcePool
-from wool._worker_discovery import DiscoveryEvent
-from wool._worker_discovery import DiscoveryLike
-from wool._worker_discovery import Factory
-from wool._worker_discovery import LocalDiscovery
-from wool._worker_discovery import WorkerInfo
+from wool.core.discovery.base import DiscoveryEvent
+from wool.core.discovery.base import DiscoverySubscriberLike
+from wool.core.discovery.base import WorkerInfo
+from wool.core.discovery.local import LocalDiscovery
+from wool.core.typing import Factory
 
 if TYPE_CHECKING:
     from wool._work import WoolTask
@@ -118,9 +118,10 @@ class WorkerProxy:
         Load balancer implementation or factory for task distribution.
     """
 
-    _discovery: DiscoveryLike | Factory[DiscoveryLike]
+    _discovery: DiscoverySubscriberLike | Factory[DiscoverySubscriberLike]
     _discovery_manager: (
-        AsyncContextManager[DiscoveryLike] | ContextManager[DiscoveryLike]
+        AsyncContextManager[DiscoverySubscriberLike]
+        | ContextManager[DiscoverySubscriberLike]
     )
 
     _loadbalancer = LoadBalancerLike | Factory[LoadBalancerLike]
@@ -132,7 +133,7 @@ class WorkerProxy:
     def __init__(
         self,
         *,
-        discovery: DiscoveryLike | Factory[DiscoveryLike],
+        discovery: DiscoverySubscriberLike | Factory[DiscoverySubscriberLike],
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
@@ -160,7 +161,9 @@ class WorkerProxy:
         self,
         pool_uri: str | None = None,
         *tags: str,
-        discovery: (DiscoveryLike | Factory[DiscoveryLike] | None) = None,
+        discovery: (
+            DiscoverySubscriberLike | Factory[DiscoverySubscriberLike] | None
+        ) = None,
         workers: Sequence[WorkerInfo] | None = None,
         loadbalancer: LoadBalancerLike
         | Factory[LoadBalancerLike] = RoundRobinLoadBalancer,
@@ -177,14 +180,14 @@ class WorkerProxy:
 
         match (pool_uri, discovery, workers):
             case (pool_uri, None, None) if pool_uri is not None:
-                self._discovery = LocalDiscovery(
-                    pool_uri, filter=lambda w: bool({pool_uri, *tags} & w.tags)
+                self._discovery = LocalDiscovery(pool_uri).subscribe(
+                    filter=lambda w: bool({pool_uri, *tags} & w.tags)
                 )
             case (None, discovery, None) if discovery is not None:
                 self._discovery = discovery
             case (None, None, workers) if workers is not None:
                 self._discovery = ReducibleAsyncIterator(
-                    [DiscoveryEvent(type="worker_added", worker_info=w) for w in workers]
+                    [DiscoveryEvent(type="worker-added", worker_info=w) for w in workers]
                 )
             case _:
                 raise ValueError(
@@ -263,10 +266,10 @@ class WorkerProxy:
             raise ValueError
 
         (
-            self._discovery_service,
+            self._discovery_stream,
             self._discovery_context_manager,
         ) = await self._enter_context(self._discovery)
-        if not isinstance(self._discovery_service, DiscoveryLike):
+        if not isinstance(self._discovery_stream, DiscoverySubscriberLike):
             raise ValueError
 
         self._proxy_token = wool.__proxy__.set(self)
@@ -360,21 +363,21 @@ class WorkerProxy:
 
     async def _worker_sentinel(self):
         assert self._loadbalancer_context
-        async for event in self._discovery_service:
+        async for event in self._discovery_stream:
             match event.type:
-                case "worker_added":
+                case "worker-added":
                     self._loadbalancer_context.add_worker(
                         event.worker_info,
                         lambda: self._connection_pool.get(
                             f"{event.worker_info.host}:{event.worker_info.port}",
                         ),
                     )
-                case "worker_updated":
+                case "worker-updated":
                     self._loadbalancer_context.update_worker(
                         event.worker_info,
                         lambda: self._connection_pool.get(
                             f"{event.worker_info.host}:{event.worker_info.port}",
                         ),
                     )
-                case "worker_removed":
+                case "worker-dropped":
                     self._loadbalancer_context.remove_worker(event.worker_info)

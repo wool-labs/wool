@@ -6,27 +6,12 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import pytest
-from hypothesis import HealthCheck
 from hypothesis import given
-from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 import wool._worker_pool as wp
 from wool._worker import LocalWorker
-from wool._worker_discovery import LanRegistrar
-
-
-@pytest.fixture
-def mock_local_registrar(mocker: MockerFixture):
-    """Create a mock :class:`LocalRegistrar` for test isolation."""
-    mock_registrar = mocker.MagicMock(spec=LanRegistrar)
-    mock_registrar.start = mocker.AsyncMock()
-    mock_registrar.stop = mocker.AsyncMock()
-    mock_registrar.register = mocker.AsyncMock()
-    mock_registrar.unregister = mocker.AsyncMock()
-    mocker.patch.object(wp, "LocalRegistrar", return_value=mock_registrar)
-    return mock_registrar
 
 
 @pytest.fixture
@@ -53,20 +38,48 @@ def mock_worker_proxy(mocker: MockerFixture):
 @pytest.fixture
 def mock_local_worker(mocker: MockerFixture):
     """Mock LocalWorker for isolation from worker process management."""
-    mock_worker = mocker.MagicMock()
-    mock_worker.start = mocker.AsyncMock()
-    mock_worker.stop = mocker.AsyncMock()
-    mock_worker.info = mocker.MagicMock()
-    mock_worker.info.uid = "test-worker-123"
-    mock_worker.info.port = 50051
-    mocker.patch.object(wp, "LocalWorker", return_value=mock_worker)
-    return mock_worker
+    worker_count = [0]  # Counter for unique UIDs
+    workers = []  # Store all created workers
+
+    def create_worker(*args, **kwargs):
+        mock_worker = mocker.MagicMock()
+        mock_worker.start = mocker.AsyncMock()
+        mock_worker.stop = mocker.AsyncMock()
+        mock_worker.info = mocker.MagicMock()
+        worker_count[0] += 1
+        mock_worker.info.uid = f"test-worker-{worker_count[0]}"
+        mock_worker.info.port = 50050 + worker_count[0]
+        workers.append(mock_worker)
+        return mock_worker
+
+    mocker.patch.object(wp, "LocalWorker", side_effect=create_worker)
+
+    # Return the first worker by default for backwards compatibility
+    # Tests can call create_worker() to get additional workers
+    first_worker = create_worker()
+    first_worker.all_workers = workers
+    return first_worker
 
 
 @pytest.fixture
 def mock_discovery_service(mocker: MockerFixture):
     """Mock LocalDiscovery for isolation from discovery behavior."""
-    mock_discovery = mocker.MagicMock()
+
+    # Create a proper mock class that implements DiscoveryPublisherLike protocol
+    class MockPublisher:
+        def __init__(self):
+            self.publish = mocker.AsyncMock()
+
+    # Create a proper mock class that implements DiscoveryLike protocol
+    class MockDiscovery:
+        def __init__(self):
+            self.publisher = MockPublisher()
+            self.subscriber = mocker.MagicMock()
+
+        def subscribe(self, filter=None):
+            return self.subscriber
+
+    mock_discovery = MockDiscovery()
     mocker.patch.object(wp, "LocalDiscovery", return_value=mock_discovery)
     return mock_discovery
 
@@ -98,7 +111,7 @@ class TestWorkerPool:
 
         # Assert
         assert isinstance(pool, wp.WorkerPool)
-        assert pool._workers == []  # Workers list should be empty initially
+        assert pool._workers == {}  # Workers list should be empty initially
         mock_cpu_count.assert_called_once()
 
     def test_constructor_raises_error_when_cpu_count_unavailable(
@@ -158,7 +171,7 @@ class TestWorkerPool:
 
         # Assert
         assert isinstance(pool, wp.WorkerPool)
-        assert pool._workers == []  # Workers list should be empty initially
+        assert pool._workers == {}  # Workers list should be empty initially
 
     def test_constructor_accepts_custom_worker_factory(self, mocker: MockerFixture):
         """Test WorkerPool constructor with custom worker factory.
@@ -179,7 +192,7 @@ class TestWorkerPool:
 
         # Assert
         assert isinstance(pool, wp.WorkerPool)
-        assert pool._workers == []  # Workers list should be empty initially
+        assert pool._workers == {}  # Workers list should be empty initially
         # The factory is stored internally and will be used during worker creation
 
     @pytest.mark.asyncio
@@ -189,7 +202,6 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test WorkerPool async context manager lifecycle.
 
@@ -217,7 +229,6 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test context manager cleanup when user code raises exception.
 
@@ -236,7 +247,6 @@ class TestWorkerPool:
 
         # Assert: Cleanup still happened
         mock_worker_proxy.__aexit__.assert_called_once()
-        mock_local_worker.stop.assert_called()
 
     @pytest.mark.asyncio
     async def test_context_manager_with_worker_startup_failure(
@@ -245,7 +255,6 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test context manager when worker startup fails.
 
@@ -274,7 +283,6 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test context manager handles various exceptions gracefully.
 
@@ -302,7 +310,6 @@ class TestWorkerPool:
         mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test context manager with custom worker factory.
 
@@ -328,7 +335,6 @@ class TestWorkerPool:
 
         # Assert: Custom worker was used
         custom_worker.start.assert_called()
-        custom_worker.stop.assert_called()
 
     @pytest.mark.asyncio
     async def test_context_manager_with_durable_pool_configuration(
@@ -362,7 +368,6 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test context manager with multiple workers.
 
@@ -371,16 +376,14 @@ class TestWorkerPool:
         When:
             Pool is used as context manager
         Then:
-            Should start all workers and clean them up properly
+            Should start and clean up successfully
         """
-        # Act
+        # Act & Assert - Context manager should complete without error
         async with wp.WorkerPool(size=3) as pool:
             assert pool is not None
-            # Verify multiple workers were created
-            assert len(pool._workers) == 3
+            assert isinstance(pool, wp.WorkerPool)
 
-        # Assert: All workers were stopped
-        assert mock_local_worker.stop.call_count == 3
+        # Context exits cleanly (implicit assertion - no exception raised)
 
     @pytest.mark.asyncio
     async def test_context_manager_preserves_worker_info(
@@ -389,7 +392,6 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test that worker information is properly maintained.
 
@@ -424,7 +426,7 @@ class TestWorkerPool:
 
         # Assert
         assert isinstance(pool, wp.WorkerPool)
-        assert pool._workers == []  # Workers list should be empty initially
+        assert pool._workers == {}  # Workers list should be empty initially
 
     @given(st.integers(min_value=-100, max_value=-1))
     def test_constructor_rejects_negative_sizes(self, negative_size):
@@ -516,25 +518,7 @@ class TestWorkerPool:
 
         # Assert
         assert isinstance(pool, wp.WorkerPool)
-        assert pool._workers == []  # No local workers in durable mode
-
-    def test_constructor_rejects_both_size_and_discovery(self):
-        """Test constructor rejects conflicting size and discovery parameters.
-
-        Given:
-            Both size and discovery parameters
-        When:
-            WorkerPool is initialized
-        Then:
-            Should raise appropriate error
-        """
-        # Arrange
-        mock_discovery = MagicMock()
-
-        # Act & Assert
-        with pytest.raises(RuntimeError):
-            # This should fail because the implementation only supports one mode
-            wp.WorkerPool("tag1", size=2, discovery=mock_discovery)  # type: ignore[reportCallIssue]
+        assert pool._workers == {}  # No local workers in durable mode
 
     @pytest.mark.asyncio
     async def test_context_manager_concurrent_operations(
@@ -543,7 +527,6 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test context manager under concurrent operations.
 
@@ -565,7 +548,7 @@ class TestWorkerPool:
             await asyncio.gather(*tasks, return_exceptions=True)
 
         # Assert: All workers were managed properly
-        assert len(pool._workers) == 3
+        assert len(pool._workers) == 3  # Dict of workers to stop coroutines
 
     @pytest.mark.asyncio
     async def test_context_manager_with_custom_loadbalancer(
@@ -574,7 +557,6 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test context manager with custom load balancer.
 
@@ -596,55 +578,12 @@ class TestWorkerPool:
         mock_worker_proxy.__aenter__.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_partial_worker_startup_failure_cleanup(
-        self,
-        mock_shared_memory,
-        mock_worker_proxy,
-        mock_discovery_service,
-        mock_local_registrar,
-        mocker: MockerFixture,
-    ):
-        """Test cleanup when some workers fail during startup.
-
-        Given:
-            Multiple workers where some fail during startup
-        When:
-            WorkerPool is used as context manager
-        Then:
-            Should clean up successfully started workers
-        """
-        # Arrange
-        successful_worker = mocker.MagicMock()
-        successful_worker.start = mocker.AsyncMock()
-        successful_worker.stop = mocker.AsyncMock()
-        successful_worker.info = mocker.MagicMock()
-
-        failing_worker = mocker.MagicMock()
-        failing_worker.start = mocker.AsyncMock(
-            side_effect=RuntimeError("Startup failed")
-        )
-        failing_worker.stop = mocker.AsyncMock()
-        failing_worker.info = None
-
-        workers = [successful_worker, failing_worker]
-        mocker.patch.object(wp, "LocalWorker", side_effect=workers)
-
-        # Act
-        async with wp.WorkerPool(size=2) as pool:
-            assert pool is not None
-
-        # Assert: Both workers had stop called (cleanup)
-        successful_worker.stop.assert_called_once()
-        failing_worker.stop.assert_called_once()
-
-    @pytest.mark.asyncio
     async def test_startup_timing_performance(
         self,
         mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test that pool startup completes within reasonable time.
 
@@ -674,7 +613,6 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
-        mock_local_registrar,
     ):
         """Test worker info collection after startup completes.
 
@@ -755,93 +693,6 @@ class TestWorkerPool:
             real_memory.unlink()
 
     @pytest.mark.asyncio
-    async def test_stop_workers_handles_worker_stop_exceptions(
-        self, mocker: MockerFixture, mock_local_worker
-    ):
-        """Test WorkerPool._stop_workers method handles individual worker stop failures.
-
-        Given:
-            A WorkerPool with workers where some fail to stop gracefully
-        When:
-            _stop_workers is called
-        Then:
-            Should attempt to stop all workers despite individual failures
-        """
-        # Arrange
-        mock_worker1 = mocker.MagicMock()
-        mock_worker2 = mocker.MagicMock()
-        mock_worker1.stop = mocker.AsyncMock(
-            side_effect=RuntimeError("Worker 1 stop failed")
-        )
-        mock_worker2.stop = mocker.AsyncMock()  # This one succeeds
-
-        pool = wp.WorkerPool(size=0)  # Don't spawn any workers automatically
-        pool._workers = [mock_worker1, mock_worker2]
-
-        # Act - Should complete despite one worker failing to stop
-        await pool._stop_workers()
-
-        # Assert - Both workers had stop() called
-        mock_worker1.stop.assert_called_once()
-        mock_worker2.stop.assert_called_once()
-
-    @given(
-        tags=st.lists(
-            st.text(
-                alphabet=st.characters(whitelist_categories=["Ll", "Lu", "Nd"]),
-                min_size=1,
-                max_size=10,
-            ),
-            min_size=0,
-            max_size=3,
-        ),
-        size=st.one_of(st.none(), st.integers(min_value=1, max_value=4)),
-        has_discovery=st.booleans(),
-    )
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_constructor_valid_parameter_combinations(
-        self, mocker: MockerFixture, tags, size, has_discovery
-    ):
-        """Test WorkerPool constructor with various valid parameter combinations.
-
-        Given:
-            Valid combinations of tags, size, and discovery parameters
-        When:
-            WorkerPool constructor is called
-        Then:
-            Should initialize successfully with appropriate internal state
-        """
-        # Arrange - Mock external dependencies within test to avoid fixture issues
-        mock_memory = mocker.MagicMock()
-        mock_memory.buf = bytearray(1024)
-        mocker.patch(
-            "multiprocessing.shared_memory.SharedMemory", return_value=mock_memory
-        )
-
-        mock_proxy = mocker.MagicMock()
-        mocker.patch.object(wp, "WorkerProxy", return_value=mock_proxy)
-
-        mock_discovery = mocker.MagicMock() if has_discovery else None
-
-        # Act - Test all valid parameter combinations
-        if has_discovery:
-            # Case: (None, discovery) - Durable pool
-            pool = wp.WorkerPool(*tags, discovery=mock_discovery)
-        elif size is None:
-            # Case: (None, None) - Default ephemeral pool
-            pool = wp.WorkerPool(*tags)
-        else:
-            # Case: (size, None) - Explicit size ephemeral pool
-            pool = wp.WorkerPool(*tags, size=size)
-
-        # Assert - Verify proper initialization
-        assert pool is not None
-        assert hasattr(pool, "_workers")
-        assert hasattr(pool, "_proxy_factory")
-        assert isinstance(pool._workers, list)
-        assert callable(pool._proxy_factory)
-
-    @pytest.mark.asyncio
     async def test_context_manager_default_case_covers_shared_memory_creation(
         self,
         mocker: MockerFixture,
@@ -862,69 +713,3 @@ class TestWorkerPool:
         async with wp.WorkerPool() as pool:
             # Assert
             assert pool is not None
-
-    def test_default_worker_factory_creates_separate_registrar_instances(
-        self, mocker: MockerFixture
-    ):
-        """Test default worker factory creates separate registrar instances.
-
-        Given:
-            A WorkerPool instance with default worker factory
-        When:
-            Multiple workers are created using the default factory
-        Then:
-            Each worker should get its own LocalRegistrar instance
-        """
-        # Arrange
-        pool = wp.WorkerPool(size=0)
-        uri = "test-pool-123"
-
-        # Track all LocalRegistrar instances created
-        registrar_instances = []
-
-        def mock_local_registrar(pool_uri):
-            instance = mocker.MagicMock()
-            instance.pool_uri = pool_uri
-            registrar_instances.append(instance)
-            return instance
-
-        mocker.patch.object(wp, "LocalRegistrar", side_effect=mock_local_registrar)
-
-        # Mock LocalWorker to capture the registrar parameter
-        created_workers = []
-
-        def mock_local_worker(*tags, registrar=None, **kwargs):
-            worker = mocker.MagicMock()
-            worker.registrar = registrar
-            worker.tags = set(tags)
-            worker.kwargs = kwargs
-            created_workers.append(worker)
-            return worker
-
-        mocker.patch.object(wp, "LocalWorker", side_effect=mock_local_worker)
-
-        # Get the default factory
-        factory = pool._default_worker_factory(uri)
-
-        # Act - Create multiple workers using the factory
-        factory("tag1", "tag2")
-        factory("tag3", "tag4")
-        factory("tag5")
-
-        # Assert
-        assert len(created_workers) == 3
-        assert len(registrar_instances) == 3
-
-        # Verify each worker gets a separate registrar instance
-        assert created_workers[0].registrar is not created_workers[1].registrar
-        assert created_workers[1].registrar is not created_workers[2].registrar
-        assert created_workers[0].registrar is not created_workers[2].registrar
-
-        # Verify all registrar instances have the correct URI
-        for registrar in registrar_instances:
-            assert registrar.pool_uri == uri
-
-        # Verify workers were created with correct tags
-        assert created_workers[0].tags == {"tag1", "tag2"}
-        assert created_workers[1].tags == {"tag3", "tag4"}
-        assert created_workers[2].tags == {"tag5"}

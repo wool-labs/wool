@@ -22,12 +22,10 @@ from typing import final
 import grpc.aio
 
 import wool
-from wool import _protobuf as pb
 from wool._resource_pool import ResourcePool
-from wool._worker_discovery import Factory
-from wool._worker_discovery import RegistrarLike
-from wool._worker_discovery import WorkerInfo
 from wool._worker_service import WorkerService
+from wool.core import protobuf as pb
+from wool.core.discovery.base import WorkerInfo
 
 if TYPE_CHECKING:
     from wool._worker_proxy import WorkerProxy
@@ -101,23 +99,17 @@ class Worker(ABC):
 
     _info: WorkerInfo | None = None
     _started: bool = False
-    _registrar: RegistrarLike | Factory[RegistrarLike]
-    _registrar_service: RegistrarLike | None = None
-    _registrar_context: Any | None = None
-    _uid: Final[str]
+    _uid: Final[uuid.UUID]
     _tags: Final[set[str]]
     _extra: Final[dict[str, Any]]
 
-    def __init__(
-        self, *tags: str, registrar: RegistrarLike | Factory[RegistrarLike], **extra: Any
-    ):
-        self._uid = f"worker-{uuid.uuid4().hex}"
+    def __init__(self, *tags: str, **extra: Any):
+        self._uid = uuid.uuid4()
         self._tags = set(tags)
         self._extra = extra
-        self._registrar = registrar
 
     @property
-    def uid(self) -> str:
+    def uid(self) -> uuid.UUID:
         """The worker's unique identifier."""
         return self._uid
 
@@ -174,16 +166,9 @@ class Worker(ABC):
         if self._started:
             raise RuntimeError("Worker has already been started")
 
-        self._registrar_service, self._registrar_context = await self._enter_context(
-            self._registrar
-        )
-        if not isinstance(self._registrar_service, RegistrarLike):
-            raise ValueError("Registrar factory must return a RegistrarLike instance")
-
         await self._start(timeout=timeout)
         self._started = True
         assert self._info
-        await self._registrar_service.register(self._info)
 
     @final
     async def stop(self, *, timeout: float | None = None):
@@ -196,18 +181,9 @@ class Worker(ABC):
         if not self._started:
             raise RuntimeError("Worker has not been started")
         try:
-            if not self._info:
-                raise RuntimeError("Cannot unregister - worker has no info")
-            assert self._registrar_service is not None
-            await self._registrar_service.unregister(self._info)
+            await self._stop(timeout)
         finally:
-            try:
-                await self._stop(timeout)
-            finally:
-                await self._exit_context(self._registrar_context)
-                self._registrar_service = None
-                self._registrar_context = None
-                self._started = False
+            self._started = False
 
     @abstractmethod
     async def _start(self, timeout: float | None):
@@ -322,12 +298,11 @@ class LocalWorker(Worker):
         *tags: str,
         host: str = "127.0.0.1",
         port: int = 0,
-        registrar: RegistrarLike | Factory[RegistrarLike],
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
         **extra: Any,
     ):
-        super().__init__(*tags, registrar=registrar, **extra)
+        super().__init__(*tags, **extra)
         self._worker_process = WorkerProcess(
             host=host,
             port=port,
