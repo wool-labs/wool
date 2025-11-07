@@ -10,11 +10,6 @@ from wool._connection import RpcError
 from wool._connection import TransientRpcError
 from wool._connection import UnexpectedResponse
 from wool._context import AppContext
-from wool._loadbalancer import ConnectionResourceFactory
-from wool._loadbalancer import LoadBalancerContext
-from wool._loadbalancer import LoadBalancerLike
-from wool._loadbalancer import NoWorkersAvailable
-from wool._loadbalancer import RoundRobinLoadBalancer
 from wool._resource_pool import ResourcePool
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
@@ -23,21 +18,29 @@ from wool._work import WoolTaskEventType
 from wool._work import WoolTaskException
 from wool._work import current_task as wool_current_task
 from wool._work import work
-from wool._worker import LocalWorker
-from wool._worker import Worker
-from wool._worker import WorkerFactory
-from wool._worker import WorkerService
 from wool._worker_pool import WorkerPool
 from wool._worker_proxy import WorkerProxy
+from wool._worker_service import WorkerService
+from wool.core.discovery.base import Discovery
 from wool.core.discovery.base import DiscoveryEvent
 from wool.core.discovery.base import DiscoveryEventType
+from wool.core.discovery.base import DiscoveryLike
 from wool.core.discovery.base import DiscoveryPublisherLike
 from wool.core.discovery.base import DiscoverySubscriberLike
 from wool.core.discovery.base import PredicateFunction
 from wool.core.discovery.base import WorkerInfo
 from wool.core.discovery.lan import LanDiscovery
 from wool.core.discovery.local import LocalDiscovery
+from wool.core.loadbalancer.base import ConnectionResourceFactory
+from wool.core.loadbalancer.base import LoadBalancerContext
+from wool.core.loadbalancer.base import LoadBalancerLike
+from wool.core.loadbalancer.base import NoWorkersAvailable
+from wool.core.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.core.typing import Factory
+from wool.core.worker.base import Worker
+from wool.core.worker.base import WorkerFactory
+from wool.core.worker.base import WorkerLike
+from wool.core.worker.local import LocalWorker
 
 pickling_support.install()
 
@@ -82,12 +85,15 @@ __all__ = [
     "LocalWorker",
     "Worker",
     "WorkerFactory",
+    "WorkerLike",
     "WorkerPool",
     "WorkerProxy",
     "WorkerService",
     # Discovery
+    "Discovery",
     "DiscoveryEvent",
     "DiscoveryEventType",
+    "DiscoveryLike",
     "DiscoveryPublisherLike",
     "DiscoverySubscriberLike",
     "LanDiscovery",
