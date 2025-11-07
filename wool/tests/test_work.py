@@ -1892,7 +1892,10 @@ class TestWoolTaskEvent:
 
 
 class TestAsyncioHandleRunWrapper:
-    def test_asyncio_handle_execution_with_task_context(self, mocker: MockerFixture):
+    @pytest.mark.asyncio
+    async def test_asyncio_handle_execution_with_task_context(
+        self, mocker: MockerFixture
+    ):
         """Test asyncio.Handle execution emits events when task context is present.
 
         Given an asyncio.Handle with current task in context
@@ -1926,7 +1929,7 @@ class TestAsyncioHandleRunWrapper:
                 return "handle_result"
 
             handle = asyncio.Handle(
-                test_callback, (), asyncio.get_event_loop(), context=mock_context
+                test_callback, (), asyncio.get_running_loop(), context=mock_context
             )
 
             # Act
@@ -1982,7 +1985,10 @@ class TestAsyncioHandleRunWrapper:
         finally:
             WoolTaskEvent._handlers = original_handlers
 
-    def test_asyncio_handle_exception_handling_with_task(self, mocker: MockerFixture):
+    @pytest.mark.asyncio
+    async def test_asyncio_handle_exception_handling_with_task(
+        self, mocker: MockerFixture
+    ):
         """Test Handle._run emits task-stopped event even when exception occurs.
 
         Given an asyncio.Handle that raises exception with task context
@@ -2020,7 +2026,7 @@ class TestAsyncioHandleRunWrapper:
                 raise ValueError("Test exception")
 
             handle = asyncio.Handle(
-                failing_callback, (), asyncio.get_event_loop(), context=mock_context
+                failing_callback, (), asyncio.get_running_loop(), context=mock_context
             )
 
             # Act - Execute handle that will raise exception

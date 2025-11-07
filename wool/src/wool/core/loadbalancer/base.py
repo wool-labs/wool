@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import AsyncIterator

@@ -11,7 +11,7 @@ from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 import wool._worker_pool as wp
-from wool._worker import LocalWorker
+from wool.core.worker.local import LocalWorker
 
 
 @pytest.fixture
