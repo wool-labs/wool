@@ -5,7 +5,6 @@ import debugpy
 import pytest
 
 import wool
-from wool import _worker
 from wool._resource_pool import ResourcePool
 
 logger = logging.getLogger(__name__)
@@ -80,11 +79,7 @@ def pool_uri():
     return "wiley-coyote"
 
 
-@pytest.fixture(scope="function")
-def mock_worker_thread(mocker):
-    mock = mocker.patch.object(_worker, "WorkerThread", autospec=True)
-    mock.return_value._loop = mocker.MagicMock()
-    return mock
+# Removed mock_worker_thread fixture - WorkerThread no longer exists after refactoring
 
 
 class DependencyItemStatus:

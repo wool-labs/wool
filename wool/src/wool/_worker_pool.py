@@ -12,9 +12,6 @@ from typing import Coroutine
 from typing import Final
 from typing import overload
 
-from wool._worker import LocalWorker
-from wool._worker import Worker
-from wool._worker import WorkerFactory
 from wool._worker_proxy import LoadBalancerLike
 from wool._worker_proxy import RoundRobinLoadBalancer
 from wool._worker_proxy import WorkerProxy
@@ -22,6 +19,9 @@ from wool.core.discovery.base import DiscoveryLike
 from wool.core.discovery.base import DiscoveryPublisherLike
 from wool.core.discovery.local import LocalDiscovery
 from wool.core.typing import Factory
+from wool.core.worker.base import WorkerFactory
+from wool.core.worker.base import WorkerLike
+from wool.core.worker.local import LocalWorker
 
 
 # public
@@ -173,7 +173,7 @@ class WorkerPool:
         If invalid configuration is provided or CPU count cannot be determined.
     """
 
-    _workers: Final[dict[Worker, Coroutine]]
+    _workers: Final[dict[WorkerLike, Coroutine]]
 
     @overload
     def __init__(
