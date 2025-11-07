@@ -19,11 +19,13 @@ classifiers = [
 ]
 dependencies = [
     "cloudpickle",
-    "grpcio",
+    "grpcio>=1.76.0",
+    "portalocker",
     "protobuf",
     "shortuuid",
     "tblib",
     "typing-extensions",
+    "watchdog",
     "zeroconf",
 ]
 description = "A Python framework for distributed multiprocessing."
@@ -49,19 +51,20 @@ dev = [
 [project.scripts]
 wool = "wool.cli:cli"
 
+[tool.hatch.build]
+sources = ["src"]
+
 [tool.hatch.build.hooks.protobuf]
 dependencies = ["hatch-protobuf"]
 generate_grpc = true
 generate_pyi = true
-output_path = "src/wool/_protobuf"
+output_path = "src/wool/core/protobuf"
 proto_paths = ["protobuf"]
 
 [tool.hatch.build.targets.sdist]
-sources = ["src"]
 include = ["wool"]
 
 [tool.hatch.build.targets.wheel]
-sources = ["src"]
 include = ["wool"]
 
 [tool.hatch.metadata]

@@ -31,8 +31,8 @@ import cloudpickle
 
 import wool
 from wool import _context as ctx
-from wool import _protobuf as pb
 from wool._typing import PassthroughDecorator
+from wool.core import protobuf as pb
 
 if TYPE_CHECKING:
     from wool._worker_proxy import WorkerProxy

@@ -12,12 +12,12 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool import _protobuf as pb
 from wool._connection import Connection
 from wool._connection import RpcError
 from wool._connection import TransientRpcError
 from wool._connection import UnexpectedResponse
 from wool._work import WoolTask
+from wool.core import protobuf as pb
 
 
 @pytest.fixture

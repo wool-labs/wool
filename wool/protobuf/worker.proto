@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package wool._protobuf.worker;
+package wool.core.protobuf.worker;
 
 import "task.proto";
 
@@ -29,6 +29,29 @@ message Nack {
 
 message StopRequest {
     float timeout = 1;
+}
+
+message WorkerInfo {
+    // Unique identifier for the worker instance
+    string uid = 1;
+
+    // Network host address where the worker is accessible
+    string host = 2;
+
+    // Network port number where the worker is listening (0 if not set)
+    int32 port = 3;
+
+    // Process ID of the worker
+    int32 pid = 4;
+
+    // Version string of the worker software
+    string version = 5;
+
+    // Capability tags for worker filtering and selection
+    repeated string tags = 6;
+
+    // Additional arbitrary metadata as key-value pairs
+    map<string, string> extra = 7;
 }
 
 message Void {}

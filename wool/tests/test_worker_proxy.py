@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from unittest.mock import MagicMock
 
 import cloudpickle
@@ -6,44 +7,28 @@ import pytest
 from pytest_mock import MockerFixture
 
 import wool._worker_proxy as wp
-from wool import _protobuf as pb
 from wool._connection import Connection
 from wool._resource_pool import Resource
 from wool._work import WoolTask
-from wool._worker_discovery import Discovery
-from wool._worker_discovery import DiscoveryEvent
-from wool._worker_discovery import LanDiscovery
-from wool._worker_discovery import LocalDiscovery
-from wool._worker_discovery import WorkerInfo
-
-
-@pytest.fixture
-def mock_lan_discovery_service(mocker: MockerFixture):
-    """Create a mock :class:`LanDiscovery` for testing.
-
-    Provides a mock discovery service with async methods and started state
-    tracking for use in worker proxy tests.
-    """
-    mock_lan_discovery_service = mocker.MagicMock(spec=LanDiscovery)
-    mock_lan_discovery_service.started = False
-    mock_lan_discovery_service.start = mocker.AsyncMock()
-    mock_lan_discovery_service.stop = mocker.AsyncMock()
-    mock_lan_discovery_service.events = mocker.AsyncMock()
-    return mock_lan_discovery_service
+from wool.core import protobuf as pb
+from wool.core.discovery.base import DiscoveryEvent
+from wool.core.discovery.base import WorkerInfo
+from wool.core.discovery.local import LocalDiscovery
 
 
 @pytest.fixture
 def mock_discovery_service(mocker: MockerFixture):
-    """Create a mock :class:`Discovery` for testing.
+    """Create a mock discovery service for testing.
 
-    Provides a generic mock discovery service with async methods for use in
-    worker proxy tests that don't require LAN-specific functionality.
+    Provides a mock discovery service implementing DiscoverySubscriberLike
+    protocol for use in worker proxy tests.
     """
-    mock_discovery_service = mocker.MagicMock(spec=Discovery)
-    mock_discovery_service.started = False
-    mock_discovery_service.start = mocker.AsyncMock()
-    mock_discovery_service.stop = mocker.AsyncMock()
-    mock_discovery_service.events = mocker.AsyncMock()
+    # Create mock without spec to allow setting dunder methods
+    mock_discovery_service = mocker.MagicMock()
+    mock_discovery_service.__aiter__ = mocker.MagicMock(
+        return_value=mock_discovery_service
+    )
+    mock_discovery_service.__anext__ = mocker.AsyncMock()
     return mock_discovery_service
 
 
@@ -181,11 +166,11 @@ def spy_discovery_with_events(mocker: MockerFixture):
 
     # Create default worker info for testing
     worker_info = WorkerInfo(
-        uid="test-worker-1", host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
+        uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
     )
 
-    # Create discovery with default worker_added event
-    events = [DiscoveryEvent(type="worker_added", worker_info=worker_info)]
+    # Create discovery with default worker-added event
+    events = [DiscoveryEvent(type="worker-added", worker_info=worker_info)]
     discovery = SpyableDiscovery(events)
 
     # Wrap methods with spies
@@ -296,7 +281,9 @@ class TestWorkerProxy:
             :class:`RoundRobinLoadBalancer`.
         """
         # Arrange
+        mock_subscriber = mocker.MagicMock()
         mock_local_discovery_service = mocker.MagicMock()
+        mock_local_discovery_service.subscribe.return_value = mock_subscriber
         mocker.patch.object(
             wp, "LocalDiscovery", return_value=mock_local_discovery_service
         )
@@ -306,7 +293,7 @@ class TestWorkerProxy:
 
         # Assert
         assert proxy._loadbalancer == wp.RoundRobinLoadBalancer
-        assert proxy._discovery == mock_local_discovery_service
+        assert proxy._discovery == mock_subscriber
 
     def test_constructor_invalid_arguments(self):
         """Test :class:`WorkerProxy` initialization with invalid
@@ -368,7 +355,7 @@ class TestWorkerProxy:
 
         # Add some workers to verify they get cleared via LoadBalancerContext
         worker_info = WorkerInfo(
-            uid="worker-1",
+            uid=uuid.uuid4(),
             host="127.0.0.1",
             port=50051,
             pid=1234,
@@ -588,7 +575,7 @@ class TestWorkerProxy:
         # Arrange
         proxy = wp.WorkerProxy(discovery=mock_discovery_service)
         worker_info = WorkerInfo(
-            uid="worker-1",
+            uid=uuid.uuid4(),
             host="127.0.0.1",
             port=50051,
             pid=1234,
@@ -681,7 +668,7 @@ class TestWorkerProxy:
         # Arrange
         # Use real objects instead of mocks for cloudpickle test
 
-        discovery_service = LocalDiscovery("test-pool")
+        discovery_service = LocalDiscovery("test-pool").subscriber
         proxy = wp.WorkerProxy(
             discovery=discovery_service, loadbalancer=wp.RoundRobinLoadBalancer
         )
@@ -716,7 +703,7 @@ class TestWorkerProxy:
         # Arrange
         # Use real objects instead of mocks for cloudpickle test
 
-        discovery_service = LocalDiscovery("test-pool")
+        discovery_service = LocalDiscovery("test-pool").subscriber
         proxy = wp.WorkerProxy(discovery=discovery_service)
 
         # Act & Assert
@@ -853,7 +840,7 @@ class TestWorkerProxy:
         # Arrange
 
         worker_info = WorkerInfo(
-            uid="test-worker-1", host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
+            uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
         )
 
         # Create discovery service with NO events initially (empty)
@@ -1059,16 +1046,16 @@ class TestWorkerProxyConstructorEdgeCases:
         **When:**
             WorkerProxy is initialized with workers parameter.
         **Then:**
-            Should create a ReducibleAsyncIterator with worker_added events.
+            Should create a ReducibleAsyncIterator with worker-added events.
         """
         # Arrange
 
         workers = [
             WorkerInfo(
-                uid="worker-1", host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
+                uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
             ),
             WorkerInfo(
-                uid="worker-2", host="127.0.0.1", port=50052, pid=1235, version="1.0.0"
+                uid=uuid.uuid4(), host="127.0.0.1", port=50052, pid=1235, version="1.0.0"
             ),
         ]
 
@@ -1078,7 +1065,7 @@ class TestWorkerProxyConstructorEdgeCases:
         # Assert
         assert isinstance(proxy._discovery, wp.ReducibleAsyncIterator)
         assert len(proxy._discovery._items) == 2
-        assert all(event.type == "worker_added" for event in proxy._discovery._items)
+        assert all(event.type == "worker-added" for event in proxy._discovery._items)
         assert proxy._discovery._items[0].worker_info == workers[0]
         assert proxy._discovery._items[1].worker_info == workers[1]
 
@@ -1096,10 +1083,10 @@ class TestWorkerProxyConstructorEdgeCases:
 
         workers = [
             WorkerInfo(
-                uid="worker-1", host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
+                uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
             )
         ]
-        discovery = LocalDiscovery("test-pool")
+        discovery = LocalDiscovery("test-pool").subscriber
 
         # Act & Assert
         with pytest.raises(ValueError, match="Must specify exactly one of"):
@@ -1274,10 +1261,10 @@ class TestWorkerProxyContextManagerAndCleanup:
     async def test_worker_sentinel_worker_updated_callback(
         self, spy_loadbalancer_with_workers, mocker: MockerFixture
     ):
-        """Test _worker_sentinel handles worker_updated events.
+        """Test _worker_sentinel handles worker-updated events.
 
         **Given:**
-            A WorkerProxy with discovery that yields worker_updated events.
+            A WorkerProxy with discovery that yields worker-updated events.
         **When:**
             _worker_sentinel runs and processes the events.
         **Then:**
@@ -1286,14 +1273,14 @@ class TestWorkerProxyContextManagerAndCleanup:
         # Arrange
 
         worker_info = WorkerInfo(
-            uid="worker-1",
+            uid=uuid.uuid4(),
             host="127.0.0.1",
             port=50051,
             pid=1234,
             version="1.0.0",
         )
 
-        events = [DiscoveryEvent(type="worker_updated", worker_info=worker_info)]
+        events = [DiscoveryEvent(type="worker-updated", worker_info=worker_info)]
         mock_discovery = wp.ReducibleAsyncIterator(events)
 
         proxy = wp.WorkerProxy(
@@ -1306,12 +1293,11 @@ class TestWorkerProxyContextManagerAndCleanup:
 
         # Set up the internal services that would be set by start()
         proxy._loadbalancer_service = spy_loadbalancer_with_workers
-        proxy._discovery_service = mock_discovery
 
         # Act - Process one event through the sentinel
         async with asyncio.timeout(1.0):  # Safety timeout
             async for event in mock_discovery:
-                # Simulate what the sentinel does for worker_updated
+                # Simulate what the sentinel does for worker-updated
                 spy_loadbalancer_with_workers.worker_updated_callback(
                     lambda: proxy._connection_pool.get(
                         f"{event.worker_info.host}:{event.worker_info.port}"
@@ -1327,10 +1313,10 @@ class TestWorkerProxyContextManagerAndCleanup:
     async def test_worker_sentinel_worker_removed_callback(
         self, spy_loadbalancer_with_workers, mocker: MockerFixture
     ):
-        """Test _worker_sentinel handles worker_removed events.
+        """Test _worker_sentinel handles worker-dropped events.
 
         **Given:**
-            A WorkerProxy with discovery that yields worker_removed events.
+            A WorkerProxy with discovery that yields worker-dropped events.
         **When:**
             _worker_sentinel runs and worker exists in LoadBalancerContext.
         **Then:**
@@ -1338,14 +1324,14 @@ class TestWorkerProxyContextManagerAndCleanup:
         """
         # Arrange
         worker_info = WorkerInfo(
-            uid="worker-1",
+            uid=uuid.uuid4(),
             host="127.0.0.1",
             port=50051,
             pid=1234,
             version="1.0.0",
         )
 
-        events = [DiscoveryEvent(type="worker_removed", worker_info=worker_info)]
+        events = [DiscoveryEvent(type="worker-dropped", worker_info=worker_info)]
         mock_discovery = wp.ReducibleAsyncIterator(events)
 
         proxy = wp.WorkerProxy(
@@ -1363,12 +1349,11 @@ class TestWorkerProxyContextManagerAndCleanup:
 
         # Set up the internal services that would be set by start()
         proxy._loadbalancer_service = spy_loadbalancer_with_workers
-        proxy._discovery_service = mock_discovery
 
         # Act - Process one event through the sentinel logic
         async with asyncio.timeout(1.0):  # Safety timeout
             async for event in mock_discovery:
-                # Simulate what the sentinel does for worker_removed
+                # Simulate what the sentinel does for worker-dropped
                 proxy._loadbalancer_context.remove_worker(event.worker_info)
                 break  # Process just one event
 
@@ -1380,10 +1365,10 @@ class TestWorkerProxyContextManagerAndCleanup:
     async def test_worker_sentinel_handles_worker_updated_event(
         self, spy_loadbalancer_with_workers, mocker: MockerFixture
     ):
-        """Test _worker_sentinel handles worker_updated events by updating LoadBalancerContext.
+        """Test _worker_sentinel handles worker-updated events by updating LoadBalancerContext.
 
         **Given:**
-            A WorkerProxy with discovery yielding worker_updated event.
+            A WorkerProxy with discovery yielding worker-updated event.
         **When:**
             _worker_sentinel processes the event.
         **Then:**
@@ -1392,14 +1377,14 @@ class TestWorkerProxyContextManagerAndCleanup:
         # Arrange
 
         worker_info = WorkerInfo(
-            uid="updated-worker",
+            uid=uuid.uuid4(),
             host="127.0.0.1",
             port=50051,
             pid=1234,
             version="1.0.0",
         )
 
-        events = [DiscoveryEvent(type="worker_updated", worker_info=worker_info)]
+        events = [DiscoveryEvent(type="worker-updated", worker_info=worker_info)]
         mock_discovery = wp.ReducibleAsyncIterator(events)
 
         proxy = wp.WorkerProxy(
@@ -1417,12 +1402,11 @@ class TestWorkerProxyContextManagerAndCleanup:
 
         # Set up the internal services that would be set by start()
         proxy._loadbalancer_service = spy_loadbalancer_with_workers
-        proxy._discovery_service = mock_discovery
 
         # Act - Process one event through the sentinel logic
         async with asyncio.timeout(1.0):  # Safety timeout
             async for event in mock_discovery:
-                # Simulate what the sentinel does for worker_updated
+                # Simulate what the sentinel does for worker-updated
                 proxy._loadbalancer_context.update_worker(
                     event.worker_info,
                     lambda: proxy._connection_pool.get(
@@ -1439,22 +1423,22 @@ class TestWorkerProxyContextManagerAndCleanup:
     async def test_worker_sentinel_worker_removed_branch_coverage(
         self, spy_loadbalancer_with_workers, mocker: MockerFixture, mock_proxy_session
     ):
-        """Test _worker_sentinel worker_removed branch for code coverage.
+        """Test _worker_sentinel worker-dropped branch for code coverage.
 
         **Given:**
-            A WorkerProxy with discovery yielding worker_removed event.
+            A WorkerProxy with discovery yielding worker-dropped event.
         **When:**
             _worker_sentinel processes the event and worker condition checks.
         **Then:**
-            Should execute the worker_removed case branch and condition check.
+            Should execute the worker-dropped case branch and condition check.
         """
         # Arrange
 
         removed_worker_info = WorkerInfo(
-            uid="removed-worker", host="127.0.0.1", port=50052, pid=5678, version="1.0.0"
+            uid=uuid.uuid4(), host="127.0.0.1", port=50052, pid=5678, version="1.0.0"
         )
 
-        events = [DiscoveryEvent(type="worker_removed", worker_info=removed_worker_info)]
+        events = [DiscoveryEvent(type="worker-dropped", worker_info=removed_worker_info)]
         mock_discovery = wp.ReducibleAsyncIterator(events)
 
         proxy = wp.WorkerProxy(
@@ -1473,7 +1457,7 @@ class TestWorkerProxyContextManagerAndCleanup:
         await asyncio.sleep(0.1)
         await proxy.stop()
 
-        # Assert - The worker_removed branch was executed (even if condition was False)
+        # Assert - The worker-dropped branch was executed (even if condition was False)
         # Since the condition will always be False due to the type mismatch bug,
         # the callback won't be called, but the branch will be covered.
         # This test achieves coverage of lines 511-515 in the source code.
