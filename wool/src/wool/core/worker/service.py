@@ -41,27 +41,15 @@ class ReadOnlyEvent:
 
 
 class WorkerService(pb.worker.WorkerServicer):
-    """gRPC service implementation for executing distributed wool tasks.
+    """gRPC service for task execution.
 
-    :class:`WorkerService` implements the gRPC WorkerServicer
-    interface, providing remote procedure calls for task scheduling
-    and worker lifecycle management. Tasks are executed in the same
-    asyncio event loop as the gRPC server.
+    Implements the worker gRPC interface for receiving and executing
+    tasks. Runs tasks in the current asyncio event loop and streams
+    results back to the client.
 
-    .. note::
-        Tasks are executed asynchronously in the current event loop
-        and results are serialized for transport back to the client.
-        The service maintains a set of running tasks for proper
-        lifecycle management during shutdown.
-
-        During shutdown, the service stops accepting new requests
-        immediately when the :meth:`stop` RPC is called, returning
-        UNAVAILABLE errors to new :meth:`dispatch` requests while
-        allowing existing tasks to complete gracefully.
-
-        The service provides :attr:`stopping` and
-        :attr:`stopped` properties to access the internal shutdown
-        state events.
+    Handles graceful shutdown by rejecting new tasks while allowing
+    in-flight tasks to complete. Exposes :attr:`stopping` and
+    :attr:`stopped` events for lifecycle monitoring.
     """
 
     _tasks: set[asyncio.Task]

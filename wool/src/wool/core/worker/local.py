@@ -15,33 +15,44 @@ from wool.core.worker.process import WorkerProcess
 
 # public
 class LocalWorker(Worker):
-    """Local worker implementation that runs tasks in a separate process.
+    """Worker running in a local subprocess.
 
-    :class:`LocalWorker` creates and manages a dedicated worker process
-    that hosts a gRPC server for executing distributed wool tasks. Each
-    worker automatically registers itself with the provided registrar service
-    for discovery by client sessions.
+    Spawns a dedicated process hosting a gRPC server for task execution.
+    Handles multiple concurrent tasks in an isolated asyncio event loop.
 
-    The worker process runs independently and can handle multiple concurrent
-    tasks within its own asyncio event loop, providing process-level
-    isolation for task execution.
+    **Basic usage:**
+
+    .. code-block:: python
+
+        worker = LocalWorker("gpu-capable")
+        await worker.start()
+        # Worker is now accepting tasks
+        await worker.stop()
+
+    **Custom configuration:**
+
+    .. code-block:: python
+
+        worker = LocalWorker(
+            "production",
+            "high-memory",
+            host="0.0.0.0",  # Listen on all interfaces
+            port=50051,  # Fixed port
+            shutdown_grace_period=30.0,
+        )
 
     :param tags:
-        Capability tags to associate with this worker for filtering
-        and selection by client sessions.
+        Capability tags for filtering and selection.
     :param host:
-        Host address where the worker will listen.
+        Host address to bind. Defaults to localhost.
     :param port:
-        Port number where the worker will listen. If 0, a random
-        available port will be selected.
-    :param registrar:
-        Service instance or factory for worker registration and discovery.
+        Port to bind. 0 for random available port.
     :param shutdown_grace_period:
-        Graceful shutdown timeout for the gRPC server in seconds.
+        Graceful shutdown timeout in seconds.
     :param proxy_pool_ttl:
-        Time-to-live for the proxy resource pool in seconds.
+        Proxy pool TTL in seconds.
     :param extra:
-        Additional arbitrary metadata as key-value pairs.
+        Additional metadata as key-value pairs.
     """
 
     _worker_process: WorkerProcess

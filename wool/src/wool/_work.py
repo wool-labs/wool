@@ -35,7 +35,7 @@ from wool._typing import PassthroughDecorator
 from wool.core import protobuf as pb
 
 if TYPE_CHECKING:
-    from wool._worker_proxy import WorkerProxy
+    from wool.core.worker.proxy import WorkerProxy
 
 AsyncCallable = Callable[..., Coroutine]
 C = TypeVar("C", bound=AsyncCallable)
