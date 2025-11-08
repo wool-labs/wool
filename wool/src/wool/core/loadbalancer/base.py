@@ -9,9 +9,9 @@ from typing import Protocol
 from typing import TypeAlias
 from typing import runtime_checkable
 
-from wool._connection import Connection
 from wool._resource_pool import Resource
 from wool.core.discovery.base import WorkerInfo
+from wool.core.worker.connection import Connection
 
 if TYPE_CHECKING:
     from wool._work import WoolTask
