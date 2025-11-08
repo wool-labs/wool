@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from typing import AsyncIterator
 from typing import Final
 
-from wool._connection import TransientRpcError
+from wool.core.worker.connection import TransientRpcError
 
 from .base import LoadBalancerContext
 from .base import LoadBalancerLike

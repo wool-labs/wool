@@ -5,10 +5,6 @@ from typing import Final
 
 from tblib import pickling_support
 
-from wool._connection import Connection
-from wool._connection import RpcError
-from wool._connection import TransientRpcError
-from wool._connection import UnexpectedResponse
 from wool._context import AppContext
 from wool._resource_pool import ResourcePool
 from wool._work import WoolTask
@@ -20,7 +16,6 @@ from wool._work import current_task as wool_current_task
 from wool._work import work
 from wool._worker_pool import WorkerPool
 from wool._worker_proxy import WorkerProxy
-from wool._worker_service import WorkerService
 from wool.core.discovery.base import Discovery
 from wool.core.discovery.base import DiscoveryEvent
 from wool.core.discovery.base import DiscoveryEventType
@@ -40,7 +35,12 @@ from wool.core.typing import Factory
 from wool.core.worker.base import Worker
 from wool.core.worker.base import WorkerFactory
 from wool.core.worker.base import WorkerLike
+from wool.core.worker.connection import Connection
+from wool.core.worker.connection import RpcError
+from wool.core.worker.connection import TransientRpcError
+from wool.core.worker.connection import UnexpectedResponse
 from wool.core.worker.local import LocalWorker
+from wool.core.worker.service import WorkerService
 
 pickling_support.install()
 

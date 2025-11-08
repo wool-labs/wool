@@ -11,11 +11,11 @@ from pytest_mock import MockerFixture
 
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
-from wool._worker_service import ReadOnlyEvent
-from wool._worker_service import WorkerService
 from wool.core import protobuf as pb
 from wool.core.protobuf.worker import WorkerStub
 from wool.core.protobuf.worker import add_WorkerServicer_to_server
+from wool.core.worker.service import ReadOnlyEvent
+from wool.core.worker.service import WorkerService
 
 
 @pytest.fixture(scope="function")

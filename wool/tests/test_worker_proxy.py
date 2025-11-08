@@ -7,13 +7,13 @@ import pytest
 from pytest_mock import MockerFixture
 
 import wool._worker_proxy as wp
-from wool._connection import Connection
 from wool._resource_pool import Resource
 from wool._work import WoolTask
 from wool.core import protobuf as pb
 from wool.core.discovery.base import DiscoveryEvent
 from wool.core.discovery.base import WorkerInfo
 from wool.core.discovery.local import LocalDiscovery
+from wool.core.worker.connection import Connection
 
 
 @pytest.fixture
