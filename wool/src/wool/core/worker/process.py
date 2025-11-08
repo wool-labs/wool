@@ -13,8 +13,8 @@ import grpc.aio
 
 import wool
 from wool._resource_pool import ResourcePool
-from wool._worker_service import WorkerService
 from wool.core import protobuf as pb
+from wool.core.worker.service import WorkerService
 
 if TYPE_CHECKING:
     from wool._worker_proxy import WorkerProxy
