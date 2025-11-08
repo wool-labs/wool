@@ -14,7 +14,6 @@ from typing import TypeVar
 from typing import overload
 
 import wool
-from wool._connection import Connection
 from wool._resource_pool import ResourcePool
 from wool.core.discovery.base import DiscoveryEvent
 from wool.core.discovery.base import DiscoverySubscriberLike
@@ -24,6 +23,7 @@ from wool.core.loadbalancer.base import LoadBalancerContext
 from wool.core.loadbalancer.base import LoadBalancerLike
 from wool.core.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.core.typing import Factory
+from wool.core.worker.connection import Connection
 
 if TYPE_CHECKING:
     from wool._work import WoolTask
