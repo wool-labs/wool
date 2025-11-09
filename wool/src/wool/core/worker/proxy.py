@@ -23,7 +23,7 @@ from wool.core.loadbalancer.base import LoadBalancerContext
 from wool.core.loadbalancer.base import LoadBalancerLike
 from wool.core.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.core.typing import Factory
-from wool.core.worker.connection import Connection
+from wool.core.worker.connection import WorkerConnection
 
 if TYPE_CHECKING:
     from wool._work import WoolTask
@@ -60,7 +60,7 @@ class ReducibleAsyncIterator(Generic[T]):
         return (self.__class__, (self._items,))
 
 
-async def connection_factory(target: str) -> Connection:
+async def connection_factory(target: str) -> WorkerConnection:
     """Factory function for creating worker connections.
 
     Creates a connection to the specified worker target.
@@ -71,10 +71,10 @@ async def connection_factory(target: str) -> Connection:
     :returns:
         A new connection to the target.
     """
-    return Connection(target)
+    return WorkerConnection(target)
 
 
-async def connection_finalizer(connection: Connection) -> None:
+async def connection_finalizer(connection: WorkerConnection) -> None:
     """Finalizer function for gRPC channels.
 
     Closes the gRPC connection when it's being cleaned up from the resource pool.
@@ -93,29 +93,73 @@ WorkerUri: TypeAlias = str
 
 # public
 class WorkerProxy:
-    """Client-side interface for task dispatch to distributed workers.
+    """Client-side proxy for dispatching tasks to distributed workers.
 
-    The WorkerProxy manages worker discovery, load balancing, and task routing
-    within the wool framework. It serves as the bridge between task decorators
-    and the underlying worker pool, handling connection management and fault
-    tolerance transparently.
+    Manages worker discovery, connection pooling, and load-balanced task
+    routing. The bridge between :func:`@wool.work <wool.work>` decorated
+    functions and the worker pool.
 
-    Supports multiple configuration modes:
-    - Pool URI-based discovery for connecting to specific worker pools
-    - Custom discovery services for advanced deployment scenarios
-    - Static worker lists for testing and development
-    - Configurable load balancing strategies
+    Connects to workers through discovery services, pool URIs, or static
+    worker lists. Handles connection lifecycle and fault tolerance
+    automatically.
+
+    **Connect via pool URI:**
+
+    .. code-block:: python
+
+        async with WorkerProxy("pool-abc123") as proxy:
+            result = await task()
+
+    **Connect via discovery:**
+
+    .. code-block:: python
+
+        from wool.core.discovery.lan import LanDiscovery
+
+        discovery = LanDiscovery().subscribe()
+        async with WorkerProxy(discovery=discovery) as proxy:
+            result = await task()
+
+    **Connect to static workers:**
+
+    .. code-block:: python
+
+        workers = [
+            WorkerInfo(host="10.0.0.1", port=50051, ...),
+            WorkerInfo(host="10.0.0.2", port=50051, ...),
+        ]
+        async with WorkerProxy(workers=workers) as proxy:
+            result = await task()
+
+    **Custom load balancer:**
+
+    .. code-block:: python
+
+        from wool.core.loadbalancer.roundrobin import RoundRobinLoadBalancer
+
+
+        class CustomBalancer(RoundRobinLoadBalancer):
+            async def dispatch(self, task, context, timeout=None):
+                # Custom routing strategy
+                ...
+
+
+        async with WorkerProxy(
+            discovery=discovery,
+            loadbalancer=CustomBalancer(),
+        ) as proxy:
+            result = await task()
 
     :param pool_uri:
-        Unique identifier for connecting to a specific worker pool.
+        Pool identifier for discovery-based connection.
     :param tags:
-        Additional capability tags for filtering discovered workers.
+        Additional tags for filtering discovered workers.
     :param discovery:
-        Custom discovery service or event stream for finding workers.
+        Discovery service or event stream.
     :param workers:
-        Static list of workers for direct connection (testing/development).
+        Static worker list for direct connection.
     :param loadbalancer:
-        Load balancer implementation or factory for task distribution.
+        Load balancer instance, factory, or context manager.
     """
 
     _discovery: DiscoverySubscriberLike | Factory[DiscoverySubscriberLike]
