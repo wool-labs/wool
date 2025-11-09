@@ -24,10 +24,10 @@ def test_public_api_completeness():
     # Arrange
     expected_public_api = [
         # Connection
-        "Connection",
         "RpcError",
         "TransientRpcError",
         "UnexpectedResponse",
+        "WorkerConnection",
         # Context
         "AppContext",
         # Load balancing

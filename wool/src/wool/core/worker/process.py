@@ -17,36 +17,30 @@ from wool.core import protobuf as pb
 from wool.core.worker.service import WorkerService
 
 if TYPE_CHECKING:
-    from wool._worker_proxy import WorkerProxy
+    from wool.core.worker.proxy import WorkerProxy
 
 
 class WorkerProcess(Process):
-    """A :class:`multiprocessing.Process` that runs a gRPC worker
-    server.
+    """Subprocess hosting a gRPC worker server.
 
-    :class:`WorkerProcess` creates an isolated Python process that hosts a
-    gRPC server for executing distributed tasks. Each process maintains
-    its own event loop and serves as an independent worker node in the
-    wool distributed runtime.
+    Isolated Python process running a gRPC server for task execution.
+    Maintains its own event loop and serves as an independent worker node.
+
+    Communicates the bound port back to the parent process via pipe after
+    startup. Handles SIGTERM and SIGINT for graceful shutdown.
 
     :param host:
-        Host address where the gRPC server will listen.
+        Host address to bind.
     :param port:
-        Port number where the gRPC server will listen. If 0, a random
-        available port will be selected.
+        Port to bind. 0 for random available port.
     :param shutdown_grace_period:
-        Graceful shutdown timeout for the gRPC server in seconds.
+        Graceful shutdown timeout in seconds.
     :param proxy_pool_ttl:
-        Time-to-live for the proxy resource pool in seconds.
+        Proxy pool TTL in seconds.
     :param args:
-        Additional positional arguments passed to the parent
-        :class:`multiprocessing.Process` class.
+        Additional args for :class:`multiprocessing.Process`.
     :param kwargs:
-        Additional keyword arguments passed to the parent
-        :class:`multiprocessing.Process` class.
-
-    .. attribute:: address
-        The network address where the gRPC server is listening.
+        Additional kwargs for :class:`multiprocessing.Process`.
     """
 
     _port: int | None

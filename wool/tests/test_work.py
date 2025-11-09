@@ -17,8 +17,8 @@ from wool._work import _execute
 from wool._work import _resolve
 from wool._work import current_task
 from wool._work import work
-from wool._worker_proxy import WorkerProxy
 from wool.core import protobuf as pb
+from wool.core.worker.proxy import WorkerProxy
 
 
 def create_mock_proxy():
