@@ -30,9 +30,9 @@ from uuid import uuid4
 import cloudpickle
 
 import wool
-from wool import _context as ctx
-from wool._typing import PassthroughDecorator
+from wool.core import context as ctx
 from wool.core import protobuf as pb
+from wool.core.typing import PassthroughWrapper
 
 if TYPE_CHECKING:
     from wool.core.worker.proxy import WorkerProxy
@@ -436,7 +436,7 @@ class WoolTaskEvent:
     @classmethod
     def handler(
         cls, *event_types: WoolTaskEventType
-    ) -> PassthroughDecorator[WoolTaskEventCallback]:
+    ) -> PassthroughWrapper[WoolTaskEventCallback]:
         """
         Register a handler function for specific task event types.
 

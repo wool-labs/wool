@@ -5,15 +5,14 @@ from dataclasses import dataclass
 from typing import Any
 from typing import Awaitable
 from typing import Callable
-from typing import Final
 from typing import Generic
 from typing import TypeVar
 from typing import cast
 
+from wool.core.typing import Undefined
+from wool.core.typing import UndefinedType
+
 T = TypeVar("T")
-
-
-SENTINEL: Final = object()
 
 
 class Resource(Generic[T]):
@@ -286,15 +285,15 @@ class ResourcePool(Generic[T]):
                     # Immediate cleanup
                     await self._cleanup(key)
 
-    async def clear(self, key=SENTINEL) -> None:
+    async def clear(self, key: Any | UndefinedType = Undefined) -> None:
         """Clear cache entries and cancel pending cleanups.
 
         :param key:
-            Specific key to clear, or SENTINEL to clear all entries.
+            Specific key to clear (clears all entries if not specified).
         """
         async with self._lock:
             # Clean up all entries
-            if key is SENTINEL:
+            if key is Undefined:
                 keys = list(self._cache.keys())
             else:
                 keys = [key]
