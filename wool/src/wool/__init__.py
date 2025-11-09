@@ -5,8 +5,7 @@ from typing import Final
 
 from tblib import pickling_support
 
-from wool._context import AppContext
-from wool._resource_pool import ResourcePool
+from wool.core.resourcepool import ResourcePool
 from wool._work import WoolTask
 from wool._work import WoolTaskEvent
 from wool._work import WoolTaskEventCallback
@@ -14,6 +13,7 @@ from wool._work import WoolTaskEventType
 from wool._work import WoolTaskException
 from wool._work import current_task as wool_current_task
 from wool._work import work
+from wool.core.context import RuntimeContext
 from wool.core.discovery.base import Discovery
 from wool.core.discovery.base import DiscoveryEvent
 from wool.core.discovery.base import DiscoveryEventType
@@ -65,7 +65,7 @@ __all__ = [
     "UnexpectedResponse",
     "WorkerConnection",
     # Context
-    "AppContext",
+    "RuntimeContext",
     # Load balancing
     "ConnectionResourceFactory",
     "LoadBalancerContext",
