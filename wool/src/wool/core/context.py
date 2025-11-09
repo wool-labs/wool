@@ -2,16 +2,16 @@ from contextvars import ContextVar
 from contextvars import Token
 from typing import Final
 
-from wool._undefined import Undefined
-from wool._undefined import UndefinedType
+from wool.core.typing import Undefined
+from wool.core.typing import UndefinedType
 
 dispatch_timeout: Final[ContextVar[float | None]] = ContextVar(
-    "_dispatch_timeout", default=None
+    "dispatch_timeout", default=None
 )
 
 
 # public
-class AppContext:
+class RuntimeContext:
     _dispatch_timeout: float | None | UndefinedType
     _dispatch_timeout_token: Token | UndefinedType
 

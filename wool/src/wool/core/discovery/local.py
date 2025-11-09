@@ -21,7 +21,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from wool._resource_pool import ResourcePool
+from wool.core.resourcepool import ResourcePool
 from wool.core.discovery.base import Discovery
 from wool.core.discovery.base import DiscoveryEvent
 from wool.core.discovery.base import DiscoveryEventType
