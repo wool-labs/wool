@@ -18,7 +18,7 @@ from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 import wool.core.worker.proxy as wp
-from wool._resource_pool import Resource
+from wool.core.resourcepool import Resource
 from wool._work import WoolTask
 from wool.core import protobuf as pb
 from wool.core.discovery.base import DiscoveryEvent

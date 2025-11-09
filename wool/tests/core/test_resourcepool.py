@@ -10,8 +10,9 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies
 
-from wool._resource_pool import Resource
-from wool._resource_pool import ResourcePool
+import wool.core.resourcepool as rp
+from wool.core.resourcepool import Resource
+from wool.core.resourcepool import ResourcePool
 
 # Global tracking for factory and finalizer calls using function names as keys
 call_tracker = defaultdict(lambda: {"factory_calls": [], "finalizer_calls": []})
@@ -541,9 +542,7 @@ class TestResourcePool:
             # Wait for the test to signal that sleep should complete
             await sleep_event.wait()
 
-        import wool._resource_pool as rp_module
-
-        with patch.object(rp_module.asyncio, "sleep", side_effect=mock_sleep):
+        with patch.object(rp.asyncio, "sleep", side_effect=mock_sleep):
             # Act
             # Acquire and immediately release
             async with pool.get(key) as resource:
@@ -1055,7 +1054,7 @@ class TestResource:
         mock_pool = AsyncMock()
         mock_pool.acquire.side_effect = RuntimeError("Acquire failed")
 
-        from wool._resource_pool import Resource
+        from wool.core.resourcepool import Resource
 
         resource = Resource(pool=mock_pool, key="test-key")
 
@@ -1080,7 +1079,7 @@ class TestResource:
         """
         # Arrange
         mock_pool = AsyncMock()
-        from wool._resource_pool import Resource
+        from wool.core.resourcepool import Resource
 
         resource = Resource(pool=mock_pool, key="test-key")
 
@@ -1106,7 +1105,7 @@ class TestResource:
         mock_resource = Mock()
         mock_pool.acquire.return_value = mock_resource
 
-        from wool._resource_pool import Resource
+        from wool.core.resourcepool import Resource
 
         resource = Resource(pool=mock_pool, key="test-key")
 
