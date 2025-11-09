@@ -12,12 +12,12 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool._connection import Connection
-from wool._connection import RpcError
-from wool._connection import TransientRpcError
-from wool._connection import UnexpectedResponse
 from wool._work import WoolTask
 from wool.core import protobuf as pb
+from wool.core.worker.connection import RpcError
+from wool.core.worker.connection import TransientRpcError
+from wool.core.worker.connection import UnexpectedResponse
+from wool.core.worker.connection import WorkerConnection
 
 
 @pytest.fixture
@@ -98,22 +98,22 @@ def mock_grpc_call(mocker: MockerFixture):
     return create_call
 
 
-class TestConnection:
+class TestWorkerConnection:
     @pytest.mark.asyncio
     @given(limit=st.integers(max_value=0))
     async def test_init_invalid_limit(self, limit: int):
-        """Test Connection initialization with invalid limit.
+        """Test WorkerConnection initialization with invalid limit.
 
         Given:
             An invalid limit value (0 or negative)
         When:
-            Connection is instantiated
+            WorkerConnection is instantiated
         Then:
             It should raise ValueError with appropriate message
         """
         # Act & Assert
         with pytest.raises(ValueError, match="Limit must be positive"):
-            Connection("localhost:50051", limit=limit)
+            WorkerConnection("localhost:50051", limit=limit)
 
     @pytest.mark.asyncio
     async def test_dispatch_task_that_returns(
@@ -144,7 +144,7 @@ class TestConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
 
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
 
         # Act
         results = []
@@ -188,7 +188,7 @@ class TestConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
 
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
 
         # Act & Assert
         with pytest.raises(ValueError, match="task_error"):
@@ -223,7 +223,7 @@ class TestConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
 
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
 
         # Act & Assert
         with pytest.raises(UnexpectedResponse, match="Expected 'ack' response"):
@@ -266,7 +266,7 @@ class TestConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
 
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
 
         # Act & Assert
         with pytest.raises(
@@ -311,7 +311,7 @@ class TestConnection:
         mock_stub.dispatch = mocker.MagicMock(side_effect=mock_rpc_error)
         mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
 
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
 
         # Act & Assert
         with pytest.raises(TransientRpcError):
@@ -354,7 +354,7 @@ class TestConnection:
         mock_stub.dispatch = mocker.MagicMock(side_effect=mock_rpc_error)
         mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
 
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
 
         # Act & Assert
         with pytest.raises(RpcError):
@@ -375,7 +375,7 @@ class TestConnection:
             It should raise ValueError and not attempt dispatch
         """
         # Arrange
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
 
         async def sample_task():
             return "test"
@@ -418,7 +418,7 @@ class TestConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
 
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
 
         # Act & Assert
         with pytest.raises(TimeoutError):
@@ -454,7 +454,7 @@ class TestConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=long_running_call)
         mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
 
-        connection = Connection("localhost:50051", limit=1)
+        connection = WorkerConnection("localhost:50051", limit=1)
 
         async def consume_slot():
             async for _ in await connection.dispatch(mock_task):
@@ -519,7 +519,7 @@ class TestConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
 
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
 
         # Act
         async def run_dispatch():
@@ -577,7 +577,7 @@ class TestConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
 
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
 
         # Act
         async def run_dispatch():
@@ -608,7 +608,7 @@ class TestConnection:
             It should close the connection's channel without error
         """
         # Arrange
-        connection = Connection("localhost:50051", limit=10)
+        connection = WorkerConnection("localhost:50051", limit=10)
         close_spy = mocker.spy(connection._channel, "close")
 
         # Act

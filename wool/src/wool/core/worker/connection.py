@@ -101,31 +101,34 @@ class TransientRpcError(RpcError):
 
 
 # public
-class Connection:
-    """Connection to a remote worker service used for dispatching tasks.
+class WorkerConnection:
+    """gRPC connection to a worker for task dispatch.
 
-    Maintains a persistent gRPC channel to a single worker and manages
-    the channel lifecycle. Provides task dispatch functionality with
-    concurrency control.
+    Maintains a persistent channel to a worker with concurrency limiting.
+    Handles connection lifecycle and error classification (transient vs
+    permanent failures).
+
+    **Usage:**
+
+    .. code-block:: python
+
+        conn = WorkerConnection("localhost:50051")
+        async for result in conn.dispatch(task):
+            process(result)
+        await conn.close()
 
     :param target:
-        The target URI for the worker service to connect to. Can be specified
-        in several formats:
+        Worker URI. Supports multiple formats:
 
-        - ``host:port`` - DNS name or IP with port (defaults to dns scheme)
+        - ``host:port`` - DNS name or IP with port
         - ``dns://host:port`` - Explicit DNS resolution
         - ``ipv4:address:port`` - IPv4 address
-        - ``ipv6:[address]:port`` - IPv6 address (brackets required)
-        - ``unix:path`` or ``unix:///path`` - Unix domain socket
+        - ``ipv6:[address]:port`` - IPv6 address
+        - ``unix:path`` - Unix domain socket
 
-        If no scheme is specified, the dns scheme is used by default.
-        Examples: ``localhost:50051``, ``dns://example.com:8080``,
-        ``ipv4:192.0.2.1:50051``.
-
-        See https://github.com/grpc/grpc/blob/master/doc/naming.md for
-        complete URI format specifications.
+        Examples: ``localhost:50051``, ``192.0.2.1:50051``
     :param limit:
-        Maximum number of concurrent task dispatches allowed.
+        Maximum concurrent task dispatches.
     """
 
     TRANSIENT_ERRORS: Final = {

@@ -8,14 +8,14 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool._connection import Connection
-from wool._connection import RpcError
-from wool._connection import TransientRpcError
 from wool._work import WoolTask
 from wool.core.discovery.base import WorkerInfo
 from wool.core.loadbalancer.base import LoadBalancerContext
 from wool.core.loadbalancer.base import NoWorkersAvailable
 from wool.core.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.core.worker.connection import RpcError
+from wool.core.worker.connection import TransientRpcError
+from wool.core.worker.connection import WorkerConnection
 
 
 @st.composite
@@ -80,7 +80,7 @@ class TestRoundRobinLoadBalancer:
         mock_workers = {}
 
         for i in range(worker_count):
-            mock_connection = mocker.create_autospec(Connection, instance=True)
+            mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
             mock_connection.dispatch = mocker.AsyncMock()
             worker_info = WorkerInfo(
                 uid=uuid4(),
@@ -215,7 +215,7 @@ class TestRoundRobinLoadBalancer:
         mock_workers = {}
 
         for i in range(worker_count):
-            mock_connection = mocker.create_autospec(Connection, instance=True)
+            mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
             mock_connection.dispatch = mocker.AsyncMock()
             worker_info = WorkerInfo(
                 uid=uuid4(),

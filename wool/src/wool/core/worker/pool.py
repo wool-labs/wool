@@ -12,9 +12,6 @@ from typing import Coroutine
 from typing import Final
 from typing import overload
 
-from wool._worker_proxy import LoadBalancerLike
-from wool._worker_proxy import RoundRobinLoadBalancer
-from wool._worker_proxy import WorkerProxy
 from wool.core.discovery.base import DiscoveryLike
 from wool.core.discovery.base import DiscoveryPublisherLike
 from wool.core.discovery.local import LocalDiscovery
@@ -22,25 +19,26 @@ from wool.core.typing import Factory
 from wool.core.worker.base import WorkerFactory
 from wool.core.worker.base import WorkerLike
 from wool.core.worker.local import LocalWorker
+from wool.core.worker.proxy import LoadBalancerLike
+from wool.core.worker.proxy import RoundRobinLoadBalancer
+from wool.core.worker.proxy import WorkerProxy
 
 
 # public
 class WorkerPool:
-    """Manages a pool of distributed worker processes for task execution.
+    """Orchestrates distributed workers for task execution.
 
-    The WorkerPool is the core orchestrator in the wool framework, providing
-    both ephemeral and durable pool configurations. It handles worker lifecycle,
-    service discovery, and load balancing through configurable components.
+    The core of wool's distributed runtime. Manages worker lifecycle,
+    discovery, and load balancing across two modes:
 
-    **Ephemeral Pools** spawn local worker processes with automatic cleanup,
-    ideal for development and single-machine deployments.
+    **Ephemeral pools** spawn local workers automatically managed within the
+    pool's lifecycle. Perfect for development and single-machine deployments.
 
-    **Durable Pools** connect to existing distributed workers via discovery
-    services, supporting production deployments across multiple machines.
+    **Durable pools** connect to existing remote workers through discovery
+    services. Workers run independently, serving multiple clients across
+    distributed deployments.
 
-    Example usage:
-
-    **Basic ephemeral pool (default configuration):**
+    **Basic ephemeral pool:**
 
     .. code-block:: python
 
@@ -51,126 +49,104 @@ class WorkerPool:
         async def fibonacci(n: int) -> int:
             if n <= 1:
                 return n
-            return await fibonacci(n - 1) + await fibonacci(n - 2)
+            a = await fibonacci(n - 1)
+            b = await fibonacci(n - 2)
+            return a + b
 
 
-        async def main():
-            async with wool.WorkerPool() as pool:
-                result = await fibonacci(10)
-                print(f"Result: {result}")
+        async with wool.WorkerPool() as pool:
+            result = await fibonacci(10)
 
-    **Ephemeral pool with custom configuration:**
+    **Ephemeral with tags:**
 
     .. code-block:: python
 
-        from wool import WorkerPool, LocalWorker
+        async with WorkerPool("gpu-capable", size=4) as pool:
+            result = await gpu_task()
+
+    **Custom worker factory:**
+
+    .. code-block:: python
+
         from functools import partial
 
-        # Custom worker factory with specific configuration
-        worker_factory = partial(LocalWorker, host="0.0.0.0", port=50051)
+        worker_factory = partial(LocalWorker, host="0.0.0.0")
 
-        async with WorkerPool(
-            "gpu-capable",
-            "ml-model",  # Worker tags
-            size=4,  # Number of workers
-            worker=worker_factory,  # Custom factory
-        ) as pool:
-            result = await process_data()
+        async with WorkerPool(size=8, worker=worker_factory) as pool:
+            result = await task()
 
-    **Durable pool with LAN discovery:**
+    **Durable pool:**
 
     .. code-block:: python
 
-        from wool import WorkerPool
+        from wool.core.discovery.lan import LanDiscovery
 
-        # Connect to existing workers on the network
-        discovery = LanDiscovery(filter=lambda w: "production" in w.tags)
+        async with WorkerPool(discovery=LanDiscovery()) as pool:
+            result = await task()
 
+    **Filtered discovery:**
+
+    .. code-block:: python
+
+        discovery = LanDiscovery().subscribe(filter=lambda w: "production" in w.tags)
         async with WorkerPool(discovery=discovery) as pool:
-            results = await gather_metrics()
+            result = await task()
 
-    **Durable pool with custom load balancer:**
+    **Hybrid pool:**
 
     .. code-block:: python
 
-        from wool import WorkerPool
-        from wool._worker_proxy import RoundRobinLoadBalancer
+        # Spawn local workers AND discover remote workers
+        async with WorkerPool(size=4, discovery=LanDiscovery()) as pool:
+            result = await task()
+
+    **Custom load balancer:**
+
+    .. code-block:: python
+
+        from wool.core.loadbalancer.roundrobin import RoundRobinLoadBalancer
 
 
-        class WeightedLoadBalancer(RoundRobinLoadBalancer):
-            # Custom load balancing logic
-            pass
+        class PriorityBalancer(RoundRobinLoadBalancer):
+            async def dispatch(self, task, context, timeout=None):
+                # Custom routing logic
+                ...
 
 
-        async with WorkerPool(
-            discovery=discovery_service, loadbalancer=WeightedLoadBalancer
-        ) as pool:
-            result = await distributed_computation()
+        async with WorkerPool(loadbalancer=PriorityBalancer()) as pool:
+            result = await task()
+
+    **Custom discovery:**
+
+    .. code-block:: python
+
+        from contextlib import asynccontextmanager
+
+
+        @asynccontextmanager
+        async def custom_discovery():
+            svc = await DatabaseDiscovery.connect()
+            try:
+                yield svc.subscribe()
+            finally:
+                await svc.close()
+
+
+        async with WorkerPool(discovery=custom_discovery) as pool:
+            result = await task()
 
     :param tags:
-        Capability tags to associate with spawned workers (ephemeral pools only).
+        Capability tags for spawned workers.
     :param size:
-        Number of worker processes to spawn (ephemeral pools, 0 = CPU count).
+        Number of workers to spawn (0 = CPU count).
     :param worker:
-        Factory function for creating worker instances (ephemeral pools).
+        Worker factory callable. Defaults to :class:`LocalWorker`.
     :param loadbalancer:
-        Load balancer for task distribution. Can be provided as:
-
-        - **Instance**: Direct loadbalancer object
-        - **Factory function**: Function returning a loadbalancer instance
-        - **Context manager factory**: Function returning a context manager
-            that yields a loadbalancer instance
-
-        Examples::
-
-            # Direct instance
-            loadbalancer = RoundRobinLoadBalancer()
-
-            # Instance factory
-            loadbalancer = lambda: CustomLoadBalancer(...)
-
-
-            # Context manager factory
-            @contextmanager
-            def loadbalancer():
-                async with CustomLoadBalancer() as lb:
-                    ...
-                    yield lb
-                    ...
-
-
-            loadbalancer = loadbalancer
-
+        Load balancer instance, factory, or context manager.
     :param discovery:
-        Discovery service for finding existing workers (durable pools only).
-        Can be provided as:
-
-        - **Instance**: Direct discovery service object
-        - **Factory function**: Function returning a discovery service instance
-        - **Context manager factory**: Function returning a context manager that
-            yields a discovery service
-
-        Examples::
-
-            # Direct instance
-            discovery=LanDiscovery(filter=lambda w: "prod" in w.tags)
-
-            # Instance factory
-            discovery=lambda: LocalDiscovery("pool-123")
-
-            # Context manager factory
-            @asynccontextmanager
-            async def discovery():
-                service = await DatabaseDiscovery.create(connection_string)
-                try:
-                    ...
-                    yield service
-                finally:
-                    ...
-                    await service.close()
-            discovery=discovery
+        Discovery service instance, factory, or context manager.
     :raises ValueError:
-        If invalid configuration is provided or CPU count cannot be determined.
+        If configuration is invalid or CPU count unavailable.
     """
 
     _workers: Final[dict[WorkerLike, Coroutine]]
