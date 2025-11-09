@@ -15,25 +15,34 @@ from wool.core.discovery.base import WorkerInfo
 # public
 @runtime_checkable
 class WorkerFactory(Protocol):
-    """Protocol for creating worker instances with registrar integration.
+    """Protocol for worker factory callables.
 
-    Defines the callable interface for worker factory implementations
-    that can create :class:`WorkerLike` instances configured with specific
-    capability tags and metadata.
+    Worker factories create :class:`WorkerLike` instances with specific
+    tags and configuration. Used by :class:`WorkerPool` to spawn workers.
 
-    Worker factories are used by :class:`WorkerPool` to spawn multiple
-    worker processes with consistent configuration.
+    **Example factory:**
+
+    .. code-block:: python
+
+        from functools import partial
+
+
+        def custom_factory(*tags, custom_param=None):
+            return LocalWorker(*tags, host="0.0.0.0", port=8080)
+
+
+        # Or using partial
+        factory = partial(LocalWorker, host="0.0.0.0")
+
     """
 
     def __call__(self, *tags: str, **_) -> WorkerLike:
         """Create a new worker instance.
 
         :param tags:
-            Additional tags to associate with this worker for discovery
-            and filtering purposes.
+            Capability tags for worker discovery and filtering.
         :returns:
-            A new :class:`WorkerLike` instance configured with the
-            specified tags and metadata.
+            Configured :class:`WorkerLike` instance.
         """
         ...
 
@@ -41,17 +50,14 @@ class WorkerFactory(Protocol):
 # public
 @runtime_checkable
 class WorkerLike(Protocol):
-    """Protocol defining the public interface for worker implementations.
+    """Protocol defining the worker interface.
 
-    This protocol represents the structural interface that all workers
-    must implement, regardless of their concrete implementation. It is
-    the preferred type for type hints and function signatures that accept
-    worker instances.
+    All worker implementations must satisfy this protocol. Prefer
+    :class:`WorkerLike` over :class:`Worker` for type annotations to
+    support structural subtyping.
 
-    .. note::
-       Prefer using :class:`WorkerLike` for type annotations instead of
-       :class:`Worker` to allow for structural subtyping and greater
-       flexibility in worker implementations.
+    Workers execute distributed tasks within their own process and event
+    loop, exposing a gRPC server for task dispatch.
     """
 
     @property
@@ -143,29 +149,45 @@ class WorkerLike(Protocol):
 
 
 class Worker(ABC):
-    """Abstract base class for worker implementations in the wool framework.
+    """Abstract base class for worker implementations.
 
-    Workers are individual processes that execute distributed tasks within
-    a worker pool. Each worker runs a gRPC server and registers itself with
-    a discovery service to be found by client sessions.
+    Workers execute distributed tasks in dedicated processes, each running
+    a gRPC server for task dispatch. Subclasses implement the actual worker
+    process lifecycle in :meth:`_start` and :meth:`_stop`.
 
-    This class defines the core interface that all worker implementations
-    must provide, including lifecycle management and registrar service
-    integration for peer-to-peer discovery.
+    **Implementing a custom worker:**
+
+    .. code-block:: python
+
+        from wool.core.worker.base import Worker
+        from wool.core.discovery.base import WorkerInfo
+
+
+        class CustomWorker(Worker):
+            async def _start(self, timeout):
+                # Start your worker process
+                self._info = WorkerInfo(...)
+
+            async def _stop(self, timeout):
+                # Clean shutdown
+                ...
+
+            @property
+            def address(self):
+                return f"{self.host}:{self.port}"
+
+            @property
+            def host(self):
+                return self._host
+
+            @property
+            def port(self):
+                return self._port
 
     :param tags:
-        Capability tags associated with this worker for filtering and
-        selection by client sessions.
-    :param registrar:
-        Service instance or factory for worker registration and discovery
-        within the distributed pool. Can be provided as:
-
-        - **Instance**: Direct registrar service object
-        - **Factory function**: Function returning a registrar service instance
-        - **Context manager factory**: Function returning a context manager
-            that yields a registrar service
+        Capability tags for filtering and selection.
     :param extra:
-        Additional arbitrary metadata as key-value pairs.
+        Additional metadata as key-value pairs.
     """
 
     _info: WorkerInfo | None = None
