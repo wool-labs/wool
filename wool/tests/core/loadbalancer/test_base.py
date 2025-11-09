@@ -7,9 +7,9 @@ from hypothesis import strategies as st
 from wool._resource_pool import ResourcePool
 from wool.core.discovery.base import WorkerInfo
 from wool.core.loadbalancer.base import LoadBalancerContext
-from wool.core.worker.connection import Connection
+from wool.core.worker.connection import WorkerConnection
 
-connection_pool = ResourcePool(Connection)
+connection_pool = ResourcePool(WorkerConnection)
 
 
 @st.composite
