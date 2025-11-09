@@ -1039,12 +1039,15 @@ class TestWorkerPool:
         Then:
             Should raise ValueError
         """
+
         # Arrange - Create discovery that doesn't implement DiscoveryLike protocol
         # Use a simple object that explicitly lacks the required protocol methods
         class InvalidDiscovery:
             """Object that does not implement DiscoveryLike protocol."""
+
             async def __aenter__(self):
                 return self
+
             async def __aexit__(self, *args):
                 pass
 
@@ -1068,12 +1071,15 @@ class TestWorkerPool:
         Then:
             Should raise TypeError
         """
+
         # Arrange - Create discovery that doesn't implement DiscoveryLike protocol
         # Use a simple object that explicitly lacks the required protocol methods
         class InvalidDiscovery:
             """Object that does not implement DiscoveryLike protocol."""
+
             async def __aenter__(self):
                 return self
+
             async def __aexit__(self, *args):
                 pass
 

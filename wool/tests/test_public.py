@@ -29,7 +29,7 @@ def test_public_api_completeness():
         "UnexpectedResponse",
         "WorkerConnection",
         # Context
-        "AppContext",
+        "RuntimeContext",
         # Load balancing
         "ConnectionResourceFactory",
         "LoadBalancerContext",
