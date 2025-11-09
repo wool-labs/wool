@@ -1040,10 +1040,15 @@ class TestWorkerPool:
             Should raise ValueError
         """
         # Arrange - Create discovery that doesn't implement DiscoveryLike protocol
-        invalid_discovery = MagicMock()
-        # Make it return itself when entered as context manager
-        invalid_discovery.__aenter__ = mocker.AsyncMock(return_value=invalid_discovery)
-        invalid_discovery.__aexit__ = mocker.AsyncMock()
+        # Use a simple object that explicitly lacks the required protocol methods
+        class InvalidDiscovery:
+            """Object that does not implement DiscoveryLike protocol."""
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+
+        invalid_discovery = InvalidDiscovery()
 
         # Act & Assert
         with pytest.raises(ValueError):
@@ -1064,11 +1069,17 @@ class TestWorkerPool:
             Should raise TypeError
         """
         # Arrange - Create discovery that doesn't implement DiscoveryLike protocol
-        invalid_discovery = MagicMock()
-        invalid_discovery.__aenter__ = mocker.AsyncMock(return_value=invalid_discovery)
-        invalid_discovery.__aexit__ = mocker.AsyncMock()
+        # Use a simple object that explicitly lacks the required protocol methods
+        class InvalidDiscovery:
+            """Object that does not implement DiscoveryLike protocol."""
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
 
-        # Act & Assert - This tests line 236 (TypeError)
+        invalid_discovery = InvalidDiscovery()
+
+        # Act & Assert - This tests line 212 (TypeError)
         with pytest.raises(TypeError, match="Expected DiscoveryLike"):
             async with WorkerPool(size=2, discovery=invalid_discovery):
                 pass
