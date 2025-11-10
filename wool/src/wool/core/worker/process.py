@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 import grpc.aio
 
 import wool
-from wool.core.resourcepool import ResourcePool
 from wool.core import protobuf as pb
+from wool.core.resourcepool import ResourcePool
 from wool.core.worker.service import WorkerService
 
 if TYPE_CHECKING:

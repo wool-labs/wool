@@ -8,11 +8,11 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool._work import WoolTask
 from wool.core.discovery.base import WorkerInfo
 from wool.core.loadbalancer.base import LoadBalancerContext
 from wool.core.loadbalancer.base import NoWorkersAvailable
 from wool.core.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.core.work import WorkTask
 from wool.core.worker.connection import RpcError
 from wool.core.worker.connection import TransientRpcError
 from wool.core.worker.connection import WorkerConnection
@@ -100,7 +100,7 @@ class TestRoundRobinLoadBalancer:
 
         mock_proxy = mocker.MagicMock(id="mock-proxy")
 
-        task = WoolTask(
+        task = WorkTask(
             id=uuid4(),
             callable=routine,
             args=(),
@@ -235,7 +235,7 @@ class TestRoundRobinLoadBalancer:
 
         mock_proxy = mocker.MagicMock(id="mock-proxy")
 
-        task = WoolTask(
+        task = WorkTask(
             id=uuid4(),
             callable=routine,
             args=(),

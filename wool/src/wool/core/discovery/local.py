@@ -21,7 +21,6 @@ from watchdog.events import FileSystemEvent
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from wool.core.resourcepool import ResourcePool
 from wool.core.discovery.base import Discovery
 from wool.core.discovery.base import DiscoveryEvent
 from wool.core.discovery.base import DiscoveryEventType
@@ -30,6 +29,7 @@ from wool.core.discovery.base import DiscoverySubscriberLike
 from wool.core.discovery.base import PredicateFunction
 from wool.core.discovery.base import WorkerInfo
 from wool.core.protobuf.worker import WorkerInfo as WorkerInfoProtobuf
+from wool.core.resourcepool import ResourcePool
 
 REF_WIDTH: Final = 16
 NULL_REF: Final = b"\x00" * REF_WIDTH

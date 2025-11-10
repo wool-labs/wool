@@ -5,15 +5,22 @@ from typing import Final
 
 from tblib import pickling_support
 
-from wool.core.resourcepool import ResourcePool
-from wool._work import WoolTask
-from wool._work import WoolTaskEvent
-from wool._work import WoolTaskEventCallback
-from wool._work import WoolTaskEventType
-from wool._work import WoolTaskException
-from wool._work import current_task as wool_current_task
-from wool._work import work
 from wool.core.context import RuntimeContext
+from wool.core.resourcepool import ResourcePool
+from wool.core.work import WorkTask
+from wool.core.work import WorkTaskEvent
+from wool.core.work import WorkTaskEventCallback
+from wool.core.work import WorkTaskEventType
+from wool.core.work import WorkTaskException
+from wool.core.work import current_task
+from wool.core.work import work
+
+# Backward compatibility aliases (deprecated)
+WoolTask = WorkTask
+WoolTaskEvent = WorkTaskEvent
+WoolTaskEventCallback = WorkTaskEventCallback
+WoolTaskEventType = WorkTaskEventType
+WoolTaskException = WorkTaskException
 from wool.core.discovery.base import Discovery
 from wool.core.discovery.base import DiscoveryEvent
 from wool.core.discovery.base import DiscoveryEventType
@@ -72,15 +79,21 @@ __all__ = [
     "LoadBalancerLike",
     "NoWorkersAvailable",
     "RoundRobinLoadBalancer",
-    # Work
+    # Work - New names (preferred)
+    "WorkTask",
+    "WorkTaskEvent",
+    "WorkTaskEventCallback",
+    "WorkTaskEventType",
+    "WorkTaskException",
+    "current_task",
+    "routine",
+    "work",
+    # Work - Backward compatibility (deprecated)
     "WoolTask",
     "WoolTaskEvent",
     "WoolTaskEventCallback",
     "WoolTaskEventType",
     "WoolTaskException",
-    "routine",
-    "work",
-    "wool_current_task",
     # Workers
     "LocalWorker",
     "Worker",

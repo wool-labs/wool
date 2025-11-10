@@ -1,7 +1,12 @@
+"""Task execution and lifecycle management.
+
+This module contains classes and functions for managing distributed task
+execution, including WorkTask, WorkTaskEvent, and related functionality.
+"""
+
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import traceback
 from collections.abc import Callable
@@ -9,28 +14,20 @@ from contextvars import Context
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
-from sys import modules
 from time import perf_counter_ns
-from types import ModuleType
 from types import TracebackType
 from typing import TYPE_CHECKING
 from typing import Coroutine
 from typing import Dict
 from typing import Literal
-from typing import ParamSpec
 from typing import Protocol
 from typing import SupportsInt
 from typing import Tuple
-from typing import Type
-from typing import TypeVar
-from typing import cast
 from uuid import UUID
-from uuid import uuid4
 
 import cloudpickle
 
 import wool
-from wool.core import context as ctx
 from wool.core import protobuf as pb
 from wool.core.typing import PassthroughWrapper
 
@@ -38,8 +35,6 @@ if TYPE_CHECKING:
     from wool.core.worker.proxy import WorkerProxy
 
 AsyncCallable = Callable[..., Coroutine]
-C = TypeVar("C", bound=AsyncCallable)
-
 Args = Tuple
 Kwargs = Dict
 Timeout = SupportsInt
@@ -47,167 +42,8 @@ Timestamp = SupportsInt
 
 
 # public
-def work(fn: C) -> C:
-    """Decorator to declare an asynchronous function as remotely executable.
-
-    Converts an asynchronous function into a distributed task that can be
-    executed by a worker pool. When the decorated function is invoked, it
-    is dispatched to the worker pool associated with the current worker
-    pool session context.
-
-    :param fn:
-        The asynchronous function to convert into a distributed routine.
-    :returns:
-        The decorated function that dispatches to the worker pool when
-        called.
-    :raises ValueError:
-        If the decorated function is not a coroutine function.
-
-    .. note::
-        Decorated functions behave like regular coroutines and can
-        be awaited and cancelled normally. Task execution occurs
-        transparently across the distributed worker pool.
-
-    Best practices and considerations for designing tasks:
-
-    1. **Picklability**: Arguments and return values must be picklable for
-       serialization between processes. Avoid unpicklable objects like
-       open file handles, database connections, or lambda functions.
-       Custom objects should implement ``__getstate__`` and
-       ``__setstate__`` methods if needed.
-
-    2. **Synchronization**: Tasks are not guaranteed to execute on the
-       same process between invocations. Standard :mod:`asyncio`
-       synchronization primitives will not work across processes.
-       Use file-based or other distributed synchronization utilities.
-
-    3. **Statelessness**: Design tasks to be stateless and idempotent.
-       Avoid global variables or shared mutable state to ensure
-       predictable behavior and enable safe retries.
-
-    4. **Cancellation**: Task cancellation behaves like standard Python
-       coroutine cancellation and is properly propagated across the
-       distributed system.
-
-    5. **Error propagation**: Unhandled exceptions raised within tasks are
-       transparently propagated to the caller as they would be normally.
-
-    6. **Performance**: Minimize argument and return value sizes to reduce
-       serialization overhead. For large datasets, consider using shared
-       memory or passing references instead of the data itself.
-
-    Example usage:
-
-    .. code-block:: python
-
-        import wool
-
-
-        @wool.work
-        async def fibonacci(n: int) -> int:
-            if n <= 1:
-                return n
-            return await fibonacci(n - 1) + await fibonacci(n - 2)
-
-
-        async def main():
-            async with wool.WorkerPool():
-                result = await fibonacci(10)
-    """
-    if not inspect.iscoroutinefunction(fn):
-        raise ValueError("Expected a coroutine function")
-
-    @wraps(fn)
-    def wrapper(*args, **kwargs) -> Coroutine:
-        # Handle static and class methods in a picklable way.
-        parent, function = _resolve(fn)
-        assert parent is not None
-        assert callable(function)
-
-        if _do_dispatch.get():
-            proxy = wool.__proxy__.get()
-            assert proxy
-            stream = _dispatch(
-                proxy,
-                wrapper.__module__,
-                wrapper.__qualname__,
-                function,
-                *args,
-                **kwargs,
-            )
-            if inspect.iscoroutinefunction(fn):
-                return _stream_to_coroutine(stream)
-            else:
-                raise ValueError("Expected a coroutine function")
-        else:
-            return _execute(fn, parent, *args, **kwargs)
-
-    return cast(C, wrapper)
-
-
-routine = work
-
-
-def _dispatch(
-    proxy: WorkerProxy,
-    module: str,
-    qualname: str,
-    function: AsyncCallable,
-    *args,
-    **kwargs,
-):
-    # Skip self argument if function is a method.
-    args = args[1:] if hasattr(function, "__self__") else args
-    signature = ", ".join(
-        (
-            *(repr(v) for v in args),
-            *(f"{k}={repr(v)}" for k, v in kwargs.items()),
-        )
-    )
-    task = WoolTask(
-        id=uuid4(),
-        callable=function,
-        args=args,
-        kwargs=kwargs,
-        tag=f"{module}.{qualname}({signature})",
-        proxy=proxy,
-    )
-    return proxy.dispatch(task, timeout=ctx.dispatch_timeout.get())
-
-
-async def _execute(fn: AsyncCallable, parent, *args, **kwargs):
-    token = _do_dispatch.set(True)
-    try:
-        if isinstance(fn, classmethod):
-            return await fn.__func__(parent, *args, **kwargs)
-        else:
-            return await fn(*args, **kwargs)
-    finally:
-        _do_dispatch.reset(token)
-
-
-async def _stream_to_coroutine(stream):
-    result = None
-    async for result in await stream:
-        continue
-    return result
-
-
-# public
-def current_task() -> WoolTask | None:
-    """
-    Get the current task from the context variable if we are inside a task
-    context, otherwise return None.
-
-    :returns:
-        The current task or None if no task is active.
-    """
-    return _current_task.get()
-
-
-# public
 @dataclass
-class WoolTask:
+class WorkTask:
     """
     Represents a distributed task to be executed in the worker pool.
 
@@ -249,7 +85,7 @@ class WoolTask:
     proxy: WorkerProxy
     timeout: Timeout = 0
     caller: UUID | None = None
-    exception: WoolTaskException | None = None
+    exception: WorkTaskException | None = None
     filename: str | None = None
     function: str | None = None
     line_no: int | None = None
@@ -267,7 +103,7 @@ class WoolTask:
         """
         if caller := _current_task.get():
             self.caller = caller.id
-        WoolTaskEvent("task-created", task=self).emit()
+        WorkTaskEvent("task-created", task=self).emit()
 
     def __enter__(self) -> Callable[[], Coroutine]:
         """
@@ -303,7 +139,7 @@ class WoolTask:
         if exception_value:
             this = asyncio.current_task()
             assert this
-            self.exception = WoolTaskException(
+            self.exception = WorkTaskException(
                 exception_type.__qualname__,
                 traceback=[
                     y
@@ -318,7 +154,7 @@ class WoolTask:
         return False
 
     @classmethod
-    def from_protobuf(cls, task: pb.task.Task) -> WoolTask:
+    def from_protobuf(cls, task: pb.task.Task) -> WorkTask:
         return cls(
             id=UUID(task.id),
             callable=cloudpickle.loads(task.callable),
@@ -326,6 +162,11 @@ class WoolTask:
             kwargs=cloudpickle.loads(task.kwargs),
             caller=UUID(task.caller) if task.caller else None,
             proxy=cloudpickle.loads(task.proxy),
+            timeout=task.timeout if task.timeout else 0,
+            filename=task.filename if task.filename else None,
+            function=task.function if task.function else None,
+            line_no=task.line_no if task.line_no else None,
+            tag=task.tag if task.tag else None,
         )
 
     def to_protobuf(self) -> pb.task.Task:
@@ -337,6 +178,11 @@ class WoolTask:
             caller=str(self.caller) if self.caller else "",
             proxy=cloudpickle.dumps(self.proxy),
             proxy_id=str(self.proxy.id),
+            timeout=self.timeout if self.timeout else 0,
+            filename=self.filename if self.filename else "",
+            function=self.function if self.function else "",
+            line_no=self.line_no if self.line_no else 0,
+            tag=self.tag if self.tag else "",
         )
 
     async def run(self) -> Coroutine:
@@ -346,10 +192,11 @@ class WoolTask:
         :returns:
             A coroutine representing the routine execution.
         :raises RuntimeError:
-            If no proxy is available for task execution.
+            If no proxy pool is available for task execution.
         """
         proxy_pool = wool.__proxy_pool__.get()
-        assert proxy_pool
+        if not proxy_pool:
+            raise RuntimeError("No proxy pool available for task execution")
         async with proxy_pool.get(self.proxy) as proxy:
             # Set the proxy in context variable for nested task dispatch
             token = wool.__proxy__.set(proxy)
@@ -360,30 +207,28 @@ class WoolTask:
                 wool.__proxy__.reset(token)
 
     def _finish(self, _):
-        WoolTaskEvent("task-completed", task=self).emit()
+        WorkTaskEvent("task-completed", task=self).emit()
 
     def _with_self(self, fn: AsyncCallable) -> AsyncCallable:
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             with self:
                 current_task_token = _current_task.set(self)
-                # Do not re-submit this task, execute it locally
-                local_token = _do_dispatch.set(False)
                 # Yield to event loop with context set
                 await asyncio.sleep(0)
                 try:
-                    result = await fn(*args, **kwargs)
+                    # Execute as worker without re-dispatching
+                    result = await execute_as_worker(fn)(*args, **kwargs)
                     return result
                 finally:
                     _current_task.reset(current_task_token)
-                    _do_dispatch.reset(local_token)
 
         return wrapper
 
 
 # public
 @dataclass
-class WoolTaskException:
+class WorkTaskException:
     """
     Represents an exception that occurred during distributed task execution.
 
@@ -402,7 +247,7 @@ class WoolTaskException:
 
 
 # public
-class WoolTaskEvent:
+class WorkTaskEvent:
     """
     Represents a lifecycle event for a distributed task.
 
@@ -413,30 +258,30 @@ class WoolTaskEvent:
     :param type:
         The type of task event (e.g., "task-created", "task-scheduled").
     :param task:
-        The :class:`WoolTask` instance associated with this event.
+        The :class:`WorkTask` instance associated with this event.
     """
 
-    type: WoolTaskEventType
-    task: WoolTask
+    type: WorkTaskEventType
+    task: WorkTask
 
-    _handlers: dict[str, list[WoolTaskEventCallback]] = {}
+    _handlers: dict[str, list[WorkTaskEventCallback]] = {}
 
-    def __init__(self, type: WoolTaskEventType, /, task: WoolTask) -> None:
+    def __init__(self, type: WorkTaskEventType, /, task: WorkTask) -> None:
         """
-        Initialize a WoolTaskEvent instance.
+        Initialize a WorkTaskEvent instance.
 
         :param type:
             The type of the task event.
         :param task:
-            The :class:`WoolTask` instance associated with the event.
+            The :class:`WorkTask` instance associated with the event.
         """
         self.type = type
         self.task = task
 
     @classmethod
     def handler(
-        cls, *event_types: WoolTaskEventType
-    ) -> PassthroughWrapper[WoolTaskEventCallback]:
+        cls, *event_types: WorkTaskEventType
+    ) -> PassthroughWrapper[WorkTaskEventCallback]:
         """
         Register a handler function for specific task event types.
 
@@ -447,8 +292,8 @@ class WoolTaskEvent:
         """
 
         def _handler(
-            fn: WoolTaskEventCallback,
-        ) -> WoolTaskEventCallback:
+            fn: WorkTaskEventCallback,
+        ) -> WorkTaskEventCallback:
             for event_type in event_types:
                 cls._handlers.setdefault(event_type, []).append(fn)
             return fn
@@ -477,7 +322,7 @@ class WoolTaskEvent:
 
 
 # public
-WoolTaskEventType = Literal[
+WorkTaskEventType = Literal[
     "task-created",
     "task-queued",
     "task-scheduled",
@@ -486,47 +331,62 @@ WoolTaskEventType = Literal[
     "task-completed",
 ]
 """
-Defines the types of events that can occur during the lifecycle of a Wool 
+Defines the types of events that can occur during the lifecycle of a Wool
 task.
 
-- "task-created": 
+- "task-created":
     Emitted when a task is created.
-- "task-queued": 
+- "task-queued":
     Emitted when a task is added to the queue.
-- "task-scheduled": 
+- "task-scheduled":
     Emitted when a task is scheduled for execution in a worker's event
     loop.
-- "task-started": 
+- "task-started":
     Emitted when a task starts execution.
-- "task-stopped": 
+- "task-stopped":
     Emitted when a task stops execution.
-- "task-completed": 
+- "task-completed":
     Emitted when a task completes execution.
 """
 
 
 # public
-class WoolTaskEventCallback(Protocol):
+class WorkTaskEventCallback(Protocol):
     """
-    Protocol for WoolTaskEvent callback functions.
+    Protocol for WorkTaskEvent callback functions.
     """
 
-    def __call__(self, event: WoolTaskEvent, timestamp: Timestamp) -> None: ...
+    def __call__(self, event: WorkTaskEvent, timestamp: Timestamp) -> None: ...
 
 
-_do_dispatch: ContextVar[bool] = ContextVar("_do_dispatch", default=True)
-_current_task: ContextVar[WoolTask | None] = ContextVar("_current_task", default=None)
+# Import from wrapper module (after class definitions to avoid circular import issues)
+from wool.core.work.wrapper import _do_dispatch  # noqa: E402
+from wool.core.work.wrapper import execute_as_worker  # noqa: E402
+
+_current_task: ContextVar[WorkTask | None] = ContextVar("_current_task", default=None)
+
+
+# public
+def current_task() -> WorkTask | None:
+    """
+    Get the current task from the context variable if we are inside a task
+    context, otherwise return None.
+
+    :returns:
+        The current task or None if no task is active.
+    """
+    return _current_task.get()
 
 
 def _run(fn):
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
         if current_task := self._context.get(_current_task):
-            WoolTaskEvent("task-started", task=current_task).emit()
+            WorkTaskEvent("task-started", task=current_task).emit()
             try:
                 result = fn(self, *args, **kwargs)
             finally:
-                WoolTaskEvent("task-stopped", task=current_task).emit()
+                WorkTaskEvent("task-stopped", task=current_task).emit()
             return result
         else:
             return fn(self, *args, **kwargs)
@@ -535,20 +395,3 @@ def _run(fn):
 
 
 asyncio.Handle._run = _run(asyncio.Handle._run)
-
-
-P = ParamSpec("P")
-R = TypeVar("R")
-
-
-def _resolve(
-    method: Callable[P, R],
-) -> Tuple[Type | ModuleType | None, Callable[P, R]]:
-    scope = modules[method.__module__]
-    parent = None
-    for name in method.__qualname__.split("."):
-        parent = scope
-        scope = getattr(scope, name)
-        assert scope
-    assert isinstance(parent, (Type, ModuleType))
-    return parent, cast(Callable[P, R], scope)
