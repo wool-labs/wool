@@ -14,7 +14,6 @@ from typing import TypeVar
 from typing import overload
 
 import wool
-from wool.core.resourcepool import ResourcePool
 from wool.core.discovery.base import DiscoveryEvent
 from wool.core.discovery.base import DiscoverySubscriberLike
 from wool.core.discovery.base import WorkerInfo
@@ -22,11 +21,12 @@ from wool.core.discovery.local import LocalDiscovery
 from wool.core.loadbalancer.base import LoadBalancerContext
 from wool.core.loadbalancer.base import LoadBalancerLike
 from wool.core.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.core.resourcepool import ResourcePool
 from wool.core.typing import Factory
 from wool.core.worker.connection import WorkerConnection
 
 if TYPE_CHECKING:
-    from wool._work import WoolTask
+    from wool.core.work import WorkTask
 
 T = TypeVar("T")
 
@@ -348,7 +348,7 @@ class WorkerProxy:
         self._loadbalancer_context = None
         self._started = False
 
-    async def dispatch(self, task: WoolTask, *, timeout: float | None = None):
+    async def dispatch(self, task: WorkTask, *, timeout: float | None = None):
         """Dispatches a task to an available worker in the pool.
 
         This method selects a worker using a round-robin strategy. If no
@@ -356,7 +356,7 @@ class WorkerProxy:
         exception.
 
         :param task:
-            The :class:`WoolTask` object to be dispatched.
+            The :class:`WorkTask` object to be dispatched.
         :param timeout:
             Timeout in seconds for getting a worker.
         :returns:
