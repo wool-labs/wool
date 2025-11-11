@@ -8,7 +8,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
@@ -82,18 +82,16 @@ class TestRoundRobinLoadBalancer:
         for i in range(worker_count):
             mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
             mock_connection.dispatch = mocker.AsyncMock()
-            worker_info = WorkerInfo(
+            metadata = WorkerMetadata(
                 uid=uuid4(),
                 host="localhost",
                 port=50051,
                 pid=1000 + i,
                 version="1.0.0",
             )
-            mock_workers[worker_info] = mock_connection
-            resource_factory = mock_connection_resource_factory(
-                worker_info, mock_workers
-            )
-            ctx.add_worker(worker_info, resource_factory)
+            mock_workers[metadata] = mock_connection
+            resource_factory = mock_connection_resource_factory(metadata, mock_workers)
+            ctx.add_worker(metadata, resource_factory)
 
         async def routine():
             return "Hello world!"
@@ -147,11 +145,11 @@ class TestRoundRobinLoadBalancer:
             )
 
             # Reset dispatch side effect and call count on all remaining workers
-            for worker_info in workers_remaining:
-                mock_connection = mock_workers[worker_info]
+            for metadata in workers_remaining:
+                mock_connection = mock_workers[metadata]
                 mock_connection.dispatch.reset_mock()
                 mock_connection.dispatch.side_effect = make_dispatch_side_effect(
-                    worker_info
+                    metadata
                 )
 
             result = await lb.dispatch(task, context=ctx, timeout=timeout)
@@ -217,18 +215,16 @@ class TestRoundRobinLoadBalancer:
         for i in range(worker_count):
             mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
             mock_connection.dispatch = mocker.AsyncMock()
-            worker_info = WorkerInfo(
+            metadata = WorkerMetadata(
                 uid=uuid4(),
                 host="localhost",
                 port=50051,
                 pid=1000 + i,
                 version="1.0.0",
             )
-            mock_workers[worker_info] = mock_connection
-            resource_factory = mock_connection_resource_factory(
-                worker_info, mock_workers
-            )
-            ctx.add_worker(worker_info, resource_factory)
+            mock_workers[metadata] = mock_connection
+            resource_factory = mock_connection_resource_factory(metadata, mock_workers)
+            ctx.add_worker(metadata, resource_factory)
 
         async def routine():
             return "Hello world!"
@@ -272,11 +268,11 @@ class TestRoundRobinLoadBalancer:
             )
 
             # Reset dispatch side effect and call count on all remaining workers
-            for worker_info in workers_remaining:
-                mock_connection = mock_workers[worker_info]
+            for metadata in workers_remaining:
+                mock_connection = mock_workers[metadata]
                 mock_connection.dispatch.reset_mock()
                 mock_connection.dispatch.side_effect = make_dispatch_side_effect(
-                    worker_info
+                    metadata
                 )
 
             with pytest.raises(NoWorkersAvailable):

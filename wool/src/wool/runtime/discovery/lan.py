@@ -25,7 +25,7 @@ from wool.runtime.discovery.base import DiscoveryEventType
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 
 
 # public
@@ -47,13 +47,13 @@ class LanDiscovery(Discovery):
     .. code-block:: python
         publisher = LanDiscovery.Publisher()
         async with publisher:
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
     Subscribe to workers
     .. code-block:: python
         discovery = LanDiscovery()
         async for event in discovery.subscriber:
-            print(f"Discovered worker: {event.worker_info}")
+            print(f"Discovered worker: {event.metadata}")
     """
 
     service_type: Literal["_wool._tcp.local."] = "_wool._tcp.local."
@@ -136,7 +136,7 @@ class LanDiscovery(Discovery):
                 await self.aiozc.async_close()
                 self.aiozc = None
 
-        async def publish(self, type: DiscoveryEventType, worker_info: WorkerInfo):
+        async def publish(self, type: DiscoveryEventType, metadata: WorkerMetadata):
             """Publish a worker discovery event.
 
             Manages Zeroconf service records based on the event type:
@@ -147,8 +147,8 @@ class LanDiscovery(Discovery):
 
             :param type:
                 The type of discovery event.
-            :param worker_info:
-                Worker information to publish.
+            :param metadata:
+                Worker metadata to publish.
             :raises RuntimeError:
                 If the publisher is not properly initialized or if an
                 unexpected event type is provided.
@@ -158,18 +158,18 @@ class LanDiscovery(Discovery):
 
             match type:
                 case "worker-added":
-                    await self._add(worker_info)
+                    await self._add(metadata)
                 case "worker-dropped":
-                    await self._drop(worker_info)
+                    await self._drop(metadata)
                 case "worker-updated":
-                    await self._update(worker_info)
+                    await self._update(metadata)
                 case _:
                     raise RuntimeError(f"Unexpected discovery event type: {type}")
 
-        async def _add(self, worker_info: WorkerInfo) -> None:
+        async def _add(self, metadata: WorkerMetadata) -> None:
             """Register a worker by publishing its service info.
 
-            :param worker_info:
+            :param metadata:
                 The worker details to publish.
             :raises RuntimeError:
                 If the publisher is not properly initialized.
@@ -178,47 +178,47 @@ class LanDiscovery(Discovery):
             """
             assert self.aiozc
 
-            if worker_info.port is None:
+            if metadata.port is None:
                 raise ValueError("Worker port must be specified for LAN discovery")
 
-            address = f"{worker_info.host}:{worker_info.port}"
+            address = f"{metadata.host}:{metadata.port}"
             ip_address, port = self._resolve_address(address)
-            service_name = f"{worker_info.uid}.{self.service_type}"
+            service_name = f"{metadata.uid}.{self.service_type}"
             service_info = ServiceInfo(
                 self.service_type,
                 service_name,
                 addresses=[ip_address],
                 port=port,
-                properties=_serialize_worker_info(worker_info),
+                properties=_serialize_metadata(metadata),
             )
-            self.services[str(worker_info.uid)] = service_info
+            self.services[str(metadata.uid)] = service_info
             await self.aiozc.async_register_service(service_info)
 
-        async def _drop(self, worker_info: WorkerInfo) -> None:
+        async def _drop(self, metadata: WorkerMetadata) -> None:
             """Unregister a worker by removing its service record.
 
-            :param worker_info:
+            :param metadata:
                 The worker to unregister.
             :raises RuntimeError:
                 If the publisher is not properly initialized.
             """
             assert self.aiozc
 
-            uid_str = str(worker_info.uid)
+            uid_str = str(metadata.uid)
             if uid_str in self.services:
                 service = self.services[uid_str]
                 await self.aiozc.async_unregister_service(service)
                 del self.services[uid_str]
 
-        async def _update(self, worker_info: WorkerInfo) -> None:
+        async def _update(self, metadata: WorkerMetadata) -> None:
             """Update a worker's properties if they have changed.
 
             Updates both the Zeroconf service and local cache
             atomically. If the Zeroconf update fails, the local cache
             remains unchanged to maintain consistency.
 
-            :param worker_info:
-                The updated worker information.
+            :param metadata:
+                The updated worker metadata.
             :raises RuntimeError:
                 If the publisher is not properly initialized.
             :raises Exception:
@@ -226,14 +226,14 @@ class LanDiscovery(Discovery):
             """
             assert self.aiozc
 
-            uid_str = str(worker_info.uid)
+            uid_str = str(metadata.uid)
             if uid_str not in self.services:
                 # Worker not found, treat as registration
-                await self._add(worker_info)
+                await self._add(metadata)
                 return
 
             service = self.services[uid_str]
-            new_properties = _serialize_worker_info(worker_info)
+            new_properties = _serialize_metadata(metadata)
 
             if service.decoded_properties != new_properties:
                 updated_service = ServiceInfo(
@@ -296,12 +296,12 @@ class LanDiscovery(Discovery):
             events.
         """
 
-        _filter: Final[PredicateFunction[WorkerInfo] | None]
+        _filter: Final[PredicateFunction[WorkerMetadata] | None]
         service_type: Literal["_wool._tcp.local."] = "_wool._tcp.local."
 
         def __init__(
             self,
-            filter: PredicateFunction[WorkerInfo] | None = None,
+            filter: PredicateFunction[WorkerMetadata] | None = None,
         ) -> None:
             self._filter = filter
 
@@ -321,7 +321,7 @@ class LanDiscovery(Discovery):
             """
             # Create isolated state for this iterator
             event_queue: Queue[DiscoveryEvent] = Queue()
-            service_cache: Dict[str, WorkerInfo] = {}
+            service_cache: Dict[str, WorkerMetadata] = {}
 
             # Configure zeroconf to use localhost only to avoid network warnings
             aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
@@ -365,14 +365,14 @@ class LanDiscovery(Discovery):
             aiozc: AsyncZeroconf
             _event_queue: Queue[DiscoveryEvent]
             _service_addresses: Dict[str, str]
-            _service_cache: Dict[str, WorkerInfo]
+            _service_cache: Dict[str, WorkerMetadata]
 
             def __init__(
                 self,
                 aiozc: AsyncZeroconf,
                 event_queue: Queue[DiscoveryEvent],
-                predicate: PredicateFunction[WorkerInfo],
-                service_cache: Dict[str, WorkerInfo],
+                predicate: PredicateFunction[WorkerMetadata],
+                service_cache: Dict[str, WorkerMetadata],
             ) -> None:
                 self.aiozc = aiozc
                 self._event_queue = event_queue
@@ -391,7 +391,7 @@ class LanDiscovery(Discovery):
                     if worker := self._service_cache.pop(name, None):
                         asyncio.create_task(
                             self._event_queue.put(
-                                DiscoveryEvent(type="worker-dropped", worker_info=worker)
+                                DiscoveryEvent("worker-dropped", metadata=worker)
                             )
                         )
 
@@ -411,15 +411,13 @@ class LanDiscovery(Discovery):
                         return
 
                     try:
-                        worker_info = _deserialize_worker_info(service_info)
+                        metadata = _deserialize_metadata(service_info)
                     except ValueError:
                         return
 
-                    if self._predicate(worker_info):
-                        self._service_cache[name] = worker_info
-                        event = DiscoveryEvent(
-                            type="worker-added", worker_info=worker_info
-                        )
+                    if self._predicate(metadata):
+                        self._service_cache[name] = metadata
+                        event = DiscoveryEvent("worker-added", metadata=metadata)
                         await self._event_queue.put(event)
                 except Exception:  # pragma: no cover
                     pass
@@ -435,33 +433,29 @@ class LanDiscovery(Discovery):
                         return
 
                     try:
-                        worker_info = _deserialize_worker_info(service_info)
+                        metadata = _deserialize_metadata(service_info)
                     except ValueError:
                         return
 
                     if name not in self._service_cache:
                         # New worker that wasn't tracked before
-                        if self._predicate(worker_info):
-                            self._service_cache[name] = worker_info
-                            event = DiscoveryEvent(
-                                type="worker-added", worker_info=worker_info
-                            )
+                        if self._predicate(metadata):
+                            self._service_cache[name] = metadata
+                            event = DiscoveryEvent("worker-added", metadata=metadata)
                             await self._event_queue.put(event)
                     else:
                         # Existing tracked worker
                         old_worker = self._service_cache[name]
-                        if self._predicate(worker_info):
+                        if self._predicate(metadata):
                             # Still satisfies filter, update cache and emit update
-                            self._service_cache[name] = worker_info
-                            event = DiscoveryEvent(
-                                type="worker-updated", worker_info=worker_info
-                            )
+                            self._service_cache[name] = metadata
+                            event = DiscoveryEvent("worker-updated", metadata=metadata)
                             await self._event_queue.put(event)
                         else:
                             # No longer satisfies filter, remove and emit removal
                             del self._service_cache[name]
                             removal_event = DiscoveryEvent(
-                                type="worker-dropped", worker_info=old_worker
+                                "worker-dropped", metadata=old_worker
                             )
                             await self._event_queue.put(removal_event)
 
@@ -469,13 +463,13 @@ class LanDiscovery(Discovery):
                     pass
 
 
-def _serialize_worker_info(
-    info: WorkerInfo,
+def _serialize_metadata(
+    info: WorkerMetadata,
 ) -> dict[str, str | None]:
-    """Serialize WorkerInfo to a flat dict for service properties.
+    """Serialize WorkerMetadata to a flat dict for service properties.
 
     :param info:
-        WorkerInfo instance to serialize.
+        WorkerMetadata instance to serialize.
     :returns:
         Flat dict with pid, version, tags (JSON), extra (JSON).
     """
@@ -488,13 +482,13 @@ def _serialize_worker_info(
     return properties
 
 
-def _deserialize_worker_info(info: ServiceInfo) -> WorkerInfo:
-    """Deserialize ServiceInfo.decoded_properties to WorkerInfo.
+def _deserialize_metadata(info: ServiceInfo) -> WorkerMetadata:
+    """Deserialize ServiceInfo.decoded_properties to WorkerMetadata.
 
     :param info:
         ServiceInfo with decoded properties dict (str keys/values).
     :returns:
-        WorkerInfo instance.
+        WorkerMetadata instance.
     :raises ValueError:
         If required fields are missing or invalid JSON.
     """
@@ -523,7 +517,7 @@ def _deserialize_worker_info(info: ServiceInfo) -> WorkerInfo:
     service_name = info.name
     uid_str = service_name.split(".")[0]
 
-    return WorkerInfo(
+    return WorkerMetadata(
         uid=UUID(uid_str),
         pid=pid,
         host=str(info.ip_addresses_by_version(IPVersion.V4Only)[0]),

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
-from contextvars import ContextVar
 from functools import wraps
 from sys import modules
 from types import ModuleType
@@ -23,8 +22,9 @@ from uuid import uuid4
 
 import wool
 from wool.runtime import context as ctx
-from wool.runtime.work.task import AsyncCallable
+from wool.runtime.typing import AsyncCallable
 from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import do_dispatch
 
 if TYPE_CHECKING:
     from wool.runtime.worker.proxy import WorkerProxy
@@ -32,9 +32,6 @@ if TYPE_CHECKING:
 C = TypeVar("C", bound=AsyncCallable)
 P = ParamSpec("P")
 R = TypeVar("R")
-
-# Context variable for controlling dispatch behavior
-_do_dispatch: ContextVar[bool] = ContextVar("_do_dispatch", default=True)
 
 
 # public
@@ -115,7 +112,7 @@ def work(fn: C) -> C:
         assert parent is not None
         assert callable(function)
 
-        if _do_dispatch.get():
+        if do_dispatch():
             proxy = wool.__proxy__.get()
             assert proxy
             stream = _dispatch(
@@ -137,29 +134,6 @@ def work(fn: C) -> C:
 
 
 routine = work
-
-
-def execute_as_worker(fn: AsyncCallable):
-    """Execute a coroutine as a worker without re-dispatching.
-
-    This closure wraps a coroutine execution to run in worker mode,
-    preventing the task from being re-dispatched to the worker pool.
-    Used when executing tasks locally within a worker process.
-
-    :param fn:
-        The async callable to execute as a worker.
-    :returns:
-        A coroutine that executes the callable with dispatch disabled.
-    """
-
-    async def _executor(*args, **kwargs):
-        token = _do_dispatch.set(False)
-        try:
-            return await fn(*args, **kwargs)
-        finally:
-            _do_dispatch.reset(token)
-
-    return _executor
 
 
 def _dispatch(
@@ -190,14 +164,11 @@ def _dispatch(
 
 
 async def _execute(fn: AsyncCallable, parent, *args, **kwargs):
-    token = _do_dispatch.set(True)
-    try:
+    with do_dispatch(True):
         if isinstance(fn, classmethod):
             return await fn.__func__(parent, *args, **kwargs)
         else:
             return await fn(*args, **kwargs)
-    finally:
-        _do_dispatch.reset(token)
 
 
 async def _stream_to_coroutine(stream):

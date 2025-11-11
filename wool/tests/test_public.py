@@ -39,7 +39,7 @@ def test_public_api_completeness():
         # Work - New names (preferred)
         "WorkTask",
         "WorkTaskEvent",
-        "WorkTaskEventCallback",
+        "WorkTaskEventHandler",
         "WorkTaskEventType",
         "WorkTaskException",
         "current_task",
@@ -48,7 +48,7 @@ def test_public_api_completeness():
         # Work - Backward compatibility (deprecated)
         "WoolTask",
         "WoolTaskEvent",
-        "WoolTaskEventCallback",
+        "WoolTaskEventHandler",
         "WoolTaskEventType",
         "WoolTaskException",
         # Workers
@@ -69,7 +69,7 @@ def test_public_api_completeness():
         "LanDiscovery",
         "LocalDiscovery",
         "PredicateFunction",
-        "WorkerInfo",
+        "WorkerMetadata",
         # Typing
         "Factory",
     ]
