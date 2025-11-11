@@ -7,7 +7,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
@@ -39,7 +39,7 @@ class ConcreteWorker(Worker):
         self._address = "localhost:50051"
         self._host = "localhost"
         self._port = 50051
-        self._info = WorkerInfo(
+        self._info = WorkerMetadata(
             uid=self._uid,
             host="localhost",
             port=50051,
@@ -107,10 +107,10 @@ class TestWorker:
             It should return None
         """
         worker = ConcreteWorker()
-        assert worker.info is None
+        assert worker.metadata is None
 
     @pytest.mark.asyncio
-    async def test_start_calls_implementation_start(self, mocker, worker_info):
+    async def test_start_calls_implementation_start(self, mocker, metadata):
         """Test Worker start method calls _start implementation.
 
         Given:
@@ -123,7 +123,7 @@ class TestWorker:
         worker = ConcreteWorker()
 
         async def mock_start_impl(timeout):
-            worker._info = worker_info
+            worker._info = metadata
 
         mock_start = mocker.patch.object(
             worker, "_start", side_effect=mock_start_impl, new_callable=AsyncMock
@@ -144,7 +144,7 @@ class TestWorker:
         """
         worker = ConcreteWorker()
         await worker.start()
-        assert worker.info is not None
+        assert worker.metadata is not None
 
     @pytest.mark.asyncio
     async def test_start_raises_error_if_already_started(self):
@@ -191,7 +191,7 @@ class TestWorker:
         """
         worker = ConcreteWorker()
         await worker.start(timeout=timeout)
-        assert worker.info is not None
+        assert worker.metadata is not None
 
     @given(count=st.integers(min_value=2, max_value=100))
     def test_multiple_workers_have_unique_uids(self, count):
@@ -288,7 +288,7 @@ class TestWorker:
         await worker.stop()
         # Should be able to start again without error
         await worker.start()
-        assert worker.info is not None
+        assert worker.metadata is not None
 
     @pytest.mark.asyncio
     async def test_stop_raises_error_if_not_started(self):
@@ -326,7 +326,7 @@ class TestWorker:
         # Should still be able to restart despite error
         mocker.patch.object(worker, "_stop", new_callable=AsyncMock)
         await worker.start()
-        assert worker.info is not None
+        assert worker.metadata is not None
 
 
 class TestWorkerLike:

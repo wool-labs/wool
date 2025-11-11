@@ -31,7 +31,7 @@ message StopRequest {
     float timeout = 1;
 }
 
-message WorkerInfo {
+message WorkerMetadata {
     // Unique identifier for the worker instance
     string uid = 1;
 

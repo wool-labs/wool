@@ -1,7 +1,7 @@
 import pytest
 from pytest_mock import MockerFixture
 
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 
 
 @pytest.fixture
@@ -26,10 +26,10 @@ def dispatch_side_effect_factory():
             A function that creates dispatch side effect functions for workers.
         """
 
-        def make_dispatch_side_effect(worker_info):
+        def make_dispatch_side_effect(metadata):
             async def dispatch_side_effect(task, *, timeout=None):
                 del timeout
-                workers_attempted.append(worker_info)
+                workers_attempted.append(metadata)
                 side_effect = next(side_effect_iterator)
                 if isinstance(side_effect, Exception):
                     raise side_effect
@@ -51,10 +51,10 @@ def mock_connection_resource_factory(mocker: MockerFixture):
     Returns a function that creates connection resource factories for workers.
     """
 
-    def factory(worker_info: WorkerInfo, mock_workers: dict):
+    def factory(metadata: WorkerMetadata, mock_workers: dict):
         """Create a connection resource factory for the specified worker.
 
-        :param worker_info:
+        :param metadata:
             The worker info for which to create the factory.
         :param mock_workers:
             Dictionary mapping worker info to mock connections.
@@ -63,7 +63,7 @@ def mock_connection_resource_factory(mocker: MockerFixture):
             A callable that returns a mock connection resource.
         """
         mock_connection_resource = mocker.MagicMock(
-            __aenter__=mocker.AsyncMock(return_value=mock_workers[worker_info]),
+            __aenter__=mocker.AsyncMock(return_value=mock_workers[metadata]),
             __aexit__=mocker.AsyncMock(return_value=None),
         )
         return lambda: mock_connection_resource

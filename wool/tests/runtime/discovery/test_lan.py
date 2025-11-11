@@ -10,20 +10,20 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from zeroconf import ServiceInfo
 
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.lan import LanDiscovery
-from wool.runtime.discovery.lan import _deserialize_worker_info
-from wool.runtime.discovery.lan import _serialize_worker_info
+from wool.runtime.discovery.lan import _deserialize_metadata
+from wool.runtime.discovery.lan import _serialize_metadata
 
 
 @pytest.fixture
-def worker_info():
-    """Provides sample WorkerInfo for testing.
+def metadata():
+    """Provides sample WorkerMetadata for testing.
 
-    Creates a WorkerInfo instance with typical field values for use in
+    Creates a WorkerMetadata instance with typical field values for use in
     tests that need a well-formed worker instance.
     """
-    return WorkerInfo(
+    return WorkerMetadata(
         uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
         host="localhost",
         port=50051,
@@ -38,13 +38,13 @@ def worker_info():
 def worker_factory():
     """Factory for creating multiple unique workers.
 
-    Provides a factory function that creates WorkerInfo instances with
+    Provides a factory function that creates WorkerMetadata instances with
     unique UIDs and customizable port/tags for tests requiring multiple
     distinct workers.
     """
 
-    def _create_worker(port: int, tags: frozenset[str] | None = None) -> WorkerInfo:
-        return WorkerInfo(
+    def _create_worker(port: int, tags: frozenset[str] | None = None) -> WorkerMetadata:
+        return WorkerMetadata(
             uid=uuid.uuid4(),
             host="localhost",
             port=port,
@@ -59,10 +59,10 @@ def worker_factory():
 
 # Hypothesis strategies for property-based testing
 @st.composite
-def worker_info_strategy(draw):
-    """Generate arbitrary WorkerInfo instances for property-based testing.
+def metadata_strategy(draw):
+    """Generate arbitrary WorkerMetadata instances for property-based testing.
 
-    Generates WorkerInfo with valid ranges for all fields:
+    Generates WorkerMetadata with valid ranges for all fields:
     - Valid UUIDs
     - Non-empty host strings (ASCII alphanumeric + .-_)
     - Valid port numbers (1-65535)
@@ -81,7 +81,7 @@ def worker_info_strategy(draw):
     # ASCII alphanumeric only to avoid multi-byte UTF-8 sequences
     ascii_alphanumeric = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
-    return WorkerInfo(
+    return WorkerMetadata(
         uid=draw(st.uuids()),
         host=draw(st.text(min_size=1, max_size=50, alphabet=ascii_alphanumeric + ".-_")),
         port=draw(st.integers(min_value=1, max_value=65535)),
@@ -258,7 +258,7 @@ class TestLanDiscoveryPublisher:
         assert publisher.aiozc is None
 
     @pytest.mark.asyncio
-    async def test_publish_worker_added(self, worker_info):
+    async def test_publish_worker_added(self, metadata):
         """Test publish() with worker-added event registers service.
 
         Given:
@@ -273,10 +273,10 @@ class TestLanDiscoveryPublisher:
 
         # Act
         async with publisher:
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
             # Assert - verify service was registered
-            service_name = f"{worker_info.uid}._wool._tcp.local."
+            service_name = f"{metadata.uid}._wool._tcp.local."
             assert publisher.aiozc is not None
             service_info = await publisher.aiozc.async_get_service_info(
                 "_wool._tcp.local.",
@@ -284,11 +284,11 @@ class TestLanDiscoveryPublisher:
             )
 
             assert service_info is not None
-            assert service_info.port == worker_info.port
+            assert service_info.port == metadata.port
             assert b"pid" in service_info.properties
 
     @pytest.mark.asyncio
-    async def test_publish_worker_updated(self, worker_info):
+    async def test_publish_worker_updated(self, metadata):
         """Test publish() with worker-updated event updates service.
 
         Given:
@@ -304,14 +304,14 @@ class TestLanDiscoveryPublisher:
         # Act
         async with publisher:
             # First add the worker
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
             # Update worker with new version
-            updated_worker = WorkerInfo(
-                uid=worker_info.uid,  # Same UID
-                host=worker_info.host,
-                port=worker_info.port,
-                pid=worker_info.pid,
+            updated_worker = WorkerMetadata(
+                uid=metadata.uid,  # Same UID
+                host=metadata.host,
+                port=metadata.port,
+                pid=metadata.pid,
                 version="2.0.0",  # Changed version
                 tags=frozenset(["updated"]),
                 extra=MappingProxyType({"new": "data"}),
@@ -319,13 +319,13 @@ class TestLanDiscoveryPublisher:
             await publisher.publish("worker-updated", updated_worker)
 
             # Assert - verify service was updated in publisher's cache
-            service_info = publisher.services[str(worker_info.uid)]
+            service_info = publisher.services[str(metadata.uid)]
             assert service_info is not None
             properties = service_info.decoded_properties
             assert properties["version"] == "2.0.0"
 
     @pytest.mark.asyncio
-    async def test_publish_worker_dropped(self, worker_info):
+    async def test_publish_worker_dropped(self, metadata):
         """Test publish() with worker-dropped event unregisters service.
 
         Given:
@@ -341,23 +341,23 @@ class TestLanDiscoveryPublisher:
         # Act
         async with publisher:
             # First add the worker
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
             # Verify it was added
-            assert str(worker_info.uid) in publisher.services
+            assert str(metadata.uid) in publisher.services
 
             # Drop the worker
-            await publisher.publish("worker-dropped", worker_info)
+            await publisher.publish("worker-dropped", metadata)
 
             # Assert - verify service was removed
-            assert str(worker_info.uid) not in publisher.services
+            assert str(metadata.uid) not in publisher.services
 
     @pytest.mark.asyncio
     async def test_publish_without_port(self):
         """Test publish() with worker without port.
 
         Given:
-            A Publisher and WorkerInfo with port=None
+            A Publisher and WorkerMetadata with port=None
         When:
             Publishing worker-added event
         Then:
@@ -365,7 +365,7 @@ class TestLanDiscoveryPublisher:
         """
         # Arrange
         publisher = LanDiscovery.Publisher()
-        worker_no_port = WorkerInfo(
+        worker_no_port = WorkerMetadata(
             uid=uuid.uuid4(),
             host="localhost",
             port=None,  # Invalid for LAN discovery
@@ -379,7 +379,7 @@ class TestLanDiscoveryPublisher:
                 await publisher.publish("worker-added", worker_no_port)
 
     @pytest.mark.asyncio
-    async def test_publish_uninitialized(self, worker_info):
+    async def test_publish_uninitialized(self, metadata):
         """Test publish() when publisher not initialized.
 
         Given:
@@ -394,10 +394,10 @@ class TestLanDiscoveryPublisher:
 
         # Act & Assert
         with pytest.raises(RuntimeError, match="not properly initialized"):
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
     @pytest.mark.asyncio
-    async def test_publish_unexpected_event_type(self, worker_info):
+    async def test_publish_unexpected_event_type(self, metadata):
         """Test publish() with unexpected event type.
 
         Given:
@@ -413,7 +413,7 @@ class TestLanDiscoveryPublisher:
         # Act & Assert
         async with publisher:
             with pytest.raises(RuntimeError, match="Unexpected discovery event type"):
-                await publisher.publish("invalid-type", worker_info)  # type: ignore
+                await publisher.publish("invalid-type", metadata)  # type: ignore
 
 
 class TestLanDiscoverySubscriber:
@@ -443,7 +443,7 @@ class TestLanDiscoverySubscriber:
         assert hasattr(iterator, "__anext__")
 
     @pytest.mark.asyncio
-    async def test_initial_scan_discovers_existing_workers(self, worker_info):
+    async def test_initial_scan_discovers_existing_workers(self, metadata):
         """Test initial scan discovers existing workers on startup.
 
         Given:
@@ -463,13 +463,13 @@ class TestLanDiscoverySubscriber:
         async def collect_events():
             async for event in subscriber:
                 events.append(event)
-                if event.worker_info.uid == worker_info.uid:
+                if event.metadata.uid == metadata.uid:
                     worker_discovered.set()
                     break
 
         # Act
         async with publisher:
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
             # Give Zeroconf time to register
             await asyncio.sleep(0.2)
@@ -491,10 +491,10 @@ class TestLanDiscoverySubscriber:
         # Assert
         assert len(events) >= 1
         assert events[0].type == "worker-added"
-        assert events[0].worker_info.uid == worker_info.uid
+        assert events[0].metadata.uid == metadata.uid
 
     @pytest.mark.asyncio
-    async def test_worker_added_event(self, worker_info):
+    async def test_worker_added_event(self, metadata):
         """Test subscriber yields worker-added event for published worker.
 
         Given:
@@ -514,7 +514,7 @@ class TestLanDiscoverySubscriber:
         async def collect_events():
             async for event in subscriber:
                 events.append(event)
-                if event.worker_info.uid == worker_info.uid:
+                if event.metadata.uid == metadata.uid:
                     worker_discovered.set()
                     break
 
@@ -525,7 +525,7 @@ class TestLanDiscoverySubscriber:
             # Give subscriber time to initialize
             await asyncio.sleep(0.1)
 
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
             # Wait for discovery with timeout
             try:
@@ -542,10 +542,10 @@ class TestLanDiscoverySubscriber:
         # Assert
         assert len(events) >= 1
         assert events[0].type == "worker-added"
-        assert events[0].worker_info.uid == worker_info.uid
+        assert events[0].metadata.uid == metadata.uid
 
     @pytest.mark.asyncio
-    async def test_worker_updated_event(self, worker_info):
+    async def test_worker_updated_event(self, metadata):
         """Test subscriber yields worker-updated event for property changes.
 
         Given:
@@ -565,10 +565,7 @@ class TestLanDiscoverySubscriber:
         async def collect_events():
             async for event in subscriber:
                 events.append(event)
-                if (
-                    event.type == "worker-updated"
-                    and event.worker_info.uid == worker_info.uid
-                ):
+                if event.type == "worker-updated" and event.metadata.uid == metadata.uid:
                     worker_updated.set()
                     break
 
@@ -579,15 +576,15 @@ class TestLanDiscoverySubscriber:
             await asyncio.sleep(0.1)
 
             # Add worker first
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
             await asyncio.sleep(0.2)
 
             # Update worker
-            updated_worker = WorkerInfo(
-                uid=worker_info.uid,
-                host=worker_info.host,
-                port=worker_info.port,
-                pid=worker_info.pid,
+            updated_worker = WorkerMetadata(
+                uid=metadata.uid,
+                host=metadata.host,
+                port=metadata.port,
+                pid=metadata.pid,
                 version="2.0.0",  # Changed
                 tags=frozenset(["updated"]),
             )
@@ -608,10 +605,10 @@ class TestLanDiscoverySubscriber:
         # Assert
         update_events = [e for e in events if e.type == "worker-updated"]
         assert len(update_events) >= 1
-        assert update_events[0].worker_info.version == "2.0.0"
+        assert update_events[0].metadata.version == "2.0.0"
 
     @pytest.mark.asyncio
-    async def test_worker_dropped_event(self, worker_info):
+    async def test_worker_dropped_event(self, metadata):
         """Test subscriber yields worker-dropped event for removed workers.
 
         Given:
@@ -631,10 +628,7 @@ class TestLanDiscoverySubscriber:
         async def collect_events():
             async for event in subscriber:
                 events.append(event)
-                if (
-                    event.type == "worker-dropped"
-                    and event.worker_info.uid == worker_info.uid
-                ):
+                if event.type == "worker-dropped" and event.metadata.uid == metadata.uid:
                     worker_dropped.set()
                     break
 
@@ -645,11 +639,11 @@ class TestLanDiscoverySubscriber:
             await asyncio.sleep(0.1)
 
             # Add worker first
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
             await asyncio.sleep(0.2)
 
             # Drop worker
-            await publisher.publish("worker-dropped", worker_info)
+            await publisher.publish("worker-dropped", metadata)
 
             # Wait for drop event with timeout
             try:
@@ -666,7 +660,7 @@ class TestLanDiscoverySubscriber:
         # Assert
         drop_events = [e for e in events if e.type == "worker-dropped"]
         assert len(drop_events) >= 1
-        assert drop_events[0].worker_info.uid == worker_info.uid
+        assert drop_events[0].metadata.uid == metadata.uid
 
     @pytest.mark.asyncio
     async def test_filtering_with_predicate(self, worker_factory):
@@ -723,11 +717,11 @@ class TestLanDiscoverySubscriber:
 
         # Assert - only matching worker should appear
         assert len(events) >= 1
-        assert all(e.worker_info.port == 50051 for e in events)
-        assert any(e.worker_info.uid == worker_match.uid for e in events)
+        assert all(e.metadata.port == 50051 for e in events)
+        assert any(e.metadata.uid == worker_match.uid for e in events)
 
     @pytest.mark.asyncio
-    async def test_multiple_instances_isolated(self, worker_info):
+    async def test_multiple_instances_isolated(self, metadata):
         """Test multiple subscriber instances have isolated state.
 
         Given:
@@ -767,7 +761,7 @@ class TestLanDiscoverySubscriber:
 
             await asyncio.sleep(0.1)
 
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
             try:
                 await asyncio.wait_for(both_discovered.wait(), timeout=2.0)
@@ -786,7 +780,7 @@ class TestLanDiscoverySubscriber:
         assert len(events2) >= 1
 
     @pytest.mark.asyncio
-    async def test_publish_worker_updated_not_in_cache(self, worker_info):
+    async def test_publish_worker_updated_not_in_cache(self, metadata):
         """Test updating worker that was never added.
 
         Given:
@@ -802,10 +796,10 @@ class TestLanDiscoverySubscriber:
         # Act
         async with publisher:
             # Update worker that doesn't exist yet - should add it
-            await publisher.publish("worker-updated", worker_info)
+            await publisher.publish("worker-updated", metadata)
 
             # Assert - verify service was registered
-            assert str(worker_info.uid) in publisher.services
+            assert str(metadata.uid) in publisher.services
 
     @pytest.mark.asyncio
     async def test_filtering_dynamic_transition(self, worker_factory):
@@ -849,7 +843,7 @@ class TestLanDiscoverySubscriber:
             await asyncio.sleep(0.2)
 
             # Update worker to remove gpu tag (no longer matches filter)
-            updated_worker = WorkerInfo(
+            updated_worker = WorkerMetadata(
                 uid=worker.uid,
                 host=worker.host,
                 port=worker.port,
@@ -876,7 +870,7 @@ class TestLanDiscoverySubscriber:
         assert len(drop_events) >= 1
 
     @pytest.mark.asyncio
-    async def test_update_with_no_property_changes(self, worker_info):
+    async def test_update_with_no_property_changes(self, metadata):
         """Test updating worker when properties haven't actually changed.
 
         Given:
@@ -892,15 +886,15 @@ class TestLanDiscoverySubscriber:
         # Act
         async with publisher:
             # Add worker
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
-            initial_service = publisher.services[str(worker_info.uid)]
+            initial_service = publisher.services[str(metadata.uid)]
 
             # Update with identical properties
-            await publisher.publish("worker-updated", worker_info)
+            await publisher.publish("worker-updated", metadata)
 
             # Assert - service object should be unchanged
-            assert publisher.services[str(worker_info.uid)] is initial_service
+            assert publisher.services[str(metadata.uid)] is initial_service
 
     @pytest.mark.asyncio
     async def test_subscriber_handles_service_disappearance(self, mocker):
@@ -1028,9 +1022,9 @@ class TestLanDiscoverySubscriber:
         # Mock async_get_service_info to return the mock service
         mock_get_service = mocker.AsyncMock(return_value=mock_service_info)
 
-        # Patch _deserialize_worker_info to raise ValueError
+        # Patch _deserialize_metadata to raise ValueError
         mocker.patch(
-            "wool.runtime.discovery.lan._deserialize_worker_info",
+            "wool.runtime.discovery.lan._deserialize_metadata",
             side_effect=ValueError("Invalid service properties"),
         )
 
@@ -1060,7 +1054,7 @@ class TestLanDiscoverySubscriber:
         )
 
     @pytest.mark.asyncio
-    async def test_subscriber_handles_new_worker_via_update(self, mocker, worker_info):
+    async def test_subscriber_handles_new_worker_via_update(self, mocker, metadata):
         """Test subscriber handles new worker appearing via update event.
 
         Given:
@@ -1074,10 +1068,10 @@ class TestLanDiscoverySubscriber:
         subscriber = LanDiscovery.Subscriber()
 
         # Create a real ServiceInfo for the worker
-        from wool.runtime.discovery.lan import _serialize_worker_info
+        from wool.runtime.discovery.lan import _serialize_metadata
 
-        properties = _serialize_worker_info(worker_info)
-        service_name = f"{worker_info.uid}._wool._tcp.local."
+        properties = _serialize_metadata(metadata)
+        service_name = f"{metadata.uid}._wool._tcp.local."
 
         from zeroconf import ServiceInfo
 
@@ -1085,7 +1079,7 @@ class TestLanDiscoverySubscriber:
             "_wool._tcp.local.",
             service_name,
             addresses=[b"\x7f\x00\x00\x01"],
-            port=worker_info.port,
+            port=metadata.port,
             properties=properties,
         )
 
@@ -1114,19 +1108,19 @@ class TestLanDiscoverySubscriber:
         assert not event_queue.empty()
         event = await event_queue.get()
         assert event.type == "worker-added"
-        assert event.worker_info.uid == worker_info.uid
-        assert event.worker_info.port == worker_info.port
+        assert event.metadata.uid == metadata.uid
+        assert event.metadata.port == metadata.port
         # Verify worker was added to cache
         assert service_name in service_cache
-        assert service_cache[service_name].uid == worker_info.uid
+        assert service_cache[service_name].uid == metadata.uid
 
-    @given(worker=worker_info_strategy())
+    @given(worker=metadata_strategy())
     @settings(max_examples=20)
     def test_subscriber_handles_new_worker_via_update_property(self, worker):
         """Property: Any worker appearing via update emits worker-added event.
 
         Given:
-            Arbitrary valid WorkerInfo generated by hypothesis
+            Arbitrary valid WorkerMetadata generated by hypothesis
             Subscriber with empty service cache
         When:
             Update event arrives for worker not in cache
@@ -1137,9 +1131,9 @@ class TestLanDiscoverySubscriber:
         subscriber = LanDiscovery.Subscriber()
 
         # Create a real ServiceInfo for the worker
-        from wool.runtime.discovery.lan import _serialize_worker_info
+        from wool.runtime.discovery.lan import _serialize_metadata
 
-        properties = _serialize_worker_info(worker)
+        properties = _serialize_metadata(worker)
         service_name = f"{worker.uid}._wool._tcp.local."
 
         from zeroconf import ServiceInfo
@@ -1184,12 +1178,12 @@ class TestLanDiscoverySubscriber:
             assert not event_queue.empty()
             event = loop.run_until_complete(event_queue.get())
             assert event.type == "worker-added"
-            assert event.worker_info.uid == worker.uid
-            assert event.worker_info.port == worker.port
-            assert event.worker_info.pid == worker.pid
-            assert event.worker_info.version == worker.version
-            assert event.worker_info.tags == worker.tags
-            assert event.worker_info.extra == worker.extra
+            assert event.metadata.uid == worker.uid
+            assert event.metadata.port == worker.port
+            assert event.metadata.pid == worker.pid
+            assert event.metadata.version == worker.version
+            assert event.metadata.tags == worker.tags
+            assert event.metadata.extra == worker.extra
             # Verify worker was added to cache
             assert service_name in service_cache
             assert service_cache[service_name].uid == worker.uid
@@ -1197,7 +1191,7 @@ class TestLanDiscoverySubscriber:
             loop.close()
 
     @pytest.mark.asyncio
-    async def test_subscriber_handles_deserialization_error(self, mocker, worker_info):
+    async def test_subscriber_handles_deserialization_error(self, mocker, metadata):
         """Test subscriber handles deserialization errors gracefully.
 
         Given:
@@ -1211,9 +1205,9 @@ class TestLanDiscoverySubscriber:
         publisher = LanDiscovery.Publisher()
         subscriber = LanDiscovery.Subscriber()
 
-        # Patch _deserialize_worker_info to raise ValueError
+        # Patch _deserialize_metadata to raise ValueError
         mocker.patch(
-            "wool.runtime.discovery.lan._deserialize_worker_info",
+            "wool.runtime.discovery.lan._deserialize_metadata",
             side_effect=ValueError("Invalid service"),
         )
 
@@ -1234,7 +1228,7 @@ class TestLanDiscoverySubscriber:
             await asyncio.sleep(0.1)
 
             # This will trigger _handle_add_service, which will catch ValueError
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
             await asyncio.sleep(0.4)
 
@@ -1270,7 +1264,7 @@ class TestLanDiscoverySubscriber:
         async def collect_events():
             async for event in subscriber:
                 events.append(event)
-                if event.worker_info.uid == worker.uid:
+                if event.metadata.uid == worker.uid:
                     event_received.set()
                     break
 
@@ -1303,7 +1297,7 @@ class TestIntegration:
     """Integration tests for LAN Discovery end-to-end flows."""
 
     @pytest.mark.asyncio
-    async def test_publish_and_discover_integration(self, worker_info):
+    async def test_publish_and_discover_integration(self, metadata):
         """Test end-to-end publisher→Zeroconf→subscriber flow.
 
         Given:
@@ -1323,7 +1317,7 @@ class TestIntegration:
         async def collect_events():
             async for event in subscriber:
                 events.append(event)
-                if event.worker_info.uid == worker_info.uid:
+                if event.metadata.uid == metadata.uid:
                     worker_discovered.set()
                     break
 
@@ -1334,7 +1328,7 @@ class TestIntegration:
             # Give subscriber time to initialize
             await asyncio.sleep(0.1)
 
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
             # Wait for discovery with timeout
             try:
@@ -1352,9 +1346,9 @@ class TestIntegration:
         assert len(events) >= 1
         discovered_event = events[0]
         assert discovered_event.type == "worker-added"
-        assert discovered_event.worker_info.uid == worker_info.uid
-        assert discovered_event.worker_info.port == worker_info.port
-        assert discovered_event.worker_info.pid == worker_info.pid
+        assert discovered_event.metadata.uid == metadata.uid
+        assert discovered_event.metadata.port == metadata.port
+        assert discovered_event.metadata.pid == metadata.pid
 
 
 class TestSerializationFunctions:
@@ -1363,25 +1357,25 @@ class TestSerializationFunctions:
     Fully qualified name: wool.runtime.discovery.lan
     """
 
-    def test_serialize_worker_info_complete(self, worker_info):
-        """Test _serialize_worker_info() with all fields populated.
+    def test_serialize_metadata_complete(self, metadata):
+        """Test _serialize_metadata() with all fields populated.
 
         Given:
-            WorkerInfo with all fields including tags and extra
+            WorkerMetadata with all fields including tags and extra
         When:
             Serializing to service properties dict
         Then:
             All fields should be converted to dict with JSON-encoded tags/extra
         """
         # Arrange
-        # worker_info fixture has all fields
+        # metadata fixture has all fields
 
         # Act
-        properties = _serialize_worker_info(worker_info)
+        properties = _serialize_metadata(metadata)
 
         # Assert
-        assert properties["pid"] == str(worker_info.pid)
-        assert properties["version"] == worker_info.version
+        assert properties["pid"] == str(metadata.pid)
+        assert properties["version"] == metadata.version
         assert properties["tags"] is not None
         assert '"test"' in properties["tags"]
         assert '"worker"' in properties["tags"]
@@ -1389,18 +1383,18 @@ class TestSerializationFunctions:
         assert '"key"' in properties["extra"]
         assert '"value"' in properties["extra"]
 
-    def test_serialize_worker_info_minimal(self):
-        """Test _serialize_worker_info() with minimal fields (empty tags/extra).
+    def test_serialize_metadata_minimal(self):
+        """Test _serialize_metadata() with minimal fields (empty tags/extra).
 
         Given:
-            WorkerInfo with empty tags and extra
+            WorkerMetadata with empty tags and extra
         When:
             Serializing to service properties dict
         Then:
             Optional fields should be None
         """
         # Arrange
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(),
             host="localhost",
             port=50051,
@@ -1411,7 +1405,7 @@ class TestSerializationFunctions:
         )
 
         # Act
-        properties = _serialize_worker_info(worker)
+        properties = _serialize_metadata(worker)
 
         # Assert
         assert properties["pid"] == "12345"
@@ -1419,18 +1413,18 @@ class TestSerializationFunctions:
         assert properties["tags"] is None
         assert properties["extra"] is None
 
-    def test_serialize_worker_info_handles_none_values(self):
-        """Test _serialize_worker_info() handles empty collections.
+    def test_serialize_metadata_handles_none_values(self):
+        """Test _serialize_metadata() handles empty collections.
 
         Given:
-            WorkerInfo with empty tags and extra collections
+            WorkerMetadata with empty tags and extra collections
         When:
             Serializing to service properties dict
         Then:
             Tags and extra should be None (not empty JSON strings)
         """
         # Arrange
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(),
             host="localhost",
             port=50051,
@@ -1441,51 +1435,51 @@ class TestSerializationFunctions:
         )
 
         # Act
-        properties = _serialize_worker_info(worker)
+        properties = _serialize_metadata(worker)
 
         # Assert
         assert properties["tags"] is None
         assert properties["extra"] is None
 
-    def test_deserialize_worker_info_complete(self, worker_info):
-        """Test _deserialize_worker_info() with complete ServiceInfo.
+    def test_deserialize_metadata_complete(self, metadata):
+        """Test _deserialize_metadata() with complete ServiceInfo.
 
         Given:
             ServiceInfo with all fields including tags and extra
         When:
-            Deserializing to WorkerInfo
+            Deserializing to WorkerMetadata
         Then:
             All fields should be correctly parsed including JSON fields
         """
         # Arrange
-        properties = _serialize_worker_info(worker_info)
-        service_name = f"{worker_info.uid}._wool._tcp.local."
+        properties = _serialize_metadata(metadata)
+        service_name = f"{metadata.uid}._wool._tcp.local."
         service_info = ServiceInfo(
             "_wool._tcp.local.",
             service_name,
             addresses=[b"\x7f\x00\x00\x01"],  # 127.0.0.1
-            port=worker_info.port,
+            port=metadata.port,
             properties=properties,
         )
 
         # Act
-        result = _deserialize_worker_info(service_info)
+        result = _deserialize_metadata(service_info)
 
         # Assert
-        assert result.uid == worker_info.uid
-        assert result.pid == worker_info.pid
-        assert result.version == worker_info.version
-        assert result.port == worker_info.port
-        assert result.tags == worker_info.tags
-        assert result.extra == worker_info.extra
+        assert result.uid == metadata.uid
+        assert result.pid == metadata.pid
+        assert result.version == metadata.version
+        assert result.port == metadata.port
+        assert result.tags == metadata.tags
+        assert result.extra == metadata.extra
 
-    def test_deserialize_worker_info_missing_required_fields(self):
-        """Test _deserialize_worker_info() with missing required fields.
+    def test_deserialize_metadata_missing_required_fields(self):
+        """Test _deserialize_metadata() with missing required fields.
 
         Given:
             ServiceInfo missing required 'pid' or 'version' field
         When:
-            Deserializing to WorkerInfo
+            Deserializing to WorkerMetadata
         Then:
             ValueError should be raised with clear message
         """
@@ -1502,15 +1496,15 @@ class TestSerializationFunctions:
 
         # Act & Assert
         with pytest.raises(ValueError, match="Missing required properties: version"):
-            _deserialize_worker_info(service_info)
+            _deserialize_metadata(service_info)
 
-    def test_deserialize_worker_info_invalid_uuid(self):
-        """Test _deserialize_worker_info() with invalid UUID in service name.
+    def test_deserialize_metadata_invalid_uuid(self):
+        """Test _deserialize_metadata() with invalid UUID in service name.
 
         Given:
             ServiceInfo with malformed UUID in service name
         When:
-            Deserializing to WorkerInfo
+            Deserializing to WorkerMetadata
         Then:
             ValueError should be raised
         """
@@ -1526,15 +1520,15 @@ class TestSerializationFunctions:
 
         # Act & Assert
         with pytest.raises(ValueError, match="badly formed hexadecimal UUID string"):
-            _deserialize_worker_info(service_info)
+            _deserialize_metadata(service_info)
 
-    def test_deserialize_worker_info_malformed_json(self):
-        """Test _deserialize_worker_info() with malformed JSON in properties.
+    def test_deserialize_metadata_malformed_json(self):
+        """Test _deserialize_metadata() with malformed JSON in properties.
 
         Given:
             ServiceInfo with malformed JSON in tags or extra
         When:
-            Deserializing to WorkerInfo
+            Deserializing to WorkerMetadata
         Then:
             JSONDecodeError should be raised
         """
@@ -1555,15 +1549,15 @@ class TestSerializationFunctions:
 
         # Act & Assert
         with pytest.raises(Exception):  # json.JSONDecodeError
-            _deserialize_worker_info(service_info)
+            _deserialize_metadata(service_info)
 
-    def test_deserialize_worker_info_optional_fields(self):
-        """Test _deserialize_worker_info() with only required fields.
+    def test_deserialize_metadata_optional_fields(self):
+        """Test _deserialize_metadata() with only required fields.
 
         Given:
             ServiceInfo with only required fields (no tags/extra)
         When:
-            Deserializing to WorkerInfo
+            Deserializing to WorkerMetadata
         Then:
             Optional fields should have empty defaults
         """
@@ -1579,43 +1573,43 @@ class TestSerializationFunctions:
         )
 
         # Act
-        result = _deserialize_worker_info(service_info)
+        result = _deserialize_metadata(service_info)
 
         # Assert
         assert result.tags == frozenset()
         assert result.extra == MappingProxyType({})
 
-    def test_serialize_deserialize_roundtrip(self, worker_info):
+    def test_serialize_deserialize_roundtrip(self, metadata):
         """Test serialization roundtrip preserves all fields.
 
         Given:
-            WorkerInfo instance with all fields
+            WorkerMetadata instance with all fields
         When:
             Serializing and then deserializing
         Then:
             All fields should be preserved exactly
         """
         # Arrange
-        properties = _serialize_worker_info(worker_info)
-        service_name = f"{worker_info.uid}._wool._tcp.local."
+        properties = _serialize_metadata(metadata)
+        service_name = f"{metadata.uid}._wool._tcp.local."
         service_info = ServiceInfo(
             "_wool._tcp.local.",
             service_name,
             addresses=[b"\x7f\x00\x00\x01"],
-            port=worker_info.port,
+            port=metadata.port,
             properties=properties,
         )
 
         # Act
-        result = _deserialize_worker_info(service_info)
+        result = _deserialize_metadata(service_info)
 
         # Assert
-        assert result.uid == worker_info.uid
-        assert result.pid == worker_info.pid
-        assert result.version == worker_info.version
-        assert result.port == worker_info.port
-        assert result.tags == worker_info.tags
-        assert result.extra == worker_info.extra
+        assert result.uid == metadata.uid
+        assert result.pid == metadata.pid
+        assert result.version == metadata.version
+        assert result.port == metadata.port
+        assert result.tags == metadata.tags
+        assert result.extra == metadata.extra
 
     def test_resolve_address_ipv4(self):
         """Test Publisher._resolve_address() with IPv4 address.
@@ -1695,20 +1689,20 @@ class TestPropertyBasedSerialization:
         realistic production usage patterns.
     """
 
-    @given(worker=worker_info_strategy())
+    @given(worker=metadata_strategy())
     @settings(max_examples=50)
     def test_serialize_deserialize_roundtrip_property(self, worker):
-        """Property: Any valid WorkerInfo survives serialize→deserialize.
+        """Property: Any valid WorkerMetadata survives serialize→deserialize.
 
         Given:
-            Arbitrary valid WorkerInfo generated by hypothesis
+            Arbitrary valid WorkerMetadata generated by hypothesis
         When:
             Serializing and then deserializing
         Then:
             All fields should be preserved exactly
         """
         # Arrange - worker provided by hypothesis
-        properties = _serialize_worker_info(worker)
+        properties = _serialize_metadata(worker)
         service_name = f"{worker.uid}._wool._tcp.local."
         service_info = ServiceInfo(
             "_wool._tcp.local.",
@@ -1719,7 +1713,7 @@ class TestPropertyBasedSerialization:
         )
 
         # Act
-        result = _deserialize_worker_info(service_info)
+        result = _deserialize_metadata(service_info)
 
         # Assert - all fields preserved
         assert result.uid == worker.uid
@@ -1767,13 +1761,13 @@ class TestPropertyBasedSerialization:
         Given:
             Arbitrary tags (frozenset) and extra (dict) collections
         When:
-            Serializing WorkerInfo with these collections
+            Serializing WorkerMetadata with these collections
         Then:
             Empty collections serialize as None, non-empty as JSON
             All values should roundtrip correctly
         """
         # Arrange
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(),
             host="localhost",
             port=50051,
@@ -1784,7 +1778,7 @@ class TestPropertyBasedSerialization:
         )
 
         # Act
-        properties = _serialize_worker_info(worker)
+        properties = _serialize_metadata(worker)
 
         # Assert - empty collections serialize as None
         if not tags:
@@ -1826,12 +1820,12 @@ class TestPropertyBasedSerialization:
         Given:
             Arbitrary version string (various formats)
         When:
-            Serializing and deserializing WorkerInfo
+            Serializing and deserializing WorkerMetadata
         Then:
             Version should be preserved exactly
         """
         # Arrange
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(),
             host="localhost",
             port=50051,
@@ -1840,7 +1834,7 @@ class TestPropertyBasedSerialization:
         )
 
         # Act
-        properties = _serialize_worker_info(worker)
+        properties = _serialize_metadata(worker)
 
         # Assert
         assert properties["version"] == version
@@ -1854,7 +1848,7 @@ class TestPropertyBasedSerialization:
             port=worker.port,
             properties=properties,
         )
-        result = _deserialize_worker_info(service_info)
+        result = _deserialize_metadata(service_info)
         assert result.version == version
 
     @given(
@@ -1898,12 +1892,12 @@ class TestPropertyBasedSerialization:
         Given:
             Arbitrary valid PID and port numbers
         When:
-            Serializing and deserializing WorkerInfo
+            Serializing and deserializing WorkerMetadata
         Then:
             Numeric fields should roundtrip as integers
         """
         # Arrange
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(),
             host="localhost",
             port=port,
@@ -1912,7 +1906,7 @@ class TestPropertyBasedSerialization:
         )
 
         # Act
-        properties = _serialize_worker_info(worker)
+        properties = _serialize_metadata(worker)
         service_name = f"{worker.uid}._wool._tcp.local."
         service_info = ServiceInfo(
             "_wool._tcp.local.",
@@ -1921,7 +1915,7 @@ class TestPropertyBasedSerialization:
             port=worker.port,
             properties=properties,
         )
-        result = _deserialize_worker_info(service_info)
+        result = _deserialize_metadata(service_info)
 
         # Assert
         assert result.pid == pid

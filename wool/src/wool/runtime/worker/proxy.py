@@ -16,7 +16,7 @@ from typing import overload
 import wool
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoverySubscriberLike
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerLike
@@ -125,8 +125,8 @@ class WorkerProxy:
     .. code-block:: python
 
         workers = [
-            WorkerInfo(host="10.0.0.1", port=50051, ...),
-            WorkerInfo(host="10.0.0.2", port=50051, ...),
+            WorkerMetadata(host="10.0.0.1", port=50051, ...),
+            WorkerMetadata(host="10.0.0.2", port=50051, ...),
         ]
         async with WorkerProxy(workers=workers) as proxy:
             result = await task()
@@ -187,7 +187,7 @@ class WorkerProxy:
     def __init__(
         self,
         *,
-        workers: Sequence[WorkerInfo],
+        workers: Sequence[WorkerMetadata],
         loadbalancer: LoadBalancerLike
         | Factory[LoadBalancerLike] = RoundRobinLoadBalancer,
     ): ...
@@ -208,7 +208,7 @@ class WorkerProxy:
         discovery: (
             DiscoverySubscriberLike | Factory[DiscoverySubscriberLike] | None
         ) = None,
-        workers: Sequence[WorkerInfo] | None = None,
+        workers: Sequence[WorkerMetadata] | None = None,
         loadbalancer: LoadBalancerLike
         | Factory[LoadBalancerLike] = RoundRobinLoadBalancer,
     ):
@@ -231,7 +231,7 @@ class WorkerProxy:
                 self._discovery = discovery
             case (None, None, workers) if workers is not None:
                 self._discovery = ReducibleAsyncIterator(
-                    [DiscoveryEvent(type="worker-added", worker_info=w) for w in workers]
+                    [DiscoveryEvent("worker-added", metadata=w) for w in workers]
                 )
             case _:
                 raise ValueError(
@@ -286,7 +286,7 @@ class WorkerProxy:
         return self._started
 
     @property
-    def workers(self) -> list[WorkerInfo]:
+    def workers(self) -> list[WorkerMetadata]:
         """A list of the currently discovered worker gRPC stubs."""
         if self._loadbalancer_context:
             return list(self._loadbalancer_context.workers.keys())
@@ -408,20 +408,21 @@ class WorkerProxy:
     async def _worker_sentinel(self):
         assert self._loadbalancer_context
         async for event in self._discovery_stream:
+            event.emit(context={"proxy_id": str(self.id)})
             match event.type:
                 case "worker-added":
                     self._loadbalancer_context.add_worker(
-                        event.worker_info,
+                        event.metadata,
                         lambda: self._connection_pool.get(
-                            f"{event.worker_info.host}:{event.worker_info.port}",
+                            f"{event.metadata.host}:{event.metadata.port}",
                         ),
                     )
                 case "worker-updated":
                     self._loadbalancer_context.update_worker(
-                        event.worker_info,
+                        event.metadata,
                         lambda: self._connection_pool.get(
-                            f"{event.worker_info.host}:{event.worker_info.port}",
+                            f"{event.metadata.host}:{event.metadata.port}",
                         ),
                     )
                 case "worker-dropped":
-                    self._loadbalancer_context.remove_worker(event.worker_info)
+                    self._loadbalancer_context.remove_worker(event.metadata)

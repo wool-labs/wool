@@ -33,7 +33,8 @@ class PicklableProxy:
 class TestWorkerTask:
     """Tests for WorkTask class."""
 
-    def test_init_emits_task_created_event(
+    @pytest.mark.asyncio
+    async def test_init_emits_task_created_event(
         self, mock_task, event_spy, clear_event_handlers
     ):
         """Test WorkTask instantiation emits task-created event.
@@ -51,9 +52,12 @@ class TestWorkerTask:
         # Act
         task = mock_task()
 
+        # Wait for event loop to process scheduled handlers
+        await asyncio.sleep(0)
+
         # Assert
         assert len(event_spy.calls) == 1
-        event, timestamp = event_spy.calls[0]
+        event, timestamp, context = event_spy.calls[0]
         assert event.type == "task-created"
         assert event.task.id == task.id
         assert isinstance(timestamp, int)
@@ -438,7 +442,7 @@ class TestWorkerTask:
 
         # Assert the event was emitted
         assert len(event_spy.calls) == 1
-        event, timestamp = event_spy.calls[0]
+        event, timestamp, context = event_spy.calls[0]
         assert event.type == "task-completed"
         assert event.task.id == task.id
 
@@ -679,8 +683,8 @@ class TestWorkerTaskEvent:
 
         # Act
         @WorkTaskEvent.handler("task-created", "task-completed")
-        def test_handler(event, timestamp):
-            call_log.append((event, timestamp))
+        def test_handler(event, timestamp, context=None):
+            call_log.append((event, timestamp, context))
 
         # Assert - handler is registered
         assert "task-created" in WorkTaskEvent._handlers
@@ -691,7 +695,8 @@ class TestWorkerTaskEvent:
         # Assert - original function is returned
         assert callable(test_handler)
 
-    def test_emit_with_handlers(self, mock_task, event_spy, clear_event_handlers):
+    @pytest.mark.asyncio
+    async def test_emit_with_handlers(self, mock_task, event_spy, clear_event_handlers):
         """Test emit calls registered handlers.
 
         Given:
@@ -709,9 +714,12 @@ class TestWorkerTaskEvent:
         # Act
         event.emit()
 
+        # Wait for event loop to process scheduled handlers
+        await asyncio.sleep(0)
+
         # Assert
         assert len(event_spy.calls) == 1
-        emitted_event, timestamp = event_spy.calls[0]
+        emitted_event, timestamp, context = event_spy.calls[0]
         assert emitted_event == event
         assert isinstance(timestamp, int)
         assert timestamp > 0
@@ -733,29 +741,54 @@ class TestWorkerTaskEvent:
         # Act & Assert (no exception should be raised)
         event.emit()
 
-    def test_emit_handler_exception_propagates(self, mock_task, clear_event_handlers):
-        """Test emit handler exception propagation.
+    @pytest.mark.asyncio
+    async def test_emit_handler_exception_isolated(
+        self, mock_task, clear_event_handlers
+    ):
+        """Test emit handler exception isolation via call_soon.
 
         Given:
             Event handler that raises an exception
         When:
             emit() calls a failing handler
         Then:
-            Exception propagates from emit()
+            Exception is caught by event loop, does not propagate to emit() caller
         """
         # Arrange
         task = mock_task()
         event = WorkTaskEvent("task-created", task=task)
+        exception_caught = []
 
-        def failing_handler(event, timestamp):
+        def failing_handler(event, timestamp, context=None):
             raise ValueError("Handler failed")
 
         WorkTaskEvent._handlers["task-created"] = [failing_handler]
 
-        # Act & Assert
-        with pytest.raises(ValueError, match="Handler failed"):
+        # Set up event loop exception handler to catch the exception
+        loop = asyncio.get_event_loop()
+        old_exception_handler = loop.get_exception_handler()
+
+        def exception_handler(loop, context):
+            exception_caught.append(context["exception"])
+
+        loop.set_exception_handler(exception_handler)
+
+        try:
+            # Act - emit does not raise
             event.emit()
 
+            # Wait for event loop to process scheduled handlers
+            await asyncio.sleep(0)
+
+            # Assert - exception was caught by event loop, not propagated
+            assert len(exception_caught) == 1
+            assert isinstance(exception_caught[0], ValueError)
+            assert str(exception_caught[0]) == "Handler failed"
+        finally:
+            # Restore original exception handler
+            loop.set_exception_handler(old_exception_handler)
+
+    @pytest.mark.asyncio
     @settings(max_examples=20, deadline=None)
     @given(
         event_types_to_register=st.sets(
@@ -774,7 +807,7 @@ class TestWorkerTaskEvent:
         ),
         num_handlers=st.integers(min_value=1, max_value=5),
     )
-    def test_handler_registration_and_emission(
+    async def test_handler_registration_and_emission(
         self,
         event_types_to_register,
         num_handlers,
@@ -814,8 +847,8 @@ class TestWorkerTaskEvent:
             for i in range(num_handlers):
 
                 def create_handler(handler_id):
-                    def handler(event, timestamp):
-                        handler_calls[handler_id].append((event, timestamp))
+                    def handler(event, timestamp, context=None):
+                        handler_calls[handler_id].append((event, timestamp, context))
 
                     return handler
 
@@ -827,6 +860,9 @@ class TestWorkerTaskEvent:
             for event_type in event_types_to_register:
                 event = WorkTaskEvent(event_type, task=task)
                 event.emit()
+
+            # Wait for event loop to process all scheduled handlers
+            await asyncio.sleep(0)
 
             # Assert - each handler should be called once per event type
             for i in range(num_handlers):
