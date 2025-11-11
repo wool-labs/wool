@@ -36,15 +36,21 @@ def test_public_api_completeness():
         "LoadBalancerLike",
         "NoWorkersAvailable",
         "RoundRobinLoadBalancer",
-        # Work
+        # Work - New names (preferred)
+        "WorkTask",
+        "WorkTaskEvent",
+        "WorkTaskEventCallback",
+        "WorkTaskEventType",
+        "WorkTaskException",
+        "current_task",
+        "routine",
+        "work",
+        # Work - Backward compatibility (deprecated)
         "WoolTask",
         "WoolTaskEvent",
         "WoolTaskEventCallback",
         "WoolTaskEventType",
         "WoolTaskException",
-        "routine",
-        "work",
-        "wool_current_task",
         # Workers
         "LocalWorker",
         "Worker",

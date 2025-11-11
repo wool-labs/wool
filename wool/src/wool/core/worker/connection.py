@@ -10,8 +10,8 @@ from typing import TypeVar
 import cloudpickle
 import grpc.aio
 
-from wool._work import WoolTask
 from wool.core import protobuf as pb
+from wool.core.work import WorkTask
 
 _DispatchCall: TypeAlias = grpc.aio.UnaryStreamCall[pb.task.Task, pb.worker.Response]
 
@@ -161,7 +161,7 @@ class WorkerConnection:
 
     async def dispatch(
         self,
-        task: WoolTask,
+        task: WorkTask,
         *,
         timeout: float | None = None,
     ) -> AsyncIterator[pb.task.Result]:
@@ -173,7 +173,7 @@ class WorkerConnection:
         (semaphore acquisition and acknowledgment).
 
         :param task:
-            The :class:`WoolTask` instance to dispatch to the worker.
+            The :class:`WorkTask` instance to dispatch to the worker.
         :param timeout:
             Timeout in seconds for semaphore acquisition and task
             acknowledgment. If ``None``, no timeout is applied. Does not

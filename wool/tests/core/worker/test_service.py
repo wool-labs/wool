@@ -9,11 +9,11 @@ import pytest
 from grpc import StatusCode
 from pytest_mock import MockerFixture
 
-from wool._work import WoolTask
-from wool._work import WoolTaskEvent
 from wool.core import protobuf as pb
 from wool.core.protobuf.worker import WorkerStub
 from wool.core.protobuf.worker import add_WorkerServicer_to_server
+from wool.core.work import WorkTask
+from wool.core.work import WorkTaskEvent
 from wool.core.worker.service import ReadOnlyEvent
 from wool.core.worker.service import WorkerService
 
@@ -70,7 +70,7 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
     mock_proxy = mocker.MagicMock()
     mock_proxy.id = "test-proxy-id"
 
-    wool_task = WoolTask(
+    wool_task = WorkTask(
         id=uuid4(),
         callable=_controllable_task,
         args=(),
@@ -221,7 +221,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WoolTask(
+        wool_task = WorkTask(
             id=uuid4(),
             callable=sample_task,
             args=(),
@@ -231,7 +231,7 @@ class TestWorkerService:
 
         request = wool_task.to_protobuf()
 
-        emit_spy = mocker.spy(WoolTaskEvent, "emit")
+        emit_spy = mocker.spy(WorkTaskEvent, "emit")
 
         # Act
         async with grpc_aio_stub() as stub:
@@ -273,7 +273,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WoolTask(
+        wool_task = WorkTask(
             id=uuid4(),
             callable=failing_task,
             args=(),
@@ -283,7 +283,7 @@ class TestWorkerService:
 
         request = wool_task.to_protobuf()
 
-        emit_spy = mocker.spy(WoolTaskEvent, "emit")
+        emit_spy = mocker.spy(WorkTaskEvent, "emit")
 
         # Act
         async with grpc_aio_stub() as stub:
@@ -319,7 +319,7 @@ class TestWorkerService:
         """
         # Arrange
         async with service_fixture as (service, event, stub):
-            emit_spy = mocker.spy(WoolTaskEvent, "emit")
+            emit_spy = mocker.spy(WorkTaskEvent, "emit")
             initial_emit_count = emit_spy.call_count
 
             # Initiate stop (service enters stopping state)
@@ -338,7 +338,7 @@ class TestWorkerService:
             mock_proxy = mocker.MagicMock()
             mock_proxy.id = "test-proxy-id-2"
 
-            wool_task = WoolTask(
+            wool_task = WorkTask(
                 id=uuid4(),
                 callable=another_task,
                 args=(),
@@ -390,7 +390,7 @@ class TestWorkerService:
             assert service.stopping.is_set()
             assert service.stopped.is_set()
 
-            emit_spy = mocker.spy(WoolTaskEvent, "emit")
+            emit_spy = mocker.spy(WorkTaskEvent, "emit")
             initial_emit_count = emit_spy.call_count
 
             # Create a new task to dispatch
@@ -400,7 +400,7 @@ class TestWorkerService:
             mock_proxy = mocker.MagicMock()
             mock_proxy.id = "test-proxy-id-2"
 
-            wool_task = WoolTask(
+            wool_task = WorkTask(
                 id=uuid4(),
                 callable=another_task,
                 args=(),
@@ -454,7 +454,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WoolTask(
+        wool_task = WorkTask(
             id=uuid4(),
             callable=long_running_task,
             args=(),
@@ -515,7 +515,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WoolTask(
+        wool_task = WorkTask(
             id=uuid4(),
             callable=quick_task,
             args=(),
