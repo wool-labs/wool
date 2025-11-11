@@ -3,7 +3,7 @@ source = src/wool
 omit = 
     src/wool/__init__.py
     src/wool/cli.py
-    src/wool/core/protobuf/*
+    src/wool/runtime/protobuf/*
 
 [report]
 show_missing = true

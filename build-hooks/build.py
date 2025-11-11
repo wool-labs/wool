@@ -25,7 +25,7 @@ class EditableInstallHook(BuildHookInterface):
 
     def initialize(self, version: str, build_data: dict) -> None:
         for root, _, filenames in os.walk(
-            pathlib.Path(self.root) / "src" / "wool" / "core" / "protobuf"
+            pathlib.Path(self.root) / "src" / "wool" / "runtime" / "protobuf"
         ):
             for filename in filenames:
                 if filename.endswith("_pb2_grpc.py"):
