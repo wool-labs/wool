@@ -4,9 +4,9 @@ from uuid import uuid4
 from hypothesis import given
 from hypothesis import strategies as st
 
-from wool.core.resourcepool import ResourcePool
 from wool.core.discovery.base import WorkerInfo
 from wool.core.loadbalancer.base import LoadBalancerContext
+from wool.core.resourcepool import ResourcePool
 from wool.core.worker.connection import WorkerConnection
 
 connection_pool = ResourcePool(WorkerConnection)

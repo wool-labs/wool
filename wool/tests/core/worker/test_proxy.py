@@ -18,13 +18,13 @@ from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 import wool.core.worker.proxy as wp
-from wool.core.resourcepool import Resource
-from wool._work import WoolTask
 from wool.core import protobuf as pb
 from wool.core.discovery.base import DiscoveryEvent
 from wool.core.discovery.base import WorkerInfo
 from wool.core.discovery.local import LocalDiscovery
 from wool.core.loadbalancer.base import NoWorkersAvailable
+from wool.core.resourcepool import Resource
+from wool.core.work import WorkTask
 from wool.core.worker.connection import WorkerConnection
 from wool.core.worker.proxy import WorkerProxy
 
@@ -65,12 +65,12 @@ def mock_worker_stub(mocker: MockerFixture):
 
 @pytest.fixture
 def mock_wool_task(mocker: MockerFixture):
-    """Create a mock :class:`WoolTask` for testing.
+    """Create a mock :class:`WorkTask` for testing.
 
     Provides a mock task with protobuf serialization capabilities for
     testing task dispatch and processing scenarios.
     """
-    mock_task = mocker.MagicMock(spec=WoolTask)
+    mock_task = mocker.MagicMock(spec=WorkTask)
     mock_task.to_protobuf = mocker.MagicMock()
     return mock_task
 

@@ -9,9 +9,9 @@ from grpc import StatusCode
 from grpc.aio import ServicerContext
 
 import wool
-from wool._work import WoolTask
-from wool._work import WoolTaskEvent
 from wool.core import protobuf as pb
+from wool.core.work import WorkTask
+from wool.core.work import WorkTaskEvent
 
 
 class ReadOnlyEvent:
@@ -86,7 +86,7 @@ class WorkerService(pb.worker.WorkerServicer):
     ) -> AsyncIterator[pb.worker.Response]:
         """Execute a task in the current event loop.
 
-        Deserializes the incoming task into a :class:`WoolTask`
+        Deserializes the incoming task into a :class:`WorkTask`
         instance, schedules it for execution in the current asyncio
         event loop, and yields responses for acknowledgment and result.
 
@@ -100,7 +100,7 @@ class WorkerService(pb.worker.WorkerServicer):
             then yields a Response containing the task result.
 
         .. note::
-            Emits a :class:`WoolTaskEvent` when the task is
+            Emits a :class:`WorkTaskEvent` when the task is
             scheduled for execution.
         """
         if self._stopping.is_set():
@@ -108,7 +108,7 @@ class WorkerService(pb.worker.WorkerServicer):
                 StatusCode.UNAVAILABLE, "Worker service is shutting down"
             )
 
-        with self._tracker(WoolTask.from_protobuf(request)) as task:
+        with self._tracker(WorkTask.from_protobuf(request)) as task:
             try:
                 yield pb.worker.Response(ack=pb.worker.Ack())
                 try:
@@ -143,7 +143,7 @@ class WorkerService(pb.worker.WorkerServicer):
         return pb.worker.Void()
 
     @contextmanager
-    def _tracker(self, wool_task: WoolTask):
+    def _tracker(self, wool_task: WorkTask):
         """Context manager for tracking running tasks.
 
         Manages the lifecycle of a task execution, adding it to the
@@ -151,15 +151,15 @@ class WorkerService(pb.worker.WorkerServicer):
         proper cleanup when the task completes or fails.
 
         :param wool_task:
-            The :class:`WoolTask` instance to execute and track.
+            The :class:`WorkTask` instance to execute and track.
         :yields:
             The :class:`asyncio.Task` created for the wool task.
 
         .. note::
-            Emits a :class:`WoolTaskEvent` with type "task-scheduled"
+            Emits a :class:`WorkTaskEvent` with type "task-scheduled"
             when the task begins execution.
         """
-        WoolTaskEvent("task-scheduled", task=wool_task).emit()
+        WorkTaskEvent("task-scheduled", task=wool_task).emit()
         task = asyncio.create_task(wool_task.run())
         self._tasks.add(task)
         try:
