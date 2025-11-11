@@ -58,7 +58,7 @@ sources = ["src"]
 dependencies = ["hatch-protobuf"]
 generate_grpc = true
 generate_pyi = true
-output_path = "src/wool/core/protobuf"
+output_path = "src/wool/runtime/protobuf"
 proto_paths = ["protobuf"]
 
 [tool.hatch.build.targets.sdist]
