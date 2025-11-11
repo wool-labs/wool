@@ -5,7 +5,7 @@ import debugpy
 import pytest
 
 import wool
-from wool.core.resourcepool import ResourcePool
+from wool.runtime.resourcepool import ResourcePool
 
 logger = logging.getLogger(__name__)
 
