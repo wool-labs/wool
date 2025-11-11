@@ -9,17 +9,17 @@ from pytest_mock import MockerFixture
 
 import wool.runtime.worker.pool as wp
 from wool.runtime.discovery.base import DiscoveryEvent
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 
 
 @pytest.fixture
-def worker_info():
-    """Provides sample WorkerInfo for testing.
+def metadata():
+    """Provides sample WorkerMetadata for testing.
 
-    Creates a WorkerInfo instance with typical field values for use in
+    Creates a WorkerMetadata instance with typical field values for use in
     tests that need a well-formed worker instance.
     """
-    return WorkerInfo(
+    return WorkerMetadata(
         uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
         host="localhost",
         port=50051,
@@ -68,7 +68,7 @@ class MockWorker:
         self._uid = uuid.uuid4()
         self._tags = set(tags)
         self._started = False
-        self._info: WorkerInfo | None = None
+        self._info: WorkerMetadata | None = None
         self.dispatch_count = 0
         self.should_fail = should_fail
         self.start_delay = start_delay
@@ -84,8 +84,8 @@ class MockWorker:
         return self._tags
 
     @property
-    def info(self) -> WorkerInfo | None:
-        """Worker information (available after start)."""
+    def metadata(self) -> WorkerMetadata | None:
+        """Worker metadata (available after start)."""
         return self._info
 
     @property
@@ -111,8 +111,8 @@ class MockWorker:
         if self.start_delay > 0:
             await asyncio.sleep(self.start_delay)
 
-        # Create WorkerInfo after successful start
-        self._info = WorkerInfo(
+        # Create WorkerMetadata after successful start
+        self._info = WorkerMetadata(
             uid=self._uid,
             host="localhost",
             port=50051,
@@ -185,7 +185,7 @@ class MockDiscoveryService:
 
     def __init__(self, **kwargs):
         """Create mock discovery service."""
-        self.workers: list[WorkerInfo] = []
+        self.workers: list[WorkerMetadata] = []
         self.started = False
         self._event_queue: asyncio.Queue = asyncio.Queue()
 
@@ -197,28 +197,28 @@ class MockDiscoveryService:
         """Stop the mock discovery service."""
         self.started = False
 
-    def inject_worker_added(self, worker_info: WorkerInfo) -> None:
+    def inject_worker_added(self, metadata: WorkerMetadata) -> None:
         """Simulate discovery of a new worker.
 
         Args:
-            worker_info: Worker connection information
+            metadata: Worker connection metadata
         """
-        if worker_info not in self.workers:
-            self.workers.append(worker_info)
+        if metadata not in self.workers:
+            self.workers.append(metadata)
         if self.started:
-            event = DiscoveryEvent(type="worker-added", worker_info=worker_info)
+            event = DiscoveryEvent("worker-added", metadata=metadata)
             self._event_queue.put_nowait(event)
 
-    def inject_worker_removed(self, worker_info: WorkerInfo) -> None:
+    def inject_worker_removed(self, metadata: WorkerMetadata) -> None:
         """Simulate departure of a worker.
 
         Args:
-            worker_info: Worker connection information
+            metadata: Worker connection metadata
         """
-        if worker_info in self.workers:
-            self.workers.remove(worker_info)
+        if metadata in self.workers:
+            self.workers.remove(metadata)
         if self.started:
-            event = DiscoveryEvent(type="worker-dropped", worker_info=worker_info)
+            event = DiscoveryEvent("worker-dropped", metadata=metadata)
             self._event_queue.put_nowait(event)
 
     async def __aiter__(self):
@@ -277,10 +277,10 @@ def mock_local_worker(mocker: MockerFixture):
         mock_worker = mocker.MagicMock()
         mock_worker.start = mocker.AsyncMock()
         mock_worker.stop = mocker.AsyncMock()
-        mock_worker.info = mocker.MagicMock()
+        mock_worker.metadata = mocker.MagicMock()
         worker_count[0] += 1
-        mock_worker.info.uid = f"test-worker-{worker_count[0]}"
-        mock_worker.info.port = 50050 + worker_count[0]
+        mock_worker.metadata.uid = f"test-worker-{worker_count[0]}"
+        mock_worker.metadata.port = 50050 + worker_count[0]
         workers.append(mock_worker)
         return mock_worker
 
@@ -327,18 +327,18 @@ class MockGrpcStub:
 
     def __init__(
         self,
-        worker_info: WorkerInfo,
+        metadata: WorkerMetadata,
         response_mode: str = "success",
         response_value: Any = None,
     ):
         """Create mock gRPC stub.
 
         Args:
-            worker_info: Worker connection information
+            metadata: Worker connection metadata
             response_mode: Response behavior ('success', 'failure', 'timeout')
             response_value: Value to return on success
         """
-        self.worker_info = worker_info
+        self.metadata = metadata
         self.dispatch_calls: list = []
         self.response_mode = response_mode
         self.response_value = response_value
@@ -390,14 +390,14 @@ def mock_grpc_stub_factory():
         Callable that creates MockGrpcStub instances
     """
 
-    def factory(worker_info: WorkerInfo, **kwargs):
-        return MockGrpcStub(worker_info, **kwargs)
+    def factory(metadata: WorkerMetadata, **kwargs):
+        return MockGrpcStub(metadata, **kwargs)
 
     return factory
 
 
 @pytest.fixture
-async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, worker_info):
+async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata):
     """Pre-configured WorkerProxy with mock discovery and gRPC stubs.
 
     Yields:
@@ -406,7 +406,7 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, worker_in
     from wool.runtime.worker.proxy import WorkerProxy
 
     # Inject 2 mock workers into discovery
-    worker1 = WorkerInfo(
+    worker1 = WorkerMetadata(
         uid=uuid.uuid4(),
         host="192.168.1.100",
         port=50051,
@@ -415,7 +415,7 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, worker_in
         tags=frozenset(["test"]),
         extra=MappingProxyType({}),
     )
-    worker2 = WorkerInfo(
+    worker2 = WorkerMetadata(
         uid=uuid.uuid4(),
         host="192.168.1.101",
         port=50051,

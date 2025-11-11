@@ -40,7 +40,7 @@ class TestLocalWorker:
         """
         worker = LocalWorker(host="0.0.0.0", port=50051)
         # Before start, address/host/port are None or reflect unstarted state
-        assert worker.info is None
+        assert worker.metadata is None
 
     def test_init_with_tags(self, worker_tags):
         """Test LocalWorker initialization with capability tags.
@@ -84,7 +84,7 @@ class TestLocalWorker:
         """
         worker = LocalWorker(shutdown_grace_period=grace_period, proxy_pool_ttl=ttl)
         # Timeouts are internal config - just verify construction succeeds
-        assert worker.info is None
+        assert worker.metadata is None
         assert worker.address is None
 
     def test_implements_workerlike_protocol(self):
@@ -155,7 +155,9 @@ class TestLocalWorker:
         mock_process.pid = 12345
         mock_process.start.return_value = None
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker()
         await worker.start()
@@ -170,14 +172,16 @@ class TestLocalWorker:
         When:
             The host property is accessed
         Then:
-            It should return the host from WorkerInfo
+            It should return the host from WorkerMetadata
         """
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "192.168.1.100:50051"
         mock_process.pid = 12345
         mock_process.start.return_value = None
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker()
         await worker.start()
@@ -192,14 +196,16 @@ class TestLocalWorker:
         When:
             The port property is accessed
         Then:
-            It should return the port from WorkerInfo
+            It should return the port from WorkerMetadata
         """
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:8080"
         mock_process.pid = 12345
         mock_process.start.return_value = None
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker()
         await worker.start()
@@ -221,41 +227,45 @@ class TestLocalWorker:
         mock_process.pid = 12345
         mock_process.start.return_value = None
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker()
         await worker.start(timeout=60.0)
         mock_process.start.assert_called_once_with(timeout=60.0)
 
     @pytest.mark.asyncio
-    async def test_start_creates_worker_info(self, mocker):
-        """Test _start method creates WorkerInfo.
+    async def test_start_creates_metadata(self, mocker):
+        """Test _start method creates WorkerMetadata.
 
         Given:
             A LocalWorker with tags and extra metadata
         When:
             start() is called
         Then:
-            It should create WorkerInfo with correct data
+            It should create WorkerMetadata with correct data
         """
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "192.168.1.100:50051"
         mock_process.pid = 12345
         mock_process.start.return_value = None
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker("gpu", "ml", region="us-west")
         await worker.start()
 
-        assert worker.info is not None
-        assert worker.info.uid == worker.uid
-        assert worker.info.host == "192.168.1.100"
-        assert worker.info.port == 50051
-        assert worker.info.pid == 12345
-        assert "gpu" in worker.info.tags
-        assert "ml" in worker.info.tags
-        assert worker.info.extra["region"] == "us-west"
+        assert worker.metadata is not None
+        assert worker.metadata.uid == worker.uid
+        assert worker.metadata.host == "192.168.1.100"
+        assert worker.metadata.port == 50051
+        assert worker.metadata.pid == 12345
+        assert "gpu" in worker.metadata.tags
+        assert "ml" in worker.metadata.tags
+        assert worker.metadata.extra["region"] == "us-west"
 
     @pytest.mark.asyncio
     async def test_start_raises_error_if_no_address(self, mocker):
@@ -273,7 +283,9 @@ class TestLocalWorker:
         mock_process.pid = 12345
         mock_process.start.return_value = None
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker()
         with pytest.raises(RuntimeError, match="no address"):
@@ -295,7 +307,9 @@ class TestLocalWorker:
         mock_process.pid = None
         mock_process.start.return_value = None
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker()
         with pytest.raises(RuntimeError, match="no PID"):
@@ -317,7 +331,9 @@ class TestLocalWorker:
         mock_process.pid = 99999
         mock_process.start.return_value = None
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker()
         await worker.start()
@@ -342,7 +358,9 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker()
         await worker.start()
@@ -377,7 +395,9 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = False
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker()
         await worker.start()
@@ -405,7 +425,9 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
-        mocker.patch("wool.runtime.worker.local.WorkerProcess", return_value=mock_process)
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
 
         worker = LocalWorker()
         await worker.start()
