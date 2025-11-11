@@ -9,7 +9,7 @@ from typing import Protocol
 from typing import TypeAlias
 from typing import runtime_checkable
 
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.resourcepool import Resource
 from wool.runtime.worker.connection import WorkerConnection
 
@@ -62,17 +62,17 @@ class LoadBalancerContext:
     with independent state and worker lists.
     """
 
-    _workers: Final[dict[WorkerInfo, ConnectionResourceFactory]]
+    _workers: Final[dict[WorkerMetadata, ConnectionResourceFactory]]
 
     def __init__(self):
         self._workers = {}
 
     @property
-    def workers(self) -> MappingProxyType[WorkerInfo, ConnectionResourceFactory]:
+    def workers(self) -> MappingProxyType[WorkerMetadata, ConnectionResourceFactory]:
         """Read-only view of workers in this context.
 
         :returns:
-            Immutable mapping of worker information to connection resource
+            Immutable mapping of worker metadata to connection resource
             factories. Changes to the underlying context are reflected in
             the returned proxy.
         """
@@ -80,28 +80,28 @@ class LoadBalancerContext:
 
     def add_worker(
         self,
-        worker_info: WorkerInfo,
+        metadata: WorkerMetadata,
         connection_resource_factory: ConnectionResourceFactory,
     ):
         """Add a worker to this context.
 
-        :param worker_info:
+        :param metadata:
             Information about the worker to add.
         :param connection_resource_factory:
             Factory function that creates connection resources for this worker.
         """
-        self._workers[worker_info] = connection_resource_factory
+        self._workers[metadata] = connection_resource_factory
 
     def update_worker(
         self,
-        worker_info: WorkerInfo,
+        metadata: WorkerMetadata,
         connection_resource_factory: ConnectionResourceFactory,
         *,
         upsert: bool = False,
     ):
         """Update an existing worker's connection resource factory.
 
-        :param worker_info:
+        :param metadata:
             Information about the worker to update. If the worker is not
             present in the context, this method does nothing.
         :param connection_resource_factory:
@@ -111,15 +111,15 @@ class LoadBalancerContext:
             Flag indicating whether or not to add the worker if it's not
             already in the context.
         """
-        if upsert or worker_info in self._workers:
-            self._workers[worker_info] = connection_resource_factory
+        if upsert or metadata in self._workers:
+            self._workers[metadata] = connection_resource_factory
 
-    def remove_worker(self, worker_info: WorkerInfo):
+    def remove_worker(self, metadata: WorkerMetadata):
         """Remove a worker from this context.
 
-        :param worker_info:
+        :param metadata:
             Information about the worker to remove. If the worker is not
             present in the context, this method does nothing.
         """
-        if worker_info in self._workers:
-            del self._workers[worker_info]
+        if metadata in self._workers:
+            del self._workers[metadata]

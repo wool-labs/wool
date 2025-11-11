@@ -515,7 +515,8 @@ class TestWorkerProcess:
         mock_get_port.recv.return_value = 50051
         mock_set_port = MagicMock()
         mocker.patch(
-            "wool.runtime.worker.process.Pipe", return_value=(mock_get_port, mock_set_port)
+            "wool.runtime.worker.process.Pipe",
+            return_value=(mock_get_port, mock_set_port),
         )
 
         # Mock parent start
@@ -545,7 +546,8 @@ class TestWorkerProcess:
         mock_get_port.recv.return_value = 50051
         mock_set_port = MagicMock()
         mocker.patch(
-            "wool.runtime.worker.process.Pipe", return_value=(mock_get_port, mock_set_port)
+            "wool.runtime.worker.process.Pipe",
+            return_value=(mock_get_port, mock_set_port),
         )
 
         mocker.patch("multiprocessing.Process.start")
@@ -571,7 +573,8 @@ class TestWorkerProcess:
         mock_get_port.poll.return_value = False
         mock_set_port = MagicMock()
         mocker.patch(
-            "wool.runtime.worker.process.Pipe", return_value=(mock_get_port, mock_set_port)
+            "wool.runtime.worker.process.Pipe",
+            return_value=(mock_get_port, mock_set_port),
         )
 
         mocker.patch("multiprocessing.Process.start")
@@ -604,7 +607,8 @@ class TestWorkerProcess:
         mock_get_port.recv.return_value = 50051
         mock_set_port = MagicMock()
         mocker.patch(
-            "wool.runtime.worker.process.Pipe", return_value=(mock_get_port, mock_set_port)
+            "wool.runtime.worker.process.Pipe",
+            return_value=(mock_get_port, mock_set_port),
         )
 
         mocker.patch("multiprocessing.Process.start")
@@ -724,7 +728,9 @@ class TestWorkerProcess:
         # Mock WorkerService
         mock_service = MagicMock()
         mock_service.stopped.wait = AsyncMock()
-        mocker.patch("wool.runtime.worker.process.WorkerService", return_value=mock_service)
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
 
         # Mock signal handlers
         mocker.patch("wool.runtime.worker.process._signal_handlers")
@@ -779,7 +785,9 @@ class TestWorkerProcess:
         # Mock WorkerService
         mock_service = MagicMock()
         mock_service.stopped.wait = AsyncMock()
-        mocker.patch("wool.runtime.worker.process.WorkerService", return_value=mock_service)
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
 
         # Mock signal handlers
         mocker.patch("wool.runtime.worker.process._signal_handlers")
@@ -819,7 +827,9 @@ class TestWorkerProcess:
         # Mock WorkerService
         mock_service = MagicMock()
         mock_service.stopped.wait = AsyncMock()
-        mocker.patch("wool.runtime.worker.process.WorkerService", return_value=mock_service)
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
 
         # Mock signal handlers
         mocker.patch("wool.runtime.worker.process._signal_handlers")
@@ -865,7 +875,9 @@ class TestWorkerProcess:
         # Mock WorkerService with error
         mock_service = MagicMock()
         mock_service.stopped.wait = AsyncMock(side_effect=Exception("Service error"))
-        mocker.patch("wool.runtime.worker.process.WorkerService", return_value=mock_service)
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
 
         # Mock signal handlers
         mocker.patch("wool.runtime.worker.process._signal_handlers")

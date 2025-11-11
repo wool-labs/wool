@@ -9,7 +9,7 @@ from wool.runtime.context import RuntimeContext
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.work import WorkTask
 from wool.runtime.work import WorkTaskEvent
-from wool.runtime.work import WorkTaskEventCallback
+from wool.runtime.work import WorkTaskEventHandler
 from wool.runtime.work import WorkTaskEventType
 from wool.runtime.work import WorkTaskException
 from wool.runtime.work import current_task
@@ -18,7 +18,7 @@ from wool.runtime.work import work
 # Backward compatibility aliases (deprecated)
 WoolTask = WorkTask
 WoolTaskEvent = WorkTaskEvent
-WoolTaskEventCallback = WorkTaskEventCallback
+WoolTaskEventHandler = WorkTaskEventHandler
 WoolTaskEventType = WorkTaskEventType
 WoolTaskException = WorkTaskException
 from wool.runtime.discovery.base import Discovery
@@ -28,7 +28,7 @@ from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import ConnectionResourceFactory
@@ -82,7 +82,7 @@ __all__ = [
     # Work - New names (preferred)
     "WorkTask",
     "WorkTaskEvent",
-    "WorkTaskEventCallback",
+    "WorkTaskEventHandler",
     "WorkTaskEventType",
     "WorkTaskException",
     "current_task",
@@ -91,7 +91,7 @@ __all__ = [
     # Work - Backward compatibility (deprecated)
     "WoolTask",
     "WoolTaskEvent",
-    "WoolTaskEventCallback",
+    "WoolTaskEventHandler",
     "WoolTaskEventType",
     "WoolTaskException",
     # Workers
@@ -112,7 +112,7 @@ __all__ = [
     "LanDiscovery",
     "LocalDiscovery",
     "PredicateFunction",
-    "WorkerInfo",
+    "WorkerMetadata",
     # Typing
     "Factory",
 ]

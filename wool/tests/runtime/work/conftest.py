@@ -112,8 +112,8 @@ def event_spy():
     """
     calls = []
 
-    def spy(event, timestamp):
-        calls.append((event, timestamp))
+    def spy(event, timestamp, context=None):
+        calls.append((event, timestamp, context))
 
     spy.calls = calls
     spy.reset = lambda: calls.clear()

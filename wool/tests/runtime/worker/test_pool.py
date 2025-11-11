@@ -557,7 +557,7 @@ class TestWorkerPool:
         # Context exits cleanly (implicit assertion - no exception raised)
 
     @pytest.mark.asyncio
-    async def test_context_manager_preserves_worker_info(
+    async def test_context_manager_preserves_metadata(
         self,
         mock_shared_memory,
         mock_worker_proxy,
@@ -580,7 +580,7 @@ class TestWorkerPool:
             assert isinstance(pool, WorkerPool)
 
     @pytest.mark.asyncio
-    async def test_worker_info_collection_after_startup(
+    async def test_metadata_collection_after_startup(
         self,
         mock_shared_memory,
         mock_worker_proxy,
@@ -597,8 +597,8 @@ class TestWorkerPool:
             Pool context manager should complete successfully
         """
         # Arrange
-        mock_local_worker.info.uid = "worker-123"
-        mock_local_worker.info.port = 50051
+        mock_local_worker.metadata.uid = "worker-123"
+        mock_local_worker.metadata.port = 50051
 
         # Act
         async with WorkerPool(size=2) as pool:
@@ -631,7 +631,7 @@ class TestWorkerPool:
         custom_worker = mocker.MagicMock()
         custom_worker.start = mocker.AsyncMock()
         custom_worker.stop = mocker.AsyncMock()
-        custom_worker.info = mocker.MagicMock()
+        custom_worker.metadata = mocker.MagicMock()
 
         def custom_factory(*args, **kwargs):
             return cast(LocalWorker, custom_worker)
@@ -1492,7 +1492,9 @@ class TestWorkerPoolContextHelpers:
         mock_discovery.subscribe = mocker.MagicMock(return_value=mocker.MagicMock())
 
         # Patch LocalDiscovery to return our mock
-        mocker.patch("wool.runtime.worker.pool.LocalDiscovery", return_value=mock_discovery)
+        mocker.patch(
+            "wool.runtime.worker.pool.LocalDiscovery", return_value=mock_discovery
+        )
 
         # Patch WorkerProxy to avoid actual proxy initialization
         mock_proxy = mocker.MagicMock()

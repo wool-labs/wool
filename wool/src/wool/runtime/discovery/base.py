@@ -15,7 +15,8 @@ from typing import TypeAlias
 from typing import TypeVar
 from typing import runtime_checkable
 
-from wool.runtime.protobuf.worker import WorkerInfo as WorkerInfoProtobuf
+from wool.runtime.event import Event
+from wool.runtime.protobuf.worker import WorkerMetadata as WorkerMetadataProtobuf
 
 T: Final = TypeVar("T")
 
@@ -25,7 +26,7 @@ PredicateFunction: TypeAlias = Callable[[T], bool]
 
 # public
 @dataclass(frozen=True)
-class WorkerInfo:
+class WorkerMetadata:
     """Properties and metadata for a worker instance.
 
     Contains identifying information and capabilities of a worker that
@@ -58,13 +59,13 @@ class WorkerInfo:
     )
 
     @classmethod
-    def from_protobuf(cls, protobuf: WorkerInfoProtobuf) -> WorkerInfo:
-        """Create a WorkerInfo instance from a protobuf message.
+    def from_protobuf(cls, protobuf: WorkerMetadataProtobuf) -> WorkerMetadata:
+        """Create a WorkerMetadata instance from a protobuf message.
 
         :param protobuf:
-            The protobuf WorkerInfo message to deserialize.
+            The protobuf WorkerMetadata message to deserialize.
         :returns:
-            A new WorkerInfo instance with data from the protobuf message.
+            A new WorkerMetadata instance with data from the protobuf message.
         :raises ValueError:
             If the UID in the protobuf message is not a valid UUID.
         """
@@ -79,14 +80,14 @@ class WorkerInfo:
             extra=MappingProxyType(dict(protobuf.extra)),
         )
 
-    def to_protobuf(self) -> WorkerInfoProtobuf:
-        """Convert this WorkerInfo instance to a protobuf message.
+    def to_protobuf(self) -> WorkerMetadataProtobuf:
+        """Convert this WorkerMetadata instance to a protobuf message.
 
         :returns:
-            A protobuf WorkerInfo message containing this instance's data.
+            A protobuf WorkerMetadata message containing this instance's data.
         """
 
-        return WorkerInfoProtobuf(
+        return WorkerMetadataProtobuf(
             uid=str(self.uid),
             host=self.host,
             port=self.port if self.port is not None else 0,
@@ -104,22 +105,24 @@ DiscoveryEventType: TypeAlias = Literal[
 
 
 # public
-@dataclass
-class DiscoveryEvent:
+class DiscoveryEvent(Event):
     """Event representing a change in worker availability.
 
     Emitted by discovery services when workers are added, updated, or
     removed from the pool. Contains both the event type and the
-    affected worker's information.
+    affected worker's metadata.
 
     :param type:
         The type of discovery event.
-    :param worker_info:
+    :param metadata:
         Information about the worker that triggered the event.
     """
 
-    type: DiscoveryEventType
-    worker_info: WorkerInfo
+    metadata: WorkerMetadata
+
+    def __init__(self, type: DiscoveryEventType, /, metadata: WorkerMetadata) -> None:
+        super().__init__(type)
+        self.metadata = metadata
 
 
 # public
@@ -131,12 +134,12 @@ class DiscoveryPublisherLike(Protocol):
     worker lifecycle events (added, updated, dropped) to subscribers.
     """
 
-    async def publish(self, type: DiscoveryEventType, worker_info: WorkerInfo) -> None:
+    async def publish(self, type: DiscoveryEventType, metadata: WorkerMetadata) -> None:
         """Publish a worker discovery event.
 
         :param type:
             The type of discovery event.
-        :param worker_info:
+        :param metadata:
             Information about the worker.
         """
         ...

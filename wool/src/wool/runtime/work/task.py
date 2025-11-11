@@ -1,44 +1,67 @@
-"""Task execution and lifecycle management.
-
-This module contains classes and functions for managing distributed task
-execution, including WorkTask, WorkTaskEvent, and related functionality.
-"""
-
 from __future__ import annotations
 
 import asyncio
 import logging
 import traceback
 from collections.abc import Callable
+from contextlib import contextmanager
 from contextvars import Context
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
-from time import perf_counter_ns
 from types import TracebackType
 from typing import TYPE_CHECKING
+from typing import ContextManager
 from typing import Coroutine
 from typing import Dict
 from typing import Literal
 from typing import Protocol
 from typing import SupportsInt
 from typing import Tuple
+from typing import overload
 from uuid import UUID
 
 import cloudpickle
 
 import wool
 from wool.runtime import protobuf as pb
-from wool.runtime.typing import PassthroughWrapper
+from wool.runtime.event import Event
+from wool.runtime.typing import AsyncCallable
 
 if TYPE_CHECKING:
     from wool.runtime.worker.proxy import WorkerProxy
 
-AsyncCallable = Callable[..., Coroutine]
 Args = Tuple
 Kwargs = Dict
 Timeout = SupportsInt
 Timestamp = SupportsInt
+
+
+_do_dispatch: ContextVar[bool] = ContextVar("_do_dispatch", default=True)
+
+
+@contextmanager
+def _do_dispatch_context_manager(flag: bool, /):
+    token = _do_dispatch.set(flag)
+    try:
+        yield
+    finally:
+        _do_dispatch.reset(token)
+
+
+@overload
+def do_dispatch() -> bool: ...
+
+
+@overload
+def do_dispatch(flag: bool, /) -> ContextManager[None]: ...
+
+
+def do_dispatch(flag: bool | None = None, /) -> bool | ContextManager[None]:
+    if flag is None:
+        return _do_dispatch.get()
+    else:
+        return _do_dispatch_context_manager(flag)
 
 
 # public
@@ -113,6 +136,7 @@ class WorkTask:
             The task's run method as a callable coroutine.
         """
         logging.debug(f"Entering {self.__class__.__name__} with ID {self.id}")
+        self._task_token = _current_task.set(self)
         return self.run
 
     def __exit__(
@@ -150,6 +174,7 @@ class WorkTask:
                 ],
             )
             this.add_done_callback(self._finish, context=Context())
+        _current_task.reset(self._task_token)
         # Return False to allow exceptions to propagate
         return False
 
@@ -213,15 +238,9 @@ class WorkTask:
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             with self:
-                current_task_token = _current_task.set(self)
-                # Yield to event loop with context set
                 await asyncio.sleep(0)
-                try:
-                    # Execute as worker without re-dispatching
-                    result = await execute_as_worker(fn)(*args, **kwargs)
-                    return result
-                finally:
-                    _current_task.reset(current_task_token)
+                with do_dispatch(False):
+                    return await fn(*args, **kwargs)
 
         return wrapper
 
@@ -247,7 +266,7 @@ class WorkTaskException:
 
 
 # public
-class WorkTaskEvent:
+class WorkTaskEvent(Event):
     """
     Represents a lifecycle event for a distributed task.
 
@@ -261,64 +280,31 @@ class WorkTaskEvent:
         The :class:`WorkTask` instance associated with this event.
     """
 
-    type: WorkTaskEventType
     task: WorkTask
 
-    _handlers: dict[str, list[WorkTaskEventCallback]] = {}
-
     def __init__(self, type: WorkTaskEventType, /, task: WorkTask) -> None:
-        """
-        Initialize a WorkTaskEvent instance.
-
-        :param type:
-            The type of the task event.
-        :param task:
-            The :class:`WorkTask` instance associated with the event.
-        """
-        self.type = type
+        super().__init__(type)
         self.task = task
 
-    @classmethod
-    def handler(
-        cls, *event_types: WorkTaskEventType
-    ) -> PassthroughWrapper[WorkTaskEventCallback]:
-        """
-        Register a handler function for specific task event types.
-
-        :param event_types:
-            The event types to handle.
-        :returns:
-            A decorator to register the handler function.
-        """
-
-        def _handler(
-            fn: WorkTaskEventCallback,
-        ) -> WorkTaskEventCallback:
-            for event_type in event_types:
-                cls._handlers.setdefault(event_type, []).append(fn)
-            return fn
-
-        return _handler
-
-    def emit(self):
+    def emit(self, context=None):
         """
         Emit the task event, invoking all registered handlers for the
         event type.
 
-        Handlers are called with the event instance and a timestamp.
+        Handlers are called with the event instance, timestamp, and
+        optional context metadata.
 
-        :raises Exception:
-            If any handler raises an exception.
+        :param context:
+            Optional metadata passed to handlers (e.g., emitter
+            identification).
         """
         logging.debug(
             f"Emitting {self.type} event for "
             f"task {self.task.id} "
             f"({self.task.callable.__qualname__})"
         )
-        if handlers := self._handlers.get(self.type):
-            timestamp = perf_counter_ns()
-            for handler in handlers:
-                handler(self, timestamp)
+        # Delegate to base class Event.emit()
+        super().emit(context)
 
 
 # public
@@ -351,17 +337,15 @@ task.
 
 
 # public
-class WorkTaskEventCallback(Protocol):
+class WorkTaskEventHandler(Protocol):
     """
     Protocol for WorkTaskEvent callback functions.
     """
 
-    def __call__(self, event: WorkTaskEvent, timestamp: Timestamp) -> None: ...
+    def __call__(
+        self, event: WorkTaskEvent, timestamp: Timestamp, context=None
+    ) -> None: ...
 
-
-# Import from wrapper module (after class definitions to avoid circular import issues)
-from wool.runtime.work.wrapper import _do_dispatch  # noqa: E402
-from wool.runtime.work.wrapper import execute_as_worker  # noqa: E402
 
 _current_task: ContextVar[WorkTask | None] = ContextVar("_current_task", default=None)
 

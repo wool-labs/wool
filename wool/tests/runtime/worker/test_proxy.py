@@ -20,7 +20,7 @@ from pytest_mock import MockerFixture
 import wool.runtime.worker.proxy as wp
 from wool.runtime import protobuf as pb
 from wool.runtime.discovery.base import DiscoveryEvent
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.resourcepool import Resource
@@ -92,18 +92,18 @@ def spy_loadbalancer_with_workers(mocker: MockerFixture):
             self._current_index = 0
 
         def worker_added_callback(
-            self, connection: Resource[WorkerConnection], info: WorkerInfo
+            self, connection: Resource[WorkerConnection], info: WorkerMetadata
         ):
             """Add worker to internal storage."""
             self._workers[info] = connection
 
         def worker_updated_callback(
-            self, connection: Resource[WorkerConnection], info: WorkerInfo
+            self, connection: Resource[WorkerConnection], info: WorkerMetadata
         ):
             """Update worker in internal storage."""
             self._workers[info] = connection
 
-        def worker_removed_callback(self, info: WorkerInfo):
+        def worker_removed_callback(self, info: WorkerMetadata):
             """Remove worker from internal storage."""
             if info in self._workers:
                 del self._workers[info]
@@ -114,7 +114,7 @@ def spy_loadbalancer_with_workers(mocker: MockerFixture):
                 raise NoWorkersAvailable("No workers available for dispatch")
 
             # Simple dispatch to first available worker
-            worker_info, worker_resource = next(iter(self._workers.items()))
+            metadata, worker_resource = next(iter(self._workers.items()))
             async with worker_resource() as worker:
                 return await worker.dispatch(task)
 
@@ -165,19 +165,19 @@ def spy_discovery_with_events(mocker: MockerFixture):
             self._events.append(event)
 
     # Create default worker info for testing
-    worker_info = WorkerInfo(
+    metadata = WorkerMetadata(
         uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
     )
 
     # Create discovery with default worker-added event
-    events = [DiscoveryEvent(type="worker-added", worker_info=worker_info)]
+    events = [DiscoveryEvent("worker-added", metadata=metadata)]
     discovery = SpyableDiscovery(events)
 
     # Wrap methods with spies
     discovery.__anext__ = mocker.spy(discovery, "__anext__")
     discovery.add_event = mocker.spy(discovery, "add_event")
 
-    return discovery, worker_info
+    return discovery, metadata
 
 
 @pytest.fixture
@@ -348,7 +348,7 @@ class TestWorkerProxy:
         """Test create a ReducibleAsyncIterator with worker-added events.
 
         Given:
-            A list of WorkerInfo objects
+            A list of WorkerMetadata objects
         When:
             WorkerProxy is initialized with workers parameter
         Then:
@@ -356,10 +356,10 @@ class TestWorkerProxy:
         """
         # Arrange
         workers = [
-            WorkerInfo(
+            WorkerMetadata(
                 uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
             ),
-            WorkerInfo(
+            WorkerMetadata(
                 uid=uuid.uuid4(), host="127.0.0.1", port=50052, pid=1235, version="1.0.0"
             ),
         ]
@@ -382,7 +382,7 @@ class TestWorkerProxy:
         """
         # Arrange
         workers = [
-            WorkerInfo(
+            WorkerMetadata(
                 uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
             )
         ]
@@ -606,7 +606,7 @@ class TestWorkerProxy:
             The proxy discovers them
         """
         # Arrange
-        worker1 = WorkerInfo(
+        worker1 = WorkerMetadata(
             uid=uuid.uuid4(),
             host="192.168.1.100",
             port=50051,
@@ -644,7 +644,7 @@ class TestWorkerProxy:
         await mock_discovery_service.start()
         proxy = WorkerProxy(discovery=mock_discovery_service)
 
-        worker1 = WorkerInfo(
+        worker1 = WorkerMetadata(
             uid=uuid.uuid4(),
             host="192.168.1.100",
             port=50051,
@@ -674,7 +674,7 @@ class TestWorkerProxy:
             The proxy removes it from available workers
         """
         # Arrange
-        worker1 = WorkerInfo(
+        worker1 = WorkerMetadata(
             uid=uuid.uuid4(),
             host="192.168.1.100",
             port=50051,
@@ -721,7 +721,7 @@ class TestWorkerProxy:
             It should delegate the task to the load balancer and yield results
         """
         # Arrange
-        discovery, worker_info = spy_discovery_with_events
+        discovery, metadata = spy_discovery_with_events
         mock_resource, mock_worker = mock_worker_resource
 
         proxy = WorkerProxy(
@@ -733,7 +733,7 @@ class TestWorkerProxy:
 
         # Add worker through proper loadbalancer callback (simulating discovery)
         spy_loadbalancer_with_workers.worker_added_callback(
-            lambda: mock_resource, worker_info
+            lambda: mock_resource, metadata
         )
 
         # Act
@@ -786,7 +786,7 @@ class TestWorkerProxy:
             It should propagate the error from the load balancer
         """
         # Arrange
-        discovery, worker_info = spy_discovery_with_events
+        discovery, metadata = spy_discovery_with_events
         mock_resource, mock_worker = mock_worker_resource
 
         # Create loadbalancer that raises errors during dispatch
@@ -814,7 +814,7 @@ class TestWorkerProxy:
         await proxy.start()
 
         # Add worker through proper callback
-        failing_loadbalancer.worker_added_callback(lambda: mock_resource, worker_info)
+        failing_loadbalancer.worker_added_callback(lambda: mock_resource, metadata)
 
         # Act & Assert
         with pytest.raises(Exception, match="Load balancer error"):
@@ -839,12 +839,12 @@ class TestWorkerProxy:
             Should wait via _await_workers, then dispatch when workers appear
         """
         # Arrange
-        worker_info = WorkerInfo(
+        metadata = WorkerMetadata(
             uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
         )
 
         # Create discovery service that will emit worker event
-        events = [DiscoveryEvent(type="worker-added", worker_info=worker_info)]
+        events = [DiscoveryEvent("worker-added", metadata=metadata)]
         discovery = wp.ReducibleAsyncIterator(events)
         mock_resource, mock_worker = mock_worker_resource
 
@@ -909,7 +909,7 @@ class TestWorkerProxy:
         """
         # Arrange
         workers = [
-            WorkerInfo(
+            WorkerMetadata(
                 uid=uuid.uuid4(),
                 host="192.168.1.100",
                 port=50051,
@@ -918,7 +918,7 @@ class TestWorkerProxy:
                 tags=frozenset(["test"]),
                 extra=MappingProxyType({}),
             ),
-            WorkerInfo(
+            WorkerMetadata(
                 uid=uuid.uuid4(),
                 host="192.168.1.101",
                 port=50052,
@@ -969,17 +969,17 @@ class TestWorkerProxy:
     async def test_workers_property_returns_workers_list(
         self, mock_discovery_service, mock_proxy_session
     ):
-        """Test return a list of WorkerInfo objects.
+        """Test return a list of WorkerMetadata objects.
 
         Given:
             A WorkerProxy with discovered workers
         When:
             The workers property is accessed
         Then:
-            It should return a list of WorkerInfo objects
+            It should return a list of WorkerMetadata objects
         """
         # Arrange
-        worker_info = WorkerInfo(
+        metadata = WorkerMetadata(
             uid=uuid.uuid4(),
             host="127.0.0.1",
             port=50051,
@@ -989,7 +989,7 @@ class TestWorkerProxy:
 
         # Inject worker into discovery service before starting proxy
         await mock_discovery_service.start()
-        mock_discovery_service.inject_worker_added(worker_info)
+        mock_discovery_service.inject_worker_added(metadata)
 
         proxy = WorkerProxy(discovery=mock_discovery_service)
 
@@ -1001,7 +1001,7 @@ class TestWorkerProxy:
 
             # Assert - verify observable behavior through public API
             assert isinstance(workers, list)
-            assert worker_info in workers
+            assert metadata in workers
             assert len(workers) == 1
 
         await mock_discovery_service.stop()
@@ -1251,7 +1251,7 @@ class TestWorkerProxyProperties:
         await mock_discovery_service.start()
         workers = []
         for i in range(worker_count):
-            worker = WorkerInfo(
+            worker = WorkerMetadata(
                 uid=uuid.uuid4(),
                 host=f"192.168.1.{100 + i}",
                 port=50051,
@@ -1366,7 +1366,7 @@ class TestWorkerProxyProperties:
         """Test succeed and create a valid proxy.
 
         Given:
-            A list of WorkerInfo objects
+            A list of WorkerMetadata objects
         When:
             Creating a WorkerProxy with workers parameter
         Then:
@@ -1374,7 +1374,7 @@ class TestWorkerProxyProperties:
         """
         # Arrange
         workers = [
-            WorkerInfo(
+            WorkerMetadata(
                 uid=uuid.uuid4(),
                 host=f"192.168.1.{100 + i}",
                 port=50051 + i,

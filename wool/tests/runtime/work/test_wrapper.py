@@ -1,8 +1,3 @@
-"""Tests for wrapper.py module."""
-
-import asyncio
-import inspect
-
 import pytest
 from hypothesis import HealthCheck
 from hypothesis import given
@@ -10,10 +5,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-import wool
 from wool.runtime.work import work
-from wool.runtime.work.wrapper import _do_dispatch
-from wool.runtime.work.wrapper import execute_as_worker
 
 
 # Module-level test functions for @work decorator tests
@@ -102,31 +94,6 @@ class TestWorkDecorator:
         # Assert
         assert result == 8
         mock_proxy_context.dispatch.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_local_execution_within_worker(
-        self,
-        mocker: MockerFixture,
-        mock_proxy_context,
-    ):
-        """Test local execution within worker.
-
-        Given:
-            A decorated async function called from within a worker (via
-            execute_as_worker)
-        When:
-            Wrapped function is called
-        Then:
-            Executes locally and returns result without re-dispatching
-        """
-        # Arrange & Act - execute as worker
-        executor = execute_as_worker(module_test_func)
-        result = await executor(5, 3)
-
-        # Assert
-        assert result == 8
-        # Dispatch should not have been called
-        mock_proxy_context.dispatch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_coroutine_result_handling(
@@ -387,61 +354,6 @@ class TestWorkDecorator:
         # Act & Assert
         with pytest.raises(ValueError, match="Stream error"):
             await module_test_func_no_args()
-
-
-class TestExecuteAsWorker:
-    """Tests for execute_as_worker() function."""
-
-    @pytest.mark.asyncio
-    async def test_execute_without_redispatch(self):
-        """Test execute_as_worker executes without redispatch.
-
-        Given:
-            An async callable is wrapped with execute_as_worker
-        When:
-            The wrapped executor is called and awaited
-        Then:
-            Executes the callable and returns result without dispatching
-            to worker pool
-        """
-
-        # Arrange
-        async def test_callable(x, y):
-            return x * y
-
-        # Act
-        executor = execute_as_worker(test_callable)
-        result = await executor(5, 3)
-
-        # Assert
-        assert result == 15
-
-    @pytest.mark.asyncio
-    async def test_execute_exception_propagation(self):
-        """Test execute_as_worker exception propagation.
-
-        Given:
-            An async callable wrapped with execute_as_worker that raises
-            an exception
-        When:
-            The wrapped executor is called
-        Then:
-            Exception is propagated to caller
-        """
-
-        # Arrange
-        async def test_callable():
-            raise ValueError("Test error")
-
-        # Act
-        executor = execute_as_worker(test_callable)
-
-        # Assert
-        with pytest.raises(ValueError, match="Test error"):
-            await executor()
-
-
-# Property-Based Tests
 
 
 @settings(

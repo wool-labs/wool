@@ -4,7 +4,7 @@ from uuid import uuid4
 from hypothesis import given
 from hypothesis import strategies as st
 
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.connection import WorkerConnection
@@ -30,14 +30,14 @@ def loadbalancer_context(draw):
     ctx = LoadBalancerContext()
 
     for i in range(worker_count):
-        worker_info = WorkerInfo(
+        metadata = WorkerMetadata(
             uid=uuid4(),
             host="localhost",
             port=50051 + i,
             pid=1000 + i,
             version="1.0.0",
         )
-        ctx.add_worker(worker_info, lambda: connection_pool.get(worker_info))
+        ctx.add_worker(metadata, lambda: connection_pool.get(metadata))
 
     return ctx
 
@@ -71,7 +71,7 @@ class TestLoadBalancerContext:
         original_workers = dict(context.workers)
 
         # Add a new worker
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid4(),
             host="localhost",
             port=60000,
@@ -80,7 +80,7 @@ class TestLoadBalancerContext:
         )
 
         def factory():
-            return connection_pool.get(worker_info)
+            return connection_pool.get(metadata)
 
         context.add_worker(worker, factory)
 
@@ -89,9 +89,9 @@ class TestLoadBalancerContext:
         assert context.workers[worker] == factory
 
         # Verify existing workers are unchanged
-        for worker_info in original_workers:
-            assert worker_info in context.workers
-            assert context.workers[worker_info] == original_workers[worker_info]
+        for metadata in original_workers:
+            assert metadata in context.workers
+            assert context.workers[metadata] == original_workers[metadata]
 
     @given(loadbalancer_context())
     def test_update_worker(self, context: LoadBalancerContext):
@@ -110,7 +110,7 @@ class TestLoadBalancerContext:
 
         # Create a different factory function
         def factory():
-            return connection_pool.get(worker_info)
+            return connection_pool.get(metadata)
 
         # Update the worker with a new factory
         context.update_worker(worker_to_update, factory)
@@ -119,9 +119,9 @@ class TestLoadBalancerContext:
         assert context.workers[worker_to_update] == factory
 
         # Verify other workers are unchanged
-        for worker_info in original_workers:
-            if worker_info != worker_to_update:
-                assert context.workers[worker_info] == original_workers[worker_info]
+        for metadata in original_workers:
+            if metadata != worker_to_update:
+                assert context.workers[metadata] == original_workers[metadata]
 
     @given(loadbalancer_context())
     def test_upsert_existing_worker(self, context: LoadBalancerContext):
@@ -142,7 +142,7 @@ class TestLoadBalancerContext:
 
         # Create a different factory function
         def factory():
-            return connection_pool.get(worker_info)
+            return connection_pool.get(metadata)
 
         # Update the worker with a new factory using upsert=True
         context.update_worker(worker_to_update, factory, upsert=True)
@@ -151,9 +151,9 @@ class TestLoadBalancerContext:
         assert context.workers[worker_to_update] == factory
 
         # Verify other workers are unchanged
-        for worker_info in original_workers:
-            if worker_info != worker_to_update:
-                assert context.workers[worker_info] == original_workers[worker_info]
+        for metadata in original_workers:
+            if metadata != worker_to_update:
+                assert context.workers[metadata] == original_workers[metadata]
 
     @given(loadbalancer_context())
     def test_upsert_new_worker(self, context: LoadBalancerContext):
@@ -171,7 +171,7 @@ class TestLoadBalancerContext:
         original_workers = dict(context.workers)
 
         # Upsert a new worker
-        new_worker = WorkerInfo(
+        new_worker = WorkerMetadata(
             uid=uuid4(),
             host="localhost",
             port=60000,
@@ -180,7 +180,7 @@ class TestLoadBalancerContext:
         )
 
         def factory():
-            return connection_pool.get(worker_info)
+            return connection_pool.get(metadata)
 
         context.update_worker(new_worker, factory, upsert=True)
 
@@ -189,9 +189,9 @@ class TestLoadBalancerContext:
         assert context.workers[new_worker] == factory
 
         # Verify existing workers are unchanged
-        for worker_info in original_workers:
-            assert worker_info in context.workers
-            assert context.workers[worker_info] == original_workers[worker_info]
+        for metadata in original_workers:
+            assert metadata in context.workers
+            assert context.workers[metadata] == original_workers[metadata]
 
     @given(loadbalancer_context())
     def test_remove_worker(self, context: LoadBalancerContext):
@@ -215,7 +215,7 @@ class TestLoadBalancerContext:
         assert worker_to_remove not in context.workers
 
         # Verify other workers are unchanged
-        for worker_info in original_workers:
-            if worker_info != worker_to_remove:
-                assert worker_info in context.workers
-                assert context.workers[worker_info] == original_workers[worker_info]
+        for metadata in original_workers:
+            if metadata != worker_to_remove:
+                assert metadata in context.workers
+                assert context.workers[metadata] == original_workers[metadata]
