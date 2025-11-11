@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package wool.core.protobuf.task;
+package wool.runtime.protobuf.task;
 
 message Task {
     string id = 1;

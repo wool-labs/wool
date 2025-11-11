@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package wool.core.protobuf.worker;
+package wool.runtime.protobuf.worker;
 
 import "task.proto";
 
