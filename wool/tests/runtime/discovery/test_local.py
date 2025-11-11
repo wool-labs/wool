@@ -14,7 +14,7 @@ from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 from wool.runtime.discovery.base import DiscoveryEvent
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.local import NULL_REF
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.discovery.local import _lock
@@ -26,13 +26,13 @@ from wool.runtime.discovery.local import _WorkerReference
 
 
 @pytest.fixture
-def worker_info():
-    """Provides sample WorkerInfo for testing.
+def metadata():
+    """Provides sample WorkerMetadata for testing.
 
-    Creates a WorkerInfo instance with typical field values for use in
+    Creates a WorkerMetadata instance with typical field values for use in
     tests that need a well-formed worker instance.
     """
-    return WorkerInfo(
+    return WorkerMetadata(
         uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
         host="localhost",
         port=50051,
@@ -806,7 +806,7 @@ class TestLocalDiscoveryPublisher:
     """Tests for LocalDiscovery.Publisher class."""
 
     @pytest.mark.asyncio
-    async def test_publish_worker_added(self, namespace, worker_info):
+    async def test_publish_worker_added(self, namespace, metadata):
         """Test publish() with worker-added event.
 
         Given:
@@ -827,12 +827,12 @@ class TestLocalDiscoveryPublisher:
             address_space.buf[i : i + 16] = NULL_REF
 
         publisher = LocalDiscovery.Publisher(namespace)
-        event = DiscoveryEvent(type="worker-added", worker_info=worker_info)
+        event = DiscoveryEvent("worker-added", metadata=metadata)
 
         try:
             async with publisher:
                 # Act
-                await publisher.publish(event.type, event.worker_info)
+                await publisher.publish(event.type, event.metadata)
 
                 # Assert - worker should be in shared memory
                 with _shared_memory(abbreviated_namespace) as shm:
@@ -849,7 +849,7 @@ class TestLocalDiscoveryPublisher:
             address_space.unlink()
 
     @pytest.mark.asyncio
-    async def test_publish_worker_dropped(self, namespace, worker_info):
+    async def test_publish_worker_dropped(self, namespace, metadata):
         """Test publish() with worker-dropped event.
 
         Given:
@@ -873,14 +873,12 @@ class TestLocalDiscoveryPublisher:
         try:
             async with publisher:
                 # Add worker first
-                add_event = DiscoveryEvent(type="worker-added", worker_info=worker_info)
-                await publisher.publish(add_event.type, add_event.worker_info)
+                add_event = DiscoveryEvent("worker-added", metadata=metadata)
+                await publisher.publish(add_event.type, add_event.metadata)
 
                 # Act - drop worker
-                drop_event = DiscoveryEvent(
-                    type="worker-dropped", worker_info=worker_info
-                )
-                await publisher.publish(drop_event.type, drop_event.worker_info)
+                drop_event = DiscoveryEvent("worker-dropped", metadata=metadata)
+                await publisher.publish(drop_event.type, drop_event.metadata)
 
                 # Assert - worker should be removed (slot is NULL)
                 with _shared_memory(abbreviated_namespace) as shm:
@@ -892,7 +890,7 @@ class TestLocalDiscoveryPublisher:
             address_space.unlink()
 
     @pytest.mark.asyncio
-    async def test_publish_worker_updated(self, namespace, worker_info):
+    async def test_publish_worker_updated(self, namespace, metadata):
         """Test publish() with worker-updated event.
 
         Given:
@@ -914,21 +912,19 @@ class TestLocalDiscoveryPublisher:
         try:
             async with publisher:
                 # Add worker first
-                add_event = DiscoveryEvent(type="worker-added", worker_info=worker_info)
-                await publisher.publish(add_event.type, add_event.worker_info)
+                add_event = DiscoveryEvent("worker-added", metadata=metadata)
+                await publisher.publish(add_event.type, add_event.metadata)
 
                 # Act - update worker with new version
-                updated_worker = WorkerInfo(
-                    uid=worker_info.uid,  # Same UID
+                updated_worker = WorkerMetadata(
+                    uid=metadata.uid,  # Same UID
                     host="newhost",
                     port=9999,
                     pid=99999,
                     version="2.0.0",
                 )
-                update_event = DiscoveryEvent(
-                    type="worker-updated", worker_info=updated_worker
-                )
-                await publisher.publish(update_event.type, update_event.worker_info)
+                update_event = DiscoveryEvent("worker-updated", metadata=updated_worker)
+                await publisher.publish(update_event.type, update_event.metadata)
 
                 # Assert - worker should be updated in shared memory
                 # (We can verify by reading back the worker metadata)
@@ -952,10 +948,10 @@ class TestLocalDiscoveryPublisher:
         namespace_a = f"test-ns-a-{uuid.uuid4()}"
         namespace_b = f"test-ns-b-{uuid.uuid4()}"
 
-        worker_a = WorkerInfo(
+        worker_a = WorkerMetadata(
             uid=uuid.uuid4(), host="host-a", port=5001, pid=111, version="1.0"
         )
-        worker_b = WorkerInfo(
+        worker_b = WorkerMetadata(
             uid=uuid.uuid4(), host="host-b", port=5002, pid=222, version="1.0"
         )
 
@@ -1023,7 +1019,7 @@ class TestLocalDiscoveryPublisher:
             address_space.buf[i : i + 16] = NULL_REF
 
         workers = [
-            WorkerInfo(
+            WorkerMetadata(
                 uid=uuid.uuid4(),
                 host=f"host-{i}",
                 port=5000 + i,
@@ -1038,11 +1034,9 @@ class TestLocalDiscoveryPublisher:
         try:
             async with publisher:
                 # Act - publish all workers concurrently
-                events = [
-                    DiscoveryEvent(type="worker-added", worker_info=w) for w in workers
-                ]
+                events = [DiscoveryEvent("worker-added", metadata=w) for w in workers]
                 await asyncio.gather(
-                    *[publisher.publish(e.type, e.worker_info) for e in events]
+                    *[publisher.publish(e.type, e.metadata) for e in events]
                 )
 
                 # Assert - all workers should be in shared memory
@@ -1088,7 +1082,7 @@ class TestLocalDiscoveryPublisher:
 
         # Create workers equal to actual_slots + 1
         workers = [
-            WorkerInfo(
+            WorkerMetadata(
                 uid=uuid.uuid4(),
                 host=f"host{i}",
                 port=5000 + i,
@@ -1143,7 +1137,7 @@ class TestLocalDiscoveryPublisher:
         for i in range(0, len(address_space.buf), 16):
             address_space.buf[i : i + 16] = NULL_REF
 
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
         )
 
@@ -1153,14 +1147,14 @@ class TestLocalDiscoveryPublisher:
             async with publisher:
                 # Act - Create event with invalid type by bypassing type system
                 # Use object.__setattr__ to bypass frozen dataclass validation
-                event = DiscoveryEvent(type="worker-added", worker_info=worker)
+                event = DiscoveryEvent("worker-added", metadata=worker)
                 object.__setattr__(event, "type", "invalid-event-type")
 
                 # Assert
                 with pytest.raises(
                     RuntimeError, match="Unexpected discovery event type"
                 ):
-                    await publisher.publish(event.type, event.worker_info)
+                    await publisher.publish(event.type, event.metadata)
         finally:
             address_space.close()
             address_space.unlink()
@@ -1183,7 +1177,7 @@ class TestLocalDiscoveryPublisher:
             Should raise RuntimeError about improper initialization
         """
         # Arrange
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
         )
 
@@ -1229,7 +1223,7 @@ class TestLocalDiscoveryPublisher:
         for i in range(0, len(address_space.buf), 16):
             address_space.buf[i : i + 16] = NULL_REF
 
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
         )
 
@@ -1272,7 +1266,7 @@ class TestLocalDiscoveryPublisher:
                 # Assert that either no events were discovered,
                 # or the worker is not in them
                 assert len(events) == 0 or all(
-                    e.worker_info.uid != worker.uid for e in events
+                    e.metadata.uid != worker.uid for e in events
                 )
         finally:
             address_space.close()
@@ -1299,7 +1293,7 @@ class TestLocalDiscoveryPublisher:
         for i in range(0, len(address_space.buf), 16):
             address_space.buf[i : i + 16] = NULL_REF
 
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
         )
 
@@ -1347,7 +1341,7 @@ class TestLocalDiscoveryPublisher:
         for i in range(0, len(address_space.buf), 16):
             address_space.buf[i : i + 16] = NULL_REF
 
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
         )
 
@@ -1406,7 +1400,7 @@ class TestLocalDiscoveryPublisher:
         for i in range(0, len(address_space.buf), 16):
             address_space.buf[i : i + 16] = NULL_REF
 
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
         )
 
@@ -1444,7 +1438,7 @@ class TestLocalDiscoveryPublisher:
             address_space.buf[i : i + 16] = NULL_REF
 
         # Create initial worker
-        initial_worker = WorkerInfo(
+        initial_worker = WorkerMetadata(
             uid=uuid.uuid4(),
             host="initial-host",
             port=50051,
@@ -1454,7 +1448,7 @@ class TestLocalDiscoveryPublisher:
         )
 
         # Create updated worker with same UID
-        updated_worker = WorkerInfo(
+        updated_worker = WorkerMetadata(
             uid=initial_worker.uid,
             host="updated-host",
             port=60061,
@@ -1476,7 +1470,7 @@ class TestLocalDiscoveryPublisher:
                     async for event in subscriber:
                         if (
                             event.type == "worker-added"
-                            and event.worker_info.uid == initial_worker.uid
+                            and event.metadata.uid == initial_worker.uid
                         ):
                             break
 
@@ -1510,13 +1504,13 @@ class TestLocalDiscoveryPublisher:
                 events = []
                 async with asyncio.timeout(1.0):
                     async for event in subscriber:
-                        if event.worker_info.uid == initial_worker.uid:
+                        if event.metadata.uid == initial_worker.uid:
                             events.append(event)
                             break
 
                 # Assert the worker's prior state was restored
                 assert len(events) == 1
-                discovered_worker = events[0].worker_info
+                discovered_worker = events[0].metadata
                 assert discovered_worker.host == "initial-host"
                 assert discovered_worker.port == 50051
                 assert discovered_worker.version == "1.0"
@@ -1530,7 +1524,7 @@ class TestLocalDiscoverySubscriber:
     """Tests for LocalDiscovery.Subscriber class."""
 
     @pytest.mark.asyncio
-    async def test_initial_scan_discovers_existing_workers(self, namespace, worker_info):
+    async def test_initial_scan_discovers_existing_workers(self, namespace, metadata):
         """Test initial scan discovers existing workers immediately.
 
         Given:
@@ -1552,7 +1546,7 @@ class TestLocalDiscoverySubscriber:
         try:
             # Keep publisher context open so worker blocks remain available
             async with publisher:
-                await publisher.publish("worker-added", worker_info)
+                await publisher.publish("worker-added", metadata)
 
                 # Act - create subscriber after worker is added
                 subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.1)
@@ -1583,7 +1577,7 @@ class TestLocalDiscoverySubscriber:
                 # Assert
                 assert len(events) >= 1
                 assert events[0].type == "worker-added"
-                assert events[0].worker_info.uid == worker_info.uid
+                assert events[0].metadata.uid == metadata.uid
         finally:
             address_space.close()
             address_space.unlink()
@@ -1606,10 +1600,10 @@ class TestLocalDiscoverySubscriber:
         for i in range(0, len(address_space.buf), 16):
             address_space.buf[i : i + 16] = NULL_REF
 
-        worker_match = WorkerInfo(
+        worker_match = WorkerMetadata(
             uid=uuid.uuid4(), host="host1", port=50051, pid=111, version="1.0"
         )
-        worker_no_match = WorkerInfo(
+        worker_no_match = WorkerMetadata(
             uid=uuid.uuid4(), host="host2", port=9999, pid=222, version="1.0"
         )
 
@@ -1657,7 +1651,7 @@ class TestLocalDiscoverySubscriber:
 
                 # Assert - only matching worker should appear
                 assert len(events) >= 1
-                assert all(e.worker_info.port == 50051 for e in events)
+                assert all(e.metadata.port == 50051 for e in events)
         finally:
             address_space.close()
             address_space.unlink()
@@ -1721,14 +1715,14 @@ class TestLocalDiscoverySubscriber:
         pickled = cloudpickle.dumps(subscriber)
         unpickled = cloudpickle.loads(pickled)
 
-        matching_worker = WorkerInfo(
+        matching_worker = WorkerMetadata(
             uid=uuid.uuid4(),
             host="test",
             port=matching_port,
             pid=123,
             version="1.0",
         )
-        non_matching_worker = WorkerInfo(
+        non_matching_worker = WorkerMetadata(
             uid=uuid.uuid4(),
             host="test",
             port=non_matching_port,
@@ -1767,8 +1761,8 @@ class TestLocalDiscoverySubscriber:
 
                 # Assert - should only receive matching worker
                 assert len(events) == 1
-                assert events[0].worker_info.port == matching_port
-                assert events[0].worker_info.uid == matching_worker.uid
+                assert events[0].metadata.port == matching_port
+                assert events[0].metadata.uid == matching_worker.uid
         finally:
             address_space.close()
             address_space.unlink()
@@ -1791,7 +1785,7 @@ class TestLocalDiscoverySubscriber:
         for i in range(0, len(address_space.buf), 16):
             address_space.buf[i : i + 16] = NULL_REF
 
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
         )
 
@@ -1805,12 +1799,9 @@ class TestLocalDiscoverySubscriber:
         async def collect_events():
             async for event in subscriber:
                 events.append(event)
-                if event.type == "worker-added" and event.worker_info.uid == worker.uid:
+                if event.type == "worker-added" and event.metadata.uid == worker.uid:
                     worker_added_event.set()
-                elif (
-                    event.type == "worker-dropped"
-                    and event.worker_info.uid == worker.uid
-                ):
+                elif event.type == "worker-dropped" and event.metadata.uid == worker.uid:
                     worker_dropped_event.set()
                     break
 
@@ -1843,7 +1834,7 @@ class TestLocalDiscoverySubscriber:
                 # Assert
                 dropped_events = [e for e in events if e.type == "worker-dropped"]
                 assert len(dropped_events) >= 1
-                assert dropped_events[0].worker_info.uid == worker.uid
+                assert dropped_events[0].metadata.uid == worker.uid
         finally:
             address_space.close()
             address_space.unlink()

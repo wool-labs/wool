@@ -31,10 +31,10 @@ class WorkerPool:
     The core of wool's distributed runtime. Manages worker lifecycle,
     discovery, and load balancing across two modes:
 
-    **Ephemeral pools** spawn local workers automatically managed within the
+    - **Ephemeral pools** spawn local workers automatically managed within the
     pool's lifecycle. Perfect for development and single-machine deployments.
 
-    **Durable pools** connect to existing remote workers through discovery
+    - **Durable pools** connect to existing remote workers through discovery
     services. Workers run independently, serving multiple clients across
     distributed deployments.
 
@@ -54,14 +54,14 @@ class WorkerPool:
             return a + b
 
 
-        async with wool.WorkerPool() as pool:
+        async with wool.WorkerPool():
             result = await fibonacci(10)
 
     **Ephemeral with tags:**
 
     .. code-block:: python
 
-        async with WorkerPool("gpu-capable", size=4) as pool:
+        async with WorkerPool("gpu-capable", size=4):
             result = await gpu_task()
 
     **Custom worker factory:**
@@ -72,7 +72,7 @@ class WorkerPool:
 
         worker_factory = partial(LocalWorker, host="0.0.0.0")
 
-        async with WorkerPool(size=8, worker=worker_factory) as pool:
+        async with WorkerPool(size=8, worker=worker_factory):
             result = await task()
 
     **Durable pool:**
@@ -81,7 +81,7 @@ class WorkerPool:
 
         from wool.runtime.discovery.lan import LanDiscovery
 
-        async with WorkerPool(discovery=LanDiscovery()) as pool:
+        async with WorkerPool(discovery=LanDiscovery()):
             result = await task()
 
     **Filtered discovery:**
@@ -89,7 +89,7 @@ class WorkerPool:
     .. code-block:: python
 
         discovery = LanDiscovery().subscribe(filter=lambda w: "production" in w.tags)
-        async with WorkerPool(discovery=discovery) as pool:
+        async with WorkerPool(discovery=discovery):
             result = await task()
 
     **Hybrid pool:**
@@ -97,7 +97,7 @@ class WorkerPool:
     .. code-block:: python
 
         # Spawn local workers AND discover remote workers
-        async with WorkerPool(size=4, discovery=LanDiscovery()) as pool:
+        async with WorkerPool(size=4, discovery=LanDiscovery()):
             result = await task()
 
     **Custom load balancer:**
@@ -113,7 +113,7 @@ class WorkerPool:
                 ...
 
 
-        async with WorkerPool(loadbalancer=PriorityBalancer()) as pool:
+        async with WorkerPool(loadbalancer=PriorityBalancer()):
             result = await task()
 
     **Custom discovery:**
@@ -132,7 +132,7 @@ class WorkerPool:
                 await svc.close()
 
 
-        async with WorkerPool(discovery=custom_discovery) as pool:
+        async with WorkerPool(discovery=custom_discovery):
             result = await task()
 
     :param tags:
@@ -335,10 +335,10 @@ class WorkerPool:
 
             async def start(worker):
                 await worker.start()
-                await publisher.publish("worker-added", worker.info)
+                await publisher.publish("worker-added", worker.metadata)
 
             async def stop(worker):
-                await publisher.publish("worker-dropped", worker.info)
+                await publisher.publish("worker-dropped", worker.metadata)
                 await worker.stop()
 
             task = asyncio.create_task(start(worker))
@@ -347,7 +347,7 @@ class WorkerPool:
 
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
-            yield [w.info for w in self._workers if w.info]
+            yield [w.metadata for w in self._workers if w.metadata]
         finally:
             tasks = [asyncio.create_task(stop) for stop in self._workers.values()]
             await asyncio.gather(*tasks, return_exceptions=True)

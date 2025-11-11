@@ -70,7 +70,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
             if self._index[context] >= len(context.workers):
                 self._index[context] = 0
 
-            worker_info, connection_resource_factory = next(
+            metadata, connection_resource_factory = next(
                 itertools.islice(
                     context.workers.items(),
                     self._index[context],
@@ -79,8 +79,8 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
             )
 
             if checkpoint is None:
-                checkpoint = worker_info.uid
-            elif worker_info.uid == checkpoint:
+                checkpoint = metadata.uid
+            elif metadata.uid == checkpoint:
                 break
 
             async with connection_resource_factory() as connection:
@@ -90,8 +90,8 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                     self._index[context] = self._index[context] + 1
                     continue
                 except Exception:
-                    context.remove_worker(worker_info)
-                    if worker_info.uid == checkpoint:
+                    context.remove_worker(metadata)
+                    if metadata.uid == checkpoint:
                         checkpoint = None
                     continue
                 else:

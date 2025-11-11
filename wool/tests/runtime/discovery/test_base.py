@@ -10,18 +10,18 @@ from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryEventType
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
-from wool.runtime.discovery.base import WorkerInfo
-from wool.runtime.protobuf.worker import WorkerInfo as WorkerInfoProtobuf
+from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.protobuf.worker import WorkerMetadata as WorkerMetadataProtobuf
 
 
 @pytest.fixture
-def worker_info():
-    """Provides sample WorkerInfo for testing.
+def metadata():
+    """Provides sample WorkerMetadata for testing.
 
-    Creates a WorkerInfo instance with typical field values for use in
+    Creates a WorkerMetadata instance with typical field values for use in
     tests that need a well-formed worker instance.
     """
-    return WorkerInfo(
+    return WorkerMetadata(
         uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
         host="localhost",
         port=50051,
@@ -33,13 +33,13 @@ def worker_info():
 
 
 @pytest.fixture
-def worker_info_message():
-    """Provides sample protobuf WorkerInfo for testing.
+def metadata_message():
+    """Provides sample protobuf WorkerMetadata for testing.
 
-    Creates a protobuf WorkerInfo message with typical field values for use
+    Creates a protobuf WorkerMetadata message with typical field values for use
     in tests that need to deserialize protobuf messages.
     """
-    return WorkerInfoProtobuf(
+    return WorkerMetadataProtobuf(
         uid="12345678-1234-5678-1234-567812345678",
         host="localhost",
         port=50051,
@@ -50,17 +50,17 @@ def worker_info_message():
     )
 
 
-class TestWorkerInfo:
-    """Tests for WorkerInfo dataclass.
+class TestWorkerMetadata:
+    """Tests for WorkerMetadata dataclass.
 
-    Fully qualified name: wool.runtime.discovery.base.WorkerInfo
+    Fully qualified name: wool.runtime.discovery.base.WorkerMetadata
     """
 
-    def test_immutability(self, worker_info):
-        """Test WorkerInfo instances are immutable.
+    def test_immutability(self, metadata):
+        """Test WorkerMetadata instances are immutable.
 
         Given:
-            A WorkerInfo instance
+            A WorkerMetadata instance
         When:
             Attempting to modify a field
         Then:
@@ -68,15 +68,15 @@ class TestWorkerInfo:
         """
         # Act & Assert
         with pytest.raises(AttributeError):
-            worker_info.host = "newhost"
+            metadata.host = "newhost"
 
     def test_init(self):
-        """Test WorkerInfo default field values.
+        """Test WorkerMetadata default field values.
 
         Given:
-            Required field values for WorkerInfo
+            Required field values for WorkerMetadata
         When:
-            Creating WorkerInfo without optional fields
+            Creating WorkerMetadata without optional fields
         Then:
             It should use empty frozenset for tags and empty MappingProxyType
             for extra
@@ -85,7 +85,7 @@ class TestWorkerInfo:
         uid = uuid.uuid4()
 
         # Act
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uid, host="localhost", port=50051, pid=123, version="1.0.0"
         )
 
@@ -94,10 +94,10 @@ class TestWorkerInfo:
         assert worker.extra == MappingProxyType({})
 
     def test_hash(self):
-        """Test WorkerInfo hash is based on uid only.
+        """Test WorkerMetadata hash is based on uid only.
 
         Given:
-            Two WorkerInfo instances with same uid but different other fields
+            Two WorkerMetadata instances with same uid but different other fields
         When:
             Computing hash of both instances
         Then:
@@ -105,17 +105,21 @@ class TestWorkerInfo:
         """
         # Arrange
         uid = uuid.uuid4()
-        worker1 = WorkerInfo(uid=uid, host="host1", port=5001, pid=123, version="1.0.0")
-        worker2 = WorkerInfo(uid=uid, host="host2", port=5002, pid=456, version="2.0.0")
+        worker1 = WorkerMetadata(
+            uid=uid, host="host1", port=5001, pid=123, version="1.0.0"
+        )
+        worker2 = WorkerMetadata(
+            uid=uid, host="host2", port=5002, pid=456, version="2.0.0"
+        )
 
         # Act & Assert
         assert hash(worker1) == hash(worker2)
 
     def test_eq(self):
-        """Test WorkerInfo equality is based on all fields.
+        """Test WorkerMetadata equality is based on all fields.
 
         Given:
-            Two WorkerInfo instances with same uid but different other fields
+            Two WorkerMetadata instances with same uid but different other fields
         When:
             Comparing the instances for equality
         Then:
@@ -123,28 +127,34 @@ class TestWorkerInfo:
         """
         # Arrange
         uid = uuid.uuid4()
-        worker1 = WorkerInfo(uid=uid, host="host1", port=5001, pid=123, version="1.0.0")
-        worker2 = WorkerInfo(uid=uid, host="host2", port=5002, pid=456, version="2.0.0")
+        worker1 = WorkerMetadata(
+            uid=uid, host="host1", port=5001, pid=123, version="1.0.0"
+        )
+        worker2 = WorkerMetadata(
+            uid=uid, host="host2", port=5002, pid=456, version="2.0.0"
+        )
 
         # Act & Assert
         assert worker1 != worker2
 
         # Workers with all same fields should be equal
-        worker3 = WorkerInfo(uid=uid, host="host1", port=5001, pid=123, version="1.0.0")
+        worker3 = WorkerMetadata(
+            uid=uid, host="host1", port=5001, pid=123, version="1.0.0"
+        )
         assert worker1 == worker3
 
-    def test_from_protobuf(self, worker_info_message):
+    def test_from_protobuf(self, metadata_message):
         """Test from_protobuf() with valid protobuf message.
 
         Given:
-            A valid protobuf WorkerInfo message
+            A valid protobuf WorkerMetadata message
         When:
-            Converting to WorkerInfo
+            Converting to WorkerMetadata
         Then:
-            It should create WorkerInfo with matching field values
+            It should create WorkerMetadata with matching field values
         """
         # Act
-        worker = WorkerInfo.from_protobuf(worker_info_message)
+        worker = WorkerMetadata.from_protobuf(metadata_message)
 
         # Assert
         assert worker.uid == uuid.UUID("12345678-1234-5678-1234-567812345678")
@@ -159,14 +169,14 @@ class TestWorkerInfo:
         """Test from_protobuf() with invalid UUID string.
 
         Given:
-            A protobuf WorkerInfo with invalid UUID string
+            A protobuf WorkerMetadata with invalid UUID string
         When:
-            Converting to WorkerInfo
+            Converting to WorkerMetadata
         Then:
             It should raise ValueError
         """
         # Arrange
-        protobuf = WorkerInfoProtobuf(
+        protobuf = WorkerMetadataProtobuf(
             uid="invalid-uuid",
             host="localhost",
             port=50051,
@@ -176,20 +186,20 @@ class TestWorkerInfo:
 
         # Act & Assert
         with pytest.raises(ValueError):
-            WorkerInfo.from_protobuf(protobuf)
+            WorkerMetadata.from_protobuf(protobuf)
 
     def test_from_protobuf_port_zero(self):
         """Test from_protobuf() converts port 0 to None.
 
         Given:
-            A protobuf WorkerInfo with port=0
+            A protobuf WorkerMetadata with port=0
         When:
-            Converting to WorkerInfo
+            Converting to WorkerMetadata
         Then:
             It should set port to None
         """
         # Arrange
-        protobuf = WorkerInfoProtobuf(
+        protobuf = WorkerMetadataProtobuf(
             uid="12345678-1234-5678-1234-567812345678",
             host="localhost",
             port=0,
@@ -198,23 +208,23 @@ class TestWorkerInfo:
         )
 
         # Act
-        worker = WorkerInfo.from_protobuf(protobuf)
+        worker = WorkerMetadata.from_protobuf(protobuf)
 
         # Assert
         assert worker.port is None
 
-    def test_to_protobuf(self, worker_info):
-        """Test to_protobuf() with valid WorkerInfo.
+    def test_to_protobuf(self, metadata):
+        """Test to_protobuf() with valid WorkerMetadata.
 
         Given:
-            A valid WorkerInfo instance
+            A valid WorkerMetadata instance
         When:
             Converting to protobuf
         Then:
             It should create protobuf message with matching field values
         """
         # Act
-        protobuf = worker_info.to_protobuf()
+        protobuf = metadata.to_protobuf()
 
         # Assert
         assert protobuf.uid == "12345678-1234-5678-1234-567812345678"
@@ -229,14 +239,14 @@ class TestWorkerInfo:
         """Test to_protobuf() converts None port to 0.
 
         Given:
-            A WorkerInfo instance with port=None
+            A WorkerMetadata instance with port=None
         When:
             Converting to protobuf
         Then:
             It should set port to 0 in protobuf message
         """
         # Arrange
-        worker = WorkerInfo(
+        worker = WorkerMetadata(
             uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
             host="localhost",
             port=None,
@@ -257,18 +267,18 @@ class TestWorkerInfo:
         version=st.text(min_size=1),
     )
     def test_roundtrip_conversion(self, host, port, pid, version):
-        """Test round-trip conversion preserves WorkerInfo data.
+        """Test round-trip conversion preserves WorkerMetadata data.
 
         Given:
-            A WorkerInfo instance with arbitrary field values
+            A WorkerMetadata instance with arbitrary field values
         When:
-            Converting to protobuf and back to WorkerInfo
+            Converting to protobuf and back to WorkerMetadata
         Then:
             It should preserve all field values
         """
         # Arrange
         uid = uuid.uuid4()
-        original = WorkerInfo(
+        original = WorkerMetadata(
             uid=uid,
             host=host,
             port=port,
@@ -278,7 +288,7 @@ class TestWorkerInfo:
 
         # Act
         serialized = original.to_protobuf()
-        deserialized = WorkerInfo.from_protobuf(serialized)
+        deserialized = WorkerMetadata.from_protobuf(serialized)
 
         # Assert
         assert deserialized.uid == original.uid
@@ -300,24 +310,24 @@ class TestDiscoveryEvent:
         "event_type",
         ["worker-added", "worker-dropped", "worker-updated"],
     )
-    def test_event(self, worker_info, event_type: DiscoveryEventType):
+    def test_event(self, metadata, event_type: DiscoveryEventType):
         """Test creating DiscoveryEvent with valid event types.
 
         Given:
-            A WorkerInfo instance and valid event type
+            A WorkerMetadata instance and valid event type
         When:
             Creating a DiscoveryEvent
         Then:
-            It should create event with specified type and worker_info
+            It should create event with specified type and metadata
         """
         # Act
-        event = DiscoveryEvent(type=event_type, worker_info=worker_info)
+        event = DiscoveryEvent(event_type, metadata=metadata)
 
         # Assert
         assert event.type is event_type
-        assert event.worker_info is worker_info
+        assert event.metadata is metadata
 
-    def test_dataclass_properties(self, worker_info):
+    def test_dataclass_properties(self, metadata):
         """Test DiscoveryEvent dataclass properties.
 
         Given:
@@ -328,8 +338,8 @@ class TestDiscoveryEvent:
             It should allow field access and modification (not frozen)
         """
         # Arrange
-        event = DiscoveryEvent(type="worker-added", worker_info=worker_info)
-        new_worker = WorkerInfo(
+        event = DiscoveryEvent("worker-added", metadata=metadata)
+        new_worker = WorkerMetadata(
             uid=uuid.uuid4(),
             host="newhost",
             port=9999,
@@ -338,10 +348,10 @@ class TestDiscoveryEvent:
         )
 
         # Act
-        event.worker_info = new_worker
+        event.metadata = new_worker
 
         # Assert
-        assert event.worker_info is new_worker
+        assert event.metadata is new_worker
 
 
 class TestDiscoveryPublisherLike:
@@ -364,7 +374,7 @@ class TestDiscoveryPublisherLike:
         # Arrange
         class ConformingPublisher:
             async def publish(
-                self, type: DiscoveryEventType, worker_info: WorkerInfo
+                self, type: DiscoveryEventType, metadata: WorkerMetadata
             ): ...
 
         publisher = ConformingPublisher()
@@ -406,7 +416,7 @@ class TestDiscoveryPublisherLike:
         # Arrange
         class Publisher:
             async def publish(
-                self, type: DiscoveryEventType, worker_info: WorkerInfo
+                self, type: DiscoveryEventType, metadata: WorkerMetadata
             ) -> None: ...
 
         publisher = Publisher()

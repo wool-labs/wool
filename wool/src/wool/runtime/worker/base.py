@@ -9,7 +9,7 @@ from typing import Protocol
 from typing import final
 from typing import runtime_checkable
 
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 
 
 # public
@@ -70,11 +70,11 @@ class WorkerLike(Protocol):
         ...
 
     @property
-    def info(self) -> WorkerInfo | None:
-        """Worker information including network address and metadata.
+    def metadata(self) -> WorkerMetadata | None:
+        """Worker metadata including network address and metadata.
 
         :returns:
-            The worker's complete information or None if not started.
+            The worker's complete metadata or None if not started.
         """
         ...
 
@@ -160,13 +160,13 @@ class Worker(ABC):
     .. code-block:: python
 
         from wool.runtime.worker.base import Worker
-        from wool.runtime.discovery.base import WorkerInfo
+        from wool.runtime.discovery.base import WorkerMetadata
 
 
         class CustomWorker(Worker):
             async def _start(self, timeout):
                 # Start your worker process
-                self._info = WorkerInfo(...)
+                self._info = WorkerMetadata(...)
 
             async def _stop(self, timeout):
                 # Clean shutdown
@@ -190,7 +190,7 @@ class Worker(ABC):
         Additional metadata as key-value pairs.
     """
 
-    _info: WorkerInfo | None = None
+    _info: WorkerMetadata | None = None
     _started: bool = False
     _uid: Final[uuid.UUID]
     _tags: Final[set[str]]
@@ -207,11 +207,11 @@ class Worker(ABC):
         return self._uid
 
     @property
-    def info(self) -> WorkerInfo | None:
-        """Worker information including network address and metadata.
+    def metadata(self) -> WorkerMetadata | None:
+        """Worker metadata including network address and metadata.
 
         :returns:
-            The worker's complete information or None if not started.
+            The worker's complete metadata or None if not started.
         """
         return self._info
 

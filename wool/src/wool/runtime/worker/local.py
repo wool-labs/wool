@@ -8,7 +8,7 @@ import grpc.aio
 
 import wool
 from wool.runtime import protobuf as pb
-from wool.runtime.discovery.base import WorkerInfo
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.process import WorkerProcess
 
@@ -123,7 +123,7 @@ class LocalWorker(Worker):
         host, port_str = self._worker_process.address.split(":")
         port = int(port_str)
 
-        self._info = WorkerInfo(
+        self._info = WorkerMetadata(
             uid=self._uid,
             host=host,
             port=port,

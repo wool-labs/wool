@@ -27,8 +27,8 @@ from wool.runtime.discovery.base import DiscoveryEventType
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
-from wool.runtime.discovery.base import WorkerInfo
-from wool.runtime.protobuf.worker import WorkerInfo as WorkerInfoProtobuf
+from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.protobuf.worker import WorkerMetadata as WorkerMetadataProtobuf
 from wool.runtime.resourcepool import ResourcePool
 
 REF_WIDTH: Final = 16
@@ -186,7 +186,7 @@ class LocalDiscovery(Discovery):
     automatic worker discovery across process boundaries.
 
     The namespace identifies a shared memory region where worker
-    information is stored. Publishers write worker metadata to this
+    metadata is stored. Publishers write worker metadata to this
     region, and subscribers read from it to discover available
     workers. All access is synchronized using file-based locking to
     ensure consistency.
@@ -216,7 +216,7 @@ class LocalDiscovery(Discovery):
 
         publisher = LocalDiscovery.Publisher("my-worker-pool")
         async with publisher:
-            await publisher.publish("worker-added", worker_info)
+            await publisher.publish("worker-added", metadata)
 
     Subscribe to workers
 
@@ -224,7 +224,7 @@ class LocalDiscovery(Discovery):
 
         subscriber = LocalDiscovery.Subscriber("my-worker-pool")
         async for event in subscriber:
-            print(f"Discovered worker: {event.worker_info}")
+            print(f"Discovered worker: {event.metadata}")
     """
 
     _namespace: Final[str]
@@ -321,7 +321,7 @@ class LocalDiscovery(Discovery):
         :param block_size:
             Size in bytes for worker metadata storage blocks. Defaults
             to 512 bytes, which accommodates typical worker
-            information including tags and extra metadata.
+            metadata including tags and extra metadata.
         :raises ValueError:
             If block_size is negative.
         """
@@ -359,7 +359,7 @@ class LocalDiscovery(Discovery):
             """
             return self._namespace
 
-        async def publish(self, type: DiscoveryEventType, worker_info: WorkerInfo):
+        async def publish(self, type: DiscoveryEventType, metadata: WorkerMetadata):
             """Publish a worker discovery event.
 
             Writes the event to shared memory where subscribers can
@@ -370,8 +370,8 @@ class LocalDiscovery(Discovery):
 
             :param type:
                 The type of discovery event.
-            :param worker_info:
-                Worker information to publish.
+            :param metadata:
+                Worker metadata to publish.
             :raises RuntimeError:
                 If an unexpected event type is provided or if the
                 shared memory is not properly initialized.
@@ -380,11 +380,11 @@ class LocalDiscovery(Discovery):
                 with _shared_memory(_short_hash(self._namespace)) as address_space:
                     match type:
                         case "worker-added":
-                            await self._add(worker_info, address_space)
+                            await self._add(metadata, address_space)
                         case "worker-dropped":
-                            await self._drop(worker_info, address_space)
+                            await self._drop(metadata, address_space)
                         case "worker-updated":
-                            await self._update(worker_info, address_space)
+                            await self._update(metadata, address_space)
                         case _:
                             raise RuntimeError(
                                 f"Unexpected discovery event type: {type}"
@@ -393,10 +393,10 @@ class LocalDiscovery(Discovery):
                 # Notify subscribers by touching the notification file
                 _watchdog_path(self._namespace).touch()
 
-        async def _add(self, worker_info: WorkerInfo, address_space: SharedMemory):
+        async def _add(self, metadata: WorkerMetadata, address_space: SharedMemory):
             """Register a worker by adding it to shared memory.
 
-            :param worker_info:
+            :param metadata:
                 The worker to publish to the namespace's shared memory.
             :raises RuntimeError:
                 If the shared memory region is not properly initialized or no
@@ -407,8 +407,8 @@ class LocalDiscovery(Discovery):
             if address_space.buf is None:
                 raise RuntimeError("Registrar service not properly initialized")
 
-            ref = _WorkerReference(worker_info.uid)
-            serialized = worker_info.to_protobuf().SerializeToString()
+            ref = _WorkerReference(metadata.uid)
+            serialized = metadata.to_protobuf().SerializeToString()
             size = len(serialized)
 
             for i in range(0, len(address_space.buf), REF_WIDTH):
@@ -422,16 +422,16 @@ class LocalDiscovery(Discovery):
                         )
                         struct.pack_into("16s", address_space.buf, i, ref.bytes)
                     except Exception:
-                        await self._drop(worker_info, address_space)
+                        await self._drop(metadata, address_space)
                         raise
                     break
             else:
                 raise RuntimeError("No available slots in shared memory registrar")
 
-        async def _drop(self, worker_info: WorkerInfo, address_space: SharedMemory):
+        async def _drop(self, metadata: WorkerMetadata, address_space: SharedMemory):
             """Unregister a worker by removing it from shared memory.
 
-            :param worker_info:
+            :param metadata:
                 The worker to unpublish from the namespace's shared memory.
             :raises RuntimeError:
                 If the registrar service is not properly initialized.
@@ -439,7 +439,7 @@ class LocalDiscovery(Discovery):
             if address_space.buf is None:
                 raise RuntimeError("Registrar service not properly initialized")
 
-            target_ref = _WorkerReference(worker_info.uid)
+            target_ref = _WorkerReference(metadata.uid)
 
             for i in range(0, len(address_space.buf), REF_WIDTH):
                 slot = struct.unpack_from("16s", address_space.buf, i)[0]
@@ -450,10 +450,10 @@ class LocalDiscovery(Discovery):
                         await self._shared_memory_pool.release(str(ref))
                         break
 
-        async def _update(self, worker_info: WorkerInfo, address_space: SharedMemory):
+        async def _update(self, metadata: WorkerMetadata, address_space: SharedMemory):
             """Update a worker's properties in shared memory.
 
-            :param worker_info:
+            :param metadata:
                 The updated worker to publish to the namespace's shared memory.
             :raises RuntimeError:
                 If the registrar service is not properly initialized.
@@ -463,8 +463,8 @@ class LocalDiscovery(Discovery):
             if address_space.buf is None:
                 raise RuntimeError("Registrar service not properly initialized")
 
-            target_ref = _WorkerReference(worker_info.uid)
-            serialized = worker_info.to_protobuf().SerializeToString()
+            target_ref = _WorkerReference(metadata.uid)
+            serialized = metadata.to_protobuf().SerializeToString()
             size = len(serialized)
 
             for i in range(0, len(address_space.buf), REF_WIDTH):
@@ -496,7 +496,7 @@ class LocalDiscovery(Discovery):
                         return
 
             # Worker not found in address space
-            raise KeyError(f"Worker {worker_info.uid} not found in address space")
+            raise KeyError(f"Worker {metadata.uid} not found in address space")
 
         def _shared_memory_factory(self, name: str):
             """Create a new shared memory block for worker metadata storage.
@@ -613,7 +613,7 @@ class LocalDiscovery(Discovery):
             :yields:
                 Discovery events as changes are detected in shared memory.
             """
-            cached_workers: dict[str, WorkerInfo] = {}
+            cached_workers: dict[str, WorkerMetadata] = {}
             notification = asyncio.Event()
             lock = asyncio.Lock()
             loop = asyncio.get_running_loop()
@@ -631,16 +631,14 @@ class LocalDiscovery(Discovery):
                     while True:
                         async with lock:
                             notification.clear()
-                            discovered_workers: dict[str, WorkerInfo] = {}
+                            discovered_workers: dict[str, WorkerMetadata] = {}
                             for i in range(0, len(address_space.buf), REF_WIDTH):
                                 slot = struct.unpack_from("16s", address_space.buf, i)[0]
                                 if slot != NULL_REF:
                                     ref = _WorkerReference.from_bytes(slot)
-                                    worker_info = self._deserialize_worker_info(str(ref))
-                                    if filter is None or filter(worker_info):
-                                        discovered_workers[str(worker_info.uid)] = (
-                                            worker_info
-                                        )
+                                    metadata = self._deserialize_metadata(str(ref))
+                                    if filter is None or filter(metadata):
+                                        discovered_workers[str(metadata.uid)] = metadata
 
                             for event in self._diff(cached_workers, discovered_workers):
                                 yield event
@@ -654,30 +652,30 @@ class LocalDiscovery(Discovery):
                 observer.stop()
                 observer.join()
 
-        def _deserialize_worker_info(self, ref: str):
+        def _deserialize_metadata(self, ref: str):
             """Load and deserialize worker metadata from shared memory.
 
             Opens the shared memory block identified by the reference string
             (worker UUID hex), reads the size header and serialized protobuf
-            data, and reconstructs the WorkerInfo instance.
+            data, and reconstructs the WorkerMetadata instance.
 
             :param ref:
                 The worker reference string (UUID hex) identifying the shared
                 memory block containing the worker's metadata.
             :returns:
-                The deserialized WorkerInfo instance.
+                The deserialized WorkerMetadata instance.
             """
             with _shared_memory(ref) as memory_block:
                 assert memory_block.buf is not None
                 size = struct.unpack_from("I", memory_block.buf, 0)[0]
                 serialized = struct.unpack_from(f"{size}s", memory_block.buf, 4)[0]
-                protobuf = WorkerInfoProtobuf.FromString(serialized)
-                return WorkerInfo.from_protobuf(protobuf)
+                protobuf = WorkerMetadataProtobuf.FromString(serialized)
+                return WorkerMetadata.from_protobuf(protobuf)
 
         def _diff(
             self,
-            cached_workers: dict[str, WorkerInfo],
-            discovered_workers: dict[str, WorkerInfo],
+            cached_workers: dict[str, WorkerMetadata],
+            discovered_workers: dict[str, WorkerMetadata],
         ):
             """Detect and emit events for worker changes.
 
@@ -688,10 +686,10 @@ class LocalDiscovery(Discovery):
 
             :param cached_workers:
                 Dictionary of previously discovered workers (UID string ->
-                WorkerInfo). Modified in-place to reflect current state.
+                WorkerMetadata). Modified in-place to reflect current state.
             :param discovered_workers:
                 Dictionary of workers found in the current scan (UID string ->
-                WorkerInfo).
+                WorkerMetadata).
             :yields:
                 Discovery events for each detected change (worker-added,
                 worker-dropped, worker-updated).
@@ -700,24 +698,20 @@ class LocalDiscovery(Discovery):
             # Identify added workers
             for uid in set(discovered_workers) - set(cached_workers):
                 cached_workers[uid] = discovered_workers[uid]
-                event = DiscoveryEvent(
-                    type="worker-added", worker_info=discovered_workers[uid]
-                )
+                event = DiscoveryEvent("worker-added", metadata=discovered_workers[uid])
                 yield event
 
             # Identify removed workers
             for uid in set(cached_workers) - set(discovered_workers):
                 discovered_worker = cached_workers.pop(uid)
-                event = DiscoveryEvent(
-                    type="worker-dropped", worker_info=discovered_worker
-                )
+                event = DiscoveryEvent("worker-dropped", metadata=discovered_worker)
                 yield event
 
             # Identify updated workers
             for uid in set(cached_workers) & set(discovered_workers):
                 cached_workers[uid] = discovered_workers[uid]
                 event = DiscoveryEvent(
-                    type="worker-updated", worker_info=discovered_workers[uid]
+                    "worker-updated", metadata=discovered_workers[uid]
                 )
                 yield event
 
