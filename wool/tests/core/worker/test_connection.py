@@ -12,8 +12,8 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool._work import WoolTask
 from wool.core import protobuf as pb
+from wool.core.work import WorkTask
 from wool.core.worker.connection import RpcError
 from wool.core.worker.connection import TransientRpcError
 from wool.core.worker.connection import UnexpectedResponse
@@ -22,9 +22,9 @@ from wool.core.worker.connection import WorkerConnection
 
 @pytest.fixture
 def mock_task(mocker: MockerFixture):
-    """Provides a mock :class:`WoolTask` for testing.
+    """Provides a mock :class:`WorkTask` for testing.
 
-    Creates a WoolTask with a simple async function that returns a
+    Creates a WorkTask with a simple async function that returns a
     test value.
     """
 
@@ -34,7 +34,7 @@ def mock_task(mocker: MockerFixture):
     mock_proxy = mocker.MagicMock()
     mock_proxy.id = "test-proxy-id"
 
-    return WoolTask(
+    return WorkTask(
         id=uuid4(),
         callable=sample_task,
         args=(),
@@ -130,7 +130,7 @@ class TestWorkerConnection:
             stub, and yield the return value yielded from the gRPC response stream
         """
         # Arrange
-        to_protobuf_spy = mocker.spy(WoolTask, "to_protobuf")
+        to_protobuf_spy = mocker.spy(WorkTask, "to_protobuf")
 
         responses = (
             pb.worker.Response(ack=pb.worker.Ack()),
@@ -172,7 +172,7 @@ class TestWorkerConnection:
             stub, and raise the exception yielded from the gRPC response stream
         """
         # Arrange
-        to_protobuf_spy = mocker.spy(WoolTask, "to_protobuf")
+        to_protobuf_spy = mocker.spy(WorkTask, "to_protobuf")
 
         responses = (
             pb.worker.Response(ack=pb.worker.Ack()),
@@ -383,7 +383,7 @@ class TestWorkerConnection:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        mock_task = WoolTask(
+        mock_task = WorkTask(
             id=uuid4(),
             callable=sample_task,
             args=(),
