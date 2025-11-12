@@ -14,8 +14,8 @@ from wool.runtime.protobuf.worker import WorkerStub
 from wool.runtime.protobuf.worker import add_WorkerServicer_to_server
 from wool.runtime.work import WorkTask
 from wool.runtime.work import WorkTaskEvent
-from wool.runtime.worker.service import ReadOnlyEvent
 from wool.runtime.worker.service import WorkerService
+from wool.runtime.worker.service import _ReadOnlyEvent
 
 
 @pytest.fixture(scope="function")
@@ -102,7 +102,7 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
 
 
 class TestReadOnlyEvent:
-    """Tests for :class:`ReadOnlyEvent` wrapper."""
+    """Tests for :class:`_ReadOnlyEvent` wrapper."""
 
     unset_event: Final = asyncio.Event()
     set_event: Final = asyncio.Event()
@@ -110,17 +110,17 @@ class TestReadOnlyEvent:
 
     @pytest.mark.parametrize("event", (unset_event, set_event))
     def test_init(self, event):
-        """Test :class:`ReadOnlyEvent` initialization.
+        """Test :class:`_ReadOnlyEvent` initialization.
 
         Given:
             An :class:`asyncio.Event` instance
         When:
-            :class:`ReadOnlyEvent` is instantiated with the event
+            :class:`_ReadOnlyEvent` is instantiated with the event
         Then:
             It should wrap the event successfully
         """
         # Act
-        read_only_event = ReadOnlyEvent(event)
+        read_only_event = _ReadOnlyEvent(event)
 
         # Assert
         assert read_only_event.is_set() == event.is_set()
@@ -132,20 +132,20 @@ class TestReadOnlyEvent:
             getattr(read_only_event, "clear")
 
     def test_is_set(self, mocker: MockerFixture):
-        """Test :class:`ReadOnlyEvent.is_set` calls :meth:`~asyncio.Event.is_set` on its
+        """Test :class:`_ReadOnlyEvent.is_set` calls :meth:`~asyncio.Event.is_set` on its
         underlying event.
 
         Given:
-            A :class:`ReadOnlyEvent` instance wrapping an event
+            A :class:`_ReadOnlyEvent` instance wrapping an event
         When:
-            :meth:`~ReadOnlyEvent.is_set` is called
+            :meth:`~_ReadOnlyEvent.is_set` is called
         Then:
             :meth:`~asyncio.Event.is_set` is called on the underlying event
         """
         # Arrange
         event = asyncio.Event()
         is_set_spy = mocker.spy(event, "is_set")
-        read_only_event = ReadOnlyEvent(event)
+        read_only_event = _ReadOnlyEvent(event)
 
         # Act
         read_only_event.is_set()
@@ -155,13 +155,13 @@ class TestReadOnlyEvent:
 
     @pytest.mark.asyncio
     async def test_wait(self, mocker: MockerFixture):
-        """Test :class:`ReadOnlyEvent.wait` calls :meth:`~asyncio.Event.wait` on its
+        """Test :class:`_ReadOnlyEvent.wait` calls :meth:`~asyncio.Event.wait` on its
         underlying event.
 
         Given:
-            A :class:`ReadOnlyEvent` instance wrapping an event
+            A :class:`_ReadOnlyEvent` instance wrapping an event
         When:
-            :meth:`~ReadOnlyEvent.wait` is called
+            :meth:`~_ReadOnlyEvent.wait` is called
         Then:
             :meth:`~asyncio.Event.wait` is called and awaited on the underlying event
         """
@@ -169,7 +169,7 @@ class TestReadOnlyEvent:
         event = asyncio.Event()
         event.set()
         wait_spy = mocker.patch.object(event, "wait", mocker.AsyncMock(wraps=event.wait))
-        read_only_event = ReadOnlyEvent(event)
+        read_only_event = _ReadOnlyEvent(event)
 
         # Act
         await read_only_event.wait()
@@ -643,3 +643,238 @@ class TestWorkerService:
             assert isinstance(result, pb.worker.Void)
             assert service.stopping.is_set()
             assert service.stopped.is_set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_async_generator_task(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() with async generator yields multiple results.
+
+        Given:
+            A service receiving task with async generator callable
+        When:
+            dispatch() is called and iterated
+        Then:
+            Yields acknowledgment, then multiple result responses from generator in order
+        """
+
+        # Arrange
+        async def test_generator():
+            for i in range(3):
+                yield f"gen_value_{i}"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = WorkTask(
+            id=uuid4(),
+            callable=test_generator,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+
+        emit_spy = mocker.spy(WorkTaskEvent, "emit")
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 4  # 1 ack + 3 results
+        assert responses[0].HasField("ack")
+
+        for i, response in enumerate(responses[1:]):
+            assert response.HasField("result")
+            result = cloudpickle.loads(response.result.dump)
+            assert result == f"gen_value_{i}"
+
+        # Verify task-scheduled event was emitted
+        emit_spy.assert_called()
+        event_calls = [call[0][0] for call in emit_spy.call_args_list]
+        scheduled_events = [e for e in event_calls if e.type == "task-scheduled"]
+        assert len(scheduled_events) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_async_generator_raises_during_iteration(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() with async generator that raises yields exception.
+
+        Given:
+            A service with async generator task that raises during iteration
+        When:
+            dispatch() is called and iterated
+        Then:
+            Yields ack, then exception response containing the raised exception
+        """
+
+        # Arrange
+        async def failing_generator():
+            yield "first_value"
+            raise ValueError("Generator error")
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = WorkTask(
+            id=uuid4(),
+            callable=failing_generator,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 3  # 1 ack + 1 result + 1 exception
+        assert responses[0].HasField("ack")
+        assert responses[1].HasField("result")
+        assert cloudpickle.loads(responses[1].result.dump) == "first_value"
+        assert responses[2].HasField("exception")
+        exception = cloudpickle.loads(responses[2].exception.dump)
+        assert isinstance(exception, ValueError)
+        assert str(exception) == "Generator error"
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_async_generator_completes_normally(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() with async generator completes cleanly.
+
+        Given:
+            A service with async generator task
+        When:
+            dispatch() is called and fully consumed
+        Then:
+            Yields acknowledgment, all results, then stream ends cleanly
+        """
+
+        # Arrange
+        async def test_generator():
+            for i in range(2):
+                yield i
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = WorkTask(
+            id=uuid4(),
+            callable=test_generator,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 3  # 1 ack + 2 results
+        assert responses[0].HasField("ack")
+        assert responses[1].HasField("result")
+        assert cloudpickle.loads(responses[1].result.dump) == 0
+        assert responses[2].HasField("result")
+        assert cloudpickle.loads(responses[2].result.dump) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_async_generator_empty(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() with empty async generator.
+
+        Given:
+            A service with async generator task yielding zero values
+        When:
+            dispatch() is called and iterated
+        Then:
+            Yields acknowledgment, then immediately ends without result responses
+        """
+
+        # Arrange
+        async def empty_generator():
+            return
+            yield  # unreachable, but makes it a generator
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = WorkTask(
+            id=uuid4(),
+            callable=empty_generator,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 1  # only ack
+        assert responses[0].HasField("ack")
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_coroutine_for_comparison(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() with coroutine task for comparison with async generator.
+
+        Given:
+            A service receiving task with coroutine callable
+        When:
+            dispatch() is called and iterated
+        Then:
+            Yields acknowledgment, then single result response
+        """
+
+        # Arrange
+        async def test_coroutine():
+            return "coroutine_result"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = WorkTask(
+            id=uuid4(),
+            callable=test_coroutine,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 2  # 1 ack + 1 result
+        assert responses[0].HasField("ack")
+        assert responses[1].HasField("result")
+        result = cloudpickle.loads(responses[1].result.dump)
+        assert result == "coroutine_result"

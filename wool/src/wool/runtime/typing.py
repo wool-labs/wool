@@ -5,7 +5,6 @@ from typing import AsyncContextManager
 from typing import Awaitable
 from typing import Callable
 from typing import ContextManager
-from typing import Coroutine
 from typing import Final
 from typing import TypeAlias
 from typing import TypeVar
@@ -15,8 +14,6 @@ F = TypeVar("F", bound=Callable)
 W = TypeVar("W", bound=Callable)
 Wrapper = Callable[[F], W]
 PassthroughWrapper = Callable[[F], F]
-
-AsyncCallable = Callable[..., Coroutine]
 
 
 @final

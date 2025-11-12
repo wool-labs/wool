@@ -9,15 +9,20 @@ from contextvars import Context
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
+from inspect import isasyncgenfunction
+from inspect import iscoroutinefunction
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import AsyncGenerator
 from typing import ContextManager
 from typing import Coroutine
 from typing import Dict
+from typing import Generic
 from typing import Literal
 from typing import Protocol
 from typing import SupportsInt
 from typing import Tuple
+from typing import TypeAlias
+from typing import TypeVar
 from typing import overload
 from uuid import UUID
 
@@ -26,15 +31,13 @@ import cloudpickle
 import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.event import Event
-from wool.runtime.typing import AsyncCallable
-
-if TYPE_CHECKING:
-    from wool.runtime.worker.proxy import WorkerProxy
 
 Args = Tuple
 Kwargs = Dict
 Timeout = SupportsInt
 Timestamp = SupportsInt
+Work: TypeAlias = Coroutine | AsyncGenerator
+W = TypeVar("W", bound=Work)
 
 
 _do_dispatch: ContextVar[bool] = ContextVar("_do_dispatch", default=True)
@@ -65,8 +68,24 @@ def do_dispatch(flag: bool | None = None, /) -> bool | ContextManager[None]:
 
 
 # public
+class WorkerProxyLike(Protocol):
+    """Protocol defining the interface required by WorkTask for proxy objects.
+
+    This allows both the actual WorkerProxy and test doubles to be used
+    with WorkTask without requiring inheritance.
+    """
+
+    @property
+    def id(self) -> uuid.UUID: ...
+
+    async def dispatch(
+        self, task: WorkTask, *, timeout: float | None = None
+    ) -> AsyncGenerator: ...
+
+
+# public
 @dataclass
-class WorkTask:
+class WorkTask(Generic[W]):
     """
     Represents a distributed task to be executed in the worker pool.
 
@@ -84,7 +103,7 @@ class WorkTask:
     :param kwargs:
         Keyword arguments for the function.
     :param proxy:
-        Worker proxy for task dispatch and routing.
+        Proxy object for task dispatch and routing (satisfies WorkerProxyLike).
     :param timeout:
         Task timeout in seconds (0 means no timeout).
     :param caller:
@@ -102,10 +121,10 @@ class WorkTask:
     """
 
     id: UUID
-    callable: AsyncCallable
+    callable: Callable[..., W]
     args: Args
     kwargs: Kwargs
-    proxy: WorkerProxy
+    proxy: WorkerProxyLike
     timeout: Timeout = 0
     caller: UUID | None = None
     exception: WorkTaskException | None = None
@@ -128,7 +147,7 @@ class WorkTask:
             self.caller = caller.id
         WorkTaskEvent("task-created", task=self).emit()
 
-    def __enter__(self) -> Callable[[], Coroutine]:
+    def __enter__(self) -> Callable[[], Coroutine | AsyncGenerator]:
         """
         Enter the task context for execution.
 
@@ -137,7 +156,12 @@ class WorkTask:
         """
         logging.debug(f"Entering {self.__class__.__name__} with ID {self.id}")
         self._task_token = _current_task.set(self)
-        return self.run
+        if iscoroutinefunction(self.callable):
+            return self._run
+        elif isasyncgenfunction(self.callable):
+            return self._stream
+        else:
+            raise ValueError("Expected coroutine function or async generator function")
 
     def __exit__(
         self,
@@ -203,19 +227,27 @@ class WorkTask:
             caller=str(self.caller) if self.caller else "",
             proxy=cloudpickle.dumps(self.proxy),
             proxy_id=str(self.proxy.id),
-            timeout=self.timeout if self.timeout else 0,
+            timeout=int(self.timeout) if self.timeout else 0,
             filename=self.filename if self.filename else "",
             function=self.function if self.function else "",
             line_no=self.line_no if self.line_no else 0,
             tag=self.tag if self.tag else "",
         )
 
-    async def run(self) -> Coroutine:
+    def dispatch(self) -> W:
+        if isasyncgenfunction(self.callable):
+            return self._stream()
+        elif iscoroutinefunction(self.callable):
+            return self._run()
+        else:
+            raise ValueError("Expected work to be coroutine or async generator")
+
+    async def _run(self):
         """
         Execute the task's callable with its arguments in proxy context.
 
         :returns:
-            A coroutine representing the routine execution.
+            The result of executing the callable.
         :raises RuntimeError:
             If no proxy pool is available for task execution.
         """
@@ -226,23 +258,48 @@ class WorkTask:
             # Set the proxy in context variable for nested task dispatch
             token = wool.__proxy__.set(proxy)
             try:
-                work = self._with_self(self.callable)
-                return await work(*self.args, **self.kwargs)
+                with self:
+                    with do_dispatch(False):
+                        await asyncio.sleep(0)
+                        return await self.callable(*self.args, **self.kwargs)
             finally:
                 wool.__proxy__.reset(token)
 
+    async def _stream(self):
+        """
+        Execute the task's callable with its arguments in proxy context.
+
+        :returns:
+            An async generator that yields values from the callable.
+        :raises RuntimeError:
+            If no proxy pool is available for task execution.
+        """
+        proxy_pool = wool.__proxy_pool__.get()
+        if not proxy_pool:
+            raise RuntimeError("No proxy pool available for task execution")
+        async with proxy_pool.get(self.proxy) as proxy:
+            await asyncio.sleep(0)
+            gen = self.callable(*self.args, **self.kwargs)
+            try:
+                while True:
+                    # Set the proxy in context variable for nested task dispatch
+                    token = wool.__proxy__.set(proxy)
+                    try:
+                        with self:
+                            with do_dispatch(False):
+                                try:
+                                    result = await anext(gen)
+                                except StopAsyncIteration:
+                                    break
+                    finally:
+                        wool.__proxy__.reset(token)
+
+                    yield result
+            finally:
+                await gen.aclose()
+
     def _finish(self, _):
         WorkTaskEvent("task-completed", task=self).emit()
-
-    def _with_self(self, fn: AsyncCallable) -> AsyncCallable:
-        @wraps(fn)
-        async def wrapper(*args, **kwargs):
-            with self:
-                await asyncio.sleep(0)
-                with do_dispatch(False):
-                    return await fn(*args, **kwargs)
-
-        return wrapper
 
 
 # public
