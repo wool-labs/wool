@@ -5,42 +5,49 @@ from typing import Final
 
 from tblib import pickling_support
 
-from wool.core.resourcepool import ResourcePool
-from wool._work import WoolTask
-from wool._work import WoolTaskEvent
-from wool._work import WoolTaskEventCallback
-from wool._work import WoolTaskEventType
-from wool._work import WoolTaskException
-from wool._work import current_task as wool_current_task
-from wool._work import work
-from wool.core.context import RuntimeContext
-from wool.core.discovery.base import Discovery
-from wool.core.discovery.base import DiscoveryEvent
-from wool.core.discovery.base import DiscoveryEventType
-from wool.core.discovery.base import DiscoveryLike
-from wool.core.discovery.base import DiscoveryPublisherLike
-from wool.core.discovery.base import DiscoverySubscriberLike
-from wool.core.discovery.base import PredicateFunction
-from wool.core.discovery.base import WorkerInfo
-from wool.core.discovery.lan import LanDiscovery
-from wool.core.discovery.local import LocalDiscovery
-from wool.core.loadbalancer.base import ConnectionResourceFactory
-from wool.core.loadbalancer.base import LoadBalancerContext
-from wool.core.loadbalancer.base import LoadBalancerLike
-from wool.core.loadbalancer.base import NoWorkersAvailable
-from wool.core.loadbalancer.roundrobin import RoundRobinLoadBalancer
-from wool.core.typing import Factory
-from wool.core.worker.base import Worker
-from wool.core.worker.base import WorkerFactory
-from wool.core.worker.base import WorkerLike
-from wool.core.worker.connection import RpcError
-from wool.core.worker.connection import TransientRpcError
-from wool.core.worker.connection import UnexpectedResponse
-from wool.core.worker.connection import WorkerConnection
-from wool.core.worker.local import LocalWorker
-from wool.core.worker.pool import WorkerPool
-from wool.core.worker.proxy import WorkerProxy
-from wool.core.worker.service import WorkerService
+from wool.runtime.context import RuntimeContext
+from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.work import WorkTask
+from wool.runtime.work import WorkTaskEvent
+from wool.runtime.work import WorkTaskEventHandler
+from wool.runtime.work import WorkTaskEventType
+from wool.runtime.work import WorkTaskException
+from wool.runtime.work import current_task
+from wool.runtime.work import work
+
+# Backward compatibility aliases (deprecated)
+WoolTask = WorkTask
+WoolTaskEvent = WorkTaskEvent
+WoolTaskEventHandler = WorkTaskEventHandler
+WoolTaskEventType = WorkTaskEventType
+WoolTaskException = WorkTaskException
+from wool.runtime.discovery.base import Discovery
+from wool.runtime.discovery.base import DiscoveryEvent
+from wool.runtime.discovery.base import DiscoveryEventType
+from wool.runtime.discovery.base import DiscoveryLike
+from wool.runtime.discovery.base import DiscoveryPublisherLike
+from wool.runtime.discovery.base import DiscoverySubscriberLike
+from wool.runtime.discovery.base import PredicateFunction
+from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.discovery.lan import LanDiscovery
+from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.loadbalancer.base import ConnectionResourceFactory
+from wool.runtime.loadbalancer.base import LoadBalancerContext
+from wool.runtime.loadbalancer.base import LoadBalancerLike
+from wool.runtime.loadbalancer.base import NoWorkersAvailable
+from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.runtime.typing import Factory
+from wool.runtime.worker.base import Worker
+from wool.runtime.worker.base import WorkerFactory
+from wool.runtime.worker.base import WorkerLike
+from wool.runtime.worker.connection import RpcError
+from wool.runtime.worker.connection import TransientRpcError
+from wool.runtime.worker.connection import UnexpectedResponse
+from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.local import LocalWorker
+from wool.runtime.worker.pool import WorkerPool
+from wool.runtime.worker.proxy import WorkerProxy
+from wool.runtime.worker.service import WorkerService
 
 pickling_support.install()
 
@@ -72,15 +79,21 @@ __all__ = [
     "LoadBalancerLike",
     "NoWorkersAvailable",
     "RoundRobinLoadBalancer",
-    # Work
-    "WoolTask",
-    "WoolTaskEvent",
-    "WoolTaskEventCallback",
-    "WoolTaskEventType",
-    "WoolTaskException",
+    # Work - New names (preferred)
+    "WorkTask",
+    "WorkTaskEvent",
+    "WorkTaskEventHandler",
+    "WorkTaskEventType",
+    "WorkTaskException",
+    "current_task",
     "routine",
     "work",
-    "wool_current_task",
+    # Work - Backward compatibility (deprecated)
+    "WoolTask",
+    "WoolTaskEvent",
+    "WoolTaskEventHandler",
+    "WoolTaskEventType",
+    "WoolTaskException",
     # Workers
     "LocalWorker",
     "Worker",
@@ -99,7 +112,7 @@ __all__ = [
     "LanDiscovery",
     "LocalDiscovery",
     "PredicateFunction",
-    "WorkerInfo",
+    "WorkerMetadata",
     # Typing
     "Factory",
 ]

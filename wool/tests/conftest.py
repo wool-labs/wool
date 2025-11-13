@@ -5,7 +5,7 @@ import debugpy
 import pytest
 
 import wool
-from wool.core.resourcepool import ResourcePool
+from wool.runtime.resourcepool import ResourcePool
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +165,7 @@ class DependencyManager:
                 logger.debug("... %s is unknown", dependency)
                 if _ignore_unknown:
                     continue
-            logger.info("skip %s because it depends on %s", item.name, dependency)
+            logger.metadata("skip %s because it depends on %s", item.name, dependency)
             pytest.skip("%s depends on %s" % (item.name, dependency))
 
 

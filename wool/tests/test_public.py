@@ -36,15 +36,21 @@ def test_public_api_completeness():
         "LoadBalancerLike",
         "NoWorkersAvailable",
         "RoundRobinLoadBalancer",
-        # Work
-        "WoolTask",
-        "WoolTaskEvent",
-        "WoolTaskEventCallback",
-        "WoolTaskEventType",
-        "WoolTaskException",
+        # Work - New names (preferred)
+        "WorkTask",
+        "WorkTaskEvent",
+        "WorkTaskEventHandler",
+        "WorkTaskEventType",
+        "WorkTaskException",
+        "current_task",
         "routine",
         "work",
-        "wool_current_task",
+        # Work - Backward compatibility (deprecated)
+        "WoolTask",
+        "WoolTaskEvent",
+        "WoolTaskEventHandler",
+        "WoolTaskEventType",
+        "WoolTaskException",
         # Workers
         "LocalWorker",
         "Worker",
@@ -63,7 +69,7 @@ def test_public_api_completeness():
         "LanDiscovery",
         "LocalDiscovery",
         "PredicateFunction",
-        "WorkerInfo",
+        "WorkerMetadata",
         # Typing
         "Factory",
     ]

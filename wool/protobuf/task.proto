@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package wool.core.protobuf.task;
+package wool.runtime.protobuf.task;
 
 message Task {
     string id = 1;
@@ -10,6 +10,11 @@ message Task {
     string caller = 5;
     bytes proxy = 7;
     string proxy_id = 8;
+    int32 timeout = 9;
+    string filename = 10;
+    string function = 11;
+    int32 line_no = 12;
+    string tag = 13;
 }
 
 message Result {
