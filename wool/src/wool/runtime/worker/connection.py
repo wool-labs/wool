@@ -31,6 +31,7 @@ class _DispatchStream(Generic[_T]):
     def __init__(self, call: _DispatchCall):
         self._call = call
         self._iter = aiter(call)
+        self._closed = False
 
     def __aiter__(self) -> AsyncIterator[_T]:
         """Return self as the async iterator."""
@@ -42,12 +43,15 @@ class _DispatchStream(Generic[_T]):
         :returns:
             The next task result from the worker.
         :raises StopAsyncIteration:
-            When the stream is exhausted.
+            When the stream is exhausted or after aclose() is called.
         :raises UnexpectedResponse:
             If the response is neither a result nor an exception.
         :raises Exception:
             Any exception raised by the task execution is re-raised.
         """
+        if self._closed:
+            raise StopAsyncIteration
+
         try:
             response = await anext(self._iter)
             if response.HasField("result"):
@@ -65,6 +69,60 @@ class _DispatchStream(Generic[_T]):
             except Exception:
                 pass
             raise
+
+    async def aclose(self) -> None:
+        """Close the async generator and cancel the underlying gRPC call.
+
+        This method provides proper cleanup for async generators decorated
+        with @work. When called, it cancels the gRPC stream to the worker,
+        which triggers cleanup on the worker side.
+
+        Implements the async generator protocol's aclose() method to match
+        native Python async generator behavior. This method is idempotent
+        and can be safely called multiple times.
+        """
+        if self._closed:
+            return
+
+        self._closed = True
+        try:
+            self._call.cancel()
+        except Exception:
+            pass
+
+    async def asend(self, value):
+        """Send a value into the async generator (not supported).
+
+        :param value:
+            The value to send into the generator.
+        :raises NotImplementedError:
+            Bidirectional communication via asend() is not yet supported
+            for distributed async generators. Use pull-based iteration with
+            __anext__() instead.
+        """
+        raise NotImplementedError(
+            "asend() is not supported for distributed async generators. "
+            "Only pull-based iteration via __anext__() and aclose() are supported."
+        )
+
+    async def athrow(self, typ, val=None, tb=None):
+        """Throw an exception into the async generator (not supported).
+
+        :param typ:
+            The exception type to throw.
+        :param val:
+            The exception value.
+        :param tb:
+            The exception traceback.
+        :raises NotImplementedError:
+            Bidirectional communication via athrow() is not yet supported
+            for distributed async generators. Exceptions can only be raised
+            from the worker side during iteration.
+        """
+        raise NotImplementedError(
+            "athrow() is not supported for distributed async generators. "
+            "Only pull-based iteration via __anext__() and aclose() are supported."
+        )
 
 
 # public
@@ -237,12 +295,13 @@ class WorkerConnection:
         return call
 
     async def _execute(self, call):
+        stream = _DispatchStream(call)
         try:
-            async for result in _DispatchStream(call):
+            async for result in stream:
                 yield result
-        except (Exception, asyncio.CancelledError):
+        except (Exception, GeneratorExit, asyncio.CancelledError):
             try:
-                call.cancel()
+                await stream.aclose()
             except Exception:
                 pass
             raise

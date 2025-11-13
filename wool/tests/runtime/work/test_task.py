@@ -1,8 +1,10 @@
 import asyncio
+from typing import Callable
 from uuid import uuid4
 
 import cloudpickle
 import pytest
+from hypothesis import HealthCheck
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
@@ -30,12 +32,12 @@ class PicklableProxy:
         return _stream()
 
 
-class TestWorkerTask:
+class TestWorkTask:
     """Tests for WorkTask class."""
 
     @pytest.mark.asyncio
     async def test_init_emits_task_created_event(
-        self, mock_task, event_spy, clear_event_handlers
+        self, sample_task, event_spy, clear_event_handlers
     ):
         """Test WorkTask instantiation emits task-created event.
 
@@ -50,7 +52,7 @@ class TestWorkerTask:
         wool.WorkTaskEvent._handlers["task-created"] = [event_spy]
 
         # Act
-        task = mock_task()
+        task = sample_task()
 
         # Wait for event loop to process scheduled handlers
         await asyncio.sleep(0)
@@ -65,7 +67,7 @@ class TestWorkerTask:
 
     @pytest.mark.asyncio
     async def test_init_sets_caller_in_nested_context(
-        self, mock_task, sample_async_callable, mock_proxy, clear_event_handlers
+        self, sample_task, sample_async_callable, mock_proxy, clear_event_handlers
     ):
         """Test WorkTask sets caller field in nested task context.
 
@@ -77,7 +79,7 @@ class TestWorkerTask:
             The caller field is set to the parent task's ID
         """
         # Arrange
-        parent_task = mock_task()
+        parent_task = sample_task()
 
         # Act
         async def create_nested_task():
@@ -86,7 +88,7 @@ class TestWorkerTask:
 
             token = _current_task.set(parent_task)
             try:
-                nested_task = mock_task()
+                nested_task = sample_task()
                 return nested_task
             finally:
                 _current_task.reset(token)
@@ -97,7 +99,7 @@ class TestWorkerTask:
         assert nested_task.caller == parent_task.id
 
     def test_init_caller_none_outside_task_context(
-        self, mock_task, clear_event_handlers
+        self, sample_task, clear_event_handlers
     ):
         """Test WorkTask caller field is None outside task context.
 
@@ -109,13 +111,13 @@ class TestWorkerTask:
             The caller field remains None
         """
         # Arrange & Act
-        task = mock_task()
+        task = sample_task()
 
         # Assert
         assert task.caller is None
 
     @pytest.mark.asyncio
-    async def test_context_manager_entry(self, mock_task, clear_event_handlers):
+    async def test_context_manager_entry(self, sample_task, clear_event_handlers):
         """Test WorkTask context manager entry.
 
         Given:
@@ -126,16 +128,16 @@ class TestWorkerTask:
             Context manager provides access to task execution
         """
         # Arrange
-        task = mock_task()
+        task = sample_task()
 
         # Act
         with task as run_method:
             # Assert
             assert callable(run_method)
-            assert run_method == task.run
+            # We should not test which specific method is returned (private detail)
 
     @pytest.mark.asyncio
-    async def test_context_manager_normal_exit(self, mock_task, clear_event_handlers):
+    async def test_context_manager_normal_exit(self, sample_task, clear_event_handlers):
         """Test WorkTask context manager exits normally.
 
         Given:
@@ -146,7 +148,7 @@ class TestWorkerTask:
             Context exits cleanly without suppressing exceptions
         """
         # Arrange
-        task = mock_task()
+        task = sample_task()
 
         # Act & Assert (no exception should be raised)
         with task:
@@ -154,7 +156,7 @@ class TestWorkerTask:
 
     @pytest.mark.asyncio
     async def test_context_manager_exception_handling(
-        self, mock_task, clear_event_handlers
+        self, sample_task, clear_event_handlers
     ):
         """Test WorkTask context manager exception handling.
 
@@ -168,7 +170,7 @@ class TestWorkerTask:
             propagates normally
         """
         # Arrange
-        task = mock_task()
+        task = sample_task()
 
         # Act & Assert
         async def run_with_exception():
@@ -370,13 +372,13 @@ class TestWorkerTask:
         assert pb_task.tag == ""
 
     @pytest.mark.asyncio
-    async def test_run_successful_execution(
+    async def test_dispatch_successful_execution(
         self,
-        mock_task,
+        sample_task,
         mock_worker_proxy_cache,
         clear_event_handlers,
     ):
-        """Test WorkTask.run executes successfully.
+        """Test WorkTask.dispatch executes successfully.
 
         Given:
             A WorkTask with a valid proxy pool in context
@@ -390,27 +392,27 @@ class TestWorkerTask:
         async def test_callable(x, y=0):
             return x + y
 
-        task = mock_task(
+        task = sample_task(
             callable=test_callable,
             args=(5,),
             kwargs={"y": 3},
         )
 
         # Act
-        result = await task.run()
+        result = await task.dispatch()
 
         # Assert
         assert result == 8
 
     @pytest.mark.asyncio
-    async def test_run_emits_task_completed_event(
+    async def test_dispatch_emits_task_completed_event(
         self,
-        mock_task,
+        sample_task,
         mock_worker_proxy_cache,
         event_spy,
         clear_event_handlers,
     ):
-        """Test WorkTask.run emits task-completed event on exception.
+        """Test WorkTask.dispatch emits task-completed event on exception.
 
         Given:
             A WorkTask completes execution with an exception
@@ -425,12 +427,12 @@ class TestWorkerTask:
         async def test_callable():
             raise ValueError("Test error")
 
-        task = mock_task(callable=test_callable)
+        task = sample_task(callable=test_callable)
 
         # Act - Create a task so the done callback can be invoked
         async def run_task():
             try:
-                await task.run()
+                await task.dispatch()
             except ValueError:
                 pass  # Expected
 
@@ -447,30 +449,30 @@ class TestWorkerTask:
         assert event.task.id == task.id
 
     @pytest.mark.asyncio
-    async def test_run_without_proxy_pool_raises_error(
-        self, mock_task, clear_event_handlers
+    async def test_dispatch_without_proxy_pool_raises_error(
+        self, sample_task, clear_event_handlers
     ):
-        """Test WorkTask.run without proxy pool raises error.
+        """Test WorkTask.dispatch without proxy pool raises error.
 
         Given:
-            WorkTask.run is called without proxy pool in context
+            WorkTask.dispatch is called without proxy pool in context
         When:
             run() is invoked
         Then:
             RuntimeError is raised
         """
         # Arrange
-        task = mock_task()
+        task = sample_task()
 
         # Act & Assert
         with pytest.raises(
             RuntimeError, match="No proxy pool available for task execution"
         ):
-            await task.run()
+            await task.dispatch()
 
     @pytest.mark.asyncio
     async def test_context_manager_with_multiple_exception_types(
-        self, mock_task, clear_event_handlers
+        self, sample_task, clear_event_handlers
     ):
         """Test WorkTask context manager with various exception types.
 
@@ -489,7 +491,7 @@ class TestWorkerTask:
         ]
 
         for exception_type, message in test_cases:
-            task = mock_task()
+            task = sample_task()
 
             async def run_with_exception():
                 with pytest.raises(exception_type, match=message):
@@ -615,6 +617,362 @@ class TestWorkerTask:
         assert deserialized_task.line_no == original_task.line_no
         assert deserialized_task.tag == original_task.tag
 
+    # Async Generator Tests via dispatch()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_async_generator_callable(
+        self,
+        sample_task,
+        mock_worker_proxy_cache,
+        clear_event_handlers,
+    ):
+        """Test dispatch() with async generator yields all values in order.
+
+        Given:
+            A WorkTask with async generator callable and valid proxy pool
+        When:
+            dispatch() is called and iterated
+        Then:
+            Yields all values from the async generator callable in order
+        """
+
+        # Arrange
+        async def test_generator():
+            for i in range(3):
+                yield f"value_{i}"
+
+        task = sample_task(callable=test_generator)
+
+        # Act
+        results = []
+        async for value in task.dispatch():
+            results.append(value)
+
+        # Assert
+        assert results == ["value_0", "value_1", "value_2"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_coroutine_callable(
+        self,
+        sample_task: Callable[..., WorkTask],
+        mock_worker_proxy_cache,
+        clear_event_handlers,
+    ):
+        """Test dispatch() with coroutine returns the result.
+
+        Given:
+            A WorkTask with coroutine callable and valid proxy pool
+        When:
+            dispatch() is called and awaited
+        Then:
+            Returns the result from the coroutine callable
+        """
+
+        # Arrange
+        async def test_coroutine():
+            return "coroutine_result"
+
+        task = sample_task(callable=test_coroutine)
+
+        # Act
+        result = await task.dispatch()
+
+        # Assert
+        assert result == "coroutine_result"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_invalid_callable_raises_error(
+        self,
+        sample_task,
+        clear_event_handlers,
+    ):
+        """Test dispatch() with neither coroutine nor async generator raises ValueError.
+
+        Given:
+            A WorkTask with neither coroutine nor async generator
+        When:
+            dispatch() is called
+        Then:
+            Raises ValueError with expected message
+        """
+
+        # Arrange
+        def not_async():
+            return "not async"
+
+        task = sample_task(callable=not_async)
+
+        # Act & Assert
+        with pytest.raises(
+            ValueError, match="Expected work to be coroutine or async generator"
+        ):
+            _ = task.dispatch()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_async_generator_without_proxy_pool_raises_error(
+        self,
+        sample_task,
+        clear_event_handlers,
+    ):
+        """Test dispatch() with async generator without proxy pool raises RuntimeError.
+
+        Given:
+            A WorkTask with async generator callable
+        When:
+            dispatch() is called without proxy pool in context
+        Then:
+            Raises RuntimeError with message "No proxy pool available for task execution"
+        """
+
+        # Arrange
+        async def test_generator():
+            yield "value"
+
+        task = sample_task(callable=test_generator)
+
+        # Act & Assert
+        with pytest.raises(
+            RuntimeError, match="No proxy pool available for task execution"
+        ):
+            async for _ in task.dispatch():
+                pass
+
+    @pytest.mark.asyncio
+    async def test_dispatch_async_generator_raises_during_iteration(
+        self,
+        sample_task,
+        mock_worker_proxy_cache,
+        clear_event_handlers,
+    ):
+        """Test dispatch() with async generator that raises propagates exception.
+
+        Given:
+            A WorkTask with async generator that raises during iteration
+        When:
+            dispatch() is called and iterated
+        Then:
+            Exception propagates to caller and generator is cleaned up via aclose()
+        """
+
+        # Arrange
+        async def failing_generator():
+            yield "first"
+            raise ValueError("Generator error")
+
+        task = sample_task(callable=failing_generator)
+
+        # Act & Assert
+        results = []
+        with pytest.raises(ValueError, match="Generator error"):
+            async for value in task.dispatch():
+                results.append(value)
+
+        # Verify we got the first value before the exception
+        assert results == ["first"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_async_generator_early_termination(
+        self,
+        sample_task,
+        mock_worker_proxy_cache,
+        clear_event_handlers,
+    ):
+        """Test dispatch() async iterator terminated early via break.
+
+        Given:
+            A WorkTask with async generator callable
+        When:
+            dispatch() async iterator is terminated early via break
+        Then:
+            Iteration stops after receiving expected values
+        """
+
+        # Arrange
+        async def test_generator():
+            for i in range(10):
+                yield f"value_{i}"
+
+        task = sample_task(callable=test_generator)
+
+        # Act
+        results = []
+        async for value in task.dispatch():
+            results.append(value)
+            if len(results) >= 2:
+                break
+
+        # Assert - verify we only got the first 2 values
+        assert results == ["value_0", "value_1"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_async_generator_multiple_values(
+        self,
+        sample_task,
+        mock_worker_proxy_cache,
+        clear_event_handlers,
+    ):
+        """Test dispatch() fully consumed yields all values in correct order.
+
+        Given:
+            A WorkTask with async generator that yields multiple values
+        When:
+            dispatch() is fully consumed via async for
+        Then:
+            All yielded values are received in correct order
+        """
+
+        # Arrange
+        async def multi_value_generator():
+            for i in range(5):
+                await asyncio.sleep(0)
+                yield i * 10
+
+        task = sample_task(callable=multi_value_generator)
+
+        # Act
+        results = []
+        async for value in task.dispatch():
+            results.append(value)
+
+        # Assert
+        assert results == [0, 10, 20, 30, 40]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_async_generator_empty(
+        self,
+        sample_task,
+        mock_worker_proxy_cache,
+        clear_event_handlers,
+    ):
+        """Test dispatch() with async generator that yields zero values.
+
+        Given:
+            A WorkTask with async generator that yields zero values
+        When:
+            dispatch() is called and consumed
+        Then:
+            Completes immediately without yielding any values
+        """
+
+        # Arrange
+        async def empty_generator():
+            return
+            yield  # unreachable, but makes it a generator
+
+        task = sample_task(callable=empty_generator)
+
+        # Act
+        results = []
+        async for value in task.dispatch():
+            results.append(value)
+
+        # Assert - verify no values were yielded
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_context_manager_returns_stream_for_async_generator(
+        self,
+        sample_task,
+        clear_event_handlers,
+    ):
+        """Test context manager returns callable for async generator.
+
+        Given:
+            A WorkTask with an async generator callable
+        When:
+            Context manager is entered using `with` statement
+        Then:
+            Returns callable that can be used (private _stream method)
+        """
+
+        # Arrange
+        async def test_generator():
+            yield "value"
+
+        task = sample_task(callable=test_generator)
+
+        # Act
+        with task as run_method:
+            # Assert
+            assert callable(run_method)
+            # We should not call the returned method directly
+            # (it's the private _stream method), just verify it's callable
+
+    @pytest.mark.asyncio
+    async def test_context_manager_with_invalid_callable_raises_error(
+        self,
+        sample_task,
+        clear_event_handlers,
+    ):
+        """Test context manager with invalid callable raises ValueError.
+
+        Given:
+            A WorkTask with neither coroutine nor async generator callable
+        When:
+            Context manager is entered using `with` statement
+        Then:
+            Raises ValueError with expected message
+        """
+
+        # Arrange
+        def not_async():
+            return "not async"
+
+        task = sample_task(callable=not_async)
+
+        # Act & Assert
+        with pytest.raises(
+            ValueError, match="Expected coroutine function or async generator function"
+        ):
+            with task:
+                pass
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=20,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(value_count=st.integers(min_value=0, max_value=10))
+    async def test_property_async_generator_correctness(
+        self,
+        value_count,
+        mock_worker_proxy_cache,
+        clear_event_handlers,
+    ):
+        """Property test: Any async generator yielding N values returns all N in order.
+
+        Given:
+            Any async generator yielding N values (N = 0-10)
+        When:
+            Dispatched via dispatch() and fully consumed
+        Then:
+            All N values are received in order
+        """
+
+        # Arrange
+        async def test_generator():
+            for i in range(value_count):
+                yield i
+
+        proxy = PicklableProxy()
+        task = WorkTask(
+            id=uuid4(),
+            callable=test_generator,
+            args=(),
+            kwargs={},
+            proxy=proxy,
+        )
+
+        # Act
+        results = []
+        async for value in task.dispatch():
+            results.append(value)
+
+        # Assert
+        assert len(results) == value_count
+        assert results == list(range(value_count))
+
 
 class TestWorkerTaskException:
     """Tests for WorkTaskException class."""
@@ -647,7 +1005,7 @@ class TestWorkerTaskException:
 class TestWorkerTaskEvent:
     """Tests for WorkTaskEvent class."""
 
-    def test_init(self, mock_task, clear_event_handlers):
+    def test_init(self, sample_task, clear_event_handlers):
         """Test WorkTaskEvent instantiation.
 
         Given:
@@ -658,7 +1016,7 @@ class TestWorkerTaskEvent:
             Event object is created with correct attributes
         """
         # Arrange
-        task = mock_task()
+        task = sample_task()
 
         # Act
         event = WorkTaskEvent("task-created", task=task)
@@ -696,7 +1054,9 @@ class TestWorkerTaskEvent:
         assert callable(test_handler)
 
     @pytest.mark.asyncio
-    async def test_emit_with_handlers(self, mock_task, event_spy, clear_event_handlers):
+    async def test_emit_with_handlers(
+        self, sample_task, event_spy, clear_event_handlers
+    ):
         """Test emit calls registered handlers.
 
         Given:
@@ -707,7 +1067,7 @@ class TestWorkerTaskEvent:
             All registered handlers are called with event and timestamp
         """
         # Arrange
-        task = mock_task()
+        task = sample_task()
         event = WorkTaskEvent("task-created", task=task)
         WorkTaskEvent._handlers["task-created"] = [event_spy]
 
@@ -724,7 +1084,7 @@ class TestWorkerTaskEvent:
         assert isinstance(timestamp, int)
         assert timestamp > 0
 
-    def test_emit_without_handlers(self, mock_task, clear_event_handlers):
+    def test_emit_without_handlers(self, sample_task, clear_event_handlers):
         """Test emit without handlers completes normally.
 
         Given:
@@ -735,7 +1095,7 @@ class TestWorkerTaskEvent:
             No handlers are called, execution completes normally
         """
         # Arrange
-        task = mock_task()
+        task = sample_task()
         event = WorkTaskEvent("task-created", task=task)
 
         # Act & Assert (no exception should be raised)
@@ -743,7 +1103,7 @@ class TestWorkerTaskEvent:
 
     @pytest.mark.asyncio
     async def test_emit_handler_exception_isolated(
-        self, mock_task, clear_event_handlers
+        self, sample_task, clear_event_handlers
     ):
         """Test emit handler exception isolation via call_soon.
 
@@ -755,7 +1115,7 @@ class TestWorkerTaskEvent:
             Exception is caught by event loop, does not propagate to emit() caller
         """
         # Arrange
-        task = mock_task()
+        task = sample_task()
         event = WorkTaskEvent("task-created", task=task)
         exception_caught = []
 
@@ -877,7 +1237,7 @@ class TestCurrentTask:
 
     @pytest.mark.asyncio
     async def test_current_task_within_context(
-        self, mock_task, mock_worker_proxy_cache, clear_event_handlers
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
     ):
         """Test current_task() returns task within context.
 
@@ -893,10 +1253,10 @@ class TestCurrentTask:
         async def test_callable():
             return current_task()
 
-        task = mock_task(callable=test_callable)
+        task = sample_task(callable=test_callable)
 
         # Act
-        result = await task.run()
+        result = await task.dispatch()
 
         # Assert
         assert result == task
