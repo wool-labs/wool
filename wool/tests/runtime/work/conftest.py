@@ -1,6 +1,8 @@
 """Shared fixtures for work subpackage tests."""
 
 import asyncio
+from typing import Callable
+from typing import Coroutine
 from uuid import uuid4
 
 import pytest
@@ -73,14 +75,16 @@ def sample_async_callable():
 
 
 @pytest.fixture
-def mock_task(mocker: MockerFixture, sample_async_callable, mock_proxy):
+def sample_task(
+    mocker: MockerFixture, sample_async_callable: Callable[..., Coroutine], mock_proxy
+) -> Callable[..., WorkTask]:
     """Provides a factory for creating mock WorkTask instances.
 
     Returns a function that creates WorkTask instances with customizable
     parameters for testing.
     """
 
-    def _create_task(**overrides):
+    def _create_task(**overrides) -> WorkTask:
         defaults = {
             "id": uuid4(),
             "callable": sample_async_callable,

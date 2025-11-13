@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+from inspect import isasyncgen
+from inspect import iscoroutine
+from typing import AsyncGenerator
 from typing import AsyncIterator
+from typing import Coroutine
 
 import cloudpickle
 from grpc import StatusCode
@@ -14,7 +18,28 @@ from wool.runtime.work import WorkTask
 from wool.runtime.work import WorkTaskEvent
 
 
-class ReadOnlyEvent:
+def istask(value) -> bool:
+    return isinstance(value, asyncio.Task)
+
+
+class _Task:
+    def __init__(self, work: asyncio.Task):
+        self._work = work
+
+    async def cancel(self):
+        self._work.cancel()
+        await self._work
+
+
+class _AsyncGen:
+    def __init__(self, work: AsyncGenerator):
+        self._work = work
+
+    async def cancel(self):
+        await self._work.aclose()
+
+
+class _ReadOnlyEvent:
     """A read-only wrapper around :class:`asyncio.Event`.
 
     Provides access to check if an event is set and wait for it to be
@@ -52,7 +77,7 @@ class WorkerService(pb.worker.WorkerServicer):
     :attr:`stopped` events for lifecycle monitoring.
     """
 
-    _tasks: set[asyncio.Task]
+    _docket: set[_Task | _AsyncGen]
     _stopped: asyncio.Event
     _stopping: asyncio.Event
     _task_completed: asyncio.Event
@@ -61,25 +86,25 @@ class WorkerService(pb.worker.WorkerServicer):
         self._stopped = asyncio.Event()
         self._stopping = asyncio.Event()
         self._task_completed = asyncio.Event()
-        self._tasks = set()
+        self._docket = set()
 
     @property
-    def stopping(self) -> ReadOnlyEvent:
+    def stopping(self) -> _ReadOnlyEvent:
         """Read-only event signaling that the service is stopping.
 
         :returns:
-            A :class:`ReadOnlyEvent`.
+            A :class:`_ReadOnlyEvent`.
         """
-        return ReadOnlyEvent(self._stopping)
+        return _ReadOnlyEvent(self._stopping)
 
     @property
-    def stopped(self) -> ReadOnlyEvent:
+    def stopped(self) -> _ReadOnlyEvent:
         """Read-only event signaling that the service has stopped.
 
         :returns:
-            A :class:`ReadOnlyEvent`.
+            A :class:`_ReadOnlyEvent`.
         """
-        return ReadOnlyEvent(self._stopped)
+        return _ReadOnlyEvent(self._stopped)
 
     async def dispatch(
         self, request: pb.task.Task, context: ServicerContext
@@ -108,16 +133,21 @@ class WorkerService(pb.worker.WorkerServicer):
                 StatusCode.UNAVAILABLE, "Worker service is shutting down"
             )
 
-        with self._tracker(WorkTask.from_protobuf(request)) as task:
+        with self._tracker(WorkTask.from_protobuf(request)) as work:
+            yield pb.worker.Response(ack=pb.worker.Ack())
             try:
-                yield pb.worker.Response(ack=pb.worker.Ack())
-                try:
-                    result = pb.task.Result(dump=cloudpickle.dumps(await task))
+                if isasyncgen(work):
+                    async for result in work:
+                        result = pb.task.Result(dump=cloudpickle.dumps(result))
+                        yield pb.worker.Response(result=result)
+                elif istask(work):
+                    result = pb.task.Result(dump=cloudpickle.dumps(await work))
                     yield pb.worker.Response(result=result)
-                except Exception as e:
-                    exception = pb.task.Exception(dump=cloudpickle.dumps(e))
-                    yield pb.worker.Response(exception=exception)
-            except asyncio.CancelledError as e:
+                else:
+                    raise RuntimeError(
+                        f"Expected task or async generator, got {type(work)}"
+                    )
+            except (Exception, asyncio.CancelledError) as e:
                 exception = pb.task.Exception(dump=cloudpickle.dumps(e))
                 yield pb.worker.Response(exception=exception)
 
@@ -143,14 +173,14 @@ class WorkerService(pb.worker.WorkerServicer):
         return pb.worker.Void()
 
     @contextmanager
-    def _tracker(self, wool_task: WorkTask):
+    def _tracker(self, work_task: WorkTask):
         """Context manager for tracking running tasks.
 
         Manages the lifecycle of a task execution, adding it to the
         active tasks set and emitting appropriate events. Ensures
         proper cleanup when the task completes or fails.
 
-        :param wool_task:
+        :param work_task:
             The :class:`WorkTask` instance to execute and track.
         :yields:
             The :class:`asyncio.Task` created for the wool task.
@@ -159,24 +189,31 @@ class WorkerService(pb.worker.WorkerServicer):
             Emits a :class:`WorkTaskEvent` with type "task-scheduled"
             when the task begins execution.
         """
-        WorkTaskEvent("task-scheduled", task=wool_task).emit()
-        task = asyncio.create_task(wool_task.run())
-        self._tasks.add(task)
+        WorkTaskEvent("task-scheduled", task=work_task).emit()
+        if isasyncgen(work := work_task.dispatch()):
+            watcher = _AsyncGen(work)
+        elif iscoroutine(work):
+            work = asyncio.create_task(work)
+            watcher = _Task(work)
+        else:
+            raise ValueError("Expected work to be coroutine or async generator")
+
+        self._docket.add(watcher)
         try:
-            yield task
+            yield work
         finally:
-            self._tasks.remove(task)
+            self._docket.discard(watcher)
 
     async def _stop(self, *, timeout: float | None = 0) -> None:
         self._stopping.set()
-        await self._await_or_cancel_tasks(timeout=timeout)
+        await self._await_or_cancel(timeout=timeout)
         try:
             if proxy_pool := wool.__proxy_pool__.get():
                 await proxy_pool.clear()
         finally:
             self._stopped.set()
 
-    async def _await_or_cancel_tasks(self, *, timeout: float | None = 0) -> None:
+    async def _await_or_cancel(self, *, timeout: float | None = 0) -> None:
         """Stop the worker service gracefully.
 
         Gracefully shuts down the worker service by canceling or waiting
@@ -194,18 +231,19 @@ class WorkerService(pb.worker.WorkerServicer):
             the method recursively calls itself with a timeout of 0
             to cancel all remaining tasks immediately.
         """
-        if self._tasks and timeout == 0:
-            await self._cancel(*self._tasks)
-        elif self._tasks:
+        if self._docket and timeout == 0:
+            await self._cancel()
+        elif self._docket:
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(*self._tasks, return_exceptions=True),
-                    timeout=timeout,
-                )
+                await asyncio.wait_for(self._await(), timeout=timeout)
             except asyncio.TimeoutError:
-                return await self._await_or_cancel_tasks(timeout=0)
+                return await self._await_or_cancel(timeout=0)
 
-    async def _cancel(self, *tasks: asyncio.Task):
+    async def _await(self):
+        while self._docket:
+            await asyncio.sleep(0)
+
+    async def _cancel(self):
         """Cancel multiple tasks safely.
 
         Cancels the provided tasks while performing safety checks to
@@ -223,9 +261,4 @@ class WorkerService(pb.worker.WorkerServicer):
             - Properly handles :exc:`asyncio.CancelledError`
               exceptions.
         """
-        current = asyncio.current_task()
-        to_cancel = [task for task in tasks if not task.done() and task != current]
-        for task in to_cancel:
-            task.cancel()
-        if to_cancel:
-            await asyncio.gather(*to_cancel, return_exceptions=True)
+        await asyncio.gather(*(w.cancel() for w in self._docket), return_exceptions=True)

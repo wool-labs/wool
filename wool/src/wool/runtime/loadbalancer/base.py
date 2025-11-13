@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import MappingProxyType
 from typing import TYPE_CHECKING
-from typing import AsyncIterator
+from typing import AsyncGenerator
 from typing import Callable
 from typing import Final
 from typing import Protocol
@@ -50,7 +50,7 @@ class LoadBalancerLike(Protocol):
         *,
         context: LoadBalancerContext,
         timeout: float | None = None,
-    ) -> AsyncIterator: ...
+    ) -> AsyncGenerator: ...
 
 
 # public
