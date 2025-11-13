@@ -4,6 +4,7 @@ import asyncio
 import uuid
 from typing import TYPE_CHECKING
 from typing import AsyncContextManager
+from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Awaitable
 from typing import ContextManager
@@ -91,7 +92,6 @@ async def connection_finalizer(connection: WorkerConnection) -> None:
 WorkerUri: TypeAlias = str
 
 
-# public
 class WorkerProxy:
     """Client-side proxy for dispatching tasks to distributed workers.
 
@@ -348,7 +348,9 @@ class WorkerProxy:
         self._loadbalancer_context = None
         self._started = False
 
-    async def dispatch(self, task: WorkTask, *, timeout: float | None = None):
+    async def dispatch(
+        self, task: WorkTask, *, timeout: float | None = None
+    ) -> AsyncGenerator:
         """Dispatches a task to an available worker in the pool.
 
         This method selects a worker using a round-robin strategy. If no

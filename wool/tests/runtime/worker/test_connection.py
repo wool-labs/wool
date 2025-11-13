@@ -21,7 +21,7 @@ from wool.runtime.worker.connection import WorkerConnection
 
 
 @pytest.fixture
-def mock_task(mocker: MockerFixture):
+def sample_task(mocker: MockerFixture):
     """Provides a mock :class:`WorkTask` for testing.
 
     Creates a WorkTask with a simple async function that returns a
@@ -117,7 +117,7 @@ class TestWorkerConnection:
 
     @pytest.mark.asyncio
     async def test_dispatch_task_that_returns(
-        self, mocker: MockerFixture, mock_task, async_stream, mock_grpc_call
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
         """Test task dispatch with successful acknowledgment and result.
 
@@ -148,7 +148,7 @@ class TestWorkerConnection:
 
         # Act
         results = []
-        async for result in await connection.dispatch(mock_task):
+        async for result in await connection.dispatch(sample_task):
             results.append(result)
 
         # Assert
@@ -159,7 +159,7 @@ class TestWorkerConnection:
 
     @pytest.mark.asyncio
     async def test_dispatch_task_that_raises(
-        self, mocker: MockerFixture, mock_task, async_stream, mock_grpc_call
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
         """Test task dispatch when task raises an exception.
 
@@ -192,7 +192,7 @@ class TestWorkerConnection:
 
         # Act & Assert
         with pytest.raises(ValueError, match="task_error"):
-            async for _ in await connection.dispatch(mock_task):
+            async for _ in await connection.dispatch(sample_task):
                 pass
 
         to_protobuf_spy.assert_called_once()
@@ -200,7 +200,7 @@ class TestWorkerConnection:
 
     @pytest.mark.asyncio
     async def test_dispatch_no_ack(
-        self, mocker: MockerFixture, mock_task, async_stream, mock_grpc_call
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
         """Test task dispatch when acknowledgment is not received.
 
@@ -227,7 +227,7 @@ class TestWorkerConnection:
 
         # Act & Assert
         with pytest.raises(UnexpectedResponse, match="Expected 'ack' response"):
-            async for _ in await connection.dispatch(mock_task):
+            async for _ in await connection.dispatch(sample_task):
                 pass
 
         mock_call.cancel.assert_called_once()
@@ -241,7 +241,7 @@ class TestWorkerConnection:
     async def test_dispatch_unexpected_response(
         self,
         mocker: MockerFixture,
-        mock_task,
+        sample_task,
         mock_grpc_call,
         async_stream,
         cancel_raises: bool,
@@ -272,7 +272,7 @@ class TestWorkerConnection:
         with pytest.raises(
             UnexpectedResponse, match="Expected 'result' or 'exception' response"
         ):
-            async for _ in await connection.dispatch(mock_task):
+            async for _ in await connection.dispatch(sample_task):
                 pass
 
         mock_call.cancel.assert_called()
@@ -287,7 +287,7 @@ class TestWorkerConnection:
         ],
     )
     async def test_dispatch_transient_rpc_error(
-        self, mocker: MockerFixture, mock_task, status_code: grpc.StatusCode
+        self, mocker: MockerFixture, sample_task, status_code: grpc.StatusCode
     ):
         """Test task dispatch when stub raises a transient RPC error.
 
@@ -315,7 +315,7 @@ class TestWorkerConnection:
 
         # Act & Assert
         with pytest.raises(TransientRpcError):
-            async for _ in await connection.dispatch(mock_task):
+            async for _ in await connection.dispatch(sample_task):
                 pass
 
     @pytest.mark.asyncio
@@ -330,7 +330,7 @@ class TestWorkerConnection:
         ],
     )
     async def test_dispatch_nontransient_rpc_error(
-        self, mocker: MockerFixture, mock_task, status_code: grpc.StatusCode
+        self, mocker: MockerFixture, sample_task, status_code: grpc.StatusCode
     ):
         """Test task dispatch when stub raises a non-transient RPC error.
 
@@ -358,7 +358,7 @@ class TestWorkerConnection:
 
         # Act & Assert
         with pytest.raises(RpcError):
-            async for _ in await connection.dispatch(mock_task):
+            async for _ in await connection.dispatch(sample_task):
                 pass
 
     @pytest.mark.asyncio
@@ -377,15 +377,15 @@ class TestWorkerConnection:
         # Arrange
         connection = WorkerConnection("localhost:50051", limit=10)
 
-        async def sample_task():
+        async def test_callable():
             return "test"
 
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        mock_task = WorkTask(
+        work_task = WorkTask(
             id=uuid4(),
-            callable=sample_task,
+            callable=test_callable,
             args=(),
             kwargs={},
             proxy=mock_proxy,
@@ -393,12 +393,12 @@ class TestWorkerConnection:
 
         # Act & Assert
         with pytest.raises(ValueError, match="Dispatch timeout must be positive"):
-            async for _ in await connection.dispatch(mock_task, timeout=timeout):
+            async for _ in await connection.dispatch(work_task, timeout=timeout):
                 pass
 
     @pytest.mark.asyncio
     async def test_dispatch_exceeds_timeout(
-        self, mocker: MockerFixture, mock_task, async_stream, mock_grpc_call
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
         """Test task dispatch when dispatch timeout is exceeded.
 
@@ -422,14 +422,14 @@ class TestWorkerConnection:
 
         # Act & Assert
         with pytest.raises(TimeoutError):
-            async for _ in await connection.dispatch(mock_task, timeout=0.001):
+            async for _ in await connection.dispatch(sample_task, timeout=0.001):
                 pass
 
         mock_call.cancel.assert_called()
 
     @pytest.mark.asyncio
     async def test_dispatch_exceeds_limit(
-        self, mocker: MockerFixture, mock_task, mock_grpc_call, async_stream
+        self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
     ):
         """Test task dispatch when concurrency limit is reached.
 
@@ -457,7 +457,7 @@ class TestWorkerConnection:
         connection = WorkerConnection("localhost:50051", limit=1)
 
         async def consume_slot():
-            async for _ in await connection.dispatch(mock_task):
+            async for _ in await connection.dispatch(sample_task):
                 pass
 
         blocking_task = asyncio.create_task(consume_slot())
@@ -468,7 +468,7 @@ class TestWorkerConnection:
         try:
             # Act & Assert
             with pytest.raises(TimeoutError):
-                async for _ in await connection.dispatch(mock_task, timeout=0.01):
+                async for _ in await connection.dispatch(sample_task, timeout=0.01):
                     pass
 
             assert mock_stub.dispatch.call_count == 1
@@ -488,7 +488,7 @@ class TestWorkerConnection:
     async def test_dispatch_cancelled_during_dispatch(
         self,
         mocker: MockerFixture,
-        mock_task,
+        sample_task,
         mock_grpc_call,
         async_stream,
         cancel_raises: bool,
@@ -523,7 +523,7 @@ class TestWorkerConnection:
 
         # Act
         async def run_dispatch():
-            async for _ in await connection.dispatch(mock_task):
+            async for _ in await connection.dispatch(sample_task):
                 pass
 
         task = asyncio.create_task(run_dispatch())
@@ -545,7 +545,7 @@ class TestWorkerConnection:
     async def test_dispatch_cancelled_during_execution(
         self,
         mocker: MockerFixture,
-        mock_task,
+        sample_task,
         mock_grpc_call,
         async_stream,
         cancel_raises: bool,
@@ -581,7 +581,7 @@ class TestWorkerConnection:
 
         # Act
         async def run_dispatch():
-            async for _ in await connection.dispatch(mock_task):
+            async for _ in await connection.dispatch(sample_task):
                 pass
 
         task = asyncio.create_task(run_dispatch())
@@ -617,3 +617,474 @@ class TestWorkerConnection:
 
         # Assert
         assert close_spy.call_count == call_count
+
+    @pytest.mark.asyncio
+    async def test_dispatch_task_that_yields_multiple_results(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test task dispatch with multiple streaming results.
+
+        Given:
+            A connection with a task that yields multiple results
+        When:
+            Task is dispatched
+        Then:
+            Async iterator yields all results in order
+        """
+        # Arrange
+        to_protobuf_spy = mocker.spy(WorkTask, "to_protobuf")
+
+        responses = (
+            pb.worker.Response(ack=pb.worker.Ack()),
+            pb.worker.Response(
+                result=pb.task.Result(dump=cloudpickle.dumps("result_1"))
+            ),
+            pb.worker.Response(
+                result=pb.task.Result(dump=cloudpickle.dumps("result_2"))
+            ),
+            pb.worker.Response(
+                result=pb.task.Result(dump=cloudpickle.dumps("result_3"))
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", limit=10)
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert
+        to_protobuf_spy.assert_called_once()
+        mock_stub.dispatch.assert_called_once()
+        assert len(results) == 3
+        assert results == ["result_1", "result_2", "result_3"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_stream_early_close(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test iterator closed via break before completion.
+
+        Given:
+            A connection with a task yielding results
+        When:
+            Iterator is terminated early via break
+        Then:
+            Underlying gRPC call is cancelled and stream stops
+        """
+        # Arrange
+        responses = (
+            pb.worker.Response(ack=pb.worker.Ack()),
+            pb.worker.Response(
+                result=pb.task.Result(dump=cloudpickle.dumps("result_1"))
+            ),
+            pb.worker.Response(
+                result=pb.task.Result(dump=cloudpickle.dumps("result_2"))
+            ),
+            pb.worker.Response(
+                result=pb.task.Result(dump=cloudpickle.dumps("result_3"))
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", limit=10)
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+            if len(results) >= 2:
+                break
+
+        # Assert - only got first 2 results
+        assert results == ["result_1", "result_2"]
+
+
+class TestDispatchStream:
+    """Tests for _DispatchStream class."""
+
+    @pytest.mark.asyncio
+    async def test_init(self, mocker: MockerFixture):
+        """Test _DispatchStream instantiation.
+
+        Given:
+            A gRPC call object
+        When:
+            _DispatchStream is instantiated
+        Then:
+            Creates iterator wrapping the call
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+
+        # Act
+        stream = _DispatchStream(mock_call)
+
+        # Assert
+        assert stream._call == mock_call
+        assert not stream._closed
+
+    @pytest.mark.asyncio
+    async def test_aiter(self, mocker: MockerFixture):
+        """Test _DispatchStream used in async for loop.
+
+        Given:
+            A _DispatchStream instance
+        When:
+            Used in async for loop
+        Then:
+            Returns self as async iterator
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        stream = _DispatchStream(mock_call)
+
+        # Act
+        result = stream.__aiter__()
+
+        # Assert
+        assert result is stream
+
+    @pytest.mark.asyncio
+    async def test_anext_with_result(self, mocker: MockerFixture):
+        """Test _DispatchStream __anext__ with response containing result.
+
+        Given:
+            A _DispatchStream with response containing result
+        When:
+            __anext__ is called
+        Then:
+            Returns deserialized result value
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            yield pb.worker.Response(
+                result=pb.task.Result(dump=cloudpickle.dumps("test_value"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        stream = _DispatchStream(mock_call)
+
+        # Act
+        result = await stream.__anext__()
+
+        # Assert
+        assert result == "test_value"
+
+    @pytest.mark.asyncio
+    async def test_anext_with_exception(self, mocker: MockerFixture):
+        """Test _DispatchStream __anext__ with response containing exception.
+
+        Given:
+            A _DispatchStream with response containing exception
+        When:
+            __anext__ is called
+        Then:
+            Raises the deserialized exception
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        test_exception = ValueError("test error")
+
+        async def mock_iter():
+            yield pb.worker.Response(
+                exception=pb.task.Exception(dump=cloudpickle.dumps(test_exception))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        stream = _DispatchStream(mock_call)
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="test error"):
+            await stream.__anext__()
+
+    @pytest.mark.asyncio
+    async def test_anext_with_unexpected_response(self, mocker: MockerFixture):
+        """Test _DispatchStream __anext__ with neither result nor exception.
+
+        Given:
+            A _DispatchStream with response containing neither result nor exception
+        When:
+            __anext__ is called
+        Then:
+            Raises UnexpectedResponse with descriptive message
+        """
+        # Arrange
+        from wool.runtime.worker.connection import UnexpectedResponse
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            yield pb.worker.Response()  # Empty response
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.cancel = mocker.MagicMock()
+        stream = _DispatchStream(mock_call)
+
+        # Act & Assert
+        with pytest.raises(
+            UnexpectedResponse, match="Expected 'result' or 'exception' response"
+        ):
+            await stream.__anext__()
+
+        # Should have cancelled the call
+        mock_call.cancel.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_anext_when_closed(self, mocker: MockerFixture):
+        """Test _DispatchStream __anext__ when already closed.
+
+        Given:
+            A _DispatchStream that has been closed
+        When:
+            __anext__ is called
+        Then:
+            Raises StopAsyncIteration
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        stream = _DispatchStream(mock_call)
+        stream._closed = True
+
+        # Act & Assert
+        with pytest.raises(StopAsyncIteration):
+            await stream.__anext__()
+
+    @pytest.mark.asyncio
+    async def test_anext_with_iteration_exception(self, mocker: MockerFixture):
+        """Test _DispatchStream __anext__ when iteration raises exception.
+
+        Given:
+            A _DispatchStream where iteration raises exception
+        When:
+            __anext__ encounters error
+        Then:
+            Cancels underlying call and re-raises exception
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            raise RuntimeError("Iteration failed")
+            yield  # unreachable
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.cancel = mocker.MagicMock()
+        stream = _DispatchStream(mock_call)
+
+        # Act & Assert
+        with pytest.raises(RuntimeError, match="Iteration failed"):
+            await stream.__anext__()
+
+        # Should have cancelled the call
+        mock_call.cancel.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_anext_cancel_exception_suppressed(self, mocker: MockerFixture):
+        """Test _DispatchStream __anext__ when call.cancel() fails.
+
+        Given:
+            A _DispatchStream where call.cancel() raises
+        When:
+            Exception occurs during iteration
+        Then:
+            Suppresses cancel exception and re-raises original
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            raise RuntimeError("Original error")
+            yield  # unreachable
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.cancel = mocker.MagicMock(side_effect=Exception("Cancel failed"))
+        stream = _DispatchStream(mock_call)
+
+        # Act & Assert - should raise original error, not cancel error
+        with pytest.raises(RuntimeError, match="Original error"):
+            await stream.__anext__()
+
+    @pytest.mark.asyncio
+    async def test_aclose(self, mocker: MockerFixture):
+        """Test _DispatchStream aclose() method.
+
+        Given:
+            A _DispatchStream that is not closed
+        When:
+            aclose() is called
+        Then:
+            Cancels underlying call and sets closed flag
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        mock_call.cancel = mocker.MagicMock()
+        stream = _DispatchStream(mock_call)
+
+        # Act
+        await stream.aclose()
+
+        # Assert
+        assert stream._closed
+        mock_call.cancel.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_aclose_idempotent(self, mocker: MockerFixture):
+        """Test _DispatchStream aclose() when already closed.
+
+        Given:
+            A _DispatchStream that is already closed
+        When:
+            aclose() is called
+        Then:
+            Returns immediately without error (idempotent)
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        mock_call.cancel = mocker.MagicMock()
+        stream = _DispatchStream(mock_call)
+        stream._closed = True
+
+        # Act
+        await stream.aclose()
+
+        # Assert - cancel should not be called again
+        mock_call.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_aclose_cancel_exception_suppressed(self, mocker: MockerFixture):
+        """Test _DispatchStream aclose() when call.cancel() raises.
+
+        Given:
+            A _DispatchStream where call.cancel() raises
+        When:
+            aclose() is called
+        Then:
+            Suppresses cancel exception and completes cleanup
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        mock_call.cancel = mocker.MagicMock(side_effect=Exception("Cancel failed"))
+        stream = _DispatchStream(mock_call)
+
+        # Act - should not raise
+        await stream.aclose()
+
+        # Assert
+        assert stream._closed
+
+    @pytest.mark.asyncio
+    async def test_asend_not_implemented(self, mocker: MockerFixture):
+        """Test _DispatchStream asend() raises NotImplementedError.
+
+        Given:
+            A _DispatchStream instance
+        When:
+            asend() is called with any value
+        Then:
+            Raises NotImplementedError with descriptive message
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        stream = _DispatchStream(mock_call)
+
+        # Act & Assert
+        with pytest.raises(NotImplementedError, match="asend\\(\\) is not supported"):
+            await stream.asend("value")
+
+    @pytest.mark.asyncio
+    async def test_athrow_not_implemented(self, mocker: MockerFixture):
+        """Test _DispatchStream athrow() raises NotImplementedError.
+
+        Given:
+            A _DispatchStream instance
+        When:
+            athrow() is called with exception info
+        Then:
+            Raises NotImplementedError with descriptive message
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        stream = _DispatchStream(mock_call)
+
+        # Act & Assert
+        with pytest.raises(NotImplementedError, match="athrow\\(\\) is not supported"):
+            await stream.athrow(ValueError, ValueError("test"))
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=10,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(response_count=st.integers(min_value=0, max_value=5))
+    async def test_property_stream_cleanup(self, mocker: MockerFixture, response_count):
+        """Property test: _DispatchStream with iteration and early termination.
+
+        Given:
+            Any _DispatchStream with valid responses
+        When:
+            Iteration and early termination via aclose()
+        Then:
+            Stream stops cleanly without resource leaks
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            for i in range(response_count):
+                yield pb.worker.Response(
+                    result=pb.task.Result(dump=cloudpickle.dumps(i))
+                )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.cancel = mocker.MagicMock()
+        stream = _DispatchStream(mock_call)
+
+        # Act - iterate partway and close
+        results = []
+        async for result in stream:
+            results.append(result)
+            if len(results) >= 2:
+                break
+
+        await stream.aclose()
+
+        # Assert
+        assert stream._closed
+        if response_count > 0:
+            assert len(results) <= min(2, response_count)
