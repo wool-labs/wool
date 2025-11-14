@@ -212,7 +212,7 @@ def _sigint_handler(loop, service, signum, frame):
     if loop.is_running():
         loop.call_soon_threadsafe(
             lambda: asyncio.create_task(
-                service.stop(pb.worker.StopRequest(timeout=None), None)
+                service.stop(pb.worker.StopRequest(timeout=-1), None)
             )
         )
 
