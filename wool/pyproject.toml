@@ -19,6 +19,7 @@ classifiers = [
 ]
 dependencies = [
     "cloudpickle",
+    "grpc-interceptor",
     "grpcio>=1.76.0",
     "portalocker",
     "protobuf",

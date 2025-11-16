@@ -23,6 +23,10 @@ from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.typing import Factory
+from wool.runtime.work.interceptor import WoolInterceptor
+from wool.runtime.work.interceptor import WoolInterceptorBridge
+from wool.runtime.work.interceptor import get_registered_interceptors
+from wool.runtime.work.interceptor import interceptor
 from wool.runtime.work.task import WorkTask
 from wool.runtime.work.task import WorkTaskEvent
 from wool.runtime.work.task import WorkTaskEventHandler
@@ -74,12 +78,16 @@ __all__ = [
     "NoWorkersAvailable",
     "RoundRobinLoadBalancer",
     # Work - New names (preferred)
+    "WoolInterceptor",
+    "WoolInterceptorBridge",
     "WorkTask",
     "WorkTaskEvent",
     "WorkTaskEventHandler",
     "WorkTaskEventType",
     "WorkTaskException",
     "current_task",
+    "get_registered_interceptors",
+    "interceptor",
     "routine",
     "work",
     # Workers

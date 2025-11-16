@@ -14,6 +14,8 @@ import grpc.aio
 import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.work.interceptor import WoolInterceptor
+from wool.runtime.work.interceptor import WoolInterceptorBridge
 from wool.runtime.worker.base import ServerCredentialsType
 from wool.runtime.worker.base import resolve_server_credentials
 from wool.runtime.worker.service import WorkerService
@@ -41,6 +43,8 @@ class WorkerProcess(Process):
         Proxy pool TTL in seconds.
     :param server_credentials:
         Optional gRPC server credentials for TLS/mTLS.
+    :param interceptors:
+        List of Wool interceptor functions to apply to task dispatch.
     :param args:
         Additional args for :class:`multiprocessing.Process`.
     :param kwargs:
@@ -53,6 +57,7 @@ class WorkerProcess(Process):
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
     _credentials: ServerCredentialsType
+    _interceptors: list[WoolInterceptor]
 
     def __init__(
         self,
@@ -62,6 +67,7 @@ class WorkerProcess(Process):
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
         server_credentials: ServerCredentialsType = None,
+        interceptors: list[WoolInterceptor] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -78,6 +84,7 @@ class WorkerProcess(Process):
             raise ValueError("Proxy pool TTL must be positive")
         self._proxy_pool_ttl = proxy_pool_ttl
         self._credentials = server_credentials
+        self._interceptors = interceptors or []
         self._get_port, self._set_port = Pipe(duplex=False)
 
     @property
@@ -156,7 +163,12 @@ class WorkerProcess(Process):
         requests. It creates a gRPC server, adds the worker service, and
         starts listening for incoming connections.
         """
-        server = grpc.aio.server()
+        # Create interceptor bridge if interceptors are registered
+        interceptors = []
+        if self._interceptors:
+            interceptors.append(WoolInterceptorBridge(self._interceptors))
+
+        server = grpc.aio.server(interceptors=interceptors)
         credentials = resolve_server_credentials(self._credentials)
         address = self._address(self._host, self._port)
 
