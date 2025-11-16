@@ -52,6 +52,9 @@ message WorkerMetadata {
 
     // Additional arbitrary metadata as key-value pairs
     map<string, string> extra = 7;
+
+    // Whether the worker requires secure TLS/mTLS connections
+    bool secure = 8;
 }
 
 message Void {}
