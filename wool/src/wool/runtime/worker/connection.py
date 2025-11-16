@@ -11,7 +11,9 @@ import cloudpickle
 import grpc.aio
 
 from wool.runtime import protobuf as pb
-from wool.runtime.work import WorkTask
+from wool.runtime.work.task import WorkTask
+from wool.runtime.worker.base import ChannelCredentialsType
+from wool.runtime.worker.base import resolve_channel_credentials
 
 _DispatchCall: TypeAlias = grpc.aio.UnaryStreamCall[pb.task.Task, pb.worker.Response]
 
@@ -187,6 +189,8 @@ class WorkerConnection:
         Examples: ``localhost:50051``, ``192.0.2.1:50051``
     :param limit:
         Maximum concurrent task dispatches.
+    :param credentials:
+        Optional channel credentials for TLS/mTLS connections.
     """
 
     TRANSIENT_ERRORS: Final = {
@@ -200,20 +204,32 @@ class WorkerConnection:
         target: str,
         *,
         limit: int = 100,
+        credentials: ChannelCredentialsType = None,
     ):
         if limit <= 0:
             raise ValueError("Limit must be positive")
-        self._channel = grpc.aio.insecure_channel(
-            target,
-            options=[
-                ("grpc.keepalive_time_ms", 10000),
-                ("grpc.keepalive_timeout_ms", 5000),
-                ("grpc.http2.max_pings_without_data", 0),
-                ("grpc.http2.min_time_between_pings_ms", 10000),
-                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                ("grpc.max_send_message_length", 100 * 1024 * 1024),
-            ],
-        )
+
+        # Resolve credentials (if callable)
+        resolved_credentials = resolve_channel_credentials(credentials)
+
+        # Create channel options
+        options = [
+            ("grpc.keepalive_time_ms", 10000),
+            ("grpc.keepalive_timeout_ms", 5000),
+            ("grpc.http2.max_pings_without_data", 0),
+            ("grpc.http2.min_time_between_pings_ms", 10000),
+            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+        ]
+
+        # Create secure or insecure channel based on credentials
+        if resolved_credentials is not None:
+            self._channel = grpc.aio.secure_channel(
+                target, resolved_credentials, options=options
+            )
+        else:
+            self._channel = grpc.aio.insecure_channel(target, options=options)
+
         self._stub = pb.worker.WorkerStub(self._channel)
         self._semaphore = asyncio.Semaphore(limit)
 

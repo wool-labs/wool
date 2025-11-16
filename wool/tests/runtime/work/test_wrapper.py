@@ -8,7 +8,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool.runtime.work import work
+from wool.runtime.work.wrapper import work
 
 
 @work
