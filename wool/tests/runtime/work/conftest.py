@@ -9,7 +9,7 @@ import pytest
 from pytest_mock import MockerFixture
 
 import wool
-from wool.runtime.work import WorkTask
+from wool.runtime.work.task import WorkTask
 
 
 class PicklableProxy:

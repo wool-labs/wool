@@ -9,7 +9,11 @@ import grpc.aio
 import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.base import ChannelCredentialsType
+from wool.runtime.worker.base import ServerCredentialsType
 from wool.runtime.worker.base import Worker
+from wool.runtime.worker.base import resolve_channel_credentials
 from wool.runtime.worker.process import WorkerProcess
 
 
@@ -51,11 +55,20 @@ class LocalWorker(Worker):
         Graceful shutdown timeout in seconds.
     :param proxy_pool_ttl:
         Proxy pool TTL in seconds.
+    :param credentials:
+        Optional credentials for TLS/mTLS authentication:
+
+        - :class:`WorkerCredentials`: Provides both server and client
+          credentials for mutual TLS. Enables secure worker-to-worker
+          communication.
+        - ``None``: Worker uses insecure connections.
     :param extra:
         Additional metadata as key-value pairs.
     """
 
     _worker_process: WorkerProcess
+    _server_credentials: ServerCredentialsType
+    _client_credentials: ChannelCredentialsType
 
     def __init__(
         self,
@@ -64,14 +77,25 @@ class LocalWorker(Worker):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
+        credentials: WorkerCredentials | None = None,
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
+
+        # Extract server and client credentials
+        if credentials is not None:
+            self._server_credentials = credentials.server_credentials
+            self._client_credentials = credentials.client_credentials
+        else:
+            self._server_credentials = None
+            self._client_credentials = None
+
         self._worker_process = WorkerProcess(
             host=host,
             port=port,
             shutdown_grace_period=shutdown_grace_period,
             proxy_pool_ttl=proxy_pool_ttl,
+            server_credentials=self._server_credentials,
         )
 
     @property
@@ -131,18 +155,32 @@ class LocalWorker(Worker):
             version=wool.__version__,
             tags=frozenset(self._tags),
             extra=MappingProxyType(self._extra),
+            secure=self._server_credentials is not None,
         )
 
     async def _stop(self, timeout: float | None):
         """Stop the worker process and unregister it from the pool.
 
         Unregisters the worker from the registrar service, gracefully
-        shuts down the worker process using SIGINT, and cleans up
-        the registrar service. If graceful shutdown fails, the process
+        shuts down the worker process using a gRPC stop request, and cleans
+        up the registrar service. If graceful shutdown fails, the process
         is forcefully terminated.
+
+        For workers configured with :class:`WorkerCredentials`, uses
+        the client credentials to establish a secure connection for the
+        stop operation. For insecure workers, uses an insecure channel.
         """
         if self._worker_process.is_alive():
             assert self.address
-            channel = grpc.aio.insecure_channel(self.address)
+
+            # Create appropriate channel based on available credentials
+            credentials = resolve_channel_credentials(self._client_credentials)
+            if credentials is not None:
+                # Secure worker with mTLS: use client credentials
+                channel = grpc.aio.secure_channel(self.address, credentials)
+            else:
+                # Insecure worker: use insecure channel
+                channel = grpc.aio.insecure_channel(self.address)
+
             stub = pb.worker.WorkerStub(channel)
             await stub.stop(pb.worker.StopRequest(timeout=timeout))

@@ -12,8 +12,8 @@ from pytest_mock import MockerFixture
 from wool.runtime import protobuf as pb
 from wool.runtime.protobuf.worker import WorkerStub
 from wool.runtime.protobuf.worker import add_WorkerServicer_to_server
-from wool.runtime.work import WorkTask
-from wool.runtime.work import WorkTaskEvent
+from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import WorkTaskEvent
 from wool.runtime.worker.service import WorkerService
 from wool.runtime.worker.service import _ReadOnlyEvent
 

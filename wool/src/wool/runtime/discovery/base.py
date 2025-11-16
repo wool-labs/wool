@@ -46,6 +46,8 @@ class WorkerMetadata:
         Frozenset of capability tags for worker filtering and selection.
     :param extra:
         Additional arbitrary metadata as immutable key-value pairs.
+    :param secure:
+        Whether the worker requires secure TLS/mTLS connections.
     """
 
     uid: uuid.UUID
@@ -57,6 +59,7 @@ class WorkerMetadata:
     extra: MappingProxyType = field(
         default_factory=lambda: MappingProxyType({}), hash=False
     )
+    secure: bool = field(default=False, hash=False)
 
     @classmethod
     def from_protobuf(cls, protobuf: WorkerMetadataProtobuf) -> WorkerMetadata:
@@ -78,6 +81,7 @@ class WorkerMetadata:
             version=protobuf.version,
             tags=frozenset(protobuf.tags),
             extra=MappingProxyType(dict(protobuf.extra)),
+            secure=protobuf.secure,
         )
 
     def to_protobuf(self) -> WorkerMetadataProtobuf:
@@ -95,6 +99,7 @@ class WorkerMetadata:
             version=self.version,
             tags=list(self.tags),
             extra=dict(self.extra),
+            secure=self.secure,
         )
 
 

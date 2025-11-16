@@ -11,10 +11,10 @@ from hypothesis import strategies as st
 
 import wool
 from wool.runtime import protobuf as pb
-from wool.runtime.work import WorkTask
-from wool.runtime.work import WorkTaskEvent
-from wool.runtime.work import WorkTaskException
-from wool.runtime.work import current_task
+from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import WorkTaskEvent
+from wool.runtime.work.task import WorkTaskException
+from wool.runtime.work.task import current_task
 
 
 class PicklableProxy:

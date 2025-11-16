@@ -12,10 +12,14 @@ from typing import Coroutine
 from typing import Final
 from typing import overload
 
+from wool.runtime.context import RuntimeContext
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.typing import Factory
+from wool.runtime.typing import Undefined
+from wool.runtime.typing import UndefinedType
+from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.local import LocalWorker
@@ -31,8 +35,8 @@ class WorkerPool:
     The core of wool's distributed runtime. Manages worker lifecycle,
     discovery, and load balancing across two modes:
 
-    - **Ephemeral pools** spawn local workers automatically managed within the
-    pool's lifecycle. Perfect for development and single-machine deployments.
+    - **Ephemeral pools** spawn local workers managed within the pool's
+    lifecycle. Perfect for development and single-machine deployments.
 
     - **Durable pools** connect to existing remote workers through discovery
     services. Workers run independently, serving multiple clients across
@@ -41,9 +45,6 @@ class WorkerPool:
     **Basic ephemeral pool:**
 
     .. code-block:: python
-
-        import wool
-
 
         @wool.work
         async def fibonacci(n: int) -> int:
@@ -145,6 +146,8 @@ class WorkerPool:
         Load balancer instance, factory, or context manager.
     :param discovery:
         Discovery service instance, factory, or context manager.
+    :param credentials:
+        Optional channel credentials for TLS/mTLS connections to workers.
     :raises ValueError:
         If configuration is invalid or CPU count unavailable.
     """
@@ -161,6 +164,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
+        credentials: WorkerCredentials | None | UndefinedType = Undefined,
     ):
         """
         Create an ephemeral pool of workers, spawning the specified quantity of workers
@@ -176,6 +180,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
+        credentials: WorkerCredentials | None | UndefinedType = Undefined,
     ):
         """
         Connect to an existing pool of workers discovered by the specified discovery
@@ -192,8 +197,23 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
+        credentials: WorkerCredentials | None | UndefinedType = Undefined,
     ):
         self._workers = {}
+
+        # Resolve credentials: explicit parameter overrides runtime context
+        if credentials is Undefined:
+            ctx = RuntimeContext.get_current()
+            credentials = ctx.credentials
+        else:
+            credentials = credentials
+
+        if credentials is not None:
+            self._server_credentials = credentials.server_credentials
+            self._client_credentials = credentials.client_credentials
+        else:
+            self._server_credentials = None
+            self._client_credentials = None
 
         match (size, discovery):
             case (size, discovery) if size is not None and discovery is not None:
@@ -223,6 +243,7 @@ class WorkerPool:
                             async with WorkerProxy(
                                 discovery=discovery_svc.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
+                                credentials=self._client_credentials,
                             ):
                                 yield
                     finally:
@@ -251,6 +272,7 @@ class WorkerPool:
                         async with WorkerProxy(
                             discovery=discovery.subscribe(_predicate(tags)),
                             loadbalancer=loadbalancer,
+                            credentials=self._client_credentials,
                         ):
                             yield
 
@@ -265,6 +287,7 @@ class WorkerPool:
                         async with WorkerProxy(
                             discovery=discovery_svc.subscriber,
                             loadbalancer=loadbalancer,
+                            credentials=self._client_credentials,
                         ):
                             yield
                     finally:
@@ -290,6 +313,7 @@ class WorkerPool:
                         async with WorkerProxy(
                             discovery=discovery.subscriber,
                             loadbalancer=loadbalancer,
+                            credentials=self._client_credentials,
                         ):
                             yield
 
@@ -331,7 +355,7 @@ class WorkerPool:
 
         tasks = []
         for _ in range(size):
-            worker = factory(*tags)
+            worker = factory(*tags, credentials=self._server_credentials)
 
             async def start(worker):
                 await worker.start()
@@ -354,8 +378,8 @@ class WorkerPool:
             await self._exit_context(publisher_ctx)
 
     def _default_worker_factory(self):
-        def factory(*tags, **_):
-            return LocalWorker(*tags)
+        def factory(*tags, credentials=None, **_):
+            return LocalWorker(*tags, credentials=credentials)
 
         return factory
 

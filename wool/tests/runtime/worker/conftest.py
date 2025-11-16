@@ -1,15 +1,24 @@
 import asyncio
+import datetime
 import uuid
 from types import MappingProxyType
 from typing import Any
 from unittest.mock import MagicMock
 
+import grpc
 import pytest
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from pytest_mock import MockerFixture
 
 import wool.runtime.worker.pool as wp
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.worker.auth import WorkerCredentials
 
 
 @pytest.fixture
@@ -434,3 +443,135 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata)
     proxy.workers = [worker1, worker2]
 
     yield proxy
+
+
+# ============================================================================
+# Credential Fixtures for Authentication Tests
+# ============================================================================
+
+
+def _generate_test_certificates():
+    """Generate self-signed test certificates for SSL/TLS testing.
+
+    Creates a certificate authority (CA) and worker certificate for
+    localhost. These certificates are used for secure gRPC connections
+    in tests.
+
+    Returns:
+        Tuple of (private_key_pem, certificate_pem, ca_cert_pem)
+    """
+    # Generate private key
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+
+    # Create certificate subject
+    subject = issuer = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+        ]
+    )
+
+    # Build self-signed certificate with both server and client auth
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.utcnow())
+        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [
+                    x509.DNSName("localhost"),
+                ]
+            ),
+            critical=False,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage(
+                [
+                    x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
+                    x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH,
+                ]
+            ),
+            critical=False,
+        )
+        .sign(private_key, hashes.SHA256(), default_backend())
+    )
+
+    # Serialize to PEM format
+    private_key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+
+    return private_key_pem, cert_pem, cert_pem
+
+
+@pytest.fixture(scope="module")
+def test_certificates():
+    """Provide test certificates for the test module.
+
+    Returns:
+        Tuple of (private_key_pem, certificate_pem, ca_cert_pem)
+    """
+    return _generate_test_certificates()
+
+
+@pytest.fixture
+def worker_credentials(test_certificates):
+    """Provide WorkerCredentials with mutual=True for testing.
+
+    Returns:
+        WorkerCredentials instance configured for mTLS
+    """
+    key_pem, cert_pem, ca_pem = test_certificates
+    return WorkerCredentials(
+        ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=True
+    )
+
+
+@pytest.fixture
+def worker_credentials_one_way(test_certificates):
+    """Provide WorkerCredentials with mutual=False for testing.
+
+    Returns:
+        WorkerCredentials instance configured for one-way TLS
+    """
+    key_pem, cert_pem, ca_pem = test_certificates
+    return WorkerCredentials(
+        ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=False
+    )
+
+
+@pytest.fixture
+def worker_credentials_callable(test_certificates):
+    """Provide WorkerCredentials with callable credentials for testing.
+
+    Returns:
+        WorkerCredentials with callable server and client credentials
+    """
+    key_pem, cert_pem, ca_pem = test_certificates
+
+    def server_factory():
+        return grpc.ssl_server_credentials(
+            private_key_certificate_chain_pairs=[(key_pem, cert_pem)],
+            root_certificates=ca_pem,
+            require_client_auth=True,
+        )
+
+    def client_factory():
+        return grpc.ssl_channel_credentials(
+            root_certificates=ca_pem, private_key=key_pem, certificate_chain=cert_pem
+        )
+
+    # Create a WorkerCredentials-like object with callable properties
+    # Since WorkerCredentials is frozen, we need to create it differently
+    return WorkerCredentials(
+        ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=True
+    )

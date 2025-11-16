@@ -6,21 +6,6 @@ from typing import Final
 from tblib import pickling_support
 
 from wool.runtime.context import RuntimeContext
-from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.work import WorkTask
-from wool.runtime.work import WorkTaskEvent
-from wool.runtime.work import WorkTaskEventHandler
-from wool.runtime.work import WorkTaskEventType
-from wool.runtime.work import WorkTaskException
-from wool.runtime.work import current_task
-from wool.runtime.work import work
-
-# Backward compatibility aliases (deprecated)
-WoolTask = WorkTask
-WoolTaskEvent = WorkTaskEvent
-WoolTaskEventHandler = WorkTaskEventHandler
-WoolTaskEventType = WorkTaskEventType
-WoolTaskException = WorkTaskException
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryEventType
@@ -36,7 +21,16 @@ from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.typing import Factory
+from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import WorkTaskEvent
+from wool.runtime.work.task import WorkTaskEventHandler
+from wool.runtime.work.task import WorkTaskEventType
+from wool.runtime.work.task import WorkTaskException
+from wool.runtime.work.task import current_task
+from wool.runtime.work.wrapper import work
+from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
@@ -88,15 +82,10 @@ __all__ = [
     "current_task",
     "routine",
     "work",
-    # Work - Backward compatibility (deprecated)
-    "WoolTask",
-    "WoolTaskEvent",
-    "WoolTaskEventHandler",
-    "WoolTaskEventType",
-    "WoolTaskException",
     # Workers
     "LocalWorker",
     "Worker",
+    "WorkerCredentials",
     "WorkerFactory",
     "WorkerLike",
     "WorkerPool",

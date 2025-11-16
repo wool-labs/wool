@@ -1,10 +1,3 @@
-"""Core event infrastructure for the Wool runtime system.
-
-This module provides the foundational event system used throughout Wool's
-runtime. All runtime events (task lifecycle, worker discovery, etc.) inherit
-from the Event base class and implement the EventLike protocol.
-"""
-
 from __future__ import annotations
 
 from abc import ABC

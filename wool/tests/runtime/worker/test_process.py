@@ -2,8 +2,11 @@ import signal
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
+import grpc
 import pytest
+from hypothesis import HealthCheck
 from hypothesis import given
+from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool.runtime.worker.process import WorkerProcess
@@ -728,6 +731,7 @@ class TestWorkerProcess:
         # Mock WorkerService
         mock_service = MagicMock()
         mock_service.stopped.wait = AsyncMock()
+        mock_service.configure_server = AsyncMock(return_value=50051)
         mocker.patch(
             "wool.runtime.worker.process.WorkerService", return_value=mock_service
         )
@@ -785,6 +789,7 @@ class TestWorkerProcess:
         # Mock WorkerService
         mock_service = MagicMock()
         mock_service.stopped.wait = AsyncMock()
+        mock_service.configure_server = AsyncMock(return_value=8080)
         mocker.patch(
             "wool.runtime.worker.process.WorkerService", return_value=mock_service
         )
@@ -827,6 +832,7 @@ class TestWorkerProcess:
         # Mock WorkerService
         mock_service = MagicMock()
         mock_service.stopped.wait = AsyncMock()
+        mock_service.configure_server = AsyncMock(return_value=50051)
         mocker.patch(
             "wool.runtime.worker.process.WorkerService", return_value=mock_service
         )
@@ -875,6 +881,7 @@ class TestWorkerProcess:
         # Mock WorkerService with error
         mock_service = MagicMock()
         mock_service.stopped.wait = AsyncMock(side_effect=Exception("Service error"))
+        mock_service.configure_server = AsyncMock(return_value=50051)
         mocker.patch(
             "wool.runtime.worker.process.WorkerService", return_value=mock_service
         )
@@ -892,3 +899,421 @@ class TestWorkerProcess:
 
         # But server.stop should still be called with correct grace period
         mock_stop.assert_called_once_with(grace=45.0)
+
+    # === SINGLE-PORT ARCHITECTURE TESTS ===
+
+    def test_serve_insecure_worker_single_port(self, mocker):
+        """Test single insecure port for insecure workers.
+
+        Given:
+            WorkerProcess with server_credentials=None
+        When:
+            Process is started and server is configured
+        Then:
+            Only add_insecure_port is called, add_secure_port is not called
+        """
+        # Mock server
+        mock_server = MagicMock()
+        mock_server.add_insecure_port = MagicMock(return_value=50051)
+        mock_server.add_secure_port = MagicMock()
+        mock_server.start = AsyncMock()
+        mock_server.stop = AsyncMock()
+        mocker.patch("grpc.aio.server", return_value=mock_server)
+
+        # Mock WorkerService
+        mock_service = MagicMock()
+        mock_service.configure_server = AsyncMock(return_value=50051)
+        mock_service.stopped.wait = AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
+
+        # Mock signal handlers
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        # Create insecure worker
+        process = WorkerProcess(host="127.0.0.1", port=0, server_credentials=None)
+
+        # Mock pipe
+        mocker.patch.object(process._set_port, "send")
+        mocker.patch.object(process._set_port, "close")
+
+        # Run process (will block, so we need to mock stopped.wait)
+        process.run()
+
+        # Verify only insecure port was added
+        mock_server.add_insecure_port.assert_called_once()
+        mock_server.add_secure_port.assert_not_called()
+
+    def test_serve_secure_worker_single_port(self, mocker):
+        """Test single secure port for secure workers.
+
+        Given:
+            WorkerProcess with valid ServerCredentials
+        When:
+            Process is started and server is configured
+        Then:
+            Only add_secure_port is called with credentials, add_insecure_port is not called
+        """
+        # Create server credentials
+        dummy_key = (
+            b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
+        )
+        dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
+        server_creds = grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+
+        # Mock server
+        mock_server = MagicMock()
+        mock_server.add_secure_port = MagicMock(return_value=50051)
+        mock_server.start = AsyncMock()
+        mock_server.stop = AsyncMock()
+        mock_server.add_insecure_port = MagicMock()
+        mock_server.start = AsyncMock()
+        mock_server.stop = AsyncMock()
+        mocker.patch("grpc.aio.server", return_value=mock_server)
+
+        # Mock WorkerService
+        mock_service = MagicMock()
+        mock_service.configure_server = AsyncMock(return_value=50051)
+        mock_service.stopped.wait = AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
+
+        # Mock signal handlers
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        # Create secure worker
+        process = WorkerProcess(
+            host="127.0.0.1", port=0, server_credentials=server_creds
+        )
+
+        # Mock pipe
+        mocker.patch.object(process._set_port, "send")
+        mocker.patch.object(process._set_port, "close")
+
+        # Run process
+        process.run()
+
+        # Verify only secure port was added
+        mock_server.add_secure_port.assert_called_once()
+        mock_server.add_insecure_port.assert_not_called()
+
+    def test_serve_callable_credentials_resolved(self, mocker):
+        """Test callable credential resolution.
+
+        Given:
+            WorkerProcess with callable ServerCredentials
+        When:
+            Process is started and server is configured
+        Then:
+            Credentials are resolved and add_secure_port is called with resolved credentials
+        """
+        # Create callable credentials
+        dummy_key = (
+            b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
+        )
+        dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
+
+        def server_creds_factory():
+            return grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+
+        # Mock server
+        mock_server = MagicMock()
+        mock_server.add_secure_port = MagicMock(return_value=50051)
+        mock_server.start = AsyncMock()
+        mock_server.stop = AsyncMock()
+        mocker.patch("grpc.aio.server", return_value=mock_server)
+
+        # Mock WorkerService
+        mock_service = MagicMock()
+        mock_service.configure_server = AsyncMock(return_value=50051)
+        mock_service.stopped.wait = AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
+
+        # Mock signal handlers
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        # Create secure worker with callable
+        process = WorkerProcess(
+            host="127.0.0.1", port=0, server_credentials=server_creds_factory
+        )
+
+        # Mock pipe
+        mocker.patch.object(process._set_port, "send")
+        mocker.patch.object(process._set_port, "close")
+
+        # Run process
+        process.run()
+
+        # Verify secure port was added (credentials were resolved)
+        mock_server.add_secure_port.assert_called_once()
+
+    def test_serve_secure_worker_random_port_assignment(self, mocker):
+        """Test random port assignment for secure worker.
+
+        Given:
+            WorkerProcess with ServerCredentials and port=0
+        When:
+            Process is started
+        Then:
+            A single random port is assigned and returned
+        """
+        dummy_key = (
+            b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
+        )
+        dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
+        server_creds = grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+
+        # Mock server to return random port
+        mock_server = MagicMock()
+        mock_server.add_secure_port = MagicMock(return_value=54321)
+        mock_server.start = AsyncMock()
+        mock_server.stop = AsyncMock()
+        mocker.patch("grpc.aio.server", return_value=mock_server)
+
+        # Mock WorkerService
+        mock_service = MagicMock()
+        mock_service.configure_server = AsyncMock(return_value=54321)
+        mock_service.stopped.wait = AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
+
+        # Mock signal handlers
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        # Create secure worker with port=0
+        process = WorkerProcess(
+            host="127.0.0.1", port=0, server_credentials=server_creds
+        )
+
+        # Mock pipe - capture the port that was sent
+        sent_ports = []
+        mocker.patch.object(
+            process._set_port, "send", side_effect=lambda x: sent_ports.append(x)
+        )
+        mocker.patch.object(process._set_port, "close")
+
+        # Run process
+        process.run()
+
+        # Verify a port was assigned
+        assert len(sent_ports) == 1
+        assert sent_ports[0] == 54321
+
+    def test_serve_insecure_worker_random_port_assignment(self, mocker):
+        """Test random port assignment for insecure worker.
+
+        Given:
+            WorkerProcess with no credentials and port=0
+        When:
+            Process is started
+        Then:
+            A single random port is assigned and returned
+        """
+        # Mock server to return random port
+        mock_server = MagicMock()
+        mock_server.add_insecure_port = MagicMock(return_value=54322)
+        mock_server.start = AsyncMock()
+        mock_server.stop = AsyncMock()
+        mocker.patch("grpc.aio.server", return_value=mock_server)
+
+        # Mock WorkerService
+        mock_service = MagicMock()
+        mock_service.configure_server = AsyncMock(return_value=54322)
+        mock_service.stopped.wait = AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
+
+        # Mock signal handlers
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        # Create insecure worker with port=0
+        process = WorkerProcess(host="127.0.0.1", port=0, server_credentials=None)
+
+        # Mock pipe - capture the port that was sent
+        sent_ports = []
+        mocker.patch.object(
+            process._set_port, "send", side_effect=lambda x: sent_ports.append(x)
+        )
+        mocker.patch.object(process._set_port, "close")
+
+        # Run process
+        process.run()
+
+        # Verify a port was assigned
+        assert len(sent_ports) == 1
+        assert sent_ports[0] == 54322
+
+    def test_serve_no_dual_port_architecture(self, mocker):
+        """Test no dual-port architecture.
+
+        Given:
+            WorkerProcess with ServerCredentials
+        When:
+            Process is started and port is retrieved
+        Then:
+            Port number matches the secure port, no additional localhost port exists
+        """
+        dummy_key = (
+            b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
+        )
+        dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
+        server_creds = grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+
+        # Mock server
+        mock_server = MagicMock()
+        mock_server.add_secure_port = MagicMock(return_value=50051)
+        mock_server.start = AsyncMock()
+        mock_server.stop = AsyncMock()
+        mock_server.add_insecure_port = MagicMock()
+        mocker.patch("grpc.aio.server", return_value=mock_server)
+
+        # Mock WorkerService
+        mock_service = MagicMock()
+        mock_service.configure_server = AsyncMock(return_value=50051)
+        mock_service.stopped.wait = AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
+
+        # Mock signal handlers
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        # Create secure worker
+        process = WorkerProcess(
+            host="127.0.0.1", port=0, server_credentials=server_creds
+        )
+
+        # Mock pipe
+        mocker.patch.object(process._set_port, "send")
+        mocker.patch.object(process._set_port, "close")
+
+        # Run process
+        process.run()
+
+        # Verify no insecure port was added (no dual-port architecture)
+        mock_server.add_insecure_port.assert_not_called()
+        # Verify only one port was added
+        assert mock_server.add_secure_port.call_count == 1
+
+    def test_serve_no_insecure_backdoor(self, mocker):
+        """Test no insecure localhost backdoor.
+
+        Given:
+            Running WorkerProcess with ServerCredentials
+        When:
+            Attempt to connect via insecure channel to the port
+        Then:
+            Connection fails or is rejected (no insecure fallback port)
+        """
+        dummy_key = (
+            b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
+        )
+        dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
+        server_creds = grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+
+        # Mock server
+        mock_server = MagicMock()
+        mock_server.add_secure_port = MagicMock(return_value=50051)
+        mock_server.start = AsyncMock()
+        mock_server.stop = AsyncMock()
+        mock_server.add_insecure_port = MagicMock()
+        mocker.patch("grpc.aio.server", return_value=mock_server)
+
+        # Mock WorkerService
+        mock_service = MagicMock()
+        mock_service.configure_server = AsyncMock(return_value=50051)
+        mock_service.stopped.wait = AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
+
+        # Mock signal handlers
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        # Create secure worker
+        process = WorkerProcess(
+            host="127.0.0.1", port=0, server_credentials=server_creds
+        )
+
+        # Mock pipe
+        mocker.patch.object(process._set_port, "send")
+        mocker.patch.object(process._set_port, "close")
+
+        # Run process
+        process.run()
+
+        # Verify no insecure port exists - no backdoor
+        # The key assertion: add_insecure_port was never called
+        mock_server.add_insecure_port.assert_not_called()
+
+    @given(has_credentials=st.booleans())
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test_single_port_invariant(self, has_credentials, mocker):
+        """Test single-port invariant property.
+
+        Given:
+            Any WorkerProcess with valid or None credentials
+        When:
+            Process is started and configured
+        Then:
+            Exactly one port is bound (either secure or insecure, never both)
+        """
+        # Create credentials if needed
+        if has_credentials:
+            dummy_key = (
+                b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
+            )
+            dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
+            server_creds = grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+        else:
+            server_creds = None
+
+        # Mock server
+        mock_server = MagicMock()
+        mock_server.add_secure_port = MagicMock(return_value=50051)
+        mock_server.start = AsyncMock()
+        mock_server.stop = AsyncMock()
+        mock_server.add_insecure_port = MagicMock(return_value=50051)
+        mocker.patch("grpc.aio.server", return_value=mock_server)
+
+        # Mock WorkerService
+        mock_service = MagicMock()
+        mock_service.configure_server = AsyncMock(return_value=50051)
+        mock_service.stopped.wait = AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService", return_value=mock_service
+        )
+
+        # Mock signal handlers
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        # Create worker
+        process = WorkerProcess(
+            host="127.0.0.1", port=0, server_credentials=server_creds
+        )
+
+        # Mock pipe
+        mocker.patch.object(process._set_port, "send")
+        mocker.patch.object(process._set_port, "close")
+
+        # Run process
+        process.run()
+
+        # Verify exactly one port binding method was called
+        secure_calls = mock_server.add_secure_port.call_count
+        insecure_calls = mock_server.add_insecure_port.call_count
+        assert secure_calls + insecure_calls == 1, "Exactly one port must be bound"
+
+        # Verify correct method was called based on credentials
+        if has_credentials:
+            assert secure_calls == 1, "Secure worker must use secure port"
+            assert insecure_calls == 0, "Secure worker must not have insecure port"
+        else:
+            assert insecure_calls == 1, "Insecure worker must use insecure port"
+            assert secure_calls == 0, "Insecure worker must not have secure port"

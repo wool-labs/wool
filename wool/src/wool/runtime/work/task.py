@@ -76,7 +76,7 @@ class WorkerProxyLike(Protocol):
     """
 
     @property
-    def id(self) -> uuid.UUID: ...
+    def id(self) -> UUID: ...
 
     async def dispatch(
         self, task: WorkTask, *, timeout: float | None = None
