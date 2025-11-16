@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from functools import partial
 from typing import TYPE_CHECKING
 from typing import AsyncContextManager
 from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Awaitable
+from typing import Callable
 from typing import ContextManager
 from typing import Generic
 from typing import Sequence
@@ -24,10 +26,11 @@ from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.typing import Factory
+from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.connection import WorkerConnection
 
 if TYPE_CHECKING:
-    from wool.runtime.work import WorkTask
+    from wool.runtime.work.task import WorkTask
 
 T = TypeVar("T")
 
@@ -61,7 +64,9 @@ class ReducibleAsyncIterator(Generic[T]):
         return (self.__class__, (self._items,))
 
 
-async def connection_factory(target: str) -> WorkerConnection:
+async def connection_factory(
+    target: str, credentials: ChannelCredentialsType = None
+) -> WorkerConnection:
     """Factory function for creating worker connections.
 
     Creates a connection to the specified worker target.
@@ -69,10 +74,12 @@ async def connection_factory(target: str) -> WorkerConnection:
 
     :param target:
         The network target (host:port) to create a channel for.
+    :param credentials:
+        Optional channel credentials for TLS/mTLS.
     :returns:
         A new connection to the target.
     """
-    return WorkerConnection(target)
+    return WorkerConnection(target, credentials=credentials)
 
 
 async def connection_finalizer(connection: WorkerConnection) -> None:
@@ -160,6 +167,8 @@ class WorkerProxy:
         Static worker list for direct connection.
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
+    :param credentials:
+        Optional channel credentials for TLS/mTLS connections to workers.
     """
 
     _discovery: DiscoverySubscriberLike | Factory[DiscoverySubscriberLike]
@@ -172,6 +181,7 @@ class WorkerProxy:
     _loadbalancer_manager: (
         AsyncContextManager[LoadBalancerLike] | ContextManager[LoadBalancerLike]
     )
+    _credentials: ChannelCredentialsType
 
     @overload
     def __init__(
@@ -181,6 +191,7 @@ class WorkerProxy:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
+        credentials: ChannelCredentialsType | None = None,
     ): ...
 
     @overload
@@ -188,8 +199,10 @@ class WorkerProxy:
         self,
         *,
         workers: Sequence[WorkerMetadata],
-        loadbalancer: LoadBalancerLike
-        | Factory[LoadBalancerLike] = RoundRobinLoadBalancer,
+        loadbalancer: (
+            LoadBalancerLike | Factory[LoadBalancerLike]
+        ) = RoundRobinLoadBalancer,
+        credentials: ChannelCredentialsType | None = None,
     ): ...
 
     @overload
@@ -197,8 +210,10 @@ class WorkerProxy:
         self,
         pool_uri: str,
         *tags: str,
-        loadbalancer: LoadBalancerLike
-        | Factory[LoadBalancerLike] = RoundRobinLoadBalancer,
+        loadbalancer: (
+            LoadBalancerLike | Factory[LoadBalancerLike]
+        ) = RoundRobinLoadBalancer,
+        credentials: ChannelCredentialsType | None = None,
     ): ...
 
     def __init__(
@@ -209,8 +224,10 @@ class WorkerProxy:
             DiscoverySubscriberLike | Factory[DiscoverySubscriberLike] | None
         ) = None,
         workers: Sequence[WorkerMetadata] | None = None,
-        loadbalancer: LoadBalancerLike
-        | Factory[LoadBalancerLike] = RoundRobinLoadBalancer,
+        loadbalancer: (
+            LoadBalancerLike | Factory[LoadBalancerLike]
+        ) = RoundRobinLoadBalancer,
+        credentials: ChannelCredentialsType | None = None,
     ):
         if not (pool_uri or discovery or workers):
             raise ValueError(
@@ -221,17 +238,30 @@ class WorkerProxy:
         self._id: uuid.UUID = uuid.uuid4()
         self._started = False
         self._loadbalancer = loadbalancer
+        self._credentials = credentials
+
+        # Create security filter based on resolved credentials
+        security_filter = self._create_security_filter(self._credentials)
 
         match (pool_uri, discovery, workers):
             case (pool_uri, None, None) if pool_uri is not None:
+                # Combine tag filter with security filter
+                def combined_filter(w):
+                    return bool({pool_uri, *tags} & w.tags) and security_filter(w)
+
                 self._discovery = LocalDiscovery(pool_uri).subscribe(
-                    filter=lambda w: bool({pool_uri, *tags} & w.tags)
+                    filter=combined_filter
                 )
             case (None, discovery, None) if discovery is not None:
                 self._discovery = discovery
             case (None, None, workers) if workers is not None:
+                # Filter workers by security compatibility
+                compatible_workers = [w for w in workers if security_filter(w)]
                 self._discovery = ReducibleAsyncIterator(
-                    [DiscoveryEvent("worker-added", metadata=w) for w in workers]
+                    [
+                        DiscoveryEvent("worker-added", metadata=w)
+                        for w in compatible_workers
+                    ]
                 )
             case _:
                 raise ValueError(
@@ -317,8 +347,10 @@ class WorkerProxy:
             raise ValueError
 
         self._proxy_token = wool.__proxy__.set(self)
+        # Create connection factory with credentials bound
+        factory = partial(connection_factory, credentials=self._credentials)
         self._connection_pool = ResourcePool(
-            factory=connection_factory, finalizer=connection_finalizer, ttl=60
+            factory=factory, finalizer=connection_finalizer, ttl=60
         )
         self._loadbalancer_context = LoadBalancerContext()
         self._sentinel_task = asyncio.create_task(self._worker_sentinel())
@@ -403,6 +435,27 @@ class WorkerProxy:
         elif isinstance(ctx, ContextManager):
             ctx.__exit__(*args)
 
+    def _create_security_filter(
+        self, credentials: ChannelCredentialsType
+    ) -> Callable[[WorkerMetadata], bool]:
+        """Create discovery filter based on proxy credentials.
+
+        Workers and proxies must have compatible security settings:
+        - Proxy with credentials only discovers workers with secure=True
+        - Proxy without credentials only discovers workers with secure=False
+
+        :param credentials:
+            Channel credentials for this proxy.
+        :returns:
+            Predicate function for filtering workers by security compatibility.
+        """
+        if credentials is not None:
+            # Proxy has credentials: only accept secure workers
+            return lambda metadata: metadata.secure
+        else:
+            # Proxy has no credentials: only accept insecure workers
+            return lambda metadata: not metadata.secure
+
     async def _await_workers(self):
         while not self._loadbalancer_context or not self._loadbalancer_context.workers:
             await asyncio.sleep(0)
@@ -410,7 +463,6 @@ class WorkerProxy:
     async def _worker_sentinel(self):
         assert self._loadbalancer_context
         async for event in self._discovery_stream:
-            event.emit(context={"proxy_id": str(self.id)})
             match event.type:
                 case "worker-added":
                     self._loadbalancer_context.add_worker(
@@ -428,3 +480,4 @@ class WorkerProxy:
                     )
                 case "worker-dropped":
                     self._loadbalancer_context.remove_worker(event.metadata)
+            event.emit(context={"proxy_id": str(self.id)})

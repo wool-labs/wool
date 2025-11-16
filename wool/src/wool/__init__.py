@@ -30,6 +30,7 @@ from wool.runtime.work.task import WorkTaskEventType
 from wool.runtime.work.task import WorkTaskException
 from wool.runtime.work.task import current_task
 from wool.runtime.work.wrapper import work
+from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
@@ -81,15 +82,10 @@ __all__ = [
     "current_task",
     "routine",
     "work",
-    # Work - Backward compatibility (deprecated)
-    "WoolTask",
-    "WoolTaskEvent",
-    "WoolTaskEventHandler",
-    "WoolTaskEventType",
-    "WoolTaskException",
     # Workers
     "LocalWorker",
     "Worker",
+    "WorkerCredentials",
     "WorkerFactory",
     "WorkerLike",
     "WorkerPool",

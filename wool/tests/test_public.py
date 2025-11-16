@@ -45,15 +45,10 @@ def test_public_api_completeness():
         "current_task",
         "routine",
         "work",
-        # Work - Backward compatibility (deprecated)
-        "WoolTask",
-        "WoolTaskEvent",
-        "WoolTaskEventHandler",
-        "WoolTaskEventType",
-        "WoolTaskException",
         # Workers
         "LocalWorker",
         "Worker",
+        "WorkerCredentials",
         "WorkerFactory",
         "WorkerLike",
         "WorkerPool",
