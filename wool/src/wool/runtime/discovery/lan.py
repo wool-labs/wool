@@ -471,13 +471,14 @@ def _serialize_metadata(
     :param info:
         WorkerMetadata instance to serialize.
     :returns:
-        Flat dict with pid, version, tags (JSON), extra (JSON).
+        Flat dict with pid, version, tags (JSON), extra (JSON), secure.
     """
     properties = {
         "pid": str(info.pid),
         "version": info.version,
         "tags": (json.dumps(list(info.tags)) if info.tags else None),
         "extra": (json.dumps(dict(info.extra)) if info.extra else None),
+        "secure": "true" if info.secure else "false",
     }
     return properties
 
@@ -513,6 +514,11 @@ def _deserialize_metadata(info: ServiceInfo) -> WorkerMetadata:
     else:
         extra = {}
 
+    # Parse security flag (backward compatible - defaults to False)
+    secure = False
+    if "secure" in properties and properties["secure"]:
+        secure = properties["secure"].lower() == "true"
+
     # Extract UID from service name (format: "<uuid>._wool._tcp.local.")
     service_name = info.name
     uid_str = service_name.split(".")[0]
@@ -525,4 +531,5 @@ def _deserialize_metadata(info: ServiceInfo) -> WorkerMetadata:
         version=version,
         tags=tags,
         extra=MappingProxyType(extra),
+        secure=secure,
     )

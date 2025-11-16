@@ -5,6 +5,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.process import WorkerProcess
@@ -445,3 +446,307 @@ class TestLocalWorker:
         # Should raise - error is not caught in LocalWorker._stop
         with pytest.raises(Exception, match="gRPC error"):
             await worker.stop()
+
+    # === NEW CREDENTIAL TESTS ===
+
+    def test_init_with_worker_credentials(self, worker_credentials):
+        """Test LocalWorker with WorkerCredentials.
+
+        Given:
+            WorkerCredentials instance
+        When:
+            LocalWorker is instantiated with credentials parameter
+        Then:
+            Worker extracts both server_credentials and client_credentials
+        """
+        worker = LocalWorker(credentials=worker_credentials)
+        # Verify credentials were extracted
+        assert worker._server_credentials is not None
+        assert worker._client_credentials is not None
+
+    def test_init_with_no_credentials(self):
+        """Test LocalWorker with no credentials.
+
+        Given:
+            None as credentials parameter
+        When:
+            LocalWorker is instantiated
+        Then:
+            Worker sets both server_credentials and client_credentials to None
+        """
+        worker = LocalWorker(credentials=None)
+        assert worker._server_credentials is None
+        assert worker._client_credentials is None
+
+    @pytest.mark.asyncio
+    async def test_metadata_secure_flag_with_mtls(self, mocker, worker_credentials):
+        """Test metadata.secure flag with mTLS worker.
+
+        Given:
+            LocalWorker with WorkerCredentials
+        When:
+            Worker metadata is accessed after start
+        Then:
+            metadata.secure is True
+        """
+        mock_process = mocker.MagicMock(spec=WorkerProcess)
+        mock_process.address = "127.0.0.1:50051"
+        mock_process.pid = 12345
+        mock_process.start.return_value = None
+        mock_process.is_alive.return_value = False
+
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
+
+        worker = LocalWorker(credentials=worker_credentials)
+        await worker.start()
+
+        assert worker.metadata.secure is True
+
+    @pytest.mark.asyncio
+    async def test_metadata_secure_flag_without_credentials(self, mocker):
+        """Test metadata.secure flag for insecure worker.
+
+        Given:
+            LocalWorker with no credentials
+        When:
+            Worker metadata is accessed after start
+        Then:
+            metadata.secure is False
+        """
+        mock_process = mocker.MagicMock(spec=WorkerProcess)
+        mock_process.address = "127.0.0.1:50051"
+        mock_process.pid = 12345
+        mock_process.start.return_value = None
+        mock_process.is_alive.return_value = False
+
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
+
+        worker = LocalWorker()
+        await worker.start()
+
+        assert worker.metadata.secure is False
+
+    @pytest.mark.asyncio
+    async def test_stop_with_client_credentials_secure_connection(
+        self, mocker, worker_credentials
+    ):
+        """Test secure self-connection for mTLS worker.
+
+        Given:
+            Running LocalWorker with WorkerCredentials (has client_credentials)
+        When:
+            stop() is called
+        Then:
+            Worker uses client_credentials to send secure gRPC stop request
+        """
+        mock_process = mocker.MagicMock(spec=WorkerProcess)
+        mock_process.address = "127.0.0.1:50051"
+        mock_process.pid = 12345
+        mock_process.start.return_value = None
+        mock_process.is_alive.return_value = True
+
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
+
+        worker = LocalWorker(credentials=worker_credentials)
+        await worker.start()
+
+        # Mock secure channel
+        mock_channel = MagicMock()
+        mock_stub = MagicMock()
+        mock_stub.stop = AsyncMock()
+
+        mock_secure_channel = mocker.patch(
+            "grpc.aio.secure_channel", return_value=mock_channel
+        )
+        mocker.patch(
+            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+        )
+
+        await worker.stop()
+
+        # Verify secure channel was used
+        mock_secure_channel.assert_called_once()
+        # Verify the credentials passed are the client credentials
+        call_args = mock_secure_channel.call_args
+        assert call_args[0][0] == "127.0.0.1:50051"  # address
+
+    @pytest.mark.asyncio
+    async def test_stop_without_credentials_insecure_connection(self, mocker):
+        """Test insecure self-connection for insecure worker.
+
+        Given:
+            Running LocalWorker with no credentials
+        When:
+            stop() is called
+        Then:
+            Worker uses insecure channel to send gRPC stop request
+        """
+        mock_process = mocker.MagicMock(spec=WorkerProcess)
+        mock_process.address = "127.0.0.1:50051"
+        mock_process.pid = 12345
+        mock_process.start.return_value = None
+        mock_process.is_alive.return_value = True
+
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
+
+        worker = LocalWorker()
+        await worker.start()
+
+        # Mock insecure channel
+        mock_channel = MagicMock()
+        mock_stub = MagicMock()
+        mock_stub.stop = AsyncMock()
+
+        mock_insecure_channel = mocker.patch(
+            "grpc.aio.insecure_channel", return_value=mock_channel
+        )
+        mocker.patch(
+            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+        )
+
+        await worker.stop()
+
+        # Verify insecure channel was used
+        mock_insecure_channel.assert_called_once_with("127.0.0.1:50051")
+
+    @pytest.mark.asyncio
+    async def test_stop_with_one_way_tls(self, mocker, worker_credentials_one_way):
+        """Test one-way TLS worker behavior.
+
+        Given:
+            LocalWorker with WorkerCredentials where mutual=False
+        When:
+            Worker is started and stopped
+        Then:
+            Worker uses secure channel with one-way TLS credentials
+        """
+        mock_process = mocker.MagicMock(spec=WorkerProcess)
+        mock_process.address = "127.0.0.1:50051"
+        mock_process.pid = 12345
+        mock_process.start.return_value = None
+        mock_process.is_alive.return_value = True
+
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
+
+        worker = LocalWorker(credentials=worker_credentials_one_way)
+        await worker.start()
+
+        # Verify it started
+        assert worker.metadata is not None
+
+        # Mock gRPC - one-way TLS should use secure channel
+        mock_channel = MagicMock()
+        mock_stub = MagicMock()
+        mock_stub.stop = AsyncMock()
+
+        mock_secure_channel = mocker.patch(
+            "grpc.aio.secure_channel", return_value=mock_channel
+        )
+        mocker.patch(
+            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+        )
+
+        await worker.stop()
+
+        # One-way TLS still has channel credentials (anonymous client), uses secure channel
+        mock_secure_channel.assert_called_once()
+        mock_stub.stop.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_resolves_callable_channel_credentials(
+        self, mocker, worker_credentials_callable
+    ):
+        """Test callable ChannelCredentials resolution on stop.
+
+        Given:
+            LocalWorker with callable ChannelCredentials in WorkerCredentials
+        When:
+            Worker is stopped
+        Then:
+            Callable is resolved before creating secure channel
+        """
+        mock_process = mocker.MagicMock(spec=WorkerProcess)
+        mock_process.address = "127.0.0.1:50051"
+        mock_process.pid = 12345
+        mock_process.start.return_value = None
+        mock_process.is_alive.return_value = True
+
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
+
+        worker = LocalWorker(credentials=worker_credentials_callable)
+        await worker.start()
+
+        # Mock secure channel
+        mock_channel = MagicMock()
+        mock_stub = MagicMock()
+        mock_stub.stop = AsyncMock()
+
+        mock_secure_channel = mocker.patch(
+            "grpc.aio.secure_channel", return_value=mock_channel
+        )
+        mocker.patch(
+            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+        )
+
+        await worker.stop()
+
+        # Verify secure channel was called (callable was resolved)
+        mock_secure_channel.assert_called_once()
+
+    @pytest.mark.parametrize("mutual", [True, False], ids=["mtls", "one_way_tls"])
+    @pytest.mark.asyncio
+    async def test_worker_lifecycle_with_credentials(
+        self, mutual, mocker, test_certificates
+    ):
+        """Test complete worker lifecycle with both mTLS and one-way TLS.
+
+        Given:
+            WorkerCredentials with mutual=True (mTLS) or mutual=False (one-way TLS)
+        When:
+            LocalWorker is created, started, and stopped
+        Then:
+            Worker completes full lifecycle without errors
+        """
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=mutual
+        )
+
+        mock_process = mocker.MagicMock(spec=WorkerProcess)
+        mock_process.address = "127.0.0.1:50051"
+        mock_process.pid = 12345
+        mock_process.start.return_value = None
+        mock_process.is_alive.side_effect = [True, False]  # Alive during stop, then not
+
+        mocker.patch(
+            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
+        )
+
+        # Mock gRPC for stop
+        mock_channel = MagicMock()
+        mock_stub = MagicMock()
+        mock_stub.stop = AsyncMock()
+        mocker.patch("grpc.aio.secure_channel", return_value=mock_channel)
+        mocker.patch("grpc.aio.insecure_channel", return_value=mock_channel)
+        mocker.patch(
+            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+        )
+
+        # Full lifecycle
+        worker = LocalWorker(credentials=creds)
+        await worker.start()
+        assert worker.metadata is not None
+        await worker.stop()
+        # No exception means success
