@@ -13,7 +13,7 @@ from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 from wool.runtime import protobuf as pb
-from wool.runtime.work import WorkTask
+from wool.runtime.work.task import WorkTask
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse

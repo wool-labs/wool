@@ -14,6 +14,8 @@ import grpc.aio
 import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.worker.base import ServerCredentialsType
+from wool.runtime.worker.base import resolve_server_credentials
 from wool.runtime.worker.service import WorkerService
 
 if TYPE_CHECKING:
@@ -37,6 +39,8 @@ class WorkerProcess(Process):
         Graceful shutdown timeout in seconds.
     :param proxy_pool_ttl:
         Proxy pool TTL in seconds.
+    :param server_credentials:
+        Optional gRPC server credentials for TLS/mTLS.
     :param args:
         Additional args for :class:`multiprocessing.Process`.
     :param kwargs:
@@ -48,6 +52,7 @@ class WorkerProcess(Process):
     _set_port: Connection
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
+    _credentials: ServerCredentialsType
 
     def __init__(
         self,
@@ -56,6 +61,7 @@ class WorkerProcess(Process):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
+        server_credentials: ServerCredentialsType = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -71,6 +77,7 @@ class WorkerProcess(Process):
         if proxy_pool_ttl <= 0:
             raise ValueError("Proxy pool TTL must be positive")
         self._proxy_pool_ttl = proxy_pool_ttl
+        self._credentials = server_credentials
         self._get_port, self._set_port = Pipe(duplex=False)
 
     @property
@@ -150,7 +157,14 @@ class WorkerProcess(Process):
         starts listening for incoming connections.
         """
         server = grpc.aio.server()
-        port = server.add_insecure_port(self._address(self._host, self._port))
+        credentials = resolve_server_credentials(self._credentials)
+        address = self._address(self._host, self._port)
+
+        if credentials is not None:
+            port = server.add_secure_port(address, credentials)
+        else:
+            port = server.add_insecure_port(address)
+
         service = WorkerService()
         pb.add_to_server[pb.worker.WorkerServicer](service, server)
 
@@ -212,7 +226,7 @@ def _sigint_handler(loop, service, signum, frame):
     if loop.is_running():
         loop.call_soon_threadsafe(
             lambda: asyncio.create_task(
-                service.stop(pb.worker.StopRequest(timeout=None), None)
+                service.stop(pb.worker.StopRequest(timeout=-1), None)
             )
         )
 

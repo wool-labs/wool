@@ -12,7 +12,7 @@ from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-from wool.runtime.work import WorkTask
+from wool.runtime.work.task import WorkTask
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
