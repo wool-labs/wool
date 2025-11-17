@@ -1,1 +1,1 @@
-/Users/conrad/Projects/wool-labs/wool/wool/README.md
+./wool/README.md

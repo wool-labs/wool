@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Final
 from typing import Generic
@@ -250,7 +251,7 @@ class WorkerConnection:
         task: Task,
         *,
         timeout: float | None = None,
-    ) -> AsyncIterator[pb.task.Result]:
+    ) -> AsyncGenerator[pb.task.Result, None]:
         """Dispatch a task to the remote worker for execution.
 
         Sends the task to the worker via gRPC, waits for acknowledgment,
