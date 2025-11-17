@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 from typing import TYPE_CHECKING
-from typing import AsyncIterator
+from typing import AsyncGenerator
 from typing import Final
 
 from wool.runtime.worker.connection import TransientRpcError
@@ -12,7 +12,7 @@ from .base import LoadBalancerLike
 from .base import NoWorkersAvailable
 
 if TYPE_CHECKING:
-    from wool.runtime.work import WorkTask
+    from wool.runtime.work.task import WorkTask
 
 
 # public
@@ -41,7 +41,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
         *,
         context: LoadBalancerContext,
         timeout: float | None = None,
-    ) -> AsyncIterator:
+    ) -> AsyncGenerator:
         """Dispatch a task to the next available worker using round-robin.
 
         Tries workers in one round-robin cycle until dispatch succeeds.
