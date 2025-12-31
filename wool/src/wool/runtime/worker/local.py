@@ -9,6 +9,8 @@ import grpc.aio
 import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.work.interceptor import WoolInterceptor
+from wool.runtime.work.interceptor import get_registered_interceptors
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.base import ServerCredentialsType
@@ -62,6 +64,11 @@ class LocalWorker(Worker):
           credentials for mutual TLS. Enables secure worker-to-worker
           communication.
         - ``None``: Worker uses insecure connections.
+    :param interceptors:
+        Optional list of :class:`WoolInterceptor` functions to apply to
+        this worker. If ``None``, uses globally registered interceptors
+        from the :func:`@interceptor <wool.runtime.work.interceptor.interceptor>`
+        decorator. Pass an empty list to disable all interceptors.
     :param extra:
         Additional metadata as key-value pairs.
     """
@@ -78,6 +85,7 @@ class LocalWorker(Worker):
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
         credentials: WorkerCredentials | None = None,
+        interceptors: list[WoolInterceptor] | None = None,
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
@@ -90,12 +98,17 @@ class LocalWorker(Worker):
             self._server_credentials = None
             self._client_credentials = None
 
+        # Use provided interceptors or fall back to registered ones
+        if interceptors is None:
+            interceptors = get_registered_interceptors()
+
         self._worker_process = WorkerProcess(
             host=host,
             port=port,
             shutdown_grace_period=shutdown_grace_period,
             proxy_pool_ttl=proxy_pool_ttl,
             server_credentials=self._server_credentials,
+            interceptors=interceptors,
         )
 
     @property
