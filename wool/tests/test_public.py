@@ -37,12 +37,16 @@ def test_public_api_completeness():
         "NoWorkersAvailable",
         "RoundRobinLoadBalancer",
         # Work - New names (preferred)
+        "WoolInterceptor",
+        "WoolInterceptorBridge",
         "WorkTask",
         "WorkTaskEvent",
         "WorkTaskEventHandler",
         "WorkTaskEventType",
         "WorkTaskException",
         "current_task",
+        "get_registered_interceptors",
+        "interceptor",
         "routine",
         "work",
         # Workers
