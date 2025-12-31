@@ -314,6 +314,8 @@ class ReleaseCycle(metaclass=enum.EnumMeta):
 
     @classmethod
     def _missing_(cls, key: int | str) -> Optional[ReleaseCycle]:
+        if key == -1:
+            key = 3
         return cls.__ReleaseCycle_mapping__.get(key)
 
     def render(self) -> str:

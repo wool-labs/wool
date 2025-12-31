@@ -6,7 +6,6 @@ from inspect import isasyncgen
 from inspect import iscoroutine
 from typing import AsyncGenerator
 from typing import AsyncIterator
-from typing import Coroutine
 
 import cloudpickle
 from grpc import StatusCode
@@ -14,8 +13,8 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool.runtime import protobuf as pb
-from wool.runtime.work import WorkTask
-from wool.runtime.work import WorkTaskEvent
+from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import WorkTaskEvent
 
 
 def istask(value) -> bool:
@@ -205,6 +204,8 @@ class WorkerService(pb.worker.WorkerServicer):
             self._docket.discard(watcher)
 
     async def _stop(self, *, timeout: float | None = 0) -> None:
+        if timeout is not None and timeout < 0:
+            timeout = None
         self._stopping.set()
         await self._await_or_cancel(timeout=timeout)
         try:
