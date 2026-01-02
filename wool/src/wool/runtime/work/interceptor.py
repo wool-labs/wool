@@ -254,7 +254,7 @@ class WoolInterceptorBridge(AsyncServerInterceptor):
                 # Interceptor didn't yield - treat as passthrough
                 active_generators.append(None)
             except Exception:
-                # Interceptor raised error - propagate to client
+                # Interceptor raised error - propagate to caller
                 raise
 
         # If task was modified, update the protobuf request
@@ -263,40 +263,35 @@ class WoolInterceptorBridge(AsyncServerInterceptor):
             request_or_iterator.task = cloudpickle.dumps(modified_task)
 
         # Call the actual dispatch method
-        try:
-            response_stream = await method(request_or_iterator, context)
+        response_stream = await method(request_or_iterator, context)
 
-            # Wrap response stream with interceptors (in reverse order)
-            for gen in reversed(active_generators):
-                # Skip interceptors that didn't create generators
-                if gen is None:
-                    continue
+        # Wrap response stream with interceptors (in reverse order)
+        for gen in reversed(active_generators):
+            # Skip interceptors that didn't create generators
+            if gen is None:
+                continue
 
+            try:
+                # Send the response stream - generator will start yielding events
                 try:
-                    # Send the response stream - generator will start yielding events
-                    try:
-                        first_event = await gen.asend(response_stream)
+                    first_event = await gen.asend(response_stream)
 
-                        # The generator is now yielding events - wrap it
-                        async def _create_wrapped_stream(
-                            generator: AsyncGenerator,
-                            first: Any,
-                        ) -> AsyncGenerator:
-                            yield first
-                            async for event in generator:
-                                yield event
+                    # The generator is now yielding events - wrap it
+                    async def _create_wrapped_stream(
+                        generator: AsyncGenerator,
+                        first: Any,
+                    ) -> AsyncGenerator:
+                        yield first
+                        async for event in generator:
+                            yield event
 
-                        response_stream = _create_wrapped_stream(gen, first_event)
-                    except StopAsyncIteration:
-                        # Generator finished without yielding - use original stream
-                        pass
+                    response_stream = _create_wrapped_stream(gen, first_event)
+                except StopAsyncIteration:
+                    # Generator finished without yielding - use original stream
+                    pass
 
-                except Exception:
-                    # Stream wrapping failed - propagate to client
-                    raise
+            except Exception:
+                # Stream wrapping failed - propagate to caller
+                raise
 
-            return response_stream
-
-        except Exception:
-            # Dispatch or stream wrapping failed - propagate to client
-            raise
+        return response_stream

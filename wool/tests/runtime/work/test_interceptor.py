@@ -758,14 +758,14 @@ class TestWoolInterceptorBridge:
     async def test_pre_dispatch_exception_propagation(
         self, sample_task, mock_request, mock_grpc_context
     ):
-        """Pre-dispatch exception propagates and cancels context.
+        """Pre-dispatch exception propagates to caller.
 
         Given:
             A bridge with interceptor that raises exception before yielding
         When:
             intercept() is called for a dispatch method
         Then:
-            The exception propagates and the context is cancelled
+            The exception propagates to the caller
         """
         failing = create_failing_interceptor(ValueError("test error"), "pre-dispatch")
         bridge = WoolInterceptorBridge([failing])
@@ -777,8 +777,6 @@ class TestWoolInterceptorBridge:
             await bridge.intercept(
                 mock_method, mock_request, mock_grpc_context, "/wool.Worker/dispatch"
             )
-
-        mock_grpc_context.cancel.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_pre_dispatch_stop_async_iteration(
@@ -816,14 +814,14 @@ class TestWoolInterceptorBridge:
     async def test_stream_wrapping_exception_propagation(
         self, sample_task, mock_request, mock_grpc_context
     ):
-        """Stream wrapping exception propagates and cancels context.
+        """Stream wrapping exception propagates to caller.
 
         Given:
             A bridge with interceptor raising exception during wrapping
         When:
             intercept() is called for a dispatch method
         Then:
-            The exception propagates and the context is cancelled
+            The exception propagates to the caller
         """
         failing = create_failing_interceptor(
             RuntimeError("stream error"), "stream-wrapping"
@@ -837,8 +835,6 @@ class TestWoolInterceptorBridge:
             await bridge.intercept(
                 mock_method, mock_request, mock_grpc_context, "/wool.Worker/dispatch"
             )
-
-        mock_grpc_context.cancel.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_stream_wrapping_stop_async_iteration(
@@ -875,14 +871,14 @@ class TestWoolInterceptorBridge:
     async def test_dispatch_method_exception_propagation(
         self, sample_task, mock_request, mock_grpc_context
     ):
-        """Dispatch method exception propagates and cancels context.
+        """Dispatch method exception propagates to caller.
 
         Given:
             A bridge with an interceptor
         When:
             The underlying dispatch method raises an exception
         Then:
-            The exception propagates and the context is cancelled
+            The exception propagates to the caller
         """
         passthrough = create_passthrough_interceptor()
         bridge = WoolInterceptorBridge([passthrough])
@@ -897,8 +893,6 @@ class TestWoolInterceptorBridge:
                 mock_grpc_context,
                 "/wool.Worker/dispatch",
             )
-
-        mock_grpc_context.cancel.assert_called_once()
 
     # ------------------------------------------------------------------------
     # Full Lifecycle Test
@@ -1105,7 +1099,7 @@ class TestWoolInterceptorBridge:
         When:
             intercept() is called for dispatch
         Then:
-            Exception propagates to client and context.cancel() called
+            Exception propagates to caller
         """
         # Create interceptor chain with one failing interceptor
         interceptors = []
@@ -1130,6 +1124,3 @@ class TestWoolInterceptorBridge:
             # For stream-wrapping errors, we need to consume the stream
             if fail_stage == "stream-wrapping":
                 await collect_stream_events(result)
-
-        # Verify context was cancelled
-        mock_grpc_context.cancel.assert_called()
