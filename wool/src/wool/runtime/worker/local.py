@@ -9,7 +9,7 @@ import grpc.aio
 import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.discovery.base import WorkerMetadata
-from wool.runtime.work.interceptor import WoolInterceptor
+from wool.runtime.work.interceptor import InterceptorLike
 from wool.runtime.work.interceptor import get_registered_interceptors
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelCredentialsType
@@ -85,7 +85,7 @@ class LocalWorker(Worker):
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
         credentials: WorkerCredentials | None = None,
-        interceptors: list[WoolInterceptor] | None = None,
+        interceptors: list[InterceptorLike] | None = None,
         **extra: Any,
     ):
         super().__init__(*tags, **extra)

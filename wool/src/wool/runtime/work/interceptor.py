@@ -16,10 +16,11 @@ if TYPE_CHECKING:
     from wool.runtime.work.task import WorkTask
 
 # Global registry for decorator-registered interceptors
-_registered_interceptors: list[WoolInterceptor] = []
+_registered_interceptors: list[InterceptorLike] = []
 
 
-class WoolInterceptor(Protocol):
+# public
+class InterceptorLike(Protocol):
     """Protocol defining the Wool interceptor interface.
 
     Interceptors are async generators that wrap task execution, allowing
@@ -119,7 +120,7 @@ class WoolInterceptor(Protocol):
 
 
 # public
-def interceptor(func: WoolInterceptor) -> WoolInterceptor:
+def interceptor(func: InterceptorLike) -> InterceptorLike:
     """Register a Wool interceptor globally.
 
     Decorated interceptors are automatically applied to all workers that
@@ -168,7 +169,7 @@ def interceptor(func: WoolInterceptor) -> WoolInterceptor:
     return func
 
 
-def get_registered_interceptors() -> list[WoolInterceptor]:
+def get_registered_interceptors() -> list[InterceptorLike]:
     """Get all globally registered interceptors.
 
     :returns:
@@ -178,8 +179,7 @@ def get_registered_interceptors() -> list[WoolInterceptor]:
     return _registered_interceptors.copy()
 
 
-# public
-class WoolInterceptorBridge(AsyncServerInterceptor):
+class WoolInterceptor(AsyncServerInterceptor):
     """Bridges Wool interceptors to gRPC's interceptor interface.
 
     Converts high-level Wool interceptor semantics (task modification,
@@ -194,7 +194,7 @@ class WoolInterceptorBridge(AsyncServerInterceptor):
         Wool interceptor functions to apply.
     """
 
-    def __init__(self, interceptors: list[WoolInterceptor]):
+    def __init__(self, interceptors: list[InterceptorLike]):
         self._interceptors = interceptors
 
     async def intercept(

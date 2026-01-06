@@ -24,7 +24,6 @@ from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.typing import Factory
 from wool.runtime.work.interceptor import WoolInterceptor
-from wool.runtime.work.interceptor import WoolInterceptorBridge
 from wool.runtime.work.interceptor import get_registered_interceptors
 from wool.runtime.work.interceptor import interceptor
 from wool.runtime.work.task import WorkTask
@@ -64,22 +63,17 @@ __proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar
 )
 
 __all__ = [
-    # Connection
     "RpcError",
     "TransientRpcError",
     "UnexpectedResponse",
     "WorkerConnection",
-    # Context
     "RuntimeContext",
-    # Load balancing
     "ConnectionResourceFactory",
     "LoadBalancerContext",
     "LoadBalancerLike",
     "NoWorkersAvailable",
     "RoundRobinLoadBalancer",
-    # Work - New names (preferred)
     "WoolInterceptor",
-    "WoolInterceptorBridge",
     "WorkTask",
     "WorkTaskEvent",
     "WorkTaskEventHandler",
@@ -90,7 +84,6 @@ __all__ = [
     "interceptor",
     "routine",
     "work",
-    # Workers
     "LocalWorker",
     "Worker",
     "WorkerCredentials",
@@ -99,7 +92,6 @@ __all__ = [
     "WorkerPool",
     "WorkerProxy",
     "WorkerService",
-    # Discovery
     "Discovery",
     "DiscoveryEvent",
     "DiscoveryEventType",
@@ -110,7 +102,6 @@ __all__ = [
     "LocalDiscovery",
     "PredicateFunction",
     "WorkerMetadata",
-    # Typing
     "Factory",
 ]
 

@@ -10,13 +10,9 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
-from wool.runtime.work.interceptor import WoolInterceptorBridge
+from wool.runtime.work.interceptor import WoolInterceptor
 from wool.runtime.work.interceptor import get_registered_interceptors
 from wool.runtime.work.interceptor import interceptor
-
-# ============================================================================
-# Fixtures and Helpers
-# ============================================================================
 
 
 @pytest.fixture(autouse=True)
@@ -134,11 +130,6 @@ async def collect_stream_events(stream):
     return events
 
 
-# ============================================================================
-# Hypothesis Strategies
-# ============================================================================
-
-
 @st.composite
 def valid_passthrough_interceptor_list(draw):
     """Generate a list of 0-5 passthrough interceptors."""
@@ -156,11 +147,6 @@ def event_stream_strategy(draw):
             max_size=100,
         )
     )
-
-
-# ============================================================================
-# Test Suite: TestInterceptorDecorator
-# ============================================================================
 
 
 class TestInterceptorDecorator:
@@ -270,11 +256,6 @@ class TestInterceptorDecorator:
         assert registered[1] is my_interceptor
 
 
-# ============================================================================
-# Test Suite: TestGetRegisteredInterceptors
-# ============================================================================
-
-
 class TestGetRegisteredInterceptors:
     """Tests for get_registered_interceptors()."""
 
@@ -370,12 +351,7 @@ class TestGetRegisteredInterceptors:
         assert result2[0] is my_interceptor
 
 
-# ============================================================================
-# Test Suite: TestWoolInterceptorBridge
-# ============================================================================
-
-
-class TestWoolInterceptorBridge:
+class TestWoolInterceptor:
     """Tests for the WoolInterceptorBridge class."""
 
     # ------------------------------------------------------------------------
@@ -395,7 +371,7 @@ class TestWoolInterceptorBridge:
         interceptor1 = create_passthrough_interceptor()
         interceptor2 = create_passthrough_interceptor()
 
-        bridge = WoolInterceptorBridge([interceptor1, interceptor2])
+        bridge = WoolInterceptor([interceptor1, interceptor2])
 
         assert bridge._interceptors == [interceptor1, interceptor2]
 
@@ -409,7 +385,7 @@ class TestWoolInterceptorBridge:
         Then:
             The bridge is created successfully
         """
-        bridge = WoolInterceptorBridge([])
+        bridge = WoolInterceptor([])
 
         assert bridge._interceptors == []
 
@@ -428,7 +404,7 @@ class TestWoolInterceptorBridge:
         Then:
             The method is called directly without processing
         """
-        bridge = WoolInterceptorBridge([])
+        bridge = WoolInterceptor([])
 
         mock_method = AsyncMock(return_value="direct_result")
         mock_request = MagicMock()
@@ -456,7 +432,7 @@ class TestWoolInterceptorBridge:
         async def failing_interceptor(task):
             raise RuntimeError("Should not be called")
 
-        bridge = WoolInterceptorBridge([failing_interceptor])
+        bridge = WoolInterceptor([failing_interceptor])
         mock_method = AsyncMock(return_value="stop_result")
         mock_request = MagicMock()
 
@@ -485,7 +461,7 @@ class TestWoolInterceptorBridge:
             The task is dispatched unmodified
         """
         passthrough = create_passthrough_interceptor()
-        bridge = WoolInterceptorBridge([passthrough])
+        bridge = WoolInterceptor([passthrough])
 
         async def mock_method(req, ctx):
             # Verify task wasn't modified
@@ -523,7 +499,7 @@ class TestWoolInterceptorBridge:
             return modified
 
         modifier = create_task_modifying_interceptor(modify_task)
-        bridge = WoolInterceptorBridge([modifier])
+        bridge = WoolInterceptor([modifier])
 
         async def mock_method(req, ctx):
             task = cloudpickle.loads(req.task)
@@ -562,7 +538,7 @@ class TestWoolInterceptorBridge:
 
             return tracker
 
-        bridge = WoolInterceptorBridge(
+        bridge = WoolInterceptor(
             [
                 create_tracking_passthrough(1),
                 create_tracking_passthrough(2),
@@ -616,7 +592,7 @@ class TestWoolInterceptorBridge:
 
             return create_task_modifying_interceptor(modify)
 
-        bridge = WoolInterceptorBridge([create_modifier("A"), create_modifier("B")])
+        bridge = WoolInterceptor([create_modifier("A"), create_modifier("B")])
 
         async def mock_method(req, ctx):
             task = cloudpickle.loads(req.task)
@@ -645,7 +621,7 @@ class TestWoolInterceptorBridge:
             Events from the wrapped stream are returned
         """
         wrapper = create_stream_wrapping_interceptor(lambda event: f"wrapped-{event}")
-        bridge = WoolInterceptorBridge([wrapper])
+        bridge = WoolInterceptor([wrapper])
 
         async def mock_method(req, ctx):
             return create_mock_response_stream("event1", "event2")
@@ -675,7 +651,7 @@ class TestWoolInterceptorBridge:
                 if "keep" in event:
                     yield event
 
-        bridge = WoolInterceptorBridge([filtering_interceptor])
+        bridge = WoolInterceptor([filtering_interceptor])
 
         async def mock_method(req, ctx):
             return create_mock_response_stream("keep1", "drop", "keep2", "drop")
@@ -708,7 +684,7 @@ class TestWoolInterceptorBridge:
                 yield event
             yield "injected-end"
 
-        bridge = WoolInterceptorBridge([injecting_interceptor])
+        bridge = WoolInterceptor([injecting_interceptor])
 
         async def mock_method(req, ctx):
             return create_mock_response_stream("event1", "event2")
@@ -737,7 +713,7 @@ class TestWoolInterceptorBridge:
         wrapper2 = create_stream_wrapping_interceptor(lambda e: f"<{e}>")
         wrapper3 = create_stream_wrapping_interceptor(lambda e: f"{{{e}}}")
 
-        bridge = WoolInterceptorBridge([wrapper1, wrapper2, wrapper3])
+        bridge = WoolInterceptor([wrapper1, wrapper2, wrapper3])
 
         async def mock_method(req, ctx):
             return create_mock_response_stream("x")
@@ -768,7 +744,7 @@ class TestWoolInterceptorBridge:
             The exception propagates to the caller
         """
         failing = create_failing_interceptor(ValueError("test error"), "pre-dispatch")
-        bridge = WoolInterceptorBridge([failing])
+        bridge = WoolInterceptor([failing])
 
         async def mock_method(req, ctx):
             return create_mock_response_stream("should-not-reach")
@@ -798,7 +774,7 @@ class TestWoolInterceptorBridge:
                 yield
             # This will cause StopAsyncIteration when asend(None) is called
 
-        bridge = WoolInterceptorBridge([stop_iteration_interceptor])
+        bridge = WoolInterceptor([stop_iteration_interceptor])
 
         async def mock_method(req, ctx):
             return create_mock_response_stream("event")
@@ -826,7 +802,7 @@ class TestWoolInterceptorBridge:
         failing = create_failing_interceptor(
             RuntimeError("stream error"), "stream-wrapping"
         )
-        bridge = WoolInterceptorBridge([failing])
+        bridge = WoolInterceptor([failing])
 
         async def mock_method(req, ctx):
             return create_mock_response_stream("event")
@@ -855,7 +831,7 @@ class TestWoolInterceptorBridge:
             # Just return without yielding events - causes StopAsyncIteration
             return
 
-        bridge = WoolInterceptorBridge([stop_iteration_wrapper])
+        bridge = WoolInterceptor([stop_iteration_wrapper])
 
         async def mock_method(req, ctx):
             return create_mock_response_stream("event1", "event2")
@@ -881,7 +857,7 @@ class TestWoolInterceptorBridge:
             The exception propagates to the caller
         """
         passthrough = create_passthrough_interceptor()
-        bridge = WoolInterceptorBridge([passthrough])
+        bridge = WoolInterceptor([passthrough])
 
         async def failing_method(req, ctx):
             raise RuntimeError("dispatch failed")
@@ -930,7 +906,7 @@ class TestWoolInterceptorBridge:
             async for event in response_stream:
                 yield f"wrapped-{event}"
 
-        bridge = WoolInterceptorBridge([full_lifecycle_interceptor])
+        bridge = WoolInterceptor([full_lifecycle_interceptor])
 
         async def mock_method(req, ctx):
             task = cloudpickle.loads(req.task)
@@ -969,7 +945,7 @@ class TestWoolInterceptorBridge:
         Then:
             All events from original stream returned unchanged
         """
-        bridge = WoolInterceptorBridge(interceptor_list)
+        bridge = WoolInterceptor(interceptor_list)
 
         original_events = ["event1", "event2", "event3"]
 
@@ -1004,7 +980,7 @@ class TestWoolInterceptorBridge:
         interceptors = [
             create_passthrough_interceptor() for _ in range(passthrough_count)
         ]
-        bridge = WoolInterceptorBridge(interceptors)
+        bridge = WoolInterceptor(interceptors)
 
         async def mock_method(req, ctx):
             return create_mock_response_stream(*events)
@@ -1040,7 +1016,7 @@ class TestWoolInterceptorBridge:
             for i in range(interceptor_count)
         ]
 
-        bridge = WoolInterceptorBridge(interceptors)
+        bridge = WoolInterceptor(interceptors)
 
         async def mock_method(req, ctx):
             return create_mock_response_stream("event")
@@ -1056,7 +1032,7 @@ class TestWoolInterceptorBridge:
             create_order_tracking_interceptor(i, order2)
             for i in range(interceptor_count)
         ]
-        bridge2 = WoolInterceptorBridge(interceptors2)
+        bridge2 = WoolInterceptor(interceptors2)
 
         result2 = await bridge2.intercept(
             mock_method, mock_request, mock_grpc_context, "/wool.Worker/dispatch"
@@ -1111,7 +1087,7 @@ class TestWoolInterceptorBridge:
             else:
                 interceptors.append(create_passthrough_interceptor())
 
-        bridge = WoolInterceptorBridge(interceptors)
+        bridge = WoolInterceptor(interceptors)
 
         async def mock_method(req, ctx):
             return create_mock_response_stream("event")

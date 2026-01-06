@@ -14,8 +14,8 @@ import grpc.aio
 import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.work.interceptor import InterceptorLike
 from wool.runtime.work.interceptor import WoolInterceptor
-from wool.runtime.work.interceptor import WoolInterceptorBridge
 from wool.runtime.worker.base import ServerCredentialsType
 from wool.runtime.worker.base import resolve_server_credentials
 from wool.runtime.worker.service import WorkerService
@@ -57,7 +57,7 @@ class WorkerProcess(Process):
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
     _credentials: ServerCredentialsType
-    _interceptors: list[WoolInterceptor]
+    _interceptors: list[InterceptorLike]
 
     def __init__(
         self,
@@ -67,7 +67,7 @@ class WorkerProcess(Process):
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
         server_credentials: ServerCredentialsType = None,
-        interceptors: list[WoolInterceptor] | None = None,
+        interceptors: list[InterceptorLike] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -166,7 +166,7 @@ class WorkerProcess(Process):
         # Create interceptor bridge if interceptors are registered
         interceptors = []
         if self._interceptors:
-            interceptors.append(WoolInterceptorBridge(self._interceptors))
+            interceptors.append(WoolInterceptor(self._interceptors))
 
         server = grpc.aio.server(interceptors=interceptors)
         credentials = resolve_server_credentials(self._credentials)
