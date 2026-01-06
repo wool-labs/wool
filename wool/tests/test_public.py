@@ -23,29 +23,27 @@ def test_public_api_completeness():
     """
     # Arrange
     expected_public_api = [
-        # Connection
         "RpcError",
         "TransientRpcError",
         "UnexpectedResponse",
         "WorkerConnection",
-        # Context
         "RuntimeContext",
-        # Load balancing
         "ConnectionResourceFactory",
         "LoadBalancerContext",
         "LoadBalancerLike",
         "NoWorkersAvailable",
         "RoundRobinLoadBalancer",
-        # Work - New names (preferred)
+        "WoolInterceptor",
         "WorkTask",
         "WorkTaskEvent",
         "WorkTaskEventHandler",
         "WorkTaskEventType",
         "WorkTaskException",
         "current_task",
+        "get_registered_interceptors",
+        "interceptor",
         "routine",
         "work",
-        # Workers
         "LocalWorker",
         "Worker",
         "WorkerCredentials",
@@ -54,7 +52,6 @@ def test_public_api_completeness():
         "WorkerPool",
         "WorkerProxy",
         "WorkerService",
-        # Discovery
         "Discovery",
         "DiscoveryEvent",
         "DiscoveryEventType",
@@ -65,7 +62,6 @@ def test_public_api_completeness():
         "LocalDiscovery",
         "PredicateFunction",
         "WorkerMetadata",
-        # Typing
         "Factory",
     ]
 
