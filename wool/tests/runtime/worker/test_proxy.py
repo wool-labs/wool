@@ -590,6 +590,129 @@ class TestWorkerProxy:
         # Assert
         assert not proxy.started
 
+    @pytest.mark.asyncio
+    async def test_start_stop_with_sync_cm_loadbalancer(
+        self, mock_discovery_service, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test start/stop with sync context manager load balancer.
+
+        Given:
+            A WorkerProxy with a load balancer provided as a sync
+            context manager.
+        When:
+            start() then stop() are called.
+        Then:
+            The context manager's __enter__ is called on start and
+            __exit__ on stop.
+        """
+        # Arrange
+        mock_lb = mocker.MagicMock(spec=wp.LoadBalancerLike)
+        mock_lb.dispatch = mocker.AsyncMock()
+
+        class SyncCM:
+            def __init__(self):
+                self.entered = False
+                self.exited = False
+
+            def __enter__(self):
+                self.entered = True
+                return mock_lb
+
+            def __exit__(self, *args):
+                self.exited = True
+
+        cm = SyncCM()
+        proxy = WorkerProxy(discovery=mock_discovery_service, loadbalancer=cm)
+
+        # Act
+        await proxy.start()
+        assert cm.entered
+        assert proxy.started
+
+        await proxy.stop()
+
+        # Assert
+        assert cm.exited
+        assert not proxy.started
+
+    @pytest.mark.asyncio
+    async def test_start_stop_with_async_cm_loadbalancer(
+        self, mock_discovery_service, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test start/stop with async context manager load balancer.
+
+        Given:
+            A WorkerProxy with a load balancer provided as an async
+            context manager.
+        When:
+            start() then stop() are called.
+        Then:
+            The async context manager's __aenter__ is called on start
+            and __aexit__ on stop.
+        """
+        # Arrange
+        mock_lb = mocker.MagicMock(spec=wp.LoadBalancerLike)
+        mock_lb.dispatch = mocker.AsyncMock()
+
+        class AsyncCM:
+            def __init__(self):
+                self.entered = False
+                self.exited = False
+
+            async def __aenter__(self):
+                self.entered = True
+                return mock_lb
+
+            async def __aexit__(self, *args):
+                self.exited = True
+
+        cm = AsyncCM()
+        proxy = WorkerProxy(discovery=mock_discovery_service, loadbalancer=cm)
+
+        # Act
+        await proxy.start()
+        assert cm.entered
+        assert proxy.started
+
+        await proxy.stop()
+
+        # Assert
+        assert cm.exited
+        assert not proxy.started
+
+    @pytest.mark.asyncio
+    async def test_start_with_awaitable_loadbalancer(
+        self, mock_discovery_service, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test start with an awaitable load balancer.
+
+        Given:
+            A WorkerProxy with a load balancer provided as a bare
+            awaitable (coroutine object).
+        When:
+            start() is called.
+        Then:
+            The awaitable is resolved to the load balancer instance
+            and the proxy starts successfully.
+        """
+        # Arrange
+        mock_lb = mocker.MagicMock(spec=wp.LoadBalancerLike)
+        mock_lb.dispatch = mocker.AsyncMock()
+
+        async def make_lb():
+            return mock_lb
+
+        proxy = WorkerProxy(discovery=mock_discovery_service, loadbalancer=make_lb())
+
+        # Act
+        await proxy.start()
+
+        # Assert
+        assert proxy.started
+
+        # Cleanup
+        await proxy.stop()
+
     # =========================================================================
     # Discovery Integration Tests
     # =========================================================================
@@ -696,6 +819,43 @@ class TestWorkerProxy:
             await asyncio.sleep(0.1)
 
         await mock_discovery_service.stop()
+
+    @pytest.mark.asyncio
+    async def test_handles_worker_updated(self, mock_proxy_session):
+        """Test the proxy handles worker-updated events.
+
+        Given:
+            A started WorkerProxy with a discovered worker.
+        When:
+            A "worker-updated" event is received for that worker.
+        Then:
+            The worker metadata is updated without error.
+        """
+        # Arrange
+        metadata = WorkerMetadata(
+            uid=uuid.uuid4(),
+            host="192.168.1.100",
+            port=50051,
+            pid=1001,
+            version="1.0.0",
+        )
+
+        events = [
+            DiscoveryEvent("worker-added", metadata=metadata),
+            DiscoveryEvent("worker-updated", metadata=metadata),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert metadata in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
 
     # =========================================================================
     # Task Dispatch Tests
@@ -891,6 +1051,75 @@ class TestWorkerProxy:
 
         # Assert
         assert results == ["test_result"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_spins_until_worker_discovered(
+        self,
+        mocker: MockerFixture,
+        mock_proxy_session,
+    ):
+        """Test dispatch spins when no workers are available yet.
+
+        Given:
+            A started WorkerProxy whose discovery stream is gated
+            behind an asyncio.Event, so no workers exist initially.
+        When:
+            dispatch() is called before any workers are available,
+            then the gate is opened to emit a worker-added event.
+        Then:
+            dispatch() spins in the await-workers loop until the
+            sentinel processes the event and adds the worker,
+            then completes normally.
+        """
+        # Arrange — gated discovery that blocks until signaled
+        gate = asyncio.Event()
+        metadata = WorkerMetadata(
+            uid=uuid.uuid4(),
+            host="192.168.1.100",
+            port=50051,
+            pid=1001,
+            version="1.0.0",
+        )
+
+        class GatedDiscovery:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await gate.wait()
+                gate.clear()
+                return DiscoveryEvent("worker-added", metadata=metadata)
+
+        class StubLoadBalancer:
+            def __init__(self):
+                self.dispatched = False
+
+            async def dispatch(self, task, *, context, timeout=None):
+                self.dispatched = True
+
+        stub_lb = StubLoadBalancer()
+        proxy = WorkerProxy(discovery=GatedDiscovery(), loadbalancer=stub_lb)
+        await proxy.start()
+
+        # Verify no workers before the gate opens
+        assert proxy.workers == []
+
+        mock_task = mocker.MagicMock(spec=WorkTask)
+
+        # Act — launch dispatch in background; it spins waiting for workers
+        dispatch_task = asyncio.create_task(proxy.dispatch(mock_task))
+        await asyncio.sleep(0)  # yield so dispatch enters the spin loop
+
+        # Open the gate — sentinel receives the event and adds the worker
+        gate.set()
+        await dispatch_task
+
+        # Assert
+        assert metadata in proxy.workers
+        assert stub_lb.dispatched
+
+        # Cleanup
+        await proxy.stop()
 
     # =========================================================================
     # Static Worker Configuration Tests
@@ -1221,6 +1450,117 @@ class TestWorkerProxy:
         with pytest.raises(ValueError):
             await proxy.start()
 
+    # =========================================================================
+    # Security Filtering Tests
+    # =========================================================================
+
+    @pytest.mark.asyncio
+    async def test_security_filter_with_credentials(self, mock_proxy_session):
+        """Test only secure workers are discovered with credentials.
+
+        Given:
+            A WorkerProxy instantiated with credentials and a mix
+            of secure and insecure static workers.
+        When:
+            The proxy is started and discovery events are processed.
+        Then:
+            Only secure workers appear in the workers list.
+        """
+        # Arrange
+        secure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            host="192.168.1.100",
+            port=50051,
+            pid=1001,
+            version="1.0.0",
+            secure=True,
+        )
+        insecure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            host="192.168.1.101",
+            port=50052,
+            pid=1002,
+            version="1.0.0",
+            secure=False,
+        )
+        mock_credentials = object()  # Any non-None value
+
+        proxy = WorkerProxy(
+            workers=[secure_worker, insecure_worker],
+            credentials=mock_credentials,
+        )
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert secure_worker in proxy.workers
+        assert insecure_worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_pool_uri_combined_filter(self, mocker: MockerFixture):
+        """Test pool URI filter combines tag matching and security filtering.
+
+        Given:
+            A WorkerProxy instantiated with a pool URI and extra tags.
+        When:
+            The discovery filter is evaluated against workers.
+        Then:
+            Only workers matching the tags and security requirements
+            pass the filter.
+        """
+        # Arrange
+        mock_subscriber = mocker.MagicMock()
+        mock_local_discovery = mocker.MagicMock()
+        mock_local_discovery.subscribe.return_value = mock_subscriber
+        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local_discovery)
+
+        WorkerProxy("pool-1", "extra-tag")
+
+        # Capture the filter passed to subscribe()
+        filter_fn = mock_local_discovery.subscribe.call_args.kwargs["filter"]
+
+        # Act & Assert — matching tags, insecure (no credentials)
+        matching = WorkerMetadata(
+            uid=uuid.uuid4(),
+            host="127.0.0.1",
+            port=50051,
+            pid=1,
+            version="1.0.0",
+            tags=frozenset(["pool-1"]),
+            secure=False,
+        )
+        assert filter_fn(matching) is True
+
+        # Act & Assert — no matching tags
+        non_matching = WorkerMetadata(
+            uid=uuid.uuid4(),
+            host="127.0.0.1",
+            port=50052,
+            pid=2,
+            version="1.0.0",
+            tags=frozenset(["other"]),
+            secure=False,
+        )
+        assert filter_fn(non_matching) is False
+
+        # Act & Assert — matching tags but secure (no credentials means
+        # security filter rejects secure workers)
+        secure_matching = WorkerMetadata(
+            uid=uuid.uuid4(),
+            host="127.0.0.1",
+            port=50053,
+            pid=3,
+            version="1.0.0",
+            tags=frozenset(["pool-1"]),
+            secure=True,
+        )
+        assert filter_fn(secure_matching) is False
+
 
 # ============================================================================
 # Property-Based Tests
@@ -1440,3 +1780,35 @@ class TestUtilityFunctions:
 
         # Assert
         mock_connection.close.assert_called_once()
+
+
+# ============================================================================
+# ReducibleAsyncIterator Tests
+# ============================================================================
+
+
+class TestReducibleAsyncIterator:
+    """Tests for ReducibleAsyncIterator pickling support."""
+
+    @pytest.mark.asyncio
+    async def test_pickle_round_trip(self):
+        """Test pickle round-trip preserves items.
+
+        Given:
+            A ReducibleAsyncIterator with items.
+        When:
+            It is pickled and unpickled.
+        Then:
+            The unpickled iterator yields the same items in order.
+        """
+        # Arrange
+        items = [1, 2, 3, "hello", None]
+        iterator = wp.ReducibleAsyncIterator(items)
+
+        # Act
+        pickled = cloudpickle.dumps(iterator)
+        unpickled = cloudpickle.loads(pickled)
+        results = [item async for item in unpickled]
+
+        # Assert
+        assert results == items
