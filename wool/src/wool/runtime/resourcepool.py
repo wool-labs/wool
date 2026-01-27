@@ -241,11 +241,19 @@ class ResourcePool(Generic[T]):
 
                 # Cancel pending cleanup task if it exists
                 if entry.cleanup is not None and not entry.cleanup.done():
-                    entry.cleanup.cancel()
-                    try:
-                        await entry.cleanup
-                    except asyncio.CancelledError:
-                        pass
+                    current_loop = asyncio.get_running_loop()
+                    task_loop = entry.cleanup.get_loop()
+
+                    if task_loop is current_loop:
+                        # Same event loop - safe to cancel and await
+                        entry.cleanup.cancel()
+                        try:
+                            await entry.cleanup
+                        except asyncio.CancelledError:
+                            pass
+                    else:
+                        # Different event loop - cancel from correct loop, don't await
+                        task_loop.call_soon_threadsafe(entry.cleanup.cancel)
                     entry.cleanup = None
 
                 return entry.obj
@@ -337,11 +345,20 @@ class ResourcePool(Generic[T]):
         try:
             # Cancel cleanup task if running
             if entry.cleanup is not None and not entry.cleanup.done():
-                entry.cleanup.cancel()
-                try:
-                    await entry.cleanup
-                except asyncio.CancelledError:
-                    pass
+                current_loop = asyncio.get_running_loop()
+                task_loop = entry.cleanup.get_loop()
+
+                if task_loop is current_loop:
+                    # Same event loop - safe to cancel and await
+                    entry.cleanup.cancel()
+                    try:
+                        await entry.cleanup
+                    except asyncio.CancelledError:
+                        pass
+                else:
+                    # Different event loop (e.g., task created in worker thread)
+                    # Cancel from the correct loop, don't await cross-loop
+                    task_loop.call_soon_threadsafe(entry.cleanup.cancel)
         finally:
             # Call finalizer
             if self._finalizer:

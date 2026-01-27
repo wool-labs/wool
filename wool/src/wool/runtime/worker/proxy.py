@@ -465,17 +465,19 @@ class WorkerProxy:
         async for event in self._discovery_stream:
             match event.type:
                 case "worker-added":
+                    # Use default argument to capture metadata by value, not reference
                     self._loadbalancer_context.add_worker(
                         event.metadata,
-                        lambda: self._connection_pool.get(
-                            f"{event.metadata.host}:{event.metadata.port}",
+                        lambda m=event.metadata: self._connection_pool.get(
+                            f"{m.host}:{m.port}",
                         ),
                     )
                 case "worker-updated":
+                    # Use default argument to capture metadata by value, not reference
                     self._loadbalancer_context.update_worker(
                         event.metadata,
-                        lambda: self._connection_pool.get(
-                            f"{event.metadata.host}:{event.metadata.port}",
+                        lambda m=event.metadata: self._connection_pool.get(
+                            f"{m.host}:{m.port}",
                         ),
                     )
                 case "worker-dropped":
