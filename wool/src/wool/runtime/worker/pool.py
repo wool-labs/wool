@@ -262,19 +262,19 @@ class WorkerPool:
 
                 @asynccontextmanager
                 async def create_proxy():
-                    discovery = LocalDiscovery(namespace)
-                    async with self._worker_context(
-                        *tags,
-                        size=size,
-                        factory=worker,
-                        publisher=discovery.publisher,
-                    ):
-                        async with WorkerProxy(
-                            discovery=discovery.subscribe(_predicate(tags)),
-                            loadbalancer=loadbalancer,
-                            credentials=self._client_credentials,
+                    with LocalDiscovery(namespace) as discovery:
+                        async with self._worker_context(
+                            *tags,
+                            size=size,
+                            factory=worker,
+                            publisher=discovery.publisher,
                         ):
-                            yield
+                            async with WorkerProxy(
+                                discovery=discovery.subscribe(_predicate(tags)),
+                                loadbalancer=loadbalancer,
+                                credentials=self._client_credentials,
+                            ):
+                                yield
 
             case (None, discovery) if discovery is not None:
 
@@ -303,19 +303,19 @@ class WorkerPool:
 
                 @asynccontextmanager
                 async def create_proxy():
-                    discovery = LocalDiscovery(namespace)
-                    async with self._worker_context(
-                        *tags,
-                        size=size,
-                        factory=worker,
-                        publisher=discovery.publisher,
-                    ):
-                        async with WorkerProxy(
-                            discovery=discovery.subscriber,
-                            loadbalancer=loadbalancer,
-                            credentials=self._client_credentials,
+                    with LocalDiscovery(namespace) as discovery:
+                        async with self._worker_context(
+                            *tags,
+                            size=size,
+                            factory=worker,
+                            publisher=discovery.publisher,
                         ):
-                            yield
+                            async with WorkerProxy(
+                                discovery=discovery.subscriber,
+                                loadbalancer=loadbalancer,
+                                credentials=self._client_credentials,
+                            ):
+                                yield
 
             case _:
                 raise RuntimeError
