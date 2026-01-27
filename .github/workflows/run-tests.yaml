@@ -9,16 +9,16 @@ on:
 
 jobs:
   run-tests:
-    name: Python ${{ matrix.python-version }}
+    name: Namespace ${{ matrix.namespace }} / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
+        namespace:
+          - 'wool'
         python-version: 
-          - '3.8'
-          - '3.9'
-          - '3.10'
           - '3.11'
           - '3.12'
+          - '3.13'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -26,7 +26,13 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install package
-        run: uv sync --all-extras --dev
+      - name: Install packages
+        run: .github/scripts/install-python-packages.sh
       - name: Run tests
-        run: uv run pytest tests
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+        run: |
+          uv pip install -e './${{ env.NAMESPACE }}[dev]'
+          uv pip freeze
+          cd ${{ env.NAMESPACE }}
+          uv run pytest
