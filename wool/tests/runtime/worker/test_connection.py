@@ -305,6 +305,9 @@ class TestWorkerConnection:
             def code(self):
                 return status_code
 
+            def details(self):
+                return "mock error details"
+
         mock_rpc_error = MockRpcError()
 
         mock_stub = mocker.MagicMock()
@@ -347,6 +350,9 @@ class TestWorkerConnection:
         class MockRpcError(grpc.RpcError):
             def code(self):
                 return status_code
+
+            def details(self):
+                return "mock error details"
 
         mock_rpc_error = MockRpcError()
 

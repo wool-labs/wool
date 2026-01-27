@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 from typing import Final
 from uuid import uuid4
@@ -25,7 +26,10 @@ def grpc_add_to_server():
 
 @pytest.fixture(scope="function")
 def grpc_servicer():
-    return WorkerService()
+    service = WorkerService()
+    yield service
+    for entry in service._loop_pool._cache.values():
+        WorkerService._destroy_worker_loop(entry.obj)
 
 
 @pytest.fixture(scope="function")
@@ -33,11 +37,14 @@ def grpc_stub_cls():
     return WorkerStub
 
 
-# Global event for controlling test task execution
-_control_event: asyncio.Event | None = None
+# Global event for controlling test task execution.
+# Uses threading.Event (not asyncio.Event) because the controllable
+# task runs on the worker loop while the test sets the event from
+# the main loop. threading.Event is thread-safe across event loops.
+_control_event: threading.Event | None = None
 
 
-def _get_control_event() -> asyncio.Event:
+def _get_control_event() -> threading.Event:
     """Get the global control event for test tasks."""
     assert _control_event
     return _control_event
@@ -45,7 +52,8 @@ def _get_control_event() -> asyncio.Event:
 
 async def _controllable_task():
     """Task function that waits on the global control event."""
-    await _get_control_event().wait()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _get_control_event().wait)
     return "task_completed"
 
 
@@ -56,7 +64,7 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
 
     This fixture returns a tuple of (service, event, stub) where:
     - service: WorkerService instance with a controllable task dispatched
-    - event: asyncio.Event that controls task completion
+    - event: threading.Event that controls task completion
     - stub: gRPC stub for interacting with the service
 
     The task remains active until the event is set. On cleanup, if the event
@@ -65,7 +73,7 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
     global _control_event
 
     service = WorkerService()
-    _control_event = asyncio.Event()
+    _control_event = threading.Event()
 
     mock_proxy = mocker.MagicMock()
     mock_proxy.id = "test-proxy-id"
@@ -427,6 +435,47 @@ class TestWorkerService:
             assert len(scheduled_events) == 0
 
     @pytest.mark.asyncio
+    @pytest.mark.dependency("test_init")
+    async def test_dispatch_non_async_callable(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test :class:`WorkerService` dispatch rejects non-async callable.
+
+        Given:
+            A gRPC :class:`WorkerService` that is not stopping or stopped
+        When:
+            Dispatch RPC is called with a task whose callable is a synchronous function
+        Then:
+            It should abort with an error status
+        """
+
+        # Arrange
+        def sync_function():
+            return "sync_result"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = WorkTask(
+            id=uuid4(),
+            callable=sync_function,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+
+        # Act & Assert
+        async with grpc_aio_stub() as stub:
+            with pytest.raises(grpc.RpcError) as exc_info:
+                stream = stub.dispatch(request)
+                async for _ in stream:
+                    pass
+
+            assert exc_info.value.code() == StatusCode.UNKNOWN
+
+    @pytest.mark.asyncio
     @pytest.mark.dependency("test_dispatch_task_that_returns")
     async def test_stop_and_cancel(
         self,
@@ -550,6 +599,82 @@ class TestWorkerService:
             mock_worker_proxy_cache.clear.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.dependency("test_stop_and_cancel")
+    async def test_dispatch_task_that_self_cancels(
+        self,
+        grpc_aio_stub,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+    ):
+        """Test :class:`WorkerService` dispatch handles task that cancels itself.
+
+        Given:
+            A gRPC :class:`WorkerService` that is not stopping or stopped
+        When:
+            Dispatch RPC is called with a task that cancels itself on the worker loop
+        Then:
+            It should return an exception response containing a CancelledError
+        """
+
+        # Arrange
+        async def self_cancelling_task():
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+            return "should_not_return"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = WorkTask(
+            id=uuid4(),
+            callable=self_cancelling_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        ack, response = responses
+        assert ack.HasField("ack")
+        assert response.HasField("exception")
+        exception = cloudpickle.loads(response.exception.dump)
+        assert isinstance(exception, asyncio.CancelledError)
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_stop_and_cancel")
+    async def test_stop_timeout_then_cancel(
+        self, service_fixture, mock_worker_proxy_cache
+    ):
+        """Test :class:`WorkerService` stop cancels tasks after timeout expires.
+
+        Given:
+            A :class:`WorkerService` with an active task that outlasts the stop timeout
+        When:
+            stop RPC is called with a small positive timeout
+        Then:
+            It should wait for the timeout, then cancel remaining tasks and signal
+            stopped state
+        """
+        # Arrange
+        async with service_fixture as (service, event, stub):
+            # Act - stop with a very short timeout; the controllable task
+            # won't complete because the event is never set in time
+            stop_request = pb.worker.StopRequest(timeout=0.05)
+            stop_result = await stub.stop(stop_request)
+
+            # Assert
+            assert isinstance(stop_result, pb.worker.Void)
+            assert service.stopping.is_set()
+            assert service.stopped.is_set()
+
+    @pytest.mark.asyncio
     @pytest.mark.dependency("test_dispatch_task_that_returns")
     async def test_stop_while_idle(
         self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache
@@ -642,6 +767,40 @@ class TestWorkerService:
             # Assert - Verify behavior
             assert isinstance(result, pb.worker.Void)
             assert service.stopping.is_set()
+            assert service.stopped.is_set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_stop_while_idle")
+    async def test_stop_negative_timeout_waits_indefinitely(
+        self, service_fixture, mock_worker_proxy_cache
+    ):
+        """Test :class:`WorkerService` stop with negative timeout waits indefinitely.
+
+        Given:
+            A :class:`WorkerService` with an active task
+        When:
+            stop RPC is called with a negative timeout
+        Then:
+            It should treat the negative timeout as an indefinite wait and stop
+            only after the task completes
+        """
+        # Arrange
+        async with service_fixture as (service, event, stub):
+            # Initiate stop with negative timeout (treated as indefinite wait)
+            stop_task = asyncio.ensure_future(
+                stub.stop(pb.worker.StopRequest(timeout=-1))
+            )
+
+            # Wait for service to enter stopping state
+            await asyncio.wait_for(service.stopping.wait(), 1)
+            assert not service.stopped.is_set()
+
+            # Let the task complete so stop can finish
+            event.set()
+
+            # Act & Assert
+            stop_result = await asyncio.wait_for(stop_task, 5)
+            assert isinstance(stop_result, pb.worker.Void)
             assert service.stopped.is_set()
 
     @pytest.mark.asyncio
@@ -878,3 +1037,65 @@ class TestWorkerService:
         assert responses[1].HasField("result")
         result = cloudpickle.loads(responses[1].result.dump)
         assert result == "coroutine_result"
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_task")
+    async def test_stop_cancels_async_generator_task(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+    ):
+        """Test :class:`WorkerService` stop cancels an active async generator task.
+
+        Given:
+            A running :class:`WorkerService` with an active async generator task
+        When:
+            stop RPC is called with a timeout of 0
+        Then:
+            It should cancel the async generator and signal stopped state
+        """
+
+        # Arrange
+        async def blocking_generator():
+            yield "first_value"
+            await asyncio.sleep(100)
+            yield "should_not_reach"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = WorkTask(
+            id=uuid4(),
+            callable=blocking_generator,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+
+            # Read ack
+            async for response in stream:
+                assert response.HasField("ack")
+                break
+
+            # Read first result to confirm generator is active
+            async for response in stream:
+                assert response.HasField("result")
+                assert cloudpickle.loads(response.result.dump) == "first_value"
+                break
+
+            # Stop immediately to cancel the generator
+            stop_request = pb.worker.StopRequest(timeout=0)
+            stop_result = await stub.stop(stop_request)
+
+            # Assert
+            assert isinstance(stop_result, pb.worker.Void)
+            assert grpc_servicer.stopping.is_set()
+            assert grpc_servicer.stopped.is_set()
