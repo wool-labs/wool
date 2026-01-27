@@ -29,8 +29,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.MY_TOKEN }}
           ref: ${{ github.head_ref }}
+      - uses: ./.github/actions/get-wool-labs-app-token
+        id: get-wool-labs-app-token
+        with:
+          app-id: ${{ secrets.WOOL_LABS_APP_ID }}
+          app-installation-id: ${{ secrets.WOOL_LABS_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.WOOL_LABS_PRIVATE_KEY }}
       - name: Determine version segment to bump
         id: determine-version-segment
         if: ${{ github.event.inputs.version == '' }}
@@ -56,7 +61,10 @@ jobs:
           esac
       - name: Bump version
         id: bump-version
+        env:
+          GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
         run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           if [[ "${{ github.event.inputs.version }}" != "" ]]; then
             new_version="${{ github.event.inputs.version }}"
             echo "Using manually specified version: $new_version"
@@ -79,11 +87,18 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - uses: ./.github/actions/get-wool-labs-app-token
+        id: get-wool-labs-app-token
         with:
-          token: ${{ secrets.MY_TOKEN }}
+          app-id: ${{ secrets.WOOL_LABS_APP_ID }}
+          app-installation-id: ${{ secrets.WOOL_LABS_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.WOOL_LABS_PRIVATE_KEY }}
       - name: Create tag
         id: create-tag
+        env:
+          GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
         run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           new_version=${{ needs.bump-version.outputs.version }}
           echo "Tagging $new_version"
           git tag $new_version
@@ -176,10 +191,17 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - uses: ./.github/actions/get-wool-labs-app-token
+        id: get-wool-labs-app-token
         with:
-          token: ${{ secrets.MY_TOKEN }}
+          app-id: ${{ secrets.WOOL_LABS_APP_ID }}
+          app-installation-id: ${{ secrets.WOOL_LABS_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.WOOL_LABS_PRIVATE_KEY }}
       - name: Drop release branch
+        env:
+          GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
         run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git fetch --unshallow
           if [[ -n $(git ls-remote --heads origin release) ]]; then
             git push origin --delete release
