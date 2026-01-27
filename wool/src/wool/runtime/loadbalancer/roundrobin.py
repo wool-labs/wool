@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import itertools
-import logging
-from asyncio import Lock
 from typing import TYPE_CHECKING
 from typing import AsyncIterator
 from typing import Final
@@ -15,8 +13,6 @@ from .base import NoWorkersAvailable
 
 if TYPE_CHECKING:
     from wool.runtime.work import WorkTask
-
-logger = logging.getLogger(__name__)
 
 
 # public
@@ -38,7 +34,6 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
 
     def __init__(self):
         self._index = {}
-        self._lock = Lock()
 
     async def dispatch(
         self,
@@ -61,46 +56,46 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
             Timeout in seconds for each dispatch attempt. If ``None``, no
             timeout is applied.
         :returns:
-            A stream that yields worker responses.
+            A streaming dispatch result that yields worker responses.
         :raises NoWorkersAvailable:
             If no healthy workers are available to schedule the task.
         """
         checkpoint = None
 
+        # Initialize index for this context if not present
         if context not in self._index:
             self._index[context] = 0
 
         while context.workers:
-            async with self._lock:
-                if self._index[context] >= len(context.workers):
-                    self._index[context] = 0
+            if self._index[context] >= len(context.workers):
+                self._index[context] = 0
 
-                metadata, connection_resource_factory = next(
-                    itertools.islice(
-                        context.workers.items(),
-                        self._index[context],
-                        self._index[context] + 1,
-                    )
+            metadata, connection_resource_factory = next(
+                itertools.islice(
+                    context.workers.items(),
+                    self._index[context],
+                    self._index[context] + 1,
                 )
+            )
 
-                if checkpoint is None:
-                    checkpoint = metadata.uid
-                elif metadata.uid == checkpoint:
-                    break
+            if checkpoint is None:
+                checkpoint = metadata.uid
+            elif metadata.uid == checkpoint:
+                break
 
-                async with connection_resource_factory() as connection:
-                    try:
-                        stream = await connection.dispatch(task, timeout=timeout)
-                    except TransientRpcError:
-                        self._index[context] = self._index[context] + 1
-                        continue
-                    except Exception:
-                        context.remove_worker(metadata)
-                        if metadata.uid == checkpoint:
-                            checkpoint = None
-                        continue
-                    else:
-                        self._index[context] = self._index[context] + 1
-                        return stream
+            async with connection_resource_factory() as connection:
+                try:
+                    result = await connection.dispatch(task, timeout=timeout)
+                except TransientRpcError:
+                    self._index[context] = self._index[context] + 1
+                    continue
+                except Exception:
+                    context.remove_worker(metadata)
+                    if metadata.uid == checkpoint:
+                        checkpoint = None
+                    continue
+                else:
+                    self._index[context] = self._index[context] + 1
+                    return result
 
         raise NoWorkersAvailable("No healthy workers available for dispatch")

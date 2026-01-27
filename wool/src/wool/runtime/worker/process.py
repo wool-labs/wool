@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import signal
-import sys
 from contextlib import contextmanager
 from functools import partial
 from multiprocessing import Pipe
@@ -22,8 +20,6 @@ from wool.runtime.worker.service import WorkerService
 
 if TYPE_CHECKING:
     from wool.runtime.worker.proxy import WorkerProxy
-
-logger = logging.getLogger(__name__)
 
 
 class WorkerProcess(Process):
@@ -144,14 +140,6 @@ class WorkerProcess(Process):
         Sets the event loop for this process and starts the gRPC server,
         blocking until the server is stopped.
         """
-        # Configure logging for this subprocess
-        logging.basicConfig(
-            level=logging.INFO,
-            format=f"%(asctime)s - WORKER[{self.pid}] - %(name)s - %(levelname)s - %(message)s",
-            stream=sys.stderr,
-        )
-        logger.info(f"Worker process starting on {self._host}:{self._port}")
-
         wool.__proxy_pool__.set(
             ResourcePool(
                 factory=_proxy_factory,
@@ -159,11 +147,7 @@ class WorkerProcess(Process):
                 ttl=self._proxy_pool_ttl,
             )
         )
-        try:
-            asyncio.run(self._serve())
-        except Exception as e:
-            logger.exception(f"Worker process crashed: {type(e).__name__}: {e}")
-            raise
+        asyncio.run(self._serve())
 
     async def _serve(self):
         """Start the gRPC server in this worker process.
@@ -187,18 +171,12 @@ class WorkerProcess(Process):
         with _signal_handlers(service):
             try:
                 await server.start()
-                logger.info(f"Worker gRPC server started on port {port}")
                 try:
                     self._set_port.send(port)
                 finally:
                     self._set_port.close()
                 await service.stopped.wait()
-                logger.info("Worker service stopped, shutting down server")
-            except Exception as e:
-                logger.exception(f"Worker server error: {type(e).__name__}: {e}")
-                raise
             finally:
-                logger.info("Worker server stopping with grace period")
                 await server.stop(grace=self._shutdown_grace_period)
 
     def _address(self, host, port) -> str:
