@@ -146,6 +146,22 @@ class RpcError(Exception):
     unimplemented methods, permission denied).
     """
 
+    def __init__(
+        self,
+        code: grpc.StatusCode | None = None,
+        details: str | None = None,
+    ):
+        self.code = code
+        self.details = details
+        if code is not None and details is not None:
+            super().__init__(f"{code.name}: {details}")
+        elif code is not None:
+            super().__init__(code.name)
+        elif details is not None:
+            super().__init__(details)
+        else:
+            super().__init__()
+
 
 # public
 class TransientRpcError(RpcError):
@@ -214,10 +230,6 @@ class WorkerConnection:
 
         # Create channel options
         options = [
-            ("grpc.keepalive_time_ms", 10000),
-            ("grpc.keepalive_timeout_ms", 5000),
-            ("grpc.http2.max_pings_without_data", 0),
-            ("grpc.http2.min_time_between_pings_ms", 10000),
             ("grpc.max_receive_message_length", 100 * 1024 * 1024),
             ("grpc.max_send_message_length", 100 * 1024 * 1024),
         ]
@@ -272,10 +284,12 @@ class WorkerConnection:
         try:
             call = await self._dispatch(task, timeout)
         except grpc.RpcError as error:
-            if error.code() in self.TRANSIENT_ERRORS:
-                raise TransientRpcError from error
+            code = error.code()
+            details = error.details() or str(error)
+            if code in self.TRANSIENT_ERRORS:
+                raise TransientRpcError(code, details) from error
             else:
-                raise RpcError from error
+                raise RpcError(code, details) from error
 
         return self._execute(call)
 

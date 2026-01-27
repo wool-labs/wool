@@ -1488,6 +1488,7 @@ class TestWorkerPoolContextHelpers:
             pass
 
         mock_discovery = mocker.MagicMock()
+        mock_discovery.__enter__ = mocker.MagicMock(return_value=mock_discovery)
         mock_discovery.publisher = InvalidPublisher()
         mock_discovery.subscribe = mocker.MagicMock(return_value=mocker.MagicMock())
 
@@ -1508,22 +1509,3 @@ class TestWorkerPoolContextHelpers:
         with pytest.raises(ValueError):
             async with pool:
                 pass
-
-
-@pytest.mark.skip(reason="Feature not yet implemented or coverage gap identified")
-class TestWorkerPoolAdvanced:
-    """Additional coverage for WorkerPool edge cases."""
-
-    @pytest.mark.asyncio
-    async def test_worker_restart_on_failure(self, mock_worker_factory):
-        """Test the worker can be restarted (if supported).
-
-        Given:
-            A WorkerPool with a worker that fails during operation
-        When:
-            The worker failure is detected
-        Then:
-            The worker can be restarted (if supported)
-        """
-        # This test is skipped as restart behavior needs verification
-        pass
