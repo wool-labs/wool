@@ -76,6 +76,7 @@ jobs:
             git push origin $new_version
             echo "Bumping $old_version to $new_version"
           fi
+          echo "version=$new_version" >> $GITHUB_OUTPUT
 
   tag-version:
     name: Tag version
