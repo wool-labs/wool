@@ -23,6 +23,7 @@ from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.typing import Factory
+from wool.runtime.work.task import WORKER
 from wool.runtime.work.task import WorkTask
 from wool.runtime.work.task import WorkTaskEvent
 from wool.runtime.work.task import WorkTaskEventHandler
@@ -74,6 +75,7 @@ __all__ = [
     "NoWorkersAvailable",
     "RoundRobinLoadBalancer",
     # Work - New names (preferred)
+    "WORKER",
     "WorkTask",
     "WorkTaskEvent",
     "WorkTaskEventHandler",
