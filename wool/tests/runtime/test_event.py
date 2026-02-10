@@ -1,10 +1,11 @@
-import asyncio
+import logging
 from abc import ABC
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from wool.runtime.event import AsyncEventHandler
 from wool.runtime.event import Event
 from wool.runtime.event import EventHandler
 from wool.runtime.event import EventLike
@@ -46,7 +47,8 @@ def event_spy():
 def clear_handlers():
     """Clear handler registry before and after each test.
 
-    Ensures test isolation by cleaning the class-level handler registry.
+    Ensures test isolation by cleaning the class-level handler registry
+    and stopping the handler thread.
     """
     Event._handlers.clear()
     yield
@@ -281,6 +283,169 @@ class TestEventHandler:
         assert isinstance(handler, EventHandler)
 
 
+class TestAsyncEventHandler:
+    """Tests for AsyncEventHandler protocol and async handler execution."""
+
+    def test_async_handler_protocol_conformance(self):
+        """Test AsyncEventHandler protocol is runtime checkable.
+
+        Given:
+            An async callable function
+        When:
+            Check isinstance(fn, AsyncEventHandler)
+        Then:
+            Returns True (Protocol checks for __call__ existence)
+        """
+
+        # Arrange
+        async def handler(event, timestamp, context=None):
+            pass
+
+        # Act & Assert
+        assert isinstance(handler, AsyncEventHandler)
+
+    def test_sync_callable_is_also_async_handler(self):
+        """Test sync callable also satisfies AsyncEventHandler protocol.
+
+        Given:
+            A synchronous callable function
+        When:
+            Check isinstance(fn, AsyncEventHandler)
+        Then:
+            Returns True (runtime_checkable only checks __call__)
+        """
+
+        # Arrange
+        def handler(event, timestamp, context=None):
+            pass
+
+        # Act & Assert
+        # runtime_checkable Protocol only checks for __call__ existence
+        assert isinstance(handler, AsyncEventHandler)
+
+    def test_async_handler_invocation(self, concrete_event_class):
+        """Test async handler is invoked via the handler thread.
+
+        Given:
+            An async handler registered for an event type
+        When:
+            Event is emitted and flushed
+        Then:
+            The async handler is called with correct arguments
+        """
+        # Arrange
+        calls = []
+
+        async def async_handler(event, timestamp, context=None):
+            calls.append((event, timestamp, context))
+
+        Event._handlers["test-event"] = [async_handler]
+        event = concrete_event_class("test-event")
+
+        # Act
+        event.emit()
+        Event.flush()
+
+        # Assert
+        assert len(calls) == 1
+        emitted_event, timestamp, context = calls[0]
+        assert emitted_event is event
+        assert isinstance(timestamp, int)
+        assert context is None
+
+    def test_async_handler_with_context(self, concrete_event_class):
+        """Test async handler receives context argument.
+
+        Given:
+            An async handler registered for an event type
+        When:
+            Event is emitted with context and flushed
+        Then:
+            The async handler receives the context
+        """
+        # Arrange
+        calls = []
+
+        async def async_handler(event, timestamp, context=None):
+            calls.append((event, timestamp, context))
+
+        Event._handlers["test-event"] = [async_handler]
+        event = concrete_event_class("test-event")
+        context_data = {"key": "value"}
+
+        # Act
+        event.emit(context=context_data)
+        Event.flush()
+
+        # Assert
+        assert len(calls) == 1
+        _, _, context = calls[0]
+        assert context is context_data
+
+    def test_mixed_sync_and_async_handlers(self, concrete_event_class):
+        """Test mixed sync and async handlers are both invoked.
+
+        Given:
+            Both sync and async handlers registered for same type
+        When:
+            Event is emitted and flushed
+        Then:
+            All handlers are called in registration order
+        """
+        # Arrange
+        call_order = []
+
+        def sync_handler(event, timestamp, context=None):
+            call_order.append("sync")
+
+        async def async_handler(event, timestamp, context=None):
+            call_order.append("async")
+
+        Event._handlers["test-event"] = [sync_handler, async_handler]
+        event = concrete_event_class("test-event")
+
+        # Act
+        event.emit()
+        Event.flush()
+
+        # Assert
+        assert len(call_order) == 2
+        assert "sync" in call_order
+        assert "async" in call_order
+
+    def test_async_handler_exception_isolation(
+        self,
+        concrete_event_class,
+        caplog,
+    ):
+        """Test async handler exception is logged, not propagated.
+
+        Given:
+            An async handler that raises an exception
+        When:
+            Event is emitted and flushed
+        Then:
+            Exception is logged and does not propagate
+        """
+
+        # Arrange
+        async def failing_handler(event, timestamp, context=None):
+            raise ValueError("Async handler failed")
+
+        Event._handlers["test-event"] = [failing_handler]
+        event = concrete_event_class("test-event")
+
+        # Act
+        with caplog.at_level(logging.ERROR):
+            event.emit()
+            Event.flush()
+
+        # Assert
+        assert any(
+            "Exception in event handler" in record.message for record in caplog.records
+        )
+
+
 class TestEvent:
     """Tests for Event base class - all functionality."""
 
@@ -499,8 +664,7 @@ class TestEvent:
         assert "test-event" in Event._handlers
         assert handler in Event._handlers["test-event"]
 
-    @pytest.mark.asyncio
-    async def test_handler_responds_to_all_registered_types(
+    def test_handler_responds_to_all_registered_types(
         self, concrete_event_class, event_spy
     ):
         """Test handler invoked for all registered types.
@@ -522,7 +686,7 @@ class TestEvent:
         # Act
         event1.emit()
         event2.emit()
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         assert len(event_spy.calls) == 2
@@ -566,8 +730,7 @@ class TestEvent:
         # Assert
         assert len(event_spy.calls) == 0
 
-    @pytest.mark.asyncio
-    async def test_handler_receives_event_timestamp_context(
+    def test_handler_receives_event_timestamp_context(
         self, concrete_event_class, event_spy
     ):
         """Test handler receives all three arguments.
@@ -585,7 +748,7 @@ class TestEvent:
 
         # Act
         event.emit()
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         assert len(event_spy.calls) == 1
@@ -594,8 +757,7 @@ class TestEvent:
         assert isinstance(timestamp, int)
         assert context is None
 
-    @pytest.mark.asyncio
-    async def test_timestamp_generation(self, concrete_event_class, event_spy):
+    def test_timestamp_generation(self, concrete_event_class, event_spy):
         """Test timestamp generation.
 
         Given:
@@ -611,15 +773,14 @@ class TestEvent:
 
         # Act
         event.emit()
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         _, timestamp, _ = event_spy.calls[0]
         assert isinstance(timestamp, int)
         assert timestamp > 0
 
-    @pytest.mark.asyncio
-    async def test_multiple_handler_invocation_order(self, concrete_event_class):
+    def test_multiple_handler_invocation_order(self, concrete_event_class):
         """Test multiple handler invocation order.
 
         Given:
@@ -646,21 +807,20 @@ class TestEvent:
 
         # Act
         event.emit()
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         assert call_order == [1, 2, 3]
 
     # Handler emission (EV-020 to EV-022)
 
-    @pytest.mark.asyncio
-    async def test_handler_without_context(self, concrete_event_class, event_spy):
+    def test_handler_without_context(self, concrete_event_class, event_spy):
         """Test handler without context.
 
         Given:
             Handler with signature (event, timestamp, context=None)
         When:
-            Emit event without context and await event loop
+            Emit event without context and flush
         Then:
             Handler called with (event, timestamp, None)
         """
@@ -670,7 +830,7 @@ class TestEvent:
 
         # Act
         event.emit()
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         assert len(event_spy.calls) == 1
@@ -679,14 +839,13 @@ class TestEvent:
         assert isinstance(timestamp, int)
         assert context is None
 
-    @pytest.mark.asyncio
-    async def test_handler_with_context(self, concrete_event_class, event_spy):
+    def test_handler_with_context(self, concrete_event_class, event_spy):
         """Test handler with context.
 
         Given:
             Handler with signature (event, timestamp, context=None)
         When:
-            Emit event with context dict and await event loop
+            Emit event with context dict and flush
         Then:
             Handler called with (event, timestamp, context_dict)
         """
@@ -697,21 +856,20 @@ class TestEvent:
 
         # Act
         event.emit(context=context_data)
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         assert len(event_spy.calls) == 1
         emitted_event, timestamp, context = event_spy.calls[0]
         assert context is context_data
 
-    @pytest.mark.asyncio
-    async def test_explicit_none_context(self, concrete_event_class, event_spy):
+    def test_explicit_none_context(self, concrete_event_class, event_spy):
         """Test explicit None context.
 
         Given:
             Handler registered
         When:
-            Emit with context=None explicitly and await event loop
+            Emit with context=None explicitly and flush
         Then:
             Handler receives None for context parameter
         """
@@ -721,7 +879,7 @@ class TestEvent:
 
         # Act
         event.emit(context=None)
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         assert len(event_spy.calls) == 1
@@ -732,103 +890,81 @@ class TestEvent:
 
     # Exception handling (EV-025 to EV-027)
 
-    @pytest.mark.asyncio
-    async def test_exception_isolation_via_call_soon(self, concrete_event_class):
-        """Test exception isolation via call_soon.
+    def test_exception_isolation(self, concrete_event_class, caplog):
+        """Test exception isolation via handler thread.
 
         Given:
-            Handler that raises ValueError with event loop exception handler mock
+            Handler that raises ValueError
         When:
-            Emit event and await event loop
+            Emit event and flush
         Then:
-            Exception caught by event loop, does not propagate to caller
+            Exception is logged, does not propagate to caller
         """
-        # Arrange
-        exception_caught = []
 
+        # Arrange
         def failing_handler(event, timestamp, context=None):
             raise ValueError("Handler failed")
 
         Event._handlers["test-event"] = [failing_handler]
         event = concrete_event_class("test-event")
 
-        # Set up event loop exception handler
-        loop = asyncio.get_event_loop()
-        old_handler = loop.get_exception_handler()
-
-        def exception_handler(loop, context):
-            exception_caught.append(context["exception"])
-
-        loop.set_exception_handler(exception_handler)
-
-        try:
-            # Act - emit does not raise
+        # Act - emit does not raise
+        with caplog.at_level(logging.ERROR):
             event.emit()
-            await asyncio.sleep(0)
+            Event.flush()
 
-            # Assert
-            assert len(exception_caught) == 1
-            assert isinstance(exception_caught[0], ValueError)
-        finally:
-            loop.set_exception_handler(old_handler)
+        # Assert
+        assert any(
+            "Exception in event handler" in record.message for record in caplog.records
+        )
 
-    @pytest.mark.asyncio
-    async def test_exception_doesnt_stop_handler_chain(
-        self, concrete_event_class, event_spy
+    def test_exception_doesnt_stop_handler_chain(
+        self,
+        concrete_event_class,
+        event_spy,
+        caplog,
     ):
         """Test exception doesn't stop handler chain.
 
         Given:
             Two handlers: first raises exception, second is valid
         When:
-            Emit event and await event loop
+            Emit event and flush
         Then:
             Both handlers invoked; exception in first doesn't stop second
         """
-        # Arrange
-        exception_caught = []
 
+        # Arrange
         def failing_handler(event, timestamp, context=None):
             raise ValueError("First handler failed")
 
         Event._handlers["test-event"] = [failing_handler, event_spy]
         event = concrete_event_class("test-event")
 
-        # Set up event loop exception handler
-        loop = asyncio.get_event_loop()
-        old_handler = loop.get_exception_handler()
-
-        def exception_handler(loop, context):
-            exception_caught.append(context["exception"])
-
-        loop.set_exception_handler(exception_handler)
-
-        try:
-            # Act
+        # Act
+        with caplog.at_level(logging.ERROR):
             event.emit()
-            await asyncio.sleep(0)
+            Event.flush()
 
-            # Assert - exception caught
-            assert len(exception_caught) == 1
+        # Assert - exception logged
+        assert any(
+            "Exception in event handler" in record.message for record in caplog.records
+        )
 
-            # Assert - second handler still called
-            assert len(event_spy.calls) == 1
-        finally:
-            loop.set_exception_handler(old_handler)
+        # Assert - second handler still called
+        assert len(event_spy.calls) == 1
 
-    @pytest.mark.asyncio
-    async def test_handler_manages_own_exceptions(self, concrete_event_class):
+    def test_handler_manages_own_exceptions(self, concrete_event_class, caplog):
         """Test handler manages own exceptions.
 
         Given:
             Handler with try-except that catches its own error
         When:
-            Emit event and await event loop
+            Emit event and flush
         Then:
-            Handler completes without raising to event loop
+            Handler completes without logging an exception
         """
         # Arrange
-        exception_caught = []
         handler_completed = []
 
         def self_managing_handler(event, timestamp, context=None):
@@ -840,38 +976,28 @@ class TestEvent:
         Event._handlers["test-event"] = [self_managing_handler]
         event = concrete_event_class("test-event")
 
-        # Set up event loop exception handler
-        loop = asyncio.get_event_loop()
-        old_handler = loop.get_exception_handler()
-
-        def exception_handler(loop, context):
-            exception_caught.append(context["exception"])
-
-        loop.set_exception_handler(exception_handler)
-
-        try:
-            # Act
+        # Act
+        with caplog.at_level(logging.ERROR):
             event.emit()
-            await asyncio.sleep(0)
+            Event.flush()
 
-            # Assert - no exception propagated to event loop
-            assert len(exception_caught) == 0
+        # Assert - no exception logged
+        assert not any(
+            "Exception in event handler" in record.message for record in caplog.records
+        )
 
-            # Assert - handler completed
-            assert len(handler_completed) == 1
-        finally:
-            loop.set_exception_handler(old_handler)
+        # Assert - handler completed
+        assert len(handler_completed) == 1
 
     # Edge cases (EV-028 to EV-029)
 
-    @pytest.mark.asyncio
-    async def test_class_level_handler_registry(self, concrete_event_class, event_spy):
+    def test_class_level_handler_registry(self, concrete_event_class, event_spy):
         """Test class-level handler registry.
 
         Given:
             Handler registered after event instance created
         When:
-            Emit existing event instance and await event loop
+            Emit existing event instance and flush
         Then:
             Handler still invoked (class-level registry)
         """
@@ -881,19 +1007,18 @@ class TestEvent:
         # Act - register handler after event instance created
         Event._handlers["test-event"] = [event_spy]
         event.emit()
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         assert len(event_spy.calls) == 1
 
-    @pytest.mark.asyncio
-    async def test_event_mutation_visibility(self, concrete_event_class):
+    def test_event_mutation_visibility(self, concrete_event_class):
         """Test event mutation visibility.
 
         Given:
             Handler that modifies event instance
         When:
-            Emit to multiple handlers and await event loop
+            Emit to multiple handlers and flush
         Then:
             Subsequent handlers see modified state
         """
@@ -911,7 +1036,7 @@ class TestEvent:
 
         # Act
         event.emit()
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert - second handler sees mutation
         assert len(modifications) == 1
@@ -919,15 +1044,14 @@ class TestEvent:
 
     # Property-based tests (PBT-001 to PBT-004)
 
-    @pytest.mark.asyncio
     @given(event_type=st.text())
-    async def test_handler_invocation_property(self, event_type):
+    def test_handler_invocation_property(self, event_type):
         """Property-based test: handler invocation for any event type.
 
         Given:
             Any valid event type string (Hypothesis st.text() strategy)
         When:
-            Register handler, emit, and await event loop
+            Register handler, emit, and flush
         Then:
             Handler invoked exactly once
         """
@@ -948,12 +1072,11 @@ class TestEvent:
 
         # Act
         event.emit()
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         assert len(calls) == 1
 
-    @pytest.mark.asyncio
     @given(
         context=st.one_of(
             st.none(),
@@ -963,13 +1086,13 @@ class TestEvent:
             st.binary(min_size=1000, max_size=10000),  # large objects
         )
     )
-    async def test_context_identity_property(self, context):
+    def test_context_identity_property(self, context):
         """Property-based test: context identity across all types.
 
         Given:
             Arbitrary context types: None, dict, string, int, large objects
         When:
-            Emit event with context and await event loop
+            Emit event with context and flush
         Then:
             Context received by handler equals emitted context (identity preserved)
         """
@@ -990,22 +1113,21 @@ class TestEvent:
 
         # Act
         event.emit(context=context)
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         assert len(calls) == 1
         _, _, received_context = calls[0]
         assert received_context is context
 
-    @pytest.mark.asyncio
     @given(num_handlers=st.integers(min_value=1, max_value=100))
-    async def test_handler_count_invariant(self, num_handlers):
+    def test_handler_count_invariant(self, num_handlers):
         """Property-based test: handler count invariant.
 
         Given:
             N handlers registered (0 < N < 100, Hypothesis)
         When:
-            Emit event and await event loop
+            Emit event and flush
         Then:
             All N handlers invoked exactly once each
         """
@@ -1036,21 +1158,20 @@ class TestEvent:
 
         # Act
         event.emit()
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         for calls in call_counts:
             assert len(calls) == 1
 
-    @pytest.mark.asyncio
     @given(num_emissions=st.integers(min_value=1, max_value=50))
-    async def test_emission_independence_property(self, num_emissions):
+    def test_emission_independence_property(self, num_emissions):
         """Property-based test: emission independence.
 
         Given:
             Event emitted M times (0 < M < 50, Hypothesis)
         When:
-            Multiple emissions and await event loop
+            Multiple emissions and flush
         Then:
             Each emission invokes all handlers independently
         """
@@ -1073,7 +1194,7 @@ class TestEvent:
         for _ in range(num_emissions):
             event.emit()
 
-        await asyncio.sleep(0)
+        Event.flush()
 
         # Assert
         assert len(calls) == num_emissions
