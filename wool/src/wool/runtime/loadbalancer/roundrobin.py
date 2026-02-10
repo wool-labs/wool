@@ -14,7 +14,7 @@ from .base import LoadBalancerLike
 from .base import NoWorkersAvailable
 
 if TYPE_CHECKING:
-    from wool.runtime.work import WorkTask
+    from wool.runtime.work import Task
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
 
     async def dispatch(
         self,
-        task: WorkTask,
+        task: Task,
         *,
         context: LoadBalancerContext,
         timeout: float | None = None,
@@ -54,7 +54,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
         removed from the context's worker list.
 
         :param task:
-            The :class:`WorkTask` instance to dispatch to the worker.
+            The :class:`Task` instance to dispatch to the worker.
         :param context:
             The :class:`LoadBalancerContext` containing workers to dispatch to.
         :param timeout:

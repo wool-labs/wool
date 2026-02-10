@@ -13,7 +13,7 @@ from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 from wool.runtime import protobuf as pb
-from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import Task
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
@@ -22,9 +22,9 @@ from wool.runtime.worker.connection import WorkerConnection
 
 @pytest.fixture
 def sample_task(mocker: MockerFixture):
-    """Provides a mock :class:`WorkTask` for testing.
+    """Provides a mock :class:`Task` for testing.
 
-    Creates a WorkTask with a simple async function that returns a
+    Creates a Task with a simple async function that returns a
     test value.
     """
 
@@ -34,7 +34,7 @@ def sample_task(mocker: MockerFixture):
     mock_proxy = mocker.MagicMock()
     mock_proxy.id = "test-proxy-id"
 
-    return WorkTask(
+    return Task(
         id=uuid4(),
         callable=sample_task,
         args=(),
@@ -130,7 +130,7 @@ class TestWorkerConnection:
             stub, and yield the return value yielded from the gRPC response stream
         """
         # Arrange
-        to_protobuf_spy = mocker.spy(WorkTask, "to_protobuf")
+        to_protobuf_spy = mocker.spy(Task, "to_protobuf")
 
         responses = (
             pb.worker.Response(ack=pb.worker.Ack()),
@@ -172,7 +172,7 @@ class TestWorkerConnection:
             stub, and raise the exception yielded from the gRPC response stream
         """
         # Arrange
-        to_protobuf_spy = mocker.spy(WorkTask, "to_protobuf")
+        to_protobuf_spy = mocker.spy(Task, "to_protobuf")
 
         responses = (
             pb.worker.Response(ack=pb.worker.Ack()),
@@ -389,7 +389,7 @@ class TestWorkerConnection:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        work_task = WorkTask(
+        work_task = Task(
             id=uuid4(),
             callable=test_callable,
             args=(),
@@ -638,7 +638,7 @@ class TestWorkerConnection:
             Async iterator yields all results in order
         """
         # Arrange
-        to_protobuf_spy = mocker.spy(WorkTask, "to_protobuf")
+        to_protobuf_spy = mocker.spy(Task, "to_protobuf")
 
         responses = (
             pb.worker.Response(ack=pb.worker.Ack()),

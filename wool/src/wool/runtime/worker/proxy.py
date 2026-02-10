@@ -30,7 +30,7 @@ from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.connection import WorkerConnection
 
 if TYPE_CHECKING:
-    from wool.runtime.work.task import WorkTask
+    from wool.runtime.work.task import Task
 
 T = TypeVar("T")
 
@@ -103,7 +103,7 @@ class WorkerProxy:
     """Client-side proxy for dispatching tasks to distributed workers.
 
     Manages worker discovery, connection pooling, and load-balanced task
-    routing. The bridge between :func:`@wool.work <wool.work>` decorated
+    routing. The bridge between :func:`@wool.routine <wool.routine>` decorated
     functions and the worker pool.
 
     Connects to workers through discovery services, pool URIs, or static
@@ -381,7 +381,7 @@ class WorkerProxy:
         self._started = False
 
     async def dispatch(
-        self, task: WorkTask, *, timeout: float | None = None
+        self, task: Task, *, timeout: float | None = None
     ) -> AsyncGenerator:
         """Dispatches a task to an available worker in the pool.
 
@@ -390,7 +390,7 @@ class WorkerProxy:
         exception.
 
         :param task:
-            The :class:`WorkTask` object to be dispatched.
+            The :class:`Task` object to be dispatched.
         :param timeout:
             Timeout in seconds for getting a worker.
         :returns:

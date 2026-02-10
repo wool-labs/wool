@@ -18,7 +18,7 @@ from grpc.aio import ServicerContext
 import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import Task
 from wool.runtime.work.task import WorkTaskEvent
 
 # Sentinel to mark end of async generator stream
@@ -120,7 +120,7 @@ class WorkerService(pb.worker.WorkerServicer):
     ) -> AsyncIterator[pb.worker.Response]:
         """Execute a task in the current event loop.
 
-        Deserializes the incoming task into a :class:`WorkTask`
+        Deserializes the incoming task into a :class:`Task`
         instance, schedules it for execution in the current asyncio
         event loop, and yields responses for acknowledgment and result.
 
@@ -142,7 +142,7 @@ class WorkerService(pb.worker.WorkerServicer):
                 StatusCode.UNAVAILABLE, "Worker service is shutting down"
             )
 
-        with self._tracker(WorkTask.from_protobuf(request)) as work:
+        with self._tracker(Task.from_protobuf(request)) as work:
             yield pb.worker.Response(ack=pb.worker.Ack())
             try:
                 if isasyncgen(work):
@@ -219,7 +219,7 @@ class WorkerService(pb.worker.WorkerServicer):
         thread.join(timeout=5)
         loop.close()
 
-    async def _run_on_worker(self, work_task: WorkTask):
+    async def _run_on_worker(self, work_task: Task):
         """Run a task on the shared worker event loop.
 
         Offloads task execution to a dedicated worker event loop to
@@ -227,7 +227,7 @@ class WorkerService(pb.worker.WorkerServicer):
         are propagated from the calling context to the worker loop.
 
         :param work_task:
-            The :class:`WorkTask` instance to execute.
+            The :class:`Task` instance to execute.
         :returns:
             The result of the task execution.
         """
@@ -261,7 +261,7 @@ class WorkerService(pb.worker.WorkerServicer):
                     worker_loop.call_soon_threadsafe(worker_task.cancel)
                 raise
 
-    async def _stream_from_worker(self, work_task: WorkTask):
+    async def _stream_from_worker(self, work_task: Task):
         """Run a streaming task on the shared worker event loop.
 
         Offloads async generator execution to a dedicated worker event loop
@@ -269,7 +269,7 @@ class WorkerService(pb.worker.WorkerServicer):
         Context variables are propagated from the calling context to the worker loop.
 
         :param work_task:
-            The :class:`WorkTask` instance containing an async
+            The :class:`Task` instance containing an async
             generator.
         :yields:
             Values yielded by the async generator, streamed from
@@ -309,7 +309,7 @@ class WorkerService(pb.worker.WorkerServicer):
                 raise exception_holder[0]
 
     @contextmanager
-    def _tracker(self, work_task: WorkTask):
+    def _tracker(self, work_task: Task):
         """Context manager for tracking running tasks.
 
         Manages the lifecycle of a task execution, adding it to the
@@ -321,7 +321,7 @@ class WorkerService(pb.worker.WorkerServicer):
         to health checks and new task dispatches.
 
         :param work_task:
-            The :class:`WorkTask` instance to execute and track.
+            The :class:`Task` instance to execute and track.
         :yields:
             The :class:`asyncio.Task` or async generator for the wool task.
 
