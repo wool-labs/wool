@@ -19,7 +19,7 @@ from uuid import uuid4
 
 import wool
 from wool.runtime import context as ctx
-from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import Task
 from wool.runtime.work.task import do_dispatch
 
 if TYPE_CHECKING:
@@ -31,7 +31,7 @@ R = TypeVar("R")
 
 
 # public
-def work(fn: C) -> C:
+def routine(fn: C) -> C:
     """Decorator to declare an asynchronous function as remotely executable.
 
     Converts an asynchronous function or async generator into a distributed
@@ -102,19 +102,22 @@ def work(fn: C) -> C:
 
     .. code-block:: python
 
-        import wool
+        import asyncio, wool
 
 
-        @wool.work
+        @wool.routine
         async def fibonacci(n: int) -> int:
             if n <= 1:
                 return n
-            return await fibonacci(n - 1) + await fibonacci(n - 2)
+            async with asyncio.TaskGroup() as tg:
+                a = tg.create_task(fibonacci(n - 1))
+                b = tg.create_task(fibonacci(n - 2))
+            return a.result() + b.result()
 
 
         async def main():
             async with wool.WorkerPool():
-                result = await fibonacci(10)
+                print(await fibonacci(10))  # 34
 
     Example usage with async generators:
 
@@ -123,16 +126,18 @@ def work(fn: C) -> C:
         import wool
 
 
-        @wool.work
-        async def count_to(n: int):
-            for i in range(1, n + 1):
-                yield i
+        @wool.routine
+        async def fibonacci_series(n: int):
+            a, b = 0, 1
+            for _ in range(n):
+                yield a
+                a, b = b, a + b
 
 
         async def main():
             async with wool.WorkerPool():
-                async for value in count_to(10):
-                    print(value)  # Prints 1, 2, 3, ..., 10
+                async for value in fibonacci_series(10):
+                    print(value)  # 0, 1, 1, 2, 3, 5, 8, 13, 21, 34
     """
     # Check if function is a coroutine or async generator
     is_valid = (
@@ -212,7 +217,8 @@ def work(fn: C) -> C:
         return cast(C, coroutine_wrapper)
 
 
-routine = work
+# Alias for backwards compatibility
+work = routine
 
 
 def _dispatch(
@@ -231,7 +237,7 @@ def _dispatch(
             *(f"{k}={repr(v)}" for k, v in kwargs.items()),
         )
     )
-    task = WorkTask(
+    task = Task(
         id=uuid4(),
         callable=function,
         args=args,
