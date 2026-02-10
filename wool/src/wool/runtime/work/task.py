@@ -69,23 +69,23 @@ def do_dispatch(flag: bool | None = None, /) -> bool | ContextManager[None]:
 
 # public
 class WorkerProxyLike(Protocol):
-    """Protocol defining the interface required by WorkTask for proxy objects.
+    """Protocol defining the interface required by Task for proxy objects.
 
     This allows both the actual WorkerProxy and test doubles to be used
-    with WorkTask without requiring inheritance.
+    with Task without requiring inheritance.
     """
 
     @property
     def id(self) -> UUID: ...
 
     async def dispatch(
-        self, task: WorkTask, *, timeout: float | None = None
+        self, task: Task, *, timeout: float | None = None
     ) -> AsyncGenerator: ...
 
 
 # public
 @dataclass
-class WorkTask(Generic[W]):
+class Task(Generic[W]):
     """
     Represents a distributed task to be executed in the worker pool.
 
@@ -203,7 +203,7 @@ class WorkTask(Generic[W]):
         return False
 
     @classmethod
-    def from_protobuf(cls, task: pb.task.Task) -> WorkTask:
+    def from_protobuf(cls, task: pb.task.Task) -> Task:
         return cls(
             id=UUID(task.id),
             callable=cloudpickle.loads(task.callable),
@@ -334,12 +334,12 @@ class WorkTaskEvent(Event):
     :param type:
         The type of task event (e.g., "task-created", "task-scheduled").
     :param task:
-        The :class:`WorkTask` instance associated with this event.
+        The :class:`Task` instance associated with this event.
     """
 
-    task: WorkTask
+    task: Task
 
-    def __init__(self, type: WorkTaskEventType, /, task: WorkTask) -> None:
+    def __init__(self, type: WorkTaskEventType, /, task: Task) -> None:
         super().__init__(type)
         self.task = task
 
@@ -404,11 +404,11 @@ class WorkTaskEventHandler(Protocol):
     ) -> None: ...
 
 
-_current_task: ContextVar[WorkTask | None] = ContextVar("_current_task", default=None)
+_current_task: ContextVar[Task | None] = ContextVar("_current_task", default=None)
 
 
 # public
-def current_task() -> WorkTask | None:
+def current_task() -> Task | None:
     """
     Get the current task from the context variable if we are inside a task
     context, otherwise return None.

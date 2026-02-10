@@ -11,7 +11,7 @@ from hypothesis import strategies as st
 
 import wool
 from wool.runtime import protobuf as pb
-from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import Task
 from wool.runtime.work.task import WorkTaskEvent
 from wool.runtime.work.task import WorkTaskException
 from wool.runtime.work.task import current_task
@@ -33,18 +33,18 @@ class PicklableProxy:
 
 
 class TestWorkTask:
-    """Tests for WorkTask class."""
+    """Tests for Task class."""
 
     @pytest.mark.asyncio
     async def test_init_emits_task_created_event(
         self, sample_task, event_spy, clear_event_handlers
     ):
-        """Test WorkTask instantiation emits task-created event.
+        """Test Task instantiation emits task-created event.
 
         Given:
-            Valid parameters for a WorkTask
+            Valid parameters for a Task
         When:
-            WorkTask is instantiated
+            Task is instantiated
         Then:
             A "task-created" event is emitted
         """
@@ -69,12 +69,12 @@ class TestWorkTask:
     async def test_init_sets_caller_in_nested_context(
         self, sample_task, sample_async_callable, mock_proxy, clear_event_handlers
     ):
-        """Test WorkTask sets caller field in nested task context.
+        """Test Task sets caller field in nested task context.
 
         Given:
-            A WorkTask is instantiated within another task's context
+            A Task is instantiated within another task's context
         When:
-            WorkTask is created
+            Task is created
         Then:
             The caller field is set to the parent task's ID
         """
@@ -101,12 +101,12 @@ class TestWorkTask:
     def test_init_caller_none_outside_task_context(
         self, sample_task, clear_event_handlers
     ):
-        """Test WorkTask caller field is None outside task context.
+        """Test Task caller field is None outside task context.
 
         Given:
-            A WorkTask is instantiated outside any task context
+            A Task is instantiated outside any task context
         When:
-            WorkTask is created
+            Task is created
         Then:
             The caller field remains None
         """
@@ -118,10 +118,10 @@ class TestWorkTask:
 
     @pytest.mark.asyncio
     async def test_context_manager_entry(self, sample_task, clear_event_handlers):
-        """Test WorkTask context manager entry.
+        """Test Task context manager entry.
 
         Given:
-            A WorkTask is used as a context manager
+            A Task is used as a context manager
         When:
             Context is entered using `with` statement
         Then:
@@ -138,10 +138,10 @@ class TestWorkTask:
 
     @pytest.mark.asyncio
     async def test_context_manager_normal_exit(self, sample_task, clear_event_handlers):
-        """Test WorkTask context manager exits normally.
+        """Test Task context manager exits normally.
 
         Given:
-            A WorkTask context manager exits normally
+            A Task context manager exits normally
         When:
             `with` statement completes without exception
         Then:
@@ -158,10 +158,10 @@ class TestWorkTask:
     async def test_context_manager_exception_handling(
         self, sample_task, clear_event_handlers
     ):
-        """Test WorkTask context manager exception handling.
+        """Test Task context manager exception handling.
 
         Given:
-            A WorkTask context manager and an exception is raised within
+            A Task context manager and an exception is raised within
             the context
         When:
             Exception occurs inside `with` block
@@ -198,7 +198,7 @@ class TestWorkTask:
         When:
             `from_protobuf` is called
         Then:
-            Returns a WorkTask with all fields correctly deserialized
+            Returns a Task with all fields correctly deserialized
         """
         # Arrange
         task_id = uuid4()
@@ -222,7 +222,7 @@ class TestWorkTask:
         )
 
         # Act
-        task = WorkTask.from_protobuf(pb_task)
+        task = Task.from_protobuf(pb_task)
 
         # Assert
         assert task.id == task_id
@@ -249,7 +249,7 @@ class TestWorkTask:
         When:
             `from_protobuf` is called
         Then:
-            Returns a WorkTask with None/0 for empty optional fields
+            Returns a Task with None/0 for empty optional fields
         """
         # Arrange
         task_id = uuid4()
@@ -272,7 +272,7 @@ class TestWorkTask:
         )
 
         # Act
-        task = WorkTask.from_protobuf(pb_task)
+        task = Task.from_protobuf(pb_task)
 
         # Assert
         assert task.id == task_id
@@ -289,7 +289,7 @@ class TestWorkTask:
         """Test to_protobuf with all fields populated.
 
         Given:
-            A WorkTask instance with all fields populated
+            A Task instance with all fields populated
         When:
             `to_protobuf` is called
         Then:
@@ -298,7 +298,7 @@ class TestWorkTask:
         # Arrange
         caller_id = uuid4()
         task_id = uuid4()
-        task = WorkTask(
+        task = Task(
             id=task_id,
             callable=sample_async_callable,
             args=(1, 2),
@@ -338,7 +338,7 @@ class TestWorkTask:
         """Test to_protobuf with optional fields as None/0.
 
         Given:
-            A WorkTask instance with optional fields as None/0
+            A Task instance with optional fields as None/0
         When:
             `to_protobuf` is called
         Then:
@@ -346,7 +346,7 @@ class TestWorkTask:
             fields
         """
         # Arrange
-        task = WorkTask(
+        task = Task(
             id=uuid4(),
             callable=sample_async_callable,
             args=(),
@@ -378,10 +378,10 @@ class TestWorkTask:
         mock_worker_proxy_cache,
         clear_event_handlers,
     ):
-        """Test WorkTask.dispatch executes successfully.
+        """Test Task.dispatch executes successfully.
 
         Given:
-            A WorkTask with a valid proxy pool in context
+            A Task with a valid proxy pool in context
         When:
             `run` is called
         Then:
@@ -412,10 +412,10 @@ class TestWorkTask:
         event_spy,
         clear_event_handlers,
     ):
-        """Test WorkTask.dispatch emits task-completed event on success.
+        """Test Task.dispatch emits task-completed event on success.
 
         Given:
-            A WorkTask completes execution successfully
+            A Task completes execution successfully
         When:
             The task finishes without error
         Then:
@@ -452,10 +452,10 @@ class TestWorkTask:
         event_spy,
         clear_event_handlers,
     ):
-        """Test WorkTask.dispatch emits task-completed event on error.
+        """Test Task.dispatch emits task-completed event on error.
 
         Given:
-            A WorkTask completes execution with an exception
+            A Task completes execution with an exception
         When:
             The task finishes with an error
         Then:
@@ -494,10 +494,10 @@ class TestWorkTask:
     async def test_dispatch_without_proxy_pool_raises_error(
         self, sample_task, clear_event_handlers
     ):
-        """Test WorkTask.dispatch without proxy pool raises error.
+        """Test Task.dispatch without proxy pool raises error.
 
         Given:
-            WorkTask.dispatch is called without proxy pool in context
+            Task.dispatch is called without proxy pool in context
         When:
             run() is invoked
         Then:
@@ -516,10 +516,10 @@ class TestWorkTask:
     async def test_context_manager_with_multiple_exception_types(
         self, sample_task, clear_event_handlers
     ):
-        """Test WorkTask context manager with various exception types.
+        """Test Task context manager with various exception types.
 
         Given:
-            WorkTask context manager with various exception types
+            Task context manager with various exception types
         When:
             Different exception types are raised in context
         Then:
@@ -551,10 +551,10 @@ class TestWorkTask:
     def test_to_protobuf_with_unpicklable_callable_fails(
         self, picklable_proxy, clear_event_handlers
     ):
-        """Test WorkTask with unpicklable callable fails serialization.
+        """Test Task with unpicklable callable fails serialization.
 
         Given:
-            WorkTask with unpicklable callable
+            Task with unpicklable callable
         When:
             to_protobuf() is called
         Then:
@@ -576,7 +576,7 @@ class TestWorkTask:
         # Add a __qualname__ to avoid AttributeError in emit
         unpicklable_callable.__qualname__ = "unpicklable_callable"
 
-        task = WorkTask(
+        task = Task(
             id=uuid4(),
             callable=unpicklable_callable,
             args=(),
@@ -609,10 +609,10 @@ class TestWorkTask:
         line_no,
         tag,
     ):
-        """Property-based test: WorkTask serialization round-trip.
+        """Property-based test: Task serialization round-trip.
 
         Given:
-            Any WorkTask with valid picklable data
+            Any Task with valid picklable data
         When:
             from_protobuf(to_protobuf(task)) is called
         Then:
@@ -627,7 +627,7 @@ class TestWorkTask:
         args = (1, "test", [1, 2, 3])
         kwargs = {"key": "value", "number": 42}
 
-        original_task = WorkTask(
+        original_task = Task(
             id=task_id,
             callable=test_callable,
             args=args,
@@ -643,7 +643,7 @@ class TestWorkTask:
 
         # Act
         pb_task = original_task.to_protobuf()
-        deserialized_task = WorkTask.from_protobuf(pb_task)
+        deserialized_task = Task.from_protobuf(pb_task)
 
         # Assert
         assert deserialized_task.id == original_task.id
@@ -671,7 +671,7 @@ class TestWorkTask:
         """Test dispatch() with async generator yields all values in order.
 
         Given:
-            A WorkTask with async generator callable and valid proxy pool
+            A Task with async generator callable and valid proxy pool
         When:
             dispatch() is called and iterated
         Then:
@@ -696,14 +696,14 @@ class TestWorkTask:
     @pytest.mark.asyncio
     async def test_dispatch_with_coroutine_callable(
         self,
-        sample_task: Callable[..., WorkTask],
+        sample_task: Callable[..., Task],
         mock_worker_proxy_cache,
         clear_event_handlers,
     ):
         """Test dispatch() with coroutine returns the result.
 
         Given:
-            A WorkTask with coroutine callable and valid proxy pool
+            A Task with coroutine callable and valid proxy pool
         When:
             dispatch() is called and awaited
         Then:
@@ -731,7 +731,7 @@ class TestWorkTask:
         """Test dispatch() with neither coroutine nor async generator raises ValueError.
 
         Given:
-            A WorkTask with neither coroutine nor async generator
+            A Task with neither coroutine nor async generator
         When:
             dispatch() is called
         Then:
@@ -759,7 +759,7 @@ class TestWorkTask:
         """Test dispatch() with async generator without proxy pool raises RuntimeError.
 
         Given:
-            A WorkTask with async generator callable
+            A Task with async generator callable
         When:
             dispatch() is called without proxy pool in context
         Then:
@@ -789,7 +789,7 @@ class TestWorkTask:
         """Test dispatch() with async generator that raises propagates exception.
 
         Given:
-            A WorkTask with async generator that raises during iteration
+            A Task with async generator that raises during iteration
         When:
             dispatch() is called and iterated
         Then:
@@ -822,7 +822,7 @@ class TestWorkTask:
         """Test dispatch() async iterator terminated early via break.
 
         Given:
-            A WorkTask with async generator callable
+            A Task with async generator callable
         When:
             dispatch() async iterator is terminated early via break
         Then:
@@ -856,7 +856,7 @@ class TestWorkTask:
         """Test dispatch() fully consumed yields all values in correct order.
 
         Given:
-            A WorkTask with async generator that yields multiple values
+            A Task with async generator that yields multiple values
         When:
             dispatch() is fully consumed via async for
         Then:
@@ -889,7 +889,7 @@ class TestWorkTask:
         """Test dispatch() with async generator that yields zero values.
 
         Given:
-            A WorkTask with async generator that yields zero values
+            A Task with async generator that yields zero values
         When:
             dispatch() is called and consumed
         Then:
@@ -920,7 +920,7 @@ class TestWorkTask:
         """Test context manager returns callable for async generator.
 
         Given:
-            A WorkTask with an async generator callable
+            A Task with an async generator callable
         When:
             Context manager is entered using `with` statement
         Then:
@@ -949,7 +949,7 @@ class TestWorkTask:
         """Test context manager with invalid callable raises ValueError.
 
         Given:
-            A WorkTask with neither coroutine nor async generator callable
+            A Task with neither coroutine nor async generator callable
         When:
             Context manager is entered using `with` statement
         Then:
@@ -998,7 +998,7 @@ class TestWorkTask:
                 yield i
 
         proxy = PicklableProxy()
-        task = WorkTask(
+        task = Task(
             id=uuid4(),
             callable=test_generator,
             args=(),
@@ -1236,7 +1236,7 @@ class TestWorkerTaskEvent:
         wool.WorkTaskEvent._handlers.clear()
 
         try:
-            task = WorkTask(
+            task = Task(
                 id=uuid4(),
                 callable=test_callable,
                 args=(),
@@ -1288,7 +1288,7 @@ class TestCurrentTask:
         When:
             `current_task()` is called
         Then:
-            Returns the current WorkTask instance
+            Returns the current Task instance
         """
 
         # Arrange
@@ -1349,7 +1349,7 @@ class TestCurrentTask:
                 return
 
             # Create a new task
-            task = WorkTask(
+            task = Task(
                 id=uuid4(),
                 callable=test_callable,
                 args=(),
