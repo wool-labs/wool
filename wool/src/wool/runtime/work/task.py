@@ -184,9 +184,9 @@ class WorkTask(Generic[W]):
             False to allow exceptions to propagate.
         """
         logging.debug(f"Exiting {self.__class__.__name__} with ID {self.id}")
+        this = asyncio.current_task()
+        assert this
         if exception_value:
-            this = asyncio.current_task()
-            assert this
             self.exception = WorkTaskException(
                 exception_type.__qualname__,
                 traceback=[
@@ -197,7 +197,7 @@ class WorkTask(Generic[W]):
                     for y in x.split("\n")
                 ],
             )
-            this.add_done_callback(self._finish, context=Context())
+        this.add_done_callback(self._finish, context=Context())
         _current_task.reset(self._task_token)
         # Return False to allow exceptions to propagate
         return False

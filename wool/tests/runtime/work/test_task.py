@@ -405,21 +405,62 @@ class TestWorkTask:
         assert result == 8
 
     @pytest.mark.asyncio
-    async def test_dispatch_emits_task_completed_event(
+    async def test_dispatch_emits_task_completed_event_on_success(
         self,
         sample_task,
         mock_worker_proxy_cache,
         event_spy,
         clear_event_handlers,
     ):
-        """Test WorkTask.dispatch emits task-completed event on exception.
+        """Test WorkTask.dispatch emits task-completed event on success.
+
+        Given:
+            A WorkTask completes execution successfully
+        When:
+            The task finishes without error
+        Then:
+            A "task-completed" event is emitted.
+        """
+        # Arrange
+        wool.WorkTaskEvent._handlers["task-completed"] = [event_spy]
+
+        async def test_callable():
+            return 42
+
+        task = sample_task(callable=test_callable)
+
+        # Act
+        task_handle = asyncio.create_task(task.dispatch())
+        result = await task_handle
+
+        # Wait for the done callback to be invoked
+        await asyncio.sleep(0.01)
+
+        # Assert
+        assert result == 42
+        assert len(event_spy.calls) == 1
+        event, timestamp, context = event_spy.calls[0]
+        assert event.type == "task-completed"
+        assert event.task.id == task.id
+        assert event.task.exception is None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_emits_task_completed_event_on_error(
+        self,
+        sample_task,
+        mock_worker_proxy_cache,
+        event_spy,
+        clear_event_handlers,
+    ):
+        """Test WorkTask.dispatch emits task-completed event on error.
 
         Given:
             A WorkTask completes execution with an exception
         When:
             The task finishes with an error
         Then:
-            A "task-completed" event is emitted
+            A "task-completed" event is emitted with exception
+            information attached to the task.
         """
         # Arrange
         wool.WorkTaskEvent._handlers["task-completed"] = [event_spy]
@@ -447,6 +488,7 @@ class TestWorkTask:
         event, timestamp, context = event_spy.calls[0]
         assert event.type == "task-completed"
         assert event.task.id == task.id
+        assert event.task.exception is not None
 
     @pytest.mark.asyncio
     async def test_dispatch_without_proxy_pool_raises_error(
