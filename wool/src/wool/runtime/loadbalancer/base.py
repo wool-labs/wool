@@ -14,7 +14,7 @@ from wool.runtime.resourcepool import Resource
 from wool.runtime.worker.connection import WorkerConnection
 
 if TYPE_CHECKING:
-    from wool.runtime.work.task import WorkTask
+    from wool.runtime.work.task import Task
 
 
 # public
@@ -40,13 +40,13 @@ class LoadBalancerLike(Protocol):
     factories. The context provides isolation, allowing a single load balancer
     instance to service multiple worker pools with independent state.
 
-    The dispatch method accepts a :class:`WorkTask` and returns an async
+    The dispatch method accepts a :class:`Task` and returns an async
     iterator that yields task results from the worker.
     """
 
     async def dispatch(
         self,
-        task: WorkTask,
+        task: Task,
         *,
         context: LoadBalancerContext,
         timeout: float | None = None,

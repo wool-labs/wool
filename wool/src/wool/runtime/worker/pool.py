@@ -46,7 +46,7 @@ class WorkerPool:
 
     .. code-block:: python
 
-        @wool.work
+        @wool.routine
         async def fibonacci(n: int) -> int:
             if n <= 1:
                 return n
