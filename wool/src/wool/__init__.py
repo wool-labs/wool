@@ -16,6 +16,7 @@ from wool.runtime.discovery.base import PredicateFunction
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.event import AsyncEventHandler
 from wool.runtime.loadbalancer.base import ConnectionResourceFactory
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerLike
@@ -91,6 +92,8 @@ __all__ = [
     "WorkerPool",
     "WorkerProxy",
     "WorkerService",
+    # Events
+    "AsyncEventHandler",
     # Discovery
     "Discovery",
     "DiscoveryEvent",

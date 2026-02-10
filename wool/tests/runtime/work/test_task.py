@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from typing import Callable
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from hypothesis import strategies as st
 
 import wool
 from wool.runtime import protobuf as pb
+from wool.runtime.event import Event
 from wool.runtime.work.task import Task
 from wool.runtime.work.task import WorkTaskEvent
 from wool.runtime.work.task import WorkTaskException
@@ -35,8 +37,7 @@ class PicklableProxy:
 class TestWorkTask:
     """Tests for Task class."""
 
-    @pytest.mark.asyncio
-    async def test_init_emits_task_created_event(
+    def test_init_emits_task_created_event(
         self, sample_task, event_spy, clear_event_handlers
     ):
         """Test Task instantiation emits task-created event.
@@ -54,8 +55,8 @@ class TestWorkTask:
         # Act
         task = sample_task()
 
-        # Wait for event loop to process scheduled handlers
-        await asyncio.sleep(0)
+        # Wait for handler thread to process scheduled handlers
+        Event.flush()
 
         # Assert
         assert len(event_spy.calls) == 1
@@ -1095,10 +1096,7 @@ class TestWorkerTaskEvent:
         # Assert - original function is returned
         assert callable(test_handler)
 
-    @pytest.mark.asyncio
-    async def test_emit_with_handlers(
-        self, sample_task, event_spy, clear_event_handlers
-    ):
+    def test_emit_with_handlers(self, sample_task, event_spy, clear_event_handlers):
         """Test emit calls registered handlers.
 
         Given:
@@ -1116,8 +1114,8 @@ class TestWorkerTaskEvent:
         # Act
         event.emit()
 
-        # Wait for event loop to process scheduled handlers
-        await asyncio.sleep(0)
+        # Wait for handler thread to process scheduled handlers
+        Event.flush()
 
         # Assert
         assert len(event_spy.calls) == 1
@@ -1143,54 +1141,39 @@ class TestWorkerTaskEvent:
         # Act & Assert (no exception should be raised)
         event.emit()
 
-    @pytest.mark.asyncio
-    async def test_emit_handler_exception_isolated(
-        self, sample_task, clear_event_handlers
+    def test_emit_handler_exception_isolated(
+        self, sample_task, clear_event_handlers, caplog
     ):
-        """Test emit handler exception isolation via call_soon.
+        """Test emit handler exception isolation via handler thread.
 
         Given:
             Event handler that raises an exception
         When:
             emit() calls a failing handler
         Then:
-            Exception is caught by event loop, does not propagate to emit() caller
+            Exception is logged, does not propagate to emit() caller
         """
         # Arrange
         task = sample_task()
         event = WorkTaskEvent("task-created", task=task)
-        exception_caught = []
 
         def failing_handler(event, timestamp, context=None):
             raise ValueError("Handler failed")
 
         WorkTaskEvent._handlers["task-created"] = [failing_handler]
 
-        # Set up event loop exception handler to catch the exception
-        loop = asyncio.get_event_loop()
-        old_exception_handler = loop.get_exception_handler()
-
-        def exception_handler(loop, context):
-            exception_caught.append(context["exception"])
-
-        loop.set_exception_handler(exception_handler)
-
-        try:
-            # Act - emit does not raise
+        # Act - emit does not raise
+        with caplog.at_level(logging.ERROR):
             event.emit()
 
-            # Wait for event loop to process scheduled handlers
-            await asyncio.sleep(0)
+            # Wait for handler thread to process scheduled handlers
+            Event.flush()
 
-            # Assert - exception was caught by event loop, not propagated
-            assert len(exception_caught) == 1
-            assert isinstance(exception_caught[0], ValueError)
-            assert str(exception_caught[0]) == "Handler failed"
-        finally:
-            # Restore original exception handler
-            loop.set_exception_handler(old_exception_handler)
+        # Assert - exception was logged, not propagated
+        assert any(
+            "Exception in event handler" in record.message for record in caplog.records
+        )
 
-    @pytest.mark.asyncio
     @settings(max_examples=20, deadline=None)
     @given(
         event_types_to_register=st.sets(
@@ -1209,7 +1192,7 @@ class TestWorkerTaskEvent:
         ),
         num_handlers=st.integers(min_value=1, max_value=5),
     )
-    async def test_handler_registration_and_emission(
+    def test_handler_registration_and_emission(
         self,
         event_types_to_register,
         num_handlers,
@@ -1263,8 +1246,8 @@ class TestWorkerTaskEvent:
                 event = WorkTaskEvent(event_type, task=task)
                 event.emit()
 
-            # Wait for event loop to process all scheduled handlers
-            await asyncio.sleep(0)
+            # Wait for handler thread to process all scheduled handlers
+            Event.flush()
 
             # Assert - each handler should be called once per event type
             for i in range(num_handlers):

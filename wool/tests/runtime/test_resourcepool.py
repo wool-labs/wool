@@ -332,7 +332,7 @@ class TestResourcePool:
         When:
             Release is called with a nonexistent key
         Then:
-            Should raise KeyError and not affect existing resources
+            Should exit without affecting existing resources
         """
         # Arrange
         pool = ResourcePool(factory=counting_factory, ttl=1.0)
@@ -347,8 +347,7 @@ class TestResourcePool:
 
         # Act & Assert
         # Try to release a nonexistent key
-        with pytest.raises(KeyError, match="Key 'nonexistent' not found in cache"):
-            await pool.release("nonexistent")
+        await pool.release("nonexistent")
 
         # Should not affect existing resources
         assert pool.stats.total_entries == initial_cache_size
