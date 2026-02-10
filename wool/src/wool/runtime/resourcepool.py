@@ -277,7 +277,7 @@ class ResourcePool(Generic[T]):
         """
         async with self._lock:
             if key not in self._cache:
-                raise KeyError(f"Key '{key}' not found in cache")
+                return
             entry = self._cache[key]
 
             if entry.reference_count <= 0:

@@ -54,6 +54,8 @@ def test_public_api_completeness():
         "WorkerPool",
         "WorkerProxy",
         "WorkerService",
+        # Events
+        "AsyncEventHandler",
         # Discovery
         "Discovery",
         "DiscoveryEvent",
