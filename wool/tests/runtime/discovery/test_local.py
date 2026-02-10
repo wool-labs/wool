@@ -4,6 +4,7 @@ import tempfile
 import uuid
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -1194,7 +1195,7 @@ class TestLocalDiscoveryPublisher:
             mock_context.__enter__.return_value = mock_address_space
             mock_context.__exit__.return_value = None
 
-            with mocker.patch(
+            with patch(
                 "wool.runtime.discovery.local._shared_memory",
                 return_value=mock_context,
             ):
@@ -1204,9 +1205,7 @@ class TestLocalDiscoveryPublisher:
                     await publisher.publish(event_type, worker)
 
     @pytest.mark.asyncio
-    async def test_publish_worker_added_cleanup_on_exception(
-        self, namespace, mocker: MockerFixture
-    ):
+    async def test_publish_worker_added_cleanup_on_exception(self, namespace):
         """Test worker is not discoverable when exception occurs during _add.
 
         Given:
@@ -1243,7 +1242,7 @@ class TestLocalDiscoveryPublisher:
                         raise RuntimeError("Simulated pack_into failure")
                     return original_pack_into(*args, **kwargs)
 
-                with mocker.patch("struct.pack_into", side_effect=mock_pack_into):
+                with patch("struct.pack_into", side_effect=mock_pack_into):
                     # Attempt to publish should fail
                     with pytest.raises(
                         RuntimeError, match="Simulated pack_into failure"
@@ -1418,9 +1417,7 @@ class TestLocalDiscoveryPublisher:
             address_space.unlink()
 
     @pytest.mark.asyncio
-    async def test_update_restores_prior_state_on_exception(
-        self, namespace, mocker: MockerFixture
-    ):
+    async def test_update_restores_prior_state_on_exception(self, namespace):
         """Test update restores prior worker state when exception occurs.
 
         Given:
@@ -1486,7 +1483,7 @@ class TestLocalDiscoveryPublisher:
                         raise RuntimeError("Simulated pack_into failure during update")
                     return original_pack_into(fmt, buffer, offset, *args)
 
-                with mocker.patch(
+                with patch(
                     "wool.runtime.discovery.local.struct.pack_into",
                     side_effect=mock_pack_into,
                 ):

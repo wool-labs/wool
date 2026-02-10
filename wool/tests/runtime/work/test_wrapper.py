@@ -8,10 +8,10 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool.runtime.work.wrapper import work
+from wool.runtime.work.wrapper import routine
 
 
-@work
+@routine
 async def foo(x, y):
     """Test function for dispatch tests."""
     return x + y
@@ -21,7 +21,7 @@ assert foo.__qualname__ == "foo"
 assert foo.__module__ == "runtime.work.test_wrapper"
 
 
-@work
+@routine
 async def bar():
     """Test function with no arguments."""
     return "async_result"
@@ -31,7 +31,7 @@ assert bar.__qualname__ == "bar"
 assert bar.__module__ == "runtime.work.test_wrapper"
 
 
-@work
+@routine
 async def foo_gen(x):
     """Async generator test function."""
     for i in range(x):
@@ -45,7 +45,7 @@ assert foo_gen.__module__ == "runtime.work.test_wrapper"
 class Foo:
     """Test class for instance and class method tests."""
 
-    @work
+    @routine
     async def foo(self, x):
         """Instance method."""
         return x * 2
@@ -53,7 +53,7 @@ class Foo:
     assert foo.__qualname__ == "Foo.foo"
     assert foo.__module__ == "runtime.work.test_wrapper"
 
-    @work
+    @routine
     @classmethod
     async def bar(cls, x):
         """Class method."""
@@ -62,7 +62,7 @@ class Foo:
     assert bar.__qualname__ == "Foo.bar"
     assert bar.__module__ == "runtime.work.test_wrapper"
 
-    @work
+    @routine
     @staticmethod
     async def baz(x):
         """Static method."""
@@ -71,7 +71,7 @@ class Foo:
     assert baz.__qualname__ == "Foo.baz"
     assert baz.__module__ == "runtime.work.test_wrapper"
 
-    @work
+    @routine
     async def foo_gen(self, x):
         """Async generator instance method."""
         for i in range(x):
@@ -80,7 +80,7 @@ class Foo:
     assert foo_gen.__qualname__ == "Foo.foo_gen"
     assert foo_gen.__module__ == "runtime.work.test_wrapper"
 
-    @work
+    @routine
     @classmethod
     async def bar_gen(cls, x):
         """Async generator class method."""
@@ -90,7 +90,7 @@ class Foo:
     assert bar_gen.__qualname__ == "Foo.bar_gen"
     assert bar_gen.__module__ == "runtime.work.test_wrapper"
 
-    @work
+    @routine
     @staticmethod
     async def baz_gen(x):
         """Async generator static method."""
@@ -130,10 +130,10 @@ class TestWork:
         mocker: MockerFixture,
         mock_proxy_context,
     ):
-        """Property-based test: Work decorator with various function types.
+        """Property-based test: Routine decorator with various function types.
 
         Given:
-            The @work decorator applied to different function types (module
+            The @routine decorator applied to different function types (module
             function, instance method, classmethod, staticmethod, async generators)
             with do_dispatch set to either True or False
         When:
@@ -229,10 +229,10 @@ class TestWork:
         mocker: MockerFixture,
         mock_proxy_context,
     ):
-        """Property-based test: Work decorator with various argument patterns.
+        """Property-based test: Routine decorator with various argument patterns.
 
         Given:
-            The @work decorator with any valid combination of positional
+            The @routine decorator with any valid combination of positional
             arguments
         When:
             The decorated function is called with these arguments
@@ -265,10 +265,10 @@ class TestWork:
     )
     @given(function_type=st.sampled_from(["function", "generator", "class"]))
     def test_invalid_wrapper(self, function_type):
-        """Property-based test: @work decorator validation.
+        """Property-based test: @routine decorator validation.
 
         Given:
-            The @work decorator applied to invalid function types
+            The @routine decorator applied to invalid function types
             (non-coroutine, sync generator, class)
         When:
             Decorator is applied
@@ -282,19 +282,19 @@ class TestWork:
             match function_type:
                 case "function":
 
-                    @work  # type: ignore[arg-type]
+                    @routine  # type: ignore[arg-type]
                     def invalid_foo(x: int):
                         return x * 2
 
                 case "generator":
 
-                    @work  # type: ignore[arg-type]
+                    @routine  # type: ignore[arg-type]
                     def invalid_bar(x: int):
                         yield x * 3
 
                 case "class":
 
-                    @work  # type: ignore[arg-type]
+                    @routine  # type: ignore[arg-type]
                     class InvalidFoo: ...
 
     @pytest.mark.asyncio
@@ -403,7 +403,7 @@ class TestWork:
         """Test async generator cleanup on aclose.
 
         Given:
-            An async generator decorated with @work
+            An async generator decorated with @routine
         When:
             The generator is closed via aclose() before exhaustion
         Then:

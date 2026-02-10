@@ -9,7 +9,7 @@ import pytest
 from pytest_mock import MockerFixture
 
 import wool
-from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import Task
 
 
 class PicklableProxy:
@@ -77,14 +77,14 @@ def sample_async_callable():
 @pytest.fixture
 def sample_task(
     mocker: MockerFixture, sample_async_callable: Callable[..., Coroutine], mock_proxy
-) -> Callable[..., WorkTask]:
-    """Provides a factory for creating mock WorkTask instances.
+) -> Callable[..., Task]:
+    """Provides a factory for creating mock Task instances.
 
-    Returns a function that creates WorkTask instances with customizable
+    Returns a function that creates Task instances with customizable
     parameters for testing.
     """
 
-    def _create_task(**overrides) -> WorkTask:
+    def _create_task(**overrides) -> Task:
         defaults = {
             "id": uuid4(),
             "callable": sample_async_callable,
@@ -101,7 +101,7 @@ def sample_task(
         }
         defaults.update(overrides)
 
-        task = WorkTask(**defaults)
+        task = Task(**defaults)
         return task
 
     return _create_task
@@ -158,13 +158,13 @@ async def picklable_async_function_raises():
 class PicklableTestClass:
     """A picklable class for testing instance and class methods."""
 
-    @wool.work
+    @wool.routine
     async def instance_method(self, x: int) -> int:
         """A picklable instance method."""
         return x * 3
 
     @classmethod
-    @wool.work
+    @wool.routine
     async def class_method(cls, x: int) -> int:
         """A picklable class method."""
         return x * 4

@@ -11,7 +11,7 @@ import cloudpickle
 import grpc.aio
 
 from wool.runtime import protobuf as pb
-from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import Task
 from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.base import resolve_channel_credentials
 
@@ -76,7 +76,7 @@ class _DispatchStream(Generic[_T]):
         """Close the async generator and cancel the underlying gRPC call.
 
         This method provides proper cleanup for async generators decorated
-        with @work. When called, it cancels the gRPC stream to the worker,
+        with @routine. When called, it cancels the gRPC stream to the worker,
         which triggers cleanup on the worker side.
 
         Implements the async generator protocol's aclose() method to match
@@ -247,7 +247,7 @@ class WorkerConnection:
 
     async def dispatch(
         self,
-        task: WorkTask,
+        task: Task,
         *,
         timeout: float | None = None,
     ) -> AsyncIterator[pb.task.Result]:
@@ -259,7 +259,7 @@ class WorkerConnection:
         (semaphore acquisition and acknowledgment).
 
         :param task:
-            The :class:`WorkTask` instance to dispatch to the worker.
+            The :class:`Task` instance to dispatch to the worker.
         :param timeout:
             Timeout in seconds for semaphore acquisition and task
             acknowledgment. If ``None``, no timeout is applied. Does not

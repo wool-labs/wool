@@ -24,7 +24,7 @@ from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.resourcepool import Resource
-from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import Task
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.proxy import WorkerProxy
 
@@ -65,12 +65,12 @@ def mock_worker_stub(mocker: MockerFixture):
 
 @pytest.fixture
 def mock_wool_task(mocker: MockerFixture):
-    """Create a mock :class:`WorkTask` for testing.
+    """Create a mock :class:`Task` for testing.
 
     Provides a mock task with protobuf serialization capabilities for
     testing task dispatch and processing scenarios.
     """
-    mock_task = mocker.MagicMock(spec=WorkTask)
+    mock_task = mocker.MagicMock(spec=Task)
     mock_task.to_protobuf = mocker.MagicMock()
     return mock_task
 
@@ -1104,7 +1104,7 @@ class TestWorkerProxy:
         # Verify no workers before the gate opens
         assert proxy.workers == []
 
-        mock_task = mocker.MagicMock(spec=WorkTask)
+        mock_task = mocker.MagicMock(spec=Task)
 
         # Act — launch dispatch in background; it spins waiting for workers
         dispatch_task = asyncio.create_task(proxy.dispatch(mock_task))
