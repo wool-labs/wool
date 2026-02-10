@@ -13,7 +13,7 @@ from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import Task
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
@@ -109,7 +109,7 @@ class TestRoundRobinLoadBalancer:
 
         mock_proxy = mocker.MagicMock(id="mock-proxy")
 
-        task = WorkTask(
+        task = Task(
             id=uuid4(),
             callable=routine,
             args=(),
@@ -242,7 +242,7 @@ class TestRoundRobinLoadBalancer:
 
         mock_proxy = mocker.MagicMock(id="mock-proxy")
 
-        task = WorkTask(
+        task = Task(
             id=uuid4(),
             callable=routine,
             args=(),
@@ -360,7 +360,7 @@ class TestRoundRobinLoadBalancer:
         mock_proxy = mocker.MagicMock(id="mock-proxy")
 
         tasks = [
-            WorkTask(
+            Task(
                 id=uuid4(),
                 callable=routine,
                 args=(),
@@ -431,14 +431,14 @@ class TestRoundRobinLoadBalancer:
 
         mock_proxy = mocker.MagicMock(id="mock-proxy")
 
-        task1 = WorkTask(
+        task1 = Task(
             id=uuid4(),
             callable=routine,
             args=(),
             kwargs={},
             proxy=mock_proxy,
         )
-        task2 = WorkTask(
+        task2 = Task(
             id=uuid4(),
             callable=routine,
             args=(),
@@ -505,7 +505,7 @@ class TestRoundRobinLoadBalancer:
 
         mock_proxy = mocker.MagicMock(id="mock-proxy")
 
-        task = WorkTask(
+        task = Task(
             id=uuid4(),
             callable=routine,
             args=(),
@@ -577,7 +577,7 @@ class TestRoundRobinLoadBalancer:
 
         mock_proxy = mocker.MagicMock(id="mock-proxy")
 
-        task = WorkTask(
+        task = Task(
             id=uuid4(),
             callable=routine,
             args=(),
@@ -649,7 +649,7 @@ class TestRoundRobinLoadBalancer:
         mock_proxy = mocker.MagicMock(id="mock-proxy")
 
         tasks = [
-            WorkTask(
+            Task(
                 id=uuid4(),
                 callable=routine,
                 args=(),

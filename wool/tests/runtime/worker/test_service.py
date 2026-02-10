@@ -13,7 +13,7 @@ from pytest_mock import MockerFixture
 from wool.runtime import protobuf as pb
 from wool.runtime.protobuf.worker import WorkerStub
 from wool.runtime.protobuf.worker import add_WorkerServicer_to_server
-from wool.runtime.work.task import WorkTask
+from wool.runtime.work.task import Task
 from wool.runtime.work.task import WorkTaskEvent
 from wool.runtime.worker.service import WorkerService
 from wool.runtime.worker.service import _ReadOnlyEvent
@@ -78,7 +78,7 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
     mock_proxy = mocker.MagicMock()
     mock_proxy.id = "test-proxy-id"
 
-    wool_task = WorkTask(
+    wool_task = Task(
         id=uuid4(),
         callable=_controllable_task,
         args=(),
@@ -229,7 +229,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=sample_task,
             args=(),
@@ -281,7 +281,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=failing_task,
             args=(),
@@ -346,7 +346,7 @@ class TestWorkerService:
             mock_proxy = mocker.MagicMock()
             mock_proxy.id = "test-proxy-id-2"
 
-            wool_task = WorkTask(
+            wool_task = Task(
                 id=uuid4(),
                 callable=another_task,
                 args=(),
@@ -408,7 +408,7 @@ class TestWorkerService:
             mock_proxy = mocker.MagicMock()
             mock_proxy.id = "test-proxy-id-2"
 
-            wool_task = WorkTask(
+            wool_task = Task(
                 id=uuid4(),
                 callable=another_task,
                 args=(),
@@ -456,7 +456,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=sync_function,
             args=(),
@@ -503,7 +503,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=long_running_task,
             args=(),
@@ -564,7 +564,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=quick_task,
             args=(),
@@ -625,7 +625,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=self_cancelling_task,
             args=(),
@@ -826,7 +826,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=test_generator,
             args=(),
@@ -881,7 +881,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=failing_generator,
             args=(),
@@ -929,7 +929,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=test_generator,
             args=(),
@@ -975,7 +975,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=empty_generator,
             args=(),
@@ -1016,7 +1016,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=test_coroutine,
             args=(),
@@ -1066,7 +1066,7 @@ class TestWorkerService:
         mock_proxy = mocker.MagicMock()
         mock_proxy.id = "test-proxy-id"
 
-        wool_task = WorkTask(
+        wool_task = Task(
             id=uuid4(),
             callable=blocking_generator,
             args=(),
