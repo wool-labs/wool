@@ -243,6 +243,8 @@ class WorkerService(pb.worker.WorkerServicer):
                 worker_task = task
 
                 def _done(t: asyncio.Task):
+                    if future.done():
+                        return
                     if t.cancelled():
                         future.cancel()
                     elif t.exception() is not None:
