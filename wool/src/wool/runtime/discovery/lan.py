@@ -30,33 +30,44 @@ from wool.runtime.discovery.base import WorkerMetadata
 
 # public
 class LanDiscovery(Discovery):
-    """Worker discovery on the local network using Zeroconf/Bonjour.
+    """Zeroconf DNS-SD discovery for network-wide worker pools.
 
-    Provides network-wide worker discovery using DNS Service Discovery
-    (DNS-SD) via the Zeroconf protocol. Workers are automatically
-    discovered as they join or leave the network without requiring
-    central coordination.
+    Workers are advertised as DNS-SD service records
+    (``_wool._tcp.local.``) on the local network. Subscribers
+    browse for these services and receive events as workers come
+    and go. No central coordinator required.
 
-    The service type "_wool._tcp.local." is used for all Wool worker
-    services on the LAN. Publishers advertise workers by registering
-    DNS-SD service records, and subscribers browse for these services.
+    :param filter:
+        Optional default predicate function to filter workers.
+        Used by :py:attr:`subscriber` and as the default for
+        :py:meth:`subscribe` when no explicit filter is provided.
 
-    Example usage:
+    Example — publish workers:
 
-    Publish workers
     .. code-block:: python
+
         publisher = LanDiscovery.Publisher()
         async with publisher:
             await publisher.publish("worker-added", metadata)
 
-    Subscribe to workers
+    Example — subscribe to workers:
+
     .. code-block:: python
+
         discovery = LanDiscovery()
         async for event in discovery.subscriber:
             print(f"Discovered worker: {event.metadata}")
     """
 
+    _filter: Final[PredicateFunction | None]
     service_type: Literal["_wool._tcp.local."] = "_wool._tcp.local."
+
+    def __init__(
+        self,
+        *,
+        filter: PredicateFunction | None = None,
+    ):
+        self._filter = filter
 
     @property
     def publisher(self) -> DiscoveryPublisherLike:
@@ -69,10 +80,10 @@ class LanDiscovery(Discovery):
 
     @property
     def subscriber(self) -> DiscoverySubscriberLike:
-        """The default subscriber that receives all worker events.
+        """A subscriber using the constructor's default filter.
 
         :returns:
-            A subscriber instance that receives all worker discovery
+            A subscriber instance for receiving worker discovery
             events.
         """
         return self.subscribe()
@@ -85,12 +96,13 @@ class LanDiscovery(Discovery):
         :param filter:
             Optional predicate function to filter workers. Only workers
             for which the predicate returns True will be included in
-            events.
+            events. Falls back to the constructor's filter if not
+            provided.
         :returns:
             A subscriber instance that receives filtered worker
             discovery events.
         """
-        return self.Subscriber(filter)
+        return self.Subscriber(filter if filter is not None else self._filter)
 
     class Publisher:
         """Publisher for broadcasting worker discovery events.
