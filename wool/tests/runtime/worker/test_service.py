@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import threading
 from contextlib import asynccontextmanager
 from typing import Final
@@ -1099,3 +1100,94 @@ class TestWorkerService:
             assert isinstance(stop_result, pb.worker.Void)
             assert grpc_servicer.stopping.is_set()
             assert grpc_servicer.stopped.is_set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_run_on_worker_done_callback_tolerates_already_cancelled_future(
+        self,
+        mocker: MockerFixture,
+    ):
+        """Done callback must not raise on already-done future.
+
+        Given:
+            A task dispatched to the worker loop, where the bridging
+            :class:`~concurrent.futures.Future` is cancelled before the
+            worker task's done callback fires
+        When:
+            The worker task completes normally and fires its done
+            callback on the already-cancelled future
+        Then:
+            The callback exits early without raising
+            :exc:`~concurrent.futures.InvalidStateError`.
+        """
+        service = WorkerService()
+        invalid_state_errors: list[Exception] = []
+
+        # Spy on set_result and set_exception to detect
+        # InvalidStateError that would occur without the
+        # future.done() guard in the _done callback.
+        _og_set_result = concurrent.futures.Future.set_result
+        _og_set_exception = concurrent.futures.Future.set_exception
+
+        def detecting_set_result(self, result):
+            try:
+                return _og_set_result(self, result)
+            except concurrent.futures.InvalidStateError as e:
+                invalid_state_errors.append(e)
+
+        def detecting_set_exception(self, exception):
+            try:
+                return _og_set_exception(self, exception)
+            except concurrent.futures.InvalidStateError as e:
+                invalid_state_errors.append(e)
+
+        mocker.patch.object(
+            concurrent.futures.Future, "set_result", detecting_set_result
+        )
+        mocker.patch.object(
+            concurrent.futures.Future, "set_exception", detecting_set_exception
+        )
+
+        # Patch wrap_future to cancel the bridging future immediately
+        # after wrapping. This deterministically simulates the race
+        # where Task.cancel() propagates through wrap_future's
+        # _chain_future to cancel the concurrent.futures.Future
+        # before the worker task's done callback fires.
+        _og_wrap_future = asyncio.wrap_future
+
+        def cancelling_wrap_future(future, *, loop=None):
+            asyncio_future = _og_wrap_future(future, loop=loop)
+            future.cancel()
+            return asyncio_future
+
+        mocker.patch("asyncio.wrap_future", cancelling_wrap_future)
+
+        async def sample_task():
+            return "completed"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        work_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await service._run_on_worker(work_task)
+
+        # Allow the worker task's done callback to fire on the
+        # worker loop.
+        await asyncio.sleep(0.2)
+
+        assert not invalid_state_errors, (
+            "InvalidStateError raised in _done callback — "
+            "the future.done() guard may have been removed"
+        )
+
+        # Cleanup worker loops
+        for entry in service._loop_pool._cache.values():
+            WorkerService._destroy_worker_loop(entry.obj)
