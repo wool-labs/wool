@@ -114,7 +114,7 @@ class DiscoveryEvent(Event):
     """Event representing a change in worker availability.
 
     Emitted by discovery services when workers are added, updated, or
-    removed from the pool. Contains both the event type and the
+    dropped from the pool. Contains both the event type and the
     affected worker's metadata.
 
     :param type:
@@ -171,12 +171,9 @@ class DiscoverySubscriberLike(Protocol):
 # public
 @runtime_checkable
 class DiscoveryLike(Protocol):
-    """Protocol for complete discovery service implementations.
+    """Structural type for custom discovery backends.
 
-    Defines the interface for discovery services that provide both
-    publishing and subscribing capabilities. Implementations must
-    expose publisher and subscriber components and support filtered
-    subscriptions.
+    See :py:class:`Discovery` for a convenience abstract base class.
     """
 
     @property
@@ -212,46 +209,21 @@ class DiscoveryLike(Protocol):
 
 # public
 class Discovery(ABC):
-    """Abstract base class for worker discovery implementations.
+    """Convenience base class for discovery implementations.
 
-    Provides the foundation for pluggable discovery mechanisms that
-    enable workers to find and communicate with each other. Concrete
-    implementations handle the specifics of service registration and
-    discovery based on the deployment environment (LAN, local, cloud).
-
-    Subclasses must implement the publisher and subscriber properties,
-    as well as the subscribe method for filtered subscriptions.
+    Conforming to :py:class:`DiscoveryLike` via structural subtyping
+    is sufficient; inheriting from this class is optional.
     """
 
     @property
     @abstractmethod
-    def publisher(self) -> DiscoveryPublisherLike:
-        """Get the publisher component.
-
-        :returns:
-            A publisher instance for broadcasting events.
-        """
-        ...
+    def publisher(self) -> DiscoveryPublisherLike: ...
 
     @property
     @abstractmethod
-    def subscriber(self) -> DiscoverySubscriberLike:
-        """Get the default subscriber component.
-
-        :returns:
-            A subscriber instance for receiving events.
-        """
-        ...
+    def subscriber(self) -> DiscoverySubscriberLike: ...
 
     @abstractmethod
     def subscribe(
         self, filter: PredicateFunction | None = None
-    ) -> DiscoverySubscriberLike:
-        """Create a filtered subscriber.
-
-        :param filter:
-            Optional predicate to filter discovered workers.
-        :returns:
-            A subscriber instance for receiving filtered events.
-        """
-        ...
+    ) -> DiscoverySubscriberLike: ...

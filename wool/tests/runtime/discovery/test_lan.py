@@ -208,6 +208,54 @@ class TestLanDiscovery:
         assert isinstance(subscriber, LanDiscovery.Subscriber)
         assert subscriber._filter == predicate
 
+    def test_subscriber_property_with_default_filter(self):
+        """Test subscriber property uses constructor's default filter.
+
+        Given:
+            A LanDiscovery instance created with a default filter
+        When:
+            Accessing subscriber property
+        Then:
+            Should return Subscriber with the default filter applied
+        """
+
+        # Arrange
+        def predicate(w):
+            return w.port == 50051
+
+        discovery = LanDiscovery(filter=predicate)
+
+        # Act
+        subscriber = discovery.subscriber
+
+        # Assert
+        assert isinstance(subscriber, LanDiscovery.Subscriber)
+        assert subscriber._filter == predicate
+
+    def test_subscribe_with_default_filter(self):
+        """Test subscribe() without explicit filter falls back to default.
+
+        Given:
+            A LanDiscovery instance created with a default filter
+        When:
+            Calling subscribe() without providing a filter
+        Then:
+            Should create Subscriber with the constructor's default filter
+        """
+
+        # Arrange
+        def predicate(w):
+            return w.port == 50051
+
+        discovery = LanDiscovery(filter=predicate)
+
+        # Act
+        subscriber = discovery.subscribe()
+
+        # Assert
+        assert isinstance(subscriber, LanDiscovery.Subscriber)
+        assert subscriber._filter == predicate
+
 
 class TestLanDiscoveryPublisher:
     """Tests for LanDiscovery.Publisher class.
