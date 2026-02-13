@@ -651,7 +651,7 @@ class TestWatchdog:
 class TestLocalDiscovery:
     """Tests for LocalDiscovery class."""
 
-    def test_publisher_property_returns_publisher(self, namespace):
+    def test_publisher_propert(self, namespace):
         """Test publisher property returns Publisher instance.
 
         Given:
@@ -671,7 +671,7 @@ class TestLocalDiscovery:
         assert isinstance(publisher, LocalDiscovery.Publisher)
         assert publisher.namespace == namespace
 
-    def test_subscriber_property_returns_subscriber(self, namespace):
+    def test_subscriber_property(self, namespace):
         """Test subscriber property returns Subscriber instance.
 
         Given:
@@ -734,6 +734,60 @@ class TestLocalDiscovery:
 
         # Act
         subscriber = discovery.subscribe(predicate)
+
+        # Assert
+        SubscriberSpy.assert_called_once_with(namespace, predicate, poll_interval=None)
+        assert isinstance(subscriber, SubscriberClass)
+
+    def test_subscriber_property_with_default_filter(
+        self, namespace, mocker: MockerFixture
+    ):
+        """Test subscriber property uses constructor's default filter.
+
+        Given:
+            A LocalDiscovery instance created with a default filter
+        When:
+            Accessing subscriber property
+        Then:
+            It should return Subscriber with the default filter applied
+        """
+        # Arrange
+        SubscriberClass = LocalDiscovery.Subscriber
+
+        def predicate(w):
+            return w.port == 50051
+
+        discovery = LocalDiscovery(namespace, filter=predicate)
+        SubscriberSpy = mocker.spy(LocalDiscovery, "Subscriber")
+
+        # Act
+        subscriber = discovery.subscriber
+
+        # Assert
+        SubscriberSpy.assert_called_once_with(namespace, predicate, poll_interval=None)
+        assert isinstance(subscriber, SubscriberClass)
+
+    def test_subscribe_with_default_filter(self, namespace, mocker: MockerFixture):
+        """Test subscribe() without explicit filter falls back to default.
+
+        Given:
+            A LocalDiscovery instance created with a default filter
+        When:
+            Calling subscribe() without providing a filter
+        Then:
+            It should create Subscriber with the constructor's default filter
+        """
+        # Arrange
+        SubscriberClass = LocalDiscovery.Subscriber
+
+        def predicate(w):
+            return w.port == 50051
+
+        discovery = LocalDiscovery(namespace, filter=predicate)
+        SubscriberSpy = mocker.spy(LocalDiscovery, "Subscriber")
+
+        # Act
+        subscriber = discovery.subscribe()
 
         # Assert
         SubscriberSpy.assert_called_once_with(namespace, predicate, poll_interval=None)
