@@ -177,24 +177,27 @@ class _WorkerReference:
 
 # public
 class LocalDiscovery(Discovery):
-    """Local discovery service using shared memory.
+    """Shared-memory discovery for single-machine worker pools.
 
-    Provides worker discovery within a single machine using shared
-    memory for communication between publishers and subscribers.
-    Multiple unrelated processes can share the same discovery
-    namespace by using the same namespace identifier, enabling
-    automatic worker discovery across process boundaries.
+    The default when a
+    :py:class:`~wool.runtime.worker.pool.WorkerPool` is created
+    without an explicit discovery protocol. Workers and subscribers
+    communicate through a shared memory region identified by a
+    namespace string. File-based locking ensures consistency across
+    processes.
 
-    The namespace identifies a shared memory region where worker
-    metadata is stored. Publishers write worker metadata to this
-    region, and subscribers read from it to discover available
-    workers. All access is synchronized using file-based locking to
-    ensure consistency.
+    .. note::
+        Multiple unrelated processes can share the same namespace,
+        enabling automatic worker discovery across process boundaries.
 
     :param namespace:
         Unique identifier for the shared memory region. Publishers
         and subscribers using the same namespace will see each
         other's workers.
+    :param filter:
+        Optional default predicate function to filter workers.
+        Used by :py:attr:`subscriber` and as the default for
+        :py:meth:`subscribe` when no explicit filter is provided.
     :param capacity:
         Maximum number of workers that can be registered
         simultaneously. Defaults to 128.
@@ -202,15 +205,7 @@ class LocalDiscovery(Discovery):
         Size in bytes for each worker's serialized data block.
         Defaults to 1024.
 
-    .. note::
-        Multiple unrelated processes can create publishers and
-        subscribers with the same namespace. They will automatically
-        discover each other's workers through the shared memory
-        region.
-
-    Example usage:
-
-    Publish workers
+    Example — publish workers:
 
     .. code-block:: python
 
@@ -218,7 +213,7 @@ class LocalDiscovery(Discovery):
         async with publisher:
             await publisher.publish("worker-added", metadata)
 
-    Subscribe to workers
+    Example — subscribe to workers:
 
     .. code-block:: python
 
@@ -227,16 +222,19 @@ class LocalDiscovery(Discovery):
             print(f"Discovered worker: {event.metadata}")
     """
 
+    _filter: Final[PredicateFunction | None]
     _namespace: Final[str]
 
     def __init__(
         self,
         namespace: str | None = None,
         *,
+        filter: PredicateFunction | None = None,
         capacity: int = 128,
         block_size: int = 1024,
     ):
         self._namespace = namespace or f"workerpool-{uuid4()}"
+        self._filter = filter
         self._capacity = capacity
         self._block_size = block_size
 
@@ -277,10 +275,10 @@ class LocalDiscovery(Discovery):
 
     @property
     def subscriber(self) -> DiscoverySubscriberLike:
-        """The default subscriber for all worker events.
+        """A subscriber using the constructor's default filter.
 
         :returns:
-            A subscriber instance that receives all worker discovery
+            A subscriber instance for receiving worker discovery
             events.
         """
         return self.subscribe()
@@ -296,7 +294,8 @@ class LocalDiscovery(Discovery):
         :param filter:
             Optional predicate function to filter workers. Only workers
             for which the predicate returns True will be included in
-            events.
+            events. Falls back to the constructor's filter if not
+            provided.
         :param poll_interval:
             Optional interval in seconds between shared memory polls.
             If not specified, uses filesystem notifications for
@@ -305,7 +304,11 @@ class LocalDiscovery(Discovery):
             A subscriber instance that receives filtered worker
             discovery events.
         """
-        return self.Subscriber(self._namespace, filter, poll_interval=poll_interval)
+        return self.Subscriber(
+            self._namespace,
+            filter if filter is not None else self._filter,
+            poll_interval=poll_interval,
+        )
 
     class Publisher:
         """Publisher for broadcasting worker discovery events.
