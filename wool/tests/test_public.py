@@ -32,7 +32,7 @@ def test_public_api_completeness():
         "RuntimeContext",
         # Load balancing
         "ConnectionResourceFactory",
-        "LoadBalancerContext",
+        "LoadBalancerContextLike",
         "LoadBalancerLike",
         "NoWorkersAvailable",
         "RoundRobinLoadBalancer",

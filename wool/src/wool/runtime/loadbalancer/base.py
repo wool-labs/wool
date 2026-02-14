@@ -32,15 +32,83 @@ class NoWorkersAvailable(Exception):
 
 # public
 @runtime_checkable
+class LoadBalancerContextLike(Protocol):
+    """Protocol defining the interface for load balancer contexts.
+
+    Load balancer contexts manage workers and their connection resource
+    factories for a specific worker pool, enabling load balancer
+    instances to service multiple pools with independent state and
+    worker lists.
+    """
+
+    @property
+    def workers(
+        self,
+    ) -> MappingProxyType[WorkerMetadata, ConnectionResourceFactory]:
+        """Read-only view of workers in this context.
+
+        :returns:
+            Immutable mapping of worker metadata to connection
+            resource factories.
+        """
+        ...
+
+    def add_worker(
+        self,
+        metadata: WorkerMetadata,
+        connection_resource_factory: ConnectionResourceFactory,
+    ) -> None:
+        """Add a worker to this context.
+
+        :param metadata:
+            Information about the worker to add.
+        :param connection_resource_factory:
+            Factory function that creates connection resources
+            for this worker.
+        """
+        ...
+
+    def update_worker(
+        self,
+        metadata: WorkerMetadata,
+        connection_resource_factory: ConnectionResourceFactory,
+        *,
+        upsert: bool = False,
+    ) -> None:
+        """Update an existing worker's connection resource factory.
+
+        :param metadata:
+            Information about the worker to update.
+        :param connection_resource_factory:
+            New factory function that creates connection resources
+            for this worker.
+        :param upsert:
+            Flag indicating whether or not to add the worker if
+            it's not already in the context.
+        """
+        ...
+
+    def remove_worker(self, metadata: WorkerMetadata) -> None:
+        """Remove a worker from this context.
+
+        :param metadata:
+            Information about the worker to remove.
+        """
+        ...
+
+
+# public
+@runtime_checkable
 class LoadBalancerLike(Protocol):
     """Protocol for load balancers that dispatch tasks to workers.
 
     Load balancers implementing this protocol operate on a
-    :class:`LoadBalancerContext` to access workers and their connection
-    factories. The context provides isolation, allowing a single load balancer
-    instance to service multiple worker pools with independent state.
+    :py:class:`LoadBalancerContextLike` to access workers and their
+    connection factories. The context provides isolation, allowing a
+    single load balancer instance to service multiple worker pools
+    with independent state.
 
-    The dispatch method accepts a :class:`Task` and returns an async
+    The dispatch method accepts a :py:class:`Task` and returns an async
     iterator that yields task results from the worker.
     """
 
@@ -48,12 +116,11 @@ class LoadBalancerLike(Protocol):
         self,
         task: Task,
         *,
-        context: LoadBalancerContext,
+        context: LoadBalancerContextLike,
         timeout: float | None = None,
     ) -> AsyncGenerator: ...
 
 
-# public
 class LoadBalancerContext:
     """Isolated load balancing context for a single worker pool.
 
