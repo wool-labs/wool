@@ -1,6 +1,6 @@
 # Worker discovery
 
-Wool workers compose a decentralized peer-to-peer network - conceptually a singular pool. From a client's perspective, however, a worker pool is actually an abstraction defined by its discovery protocol. Discovery protocols describe to a client how to find workers, and which of those workers to consider when routing work.
+Wool workers compose a decentralized peer-to-peer network — conceptually a singular pool. From a client's perspective, however, a worker pool is actually an abstraction defined by its discovery protocol. Discovery protocols describe to a client how to find workers, and which of those workers to consider when routing work.
 
 ## Publisher-subscriber pattern
 
@@ -18,7 +18,7 @@ Worker lifecycle event types:
 
 ## Protocols
 
-Wool ships with two discovery protocols - `LocalDiscovery` and `LanDiscovery`.
+Wool ships with two discovery protocols — `LocalDiscovery` and `LanDiscovery`.
 
 `LocalDiscovery`
 
@@ -32,18 +32,9 @@ Both protocols optionally accept a filter predicate for targeted subscriptions.
 
 ## Composability — bring your own discovery
 
-In addition to the aforementioned discovery protocols, Wool supports custom protocols via structural subtyping.
+Wool supports custom discovery protocols via structural subtyping.
 
-`WorkerPool` accepts `DiscoveryLike | Factory[DiscoveryLike]` for its `discovery` parameter. The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables. The runtime unwraps automatically:
-
-```python
-Factory: TypeAlias = (
-    Awaitable[T]
-    | AsyncContextManager[T]
-    | ContextManager[T]
-    | Callable[[], T | Awaitable[T] | AsyncContextManager[T] | ContextManager[T]]
-)
-```
+`WorkerPool` accepts `DiscoveryLike` or `Factory[DiscoveryLike]` for its `discovery` parameter. The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables — the runtime manages it automatically.
 
 This means you can pass a discovery instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` handles all cases.
 
@@ -76,7 +67,7 @@ async def publish(self, type: DiscoveryEventType, metadata: WorkerMetadata) -> N
 def __aiter__(self) -> AsyncIterator[DiscoveryEvent]: ...
 ```
 
-### Custom discovery example
+### Implementing a custom discovery protocol
 
 A sketch of a Redis-backed discovery backend:
 
@@ -153,20 +144,29 @@ async with wool.WorkerPool(size=4, discovery=wool.LanDiscovery()):
 
 ## How it fits together
 
-```text
-worker starts
-  → publisher emits "worker-added"
-    → subscriber receives DiscoveryEvent
-      → proxy updates routing table
-        → wool routines dispatch to available workers
-```
+```mermaid
+sequenceDiagram
+    participant Pool as WorkerPool
+    participant W as Worker
+    participant Pub as Publisher
+    participant Sub as Subscriber
+    participant Proxy as WorkerProxy
 
-The reverse on shutdown:
+    Note over Pool,Proxy: Startup
 
-```text
-pool exits
-  → publisher emits "worker-dropped"
-    → subscriber receives DiscoveryEvent
-      → proxy removes worker from routing
-        → worker process stops
+    Pool->>W: worker.start()
+    W-->>Pool: started
+    Pool->>Pub: publish("worker-added", metadata)
+    Pub->>Sub: DiscoveryEvent(worker-added)
+    Sub->>Proxy: event
+    Proxy->>Proxy: context.add_worker(metadata, factory)
+
+    Note over Pool,Proxy: Shutdown
+
+    Pool->>Pub: publish("worker-dropped", metadata)
+    Pub->>Sub: DiscoveryEvent(worker-dropped)
+    Sub->>Proxy: event
+    Proxy->>Proxy: context.remove_worker(metadata)
+    Pool->>W: worker.stop()
+    W-->>Pool: stopped
 ```
