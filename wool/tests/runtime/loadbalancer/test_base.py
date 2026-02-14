@@ -6,6 +6,7 @@ from hypothesis import strategies as st
 
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.loadbalancer.base import LoadBalancerContext
+from wool.runtime.loadbalancer.base import LoadBalancerContextLike
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.connection import WorkerConnection
 
@@ -40,6 +41,17 @@ def loadbalancer_context(draw):
         ctx.add_worker(metadata, lambda: connection_pool.get(metadata))
 
     return ctx
+
+
+class TestLoadBalancerContextLikeProtocol:
+    def test_loadbalancer_context_satisfies_protocol(self):
+        """
+        GIVEN a concrete LoadBalancerContext instance
+        WHEN checked against the LoadBalancerContextLike protocol
+        THEN the instance satisfies the protocol.
+        """
+        context = LoadBalancerContext()
+        assert isinstance(context, LoadBalancerContextLike)
 
 
 class TestLoadBalancerContext:
