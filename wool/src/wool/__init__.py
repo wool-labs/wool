@@ -18,7 +18,7 @@ from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.event import AsyncEventHandler
 from wool.runtime.loadbalancer.base import ConnectionResourceFactory
-from wool.runtime.loadbalancer.base import LoadBalancerContext
+from wool.runtime.loadbalancer.base import LoadBalancerContextLike
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
@@ -70,7 +70,7 @@ __all__ = [
     "RuntimeContext",
     # Load balancing
     "ConnectionResourceFactory",
-    "LoadBalancerContext",
+    "LoadBalancerContextLike",
     "LoadBalancerLike",
     "NoWorkersAvailable",
     "RoundRobinLoadBalancer",

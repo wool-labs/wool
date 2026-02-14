@@ -9,7 +9,7 @@ from typing import Final
 
 from wool.runtime.worker.connection import TransientRpcError
 
-from .base import LoadBalancerContext
+from .base import LoadBalancerContextLike
 from .base import LoadBalancerLike
 from .base import NoWorkersAvailable
 
@@ -23,18 +23,15 @@ logger = logging.getLogger(__name__)
 class RoundRobinLoadBalancer(LoadBalancerLike):
     """Round-robin load balancer for distributing tasks across workers.
 
-    Distributes tasks evenly across available workers using a simple round-robin
-    algorithm. Workers are managed through :class:`LoadBalancerContext` instances
-    passed to the dispatch method, enabling a single load balancer to service
-    multiple worker pools with independent state.
-
-    Automatically handles worker failures by trying the next worker in the
-    round-robin cycle. Workers that encounter transient errors remain in the
-    context, while workers that fail with non-transient errors are removed from
-    the context's worker list.
+    Cycles through workers in the given
+    :py:class:`LoadBalancerContextLike`, advancing the index after each
+    successful dispatch. When a dispatch attempt fails, transient
+    errors skip to the next worker while non-transient errors remove
+    the worker from the context. One full cycle is attempted per
+    dispatch call.
     """
 
-    _index: Final[dict[LoadBalancerContext, int]]
+    _index: Final[dict[LoadBalancerContextLike, int]]
 
     def __init__(self):
         self._index = {}
@@ -44,26 +41,23 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
         self,
         task: Task,
         *,
-        context: LoadBalancerContext,
+        context: LoadBalancerContextLike,
         timeout: float | None = None,
     ) -> AsyncIterator:
-        """Dispatch a task to the next available worker using round-robin.
-
-        Tries workers in one round-robin cycle until dispatch succeeds.
-        Workers that fail to schedule the task with a non-transient error are
-        removed from the context's worker list.
+        """Dispatch a task to the next available worker.
 
         :param task:
-            The :class:`Task` instance to dispatch to the worker.
+            The :py:class:`Task` to dispatch.
         :param context:
-            The :class:`LoadBalancerContext` containing workers to dispatch to.
+            The :py:class:`LoadBalancerContextLike` to select workers
+            from.
         :param timeout:
-            Timeout in seconds for each dispatch attempt. If ``None``, no
-            timeout is applied.
+            Timeout in seconds for each dispatch attempt. If ``None``,
+            no timeout is applied.
         :returns:
-            A stream that yields worker responses.
+            An async iterator that yields worker responses.
         :raises NoWorkersAvailable:
-            If no healthy workers are available to schedule the task.
+            If no healthy workers are available for dispatch.
         """
         checkpoint = None
 
