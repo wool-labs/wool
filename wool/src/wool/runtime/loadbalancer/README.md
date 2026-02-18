@@ -1,12 +1,12 @@
 # Load balancing
 
-Load balancing is the dispatch layer between wool routines and workers. When a routine is called, the load balancer decides which worker handles the task. Load balancers operate on a per-pool context rather than owning worker state directly, so a single load balancer instance can service multiple independent pools.
+The load balancer is the dispatch layer between Wool routines and workers. When a routine is called, the load balancer decides which worker handles the task. Load balancers operate on a per-pool context rather than owning worker state directly, so a single load balancer instance can service multiple independent pools.
 
 ## Context-based dispatch
 
-Every dispatch call receives a `LoadBalancerContextLike` — a protocol defining an isolated container of workers and their connection factories for a specific pool. Each `WorkerPool` maintains its own context, so a single load balancer instance can be reused across multiple pools while keeping dispatch scoped to the correct one. Routines are always routed to the workers belonging to the pool they were called through, regardless of how many share the same load balancer. Discovery events populate the context automatically; the load balancer never needs to know how workers were found, only that they exist.
+Every dispatch call receives a `LoadBalancerContext` — an isolated container of workers and their connection factories for a specific pool. Each `WorkerPool` maintains its own context (via its `WorkerProxy`), so a single load balancer instance can be reused across multiple pools while keeping dispatch scoped to the correct one. Routines are always routed to the workers belonging to the pool they were called through, regardless of how many share the same load balancer. Discovery events populate the context automatically; the load balancer never needs to know how workers are found, only that they exist.
 
-A `LoadBalancerContextLike` exposes a read-only view of its workers (each mapped to a `ConnectionResourceFactory`) and methods for adding, updating, and removing workers.
+A `LoadBalancerContext` exposes a read-only view of its workers and methods for adding, updating, and removing workers.
 
 ## Built-in load balancer
 
@@ -25,9 +25,7 @@ If every worker fails or the context is empty, `NoWorkersAvailable` is raised.
 
 Wool supports custom load balancers via structural subtyping.
 
-`WorkerPool` accepts `LoadBalancerLike` or `Factory[LoadBalancerLike]` for its `loadbalancer` parameter. The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables — the runtime manages it automatically.
-
-This means you can pass a load balancer instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` handles all cases.
+`WorkerPool` accepts `LoadBalancerLike` or `Factory[LoadBalancerLike]` for its `loadbalancer` parameter. The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables. This means you can pass a load balancer instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` will manage it appropriately.
 
 ### `LoadBalancerLike` protocol
 
@@ -66,7 +64,7 @@ class LeastLoadedBalancer:
         timeout: float | None = None,
     ):
         if not context.workers:
-            raise wool.NoWorkersAvailable("No workers available")
+            raise wool.NoWorkersAvailable
 
         # Pick the worker with the lowest in-flight count
         metadata, factory = min(
@@ -93,7 +91,7 @@ When no `loadbalancer` argument is provided, `WorkerPool` uses `RoundRobinLoadBa
 ```python
 import wool
 
-async with wool.WorkerPool(size=4) as pool:
+async with wool.WorkerPool(size=4):
     result = await my_routine()
 ```
 
@@ -106,39 +104,43 @@ import wool
 
 balancer = LeastLoadedBalancer()
 
-async with wool.WorkerPool(size=4, loadbalancer=balancer) as pool:
+async with wool.WorkerPool(size=4, loadbalancer=balancer):
     result = await my_routine()
 ```
 
-## How it fits together
+## Load balancing sequence
 
 ```mermaid
 sequenceDiagram
-    participant P as WorkerProxy
-    participant LB as LoadBalancer
-    participant Ctx as LoadBalancerContextLike
-    participant CF as ConnectionResourceFactory
-    participant W as Worker
+    participant Caller
+    participant Routine
+    participant Loadbalancer
+    participant Context
+    participant Worker
 
-    P->>LB: dispatch(task, context, timeout)
-    LB->>Ctx: workers
+    Caller ->> Routine: invoke wool routine
+    activate Caller
+    Routine ->> Routine: create task
+    Routine ->> Loadbalancer: route task
+    Loadbalancer ->> Loadbalancer: serialize task to protobuf
+    Loadbalancer ->> Context: get workers
+    Context -->> Loadbalancer: {worker metadata: factory, ...}
 
-    loop until ack or all workers tried
-        Ctx-->>LB: {metadata: factory, ...}
-        LB->>LB: select next worker
-        LB->>CF: factory()
-        CF-->>LB: connection
-        LB->>W: connection.dispatch(task)
-        alt ack
-            W-->>LB: stream
-            LB-->>P: stream
-        else transient error
-            LB->>LB: skip to next worker
-        else non-transient error
-            LB->>Ctx: remove_worker(metadata)
-            LB->>LB: skip to next worker
+    loop Until success or all workers exhausted
+        Loadbalancer ->> Loadbalancer: select next worker
+        Loadbalancer ->> Worker: dispatch via gRPC
+        alt Success
+            Worker -->> Loadbalancer: ack
+            Loadbalancer -->> Routine: serialized result stream
+            Loadbalancer ->> Loadbalancer: break
+        else Transient error
+            Loadbalancer ->> Loadbalancer: continue
+        else Non-transient error
+            Loadbalancer ->> Context: remove worker
+            Loadbalancer ->> Loadbalancer: continue
         end
     end
-
-    Note over LB,P: raise NoWorkersAvailable<br/>if no worker succeeded
+    opt All workers exhausted without success
+        Loadbalancer -->> Caller: raise NoWorkersAvailable
+    end
 ```

@@ -11,7 +11,7 @@ import cloudpickle
 import grpc.aio
 
 from wool.runtime import protobuf as pb
-from wool.runtime.work.task import Task
+from wool.runtime.routine.task import Task
 from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.base import resolve_channel_credentials
 

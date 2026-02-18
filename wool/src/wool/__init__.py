@@ -23,14 +23,14 @@ from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.routine.task import Task
+from wool.runtime.routine.task import TaskEvent
+from wool.runtime.routine.task import TaskEventHandler
+from wool.runtime.routine.task import TaskEventType
+from wool.runtime.routine.task import TaskException
+from wool.runtime.routine.task import current_task
+from wool.runtime.routine.wrapper import routine
 from wool.runtime.typing import Factory
-from wool.runtime.work.task import Task
-from wool.runtime.work.task import WorkTaskEvent
-from wool.runtime.work.task import WorkTaskEventHandler
-from wool.runtime.work.task import WorkTaskEventType
-from wool.runtime.work.task import WorkTaskException
-from wool.runtime.work.task import current_task
-from wool.runtime.work.wrapper import routine
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
@@ -45,9 +45,6 @@ from wool.runtime.worker.proxy import WorkerProxy
 from wool.runtime.worker.service import WorkerService
 
 pickling_support.install()
-
-# Alias for backwards compatibility
-work = routine
 
 try:
     __version__ = version("wool")
@@ -74,15 +71,14 @@ __all__ = [
     "LoadBalancerLike",
     "NoWorkersAvailable",
     "RoundRobinLoadBalancer",
-    # Work - New names (preferred)
+    # Routines
     "Task",
-    "WorkTaskEvent",
-    "WorkTaskEventHandler",
-    "WorkTaskEventType",
-    "WorkTaskException",
+    "TaskEvent",
+    "TaskEventHandler",
+    "TaskEventType",
+    "TaskException",
     "current_task",
     "routine",
-    "work",
     # Workers
     "LocalWorker",
     "Worker",
