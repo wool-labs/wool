@@ -30,7 +30,7 @@ from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.connection import WorkerConnection
 
 if TYPE_CHECKING:
-    from wool.runtime.work.task import Task
+    from wool.runtime.routine.task import Task
 
 T = TypeVar("T")
 

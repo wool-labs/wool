@@ -14,7 +14,7 @@ from .base import LoadBalancerLike
 from .base import NoWorkersAvailable
 
 if TYPE_CHECKING:
-    from wool.runtime.work import Task
+    from wool.runtime.routine.task import Task
 
 logger = logging.getLogger(__name__)
 
