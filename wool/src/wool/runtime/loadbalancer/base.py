@@ -14,7 +14,7 @@ from wool.runtime.resourcepool import Resource
 from wool.runtime.worker.connection import WorkerConnection
 
 if TYPE_CHECKING:
-    from wool.runtime.work.task import Task
+    from wool.runtime.routine.task import Task
 
 
 # public

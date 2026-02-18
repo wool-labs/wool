@@ -13,10 +13,10 @@ from hypothesis import strategies as st
 import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.event import Event
-from wool.runtime.work.task import Task
-from wool.runtime.work.task import WorkTaskEvent
-from wool.runtime.work.task import WorkTaskException
-from wool.runtime.work.task import current_task
+from wool.runtime.routine.task import Task
+from wool.runtime.routine.task import TaskEvent
+from wool.runtime.routine.task import TaskException
+from wool.runtime.routine.task import current_task
 
 
 class PicklableProxy:
@@ -34,7 +34,7 @@ class PicklableProxy:
         return _stream()
 
 
-class TestWorkTask:
+class TestTask:
     """Tests for Task class."""
 
     def test_init_emits_task_created_event(
@@ -50,7 +50,7 @@ class TestWorkTask:
             A "task-created" event is emitted
         """
         # Arrange
-        wool.WorkTaskEvent._handlers["task-created"] = [event_spy]
+        wool.TaskEvent._handlers["task-created"] = [event_spy]
 
         # Act
         task = sample_task()
@@ -85,7 +85,7 @@ class TestWorkTask:
         # Act
         async def create_nested_task():
             # Set parent task in context
-            from wool.runtime.work.task import _current_task
+            from wool.runtime.routine.task import _current_task
 
             token = _current_task.set(parent_task)
             try:
@@ -167,7 +167,7 @@ class TestWorkTask:
         When:
             Exception occurs inside `with` block
         Then:
-            WorkTaskException is created and attached to task, exception
+            TaskException is created and attached to task, exception
             propagates normally
         """
         # Arrange
@@ -423,7 +423,7 @@ class TestWorkTask:
             A "task-completed" event is emitted.
         """
         # Arrange
-        wool.WorkTaskEvent._handlers["task-completed"] = [event_spy]
+        wool.TaskEvent._handlers["task-completed"] = [event_spy]
 
         async def test_callable():
             return 42
@@ -464,7 +464,7 @@ class TestWorkTask:
             information attached to the task.
         """
         # Arrange
-        wool.WorkTaskEvent._handlers["task-completed"] = [event_spy]
+        wool.TaskEvent._handlers["task-completed"] = [event_spy]
 
         async def test_callable():
             raise ValueError("Test error")
@@ -747,7 +747,7 @@ class TestWorkTask:
 
         # Act & Assert
         with pytest.raises(
-            ValueError, match="Expected work to be coroutine or async generator"
+            ValueError, match="Expected routine to be coroutine or async generator"
         ):
             _ = task.dispatch()
 
@@ -1017,16 +1017,16 @@ class TestWorkTask:
         assert results == list(range(value_count))
 
 
-class TestWorkerTaskException:
-    """Tests for WorkTaskException class."""
+class TestTaskException:
+    """Tests for TaskException class."""
 
     def test_init(self):
-        """Test WorkTaskException instantiation.
+        """Test TaskException instantiation.
 
         Given:
             Valid exception type and traceback
         When:
-            WorkTaskException is instantiated
+            TaskException is instantiated
         Then:
             Object is created with correct attributes
         """
@@ -1035,7 +1035,7 @@ class TestWorkerTaskException:
         traceback_lines = ["line1", "line2", "line3"]
 
         # Act
-        exception = WorkTaskException(
+        exception = TaskException(
             type=exception_type,
             traceback=traceback_lines,
         )
@@ -1045,16 +1045,16 @@ class TestWorkerTaskException:
         assert exception.traceback == traceback_lines
 
 
-class TestWorkerTaskEvent:
-    """Tests for WorkTaskEvent class."""
+class TestTaskEvent:
+    """Tests for TaskEvent class."""
 
     def test_init(self, sample_task, clear_event_handlers):
-        """Test WorkTaskEvent instantiation.
+        """Test TaskEvent instantiation.
 
         Given:
             Valid event type and task
         When:
-            WorkTaskEvent is instantiated
+            TaskEvent is instantiated
         Then:
             Event object is created with correct attributes
         """
@@ -1062,7 +1062,7 @@ class TestWorkerTaskEvent:
         task = sample_task()
 
         # Act
-        event = WorkTaskEvent("task-created", task=task)
+        event = TaskEvent("task-created", task=task)
 
         # Assert
         assert event.type == "task-created"
@@ -1072,7 +1072,7 @@ class TestWorkerTaskEvent:
         """Test handler decorator registration.
 
         Given:
-            A handler function is decorated with `@WorkTaskEvent.handler`
+            A handler function is decorated with `@TaskEvent.handler`
         When:
             Handler decorator is applied with event types
         Then:
@@ -1083,15 +1083,15 @@ class TestWorkerTaskEvent:
         call_log = []
 
         # Act
-        @WorkTaskEvent.handler("task-created", "task-completed")
+        @TaskEvent.handler("task-created", "task-completed")
         def test_handler(event, timestamp, context=None):
             call_log.append((event, timestamp, context))
 
         # Assert - handler is registered
-        assert "task-created" in WorkTaskEvent._handlers
-        assert "task-completed" in WorkTaskEvent._handlers
-        assert test_handler in WorkTaskEvent._handlers["task-created"]
-        assert test_handler in WorkTaskEvent._handlers["task-completed"]
+        assert "task-created" in TaskEvent._handlers
+        assert "task-completed" in TaskEvent._handlers
+        assert test_handler in TaskEvent._handlers["task-created"]
+        assert test_handler in TaskEvent._handlers["task-completed"]
 
         # Assert - original function is returned
         assert callable(test_handler)
@@ -1108,8 +1108,8 @@ class TestWorkerTaskEvent:
         """
         # Arrange
         task = sample_task()
-        event = WorkTaskEvent("task-created", task=task)
-        WorkTaskEvent._handlers["task-created"] = [event_spy]
+        event = TaskEvent("task-created", task=task)
+        TaskEvent._handlers["task-created"] = [event_spy]
 
         # Act
         event.emit()
@@ -1136,7 +1136,7 @@ class TestWorkerTaskEvent:
         """
         # Arrange
         task = sample_task()
-        event = WorkTaskEvent("task-created", task=task)
+        event = TaskEvent("task-created", task=task)
 
         # Act & Assert (no exception should be raised)
         event.emit()
@@ -1155,12 +1155,12 @@ class TestWorkerTaskEvent:
         """
         # Arrange
         task = sample_task()
-        event = WorkTaskEvent("task-created", task=task)
+        event = TaskEvent("task-created", task=task)
 
         def failing_handler(event, timestamp, context=None):
             raise ValueError("Handler failed")
 
-        WorkTaskEvent._handlers["task-created"] = [failing_handler]
+        TaskEvent._handlers["task-created"] = [failing_handler]
 
         # Act - emit does not raise
         with caplog.at_level(logging.ERROR):
@@ -1180,7 +1180,6 @@ class TestWorkerTaskEvent:
             st.sampled_from(
                 [
                     "task-created",
-                    "task-queued",
                     "task-scheduled",
                     "task-started",
                     "task-stopped",
@@ -1197,7 +1196,7 @@ class TestWorkerTaskEvent:
         event_types_to_register,
         num_handlers,
     ):
-        """Property-based test: WorkTaskEvent handler registration and emission.
+        """Property-based test: TaskEvent handler registration and emission.
 
         Given:
             Any set of event types and any number of handlers
@@ -1215,8 +1214,8 @@ class TestWorkerTaskEvent:
         proxy = PicklableProxy()
 
         # Clear handlers before test
-        saved_handlers = wool.WorkTaskEvent._handlers.copy()
-        wool.WorkTaskEvent._handlers.clear()
+        saved_handlers = wool.TaskEvent._handlers.copy()
+        wool.TaskEvent._handlers.clear()
 
         try:
             task = Task(
@@ -1239,11 +1238,11 @@ class TestWorkerTaskEvent:
 
                 handler = create_handler(i)
                 for event_type in event_types_to_register:
-                    WorkTaskEvent._handlers.setdefault(event_type, []).append(handler)
+                    TaskEvent._handlers.setdefault(event_type, []).append(handler)
 
             # Act - emit events for all registered types
             for event_type in event_types_to_register:
-                event = WorkTaskEvent(event_type, task=task)
+                event = TaskEvent(event_type, task=task)
                 event.emit()
 
             # Wait for handler thread to process all scheduled handlers
@@ -1254,7 +1253,7 @@ class TestWorkerTaskEvent:
                 assert len(handler_calls[i]) == len(event_types_to_register)
         finally:
             # Restore handlers
-            wool.WorkTaskEvent._handlers = saved_handlers
+            wool.TaskEvent._handlers = saved_handlers
 
 
 class TestCurrentTask:
@@ -1317,7 +1316,7 @@ class TestCurrentTask:
             and caller chains should be properly maintained
         """
         # Arrange
-        from wool.runtime.work.task import _current_task
+        from wool.runtime.routine.task import _current_task
 
         async def test_callable():
             return "result"

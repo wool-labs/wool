@@ -349,7 +349,7 @@ class Event(ABC):
 
         **Example**::
 
-            @WorkTaskEvent.handler("task-created", "task-completed")
+            @TaskEvent.handler("task-created", "task-completed")
             def my_handler(event, timestamp, context=None):
                 print(f"Task event: {event.type}")
         """

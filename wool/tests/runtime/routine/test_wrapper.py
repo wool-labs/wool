@@ -8,7 +8,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool.runtime.work.wrapper import routine
+from wool.runtime.routine.wrapper import routine
 
 
 @routine
@@ -18,7 +18,7 @@ async def foo(x, y):
 
 
 assert foo.__qualname__ == "foo"
-assert foo.__module__ == "runtime.work.test_wrapper"
+assert foo.__module__ == "runtime.routine.test_wrapper"
 
 
 @routine
@@ -28,7 +28,7 @@ async def bar():
 
 
 assert bar.__qualname__ == "bar"
-assert bar.__module__ == "runtime.work.test_wrapper"
+assert bar.__module__ == "runtime.routine.test_wrapper"
 
 
 @routine
@@ -39,7 +39,7 @@ async def foo_gen(x):
 
 
 assert foo_gen.__qualname__ == "foo_gen"
-assert foo_gen.__module__ == "runtime.work.test_wrapper"
+assert foo_gen.__module__ == "runtime.routine.test_wrapper"
 
 
 class Foo:
@@ -51,7 +51,7 @@ class Foo:
         return x * 2
 
     assert foo.__qualname__ == "Foo.foo"
-    assert foo.__module__ == "runtime.work.test_wrapper"
+    assert foo.__module__ == "runtime.routine.test_wrapper"
 
     @routine
     @classmethod
@@ -60,7 +60,7 @@ class Foo:
         return x * 3
 
     assert bar.__qualname__ == "Foo.bar"
-    assert bar.__module__ == "runtime.work.test_wrapper"
+    assert bar.__module__ == "runtime.routine.test_wrapper"
 
     @routine
     @staticmethod
@@ -69,7 +69,7 @@ class Foo:
         return x * 4
 
     assert baz.__qualname__ == "Foo.baz"
-    assert baz.__module__ == "runtime.work.test_wrapper"
+    assert baz.__module__ == "runtime.routine.test_wrapper"
 
     @routine
     async def foo_gen(self, x):
@@ -78,7 +78,7 @@ class Foo:
             yield i * 2
 
     assert foo_gen.__qualname__ == "Foo.foo_gen"
-    assert foo_gen.__module__ == "runtime.work.test_wrapper"
+    assert foo_gen.__module__ == "runtime.routine.test_wrapper"
 
     @routine
     @classmethod
@@ -88,7 +88,7 @@ class Foo:
             yield i * 3
 
     assert bar_gen.__qualname__ == "Foo.bar_gen"
-    assert bar_gen.__module__ == "runtime.work.test_wrapper"
+    assert bar_gen.__module__ == "runtime.routine.test_wrapper"
 
     @routine
     @staticmethod
@@ -98,10 +98,10 @@ class Foo:
             yield i * 4
 
     assert baz_gen.__qualname__ == "Foo.baz_gen"
-    assert baz_gen.__module__ == "runtime.work.test_wrapper"
+    assert baz_gen.__module__ == "runtime.routine.test_wrapper"
 
 
-class TestWork:
+class TestRoutine:
     @settings(
         max_examples=20,
         deadline=None,
@@ -186,7 +186,7 @@ class TestWork:
                 mock_proxy_context.dispatch.assert_called_once()
         else:
             # Test execution path
-            from wool.runtime.work.task import do_dispatch
+            from wool.runtime.routine.task import do_dispatch
 
             with do_dispatch(False):
                 # Act
