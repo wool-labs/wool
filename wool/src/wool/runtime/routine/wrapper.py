@@ -19,8 +19,8 @@ from uuid import uuid4
 
 import wool
 from wool.runtime import context as ctx
-from wool.runtime.work.task import Task
-from wool.runtime.work.task import do_dispatch
+from wool.runtime.routine.task import Task
+from wool.runtime.routine.task import do_dispatch
 
 if TYPE_CHECKING:
     from wool.runtime.worker.proxy import WorkerProxy
@@ -216,9 +216,6 @@ def routine(fn: C) -> C:
 
         return cast(C, coroutine_wrapper)
 
-
-# Alias for backwards compatibility
-work = routine
 
 
 def _dispatch(
