@@ -13,7 +13,7 @@ from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-from wool.runtime.work.task import Task
+from wool.runtime.routine.task import Task
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
@@ -541,7 +541,7 @@ class TestRoundRobinLoadBalancer:
         When:
             Worker is removed from the pool
         Then:
-            Worker lock is cleaned up and subsequent dispatches work correctly
+            Worker lock is cleaned up and subsequent dispatches tasks correctly
         """
         # Arrange
         lb = RoundRobinLoadBalancer()

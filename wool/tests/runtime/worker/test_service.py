@@ -14,8 +14,8 @@ from pytest_mock import MockerFixture
 from wool.runtime import protobuf as pb
 from wool.runtime.protobuf.worker import WorkerStub
 from wool.runtime.protobuf.worker import add_WorkerServicer_to_server
-from wool.runtime.work.task import Task
-from wool.runtime.work.task import WorkTaskEvent
+from wool.runtime.routine.task import Task
+from wool.runtime.routine.task import TaskEvent
 from wool.runtime.worker.service import WorkerService
 from wool.runtime.worker.service import _ReadOnlyEvent
 
@@ -240,7 +240,7 @@ class TestWorkerService:
 
         request = wool_task.to_protobuf()
 
-        emit_spy = mocker.spy(WorkTaskEvent, "emit")
+        emit_spy = mocker.spy(TaskEvent, "emit")
 
         # Act
         async with grpc_aio_stub() as stub:
@@ -292,7 +292,7 @@ class TestWorkerService:
 
         request = wool_task.to_protobuf()
 
-        emit_spy = mocker.spy(WorkTaskEvent, "emit")
+        emit_spy = mocker.spy(TaskEvent, "emit")
 
         # Act
         async with grpc_aio_stub() as stub:
@@ -328,7 +328,7 @@ class TestWorkerService:
         """
         # Arrange
         async with service_fixture as (service, event, stub):
-            emit_spy = mocker.spy(WorkTaskEvent, "emit")
+            emit_spy = mocker.spy(TaskEvent, "emit")
             initial_emit_count = emit_spy.call_count
 
             # Initiate stop (service enters stopping state)
@@ -399,7 +399,7 @@ class TestWorkerService:
             assert service.stopping.is_set()
             assert service.stopped.is_set()
 
-            emit_spy = mocker.spy(WorkTaskEvent, "emit")
+            emit_spy = mocker.spy(TaskEvent, "emit")
             initial_emit_count = emit_spy.call_count
 
             # Create a new task to dispatch
@@ -837,7 +837,7 @@ class TestWorkerService:
 
         request = wool_task.to_protobuf()
 
-        emit_spy = mocker.spy(WorkTaskEvent, "emit")
+        emit_spy = mocker.spy(TaskEvent, "emit")
 
         # Act
         async with grpc_aio_stub() as stub:

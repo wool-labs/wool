@@ -36,15 +36,14 @@ def test_public_api_completeness():
         "LoadBalancerLike",
         "NoWorkersAvailable",
         "RoundRobinLoadBalancer",
-        # Work - New names (preferred)
+        # Routines
         "Task",
-        "WorkTaskEvent",
-        "WorkTaskEventHandler",
-        "WorkTaskEventType",
-        "WorkTaskException",
+        "TaskEvent",
+        "TaskEventHandler",
+        "TaskEventType",
+        "TaskException",
         "current_task",
         "routine",
-        "work",
         # Workers
         "LocalWorker",
         "Worker",

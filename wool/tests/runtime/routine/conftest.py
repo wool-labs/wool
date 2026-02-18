@@ -1,4 +1,4 @@
-"""Shared fixtures for work subpackage tests."""
+"""Shared fixtures for routine subpackage tests."""
 
 import asyncio
 from typing import Callable
@@ -9,7 +9,7 @@ import pytest
 from pytest_mock import MockerFixture
 
 import wool
-from wool.runtime.work.task import Task
+from wool.runtime.routine.task import Task
 
 
 class PicklableProxy:
@@ -131,17 +131,17 @@ def clear_event_handlers():
 
     Ensures test isolation by preventing handler pollution between tests.
     """
-    saved_handlers = wool.WorkTaskEvent._handlers.copy()
-    wool.WorkTaskEvent._handlers.clear()
+    saved_handlers = wool.TaskEvent._handlers.copy()
+    wool.TaskEvent._handlers.clear()
 
     yield
 
-    wool.WorkTaskEvent._handlers = saved_handlers
+    wool.TaskEvent._handlers = saved_handlers
 
 
 # Picklable test functions for decorator tests
 async def picklable_async_function(x: int) -> int:
-    """A picklable async function for testing @work decorator."""
+    """A picklable async function for testing @routine decorator."""
     return x * 2
 
 

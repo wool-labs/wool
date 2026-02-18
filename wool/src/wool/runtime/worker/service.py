@@ -18,16 +18,16 @@ from grpc.aio import ServicerContext
 import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.work.task import Task
-from wool.runtime.work.task import WorkTaskEvent
+from wool.runtime.routine.task import Task
+from wool.runtime.routine.task import TaskEvent
 
 # Sentinel to mark end of async generator stream
 _SENTINEL = object()
 
 
 class _Task:
-    def __init__(self, work: asyncio.Task):
-        self._work = work
+    def __init__(self, task: asyncio.Task):
+        self._work = task
 
     async def cancel(self):
         self._work.cancel()
@@ -35,8 +35,8 @@ class _Task:
 
 
 class _AsyncGen:
-    def __init__(self, work: AsyncGenerator):
-        self._work = work
+    def __init__(self, task: AsyncGenerator):
+        self._work = task
 
     async def cancel(self):
         await self._work.aclose()
@@ -134,7 +134,7 @@ class WorkerService(pb.worker.WorkerServicer):
             then yields a Response containing the task result.
 
         .. note::
-            Emits a :class:`WorkTaskEvent` when the task is
+            Emits a :class:`TaskEvent` when the task is
             scheduled for execution.
         """
         if self._stopping.is_set():
@@ -142,15 +142,15 @@ class WorkerService(pb.worker.WorkerServicer):
                 StatusCode.UNAVAILABLE, "Worker service is shutting down"
             )
 
-        with self._tracker(Task.from_protobuf(request)) as work:
+        with self._tracker(Task.from_protobuf(request)) as task:
             yield pb.worker.Response(ack=pb.worker.Ack())
             try:
-                if isasyncgen(work):
-                    async for result in work:
+                if isasyncgen(task):
+                    async for result in task:
                         result = pb.task.Result(dump=cloudpickle.dumps(result))
                         yield pb.worker.Response(result=result)
-                elif isinstance(work, asyncio.Task):
-                    result = pb.task.Result(dump=cloudpickle.dumps(await work))
+                elif isinstance(task, asyncio.Task):
+                    result = pb.task.Result(dump=cloudpickle.dumps(await task))
                     yield pb.worker.Response(result=result)
             except (Exception, asyncio.CancelledError) as e:
                 exception = pb.task.Exception(dump=cloudpickle.dumps(e))
@@ -328,25 +328,25 @@ class WorkerService(pb.worker.WorkerServicer):
             The :class:`asyncio.Task` or async generator for the wool task.
 
         .. note::
-            Emits a :class:`WorkTaskEvent` with type "task-scheduled"
+            Emits a :class:`TaskEvent` with type "task-scheduled"
             when the task begins execution.
         """
-        WorkTaskEvent("task-scheduled", task=work_task).emit()
+        TaskEvent("task-scheduled", task=work_task).emit()
 
         if iscoroutinefunction(work_task.callable):
             # Regular async function -> run on worker loop
-            work = asyncio.create_task(self._run_on_worker(work_task))
-            watcher = _Task(work)
+            task = asyncio.create_task(self._run_on_worker(work_task))
+            watcher = _Task(task)
         elif isasyncgenfunction(work_task.callable):
             # Async generator -> stream from worker loop via queue
-            work = self._stream_from_worker(work_task)
-            watcher = _AsyncGen(work)
+            task = self._stream_from_worker(work_task)
+            watcher = _AsyncGen(task)
         else:
             raise ValueError("Expected coroutine function or async generator function")
 
         self._docket.add(watcher)
         try:
-            yield work
+            yield task
         finally:
             self._docket.discard(watcher)
 

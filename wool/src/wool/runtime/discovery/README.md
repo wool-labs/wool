@@ -1,6 +1,6 @@
 # Worker discovery
 
-Wool workers compose a decentralized peer-to-peer network — conceptually a singular pool. From a client's perspective, however, a worker pool is actually an abstraction defined by its discovery protocol. Discovery protocols describe to a client how to find workers, and which of those workers to consider when routing work.
+Wool workers compose a decentralized peer-to-peer network. From a client's perspective, a worker pool is an abstraction defined by its discovery protocol. Discovery protocols describe to a client how to find workers, and which of those workers to consider when routing work.
 
 ## Publisher-subscriber pattern
 
@@ -34,9 +34,7 @@ Both protocols optionally accept a filter predicate for targeted subscriptions.
 
 Wool supports custom discovery protocols via structural subtyping.
 
-`WorkerPool` accepts `DiscoveryLike` or `Factory[DiscoveryLike]` for its `discovery` parameter. The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables — the runtime manages it automatically.
-
-This means you can pass a discovery instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` handles all cases.
+`WorkerPool` accepts `DiscoveryLike` or `Factory[DiscoveryLike]` for its `discovery` parameter. The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables. This means you can pass a discovery instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` will manage it appropriately.
 
 ### `DiscoveryLike` protocol
 
@@ -142,31 +140,46 @@ async with wool.WorkerPool(size=4, discovery=wool.LanDiscovery()):
     result = await my_routine()
 ```
 
-## How it fits together
+## Discovery sequence
 
 ```mermaid
 sequenceDiagram
-    participant Pool as WorkerPool
-    participant W as Worker
-    participant Pub as Publisher
-    participant Sub as Subscriber
-    participant Proxy as WorkerProxy
+    participant Pool
+    participant Worker
+    participant Discovery
+    participant Loadbalancer
 
-    Note over Pool,Proxy: Startup
+    par Worker pool startup
+        loop Per worker
+            Pool ->> Worker: start worker
+            activate Pool
+            Worker -->> Pool: worker metadata
+            Pool ->> Discovery: publish "worker added"
+            deactivate Pool
+        end
+    and Worker discovery
+        loop Per worker lifecycle event
+            Discovery -->> Loadbalancer: worker event
+            activate Discovery
+            alt Worker-added
+                Loadbalancer ->> Loadbalancer: add worker
+            else Worker-updated
+                Loadbalancer ->> Loadbalancer: update worker
+            else Worker-dropped
+                Loadbalancer ->> Loadbalancer: remove worker
+            end
+            deactivate Discovery
+        end
 
-    Pool->>W: worker.start()
-    W-->>Pool: started
-    Pool->>Pub: publish("worker-added", metadata)
-    Pub->>Sub: DiscoveryEvent(worker-added)
-    Sub->>Proxy: event
-    Proxy->>Proxy: context.add_worker(metadata, factory)
+    and Worker pool shutdown
 
-    Note over Pool,Proxy: Shutdown
-
-    Pool->>Pub: publish("worker-dropped", metadata)
-    Pub->>Sub: DiscoveryEvent(worker-dropped)
-    Sub->>Proxy: event
-    Proxy->>Proxy: context.remove_worker(metadata)
-    Pool->>W: worker.stop()
-    W-->>Pool: stopped
+        loop Per worker
+            Pool ->> Discovery: publish "worker dropped"
+            activate Pool
+            Discovery -->> Loadbalancer: worker event
+            Loadbalancer ->> Loadbalancer: remove worker
+            Pool ->> Worker: stop worker
+            deactivate Pool
+        end
+    end
 ```

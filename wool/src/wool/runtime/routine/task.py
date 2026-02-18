@@ -36,8 +36,8 @@ Args = Tuple
 Kwargs = Dict
 Timeout = SupportsInt
 Timestamp = SupportsInt
-Work: TypeAlias = Coroutine | AsyncGenerator
-W = TypeVar("W", bound=Work)
+Routine: TypeAlias = Coroutine | AsyncGenerator
+W = TypeVar("W", bound=Routine)
 
 
 _do_dispatch: ContextVar[bool] = ContextVar("_do_dispatch", default=True)
@@ -127,7 +127,7 @@ class Task(Generic[W]):
     proxy: WorkerProxyLike
     timeout: Timeout = 0
     caller: UUID | None = None
-    exception: WorkTaskException | None = None
+    exception: TaskException | None = None
     filename: str | None = None
     function: str | None = None
     line_no: int | None = None
@@ -145,7 +145,7 @@ class Task(Generic[W]):
         """
         if caller := _current_task.get():
             self.caller = caller.id
-        WorkTaskEvent("task-created", task=self).emit()
+        TaskEvent("task-created", task=self).emit()
 
     def __enter__(self) -> Callable[[], Coroutine | AsyncGenerator]:
         """
@@ -187,7 +187,7 @@ class Task(Generic[W]):
         this = asyncio.current_task()
         assert this
         if exception_value:
-            self.exception = WorkTaskException(
+            self.exception = TaskException(
                 exception_type.__qualname__,
                 traceback=[
                     y
@@ -240,7 +240,7 @@ class Task(Generic[W]):
         elif iscoroutinefunction(self.callable):
             return self._run()
         else:
-            raise ValueError("Expected work to be coroutine or async generator")
+            raise ValueError("Expected routine to be coroutine or async generator")
 
     async def _run(self):
         """
@@ -299,12 +299,12 @@ class Task(Generic[W]):
                 await gen.aclose()
 
     def _finish(self, _):
-        WorkTaskEvent("task-completed", task=self).emit()
+        TaskEvent("task-completed", task=self).emit()
 
 
 # public
 @dataclass
-class WorkTaskException:
+class TaskException:
     """
     Represents an exception that occurred during distributed task execution.
 
@@ -323,7 +323,7 @@ class WorkTaskException:
 
 
 # public
-class WorkTaskEvent(Event):
+class TaskEvent(Event):
     """
     Represents a lifecycle event for a distributed task.
 
@@ -339,7 +339,7 @@ class WorkTaskEvent(Event):
 
     task: Task
 
-    def __init__(self, type: WorkTaskEventType, /, task: Task) -> None:
+    def __init__(self, type: TaskEventType, /, task: Task) -> None:
         super().__init__(type)
         self.task = task
 
@@ -365,9 +365,8 @@ class WorkTaskEvent(Event):
 
 
 # public
-WorkTaskEventType = Literal[
+TaskEventType = Literal[
     "task-created",
-    "task-queued",
     "task-scheduled",
     "task-started",
     "task-stopped",
@@ -379,8 +378,6 @@ task.
 
 - "task-created":
     Emitted when a task is created.
-- "task-queued":
-    Emitted when a task is added to the queue.
 - "task-scheduled":
     Emitted when a task is scheduled for execution in a worker's event
     loop.
@@ -394,13 +391,13 @@ task.
 
 
 # public
-class WorkTaskEventHandler(Protocol):
+class TaskEventHandler(Protocol):
     """
-    Protocol for WorkTaskEvent callback functions.
+    Protocol for :py:class:`TaskEvent` callback functions.
     """
 
     def __call__(
-        self, event: WorkTaskEvent, timestamp: Timestamp, context=None
+        self, event: TaskEvent, timestamp: Timestamp, context=None
     ) -> None: ...
 
 
@@ -423,11 +420,11 @@ def _run(fn):
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
         if current_task := self._context.get(_current_task):
-            WorkTaskEvent("task-started", task=current_task).emit()
+            TaskEvent("task-started", task=current_task).emit()
             try:
                 result = fn(self, *args, **kwargs)
             finally:
-                WorkTaskEvent("task-stopped", task=current_task).emit()
+                TaskEvent("task-stopped", task=current_task).emit()
             return result
         else:
             return fn(self, *args, **kwargs)
