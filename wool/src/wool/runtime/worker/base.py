@@ -175,24 +175,6 @@ class WorkerLike(Protocol):
         """
         ...
 
-    @property
-    def host(self) -> str | None:
-        """Hostname or IP address of the worker.
-
-        :returns:
-            The worker's host or None if not started.
-        """
-        ...
-
-    @property
-    def port(self) -> int | None:
-        """Port number the worker is listening on.
-
-        :returns:
-            The worker's port number or None if not started.
-        """
-        ...
-
     async def start(self, *, timeout: float | None = None):
         """Start the worker and register it with the pool.
 
@@ -244,15 +226,7 @@ class Worker(ABC):
 
             @property
             def address(self):
-                return f"{self.host}:{self.port}"
-
-            @property
-            def host(self):
-                return self._host
-
-            @property
-            def port(self):
-                return self._port
+                return self._address
 
     :param tags:
         Capability tags for filtering and selection.
@@ -298,14 +272,6 @@ class Worker(ABC):
     @property
     @abstractmethod
     def address(self) -> str | None: ...
-
-    @property
-    @abstractmethod
-    def host(self) -> str | None: ...
-
-    @property
-    @abstractmethod
-    def port(self) -> int | None: ...
 
     @final
     async def start(self, *, timeout: float | None = None):

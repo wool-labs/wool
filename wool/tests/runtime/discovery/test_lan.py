@@ -25,8 +25,7 @@ def metadata():
     """
     return WorkerMetadata(
         uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
-        host="localhost",
-        port=50051,
+        address="127.0.0.1:50051",
         pid=12345,
         version="1.0.0",
         tags=frozenset(["test", "worker"]),
@@ -39,15 +38,16 @@ def worker_factory():
     """Factory for creating multiple unique workers.
 
     Provides a factory function that creates WorkerMetadata instances with
-    unique UIDs and customizable port/tags for tests requiring multiple
+    unique UIDs and customizable address/tags for tests requiring multiple
     distinct workers.
     """
 
-    def _create_worker(port: int, tags: frozenset[str] | None = None) -> WorkerMetadata:
+    def _create_worker(
+        address: str, tags: frozenset[str] | None = None
+    ) -> WorkerMetadata:
         return WorkerMetadata(
             uid=uuid.uuid4(),
-            host="localhost",
-            port=port,
+            address=address,
             pid=os.getpid(),
             version="1.0.0",
             tags=tags or frozenset(),
@@ -83,8 +83,7 @@ def metadata_strategy(draw):
 
     return WorkerMetadata(
         uid=draw(st.uuids()),
-        host=draw(st.text(min_size=1, max_size=50, alphabet=ascii_alphanumeric + ".-_")),
-        port=draw(st.integers(min_value=1, max_value=65535)),
+        address=draw(st.from_regex(r"^[a-zA-Z0-9._-]+:[0-9]{1,5}$", fullmatch=True)),
         pid=draw(st.integers(min_value=1, max_value=2147483647)),
         version=draw(
             st.text(min_size=1, max_size=20, alphabet=ascii_alphanumeric + ".-_")
@@ -199,7 +198,7 @@ class TestLanDiscovery:
         discovery = LanDiscovery()
 
         def predicate(w):
-            return w.port == 50051
+            return w.address.endswith(":50051")
 
         # Act
         subscriber = discovery.subscribe(predicate)
@@ -221,7 +220,7 @@ class TestLanDiscovery:
 
         # Arrange
         def predicate(w):
-            return w.port == 50051
+            return w.address.endswith(":50051")
 
         discovery = LanDiscovery(filter=predicate)
 
@@ -245,7 +244,7 @@ class TestLanDiscovery:
 
         # Arrange
         def predicate(w):
-            return w.port == 50051
+            return w.address.endswith(":50051")
 
         discovery = LanDiscovery(filter=predicate)
 
@@ -332,7 +331,7 @@ class TestLanDiscoveryPublisher:
             )
 
             assert service_info is not None
-            assert service_info.port == metadata.port
+            assert service_info.port == int(metadata.address.split(":")[1])
             assert b"pid" in service_info.properties
 
     @pytest.mark.asyncio
@@ -357,8 +356,7 @@ class TestLanDiscoveryPublisher:
             # Update worker with new version
             updated_worker = WorkerMetadata(
                 uid=metadata.uid,  # Same UID
-                host=metadata.host,
-                port=metadata.port,
+                address=metadata.address,
                 pid=metadata.pid,
                 version="2.0.0",  # Changed version
                 tags=frozenset(["updated"]),
@@ -399,32 +397,6 @@ class TestLanDiscoveryPublisher:
 
             # Assert - verify service was removed
             assert str(metadata.uid) not in publisher.services
-
-    @pytest.mark.asyncio
-    async def test_publish_without_port(self):
-        """Test publish() with worker without port.
-
-        Given:
-            A Publisher and WorkerMetadata with port=None
-        When:
-            Publishing worker-added event
-        Then:
-            ValueError should be raised with clear message
-        """
-        # Arrange
-        publisher = LanDiscovery.Publisher()
-        worker_no_port = WorkerMetadata(
-            uid=uuid.uuid4(),
-            host="localhost",
-            port=None,  # Invalid for LAN discovery
-            pid=12345,
-            version="1.0.0",
-        )
-
-        # Act & Assert
-        async with publisher:
-            with pytest.raises(ValueError, match="Worker port must be specified"):
-                await publisher.publish("worker-added", worker_no_port)
 
     @pytest.mark.asyncio
     async def test_publish_uninitialized(self, metadata):
@@ -630,8 +602,7 @@ class TestLanDiscoverySubscriber:
             # Update worker
             updated_worker = WorkerMetadata(
                 uid=metadata.uid,
-                host=metadata.host,
-                port=metadata.port,
+                address=metadata.address,
                 pid=metadata.pid,
                 version="2.0.0",  # Changed
                 tags=frozenset(["updated"]),
@@ -725,12 +696,16 @@ class TestLanDiscoverySubscriber:
         publisher = LanDiscovery.Publisher()
 
         def filter_fn(w):
-            return w.port == 50051
+            return w.address.endswith(":50051")
 
         subscriber = LanDiscovery.Subscriber(filter=filter_fn)
 
-        worker_match = worker_factory(port=50051, tags=frozenset(["match"]))
-        worker_no_match = worker_factory(port=9999, tags=frozenset(["no-match"]))
+        worker_match = worker_factory(
+            address="127.0.0.1:50051", tags=frozenset(["match"])
+        )
+        worker_no_match = worker_factory(
+            address="localhost:9999", tags=frozenset(["no-match"])
+        )
 
         events = []
         event_received = asyncio.Event()
@@ -765,7 +740,7 @@ class TestLanDiscoverySubscriber:
 
         # Assert - only matching worker should appear
         assert len(events) >= 1
-        assert all(e.metadata.port == 50051 for e in events)
+        assert all(e.metadata.address.endswith(":50051") for e in events)
         assert any(e.metadata.uid == worker_match.uid for e in events)
 
     @pytest.mark.asyncio
@@ -868,7 +843,7 @@ class TestLanDiscoverySubscriber:
 
         subscriber = LanDiscovery.Subscriber(filter=filter_fn)
 
-        worker = worker_factory(port=50051, tags=frozenset(["gpu"]))
+        worker = worker_factory(address="127.0.0.1:50051", tags=frozenset(["gpu"]))
 
         events = []
         dropped_event = asyncio.Event()
@@ -893,8 +868,7 @@ class TestLanDiscoverySubscriber:
             # Update worker to remove gpu tag (no longer matches filter)
             updated_worker = WorkerMetadata(
                 uid=worker.uid,
-                host=worker.host,
-                port=worker.port,
+                address=worker.address,
                 pid=worker.pid,
                 version=worker.version,
                 tags=frozenset(["cpu"]),  # Changed - no longer has 'gpu'
@@ -1127,7 +1101,7 @@ class TestLanDiscoverySubscriber:
             "_wool._tcp.local.",
             service_name,
             addresses=[b"\x7f\x00\x00\x01"],
-            port=metadata.port,
+            port=int(metadata.address.split(":")[1]),
             properties=properties,
         )
 
@@ -1157,7 +1131,7 @@ class TestLanDiscoverySubscriber:
         event = await event_queue.get()
         assert event.type == "worker-added"
         assert event.metadata.uid == metadata.uid
-        assert event.metadata.port == metadata.port
+        assert event.metadata.address == metadata.address
         # Verify worker was added to cache
         assert service_name in service_cache
         assert service_cache[service_name].uid == metadata.uid
@@ -1190,7 +1164,7 @@ class TestLanDiscoverySubscriber:
             "_wool._tcp.local.",
             service_name,
             addresses=[b"\x7f\x00\x00\x01"],
-            port=worker.port,
+            port=int(worker.address.split(":")[1]),
             properties=properties,
         )
 
@@ -1227,7 +1201,9 @@ class TestLanDiscoverySubscriber:
             event = loop.run_until_complete(event_queue.get())
             assert event.type == "worker-added"
             assert event.metadata.uid == worker.uid
-            assert event.metadata.port == worker.port
+            # Address is reconstructed from ServiceInfo IP bytes + port
+            expected_port = int(worker.address.split(":")[1])
+            assert event.metadata.address == f"127.0.0.1:{expected_port}"
             assert event.metadata.pid == worker.pid
             assert event.metadata.version == worker.version
             assert event.metadata.tags == worker.tags
@@ -1304,7 +1280,7 @@ class TestLanDiscoverySubscriber:
         publisher = LanDiscovery.Publisher()
         subscriber = LanDiscovery.Subscriber()
 
-        worker = worker_factory(port=50051, tags=frozenset(["new"]))
+        worker = worker_factory(address="127.0.0.1:50051", tags=frozenset(["new"]))
 
         events = []
         event_received = asyncio.Event()
@@ -1395,7 +1371,7 @@ class TestIntegration:
         discovered_event = events[0]
         assert discovered_event.type == "worker-added"
         assert discovered_event.metadata.uid == metadata.uid
-        assert discovered_event.metadata.port == metadata.port
+        assert discovered_event.metadata.address == metadata.address
         assert discovered_event.metadata.pid == metadata.pid
 
 
@@ -1444,8 +1420,7 @@ class TestSerializationFunctions:
         # Arrange
         worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="localhost",
-            port=50051,
+            address="127.0.0.1:50051",
             pid=12345,
             version="1.0.0",
             tags=frozenset(),
@@ -1474,8 +1449,7 @@ class TestSerializationFunctions:
         # Arrange
         worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="localhost",
-            port=50051,
+            address="127.0.0.1:50051",
             pid=999,
             version="dev",
             tags=frozenset(),
@@ -1506,7 +1480,7 @@ class TestSerializationFunctions:
             "_wool._tcp.local.",
             service_name,
             addresses=[b"\x7f\x00\x00\x01"],  # 127.0.0.1
-            port=metadata.port,
+            port=int(metadata.address.split(":")[1]),
             properties=properties,
         )
 
@@ -1517,7 +1491,7 @@ class TestSerializationFunctions:
         assert result.uid == metadata.uid
         assert result.pid == metadata.pid
         assert result.version == metadata.version
-        assert result.port == metadata.port
+        assert result.address == metadata.address
         assert result.tags == metadata.tags
         assert result.extra == metadata.extra
 
@@ -1644,7 +1618,7 @@ class TestSerializationFunctions:
             "_wool._tcp.local.",
             service_name,
             addresses=[b"\x7f\x00\x00\x01"],
-            port=metadata.port,
+            port=int(metadata.address.split(":")[1]),
             properties=properties,
         )
 
@@ -1655,7 +1629,7 @@ class TestSerializationFunctions:
         assert result.uid == metadata.uid
         assert result.pid == metadata.pid
         assert result.version == metadata.version
-        assert result.port == metadata.port
+        assert result.address == metadata.address
         assert result.tags == metadata.tags
         assert result.extra == metadata.extra
 
@@ -1756,7 +1730,7 @@ class TestPropertyBasedSerialization:
             "_wool._tcp.local.",
             service_name,
             addresses=[b"\x7f\x00\x00\x01"],
-            port=worker.port,
+            port=int(worker.address.split(":")[1]),
             properties=properties,
         )
 
@@ -1767,7 +1741,9 @@ class TestPropertyBasedSerialization:
         assert result.uid == worker.uid
         assert result.pid == worker.pid
         assert result.version == worker.version
-        assert result.port == worker.port
+        # Address is reconstructed from ServiceInfo IP bytes + port
+        expected_port = int(worker.address.split(":")[1])
+        assert result.address == f"127.0.0.1:{expected_port}"
         assert result.tags == worker.tags
         assert result.extra == worker.extra
 
@@ -1817,8 +1793,7 @@ class TestPropertyBasedSerialization:
         # Arrange
         worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="localhost",
-            port=50051,
+            address="127.0.0.1:50051",
             pid=12345,
             version="1.0.0",
             tags=tags,
@@ -1875,8 +1850,7 @@ class TestPropertyBasedSerialization:
         # Arrange
         worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="localhost",
-            port=50051,
+            address="127.0.0.1:50051",
             pid=12345,
             version=version,
         )
@@ -1893,7 +1867,7 @@ class TestPropertyBasedSerialization:
             "_wool._tcp.local.",
             service_name,
             addresses=[b"\x7f\x00\x00\x01"],
-            port=worker.port,
+            port=int(worker.address.split(":")[1]),
             properties=properties,
         )
         result = _deserialize_metadata(service_info)
@@ -1931,14 +1905,13 @@ class TestPropertyBasedSerialization:
 
     @given(
         pid=st.integers(min_value=1, max_value=2147483647),
-        port=st.integers(min_value=1, max_value=65535),
     )
     @settings(max_examples=50)
-    def test_serialize_numeric_fields_property(self, pid, port):
+    def test_serialize_numeric_fields_property(self, pid):
         """Property: Numeric fields serialize/deserialize correctly.
 
         Given:
-            Arbitrary valid PID and port numbers
+            Arbitrary valid PID number
         When:
             Serializing and deserializing WorkerMetadata
         Then:
@@ -1947,8 +1920,7 @@ class TestPropertyBasedSerialization:
         # Arrange
         worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="localhost",
-            port=port,
+            address="127.0.0.1:50051",
             pid=pid,
             version="1.0.0",
         )
@@ -1960,13 +1932,12 @@ class TestPropertyBasedSerialization:
             "_wool._tcp.local.",
             service_name,
             addresses=[b"\x7f\x00\x00\x01"],
-            port=worker.port,
+            port=50051,
             properties=properties,
         )
         result = _deserialize_metadata(service_info)
 
         # Assert
         assert result.pid == pid
-        assert result.port == port
         # Verify serialized format
         assert properties["pid"] == str(pid)
