@@ -7,10 +7,7 @@ from hypothesis import strategies as st
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
-from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.connection import WorkerConnection
-
-connection_pool = ResourcePool(WorkerConnection)
 
 
 @st.composite
@@ -18,8 +15,7 @@ def loadbalancer_context(draw):
     """Generate a LoadBalancerContext seeded with 1-8 workers.
 
     Creates a LoadBalancerContext populated with randomly generated workers.
-    Each worker has unique identifying information and a mock connection
-    resource factory.
+    Each worker has unique identifying information and a connection.
 
     :param draw:
         Hypothesis draw function
@@ -37,7 +33,7 @@ def loadbalancer_context(draw):
             pid=1000 + i,
             version="1.0.0",
         )
-        ctx.add_worker(metadata, lambda: connection_pool.get(metadata))
+        ctx.add_worker(metadata, WorkerConnection(f"localhost:{50051 + i}"))
 
     return ctx
 
@@ -89,14 +85,12 @@ class TestLoadBalancerContext:
             version="1.0.0",
         )
 
-        def factory():
-            return connection_pool.get(metadata)
-
-        context.add_worker(worker, factory)
+        connection = WorkerConnection("localhost:60000")
+        context.add_worker(worker, connection)
 
         # Verify the new worker is present
         assert worker in context.workers
-        assert context.workers[worker] == factory
+        assert context.workers[worker] == connection
 
         # Verify existing workers are unchanged
         for metadata in original_workers:
@@ -118,15 +112,14 @@ class TestLoadBalancerContext:
         original_workers = dict(context.workers)
         worker_to_update = next(iter(context.workers.keys()))
 
-        # Create a different factory function
-        def factory():
-            return connection_pool.get(metadata)
+        # Create a different connection
+        connection = WorkerConnection("localhost:60000")
 
-        # Update the worker with a new factory
-        context.update_worker(worker_to_update, factory)
+        # Update the worker with a new connection
+        context.update_worker(worker_to_update, connection)
 
         # Verify the worker was updated
-        assert context.workers[worker_to_update] == factory
+        assert context.workers[worker_to_update] == connection
 
         # Verify other workers are unchanged
         for metadata in original_workers:
@@ -150,15 +143,14 @@ class TestLoadBalancerContext:
         original_workers = dict(context.workers)
         worker_to_update = next(iter(context.workers.keys()))
 
-        # Create a different factory function
-        def factory():
-            return connection_pool.get(metadata)
+        # Create a different connection
+        connection = WorkerConnection("localhost:60000")
 
-        # Update the worker with a new factory using upsert=True
-        context.update_worker(worker_to_update, factory, upsert=True)
+        # Update the worker with a new connection using upsert=True
+        context.update_worker(worker_to_update, connection, upsert=True)
 
         # Verify the worker was updated
-        assert context.workers[worker_to_update] == factory
+        assert context.workers[worker_to_update] == connection
 
         # Verify other workers are unchanged
         for metadata in original_workers:
@@ -188,14 +180,12 @@ class TestLoadBalancerContext:
             version="1.0.0",
         )
 
-        def factory():
-            return connection_pool.get(metadata)
-
-        context.update_worker(new_worker, factory, upsert=True)
+        connection = WorkerConnection("localhost:60000")
+        context.update_worker(new_worker, connection, upsert=True)
 
         # Verify the new worker is present
         assert new_worker in context.workers
-        assert context.workers[new_worker] == factory
+        assert context.workers[new_worker] == connection
 
         # Verify existing workers are unchanged
         for metadata in original_workers:
