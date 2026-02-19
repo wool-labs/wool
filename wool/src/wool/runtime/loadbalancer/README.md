@@ -4,7 +4,7 @@ The load balancer is the dispatch layer between Wool routines and workers. When 
 
 ## Context-based dispatch
 
-Every dispatch call receives a `LoadBalancerContext` — an isolated container of workers and their connection factories for a specific pool. Each `WorkerPool` maintains its own context (via its `WorkerProxy`), so a single load balancer instance can be reused across multiple pools while keeping dispatch scoped to the correct one. Routines are always routed to the workers belonging to the pool they were called through, regardless of how many share the same load balancer. Discovery events populate the context automatically; the load balancer never needs to know how workers are found, only that they exist.
+Every dispatch call receives a `LoadBalancerContext` — an isolated container of workers and their connections for a specific pool. Each `WorkerPool` maintains its own context (via its `WorkerProxy`), so a single load balancer instance can be reused across multiple pools while keeping dispatch scoped to the correct one. Routines are always routed to the workers belonging to the pool they were called through, regardless of how many share the same load balancer. Discovery events populate the context automatically; the load balancer never needs to know how workers are found, only that they exist.
 
 A `LoadBalancerContext` exposes a read-only view of its workers and methods for adding, updating, and removing workers.
 
@@ -67,7 +67,7 @@ class LeastLoadedBalancer:
             raise wool.NoWorkersAvailable
 
         # Pick the worker with the lowest in-flight count
-        metadata, factory = min(
+        metadata, connection = min(
             context.workers.items(),
             key=lambda item: self._in_flight.get(item[0].uid, 0),
         )
@@ -76,8 +76,7 @@ class LeastLoadedBalancer:
             self._in_flight.get(metadata.uid, 0) + 1
         )
         try:
-            async with factory() as connection:
-                return await connection.dispatch(task, timeout=timeout)
+            return await connection.dispatch(task, timeout=timeout)
         finally:
             self._in_flight[metadata.uid] -= 1
 ```
@@ -124,7 +123,7 @@ sequenceDiagram
     Routine ->> Loadbalancer: route task
     Loadbalancer ->> Loadbalancer: serialize task to protobuf
     Loadbalancer ->> Context: get workers
-    Context -->> Loadbalancer: {worker metadata: factory, ...}
+    Context -->> Loadbalancer: {worker metadata: connection, ...}
 
     loop Until success or all workers exhausted
         Loadbalancer ->> Loadbalancer: select next worker
