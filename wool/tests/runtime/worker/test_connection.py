@@ -18,6 +18,7 @@ from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.connection import _channel_pool
 
 
 @pytest.fixture
@@ -601,28 +602,22 @@ class TestWorkerConnection:
         mock_call.cancel.assert_called_once()
 
     @pytest.mark.asyncio
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    @given(call_count=st.integers(min_value=1, max_value=5))
-    async def test_close(self, mocker: MockerFixture, call_count: int):
-        """Test closing a connection with multiple invocations.
+    async def test_close_idempotent(self, mocker: MockerFixture):
+        """Test closing a connection is idempotent.
 
         Given:
             A connection instance
         When:
-            Close is called one or more times
+            Close is called multiple times
         Then:
-            It should close the connection's channel without error
+            It should complete without error each time
         """
         # Arrange
         connection = WorkerConnection("localhost:50051", limit=10)
-        close_spy = mocker.spy(connection._channel, "close")
 
-        # Act
-        for _ in range(call_count):
-            await connection.close()
-
-        # Assert
-        assert close_spy.call_count == call_count
+        # Act & Assert — should not raise on repeated calls
+        await connection.close()
+        await connection.close()
 
     @pytest.mark.asyncio
     async def test_dispatch_task_that_yields_multiple_results(
@@ -714,6 +709,203 @@ class TestWorkerConnection:
 
         # Assert - only got first 2 results
         assert results == ["result_1", "result_2"]
+
+
+class TestResourceLifetime:
+    """Tests for pool-backed resource lifetime management."""
+
+    @pytest.mark.asyncio
+    async def test_stream_usable_after_dispatch_returns(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """WC-001: dispatch() returns a usable stream after its scope exits.
+
+        Given:
+            A connection backed by the module-level channel pool.
+        When:
+            dispatch() returns a stream (releasing its own pool ref).
+        Then:
+            The stream is still consumable because _execute() holds
+            its own pool reference.
+        """
+        # Arrange
+        responses = (
+            pb.worker.Response(ack=pb.worker.Ack()),
+            pb.worker.Response(result=pb.task.Result(dump=cloudpickle.dumps("value"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", limit=10)
+
+        # Act — obtain the stream, then consume later
+        stream = await connection.dispatch(sample_task)
+        # dispatch() has returned; its pool ref is released
+
+        results = [r async for r in stream]
+
+        # Assert
+        assert results == ["value"]
+
+    @pytest.mark.asyncio
+    async def test_stream_consumption_releases_pool_ref(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """WC-002: consuming the full stream drives ref count to 0.
+
+        Given:
+            A connection that dispatches a single-result task.
+        When:
+            The stream is fully consumed.
+        Then:
+            The pool reference count for the channel key drops to 0,
+            meaning no dangling references are held.
+        """
+        # Arrange
+        responses = (
+            pb.worker.Response(ack=pb.worker.Ack()),
+            pb.worker.Response(result=pb.task.Result(dump=cloudpickle.dumps("done"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", limit=10)
+
+        # Act
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        # Assert — ref count should be 0 (pending cleanup only)
+        key = connection._key
+        # Entry might still be cached (pending TTL cleanup), but no active refs
+        if key in _channel_pool._cache:
+            assert _channel_pool._cache[key].reference_count == 0
+
+    @pytest.mark.asyncio
+    async def test_error_mid_stream_releases_pool_ref(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """WC-003: an error mid-stream releases the pool reference.
+
+        Given:
+            A connection that dispatches a task whose stream raises
+            an exception after acknowledgment.
+        When:
+            The caller iterates and hits the exception.
+        Then:
+            The pool reference is released despite the error.
+        """
+        # Arrange
+        responses = (
+            pb.worker.Response(ack=pb.worker.Ack()),
+            pb.worker.Response(
+                exception=pb.task.Exception(dump=cloudpickle.dumps(RuntimeError("boom")))
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", limit=10)
+
+        # Act
+        with pytest.raises(RuntimeError, match="boom"):
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        # Assert — ref count should be 0
+        key = connection._key
+        if key in _channel_pool._cache:
+            assert _channel_pool._cache[key].reference_count == 0
+
+    @pytest.mark.asyncio
+    async def test_close_invokes_channel_finalizer(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test that close() tears down the pooled gRPC channel.
+
+        Given:
+            A connection that has dispatched a task, populating the
+            module-level channel pool.
+        When:
+            close() is called.
+        Then:
+            The underlying gRPC channel's close() method is called
+            via the pool finalizer.
+        """
+        # Arrange
+        responses = (
+            pb.worker.Response(ack=pb.worker.Ack()),
+            pb.worker.Response(result=pb.task.Result(dump=cloudpickle.dumps("done"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", limit=10)
+
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        # Spy on the pooled channel's close method before clearing
+        channel_obj = _channel_pool._cache[connection._key].obj.channel
+        close_spy = mocker.spy(channel_obj, "close")
+
+        # Act
+        await connection.close()
+
+        # Assert
+        close_spy.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_two_dispatches_share_one_channel(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """WC-005: two dispatches to the same target share one _Channel.
+
+        Given:
+            Two WorkerConnection instances with identical (target,
+            credentials, limit).
+        When:
+            Both dispatch a task.
+        Then:
+            Only one _Channel is created in the pool (the factory is
+            called once).
+        """
+
+        # Arrange
+        def make_call():
+            responses = (
+                pb.worker.Response(ack=pb.worker.Ack()),
+                pb.worker.Response(result=pb.task.Result(dump=cloudpickle.dumps("ok"))),
+            )
+            return mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=lambda _: make_call())
+        mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
+
+        conn_a = WorkerConnection("localhost:50051", limit=10)
+        conn_b = WorkerConnection("localhost:50051", limit=10)
+
+        # Act
+        async for _ in await conn_a.dispatch(sample_task):
+            pass
+        async for _ in await conn_b.dispatch(sample_task):
+            pass
+
+        # Assert — WorkerStub constructed only once (one _Channel)
+        assert pb.worker.WorkerStub.call_count == 1
 
 
 class TestDispatchStream:
