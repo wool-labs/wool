@@ -217,7 +217,6 @@ def routine(fn: C) -> C:
         return cast(C, coroutine_wrapper)
 
 
-
 def _dispatch(
     proxy: WorkerProxy,
     module: str,

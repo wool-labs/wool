@@ -30,8 +30,7 @@ def metadata():
     """
     return WorkerMetadata(
         uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
-        host="localhost",
-        port=50051,
+        address="localhost:50051",
         pid=12345,
         version="1.0.0",
         tags=frozenset(["test", "worker"]),
@@ -106,7 +105,7 @@ class MockWorker:
     def address(self) -> str | None:
         """Network address (available after start)."""
         if self._info:
-            return f"{self._info.host}:{self._info.port}"
+            return self._info.address
         return None
 
     async def start(self) -> None:
@@ -123,8 +122,7 @@ class MockWorker:
         # Create WorkerMetadata after successful start
         self._info = WorkerMetadata(
             uid=self._uid,
-            host="localhost",
-            port=50051,
+            address="localhost:50051",
             pid=12345,
             version="1.0.0",
             tags=frozenset(self._tags),
@@ -289,7 +287,7 @@ def mock_local_worker(mocker: MockerFixture):
         mock_worker.metadata = mocker.MagicMock()
         worker_count[0] += 1
         mock_worker.metadata.uid = f"test-worker-{worker_count[0]}"
-        mock_worker.metadata.port = 50050 + worker_count[0]
+        mock_worker.metadata.address = f"localhost:{50050 + worker_count[0]}"
         workers.append(mock_worker)
         return mock_worker
 
@@ -417,8 +415,7 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata)
     # Inject 2 mock workers into discovery
     worker1 = WorkerMetadata(
         uid=uuid.uuid4(),
-        host="192.168.1.100",
-        port=50051,
+        address="192.168.1.100:50051",
         pid=1001,
         version="1.0.0",
         tags=frozenset(["test"]),
@@ -426,8 +423,7 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata)
     )
     worker2 = WorkerMetadata(
         uid=uuid.uuid4(),
-        host="192.168.1.101",
-        port=50051,
+        address="192.168.1.101:50051",
         pid=1002,
         version="1.0.0",
         tags=frozenset(["test"]),
