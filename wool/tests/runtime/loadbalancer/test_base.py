@@ -33,8 +33,7 @@ def loadbalancer_context(draw):
     for i in range(worker_count):
         metadata = WorkerMetadata(
             uid=uuid4(),
-            host="localhost",
-            port=50051 + i,
+            address=f"localhost:{50051 + i}",
             pid=1000 + i,
             version="1.0.0",
         )
@@ -85,8 +84,7 @@ class TestLoadBalancerContext:
         # Add a new worker
         worker = WorkerMetadata(
             uid=uuid4(),
-            host="localhost",
-            port=60000,
+            address="localhost:60000",
             pid=9999,
             version="1.0.0",
         )
@@ -185,8 +183,7 @@ class TestLoadBalancerContext:
         # Upsert a new worker
         new_worker = WorkerMetadata(
             uid=uuid4(),
-            host="localhost",
-            port=60000,
+            address="localhost:60000",
             pid=9999,
             version="1.0.0",
         )

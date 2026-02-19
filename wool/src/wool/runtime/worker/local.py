@@ -107,24 +107,6 @@ class LocalWorker(Worker):
         """
         return self._worker_process.address
 
-    @property
-    def host(self) -> str | None:
-        """The host where the worker is listening.
-
-        :returns:
-            The host address, or None if not started.
-        """
-        return self._info.host if self._info else None
-
-    @property
-    def port(self) -> int | None:
-        """The port where the worker is listening.
-
-        :returns:
-            The port number, or None if not started.
-        """
-        return self._info.port if self._info else None
-
     async def _start(self, timeout: float | None):
         """Start the worker process and register it with the pool.
 
@@ -144,13 +126,9 @@ class LocalWorker(Worker):
         if not self._worker_process.pid:
             raise RuntimeError("Worker process failed to start - no PID")
 
-        host, port_str = self._worker_process.address.split(":")
-        port = int(port_str)
-
         self._info = WorkerMetadata(
             uid=self._uid,
-            host=host,
-            port=port,
+            address=self._worker_process.address,
             pid=self._worker_process.pid,
             version=wool.__version__,
             tags=frozenset(self._tags),

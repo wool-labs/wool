@@ -23,8 +23,7 @@ def metadata():
     """
     return WorkerMetadata(
         uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
-        host="localhost",
-        port=50051,
+        address="localhost:50051",
         pid=12345,
         version="1.0.0",
         tags=frozenset(["test", "worker"]),
@@ -41,8 +40,7 @@ def metadata_message():
     """
     return WorkerMetadataProtobuf(
         uid="12345678-1234-5678-1234-567812345678",
-        host="localhost",
-        port=50051,
+        address="localhost:50051",
         pid=12345,
         version="1.0.0",
         tags=["test", "worker"],
@@ -68,7 +66,7 @@ class TestWorkerMetadata:
         """
         # Act & Assert
         with pytest.raises(AttributeError):
-            metadata.host = "newhost"
+            metadata.address = "newhost:50051"
 
     def test_init(self):
         """Test WorkerMetadata default field values.
@@ -86,7 +84,7 @@ class TestWorkerMetadata:
 
         # Act
         worker = WorkerMetadata(
-            uid=uid, host="localhost", port=50051, pid=123, version="1.0.0"
+            uid=uid, address="localhost:50051", pid=123, version="1.0.0"
         )
 
         # Assert
@@ -105,12 +103,8 @@ class TestWorkerMetadata:
         """
         # Arrange
         uid = uuid.uuid4()
-        worker1 = WorkerMetadata(
-            uid=uid, host="host1", port=5001, pid=123, version="1.0.0"
-        )
-        worker2 = WorkerMetadata(
-            uid=uid, host="host2", port=5002, pid=456, version="2.0.0"
-        )
+        worker1 = WorkerMetadata(uid=uid, address="host1:5001", pid=123, version="1.0.0")
+        worker2 = WorkerMetadata(uid=uid, address="host2:5002", pid=456, version="2.0.0")
 
         # Act & Assert
         assert hash(worker1) == hash(worker2)
@@ -127,20 +121,14 @@ class TestWorkerMetadata:
         """
         # Arrange
         uid = uuid.uuid4()
-        worker1 = WorkerMetadata(
-            uid=uid, host="host1", port=5001, pid=123, version="1.0.0"
-        )
-        worker2 = WorkerMetadata(
-            uid=uid, host="host2", port=5002, pid=456, version="2.0.0"
-        )
+        worker1 = WorkerMetadata(uid=uid, address="host1:5001", pid=123, version="1.0.0")
+        worker2 = WorkerMetadata(uid=uid, address="host2:5002", pid=456, version="2.0.0")
 
         # Act & Assert
         assert worker1 != worker2
 
         # Workers with all same fields should be equal
-        worker3 = WorkerMetadata(
-            uid=uid, host="host1", port=5001, pid=123, version="1.0.0"
-        )
+        worker3 = WorkerMetadata(uid=uid, address="host1:5001", pid=123, version="1.0.0")
         assert worker1 == worker3
 
     def test_from_protobuf(self, metadata_message):
@@ -158,8 +146,7 @@ class TestWorkerMetadata:
 
         # Assert
         assert worker.uid == uuid.UUID("12345678-1234-5678-1234-567812345678")
-        assert worker.host == "localhost"
-        assert worker.port == 50051
+        assert worker.address == "localhost:50051"
         assert worker.pid == 12345
         assert worker.version == "1.0.0"
         assert worker.tags == frozenset(["test", "worker"])
@@ -178,8 +165,7 @@ class TestWorkerMetadata:
         # Arrange
         protobuf = WorkerMetadataProtobuf(
             uid="invalid-uuid",
-            host="localhost",
-            port=50051,
+            address="localhost:50051",
             pid=12345,
             version="1.0.0",
         )
@@ -187,31 +173,6 @@ class TestWorkerMetadata:
         # Act & Assert
         with pytest.raises(ValueError):
             WorkerMetadata.from_protobuf(protobuf)
-
-    def test_from_protobuf_port_zero(self):
-        """Test from_protobuf() converts port 0 to None.
-
-        Given:
-            A protobuf WorkerMetadata with port=0
-        When:
-            Converting to WorkerMetadata
-        Then:
-            It should set port to None
-        """
-        # Arrange
-        protobuf = WorkerMetadataProtobuf(
-            uid="12345678-1234-5678-1234-567812345678",
-            host="localhost",
-            port=0,
-            pid=12345,
-            version="1.0.0",
-        )
-
-        # Act
-        worker = WorkerMetadata.from_protobuf(protobuf)
-
-        # Assert
-        assert worker.port is None
 
     def test_to_protobuf(self, metadata):
         """Test to_protobuf() with valid WorkerMetadata.
@@ -228,45 +189,18 @@ class TestWorkerMetadata:
 
         # Assert
         assert protobuf.uid == "12345678-1234-5678-1234-567812345678"
-        assert protobuf.host == "localhost"
-        assert protobuf.port == 50051
+        assert protobuf.address == "localhost:50051"
         assert protobuf.pid == 12345
         assert protobuf.version == "1.0.0"
         assert set(protobuf.tags) == {"test", "worker"}
         assert dict(protobuf.extra) == {"key": "value"}
 
-    def test_to_protobuf_port_none(self):
-        """Test to_protobuf() converts None port to 0.
-
-        Given:
-            A WorkerMetadata instance with port=None
-        When:
-            Converting to protobuf
-        Then:
-            It should set port to 0 in protobuf message
-        """
-        # Arrange
-        worker = WorkerMetadata(
-            uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
-            host="localhost",
-            port=None,
-            pid=12345,
-            version="1.0.0",
-        )
-
-        # Act
-        protobuf = worker.to_protobuf()
-
-        # Assert
-        assert protobuf.port == 0
-
     @given(
-        host=st.text(min_size=1),
-        port=st.one_of(st.integers(min_value=1, max_value=65535), st.none()),
-        pid=st.integers(min_value=1, max_value=2147483647),  # int32 max
+        address=st.from_regex(r"^[a-zA-Z0-9._-]+:[0-9]+$", fullmatch=True),
+        pid=st.integers(min_value=1, max_value=2147483647),
         version=st.text(min_size=1),
     )
-    def test_roundtrip_conversion(self, host, port, pid, version):
+    def test_roundtrip_conversion(self, address, pid, version):
         """Test round-trip conversion preserves WorkerMetadata data.
 
         Given:
@@ -280,8 +214,7 @@ class TestWorkerMetadata:
         uid = uuid.uuid4()
         original = WorkerMetadata(
             uid=uid,
-            host=host,
-            port=port,
+            address=address,
             pid=pid,
             version=version,
         )
@@ -292,8 +225,7 @@ class TestWorkerMetadata:
 
         # Assert
         assert deserialized.uid == original.uid
-        assert deserialized.host == original.host
-        assert deserialized.port == original.port
+        assert deserialized.address == original.address
         assert deserialized.pid == original.pid
         assert deserialized.version == original.version
         assert deserialized.tags == original.tags
@@ -341,8 +273,7 @@ class TestDiscoveryEvent:
         event = DiscoveryEvent("worker-added", metadata=metadata)
         new_worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="newhost",
-            port=9999,
+            address="newhost:9999",
             pid=99999,
             version="2.0.0",
         )

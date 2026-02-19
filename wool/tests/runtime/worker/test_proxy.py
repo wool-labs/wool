@@ -166,7 +166,7 @@ def spy_discovery_with_events(mocker: MockerFixture):
 
     # Create default worker info for testing
     metadata = WorkerMetadata(
-        uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
+        uid=uuid.uuid4(), address="127.0.0.1:50051", pid=1234, version="1.0.0"
     )
 
     # Create discovery with default worker-added event
@@ -357,10 +357,10 @@ class TestWorkerProxy:
         # Arrange
         workers = [
             WorkerMetadata(
-                uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
+                uid=uuid.uuid4(), address="127.0.0.1:50051", pid=1234, version="1.0.0"
             ),
             WorkerMetadata(
-                uid=uuid.uuid4(), host="127.0.0.1", port=50052, pid=1235, version="1.0.0"
+                uid=uuid.uuid4(), address="127.0.0.1:50052", pid=1235, version="1.0.0"
             ),
         ]
 
@@ -383,7 +383,7 @@ class TestWorkerProxy:
         # Arrange
         workers = [
             WorkerMetadata(
-                uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
+                uid=uuid.uuid4(), address="127.0.0.1:50051", pid=1234, version="1.0.0"
             )
         ]
         discovery = LocalDiscovery("test-pool").subscriber
@@ -731,8 +731,7 @@ class TestWorkerProxy:
         # Arrange
         worker1 = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="192.168.1.100",
-            port=50051,
+            address="192.168.1.100:50051",
             pid=1001,
             version="1.0.0",
             tags=frozenset(["test"]),
@@ -769,8 +768,7 @@ class TestWorkerProxy:
 
         worker1 = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="192.168.1.100",
-            port=50051,
+            address="192.168.1.100:50051",
             pid=1001,
             version="1.0.0",
             tags=frozenset(["test"]),
@@ -799,8 +797,7 @@ class TestWorkerProxy:
         # Arrange
         worker1 = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="192.168.1.100",
-            port=50051,
+            address="192.168.1.100:50051",
             pid=1001,
             version="1.0.0",
             tags=frozenset(["test"]),
@@ -834,8 +831,7 @@ class TestWorkerProxy:
         # Arrange
         metadata = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="192.168.1.100",
-            port=50051,
+            address="192.168.1.100:50051",
             pid=1001,
             version="1.0.0",
         )
@@ -1000,7 +996,7 @@ class TestWorkerProxy:
         """
         # Arrange
         metadata = WorkerMetadata(
-            uid=uuid.uuid4(), host="127.0.0.1", port=50051, pid=1234, version="1.0.0"
+            uid=uuid.uuid4(), address="127.0.0.1:50051", pid=1234, version="1.0.0"
         )
 
         # Create discovery service that will emit worker event
@@ -1075,8 +1071,7 @@ class TestWorkerProxy:
         gate = asyncio.Event()
         metadata = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="192.168.1.100",
-            port=50051,
+            address="192.168.1.100:50051",
             pid=1001,
             version="1.0.0",
         )
@@ -1140,8 +1135,7 @@ class TestWorkerProxy:
         workers = [
             WorkerMetadata(
                 uid=uuid.uuid4(),
-                host="192.168.1.100",
-                port=50051,
+                address="192.168.1.100:50051",
                 pid=1001,
                 version="1.0.0",
                 tags=frozenset(["test"]),
@@ -1149,8 +1143,7 @@ class TestWorkerProxy:
             ),
             WorkerMetadata(
                 uid=uuid.uuid4(),
-                host="192.168.1.101",
-                port=50052,
+                address="192.168.1.101:50052",
                 pid=1002,
                 version="1.0.0",
                 tags=frozenset(["test"]),
@@ -1210,8 +1203,7 @@ class TestWorkerProxy:
         # Arrange
         metadata = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="127.0.0.1",
-            port=50051,
+            address="127.0.0.1:50051",
             pid=1234,
             version="1.0.0",
         )
@@ -1469,16 +1461,14 @@ class TestWorkerProxy:
         # Arrange
         secure_worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="192.168.1.100",
-            port=50051,
+            address="192.168.1.100:50051",
             pid=1001,
             version="1.0.0",
             secure=True,
         )
         insecure_worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="192.168.1.101",
-            port=50052,
+            address="192.168.1.101:50052",
             pid=1002,
             version="1.0.0",
             secure=False,
@@ -1527,8 +1517,7 @@ class TestWorkerProxy:
         # Act & Assert — matching tags, insecure (no credentials)
         matching = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="127.0.0.1",
-            port=50051,
+            address="127.0.0.1:50051",
             pid=1,
             version="1.0.0",
             tags=frozenset(["pool-1"]),
@@ -1539,8 +1528,7 @@ class TestWorkerProxy:
         # Act & Assert — no matching tags
         non_matching = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="127.0.0.1",
-            port=50052,
+            address="127.0.0.1:50052",
             pid=2,
             version="1.0.0",
             tags=frozenset(["other"]),
@@ -1552,8 +1540,7 @@ class TestWorkerProxy:
         # security filter rejects secure workers)
         secure_matching = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="127.0.0.1",
-            port=50053,
+            address="127.0.0.1:50053",
             pid=3,
             version="1.0.0",
             tags=frozenset(["pool-1"]),
@@ -1593,8 +1580,7 @@ class TestWorkerProxyProperties:
         for i in range(worker_count):
             worker = WorkerMetadata(
                 uid=uuid.uuid4(),
-                host=f"192.168.1.{100 + i}",
-                port=50051,
+                address=f"192.168.1.{100 + i}:50051",
                 pid=1000 + i,
                 version="1.0.0",
                 tags=frozenset(["test"]),
@@ -1716,8 +1702,7 @@ class TestWorkerProxyProperties:
         workers = [
             WorkerMetadata(
                 uid=uuid.uuid4(),
-                host=f"192.168.1.{100 + i}",
-                port=50051 + i,
+                address=f"192.168.1.{100 + i}:{50051 + i}",
                 pid=1000 + i,
                 version="1.0.0",
             )
