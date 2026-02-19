@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from functools import partial
 from typing import TYPE_CHECKING
 from typing import AsyncContextManager
 from typing import AsyncGenerator
@@ -24,7 +23,6 @@ from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.typing import Factory
 from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.connection import WorkerConnection
@@ -62,38 +60,6 @@ class ReducibleAsyncIterator(Generic[T]):
     def __reduce__(self) -> tuple:
         """Return constructor args for unpickling."""
         return (self.__class__, (self._items,))
-
-
-async def connection_factory(
-    target: str, credentials: ChannelCredentialsType = None
-) -> WorkerConnection:
-    """Factory function for creating worker connections.
-
-    Creates a connection to the specified worker target.
-    The target is passed as the key from ResourcePool.
-
-    :param target:
-        The network target (host:port) to create a channel for.
-    :param credentials:
-        Optional channel credentials for TLS/mTLS.
-    :returns:
-        A new connection to the target.
-    """
-    return WorkerConnection(target, credentials=credentials)
-
-
-async def connection_finalizer(connection: WorkerConnection) -> None:
-    """Finalizer function for gRPC channels.
-
-    Closes the gRPC connection when it's being cleaned up from the resource pool.
-
-    :param connection:
-        The gRPC connection to close.
-    """
-    try:
-        await connection.close()
-    except Exception:
-        pass
 
 
 WorkerUri: TypeAlias = str
@@ -347,11 +313,6 @@ class WorkerProxy:
             raise ValueError
 
         self._proxy_token = wool.__proxy__.set(self)
-        # Create connection factory with credentials bound
-        factory = partial(connection_factory, credentials=self._credentials)
-        self._connection_pool = ResourcePool(
-            factory=factory, finalizer=connection_finalizer, ttl=60
-        )
         self._loadbalancer_context = LoadBalancerContext()
         self._sentinel_task = asyncio.create_task(self._worker_sentinel())
         self._started = True
@@ -376,7 +337,6 @@ class WorkerProxy:
             except asyncio.CancelledError:
                 pass
             self._sentinel_task = None
-        await self._connection_pool.clear()
         self._loadbalancer_context = None
         self._started = False
 
@@ -465,19 +425,19 @@ class WorkerProxy:
         async for event in self._discovery_stream:
             match event.type:
                 case "worker-added":
-                    # Use default argument to capture metadata by value, not reference
                     self._loadbalancer_context.add_worker(
                         event.metadata,
-                        lambda m=event.metadata: self._connection_pool.get(
-                            m.address,
+                        WorkerConnection(
+                            event.metadata.address,
+                            credentials=self._credentials,
                         ),
                     )
                 case "worker-updated":
-                    # Use default argument to capture metadata by value, not reference
                     self._loadbalancer_context.update_worker(
                         event.metadata,
-                        lambda m=event.metadata: self._connection_pool.get(
-                            m.address,
+                        WorkerConnection(
+                            event.metadata.address,
+                            credentials=self._credentials,
                         ),
                     )
                 case "worker-dropped":

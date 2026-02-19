@@ -17,7 +17,6 @@ from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.event import AsyncEventHandler
-from wool.runtime.loadbalancer.base import ConnectionResourceFactory
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
@@ -66,7 +65,6 @@ __all__ = [
     # Context
     "RuntimeContext",
     # Load balancing
-    "ConnectionResourceFactory",
     "LoadBalancerContextLike",
     "LoadBalancerLike",
     "NoWorkersAvailable",
