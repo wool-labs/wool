@@ -1,0 +1,25 @@
+name: CI/CD
+description: Propose a CI/CD pipeline change.
+labels: ["cicd"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What CI/CD change is needed?
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this change needed? What does it improve?
+    validations:
+      required: true
+  - type: textarea
+    id: affected-code
+    attributes:
+      label: Affected code
+      description: Which workflows, pipelines, or config files are affected?
+    validations:
+      required: false
