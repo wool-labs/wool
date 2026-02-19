@@ -396,9 +396,7 @@ class TaskEventHandler(Protocol):
     Protocol for :py:class:`TaskEvent` callback functions.
     """
 
-    def __call__(
-        self, event: TaskEvent, timestamp: Timestamp, context=None
-    ) -> None: ...
+    def __call__(self, event: TaskEvent, timestamp: Timestamp, context=None) -> None: ...
 
 
 _current_task: ContextVar[Task | None] = ContextVar("_current_task", default=None)

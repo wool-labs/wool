@@ -35,8 +35,7 @@ def metadata():
     """
     return WorkerMetadata(
         uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
-        host="localhost",
-        port=50051,
+        address="localhost:50051",
         pid=12345,
         version="1.0.0",
     )
@@ -728,7 +727,7 @@ class TestLocalDiscovery:
         discovery = LocalDiscovery(namespace)
 
         def predicate(w):
-            return w.port == 50051
+            return w.address == "localhost:50051"
 
         SubscriberSpy = mocker.spy(LocalDiscovery, "Subscriber")
 
@@ -755,7 +754,7 @@ class TestLocalDiscovery:
         SubscriberClass = LocalDiscovery.Subscriber
 
         def predicate(w):
-            return w.port == 50051
+            return w.address.endswith(":50051")
 
         discovery = LocalDiscovery(namespace, filter=predicate)
         SubscriberSpy = mocker.spy(LocalDiscovery, "Subscriber")
@@ -781,7 +780,7 @@ class TestLocalDiscovery:
         SubscriberClass = LocalDiscovery.Subscriber
 
         def predicate(w):
-            return w.port == 50051
+            return w.address.endswith(":50051")
 
         discovery = LocalDiscovery(namespace, filter=predicate)
         SubscriberSpy = mocker.spy(LocalDiscovery, "Subscriber")
@@ -973,8 +972,7 @@ class TestLocalDiscoveryPublisher:
                 # Act - update worker with new version
                 updated_worker = WorkerMetadata(
                     uid=metadata.uid,  # Same UID
-                    host="newhost",
-                    port=9999,
+                    address="newhost:9999",
                     pid=99999,
                     version="2.0.0",
                 )
@@ -1004,10 +1002,10 @@ class TestLocalDiscoveryPublisher:
         namespace_b = f"test-ns-b-{uuid.uuid4()}"
 
         worker_a = WorkerMetadata(
-            uid=uuid.uuid4(), host="host-a", port=5001, pid=111, version="1.0"
+            uid=uuid.uuid4(), address="host-a:5001", pid=111, version="1.0"
         )
         worker_b = WorkerMetadata(
-            uid=uuid.uuid4(), host="host-b", port=5002, pid=222, version="1.0"
+            uid=uuid.uuid4(), address="host-b:5002", pid=222, version="1.0"
         )
 
         # Create address spaces for both namespaces
@@ -1076,8 +1074,7 @@ class TestLocalDiscoveryPublisher:
         workers = [
             WorkerMetadata(
                 uid=uuid.uuid4(),
-                host=f"host-{i}",
-                port=5000 + i,
+                address=f"host-{i}:{5000 + i}",
                 pid=100 + i,
                 version="1.0",
             )
@@ -1139,8 +1136,7 @@ class TestLocalDiscoveryPublisher:
         workers = [
             WorkerMetadata(
                 uid=uuid.uuid4(),
-                host=f"host{i}",
-                port=5000 + i,
+                address=f"host{i}:{5000 + i}",
                 pid=100 + i,
                 version="1.0",
             )
@@ -1193,7 +1189,7 @@ class TestLocalDiscoveryPublisher:
             address_space.buf[i : i + 16] = NULL_REF
 
         worker = WorkerMetadata(
-            uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
+            uid=uuid.uuid4(), address="test-host:50051", pid=12345, version="1.0"
         )
 
         publisher = LocalDiscovery.Publisher(namespace)
@@ -1233,7 +1229,7 @@ class TestLocalDiscoveryPublisher:
         """
         # Arrange
         worker = WorkerMetadata(
-            uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
+            uid=uuid.uuid4(), address="test-host:50051", pid=12345, version="1.0"
         )
 
         publisher = LocalDiscovery.Publisher(namespace)
@@ -1277,7 +1273,7 @@ class TestLocalDiscoveryPublisher:
             address_space.buf[i : i + 16] = NULL_REF
 
         worker = WorkerMetadata(
-            uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
+            uid=uuid.uuid4(), address="test-host:50051", pid=12345, version="1.0"
         )
 
         publisher = LocalDiscovery.Publisher(namespace)
@@ -1347,7 +1343,7 @@ class TestLocalDiscoveryPublisher:
             address_space.buf[i : i + 16] = NULL_REF
 
         worker = WorkerMetadata(
-            uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
+            uid=uuid.uuid4(), address="test-host:50051", pid=12345, version="1.0"
         )
 
         publisher = LocalDiscovery.Publisher(namespace)
@@ -1395,7 +1391,7 @@ class TestLocalDiscoveryPublisher:
             address_space.buf[i : i + 16] = NULL_REF
 
         worker = WorkerMetadata(
-            uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
+            uid=uuid.uuid4(), address="test-host:50051", pid=12345, version="1.0"
         )
 
         # Mock atexit.register to capture the cleanup function
@@ -1454,7 +1450,7 @@ class TestLocalDiscoveryPublisher:
             address_space.buf[i : i + 16] = NULL_REF
 
         worker = WorkerMetadata(
-            uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
+            uid=uuid.uuid4(), address="test-host:50051", pid=12345, version="1.0"
         )
 
         publisher = LocalDiscovery.Publisher(namespace)
@@ -1491,8 +1487,7 @@ class TestLocalDiscoveryPublisher:
         # Create initial worker
         initial_worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="initial-host",
-            port=50051,
+            address="initial-host:50051",
             pid=12345,
             version="1.0",
             tags=frozenset(["initial"]),
@@ -1501,8 +1496,7 @@ class TestLocalDiscoveryPublisher:
         # Create updated worker with same UID
         updated_worker = WorkerMetadata(
             uid=initial_worker.uid,
-            host="updated-host",
-            port=60061,
+            address="updated-host:60061",
             pid=99999,
             version="2.0",
             tags=frozenset(["updated"]),
@@ -1562,8 +1556,7 @@ class TestLocalDiscoveryPublisher:
                 # Assert the worker's prior state was restored
                 assert len(events) == 1
                 discovered_worker = events[0].metadata
-                assert discovered_worker.host == "initial-host"
-                assert discovered_worker.port == 50051
+                assert discovered_worker.address == "initial-host:50051"
                 assert discovered_worker.version == "1.0"
                 assert discovered_worker.tags == frozenset(["initial"])
         finally:
@@ -1652,14 +1645,14 @@ class TestLocalDiscoverySubscriber:
             address_space.buf[i : i + 16] = NULL_REF
 
         worker_match = WorkerMetadata(
-            uid=uuid.uuid4(), host="host1", port=50051, pid=111, version="1.0"
+            uid=uuid.uuid4(), address="host1:50051", pid=111, version="1.0"
         )
         worker_no_match = WorkerMetadata(
-            uid=uuid.uuid4(), host="host2", port=9999, pid=222, version="1.0"
+            uid=uuid.uuid4(), address="host2:9999", pid=222, version="1.0"
         )
 
         def filter_fn(w):
-            return w.port == 50051
+            return w.address == "host1:50051"
 
         publisher = LocalDiscovery.Publisher(namespace)
         subscriber = LocalDiscovery.Subscriber(
@@ -1702,7 +1695,7 @@ class TestLocalDiscoverySubscriber:
 
                 # Assert - only matching worker should appear
                 assert len(events) >= 1
-                assert all(e.metadata.port == 50051 for e in events)
+                assert all(e.metadata.address == "host1:50051" for e in events)
         finally:
             address_space.close()
             address_space.unlink()
@@ -1723,8 +1716,8 @@ class TestLocalDiscoverySubscriber:
             LocalDiscovery.Subscriber(namespace, poll_interval=-1.0)
 
     @given(
-        matching_port=st.integers(min_value=1, max_value=65535),
-        non_matching_port=st.integers(min_value=1, max_value=65535),
+        matching_address=st.from_regex(r"^host:[0-9]{1,5}$", fullmatch=True),
+        non_matching_address=st.from_regex(r"^other:[0-9]{1,5}$", fullmatch=True),
     )
     @settings(
         max_examples=10,
@@ -1733,7 +1726,7 @@ class TestLocalDiscoverySubscriber:
     )
     @pytest.mark.asyncio
     async def test_subscriber_pickle_round_trip(
-        self, namespace, matching_port, non_matching_port
+        self, namespace, matching_address, non_matching_address
     ):
         """Test Subscriber can be pickled and unpickled with cloudpickle.
 
@@ -1744,10 +1737,6 @@ class TestLocalDiscoverySubscriber:
         Then:
             Unpickled subscriber should work correctly with same filter
         """
-        # Skip if ports are the same (we need different ports for the test)
-        if matching_port == non_matching_port:
-            return
-
         # Arrange
         abbreviated_namespace = _short_hash(namespace)
         address_space = SharedMemory(name=abbreviated_namespace, create=True, size=1024)
@@ -1756,7 +1745,7 @@ class TestLocalDiscoverySubscriber:
             address_space.buf[i : i + 16] = NULL_REF
 
         def filter_func(w):
-            return w.port == matching_port
+            return w.address == matching_address
 
         subscriber = LocalDiscovery.Subscriber(
             namespace, filter=filter_func, poll_interval=0.05
@@ -1768,15 +1757,13 @@ class TestLocalDiscoverySubscriber:
 
         matching_worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="test",
-            port=matching_port,
+            address=matching_address,
             pid=123,
             version="1.0",
         )
         non_matching_worker = WorkerMetadata(
             uid=uuid.uuid4(),
-            host="test",
-            port=non_matching_port,
+            address=non_matching_address,
             pid=456,
             version="1.0",
         )
@@ -1812,7 +1799,7 @@ class TestLocalDiscoverySubscriber:
 
                 # Assert - should only receive matching worker
                 assert len(events) == 1
-                assert events[0].metadata.port == matching_port
+                assert events[0].metadata.address == matching_address
                 assert events[0].metadata.uid == matching_worker.uid
         finally:
             address_space.close()
@@ -1837,7 +1824,7 @@ class TestLocalDiscoverySubscriber:
             address_space.buf[i : i + 16] = NULL_REF
 
         worker = WorkerMetadata(
-            uid=uuid.uuid4(), host="test-host", port=50051, pid=12345, version="1.0"
+            uid=uuid.uuid4(), address="test-host:50051", pid=12345, version="1.0"
         )
 
         publisher = LocalDiscovery.Publisher(namespace)

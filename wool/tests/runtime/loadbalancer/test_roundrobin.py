@@ -95,8 +95,7 @@ class TestRoundRobinLoadBalancer:
             mock_connection.dispatch = mocker.AsyncMock()
             metadata = WorkerMetadata(
                 uid=uuid4(),
-                host="localhost",
-                port=50051,
+                address="localhost:50051",
                 pid=1000 + i,
                 version="1.0.0",
             )
@@ -228,8 +227,7 @@ class TestRoundRobinLoadBalancer:
             mock_connection.dispatch = mocker.AsyncMock()
             metadata = WorkerMetadata(
                 uid=uuid4(),
-                host="localhost",
-                port=50051,
+                address="localhost:50051",
                 pid=1000 + i,
                 version="1.0.0",
             )
@@ -338,8 +336,7 @@ class TestRoundRobinLoadBalancer:
             mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
             metadata = WorkerMetadata(
                 uid=uuid4(),
-                host="localhost",
-                port=50051 + i,
+                address=f"localhost:{50051 + i}",
                 pid=1000 + i,
                 version="1.0.0",
             )
@@ -347,7 +344,7 @@ class TestRoundRobinLoadBalancer:
             # Create dispatch function that tracks which worker received it
             async def dispatch_fn(task, *, timeout=None, m=metadata):
                 workers_that_received_dispatch.append(m)
-                return f"result-{m.port}"
+                return f"result-{m.address}"
 
             mock_connection.dispatch = mocker.AsyncMock(side_effect=dispatch_fn)
             mock_workers[metadata] = mock_connection
@@ -382,7 +379,7 @@ class TestRoundRobinLoadBalancer:
         unique_workers = set(w.uid for w in workers_that_received_dispatch)
         assert len(unique_workers) == 4, (
             f"Expected 4 unique workers, got {len(unique_workers)}. "
-            f"Workers used: {[w.port for w in workers_that_received_dispatch]}"
+            f"Workers used: {[w.address for w in workers_that_received_dispatch]}"
         )
 
     @pytest.mark.asyncio
@@ -410,8 +407,7 @@ class TestRoundRobinLoadBalancer:
         mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
         metadata = WorkerMetadata(
             uid=uuid4(),
-            host="localhost",
-            port=50051,
+            address="localhost:50051",
             pid=1000,
             version="1.0.0",
         )
@@ -481,8 +477,7 @@ class TestRoundRobinLoadBalancer:
         mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
         metadata = WorkerMetadata(
             uid=uuid4(),
-            host="localhost",
-            port=50051,
+            address="localhost:50051",
             pid=1000,
             version="1.0.0",
         )
@@ -553,8 +548,7 @@ class TestRoundRobinLoadBalancer:
             mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
             metadata = WorkerMetadata(
                 uid=uuid4(),
-                host="localhost",
-                port=50051 + i,
+                address=f"localhost:{50051 + i}",
                 pid=1000 + i,
                 version="1.0.0",
             )
@@ -621,8 +615,7 @@ class TestRoundRobinLoadBalancer:
             mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
             metadata = WorkerMetadata(
                 uid=uuid4(),
-                host="localhost",
-                port=50051 + i,
+                address=f"localhost:{50051 + i}",
                 pid=1000 + i,
                 version="1.0.0",
             )
@@ -636,7 +629,7 @@ class TestRoundRobinLoadBalancer:
                     all_dispatches_queued.set()
                 # Wait until signaled to proceed
                 await proceed_with_dispatch.wait()
-                return f"result-{m.port}"
+                return f"result-{m.address}"
 
             mock_connection.dispatch = mocker.AsyncMock(side_effect=dispatch_fn)
             mock_workers[metadata] = mock_connection
