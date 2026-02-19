@@ -132,8 +132,8 @@ class WorkerProxy:
     .. code-block:: python
 
         workers = [
-            WorkerMetadata(host="10.0.0.1", port=50051, ...),
-            WorkerMetadata(host="10.0.0.2", port=50051, ...),
+            WorkerMetadata(address="10.0.0.1:50051", ...),
+            WorkerMetadata(address="10.0.0.2:50051", ...),
         ]
         async with WorkerProxy(workers=workers) as proxy:
             result = await task()
@@ -469,7 +469,7 @@ class WorkerProxy:
                     self._loadbalancer_context.add_worker(
                         event.metadata,
                         lambda m=event.metadata: self._connection_pool.get(
-                            f"{m.host}:{m.port}",
+                            m.address,
                         ),
                     )
                 case "worker-updated":
@@ -477,7 +477,7 @@ class WorkerProxy:
                     self._loadbalancer_context.update_worker(
                         event.metadata,
                         lambda m=event.metadata: self._connection_pool.get(
-                            f"{m.host}:{m.port}",
+                            m.address,
                         ),
                     )
                 case "worker-dropped":

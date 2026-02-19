@@ -35,26 +35,23 @@ message WorkerMetadata {
     // Unique identifier for the worker instance
     string uid = 1;
 
-    // Network host address where the worker is accessible
-    string host = 2;
-
-    // Network port number where the worker is listening (0 if not set)
-    int32 port = 3;
+    // gRPC target address (e.g. "host:port", "unix:path")
+    string address = 2;
 
     // Process ID of the worker
-    int32 pid = 4;
+    int32 pid = 3;
 
     // Version string of the worker software
-    string version = 5;
+    string version = 4;
 
     // Capability tags for worker filtering and selection
-    repeated string tags = 6;
+    repeated string tags = 5;
 
     // Additional arbitrary metadata as key-value pairs
-    map<string, string> extra = 7;
+    map<string, string> extra = 6;
 
     // Whether the worker requires secure TLS/mTLS connections
-    bool secure = 8;
+    bool secure = 7;
 }
 
 message Void {}

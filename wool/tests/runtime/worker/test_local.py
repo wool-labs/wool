@@ -26,8 +26,6 @@ class TestLocalWorker:
         """
         worker = LocalWorker()
         assert worker.address is None
-        assert worker.host is None
-        assert worker.port is None
 
     def test_init_with_custom_host_and_port(self):
         """Test LocalWorker initialization with custom host and port.
@@ -40,7 +38,7 @@ class TestLocalWorker:
             It should initialize successfully
         """
         worker = LocalWorker(host="0.0.0.0", port=50051)
-        # Before start, address/host/port are None or reflect unstarted state
+        # Before start, address is None and metadata is not yet available
         assert worker.metadata is None
 
     def test_init_with_tags(self, worker_tags):
@@ -114,32 +112,6 @@ class TestLocalWorker:
         worker = LocalWorker()
         assert worker.address is None
 
-    def test_host_returns_none_before_start(self):
-        """Test host property returns None before worker is started.
-
-        Given:
-            A LocalWorker that has not been started
-        When:
-            The host property is accessed
-        Then:
-            It should return None
-        """
-        worker = LocalWorker()
-        assert worker.host is None
-
-    def test_port_returns_none_before_start(self):
-        """Test port property returns None before worker is started.
-
-        Given:
-            A LocalWorker that has not been started
-        When:
-            The port property is accessed
-        Then:
-            It should return None
-        """
-        worker = LocalWorker()
-        assert worker.port is None
-
     @pytest.mark.asyncio
     async def test_address_returns_value_after_start(self, mocker):
         """Test address property returns value after worker is started.
@@ -163,54 +135,6 @@ class TestLocalWorker:
         worker = LocalWorker()
         await worker.start()
         assert worker.address == "127.0.0.1:50051"
-
-    @pytest.mark.asyncio
-    async def test_host_returns_value_after_start(self, mocker):
-        """Test host property returns value after worker is started.
-
-        Given:
-            A LocalWorker that has been started
-        When:
-            The host property is accessed
-        Then:
-            It should return the host from WorkerMetadata
-        """
-        mock_process = mocker.MagicMock(spec=WorkerProcess)
-        mock_process.address = "192.168.1.100:50051"
-        mock_process.pid = 12345
-        mock_process.start.return_value = None
-
-        mocker.patch(
-            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
-        )
-
-        worker = LocalWorker()
-        await worker.start()
-        assert worker.host == "192.168.1.100"
-
-    @pytest.mark.asyncio
-    async def test_port_returns_value_after_start(self, mocker):
-        """Test port property returns value after worker is started.
-
-        Given:
-            A LocalWorker that has been started
-        When:
-            The port property is accessed
-        Then:
-            It should return the port from WorkerMetadata
-        """
-        mock_process = mocker.MagicMock(spec=WorkerProcess)
-        mock_process.address = "127.0.0.1:8080"
-        mock_process.pid = 12345
-        mock_process.start.return_value = None
-
-        mocker.patch(
-            "wool.runtime.worker.local.WorkerProcess", return_value=mock_process
-        )
-
-        worker = LocalWorker()
-        await worker.start()
-        assert worker.port == 8080
 
     @pytest.mark.asyncio
     async def test_start_calls_worker_process_start(self, mocker):
@@ -261,8 +185,7 @@ class TestLocalWorker:
 
         assert worker.metadata is not None
         assert worker.metadata.uid == worker.uid
-        assert worker.metadata.host == "192.168.1.100"
-        assert worker.metadata.port == 50051
+        assert worker.metadata.address == "192.168.1.100:50051"
         assert worker.metadata.pid == 12345
         assert "gpu" in worker.metadata.tags
         assert "ml" in worker.metadata.tags
@@ -339,8 +262,7 @@ class TestLocalWorker:
         worker = LocalWorker()
         await worker.start()
 
-        assert worker.host == "0.0.0.0"
-        assert worker.port == 8080
+        assert worker.address == "0.0.0.0:8080"
 
     @pytest.mark.asyncio
     async def test_stop_sends_grpc_stop_request(self, mocker):

@@ -34,16 +34,16 @@ class WorkerMetadata:
 
     :param uid:
         Unique identifier for the worker instance (UUID).
-    :param host:
-        Network host address where the worker is accessible.
-    :param port:
-        Network port number where the worker is listening.
+    :param address:
+        gRPC target address (e.g. ``"host:port"``,
+        ``"unix:path"``).
     :param pid:
         Process ID of the worker.
     :param version:
         Version string of the worker software.
     :param tags:
-        Frozenset of capability tags for worker filtering and selection.
+        Frozenset of capability tags for worker filtering and
+        selection.
     :param extra:
         Additional arbitrary metadata as immutable key-value pairs.
     :param secure:
@@ -51,8 +51,7 @@ class WorkerMetadata:
     """
 
     uid: uuid.UUID
-    host: str = field(hash=False)
-    port: int | None = field(hash=False)
+    address: str = field(hash=False)
     pid: int = field(hash=False)
     version: str = field(hash=False)
     tags: frozenset[str] = field(default_factory=frozenset, hash=False)
@@ -75,8 +74,7 @@ class WorkerMetadata:
 
         return cls(
             uid=uuid.UUID(protobuf.uid),
-            host=protobuf.host,
-            port=protobuf.port if protobuf.port != 0 else None,
+            address=protobuf.address,
             pid=protobuf.pid,
             version=protobuf.version,
             tags=frozenset(protobuf.tags),
@@ -93,8 +91,7 @@ class WorkerMetadata:
 
         return WorkerMetadataProtobuf(
             uid=str(self.uid),
-            host=self.host,
-            port=self.port if self.port is not None else 0,
+            address=self.address,
             pid=self.pid,
             version=self.version,
             tags=list(self.tags),
