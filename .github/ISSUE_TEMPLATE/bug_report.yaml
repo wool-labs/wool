@@ -1,0 +1,25 @@
+name: Bug Report
+description: Report something that isn't working correctly.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is the bug? Include steps to reproduce if applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: root-cause
+    attributes:
+      label: Root cause
+      description: What is causing the bug? Include relevant code snippets.
+    validations:
+      required: true
+  - type: textarea
+    id: affected-code
+    attributes:
+      label: Affected code
+      description: Which files, modules, or components are affected?
+    validations:
+      required: false
