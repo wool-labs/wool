@@ -196,7 +196,7 @@ Worker subprocesses can dispatch tasks to other workers. Each subprocess is conf
 
 ### Connection pooling
 
-`WorkerConnection` maintains a persistent gRPC channel per worker with semaphore-based concurrency limiting (default 100 concurrent dispatches). Connections are managed by a `ResourcePool` with TTL-based caching (60 seconds) — idle connections are finalized after the TTL expires.
+`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, limit)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Each channel enforces semaphore-based concurrency limiting (default 100 concurrent dispatches).
 
 ### Error classification
 
