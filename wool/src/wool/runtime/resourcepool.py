@@ -253,7 +253,10 @@ class ResourcePool(Generic[T]):
                             pass
                     else:
                         # Different event loop - cancel from correct loop, don't await
-                        task_loop.call_soon_threadsafe(entry.cleanup.cancel)
+                        try:
+                            task_loop.call_soon_threadsafe(entry.cleanup.cancel)
+                        except RuntimeError:
+                            pass
                     entry.cleanup = None
 
                 return entry.obj
@@ -358,7 +361,10 @@ class ResourcePool(Generic[T]):
                 else:
                     # Different event loop (e.g., task created in worker thread)
                     # Cancel from the correct loop, don't await cross-loop
-                    task_loop.call_soon_threadsafe(entry.cleanup.cancel)
+                    try:
+                        task_loop.call_soon_threadsafe(entry.cleanup.cancel)
+                    except RuntimeError:
+                        pass
         finally:
             # Call finalizer
             if self._finalizer:
