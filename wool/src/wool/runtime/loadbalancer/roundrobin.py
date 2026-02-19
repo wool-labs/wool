@@ -69,7 +69,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                 if self._index[context] >= len(context.workers):
                     self._index[context] = 0
 
-                metadata, connection_resource_factory = next(
+                metadata, connection = next(
                     itertools.islice(
                         context.workers.items(),
                         self._index[context],
@@ -82,19 +82,18 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                 elif metadata.uid == checkpoint:
                     break
 
-                async with connection_resource_factory() as connection:
-                    try:
-                        stream = await connection.dispatch(task, timeout=timeout)
-                    except TransientRpcError:
-                        self._index[context] = self._index[context] + 1
-                        continue
-                    except Exception:
-                        context.remove_worker(metadata)
-                        if metadata.uid == checkpoint:
-                            checkpoint = None
-                        continue
-                    else:
-                        self._index[context] = self._index[context] + 1
-                        return stream
+                try:
+                    stream = await connection.dispatch(task, timeout=timeout)
+                except TransientRpcError:
+                    self._index[context] = self._index[context] + 1
+                    continue
+                except Exception:
+                    context.remove_worker(metadata)
+                    if metadata.uid == checkpoint:
+                        checkpoint = None
+                    continue
+                else:
+                    self._index[context] = self._index[context] + 1
+                    return stream
 
         raise NoWorkersAvailable("No healthy workers available for dispatch")

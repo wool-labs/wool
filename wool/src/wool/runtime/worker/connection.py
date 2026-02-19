@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import AsyncIterator
 from typing import Final
 from typing import Generic
@@ -11,6 +12,7 @@ import cloudpickle
 import grpc.aio
 
 from wool.runtime import protobuf as pb
+from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.base import resolve_channel_credentials
@@ -18,6 +20,50 @@ from wool.runtime.worker.base import resolve_channel_credentials
 _DispatchCall: TypeAlias = grpc.aio.UnaryStreamCall[pb.task.Task, pb.worker.Response]
 
 _T = TypeVar("_T")
+
+
+@dataclass
+class _Channel:
+    """Internal holder for a pooled gRPC channel and its resources."""
+
+    channel: grpc.aio.Channel
+    stub: pb.worker.WorkerStub
+    semaphore: asyncio.Semaphore
+
+
+def _channel_factory(key):
+    """Create a new :class:`_Channel` for the given pool key.
+
+    :param key:
+        Tuple of ``(target, credentials, limit)``.
+    :returns:
+        A new :class:`_Channel` instance.
+    """
+    target, credentials, limit = key
+    resolved = resolve_channel_credentials(credentials)
+    options = [
+        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+    ]
+    if resolved is not None:
+        ch = grpc.aio.secure_channel(target, resolved, options=options)
+    else:
+        ch = grpc.aio.insecure_channel(target, options=options)
+    return _Channel(ch, pb.worker.WorkerStub(ch), asyncio.Semaphore(limit))
+
+
+async def _channel_finalizer(ch: _Channel):
+    """Close the gRPC channel held by a :class:`_Channel`.
+
+    :param ch:
+        The :class:`_Channel` to finalize.
+    """
+    await ch.channel.close()
+
+
+_channel_pool: ResourcePool[_Channel] = ResourcePool(
+    factory=_channel_factory, finalizer=_channel_finalizer, ttl=60
+)
 
 
 class _DispatchStream(Generic[_T]):
@@ -155,11 +201,11 @@ class RpcError(Exception):
         self.details = details
         if code is not None and details is not None:
             super().__init__(f"{code.name}: {details}")
-        elif code is not None:
+        elif code is not None:  # pragma: no cover
             super().__init__(code.name)
-        elif details is not None:
+        elif details is not None:  # pragma: no cover
             super().__init__(details)
-        else:
+        else:  # pragma: no cover
             super().__init__()
 
 
@@ -180,9 +226,12 @@ class TransientRpcError(RpcError):
 class WorkerConnection:
     """gRPC connection to a worker for task dispatch.
 
-    Maintains a persistent channel to a worker with concurrency limiting.
-    Handles connection lifecycle and error classification (transient vs
-    permanent failures).
+    Acquires pooled gRPC channels keyed by ``(target, credentials,
+    limit)``.  Each :meth:`dispatch` call obtains a reference-counted
+    channel from the module-level pool, primes an async generator that
+    holds its own reference, then releases the dispatch-scope reference.
+    The channel stays alive until the caller finishes consuming the
+    result stream.
 
     **Usage:**
 
@@ -225,25 +274,10 @@ class WorkerConnection:
         if limit <= 0:
             raise ValueError("Limit must be positive")
 
-        # Resolve credentials (if callable)
-        resolved_credentials = resolve_channel_credentials(credentials)
-
-        # Create channel options
-        options = [
-            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-        ]
-
-        # Create secure or insecure channel based on credentials
-        if resolved_credentials is not None:
-            self._channel = grpc.aio.secure_channel(
-                target, resolved_credentials, options=options
-            )
-        else:
-            self._channel = grpc.aio.insecure_channel(target, options=options)
-
-        self._stub = pb.worker.WorkerStub(self._channel)
-        self._semaphore = asyncio.Semaphore(limit)
+        self._target = target
+        self._credentials = credentials
+        self._limit = limit
+        self._key = (target, credentials, limit)
 
     async def dispatch(
         self,
@@ -281,31 +315,44 @@ class WorkerConnection:
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
 
+        ch = await _channel_pool.acquire(self._key)
         try:
-            call = await self._dispatch(task, timeout)
-        except grpc.RpcError as error:
-            code = error.code()
-            details = error.details() or str(error)
-            if code in self.TRANSIENT_ERRORS:
-                raise TransientRpcError(code, details) from error
-            else:
-                raise RpcError(code, details) from error
+            try:
+                call = await self._dispatch(ch, task, timeout)
+            except grpc.RpcError as error:
+                code = error.code()
+                details = error.details() or str(error)
+                if code in self.TRANSIENT_ERRORS:
+                    raise TransientRpcError(code, details) from error
+                else:
+                    raise RpcError(code, details) from error
 
-        return self._execute(call)
+            gen = self._execute(call)
+            await gen.__anext__()  # Prime: _execute acquires its own ref
+        except BaseException:
+            await _channel_pool.release(self._key)
+            raise
+
+        await _channel_pool.release(self._key)
+        return gen
 
     async def close(self):
-        """Close the connection and release all resources.
+        """Close the connection and release all pooled resources.
 
-        Gracefully closes the underlying gRPC channel to the remote
-        worker and cleans up any associated resources.
+        Clears the pooled channel entry for this connection's key.
+        Idempotent: safe to call multiple times or on connections
+        that were never used.
         """
-        await self._channel.close()
+        try:
+            await _channel_pool.clear(self._key)
+        except KeyError:
+            pass
 
-    async def _dispatch(self, task, timeout):
+    async def _dispatch(self, ch, task, timeout):
         async with asyncio.timeout(timeout):
-            await self._semaphore.acquire()
+            await ch.semaphore.acquire()
             try:
-                call: _DispatchCall = self._stub.dispatch(task.to_protobuf())
+                call: _DispatchCall = ch.stub.dispatch(task.to_protobuf())
                 try:
                     response = await anext(aiter(call))
                     if not response.HasField("ack"):
@@ -320,20 +367,25 @@ class WorkerConnection:
                         pass
                     raise
             except (Exception, asyncio.CancelledError):
-                self._semaphore.release()
+                ch.semaphore.release()
                 raise
         return call
 
     async def _execute(self, call):
-        stream = _DispatchStream(call)
+        ch = await _channel_pool.acquire(self._key)
         try:
-            async for result in stream:
-                yield result
-        except (Exception, GeneratorExit, asyncio.CancelledError):
+            yield  # Priming yield — signals dispatch() that ref is held
+            stream = _DispatchStream(call)
             try:
-                await stream.aclose()
-            except Exception:
-                pass
-            raise
+                async for result in stream:
+                    yield result
+            except (Exception, GeneratorExit, asyncio.CancelledError):
+                try:
+                    await stream.aclose()
+                except Exception:  # pragma: no cover
+                    pass
+                raise
+            finally:
+                ch.semaphore.release()
         finally:
-            self._semaphore.release()
+            await _channel_pool.release(self._key)
