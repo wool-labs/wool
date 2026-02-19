@@ -598,7 +598,7 @@ class TestWorkerPool:
         """
         # Arrange
         mock_local_worker.metadata.uid = "worker-123"
-        mock_local_worker.metadata.port = 50051
+        mock_local_worker.metadata.address = "localhost:50051"
 
         # Act
         async with WorkerPool(size=2) as pool:

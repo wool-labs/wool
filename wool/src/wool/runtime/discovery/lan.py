@@ -185,16 +185,10 @@ class LanDiscovery(Discovery):
                 The worker details to publish.
             :raises RuntimeError:
                 If the publisher is not properly initialized.
-            :raises ValueError:
-                If worker port is not specified.
             """
             assert self.aiozc
 
-            if metadata.port is None:
-                raise ValueError("Worker port must be specified for LAN discovery")
-
-            address = f"{metadata.host}:{metadata.port}"
-            ip_address, port = self._resolve_address(address)
+            ip_address, port = self._resolve_address(metadata.address)
             service_name = f"{metadata.uid}.{self.service_type}"
             service_info = ServiceInfo(
                 self.service_type,
@@ -535,11 +529,11 @@ def _deserialize_metadata(info: ServiceInfo) -> WorkerMetadata:
     service_name = info.name
     uid_str = service_name.split(".")[0]
 
+    ip = info.ip_addresses_by_version(IPVersion.V4Only)[0]
     return WorkerMetadata(
         uid=UUID(uid_str),
+        address=f"{ip}:{info.port}",
         pid=pid,
-        host=str(info.ip_addresses_by_version(IPVersion.V4Only)[0]),
-        port=info.port,
         version=version,
         tags=tags,
         extra=MappingProxyType(extra),

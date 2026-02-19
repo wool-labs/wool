@@ -24,30 +24,17 @@ class ConcreteWorker(Worker):
     def __init__(self, *tags: str, **extra: Any):
         super().__init__(*tags, **extra)
         self._address = None
-        self._host = None
-        self._port = None
 
     @property
     def address(self) -> str | None:
         return self._address
 
-    @property
-    def host(self) -> str | None:
-        return self._host
-
-    @property
-    def port(self) -> int | None:
-        return self._port
-
     async def _start(self, timeout: float | None):
         """Mock start implementation."""
         self._address = "localhost:50051"
-        self._host = "localhost"
-        self._port = 50051
         self._info = WorkerMetadata(
             uid=self._uid,
-            host="localhost",
-            port=50051,
+            address="localhost:50051",
             pid=12345,
             version="1.0.0",
             tags=frozenset(self._tags),
