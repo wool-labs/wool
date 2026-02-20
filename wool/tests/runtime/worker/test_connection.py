@@ -18,7 +18,6 @@ from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
-from wool.runtime.worker.connection import _channel_pool
 
 
 @pytest.fixture
@@ -754,17 +753,21 @@ class TestResourceLifetime:
     async def test_stream_consumption_releases_pool_ref(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """WC-002: consuming the full stream drives ref count to 0.
+        """WC-002: consuming the full stream releases the channel.
 
         Given:
-            A connection that dispatches a single-result task.
+            A connection that dispatches a single-result task with a
+            mock gRPC channel.
         When:
-            The stream is fully consumed.
+            The stream is fully consumed and close() is called.
         Then:
-            The pool reference count for the channel key drops to 0,
-            meaning no dangling references are held.
+            The mock channel's close() is invoked, confirming no
+            dangling pool references prevented finalization.
         """
         # Arrange
+        mock_channel = mocker.AsyncMock()
+        mocker.patch("grpc.aio.insecure_channel", return_value=mock_channel)
+
         responses = (
             pb.worker.Response(ack=pb.worker.Ack()),
             pb.worker.Response(result=pb.task.Result(dump=cloudpickle.dumps("done"))),
@@ -780,28 +783,32 @@ class TestResourceLifetime:
         # Act
         async for _ in await connection.dispatch(sample_task):
             pass
+        await connection.close()
 
-        # Assert — ref count should be 0 (pending cleanup only)
-        key = connection._key
-        # Entry might still be cached (pending TTL cleanup), but no active refs
-        if key in _channel_pool._cache:
-            assert _channel_pool._cache[key].reference_count == 0
+        # Assert
+        mock_channel.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_error_mid_stream_releases_pool_ref(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """WC-003: an error mid-stream releases the pool reference.
+        """WC-003: an error mid-stream releases the channel.
 
         Given:
             A connection that dispatches a task whose stream raises
-            an exception after acknowledgment.
+            an exception after acknowledgment, with a mock gRPC
+            channel.
         When:
-            The caller iterates and hits the exception.
+            The caller iterates, hits the exception, and calls
+            close().
         Then:
-            The pool reference is released despite the error.
+            The mock channel's close() is invoked, confirming the
+            pool reference was released despite the error.
         """
         # Arrange
+        mock_channel = mocker.AsyncMock()
+        mocker.patch("grpc.aio.insecure_channel", return_value=mock_channel)
+
         responses = (
             pb.worker.Response(ack=pb.worker.Ack()),
             pb.worker.Response(
@@ -820,11 +827,10 @@ class TestResourceLifetime:
         with pytest.raises(RuntimeError, match="boom"):
             async for _ in await connection.dispatch(sample_task):
                 pass
+        await connection.close()
 
-        # Assert — ref count should be 0
-        key = connection._key
-        if key in _channel_pool._cache:
-            assert _channel_pool._cache[key].reference_count == 0
+        # Assert
+        mock_channel.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_close_invokes_channel_finalizer(
@@ -833,15 +839,18 @@ class TestResourceLifetime:
         """Test that close() tears down the pooled gRPC channel.
 
         Given:
-            A connection that has dispatched a task, populating the
-            module-level channel pool.
+            A connection that has dispatched a task with a mock gRPC
+            channel, populating the module-level channel pool.
         When:
             close() is called.
         Then:
-            The underlying gRPC channel's close() method is called
-            via the pool finalizer.
+            The mock channel's close() method is called via the pool
+            finalizer.
         """
         # Arrange
+        mock_channel = mocker.AsyncMock()
+        mocker.patch("grpc.aio.insecure_channel", return_value=mock_channel)
+
         responses = (
             pb.worker.Response(ack=pb.worker.Ack()),
             pb.worker.Response(result=pb.task.Result(dump=cloudpickle.dumps("done"))),
@@ -857,15 +866,11 @@ class TestResourceLifetime:
         async for _ in await connection.dispatch(sample_task):
             pass
 
-        # Spy on the pooled channel's close method before clearing
-        channel_obj = _channel_pool._cache[connection._key].obj.channel
-        close_spy = mocker.spy(channel_obj, "close")
-
         # Act
         await connection.close()
 
         # Assert
-        close_spy.assert_called_once()
+        mock_channel.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_two_dispatches_share_one_channel(
