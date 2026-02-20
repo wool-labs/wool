@@ -23,7 +23,6 @@ from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
-from wool.runtime.resourcepool import Resource
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.proxy import WorkerProxy
@@ -92,13 +91,13 @@ def spy_loadbalancer_with_workers(mocker: MockerFixture):
             self._current_index = 0
 
         def worker_added_callback(
-            self, connection: Resource[WorkerConnection], info: WorkerMetadata
+            self, connection: WorkerConnection, info: WorkerMetadata
         ):
             """Add worker to internal storage."""
             self._workers[info] = connection
 
         def worker_updated_callback(
-            self, connection: Resource[WorkerConnection], info: WorkerMetadata
+            self, connection: WorkerConnection, info: WorkerMetadata
         ):
             """Update worker in internal storage."""
             self._workers[info] = connection
@@ -114,9 +113,8 @@ def spy_loadbalancer_with_workers(mocker: MockerFixture):
                 raise NoWorkersAvailable("No workers available for dispatch")
 
             # Simple dispatch to first available worker
-            metadata, worker_resource = next(iter(self._workers.items()))
-            async with worker_resource() as worker:
-                return await worker.dispatch(task)
+            metadata, connection = next(iter(self._workers.items()))
+            return await connection.dispatch(task)
 
     loadbalancer = SpyableLoadBalancer()
 
@@ -181,14 +179,13 @@ def spy_discovery_with_events(mocker: MockerFixture):
 
 
 @pytest.fixture
-def mock_worker_resource(mocker: MockerFixture):
-    """Create a mock worker resource for testing with spy fixtures.
+def mock_worker_connection(mocker: MockerFixture):
+    """Create a mock WorkerConnection for testing with spy fixtures.
 
-    Provides a mock Resource[WorkerConnection] that implements async context
-    manager protocol and returns a worker with dispatch capabilities.
+    Provides a mock :class:`WorkerConnection` with dispatch capabilities
+    for testing worker communication scenarios.
     """
-    # Create mock worker without spec to completely avoid real gRPC calls
-    mock_worker = mocker.MagicMock()
+    mock_connection = mocker.MagicMock(spec=WorkerConnection)
 
     async def mock_dispatch_success(task):
         async def _result_generator():
@@ -196,15 +193,9 @@ def mock_worker_resource(mocker: MockerFixture):
 
         return _result_generator()
 
-    # Replace the dispatch method completely to avoid calling real gRPC code
-    mock_worker.dispatch = mock_dispatch_success
+    mock_connection.dispatch = mock_dispatch_success
 
-    # Create mock resource with async context manager protocol
-    mock_resource = mocker.MagicMock()
-    mock_resource.__aenter__ = mocker.AsyncMock(return_value=mock_worker)
-    mock_resource.__aexit__ = mocker.AsyncMock()
-
-    return mock_resource, mock_worker
+    return mock_connection
 
 
 @pytest.fixture
@@ -862,7 +853,7 @@ class TestWorkerProxy:
         self,
         spy_loadbalancer_with_workers,
         spy_discovery_with_events,
-        mock_worker_resource,
+        mock_worker_connection,
         mock_wool_task,
         mock_proxy_session,
         mocker,
@@ -878,7 +869,6 @@ class TestWorkerProxy:
         """
         # Arrange
         discovery, metadata = spy_discovery_with_events
-        mock_resource, mock_worker = mock_worker_resource
 
         proxy = WorkerProxy(
             discovery=discovery,
@@ -889,7 +879,7 @@ class TestWorkerProxy:
 
         # Add worker through proper loadbalancer callback (simulating discovery)
         spy_loadbalancer_with_workers.worker_added_callback(
-            lambda: mock_resource, metadata
+            mock_worker_connection, metadata
         )
 
         # Act
@@ -928,7 +918,7 @@ class TestWorkerProxy:
         self,
         mocker: MockerFixture,
         spy_discovery_with_events,
-        mock_worker_resource,
+        mock_worker_connection,
         mock_wool_task,
         mock_proxy_session,
     ):
@@ -943,7 +933,6 @@ class TestWorkerProxy:
         """
         # Arrange
         discovery, metadata = spy_discovery_with_events
-        mock_resource, mock_worker = mock_worker_resource
 
         # Create loadbalancer that raises errors during dispatch
         class FailingLoadBalancer:
@@ -970,7 +959,7 @@ class TestWorkerProxy:
         await proxy.start()
 
         # Add worker through proper callback
-        failing_loadbalancer.worker_added_callback(lambda: mock_resource, metadata)
+        failing_loadbalancer.worker_added_callback(mock_worker_connection, metadata)
 
         # Act & Assert
         with pytest.raises(Exception, match="Load balancer error"):
@@ -981,7 +970,6 @@ class TestWorkerProxy:
     async def test_dispatch_waits_for_workers_then_dispatches(
         self,
         mocker: MockerFixture,
-        mock_worker_resource,
         mock_wool_task,
         mock_proxy_session,
     ):
@@ -1002,7 +990,6 @@ class TestWorkerProxy:
         # Create discovery service that will emit worker event
         events = [DiscoveryEvent("worker-added", metadata=metadata)]
         discovery = wp.ReducibleAsyncIterator(events)
-        mock_resource, mock_worker = mock_worker_resource
 
         # Create loadbalancer that tracks workers through callbacks
         class WaitingLoadBalancer:
@@ -1715,56 +1702,6 @@ class TestWorkerProxyProperties:
         # Assert
         assert isinstance(proxy, WorkerProxy)
         assert not proxy.started
-
-
-# ============================================================================
-# Utility Functions Tests
-# ============================================================================
-
-
-class TestUtilityFunctions:
-    """Test utility functions for worker connection management."""
-
-    @pytest.mark.asyncio
-    async def test_client_factory_creates_worker_client(self):
-        """Test return WorkerConnection instance for the address.
-
-        Given:
-            A network address string
-        When:
-            Connection_factory is called
-        Then:
-            It should return WorkerConnection instance for the address
-        """
-        # Arrange
-        address = "127.0.0.1:50051"
-
-        # Act
-        result = await wp.connection_factory(address)
-
-        # Assert
-        assert isinstance(result, wp.WorkerConnection)
-
-    @pytest.mark.asyncio
-    async def test_client_finalizer_handles_stop_exceptions(self, mocker: MockerFixture):
-        """Test handle exception gracefully without propagating.
-
-        Given:
-            A WorkerConnection that raises exception during close
-        When:
-            Connection_finalizer is called
-        Then:
-            It should handle exception gracefully without propagating
-        """
-        # Arrange
-        mock_connection = mocker.MagicMock()
-        mock_connection.close = mocker.AsyncMock(side_effect=Exception("Stop failed"))
-
-        # Act - Should not raise exception
-        await wp.connection_finalizer(mock_connection)
-
-        # Assert
-        mock_connection.close.assert_called_once()
 
 
 # ============================================================================
