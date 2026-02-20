@@ -30,6 +30,10 @@ class _Channel:
     stub: pb.worker.WorkerStub
     semaphore: asyncio.Semaphore
 
+    async def close(self):
+        """Close the underlying gRPC channel."""
+        await self.channel.close()
+
 
 def _channel_factory(key):
     """Create a new :class:`_Channel` for the given pool key.
@@ -46,19 +50,19 @@ def _channel_factory(key):
         ("grpc.max_send_message_length", 100 * 1024 * 1024),
     ]
     if resolved is not None:
-        ch = grpc.aio.secure_channel(target, resolved, options=options)
+        channel = grpc.aio.secure_channel(target, resolved, options=options)
     else:
-        ch = grpc.aio.insecure_channel(target, options=options)
-    return _Channel(ch, pb.worker.WorkerStub(ch), asyncio.Semaphore(limit))
+        channel = grpc.aio.insecure_channel(target, options=options)
+    return _Channel(channel, pb.worker.WorkerStub(channel), asyncio.Semaphore(limit))
 
 
-async def _channel_finalizer(ch: _Channel):
+async def _channel_finalizer(channel: _Channel):
     """Close the gRPC channel held by a :class:`_Channel`.
 
-    :param ch:
+    :param channel:
         The :class:`_Channel` to finalize.
     """
-    await ch.channel.close()
+    await channel.close()
 
 
 _channel_pool: ResourcePool[_Channel] = ResourcePool(
