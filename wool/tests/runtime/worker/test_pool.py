@@ -227,6 +227,100 @@ class TestWorkerPool:
         assert isinstance(pool, WorkerPool)
 
     # =========================================================================
+    # Credential Passing Tests
+    # =========================================================================
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_credentials(
+        self, mocker: MockerFixture, worker_credentials
+    ):
+        """Test factory receives the full WorkerCredentials object.
+
+        Given:
+            A pool constructed with WorkerCredentials
+        When:
+            Factory is called via _worker_context
+        Then:
+            It should receive the full WorkerCredentials, not
+            grpc.ServerCredentials.
+        """
+        # Arrange
+        spy_factory = mocker.MagicMock()
+        mock_worker = mocker.MagicMock()
+        mock_worker.start = mocker.AsyncMock()
+        mock_worker.stop = mocker.AsyncMock()
+        mock_worker.metadata = mocker.MagicMock()
+        spy_factory.return_value = mock_worker
+
+        # Act
+        async with WorkerPool(
+            size=1, worker=spy_factory, credentials=worker_credentials
+        ):
+            pass
+
+        # Assert
+        spy_factory.assert_called_once()
+        _, kwargs = spy_factory.call_args
+        assert kwargs["credentials"] is worker_credentials
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_none_credentials(self, mocker: MockerFixture):
+        """Test factory receives None credentials.
+
+        Given:
+            A pool constructed with credentials=None
+        When:
+            Factory is called via _worker_context
+        Then:
+            It should receive None.
+        """
+        # Arrange
+        spy_factory = mocker.MagicMock()
+        mock_worker = mocker.MagicMock()
+        mock_worker.start = mocker.AsyncMock()
+        mock_worker.stop = mocker.AsyncMock()
+        mock_worker.metadata = mocker.MagicMock()
+        spy_factory.return_value = mock_worker
+
+        # Act
+        async with WorkerPool(size=1, worker=spy_factory, credentials=None):
+            pass
+
+        # Assert
+        spy_factory.assert_called_once()
+        _, kwargs = spy_factory.call_args
+        assert kwargs["credentials"] is None
+
+    @pytest.mark.asyncio
+    async def test_worker_context_default_factory_with_credentials(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+        worker_credentials,
+    ):
+        """Test LocalWorker receives WorkerCredentials from default factory.
+
+        Given:
+            A pool with credentials and the default factory
+        When:
+            A worker is created
+        Then:
+            It should pass WorkerCredentials to LocalWorker.
+        """
+        # Act
+        async with WorkerPool(size=1, credentials=worker_credentials):
+            pass
+
+        # Assert
+        import wool.runtime.worker.pool as wp
+
+        wp.LocalWorker.assert_called()
+        _, kwargs = wp.LocalWorker.call_args
+        assert kwargs["credentials"] is worker_credentials
+
+    # =========================================================================
     # Context Manager Lifecycle Tests
     # =========================================================================
 
@@ -490,7 +584,7 @@ class TestWorkerPool:
             assert pool is not None
 
     @pytest.mark.asyncio
-    async def test_start_with_failing_worker(self, mock_worker_factory):
+    async def test_start_with_failing_worker(self, mocker: MockerFixture):
         """Test the pool starts successfully (failures are captured, not propagated).
 
         Given:
@@ -502,8 +596,13 @@ class TestWorkerPool:
         """
 
         # Arrange
-        def failing_factory(*tags, **kwargs):
-            worker = mock_worker_factory(*tags, should_fail=True, **kwargs)
+        def failing_factory(*tags, credentials=None):
+            worker = mocker.MagicMock()
+            worker.start = mocker.AsyncMock(
+                side_effect=RuntimeError("Mock worker startup failed")
+            )
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = mocker.MagicMock()
             return worker
 
         pool = WorkerPool(worker=failing_factory, size=1)
@@ -633,7 +732,7 @@ class TestWorkerPool:
         custom_worker.stop = mocker.AsyncMock()
         custom_worker.metadata = mocker.MagicMock()
 
-        def custom_factory(*args, **kwargs):
+        def custom_factory(*args, credentials=None):
             return cast(LocalWorker, custom_worker)
 
         # Act
@@ -750,7 +849,7 @@ class TestWorkerPool:
         assert isinstance(pool, WorkerPool)
 
     @pytest.mark.asyncio
-    async def test_timeout_during_worker_startup(self, mock_worker_factory):
+    async def test_timeout_during_worker_startup(self, mocker: MockerFixture):
         """Test the startup can time out.
 
         Given:
@@ -762,9 +861,16 @@ class TestWorkerPool:
         """
 
         # Arrange
-        def slow_factory(*tags, **kwargs):
-            # Create worker with 10 second delay
-            return mock_worker_factory(*tags, start_delay=10.0, **kwargs)
+        def slow_factory(*tags, credentials=None):
+            worker = mocker.MagicMock()
+
+            async def slow_start():
+                await asyncio.sleep(10.0)
+
+            worker.start = slow_start
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = mocker.MagicMock()
+            return worker
 
         pool = WorkerPool(worker=slow_factory, size=1)
 
