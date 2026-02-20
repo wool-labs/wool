@@ -195,7 +195,6 @@ class TestRoundRobinLoadBalancer:
         ],
     )
     @given(data=st.data())
-    @pytest.mark.asyncio
     async def test_dispatch_no_workers_available(
         self,
         mocker: MockerFixture,
