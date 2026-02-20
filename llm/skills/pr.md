@@ -74,6 +74,11 @@ after work has been completed. Descriptions of the current state of the
 system are exempt and SHOULD use present tense — "The registry stores
 entries in memory" not "Store entries in memory".
 
+Prose in PR descriptions MUST NOT be hard-wrapped at a fixed column width.
+Write each sentence or logical phrase as a single unwrapped line.
+Markdown renderers handle line wrapping automatically — manual line
+breaks inside paragraphs create unnecessary diffs and awkward rendering.
+
 The PR description MUST contain exactly four sections:
 
 **Summary** — A quick recap of the issue, the high-level approach, and any
