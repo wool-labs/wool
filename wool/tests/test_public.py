@@ -2,10 +2,14 @@ import wool
 
 
 def test_public_symbol_accessibility():
-    """
-    GIVEN the wool package with a defined __all__ list
-    WHEN checking for accessibility of each public symbol
-    THEN all symbols in __all__ should be importable from the package.
+    """Test public symbol accessibility from wool package.
+
+    Given:
+        The wool package with a defined __all__ list
+    When:
+        Checking for accessibility of each public symbol
+    Then:
+        All symbols in __all__ should be importable from the package
     """
     # Arrange
     expected_symbols = wool.__all__
@@ -16,10 +20,14 @@ def test_public_symbol_accessibility():
 
 
 def test_public_api_completeness():
-    """
-    GIVEN the wool package public API definition
-    WHEN validating the complete __all__ list contents
-    THEN it should match the expected public interface exactly.
+    """Test public API completeness of wool package.
+
+    Given:
+        The wool package public API definition
+    When:
+        Validating the complete __all__ list contents
+    Then:
+        It should match the expected public interface exactly
     """
     # Arrange
     expected_public_api = [
@@ -31,7 +39,6 @@ def test_public_api_completeness():
         # Context
         "RuntimeContext",
         # Load balancing
-        "ConnectionResourceFactory",
         "LoadBalancerContextLike",
         "LoadBalancerLike",
         "NoWorkersAvailable",

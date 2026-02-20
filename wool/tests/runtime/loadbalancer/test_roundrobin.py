@@ -69,7 +69,6 @@ class TestRoundRobinLoadBalancer:
     async def test_dispatch(
         self,
         mocker: MockerFixture,
-        mock_connection_resource_factory,
         dispatch_side_effect_factory,
         data: st.DataObject,
     ):
@@ -100,8 +99,7 @@ class TestRoundRobinLoadBalancer:
                 version="1.0.0",
             )
             mock_workers[metadata] = mock_connection
-            resource_factory = mock_connection_resource_factory(metadata, mock_workers)
-            ctx.add_worker(metadata, resource_factory)
+            ctx.add_worker(metadata, mock_connection)
 
         async def routine():
             return "Hello world!"
@@ -197,11 +195,9 @@ class TestRoundRobinLoadBalancer:
         ],
     )
     @given(data=st.data())
-    @pytest.mark.asyncio
     async def test_dispatch_no_workers_available(
         self,
         mocker: MockerFixture,
-        mock_connection_resource_factory,
         dispatch_side_effect_factory,
         data: st.DataObject,
     ):
@@ -232,8 +228,7 @@ class TestRoundRobinLoadBalancer:
                 version="1.0.0",
             )
             mock_workers[metadata] = mock_connection
-            resource_factory = mock_connection_resource_factory(metadata, mock_workers)
-            ctx.add_worker(metadata, resource_factory)
+            ctx.add_worker(metadata, mock_connection)
 
         async def routine():
             return "Hello world!"
@@ -314,7 +309,6 @@ class TestRoundRobinLoadBalancer:
     async def test_concurrent_dispatch_distributes_across_workers(
         self,
         mocker: MockerFixture,
-        mock_connection_resource_factory,
     ):
         """Test concurrent dispatches are distributed across different workers.
 
@@ -348,8 +342,7 @@ class TestRoundRobinLoadBalancer:
 
             mock_connection.dispatch = mocker.AsyncMock(side_effect=dispatch_fn)
             mock_workers[metadata] = mock_connection
-            resource_factory = mock_connection_resource_factory(metadata, mock_workers)
-            ctx.add_worker(metadata, resource_factory)
+            ctx.add_worker(metadata, mock_connection)
 
         async def routine():
             return "Hello world!"
@@ -386,7 +379,6 @@ class TestRoundRobinLoadBalancer:
     async def test_worker_lock_released_on_dispatch_success(
         self,
         mocker: MockerFixture,
-        mock_connection_resource_factory,
     ):
         """Test that worker lock is released after successful dispatch.
 
@@ -419,8 +411,7 @@ class TestRoundRobinLoadBalancer:
             )[-1]
         )
         mock_workers[metadata] = mock_connection
-        resource_factory = mock_connection_resource_factory(metadata, mock_workers)
-        ctx.add_worker(metadata, resource_factory)
+        ctx.add_worker(metadata, mock_connection)
 
         async def routine():
             return "Hello world!"
@@ -456,7 +447,6 @@ class TestRoundRobinLoadBalancer:
     async def test_worker_lock_released_on_transient_error(
         self,
         mocker: MockerFixture,
-        mock_connection_resource_factory,
     ):
         """Test that worker lock is released after transient error.
 
@@ -492,8 +482,7 @@ class TestRoundRobinLoadBalancer:
             side_effect=dispatch_with_transient_then_success
         )
         mock_workers[metadata] = mock_connection
-        resource_factory = mock_connection_resource_factory(metadata, mock_workers)
-        ctx.add_worker(metadata, resource_factory)
+        ctx.add_worker(metadata, mock_connection)
 
         async def routine():
             return "Hello world!"
@@ -527,7 +516,6 @@ class TestRoundRobinLoadBalancer:
     async def test_worker_lock_cleaned_up_on_removal(
         self,
         mocker: MockerFixture,
-        mock_connection_resource_factory,
     ):
         """Test that worker lock is cleaned up when worker is removed.
 
@@ -563,8 +551,7 @@ class TestRoundRobinLoadBalancer:
                 mock_connection.dispatch = mocker.AsyncMock(return_value="success")
 
             mock_workers[metadata] = mock_connection
-            resource_factory = mock_connection_resource_factory(metadata, mock_workers)
-            ctx.add_worker(metadata, resource_factory)
+            ctx.add_worker(metadata, mock_connection)
 
         async def routine():
             return "Hello world!"
@@ -590,7 +577,6 @@ class TestRoundRobinLoadBalancer:
     async def test_waiting_tasks_distributed_across_workers(
         self,
         mocker: MockerFixture,
-        mock_connection_resource_factory,
     ):
         """Test that waiting tasks are assigned to different workers in round-robin.
 
@@ -633,8 +619,7 @@ class TestRoundRobinLoadBalancer:
 
             mock_connection.dispatch = mocker.AsyncMock(side_effect=dispatch_fn)
             mock_workers[metadata] = mock_connection
-            resource_factory = mock_connection_resource_factory(metadata, mock_workers)
-            ctx.add_worker(metadata, resource_factory)
+            ctx.add_worker(metadata, mock_connection)
 
         async def routine():
             return "Hello world!"
