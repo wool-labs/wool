@@ -9,6 +9,7 @@ on:
     types:
       - opened
       - reopened
+      - synchronize
     paths:
       - wool/src/**
       - wool/pyproject.toml
