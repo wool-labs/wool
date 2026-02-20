@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import grpc
 import pytest
+import pytest_asyncio
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
@@ -19,26 +20,19 @@ import wool.runtime.worker.pool as wp
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker.auth import WorkerCredentials
-from wool.runtime.worker.connection import _channel_pool
 
 
-@pytest.fixture(autouse=True)
-def _clear_channel_pool():
+@pytest_asyncio.fixture(autouse=True)
+async def _clear_channel_pool():
     """Clear the module-level gRPC channel pool between tests.
 
     Prevents stale cached channels (with outdated mocks) from leaking
-    across tests. Directly purges the pool's internal cache rather than
-    calling the async :meth:`clear` method so the fixture works with
-    both sync and async tests.
+    across tests.
     """
     yield
-    for entry in _channel_pool._cache.values():
-        if entry.cleanup is not None and not entry.cleanup.done():
-            try:
-                entry.cleanup.cancel()
-            except RuntimeError:
-                pass
-    _channel_pool._cache.clear()
+    import wool.runtime.worker.connection as _conn
+
+    await _conn._channel_pool.clear()
 
 
 @pytest.fixture
