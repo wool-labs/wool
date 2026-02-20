@@ -77,16 +77,12 @@ class MockWorker:
     """
 
     def __init__(
-        self, *tags: str, should_fail: bool = False, start_delay: float = 0.0, **kwargs
+        self,
+        *tags: str,
+        should_fail: bool = False,
+        start_delay: float = 0.0,
+        credentials: WorkerCredentials | None = None,
     ):
-        """Create mock worker.
-
-        Args:
-            *tags: Capability tags for this worker
-            should_fail: If True, start() and dispatch() raise RuntimeError
-            start_delay: Simulated startup delay in seconds
-            **kwargs: Additional configuration (reserved)
-        """
         self._uid = uuid.uuid4()
         self._tags = set(tags)
         self._started = False
@@ -94,6 +90,7 @@ class MockWorker:
         self.dispatch_count = 0
         self.should_fail = should_fail
         self.start_delay = start_delay
+        self.credentials = credentials
 
     @property
     def uid(self):
@@ -175,8 +172,8 @@ def mock_worker_factory(mocker: MockerFixture):
         Callable that creates MockWorker instances with specified tags
     """
 
-    def factory(*tags: str, **kwargs):
-        return MockWorker(*tags, **kwargs)
+    def factory(*tags: str, credentials=None):
+        return MockWorker(*tags, credentials=credentials)
 
     return factory
 
