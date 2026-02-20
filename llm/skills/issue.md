@@ -48,6 +48,11 @@ Issue titles MUST be written in the imperative mood. Issue body prose
 SHOULD use the imperative mood for proposed actions and present tense
 for descriptions of current system state.
 
+Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width.
+Write each sentence or logical phrase as a single unwrapped line.
+Markdown renderers handle line wrapping automatically — manual line
+breaks inside paragraphs create unnecessary diffs and awkward rendering.
+
 **Bug** (label: `bug`):
 
 ```markdown
