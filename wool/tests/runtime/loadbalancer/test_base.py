@@ -40,10 +40,14 @@ def loadbalancer_context(draw):
 
 class TestLoadBalancerContextLikeProtocol:
     def test_loadbalancer_context_satisfies_protocol(self):
-        """
-        GIVEN a concrete LoadBalancerContext instance
-        WHEN checked against the LoadBalancerContextLike protocol
-        THEN the instance satisfies the protocol.
+        """Test LoadBalancerContext satisfies the protocol.
+
+        Given:
+            A concrete LoadBalancerContext instance
+        When:
+            Checked against the LoadBalancerContextLike protocol
+        Then:
+            It should satisfy the protocol
         """
         context = LoadBalancerContext()
         assert isinstance(context, LoadBalancerContextLike)
