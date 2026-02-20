@@ -72,11 +72,13 @@ async with wool.WorkerPool(size=4, discovery=wool.LanDiscovery()):
 
 ### Custom workers
 
-`WorkerPool` accepts a `WorkerFactory` for its `worker` parameter. The factory protocol is a callable that receives tags and keyword arguments and returns a `WorkerLike`:
+`WorkerPool` accepts a `WorkerFactory` for its `worker` parameter. The factory protocol is a callable that receives tags and an optional `credentials` parameter and returns a `WorkerLike`:
 
 ```python
 class WorkerFactory(Protocol):
-    def __call__(self, *tags: str, **_) -> WorkerLike: ...
+    def __call__(
+        self, *tags: str, credentials: WorkerCredentials | None = None,
+    ) -> WorkerLike: ...
 ```
 
 Custom workers need only satisfy the `WorkerLike` protocol and host a gRPC server implementing the worker service protocol at its reported `address`.
