@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from abc import ABC
 from abc import abstractmethod
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import Final
@@ -15,6 +16,9 @@ from typing import runtime_checkable
 import grpc
 
 from wool.runtime.discovery.base import WorkerMetadata
+
+if TYPE_CHECKING:
+    from wool.runtime.worker.auth import WorkerCredentials
 
 # Type aliases for credentials
 ServerCredentialsType: TypeAlias = Union[
@@ -89,28 +93,19 @@ class WorkerFactory(Protocol):
 
     Worker factories create :class:`WorkerLike` instances with specific
     tags and configuration. Used by :class:`WorkerPool` to spawn workers.
-
-    **Example factory:**
-
-    .. code-block:: python
-
-        from functools import partial
-
-
-        def custom_factory(*tags, custom_param=None):
-            return LocalWorker(*tags, host="0.0.0.0", port=8080)
-
-
-        # Or using partial
-        factory = partial(LocalWorker, host="0.0.0.0")
-
     """
 
-    def __call__(self, *tags: str, **_) -> WorkerLike:
+    def __call__(
+        self,
+        *tags: str,
+        credentials: WorkerCredentials | None = None,
+    ) -> WorkerLike:
         """Create a new worker instance.
 
         :param tags:
             Capability tags for worker discovery and filtering.
+        :param credentials:
+            Credentials for the worker.
         :returns:
             Configured :class:`WorkerLike` instance.
         """

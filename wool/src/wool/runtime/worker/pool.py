@@ -209,10 +209,10 @@ class WorkerPool:
             credentials = credentials
 
         if credentials is not None:
-            self._server_credentials = credentials.server_credentials
+            self._credentials = credentials
             self._client_credentials = credentials.client_credentials
         else:
-            self._server_credentials = None
+            self._credentials = None
             self._client_credentials = None
 
         match (size, discovery):
@@ -355,7 +355,7 @@ class WorkerPool:
 
         tasks = []
         for _ in range(size):
-            worker = factory(*tags, credentials=self._server_credentials)
+            worker = factory(*tags, credentials=self._credentials)
 
             async def start(worker):
                 await worker.start()
@@ -378,7 +378,7 @@ class WorkerPool:
             await self._exit_context(publisher_ctx)
 
     def _default_worker_factory(self):
-        def factory(*tags, credentials=None, **_):
+        def factory(*tags, credentials=None):
             return LocalWorker(*tags, credentials=credentials)
 
         return factory
