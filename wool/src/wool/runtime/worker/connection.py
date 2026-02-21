@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Final
 from typing import Generic
 from typing import TypeAlias
 from typing import TypeVar
+from typing import cast
 
 import cloudpickle
 import grpc.aio
@@ -288,7 +290,7 @@ class WorkerConnection:
         task: Task,
         *,
         timeout: float | None = None,
-    ) -> AsyncIterator[pb.task.Result]:
+    ) -> AsyncGenerator[pb.task.Result, None]:
         """Dispatch a task to the remote worker for execution.
 
         Sends the task to the worker via gRPC, waits for acknowledgment,
@@ -338,7 +340,7 @@ class WorkerConnection:
             raise
 
         await _channel_pool.release(self._key)
-        return gen
+        return cast(AsyncGenerator[pb.task.Result, None], gen)
 
     async def close(self):
         """Close the connection and release all pooled resources.
@@ -375,7 +377,9 @@ class WorkerConnection:
                 raise
         return call
 
-    async def _execute(self, call):
+    async def _execute(
+        self, call: _DispatchCall
+    ) -> AsyncGenerator[pb.task.Result | None, None]:
         ch = await _channel_pool.acquire(self._key)
         try:
             yield  # Priming yield — signals dispatch() that ref is held

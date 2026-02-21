@@ -160,15 +160,15 @@ class WorkerPool:
         *tags: str,
         size: int = 0,
         worker: WorkerFactory = LocalWorker,
-        discovery: DiscoveryLike | Factory[DiscoveryLike] | None = None,
+        discovery: None = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
     ):
         """
-        Create an ephemeral pool of workers, spawning the specified quantity of workers
-        using the specified worker factory.
+        Create an ephemeral pool of workers, spawning the specified
+        quantity of workers using the specified worker factory.
         """
         ...
 
@@ -183,8 +183,26 @@ class WorkerPool:
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
     ):
         """
-        Connect to an existing pool of workers discovered by the specified discovery
-        protocol.
+        Connect to an existing pool of workers discovered by the
+        specified discovery protocol.
+        """
+        ...
+
+    @overload
+    def __init__(
+        self,
+        *tags: str,
+        size: int = 0,
+        worker: WorkerFactory = LocalWorker,
+        discovery: DiscoveryLike | Factory[DiscoveryLike],
+        loadbalancer: (
+            LoadBalancerLike | Factory[LoadBalancerLike]
+        ) = RoundRobinLoadBalancer,
+        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+    ):
+        """
+        Create a hybrid pool that spawns local workers and discovers
+        remote workers through the specified discovery protocol.
         """
         ...
 
