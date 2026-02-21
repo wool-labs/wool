@@ -9,15 +9,27 @@ import cloudpickle
 import grpc
 import pytest
 from grpc import StatusCode
+from hypothesis import HealthCheck
+from hypothesis import assume
+from hypothesis import given
+from hypothesis import settings
+from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
+import wool
 from wool.runtime import protobuf as pb
 from wool.runtime.protobuf.worker import WorkerStub
 from wool.runtime.protobuf.worker import add_WorkerServicer_to_server
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskEvent
+from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
 from wool.runtime.worker.service import _ReadOnlyEvent
+
+
+@pytest.fixture(scope="function")
+def grpc_interceptors():
+    return [VersionInterceptor()]
 
 
 @pytest.fixture(scope="function")
@@ -1191,3 +1203,156 @@ class TestWorkerService:
         # Cleanup worker loops
         for entry in service._loop_pool._cache.values():
             WorkerService._destroy_worker_loop(entry.obj)
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_with_version_in_ack(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch returns Ack with wool.__version__.
+
+        Given:
+            A running WorkerService
+        When:
+            A task is dispatched with a compatible version
+        Then:
+            The Ack response contains wool.__version__.
+        """
+
+        # Arrange
+        async def sample_task():
+            return "test_result"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        ack_response = responses[0]
+        assert ack_response.HasField("ack")
+        assert ack_response.ack.version == wool.__version__
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_with_empty_client_version(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch accepts tasks with empty version field.
+
+        Given:
+            A running WorkerService with the version interceptor
+        When:
+            A task with empty version field is dispatched
+        Then:
+            The worker accepts and processes normally (backwards
+            compatibility).
+        """
+
+        # Arrange
+        async def sample_task():
+            return "test_result"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        # Create protobuf with empty version (simulating pre-versioned client)
+        request = wool_task.to_protobuf()
+        # Clear version field to simulate a pre-versioned client
+        request.ClearField("version")
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        ack, result = responses
+        assert ack.HasField("ack")
+        assert result.HasField("result")
+        assert cloudpickle.loads(result.result.dump) == "test_result"
+
+    @settings(
+        max_examples=20,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        local_major=st.integers(min_value=0, max_value=100),
+        client_major=st.integers(min_value=0, max_value=100),
+    )
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_with_incompatible_major_version(
+        self,
+        grpc_aio_stub,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        local_major,
+        client_major,
+    ):
+        """Test dispatch yields Nack for incompatible major version.
+
+        Given:
+            Two semver-like version strings with different major
+            versions
+        When:
+            A task is dispatched with the client version through the
+            version interceptor
+        Then:
+            The dispatch yields a Nack with a reason citing version
+            mismatch.
+        """
+        assume(local_major != client_major)
+
+        # Arrange
+        mocker.patch.object(wool, "__version__", f"{local_major}.0.0")
+
+        async def sample_task():
+            return "should_not_execute"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+        # Override version field to simulate incompatible client
+        request.version = f"{client_major}.0.0"
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 1
+        assert responses[0].HasField("nack")
+        assert "Major version mismatch" in responses[0].nack.reason
