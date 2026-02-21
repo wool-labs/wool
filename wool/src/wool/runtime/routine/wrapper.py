@@ -15,6 +15,7 @@ from typing import Tuple
 from typing import Type
 from typing import TypeVar
 from typing import cast
+from typing import overload
 from uuid import uuid4
 
 import wool
@@ -31,7 +32,7 @@ R = TypeVar("R")
 
 
 # public
-def routine(fn: C) -> C:
+def routine(fn: C | None = None, *, namespace: str | None = None) -> C:
     """Decorator to declare an asynchronous function as remotely executable.
 
     Converts an asynchronous function or async generator into a distributed
@@ -39,9 +40,31 @@ def routine(fn: C) -> C:
     is invoked, it is dispatched to the worker pool associated with the
     current worker pool session context.
 
+    This decorator supports three usage forms:
+
+    - ``@work`` - bare decorator (default namespace=None)
+    - ``@work()`` - empty call (default namespace=None)
+    - ``@work(namespace="name")`` - with explicit parameter
+
     :param fn:
         The asynchronous function or async generator to convert into a
-        distributed routine.
+        distributed routine. When using as ``@work``, this is the decorated
+        function. When using as ``@work()``, this is None.
+    :param namespace:
+        Controls global namespace isolation for task execution:
+
+        - ``None`` (default): Ephemeral isolated globals. Each invocation
+          gets fresh isolated globals, preventing global state leakage.
+        - ``"name"``: Named namespace. Tasks with the same namespace string
+          share globals, enabling patterns like ``@lru_cache``. When a task
+          enters a shared namespace, it inherits any existing globals and
+          contributes its own module globals (e.g., imports) for keys that
+          don't already exist. This allows tasks from different modules to
+          share a namespace while each bringing its required imports, and
+          prevents later tasks from overwriting state (like caches)
+          established by earlier tasks.
+        - ``wool.WORKER``: Worker-level globals. The task runs in the
+          shared worker namespace with no isolation.
     :returns:
         The decorated function that dispatches to the worker pool when
         called.
@@ -139,82 +162,93 @@ def routine(fn: C) -> C:
                 async for value in fibonacci_series(10):
                     print(value)  # 0, 1, 1, 2, 3, 5, 8, 13, 21, 34
     """
-    # Check if function is a coroutine or async generator
-    is_valid = (
-        iscoroutinefunction(fn)
-        or isasyncgenfunction(fn)
-        or (
-            isinstance(fn, (classmethod, staticmethod))
-            and (iscoroutinefunction(fn.__func__) or isasyncgenfunction(fn.__func__))
+
+    def decorator(fn: C) -> C:
+        # Check if function is a coroutine or async generator
+        is_valid = (
+            iscoroutinefunction(fn)
+            or isasyncgenfunction(fn)
+            or (
+                isinstance(fn, (classmethod, staticmethod))
+                and (iscoroutinefunction(fn.__func__) or isasyncgenfunction(fn.__func__))
+            )
         )
-    )
-    if not is_valid:
-        raise ValueError("Expected a coroutine function or async generator function")
+        if not is_valid:
+            raise ValueError("Expected a coroutine function or async generator function")
 
-    if isinstance(fn, (classmethod, staticmethod)):
-        wrapped_fn = fn.__func__
-    else:
-        wrapped_fn = fn
+        if isinstance(fn, (classmethod, staticmethod)):
+            wrapped_fn = fn.__func__
+        else:
+            wrapped_fn = fn
 
-    if isasyncgenfunction(wrapped_fn):
+        if isasyncgenfunction(wrapped_fn):
 
-        @wraps(wrapped_fn)
-        async def async_generator_wrapper(*args, **kwargs):
-            # Handle static and class methods in a picklable way.
-            parent, function = _resolve(fn)
-            assert parent is not None
-            assert callable(function)
+            @wraps(wrapped_fn)
+            async def async_generator_wrapper(*args, **kwargs):
+                # Handle static and class methods in a picklable way.
+                parent, function = _resolve(fn)
+                assert parent is not None
+                assert callable(function)
 
-            if do_dispatch():
-                proxy = wool.__proxy__.get()
-                assert proxy
-                stream = await _dispatch(
-                    proxy,
-                    async_generator_wrapper.__module__,
-                    async_generator_wrapper.__qualname__,
-                    function,
-                    *args,
-                    **kwargs,
-                )
-            else:
-                stream = _stream(fn, parent, *args, **kwargs)
-                assert isasyncgen(stream)
+                if do_dispatch():
+                    proxy = wool.__proxy__.get()
+                    assert proxy
+                    stream = await _dispatch(
+                        proxy,
+                        async_generator_wrapper.__module__,
+                        async_generator_wrapper.__qualname__,
+                        function,
+                        namespace,
+                        *args,
+                        **kwargs,
+                    )
+                else:
+                    stream = _stream(fn, parent, *args, **kwargs)
+                    assert isasyncgen(stream)
 
-            try:
-                async for result in stream:
-                    yield result
-            finally:
-                await stream.aclose()
+                try:
+                    async for result in stream:
+                        yield result
+                finally:
+                    await stream.aclose()
 
-        return cast(C, async_generator_wrapper)
+            return cast(C, async_generator_wrapper)
 
-    else:
+        else:
 
-        @wraps(wrapped_fn)
-        async def coroutine_wrapper(*args, **kwargs):
-            # Handle static and class methods in a picklable way.
-            parent, function = _resolve(fn)
-            assert parent is not None
-            assert callable(function)
+            @wraps(wrapped_fn)
+            async def coroutine_wrapper(*args, **kwargs):
+                # Handle static and class methods in a picklable way.
+                parent, function = _resolve(fn)
+                assert parent is not None
+                assert callable(function)
 
-            if do_dispatch():
-                proxy = wool.__proxy__.get()
-                assert proxy
-                stream = await _dispatch(
-                    proxy,
-                    coroutine_wrapper.__module__,
-                    coroutine_wrapper.__qualname__,
-                    function,
-                    *args,
-                    **kwargs,
-                )
-                coro = _stream_to_coroutine(stream)
-            else:
-                coro = _execute(fn, parent, *args, **kwargs)
+                if do_dispatch():
+                    proxy = wool.__proxy__.get()
+                    assert proxy
+                    stream = await _dispatch(
+                        proxy,
+                        coroutine_wrapper.__module__,
+                        coroutine_wrapper.__qualname__,
+                        function,
+                        namespace,
+                        *args,
+                        **kwargs,
+                    )
+                    coro = _stream_to_coroutine(stream)
+                else:
+                    coro = _execute(fn, parent, *args, **kwargs)
 
-            return await coro
+                return await coro
 
-        return cast(C, coroutine_wrapper)
+            return cast(C, coroutine_wrapper)
+
+    # Handle @routine vs @routine() vs @routine(namespace=...)
+    if fn is not None:
+        # Called as @routine (bare decorator)
+        return decorator(fn)
+    # Called as @routine() or @routine(namespace=...)
+    return decorator
 
 
 def _dispatch(
@@ -222,6 +256,7 @@ def _dispatch(
     module: str,
     qualname: str,
     function: Callable[..., Coroutine | AsyncGenerator],
+    namespace: str | None,
     *args,
     **kwargs,
 ):
@@ -240,6 +275,7 @@ def _dispatch(
         kwargs=kwargs,
         tag=f"{module}.{qualname}({signature})",
         proxy=proxy,
+        namespace=namespace,
     )
     return proxy.dispatch(task, timeout=ctx.dispatch_timeout.get())
 

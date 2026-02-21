@@ -19,7 +19,7 @@ classifiers = [
 ]
 dependencies = [
     "cloudpickle",
-    "grpcio>=1.76.0",
+    "grpcio>=1.78.0",
     "portalocker",
     "protobuf",
     "shortuuid",

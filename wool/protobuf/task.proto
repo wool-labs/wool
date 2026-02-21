@@ -15,6 +15,7 @@ message Task {
     string function = 11;
     int32 line_no = 12;
     string tag = 13;
+    optional string namespace = 14;
 }
 
 message Result {

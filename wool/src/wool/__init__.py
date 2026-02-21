@@ -22,6 +22,7 @@ from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.routine.task import WORKER
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskEvent
 from wool.runtime.routine.task import TaskEventHandler
@@ -70,6 +71,7 @@ __all__ = [
     "NoWorkersAvailable",
     "RoundRobinLoadBalancer",
     # Routines
+    "WORKER",
     "Task",
     "TaskEvent",
     "TaskEventHandler",
