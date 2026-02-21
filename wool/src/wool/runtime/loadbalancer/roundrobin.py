@@ -4,7 +4,7 @@ import itertools
 import logging
 from asyncio import Lock
 from typing import TYPE_CHECKING
-from typing import AsyncIterator
+from typing import AsyncGenerator
 from typing import Final
 
 from wool.runtime.worker.connection import TransientRpcError
@@ -43,7 +43,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
         *,
         context: LoadBalancerContextLike,
         timeout: float | None = None,
-    ) -> AsyncIterator:
+    ) -> AsyncGenerator:
         """Dispatch a task to the next available worker.
 
         :param task:
