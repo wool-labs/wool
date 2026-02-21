@@ -1,0 +1,25 @@
+name: Refactor
+description: Propose a code restructuring without behavior change.
+labels: ["refactor"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What should be restructured and what does the end state look like?
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this restructuring needed?
+    validations:
+      required: true
+  - type: textarea
+    id: affected-code
+    attributes:
+      label: Affected code
+      description: Which files, modules, or components are affected?
+    validations:
+      required: false

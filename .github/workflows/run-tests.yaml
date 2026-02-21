@@ -1,0 +1,66 @@
+name: Run tests
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+      - release
+
+jobs:
+  lint:
+    name: Lint / pyright
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv and prepare python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install packages
+        run: |
+          .github/scripts/install-python-packages.sh
+          uv pip install -e './wool[dev]'
+
+      - name: Run pyright
+        run: |
+          cd wool
+          uv run pyright
+
+  run-tests:
+    name: Namespace ${{ matrix.namespace }} / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        namespace:
+          - 'wool'
+        python-version:
+          - '3.11'
+          - '3.12'
+          - '3.13'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv and prepare python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install packages
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+        run: |
+          .github/scripts/install-python-packages.sh
+          uv pip install -e './${{ env.NAMESPACE }}[dev]'
+          uv pip freeze
+
+      - name: Run tests
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+        run: |
+          cd ${{ env.NAMESPACE }}
+          uv run pytest

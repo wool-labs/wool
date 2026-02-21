@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package wool.runtime.protobuf.worker;
+
+import "task.proto";
+
+service Worker {
+    rpc dispatch (task.Task) returns (stream Response);
+    rpc stop (StopRequest) returns (Void);
+}
+
+message Response {
+    oneof payload {
+        Ack ack = 1;
+        Nack nack = 2;
+        task.Result result = 3;
+        task.Exception exception = 4;
+    }
+}
+
+message Ack {
+    // Acknowledgment that the task was received and processing started
+}
+
+message Nack {
+    // Negative acknowledgment indicating the task was rejected
+    string reason = 1;
+}
+
+message StopRequest {
+    float timeout = 1;
+}
+
+message WorkerMetadata {
+    // Unique identifier for the worker instance
+    string uid = 1;
+
+    // gRPC target address (e.g. "host:port", "unix:path")
+    string address = 2;
+
+    // Process ID of the worker
+    int32 pid = 3;
+
+    // Version string of the worker software
+    string version = 4;
+
+    // Capability tags for worker filtering and selection
+    repeated string tags = 5;
+
+    // Additional arbitrary metadata as key-value pairs
+    map<string, string> extra = 6;
+
+    // Whether the worker requires secure TLS/mTLS connections
+    bool secure = 7;
+}
+
+message Void {}
