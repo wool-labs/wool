@@ -41,6 +41,7 @@ dev = [
     "cryptography",
     "debugpy",
     "hypothesis",
+    "pyright",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
@@ -96,3 +97,17 @@ docstring-code-format = true
 combine-as-imports = false
 force-single-line = true
 known-first-party = ["wool"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+include = ["src"]
+exclude = [
+    "**/__pycache__",
+    "build",
+    "dist",
+    "tests/*",
+    "src/wool/runtime/protobuf/*pb2*",
+]
+reportMissingImports = true
+reportMissingTypeStubs = false
