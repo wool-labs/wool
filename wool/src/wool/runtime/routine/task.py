@@ -12,6 +12,7 @@ from functools import wraps
 from inspect import isasyncgenfunction
 from inspect import iscoroutinefunction
 from types import TracebackType
+from typing import Any
 from typing import AsyncGenerator
 from typing import ContextManager
 from typing import Coroutine
@@ -23,6 +24,7 @@ from typing import SupportsInt
 from typing import Tuple
 from typing import TypeAlias
 from typing import TypeVar
+from typing import cast
 from typing import overload
 from uuid import UUID
 
@@ -236,9 +238,9 @@ class Task(Generic[W]):
 
     def dispatch(self) -> W:
         if isasyncgenfunction(self.callable):
-            return self._stream()
+            return cast(W, self._stream())
         elif iscoroutinefunction(self.callable):
-            return self._run()
+            return cast(W, self._run())
         else:
             raise ValueError("Expected routine to be coroutine or async generator")
 
@@ -251,6 +253,7 @@ class Task(Generic[W]):
         :raises RuntimeError:
             If no proxy pool is available for task execution.
         """
+        assert iscoroutinefunction(self.callable), "Expected coroutine function"
         proxy_pool = wool.__proxy_pool__.get()
         if not proxy_pool:
             raise RuntimeError("No proxy pool available for task execution")
@@ -274,6 +277,7 @@ class Task(Generic[W]):
         :raises RuntimeError:
             If no proxy pool is available for task execution.
         """
+        assert isasyncgenfunction(self.callable), "Expected async generator function"
         proxy_pool = wool.__proxy_pool__.get()
         if not proxy_pool:
             raise RuntimeError("No proxy pool available for task execution")
