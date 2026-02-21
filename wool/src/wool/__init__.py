@@ -22,6 +22,8 @@ from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.routine.interceptor import get_registered_interceptors
+from wool.runtime.routine.interceptor import interceptor
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskEvent
 from wool.runtime.routine.task import TaskEventHandler
@@ -57,12 +59,10 @@ __proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar
 )
 
 __all__ = [
-    # Connection
     "RpcError",
     "TransientRpcError",
     "UnexpectedResponse",
     "WorkerConnection",
-    # Context
     "RuntimeContext",
     # Load balancing
     "LoadBalancerContextLike",
@@ -76,6 +76,8 @@ __all__ = [
     "TaskEventType",
     "TaskException",
     "current_task",
+    "get_registered_interceptors",
+    "interceptor",
     "routine",
     # Workers
     "LocalWorker",
@@ -99,7 +101,6 @@ __all__ = [
     "LocalDiscovery",
     "PredicateFunction",
     "WorkerMetadata",
-    # Typing
     "Factory",
 ]
 
