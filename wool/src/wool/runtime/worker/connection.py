@@ -359,6 +359,10 @@ class WorkerConnection:
                 call: _DispatchCall = ch.stub.dispatch(task.to_protobuf())
                 try:
                     response = await anext(aiter(call))
+                    if response.HasField("nack"):
+                        raise RpcError(
+                            details=f"Task rejected by worker: {response.nack.reason}"
+                        )
                     if not response.HasField("ack"):
                         raise UnexpectedResponse(
                             f"Expected 'ack' response, "
