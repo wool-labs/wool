@@ -222,6 +222,7 @@ class Task(Generic[W]):
 
     def to_protobuf(self) -> pb.task.Task:
         return pb.task.Task(
+            version=wool.__version__,
             id=str(self.id),
             callable=cloudpickle.dumps(self.callable),
             args=cloudpickle.dumps(self.args),

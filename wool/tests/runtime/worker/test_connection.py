@@ -709,6 +709,76 @@ class TestWorkerConnection:
         # Assert - only got first 2 results
         assert results == ["result_1", "result_2"]
 
+    @pytest.mark.asyncio
+    async def test_dispatch_with_version_in_ack(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch accepts Ack with version field.
+
+        Given:
+            A mock worker returning Ack with version field
+        When:
+            dispatch() is called
+        Then:
+            Ack is accepted and stream is returned normally.
+        """
+        # Arrange
+        responses = (
+            pb.worker.Response(ack=pb.worker.Ack(version="1.0.0")),
+            pb.worker.Response(
+                result=pb.task.Result(dump=cloudpickle.dumps("test_result"))
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", limit=10)
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert
+        assert results == ["test_result"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_nack_raises_rpc_error(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch raises RpcError on Nack response.
+
+        Given:
+            A mock worker returning Nack with version mismatch reason
+        When:
+            dispatch() is called
+        Then:
+            It should raise RpcError with the rejection reason.
+        """
+        # Arrange
+        responses = (
+            pb.worker.Response(
+                nack=pb.worker.Nack(
+                    reason="Major version mismatch: client=2.0.0, worker=1.0.0"
+                )
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(pb.worker, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", limit=10)
+
+        # Act & Assert
+        with pytest.raises(RpcError, match="Task rejected by worker"):
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
 
 class TestResourceLifetime:
     """Tests for pool-backed resource lifetime management."""

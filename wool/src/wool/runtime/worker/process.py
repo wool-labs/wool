@@ -18,6 +18,7 @@ from wool.runtime import protobuf as pb
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.base import ServerCredentialsType
 from wool.runtime.worker.base import resolve_server_credentials
+from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
 
 if TYPE_CHECKING:
@@ -172,7 +173,7 @@ class WorkerProcess(Process):
         requests. It creates a gRPC server, adds the worker service, and
         starts listening for incoming connections.
         """
-        server = grpc.aio.server()
+        server = grpc.aio.server(interceptors=[VersionInterceptor()])
         credentials = resolve_server_credentials(self._credentials)
         address = self._address(self._host, self._port)
 

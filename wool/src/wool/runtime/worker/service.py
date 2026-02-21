@@ -143,7 +143,7 @@ class WorkerService(pb.worker.WorkerServicer):
             )
 
         with self._tracker(Task.from_protobuf(request)) as task:
-            yield pb.worker.Response(ack=pb.worker.Ack())
+            yield pb.worker.Response(ack=pb.worker.Ack(version=wool.__version__))
             try:
                 if isasyncgen(task):
                     async for result in task:

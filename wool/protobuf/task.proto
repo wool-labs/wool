@@ -3,11 +3,12 @@ syntax = "proto3";
 package wool.runtime.protobuf.task;
 
 message Task {
-    string id = 1;
-    bytes callable = 2;
-    bytes args = 3;
-    bytes kwargs = 4;
-    string caller = 5;
+    string version = 1;
+    string id = 2;
+    bytes callable = 3;
+    bytes args = 4;
+    bytes kwargs = 5;
+    string caller = 6;
     bytes proxy = 7;
     string proxy_id = 8;
     int32 timeout = 9;
@@ -15,6 +16,13 @@ message Task {
     string function = 11;
     int32 line_no = 12;
     string tag = 13;
+}
+
+// Minimal envelope for pre-deserialization version extraction.
+// Used by the version interceptor to parse field 1 from any
+// Task wire format, including future incompatible versions.
+message TaskVersionEnvelope {
+    string version = 1;
 }
 
 message Result {

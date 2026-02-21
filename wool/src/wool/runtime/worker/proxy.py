@@ -33,6 +33,21 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
+def _parse_major_version(version: str) -> int | None:
+    """Extract the major version number from a version string.
+
+    :param version:
+        A version string (e.g. ``"1.2.3"``).
+    :returns:
+        The major version as an integer, or ``None`` if
+        unparseable.
+    """
+    try:
+        return int(version.split(".")[0])
+    except (ValueError, IndexError):
+        return None
+
+
 class ReducibleAsyncIterator(Generic[T]):
     """An async iterator that can be pickled via __reduce__.
 
@@ -208,12 +223,17 @@ class WorkerProxy:
 
         # Create security filter based on resolved credentials
         security_filter = self._create_security_filter(self._credentials)
+        version_filter = self._create_version_filter()
 
         match (pool_uri, discovery, workers):
             case (pool_uri, None, None) if pool_uri is not None:
-                # Combine tag filter with security filter
+                # Combine tag, security, and version filters
                 def combined_filter(w):
-                    return bool({pool_uri, *tags} & w.tags) and security_filter(w)
+                    return (
+                        bool({pool_uri, *tags} & w.tags)
+                        and security_filter(w)
+                        and version_filter(w)
+                    )
 
                 self._discovery = LocalDiscovery(pool_uri).subscribe(
                     filter=combined_filter
@@ -221,8 +241,10 @@ class WorkerProxy:
             case (None, discovery, None) if discovery is not None:
                 self._discovery = discovery
             case (None, None, workers) if workers is not None:
-                # Filter workers by security compatibility
-                compatible_workers = [w for w in workers if security_filter(w)]
+                # Filter workers by security and version compatibility
+                compatible_workers = [
+                    w for w in workers if security_filter(w) and version_filter(w)
+                ]
                 self._discovery = ReducibleAsyncIterator(
                     [
                         DiscoveryEvent("worker-added", metadata=w)
@@ -415,6 +437,27 @@ class WorkerProxy:
         else:
             # Proxy has no credentials: only accept insecure workers
             return lambda metadata: not metadata.secure
+
+    @staticmethod
+    def _create_version_filter() -> Callable[[WorkerMetadata], bool]:
+        """Create discovery filter based on major version compatibility.
+
+        Workers must share the same major version as the local proxy.
+        Workers with unparseable versions are rejected.
+
+        :returns:
+            Predicate function for filtering workers by version
+            compatibility.
+        """
+        local_major = _parse_major_version(wool.__version__)
+
+        def version_filter(metadata: WorkerMetadata) -> bool:
+            worker_major = _parse_major_version(metadata.version)
+            if local_major is None or worker_major is None:
+                return False
+            return local_major == worker_major
+
+        return version_filter
 
     async def _await_workers(self):
         while not self._loadbalancer_context or not self._loadbalancer_context.workers:

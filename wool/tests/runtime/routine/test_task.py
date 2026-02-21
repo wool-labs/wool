@@ -372,6 +372,81 @@ class TestTask:
         assert pb_task.line_no == 0
         assert pb_task.tag == ""
 
+    def test_to_protobuf_with_version_field(
+        self, sample_async_callable, picklable_proxy, clear_event_handlers
+    ):
+        """Test to_protobuf includes wool.__version__ in version field.
+
+        Given:
+            A Task instance
+        When:
+            to_protobuf() is called
+        Then:
+            The protobuf Task contains wool.__version__ in the
+            version field.
+        """
+        # Arrange
+        task = Task(
+            id=uuid4(),
+            callable=sample_async_callable,
+            args=(),
+            kwargs={},
+            proxy=picklable_proxy,
+        )
+
+        # Act
+        pb_task = task.to_protobuf()
+
+        # Assert
+        assert pb_task.version == wool.__version__
+
+    @settings(
+        max_examples=50,
+        deadline=None,
+    )
+    @given(
+        version=st.from_regex(r"\d{1,3}\.\d{1,3}\.\d{1,3}", fullmatch=True),
+    )
+    def test_from_protobuf_with_version_roundtrip(self, version):
+        """Test version field round-trips through protobuf serialization.
+
+        Given:
+            Any semver-like version string
+        When:
+            A protobuf Task with that version is serialized
+        Then:
+            The version field is preserved on the wire.
+        """
+        # Arrange
+        proxy = PicklableProxy()
+
+        async def test_callable():
+            return "result"
+
+        pb_task = pb.task.Task(
+            version=version,
+            id=str(uuid4()),
+            callable=cloudpickle.dumps(test_callable),
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            caller="",
+            proxy=cloudpickle.dumps(proxy),
+            proxy_id=str(proxy.id),
+            timeout=0,
+            filename="",
+            function="",
+            line_no=0,
+            tag="",
+        )
+
+        # Act — serialize to bytes and parse back
+        wire_bytes = pb_task.SerializeToString()
+        parsed = pb.task.Task()
+        parsed.ParseFromString(wire_bytes)
+
+        # Assert
+        assert parsed.version == version
+
     @pytest.mark.asyncio
     async def test_dispatch_successful_execution(
         self,
