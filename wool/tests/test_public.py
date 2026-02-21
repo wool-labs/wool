@@ -31,12 +31,10 @@ def test_public_api_completeness():
     """
     # Arrange
     expected_public_api = [
-        # Connection
         "RpcError",
         "TransientRpcError",
         "UnexpectedResponse",
         "WorkerConnection",
-        # Context
         "RuntimeContext",
         # Load balancing
         "LoadBalancerContextLike",
@@ -50,6 +48,8 @@ def test_public_api_completeness():
         "TaskEventType",
         "TaskException",
         "current_task",
+        "get_registered_interceptors",
+        "interceptor",
         "routine",
         # Workers
         "LocalWorker",
@@ -73,7 +73,6 @@ def test_public_api_completeness():
         "LocalDiscovery",
         "PredicateFunction",
         "WorkerMetadata",
-        # Typing
         "Factory",
     ]
 
