@@ -20,6 +20,7 @@ message Response {
 
 message Ack {
     // Acknowledgment that the task was received and processing started
+    string version = 1;
 }
 
 message Nack {
