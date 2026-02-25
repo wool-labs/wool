@@ -1,0 +1,209 @@
+name: Publish release
+description: Tag, build, and publish a release or release-candidate on PR merge.
+
+on:
+  pull_request:
+    branches:
+      - master
+      - release
+    types:
+      - closed
+    paths:
+      - wool/src/**
+      - wool/pyproject.toml
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+
+jobs:
+  bump-version:
+    name: Bump version
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.merged == true || github.event.inputs.version != '' }}
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump-version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: ./.github/actions/get-wool-labs-app-token
+        id: get-wool-labs-app-token
+        with:
+          app-id: ${{ secrets.WOOL_LABS_APP_ID }}
+          app-installation-id: ${{ secrets.WOOL_LABS_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.WOOL_LABS_PRIVATE_KEY }}
+      - name: Determine version segment to bump
+        id: determine-version-segment
+        if: ${{ github.event.inputs.version == '' }}
+        run: |
+          case ${{ github.base_ref }} in
+            master)
+              case ${{ github.head_ref }} in
+                release)
+                  echo "segment=minor" >> $GITHUB_OUTPUT
+                  ;;
+                *)
+                  echo "segment=patch" >> $GITHUB_OUTPUT
+                  ;;
+              esac
+              ;;
+            release)
+              echo "segment=patch" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "Error: Unsupported base branch ${{ github.base_ref }}" >&2
+              exit 1
+              ;;
+          esac
+      - name: Bump version
+        id: bump-version
+        env:
+          GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          if [[ "${{ github.event.inputs.version }}" != "" ]]; then
+            new_version="${{ github.event.inputs.version }}"
+            echo "Using manually specified version: $new_version"
+          else
+            git fetch --unshallow
+            old_version=$(git describe --tags $(git rev-list --tags --max-count=1))
+            new_version=$(.github/scripts/bump-version.sh ${{ steps.determine-version-segment.outputs.segment }} $old_version)
+            echo "Bumping $old_version to $new_version"
+          fi
+          echo "version=$new_version" >> $GITHUB_OUTPUT
+
+  tag-version:
+    name: Tag version
+    needs: bump-version
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.merged == true || github.event.inputs.version != '' }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/get-wool-labs-app-token
+        id: get-wool-labs-app-token
+        with:
+          app-id: ${{ secrets.WOOL_LABS_APP_ID }}
+          app-installation-id: ${{ secrets.WOOL_LABS_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.WOOL_LABS_PRIVATE_KEY }}
+      - name: Create tag
+        id: create-tag
+        env:
+          GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          new_version=${{ needs.bump-version.outputs.version }}
+          echo "Tagging $new_version"
+          git tag $new_version
+          git push origin $new_version
+          echo "version=$new_version" >> $GITHUB_OUTPUT
+
+  build-release:
+    name: Build release
+    needs: 
+      - bump-version
+      - tag-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        source: [wool]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-release
+        with:
+          source: ${{ matrix.source }}
+          version: ${{ needs.bump-version.outputs.version }}
+
+  create-github-release:  
+    name: Create GitHub release
+    needs:
+      - bump-version
+      - tag-version
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ needs.bump-version.outputs.version }}" == *rc* ]]; then
+            prerelease_flag="--prerelease"
+          else
+            prerelease_flag=""
+          fi
+          gh release create ${{ needs.bump-version.outputs.version }} \
+            --repo ${{ github.repository }} \
+            --generate-notes \
+            $prerelease_flag
+      
+  publish-github-release:
+    name: Publish release to GitHub
+    needs:
+      - bump-version
+      - tag-version
+      - build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    strategy:
+      matrix:
+        source: [wool]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/publish-github-release
+        with:
+          source: ${{ matrix.source }}
+          version: ${{ needs.bump-version.outputs.version }}
+
+  publish-pypi-release:
+    name: Publish release to PyPI
+    needs:
+      - bump-version
+      - tag-version
+      - build-release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    strategy:
+      matrix:
+        source: [wool]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/publish-pypi-release
+        with:
+          source: ${{ matrix.source }}
+          version: ${{ needs.bump-version.outputs.version }}
+          pypi-token: ${{ secrets.PYPI_TOKEN }}
+
+  drop-release:
+    name: Drop release
+    needs: build-release
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true && github.head_ref == 'release' && github.base_ref == 'master'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/get-wool-labs-app-token
+        id: get-wool-labs-app-token
+        with:
+          app-id: ${{ secrets.WOOL_LABS_APP_ID }}
+          app-installation-id: ${{ secrets.WOOL_LABS_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.WOOL_LABS_PRIVATE_KEY }}
+      - name: Drop release branch
+        env:
+          GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch --unshallow
+          if [[ -n $(git ls-remote --heads origin release) ]]; then
+            git push origin --delete release
+          else
+            echo "Release branch not found, skipping."
+          fi

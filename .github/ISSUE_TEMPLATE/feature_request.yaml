@@ -1,0 +1,25 @@
+name: Feature Request
+description: Propose a new feature or capability.
+labels: ["feature"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is the feature? Describe the desired behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this feature needed? What problem does it solve?
+    validations:
+      required: true
+  - type: textarea
+    id: affected-code
+    attributes:
+      label: Affected code
+      description: Which files, modules, or components would be affected?
+    validations:
+      required: false

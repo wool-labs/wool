@@ -1,0 +1,192 @@
+name: Run tests
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+      - release
+  repository_dispatch:
+    types: [wool-protocol-release]
+
+jobs:
+  check-protocol-version:
+    name: Check wool-protocol version
+    if: github.event_name != 'repository_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      stable: ${{ steps.resolve.outputs.stable }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      is_latest: ${{ steps.resolve.outputs.is_latest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv and prepare python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.13'
+
+      - name: Resolve wool-protocol version
+        id: resolve
+        run: uv run --with packaging .github/scripts/resolve-protocol-version.py
+
+      - name: Gate on stable release
+        if: steps.resolve.outputs.stable != 'true'
+        run: |
+          echo "::error::wool-protocol stable release not found on PyPI for the version pinned in wool/pyproject.toml. Merge is blocked until a matching stable release is published."
+          exit 1
+
+  lint:
+    name: Lint / pyright
+    needs: check-protocol-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv and prepare python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install packages
+        run: |
+          .github/scripts/install-python-packages.sh
+          uv pip install -e './wool[dev]'
+
+      - name: Run pyright
+        run: |
+          cd wool
+          uv run pyright
+
+  run-tests:
+    name: Namespace ${{ matrix.namespace }} / Python ${{ matrix.python-version }}
+    needs: check-protocol-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        namespace:
+          - 'wool'
+        python-version:
+          - '3.11'
+          - '3.12'
+          - '3.13'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv and prepare python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install packages
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+        run: |
+          .github/scripts/install-python-packages.sh
+          uv pip install -e './${{ env.NAMESPACE }}[dev]'
+          uv pip freeze
+
+      - name: Run tests
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+        run: |
+          cd ${{ env.NAMESPACE }}
+          uv run pytest
+
+  test-prerelease-protocol:
+    name: Test with pre-release wool-protocol
+    needs: check-protocol-version
+    if: >-
+      always()
+      && needs.check-protocol-version.outputs.stable != 'true'
+      && needs.check-protocol-version.outputs.is_latest == 'true'
+      && needs.check-protocol-version.outputs.prerelease != 'none'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv and prepare python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install packages
+        run: |
+          .github/scripts/install-python-packages.sh
+          uv pip install -e './wool[dev]'
+
+      - name: Install pre-release wool-protocol
+        run: >-
+          uv pip install
+          'wool-protocol==${{ needs.check-protocol-version.outputs.prerelease }}'
+          --prerelease=allow
+
+      - name: Run tests
+        run: |
+          cd wool
+          uv run pytest
+
+  # ----------------------------------------------------------------
+  # Re-run stalled checks after a wool-protocol release
+  # ----------------------------------------------------------------
+  # Triggered via repository_dispatch from wool-protocol's publish
+  # workflow (out of scope for this repo).
+  #
+  # Expected client_payload schema:
+  #   { "version": "<major>.<minor>" }
+  #
+  # Example — send from wool-protocol's publish workflow:
+  #   gh api repos/wool-labs/wool/dispatches \
+  #     -f event_type=wool-protocol-release \
+  #     -f 'client_payload[version]=0.1'
+  # ----------------------------------------------------------------
+  rerun-protocol-checks:
+    name: Re-run stalled protocol checks
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Re-run failed workflows for matching PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          for pr_number in $(gh pr list --state open --json number --jq '.[].number'); do
+            head_ref=$(gh pr view "$pr_number" --json headRefName --jq '.headRefName')
+
+            pyproject=$(gh api "repos/${{ github.repository }}/contents/wool/pyproject.toml?ref=$head_ref" \
+              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null) || continue
+
+            if echo "$pyproject" | grep -q "wool-protocol"; then
+              # Find the most recent failed or cancelled workflow run on this branch
+              run_id=$(gh run list \
+                --branch "$head_ref" \
+                --workflow run-tests.yaml \
+                --status failure \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId' 2>/dev/null)
+
+              if [ -z "$run_id" ]; then
+                run_id=$(gh run list \
+                  --branch "$head_ref" \
+                  --workflow run-tests.yaml \
+                  --status cancelled \
+                  --limit 1 \
+                  --json databaseId \
+                  --jq '.[0].databaseId' 2>/dev/null)
+              fi
+
+              if [ -n "$run_id" ]; then
+                echo "Re-running workflow $run_id for PR #$pr_number (branch: $head_ref)"
+                gh run rerun "$run_id" --failed || true
+              fi
+            fi
+          done
