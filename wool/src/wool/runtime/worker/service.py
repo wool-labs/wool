@@ -16,7 +16,7 @@ from grpc import StatusCode
 from grpc.aio import ServicerContext
 
 import wool
-from wool.runtime import protobuf as pb
+from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskEvent
@@ -68,7 +68,7 @@ class _ReadOnlyEvent:
         await self._event.wait()
 
 
-class WorkerService(pb.worker.WorkerServicer):
+class WorkerService(protocol.worker.WorkerServicer):
     """gRPC service for task execution.
 
     Implements the worker gRPC interface for receiving and executing
@@ -116,8 +116,8 @@ class WorkerService(pb.worker.WorkerServicer):
         return _ReadOnlyEvent(self._stopped)
 
     async def dispatch(
-        self, request: pb.task.Task, context: ServicerContext
-    ) -> AsyncIterator[pb.worker.Response]:
+        self, request: protocol.task.Task, context: ServicerContext
+    ) -> AsyncIterator[protocol.worker.Response]:
         """Execute a task in the current event loop.
 
         Deserializes the incoming task into a :class:`Task`
@@ -143,22 +143,23 @@ class WorkerService(pb.worker.WorkerServicer):
             )
 
         with self._tracker(Task.from_protobuf(request)) as task:
-            yield pb.worker.Response(ack=pb.worker.Ack())
+            ack = protocol.task.Ack(version=protocol.__version__)
+            yield protocol.worker.Response(ack=ack)
             try:
                 if isasyncgen(task):
                     async for result in task:
-                        result = pb.task.Result(dump=cloudpickle.dumps(result))
-                        yield pb.worker.Response(result=result)
+                        result = protocol.task.Result(dump=cloudpickle.dumps(result))
+                        yield protocol.worker.Response(result=result)
                 elif isinstance(task, asyncio.Task):
-                    result = pb.task.Result(dump=cloudpickle.dumps(await task))
-                    yield pb.worker.Response(result=result)
+                    result = protocol.task.Result(dump=cloudpickle.dumps(await task))
+                    yield protocol.worker.Response(result=result)
             except (Exception, asyncio.CancelledError) as e:
-                exception = pb.task.Exception(dump=cloudpickle.dumps(e))
-                yield pb.worker.Response(exception=exception)
+                exception = protocol.task.Exception(dump=cloudpickle.dumps(e))
+                yield protocol.worker.Response(exception=exception)
 
     async def stop(
-        self, request: pb.worker.StopRequest, context: ServicerContext | None
-    ) -> pb.worker.Void:
+        self, request: protocol.worker.StopRequest, context: ServicerContext | None
+    ) -> protocol.worker.Void:
         """Stop the worker service and its thread.
 
         Gracefully shuts down the worker thread and signals the server
@@ -173,9 +174,9 @@ class WorkerService(pb.worker.WorkerServicer):
             An empty protobuf response indicating completion.
         """
         if self._stopping.is_set():
-            return pb.worker.Void()
+            return protocol.worker.Void()
         await self._stop(timeout=request.timeout)
-        return pb.worker.Void()
+        return protocol.worker.Void()
 
     @staticmethod
     def _create_worker_loop(

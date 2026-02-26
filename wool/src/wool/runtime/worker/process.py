@@ -14,10 +14,11 @@ from typing import TYPE_CHECKING
 import grpc.aio
 
 import wool
-from wool.runtime import protobuf as pb
+from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.base import ServerCredentialsType
 from wool.runtime.worker.base import resolve_server_credentials
+from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
 
 if TYPE_CHECKING:
@@ -172,7 +173,7 @@ class WorkerProcess(Process):
         requests. It creates a gRPC server, adds the worker service, and
         starts listening for incoming connections.
         """
-        server = grpc.aio.server()
+        server = grpc.aio.server(interceptors=[VersionInterceptor()])
         credentials = resolve_server_credentials(self._credentials)
         address = self._address(self._host, self._port)
 
@@ -182,7 +183,7 @@ class WorkerProcess(Process):
             port = server.add_insecure_port(address)
 
         service = WorkerService()
-        pb.add_to_server[pb.worker.WorkerServicer](service, server)
+        protocol.add_to_server[protocol.worker.WorkerServicer](service, server)
 
         with _signal_handlers(service):
             try:
@@ -239,7 +240,7 @@ def _sigterm_handler(loop, service, signum, frame):
     if loop.is_running():
         loop.call_soon_threadsafe(
             lambda: asyncio.create_task(
-                service.stop(pb.worker.StopRequest(timeout=0), None)
+                service.stop(protocol.worker.StopRequest(timeout=0), None)
             )
         )
 
@@ -248,7 +249,7 @@ def _sigint_handler(loop, service, signum, frame):
     if loop.is_running():
         loop.call_soon_threadsafe(
             lambda: asyncio.create_task(
-                service.stop(pb.worker.StopRequest(timeout=-1), None)
+                service.stop(protocol.worker.StopRequest(timeout=-1), None)
             )
         )
 
