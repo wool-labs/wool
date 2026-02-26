@@ -20,6 +20,7 @@ classifiers = [
 dependencies = [
     "cloudpickle",
     "grpcio>=1.76.0",
+    "packaging",
     "portalocker",
     "protobuf",
     "shortuuid",
@@ -60,8 +61,8 @@ sources = ["src"]
 dependencies = ["hatch-protobuf"]
 generate_grpc = true
 generate_pyi = true
-output_path = "src/wool/runtime/protobuf"
-proto_paths = ["protobuf"]
+output_path = "src/wool/protocol"
+proto_paths = ["proto"]
 
 [tool.hatch.build.targets.sdist]
 include = ["wool"]
@@ -107,7 +108,7 @@ exclude = [
     "build",
     "dist",
     "tests/*",
-    "src/wool/runtime/protobuf/*pb2*",
+    "src/wool/protocol/*pb2*",
 ]
 reportMissingImports = true
 reportMissingTypeStubs = false

@@ -15,6 +15,9 @@ from typing import TypeAlias
 from typing import TypeVar
 from typing import overload
 
+from packaging.version import InvalidVersion
+from packaging.version import Version
+
 import wool
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoverySubscriberLike
@@ -31,6 +34,38 @@ if TYPE_CHECKING:
     from wool.runtime.routine.task import Task
 
 T = TypeVar("T")
+
+
+def parse_version(version: str) -> Version | None:
+    """Parse a PEP 440 version string.
+
+    :param version:
+        A version string (e.g. ``"1.2.3"``).
+    :returns:
+        A :class:`~packaging.version.Version` instance, or
+        ``None`` if unparseable.
+    """
+    try:
+        return Version(version)
+    except InvalidVersion:
+        return None
+
+
+def is_version_compatible(client: Version, server: Version) -> bool:
+    """Check whether a client version is compatible with a server.
+
+    A server accepts requests from any client whose protocol
+    version is less than or equal to its own within the same major
+    version.  There is no forward-compatibility guarantee.
+
+    :param client:
+        The client's protocol version.
+    :param server:
+        The server's protocol version.
+    :returns:
+        ``True`` if compatible, ``False`` otherwise.
+    """
+    return client.major == server.major and client <= server
 
 
 class ReducibleAsyncIterator(Generic[T]):
@@ -208,12 +243,16 @@ class WorkerProxy:
 
         # Create security filter based on resolved credentials
         security_filter = self._create_security_filter(self._credentials)
+        version_filter = self._create_version_filter()
+
+        def compatible(w):
+            return security_filter(w) and version_filter(w)
 
         match (pool_uri, discovery, workers):
             case (pool_uri, None, None) if pool_uri is not None:
-                # Combine tag filter with security filter
+                # Combine tag and compatibility filters
                 def combined_filter(w):
-                    return bool({pool_uri, *tags} & w.tags) and security_filter(w)
+                    return bool({pool_uri, *tags} & w.tags) and compatible(w)
 
                 self._discovery = LocalDiscovery(pool_uri).subscribe(
                     filter=combined_filter
@@ -221,8 +260,7 @@ class WorkerProxy:
             case (None, discovery, None) if discovery is not None:
                 self._discovery = discovery
             case (None, None, workers) if workers is not None:
-                # Filter workers by security compatibility
-                compatible_workers = [w for w in workers if security_filter(w)]
+                compatible_workers = [w for w in workers if compatible(w)]
                 self._discovery = ReducibleAsyncIterator(
                     [
                         DiscoveryEvent("worker-added", metadata=w)
@@ -415,6 +453,30 @@ class WorkerProxy:
         else:
             # Proxy has no credentials: only accept insecure workers
             return lambda metadata: not metadata.secure
+
+    @staticmethod
+    def _create_version_filter() -> Callable[[WorkerMetadata], bool]:
+        """Create discovery filter based on major version compatibility.
+
+        A worker is accepted when its version is greater than or
+        equal to the local proxy version within the same major
+        version.  Workers with unparseable versions are rejected.
+
+        :returns:
+            Predicate function for filtering workers by version
+            compatibility.
+        """
+        from wool import protocol
+
+        local_version = parse_version(protocol.__version__)
+
+        def version_filter(metadata: WorkerMetadata) -> bool:
+            worker_version = parse_version(metadata.version)
+            if local_version is None or worker_version is None:
+                return False
+            return is_version_compatible(local_version, worker_version)
+
+        return version_filter
 
     async def _await_workers(self):
         while not self._loadbalancer_context or not self._loadbalancer_context.workers:

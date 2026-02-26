@@ -6,8 +6,7 @@ from typing import Any
 
 import grpc.aio
 
-import wool
-from wool.runtime import protobuf as pb
+from wool import protocol
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelCredentialsType
@@ -130,7 +129,7 @@ class LocalWorker(Worker):
             uid=self._uid,
             address=self._worker_process.address,
             pid=self._worker_process.pid,
-            version=wool.__version__,
+            version=protocol.__version__,
             tags=frozenset(self._tags),
             extra=MappingProxyType(self._extra),
             secure=self._server_credentials is not None,
@@ -160,5 +159,5 @@ class LocalWorker(Worker):
                 # Insecure worker: use insecure channel
                 channel = grpc.aio.insecure_channel(self.address)
 
-            stub = pb.worker.WorkerStub(channel)
-            await stub.stop(pb.worker.StopRequest(timeout=timeout))
+            stub = protocol.worker.WorkerStub(channel)
+            await stub.stop(protocol.worker.StopRequest(timeout=timeout))

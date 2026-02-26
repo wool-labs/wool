@@ -18,7 +18,7 @@ from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 import wool.runtime.worker.proxy as wp
-from wool.runtime import protobuf as pb
+from wool import protocol
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.local import LocalDiscovery
@@ -57,7 +57,7 @@ def mock_worker_stub(mocker: MockerFixture):
     Provides a mock :class:`WorkerStub` with async dispatch functionality
     for testing worker communication scenarios.
     """
-    mock_worker_stub = mocker.MagicMock(spec=pb.worker.WorkerStub)
+    mock_worker_stub = mocker.MagicMock(spec=protocol.worker.WorkerStub)
     mock_worker_stub.dispatch = mocker.AsyncMock()
     return mock_worker_stub
 
@@ -1434,7 +1434,9 @@ class TestWorkerProxy:
     # =========================================================================
 
     @pytest.mark.asyncio
-    async def test_security_filter_with_credentials(self, mock_proxy_session):
+    async def test_security_filter_with_credentials(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
         """Test only secure workers are discovered with credentials.
 
         Given:
@@ -1446,6 +1448,7 @@ class TestWorkerProxy:
             Only secure workers appear in the workers list.
         """
         # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
         secure_worker = WorkerMetadata(
             uid=uuid.uuid4(),
             address="192.168.1.100:50051",
@@ -1480,17 +1483,19 @@ class TestWorkerProxy:
 
     @pytest.mark.asyncio
     async def test_pool_uri_combined_filter(self, mocker: MockerFixture):
-        """Test pool URI filter combines tag matching and security filtering.
+        """Test pool URI filter combines tag matching, security, and version
+        filtering.
 
         Given:
             A WorkerProxy instantiated with a pool URI and extra tags.
         When:
             The discovery filter is evaluated against workers.
         Then:
-            Only workers matching the tags and security requirements
-            pass the filter.
+            Only workers matching the tags, security, and version
+            requirements pass the filter.
         """
         # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
         mock_subscriber = mocker.MagicMock()
         mock_local_discovery = mocker.MagicMock()
         mock_local_discovery.subscribe.return_value = mock_subscriber
@@ -1534,6 +1539,276 @@ class TestWorkerProxy:
             secure=True,
         )
         assert filter_fn(secure_matching) is False
+
+    # =========================================================================
+    # Version Filtering Tests
+    # =========================================================================
+
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        local_major=st.integers(min_value=0, max_value=100),
+        local_minor=st.integers(min_value=0, max_value=100),
+        local_patch=st.integers(min_value=0, max_value=100),
+        worker_minor=st.integers(min_value=0, max_value=100),
+        worker_patch=st.integers(min_value=0, max_value=100),
+    )
+    @pytest.mark.asyncio
+    async def test__worker_sentinel_with_compatible_version(
+        self,
+        mock_proxy_session,
+        local_major,
+        local_minor,
+        local_patch,
+        worker_minor,
+        worker_patch,
+        mocker: MockerFixture,
+    ):
+        """Test workers with version >= client are accepted.
+
+        Given:
+            A proxy with version X.a.b and a worker with version
+            X.c.d where (c, d) >= (a, b) (same major, worker not
+            older)
+        When:
+            The worker is discovered via static workers list
+        Then:
+            The worker is accepted into the load balancer context.
+        """
+        from hypothesis import assume
+
+        assume((worker_minor, worker_patch) >= (local_minor, local_patch))
+
+        # Arrange
+        local_version = f"{local_major}.{local_minor}.{local_patch}"
+        worker_version = f"{local_major}.{worker_minor}.{worker_patch}"
+        mocker.patch.object(protocol, "__version__", local_version)
+
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50051",
+            pid=1234,
+            version=worker_version,
+        )
+
+        proxy = WorkerProxy(workers=[worker])
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.05)
+
+        # Assert
+        assert worker in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        local_major=st.integers(min_value=0, max_value=100),
+        local_minor=st.integers(min_value=1, max_value=100),
+        local_patch=st.integers(min_value=0, max_value=100),
+        worker_minor=st.integers(min_value=0, max_value=100),
+        worker_patch=st.integers(min_value=0, max_value=100),
+    )
+    @pytest.mark.asyncio
+    async def test__worker_sentinel_with_older_worker_same_major(
+        self,
+        mock_proxy_session,
+        local_major,
+        local_minor,
+        local_patch,
+        worker_minor,
+        worker_patch,
+        mocker: MockerFixture,
+    ):
+        """Test workers older than client are rejected.
+
+        Given:
+            A proxy with version X.a.b and a worker with version
+            X.c.d where (c, d) < (a, b) (same major, worker older)
+        When:
+            The worker is discovered via static workers list
+        Then:
+            The worker is rejected from the load balancer context.
+        """
+        from hypothesis import assume
+
+        assume((worker_minor, worker_patch) < (local_minor, local_patch))
+
+        # Arrange
+        local_version = f"{local_major}.{local_minor}.{local_patch}"
+        worker_version = f"{local_major}.{worker_minor}.{worker_patch}"
+        mocker.patch.object(protocol, "__version__", local_version)
+
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50051",
+            pid=1234,
+            version=worker_version,
+        )
+
+        proxy = WorkerProxy(workers=[worker])
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.05)
+
+        # Assert
+        assert worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        local_major=st.integers(min_value=0, max_value=100),
+        worker_major=st.integers(min_value=0, max_value=100),
+    )
+    @pytest.mark.asyncio
+    async def test__worker_sentinel_with_incompatible_major_version(
+        self,
+        mock_proxy_session,
+        local_major,
+        worker_major,
+        mocker: MockerFixture,
+    ):
+        """Test workers with different major version are rejected.
+
+        Given:
+            A proxy with major version X and a worker with a
+            different major version Y
+        When:
+            The worker is discovered via static workers list
+        Then:
+            The worker is rejected from the load balancer context.
+        """
+        from hypothesis import assume
+
+        assume(local_major != worker_major)
+
+        # Arrange
+        local_version = f"{local_major}.0.0"
+        worker_version = f"{worker_major}.0.0"
+        mocker.patch.object(protocol, "__version__", local_version)
+
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50051",
+            pid=1234,
+            version=worker_version,
+        )
+
+        proxy = WorkerProxy(workers=[worker])
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.05)
+
+        # Assert
+        assert worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        version_text=st.text(min_size=0, max_size=20).filter(
+            lambda s: not s or not s.split(".")[0].strip().isdigit()
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test__worker_sentinel_with_unparseable_version(
+        self,
+        mock_proxy_session,
+        version_text,
+        mocker: MockerFixture,
+    ):
+        """Test workers with unparseable version are rejected.
+
+        Given:
+            A proxy with a valid version and a worker whose
+            version string is not valid PEP 440
+        When:
+            The worker is discovered via static workers list
+        Then:
+            The worker is rejected from the load balancer context.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50051",
+            pid=1234,
+            version=version_text,
+        )
+
+        proxy = WorkerProxy(workers=[worker])
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.05)
+
+        # Assert
+        assert worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test__worker_sentinel_with_combined_security_and_version_filter(
+        self,
+        mock_proxy_session,
+        mocker: MockerFixture,
+    ):
+        """Test version filter applies alongside security filter.
+
+        Given:
+            A proxy with credentials and version 1.x
+        When:
+            A secure worker with version 2.y is discovered
+        Then:
+            The worker is rejected (version filter applies alongside
+            security filter).
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        mock_credentials = object()
+
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50051",
+            pid=1234,
+            version="2.0.0",
+            secure=True,
+        )
+
+        proxy = WorkerProxy(
+            workers=[worker],
+            credentials=mock_credentials,
+        )
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.05)
+
+        # Assert
+        assert worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
 
 
 # ============================================================================
