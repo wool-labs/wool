@@ -1356,3 +1356,820 @@ class TestCurrentTask:
             # (except the first one which has no caller)
             if i > 0:
                 assert tasks[i].caller == tasks[i - 1].id
+
+
+class TestNamespaceIsolation:
+    """Tests for Task namespace parameter and namespace isolation."""
+
+    # NS-001: Default namespace=None when not specified
+    def test_default_namespace_none(self, sample_task, clear_event_handlers):
+        """Test Task defaults namespace to None.
+
+        Given:
+            A Task created without specifying namespace
+        When:
+            Task is instantiated
+        Then:
+            The namespace field defaults to None
+        """
+        # Arrange & Act
+        task = sample_task()
+
+        # Assert
+        assert task.namespace is None
+
+    # NS-002: Explicit namespace=None
+    def test_explicit_namespace_none(self, sample_task, clear_event_handlers):
+        """Test Task with explicit namespace=None.
+
+        Given:
+            A Task created with namespace=None
+        When:
+            Task is instantiated
+        Then:
+            The namespace field is None
+        """
+        # Arrange & Act
+        task = sample_task(namespace=None)
+
+        # Assert
+        assert task.namespace is None
+
+    # NS-003: Explicit namespace with WORKER sentinel
+    def test_explicit_namespace_worker(self, sample_task, clear_event_handlers):
+        """Test Task with namespace=WORKER.
+
+        Given:
+            A Task created with namespace=WORKER
+        When:
+            Task is instantiated
+        Then:
+            The namespace field is the WORKER sentinel
+        """
+        from wool.runtime.routine.task import WORKER
+
+        # Arrange & Act
+        task = sample_task(namespace=WORKER)
+
+        # Assert
+        assert task.namespace == WORKER
+
+    # NS-004: Explicit named namespace
+    def test_explicit_named_namespace(self, sample_task, clear_event_handlers):
+        """Test Task with explicit named namespace.
+
+        Given:
+            A Task created with namespace="cache"
+        When:
+            Task is instantiated
+        Then:
+            The namespace field is "cache"
+        """
+        # Arrange & Act
+        task = sample_task(namespace="cache")
+
+        # Assert
+        assert task.namespace == "cache"
+
+    # NS-005: Isolation - coroutine globals not visible after execution
+    @pytest.mark.asyncio
+    async def test_isolation_coroutine_globals_not_visible(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test isolated coroutine globals are not visible after execution.
+
+        Given:
+            A Task with namespace=None (default)
+        When:
+            The callable sets a global variable
+        Then:
+            The global variable is not visible in the original namespace
+        """
+
+        # Arrange
+        async def test_callable():
+            global isolation_test_var
+            isolation_test_var = "modified"  # noqa: F841
+            return "result"
+
+        task = sample_task(callable=test_callable, namespace=None)
+
+        # Act
+        result = await task.dispatch()
+
+        # Assert
+        assert result == "result"
+        # The global should not be set in the original namespace
+        assert "isolation_test_var" not in globals()
+
+    # NS-006: Worker namespace - coroutine globals persist
+    @pytest.mark.asyncio
+    async def test_worker_namespace_coroutine_globals_persist(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test worker namespace coroutine globals persist after execution.
+
+        Given:
+            A Task with namespace=WORKER
+        When:
+            The callable sets a global variable
+        Then:
+            The global variable is visible in the original namespace
+        """
+        from wool.runtime.routine.task import WORKER
+
+        # Arrange
+        async def test_callable():
+            global shared_test_var
+            shared_test_var = "modified"
+            return shared_test_var
+
+        task = sample_task(callable=test_callable, namespace=WORKER)
+
+        # Act
+        result = await task.dispatch()
+
+        # Assert
+        assert result == "modified"
+        # The global should be set in the original namespace
+        assert globals().get("shared_test_var") == "modified"
+
+        # Cleanup
+        del globals()["shared_test_var"]
+
+    # NS-007: Isolation - async generator globals not visible
+    @pytest.mark.asyncio
+    async def test_isolation_async_generator_globals_not_visible(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test isolated async generator globals are not visible after execution.
+
+        Given:
+            A Task with async generator callable and namespace=None
+        When:
+            The callable sets a global variable
+        Then:
+            The global variable is not visible in the original namespace
+        """
+
+        # Arrange
+        async def test_generator():
+            global isolation_gen_var
+            isolation_gen_var = "generator_modified"  # noqa: F841
+            yield "value"
+
+        task = sample_task(callable=test_generator, namespace=None)
+
+        # Act
+        results = []
+        async for value in task.dispatch():
+            results.append(value)
+
+        # Assert
+        assert results == ["value"]
+        assert "isolation_gen_var" not in globals()
+
+    # NS-008: Worker namespace - async generator globals persist
+    @pytest.mark.asyncio
+    async def test_worker_namespace_async_generator_globals_persist(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test worker namespace async generator globals persist after execution.
+
+        Given:
+            A Task with async generator callable and namespace=WORKER
+        When:
+            The callable sets a global variable
+        Then:
+            The global variable is visible in the original namespace
+        """
+        from wool.runtime.routine.task import WORKER
+
+        # Arrange
+        async def test_generator():
+            global shared_gen_var
+            shared_gen_var = "generator_modified"
+            yield shared_gen_var
+
+        task = sample_task(callable=test_generator, namespace=WORKER)
+
+        # Act
+        results = []
+        async for value in task.dispatch():
+            results.append(value)
+
+        # Assert
+        assert results == ["generator_modified"]
+        assert globals().get("shared_gen_var") == "generator_modified"
+
+        # Cleanup
+        del globals()["shared_gen_var"]
+
+    # NS-009: Read-through - module imports accessible via overlay
+    @pytest.mark.asyncio
+    async def test_read_through_module_imports_accessible(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test isolated tasks can read module-level imports.
+
+        Given:
+            A Task with namespace=None
+        When:
+            The callable accesses a module-level import
+        Then:
+            The import is accessible through the overlay
+        """
+
+        # Arrange
+        async def test_callable():
+            # Should be able to access uuid4 imported at module level
+            return uuid4()
+
+        task = sample_task(callable=test_callable, namespace=None)
+
+        # Act
+        result = await task.dispatch()
+
+        # Assert - should return a valid UUID
+        from uuid import UUID
+
+        assert isinstance(result, UUID)
+
+    # NS-010: Write isolation - shadowed imports don't affect original
+    @pytest.mark.asyncio
+    async def test_write_isolation_shadowed_imports_dont_affect_original(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test shadowed module-level names don't affect original namespace.
+
+        Given:
+            A Task with namespace=None
+        When:
+            The callable shadows a module-level name
+        Then:
+            The original module-level name is unchanged
+        """
+        # Arrange - capture the original uuid4 reference
+        from uuid import uuid4 as original_uuid4
+
+        # Store original reference for comparison
+        original_ref = uuid4
+
+        async def test_callable():
+            global uuid4
+            uuid4 = lambda: "fake_uuid"  # noqa: F841, E731
+            return "done"
+
+        task = sample_task(callable=test_callable, namespace=None)
+
+        # Act
+        await task.dispatch()
+
+        # Assert - uuid4 in this test file should still be the original function
+        # We compare against the captured original reference
+        assert uuid4 is original_ref
+        assert uuid4 is original_uuid4
+
+    # NS-011: Closure variables preserved with isolation
+    @pytest.mark.asyncio
+    async def test_closure_variables_preserved_with_isolation(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test closure variables work correctly with isolation.
+
+        Given:
+            A Task with namespace=None and a callable with closure
+        When:
+            The callable accesses closure variables
+        Then:
+            The closure variables are accessible
+        """
+        # Arrange
+        captured_value = "closure_value"
+
+        async def test_callable():
+            return captured_value
+
+        task = sample_task(callable=test_callable, namespace=None)
+
+        # Act
+        result = await task.dispatch()
+
+        # Assert
+        assert result == "closure_value"
+
+    # NS-012: from_protobuf with namespace set
+    @pytest.mark.asyncio
+    async def test_from_protobuf_with_namespace(
+        self, sample_async_callable, picklable_proxy, clear_event_handlers
+    ):
+        """Test from_protobuf correctly deserializes namespace.
+
+        Given:
+            A protobuf Task message with namespace="cache"
+        When:
+            from_protobuf is called
+        Then:
+            The deserialized Task has namespace="cache"
+        """
+        # Arrange
+        task_id = uuid4()
+        pb_task = pb.task.Task(
+            id=str(task_id),
+            callable=cloudpickle.dumps(sample_async_callable),
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            proxy=cloudpickle.dumps(picklable_proxy),
+            proxy_id=str(picklable_proxy.id),
+            namespace="cache",
+        )
+
+        # Act
+        task = Task.from_protobuf(pb_task)
+
+        # Assert
+        assert task.namespace == "cache"
+
+    # NS-013: from_protobuf with WORKER namespace
+    @pytest.mark.asyncio
+    async def test_from_protobuf_with_worker_namespace(
+        self, sample_async_callable, picklable_proxy, clear_event_handlers
+    ):
+        """Test from_protobuf correctly deserializes WORKER namespace.
+
+        Given:
+            A protobuf Task message with namespace=WORKER
+        When:
+            from_protobuf is called
+        Then:
+            The deserialized Task has namespace=WORKER
+        """
+        from wool.runtime.routine.task import WORKER
+
+        # Arrange
+        task_id = uuid4()
+        pb_task = pb.task.Task(
+            id=str(task_id),
+            callable=cloudpickle.dumps(sample_async_callable),
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            proxy=cloudpickle.dumps(picklable_proxy),
+            proxy_id=str(picklable_proxy.id),
+            namespace=WORKER,
+        )
+
+        # Act
+        task = Task.from_protobuf(pb_task)
+
+        # Assert
+        assert task.namespace == WORKER
+
+    # NS-014: from_protobuf defaults to None when field absent
+    @pytest.mark.asyncio
+    async def test_from_protobuf_defaults_none_when_absent(
+        self, sample_async_callable, picklable_proxy, clear_event_handlers
+    ):
+        """Test from_protobuf defaults namespace to None when field is absent.
+
+        Given:
+            A protobuf Task message without namespace field set
+        When:
+            from_protobuf is called
+        Then:
+            The deserialized Task has namespace=None (default)
+        """
+        # Arrange
+        task_id = uuid4()
+        pb_task = pb.task.Task(
+            id=str(task_id),
+            callable=cloudpickle.dumps(sample_async_callable),
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            proxy=cloudpickle.dumps(picklable_proxy),
+            proxy_id=str(picklable_proxy.id),
+            # namespace intentionally not set
+        )
+
+        # Act
+        task = Task.from_protobuf(pb_task)
+
+        # Assert
+        assert task.namespace is None
+
+    # NS-015: to_protobuf serializes namespace
+    def test_to_protobuf_serializes_namespace(
+        self, sample_async_callable, picklable_proxy, clear_event_handlers
+    ):
+        """Test to_protobuf correctly serializes namespace.
+
+        Given:
+            A Task with namespace="cache"
+        When:
+            to_protobuf is called
+        Then:
+            The protobuf Task has namespace="cache"
+        """
+        # Arrange
+        task = Task(
+            id=uuid4(),
+            callable=sample_async_callable,
+            args=(),
+            kwargs={},
+            proxy=picklable_proxy,
+            namespace="cache",
+        )
+
+        # Act
+        pb_task = task.to_protobuf()
+
+        # Assert
+        assert pb_task.namespace == "cache"
+
+    # NS-016: to_protobuf serializes namespace=None as empty string
+    def test_to_protobuf_serializes_namespace_none(
+        self, sample_async_callable, picklable_proxy, clear_event_handlers
+    ):
+        """Test to_protobuf correctly serializes namespace=None.
+
+        Given:
+            A Task with namespace=None
+        When:
+            to_protobuf is called
+        Then:
+            The protobuf Task has namespace=""
+        """
+        # Arrange
+        task = Task(
+            id=uuid4(),
+            callable=sample_async_callable,
+            args=(),
+            kwargs={},
+            proxy=picklable_proxy,
+            namespace=None,
+        )
+
+        # Act
+        pb_task = task.to_protobuf()
+
+        # Assert
+        assert pb_task.namespace == ""
+
+    # NS-EC-001: Mutable object mutation visible (overlay semantics)
+    @pytest.mark.asyncio
+    async def test_mutable_object_mutation_visible(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test mutable object mutations are visible through overlay.
+
+        Given:
+            A Task with namespace=None accessing a mutable global
+        When:
+            The callable mutates the mutable object
+        Then:
+            The mutation is visible (ChainMap semantics allow this)
+        """
+        # Arrange
+        mutable_list = [1, 2, 3]
+
+        async def test_callable():
+            # Mutations to mutable objects accessed from parent globals
+            # are visible because we get a reference to the original object
+            mutable_list.append(4)
+            return mutable_list
+
+        task = sample_task(callable=test_callable, namespace=None)
+
+        # Act
+        result = await task.dispatch()
+
+        # Assert - mutation is visible because we mutated the same object
+        assert result == [1, 2, 3, 4]
+        assert mutable_list == [1, 2, 3, 4]
+
+    # NS-EC-002: Deletion affects overlay only
+    @pytest.mark.asyncio
+    async def test_deletion_affects_overlay_only(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test deletion in isolated namespace doesn't affect original.
+
+        Given:
+            A Task with namespace=None
+        When:
+            The callable shadows then deletes a global name
+        Then:
+            The original namespace is unaffected
+        """
+        # Arrange - define a module-level variable for this test
+        global deletion_test_var
+        deletion_test_var = "original"
+
+        async def test_callable():
+            global deletion_test_var
+            deletion_test_var = "shadowed"  # noqa: F841
+            # Deletion in overlay should not raise (shadows the original)
+            del deletion_test_var
+            return "done"
+
+        task = sample_task(callable=test_callable, namespace=None)
+
+        # Act
+        result = await task.dispatch()
+
+        # Assert
+        assert result == "done"
+        # Original should be unaffected
+        assert globals().get("deletion_test_var") == "original"
+
+        # Cleanup
+        del globals()["deletion_test_var"]
+
+    # NS-EC-003: Isolation through nested function calls
+    @pytest.mark.asyncio
+    async def test_isolation_through_nested_function_calls(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test isolation is maintained through nested function calls.
+
+        Given:
+            A Task with namespace=None calling a nested function
+        When:
+            The nested function sets a global
+        Then:
+            The global is isolated to the overlay
+        """
+
+        # Arrange
+        async def test_callable():
+            def nested_helper():
+                global nested_isolation_var
+                nested_isolation_var = "from_nested"  # noqa: F841
+
+            nested_helper()
+            return "done"
+
+        task = sample_task(callable=test_callable, namespace=None)
+
+        # Act
+        await task.dispatch()
+
+        # Assert - nested globals should also be isolated
+        # Note: The nested function has its own globals reference,
+        # so this tests the isolation behavior for the main callable
+        assert "nested_isolation_var" not in globals()
+
+    # NS-EC-004: Isolation maintained on exception
+    @pytest.mark.asyncio
+    async def test_isolation_maintained_on_exception(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test isolation is maintained even when exception is raised.
+
+        Given:
+            A Task with namespace=None that raises an exception
+        When:
+            The callable sets a global then raises
+        Then:
+            The global is still isolated
+        """
+
+        # Arrange
+        async def test_callable():
+            global exception_test_var
+            exception_test_var = "before_exception"  # noqa: F841
+            raise ValueError("Test exception")
+
+        task = sample_task(callable=test_callable, namespace=None)
+
+        # Act
+        with pytest.raises(ValueError, match="Test exception"):
+            await task.dispatch()
+
+        # Assert - global should still be isolated
+        assert "exception_test_var" not in globals()
+
+    # NS-EC-005: Isolation maintained on cancellation
+    @pytest.mark.asyncio
+    async def test_isolation_maintained_on_cancellation(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test isolation is maintained when task is cancelled.
+
+        Given:
+            A Task with namespace=None that gets cancelled
+        When:
+            The callable sets a global then is cancelled
+        Then:
+            The global is still isolated
+        """
+
+        # Arrange
+        async def test_callable():
+            global cancellation_test_var
+            cancellation_test_var = "before_cancel"  # noqa: F841
+            await asyncio.sleep(10)  # Will be cancelled
+            return "not reached"
+
+        task = sample_task(callable=test_callable, namespace=None)
+
+        # Act
+        async def run_and_cancel():
+            task_coro = asyncio.create_task(task.dispatch())
+            await asyncio.sleep(0.01)
+            task_coro.cancel()
+            try:
+                await task_coro
+            except asyncio.CancelledError:
+                pass
+
+        await run_and_cancel()
+
+        # Assert - global should still be isolated
+        assert "cancellation_test_var" not in globals()
+
+    # NS-SHARE-001: Named namespace shares globals between tasks
+    @pytest.mark.asyncio
+    async def test_named_namespace_shares_globals(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test that tasks with same namespace share globals.
+
+        Given:
+            Two Tasks with namespace="shared"
+        When:
+            First task sets a global, second task reads it
+        Then:
+            The second task should see the global set by the first
+        """
+        from wool.runtime.routine.task import _namespace_registry
+
+        # Arrange
+        async def setter():
+            global shared_namespace_var
+            shared_namespace_var = "from_first_task"
+            return "done"
+
+        async def getter():
+            global shared_namespace_var
+            return shared_namespace_var
+
+        task1 = sample_task(callable=setter, namespace="shared_test")
+        task2 = sample_task(callable=getter, namespace="shared_test")
+
+        # Act
+        await task1.dispatch()
+        result = await task2.dispatch()
+
+        # Assert
+        assert result == "from_first_task"
+
+        # Cleanup - clear the namespace registry
+        await _namespace_registry.clear("shared_test")
+
+    # NS-SHARE-002: Different namespaces are isolated
+    @pytest.mark.asyncio
+    async def test_different_namespaces_isolated(
+        self, sample_task, mock_worker_proxy_cache, clear_event_handlers
+    ):
+        """Test that tasks with different namespaces are isolated.
+
+        Given:
+            Two Tasks with different namespaces
+        When:
+            First task sets a global, second task tries to read it
+        Then:
+            The second task should not see the global
+        """
+        from wool.runtime.routine.task import _namespace_registry
+
+        # Arrange
+        async def setter():
+            global isolated_namespace_var
+            isolated_namespace_var = "from_first_task"
+            return "done"
+
+        async def getter():
+            global isolated_namespace_var
+            try:
+                return isolated_namespace_var
+            except NameError:
+                return "not_found"
+
+        task1 = sample_task(callable=setter, namespace="ns_a")
+        task2 = sample_task(callable=getter, namespace="ns_b")
+
+        # Act
+        await task1.dispatch()
+        result = await task2.dispatch()
+
+        # Assert - different namespace should not see the variable
+        assert result == "not_found"
+
+        # Cleanup
+        await _namespace_registry.clear("ns_a")
+        await _namespace_registry.clear("ns_b")
+
+    # PBT-NS-001: Serialization round-trip preserves namespace
+    @settings(max_examples=50, deadline=None)
+    @given(
+        namespace_value=st.one_of(
+            st.none(),
+            st.text(
+                min_size=1,
+                max_size=20,
+                alphabet=st.characters(
+                    whitelist_categories=("Lu", "Ll", "Nd"), whitelist_characters="_-"
+                ),
+            ),
+        )
+    )
+    @pytest.mark.asyncio
+    async def test_serialization_roundtrip_preserves_namespace(
+        self,
+        namespace_value,
+    ):
+        """Property-based test: namespace survives serialization round-trip.
+
+        Given:
+            A Task with any namespace value
+        When:
+            Serialized to protobuf and deserialized
+        Then:
+            The namespace value is preserved
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        proxy = PicklableProxy()
+        original_task = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=(),
+            kwargs={},
+            proxy=proxy,
+            namespace=namespace_value,
+        )
+
+        # Act
+        pb_task = original_task.to_protobuf()
+        deserialized_task = Task.from_protobuf(pb_task)
+
+        # Assert
+        assert deserialized_task.namespace == original_task.namespace
+
+    # PBT-NS-002: Multiple executions have isolated globals with namespace=None
+    @settings(
+        max_examples=10,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(execution_count=st.integers(min_value=2, max_value=5))
+    @pytest.mark.asyncio
+    async def test_multiple_executions_have_isolated_globals(
+        self,
+        execution_count,
+        mock_worker_proxy_cache,
+        clear_event_handlers,
+    ):
+        """Property-based test: Each execution has isolated globals.
+
+        Given:
+            A Task with namespace=None
+        When:
+            Executed multiple times
+        Then:
+            Each execution has isolated globals
+        """
+        # Arrange
+        execution_results = []
+
+        async def test_callable():
+            global multi_exec_var
+            try:
+                # Try to access the variable from previous execution
+                _ = multi_exec_var
+                execution_results.append("found")
+            except NameError:
+                execution_results.append("not_found")
+            multi_exec_var = "set"  # noqa: F841
+            return "done"
+
+        proxy = PicklableProxy()
+
+        # Act - execute multiple times
+        for _ in range(execution_count):
+            task = Task(
+                id=uuid4(),
+                callable=test_callable,
+                args=(),
+                kwargs={},
+                proxy=proxy,
+                namespace=None,
+            )
+            await task.dispatch()
+
+        # Assert - each execution should not find the variable from previous
+        # (first execution gets NameError, all should get NameError with isolation)
+        assert all(r == "not_found" for r in execution_results)
