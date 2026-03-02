@@ -9,15 +9,26 @@ import cloudpickle
 import grpc
 import pytest
 from grpc import StatusCode
+from hypothesis import HealthCheck
+from hypothesis import assume
+from hypothesis import given
+from hypothesis import settings
+from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool.runtime import protobuf as pb
-from wool.runtime.protobuf.worker import WorkerStub
-from wool.runtime.protobuf.worker import add_WorkerServicer_to_server
+from wool import protocol
+from wool.protocol.worker import WorkerStub
+from wool.protocol.worker import add_WorkerServicer_to_server
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskEvent
+from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
 from wool.runtime.worker.service import _ReadOnlyEvent
+
+
+@pytest.fixture(scope="function")
+def grpc_interceptors():
+    return [VersionInterceptor()]
 
 
 @pytest.fixture(scope="function")
@@ -105,7 +116,7 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
             if _control_event and not _control_event.is_set():
                 _control_event.set()
             if not service.stopped.is_set():
-                stop_request = pb.worker.StopRequest(timeout=1)
+                stop_request = protocol.worker.StopRequest(timeout=1)
                 await stub.stop(stop_request)
             _control_event = None
 
@@ -334,7 +345,7 @@ class TestWorkerService:
             # Initiate stop (service enters stopping state)
             # Use wait=0 to immediately cancel tasks, but we'll check before tasks finish
             stop_task = asyncio.ensure_future(
-                stub.stop(pb.worker.StopRequest(timeout=5))
+                stub.stop(protocol.worker.StopRequest(timeout=5))
             )
 
             await asyncio.wait_for(service.stopping.wait(), 1)
@@ -393,7 +404,7 @@ class TestWorkerService:
         async with service_fixture as (service, event, stub):
             # Complete the task and stop the service
             event.set()
-            await stub.stop(pb.worker.StopRequest(timeout=5))
+            await stub.stop(protocol.worker.StopRequest(timeout=5))
 
             # Verify service is stopped
             assert service.stopping.is_set()
@@ -523,7 +534,7 @@ class TestWorkerService:
                 break
 
             # Stop with 0 second timeout in order to cancel tasks immediately
-            stop_request = pb.worker.StopRequest(timeout=0)
+            stop_request = protocol.worker.StopRequest(timeout=0)
             stop_result = await stub.stop(stop_request)
 
             # Assert
@@ -533,7 +544,7 @@ class TestWorkerService:
                 assert isinstance(exception, asyncio.CancelledError)
                 break
 
-            assert isinstance(stop_result, pb.worker.Void)
+            assert isinstance(stop_result, protocol.worker.Void)
             assert grpc_servicer.stopping.is_set()
             assert grpc_servicer.stopped.is_set()
             mock_worker_proxy_cache.clear.assert_called_once()
@@ -584,7 +595,7 @@ class TestWorkerService:
                 break
 
             # Stop with 5 second timeout to allow tasks to complete
-            stop_request = pb.worker.StopRequest(timeout=5)
+            stop_request = protocol.worker.StopRequest(timeout=5)
             stop_result = await stub.stop(stop_request)
 
             # Assert
@@ -594,7 +605,7 @@ class TestWorkerService:
                 assert result == "completed"
                 break
 
-            assert isinstance(stop_result, pb.worker.Void)
+            assert isinstance(stop_result, protocol.worker.Void)
             assert grpc_servicer.stopping.is_set()
             assert grpc_servicer.stopped.is_set()
             mock_worker_proxy_cache.clear.assert_called_once()
@@ -667,11 +678,11 @@ class TestWorkerService:
         async with service_fixture as (service, event, stub):
             # Act - stop with a very short timeout; the controllable task
             # won't complete because the event is never set in time
-            stop_request = pb.worker.StopRequest(timeout=0.05)
+            stop_request = protocol.worker.StopRequest(timeout=0.05)
             stop_result = await stub.stop(stop_request)
 
             # Assert
-            assert isinstance(stop_result, pb.worker.Void)
+            assert isinstance(stop_result, protocol.worker.Void)
             assert service.stopping.is_set()
             assert service.stopped.is_set()
 
@@ -690,14 +701,14 @@ class TestWorkerService:
             It should signal stopped state and call proxy_pool.clear()
         """
         # Arrange
-        stop_request = pb.worker.StopRequest(timeout=10)
+        stop_request = protocol.worker.StopRequest(timeout=10)
 
         # Act
         async with grpc_aio_stub() as stub:
             stop_result = await asyncio.wait_for(stub.stop(stop_request), 1)
 
         # Assert - Verify behavior through public API
-        assert isinstance(stop_result, pb.worker.Void)
+        assert isinstance(stop_result, protocol.worker.Void)
         assert grpc_servicer.stopping.is_set()
         assert grpc_servicer.stopped.is_set()
         # Verify proxy_pool.clear() was called
@@ -719,7 +730,7 @@ class TestWorkerService:
         async with service_fixture as (service, event, stub):
             # Initiate stop (service enters stopping state)
             stop_task = asyncio.ensure_future(
-                stub.stop(pb.worker.StopRequest(timeout=5))
+                stub.stop(protocol.worker.StopRequest(timeout=5))
             )
 
             # Wait for service to enter stopping state
@@ -727,10 +738,10 @@ class TestWorkerService:
             assert not service.stopped.is_set()
 
             # Act - Call stop again while already stopping
-            result = await stub.stop(pb.worker.StopRequest(timeout=1))
+            result = await stub.stop(protocol.worker.StopRequest(timeout=1))
 
             # Assert - Verify behavior
-            assert isinstance(result, pb.worker.Void)
+            assert isinstance(result, protocol.worker.Void)
             assert service.stopping.is_set()
 
             # Cleanup - let the original task complete so first stop can finish
@@ -756,17 +767,17 @@ class TestWorkerService:
         async with service_fixture as (service, event, stub):
             # Complete the task and stop the service
             event.set()
-            await stub.stop(pb.worker.StopRequest(timeout=5))
+            await stub.stop(protocol.worker.StopRequest(timeout=5))
 
             # Verify service is fully stopped
             assert service.stopping.is_set()
             assert service.stopped.is_set()
 
             # Act - Call stop again while already stopped
-            result = await stub.stop(pb.worker.StopRequest(timeout=1))
+            result = await stub.stop(protocol.worker.StopRequest(timeout=1))
 
             # Assert - Verify behavior
-            assert isinstance(result, pb.worker.Void)
+            assert isinstance(result, protocol.worker.Void)
             assert service.stopping.is_set()
             assert service.stopped.is_set()
 
@@ -789,7 +800,7 @@ class TestWorkerService:
         async with service_fixture as (service, event, stub):
             # Initiate stop with negative timeout (treated as indefinite wait)
             stop_task = asyncio.ensure_future(
-                stub.stop(pb.worker.StopRequest(timeout=-1))
+                stub.stop(protocol.worker.StopRequest(timeout=-1))
             )
 
             # Wait for service to enter stopping state
@@ -801,7 +812,7 @@ class TestWorkerService:
 
             # Act & Assert
             stop_result = await asyncio.wait_for(stop_task, 5)
-            assert isinstance(stop_result, pb.worker.Void)
+            assert isinstance(stop_result, protocol.worker.Void)
             assert service.stopped.is_set()
 
     @pytest.mark.asyncio
@@ -1093,11 +1104,11 @@ class TestWorkerService:
                 break
 
             # Stop immediately to cancel the generator
-            stop_request = pb.worker.StopRequest(timeout=0)
+            stop_request = protocol.worker.StopRequest(timeout=0)
             stop_result = await stub.stop(stop_request)
 
             # Assert
-            assert isinstance(stop_result, pb.worker.Void)
+            assert isinstance(stop_result, protocol.worker.Void)
             assert grpc_servicer.stopping.is_set()
             assert grpc_servicer.stopped.is_set()
 
@@ -1191,3 +1202,261 @@ class TestWorkerService:
         # Cleanup worker loops
         for entry in service._loop_pool._cache.values():
             WorkerService._destroy_worker_loop(entry.obj)
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_with_version_in_ack(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch returns Ack with protocol version.
+
+        Given:
+            A running WorkerService
+        When:
+            A task is dispatched with a compatible version
+        Then:
+            The Ack response contains the protocol version.
+        """
+
+        # Arrange
+        async def sample_task():
+            return "test_result"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        ack_response = responses[0]
+        assert ack_response.HasField("ack")
+        assert ack_response.ack.version == protocol.__version__
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_with_empty_client_version(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch rejects tasks with empty version field.
+
+        Given:
+            A running WorkerService with the version interceptor
+        When:
+            A task with empty version field is dispatched
+        Then:
+            The worker responds with a Nack citing unparseable
+            version.
+        """
+
+        # Arrange
+        async def sample_task():
+            return "test_result"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+        request.ClearField("version")
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 1
+        assert responses[0].HasField("nack")
+        assert "Unparseable version" in responses[0].nack.reason
+
+    @settings(
+        max_examples=20,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        local_major=st.integers(min_value=0, max_value=100),
+        client_major=st.integers(min_value=0, max_value=100),
+    )
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_with_incompatible_major_version(
+        self,
+        grpc_aio_stub,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        local_major,
+        client_major,
+    ):
+        """Test dispatch yields Nack for incompatible major version.
+
+        Given:
+            Two semver-like version strings with different major
+            versions
+        When:
+            A task is dispatched with the client version through the
+            version interceptor
+        Then:
+            The dispatch yields a Nack with a reason citing
+            incompatible, empty, or unparseable version.
+        """
+        assume(local_major != client_major)
+
+        # Arrange
+        mocker.patch.object(protocol, "__version__", f"{local_major}.0.0")
+
+        async def sample_task():
+            return "should_not_execute"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+        # Override version field to simulate incompatible client
+        request.version = f"{client_major}.0.0"
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 1
+        assert responses[0].HasField("nack")
+        assert "Incompatible version" in responses[0].nack.reason
+
+    @settings(
+        max_examples=20,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        major=st.integers(min_value=0, max_value=100),
+        local_minor=st.integers(min_value=0, max_value=99),
+        client_minor=st.integers(min_value=1, max_value=100),
+    )
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_with_newer_client_same_major(
+        self,
+        grpc_aio_stub,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        major,
+        local_minor,
+        client_minor,
+    ):
+        """Test dispatch yields Nack when client is newer than worker.
+
+        Given:
+            A worker with version X.a.0 and a client with version
+            X.b.0 where b > a (same major, no forward compatibility)
+        When:
+            A task is dispatched through the version interceptor
+        Then:
+            The dispatch yields a Nack with a reason citing
+            incompatible version.
+        """
+        assume(client_minor > local_minor)
+
+        # Arrange
+        mocker.patch.object(protocol, "__version__", f"{major}.{local_minor}.0")
+
+        async def sample_task():
+            return "should_not_execute"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+        request.version = f"{major}.{client_minor}.0"
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 1
+        assert responses[0].HasField("nack")
+        assert "Incompatible version" in responses[0].nack.reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_task_that_returns")
+    async def test_dispatch_with_unparseable_client_version(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch rejects tasks with unparseable version.
+
+        Given:
+            A running WorkerService with the version interceptor
+        When:
+            A task with unparseable version string is dispatched
+        Then:
+            The worker responds with a Nack citing unparseable
+            version.
+        """
+
+        # Arrange
+        async def sample_task():
+            return "should_not_execute"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = wool_task.to_protobuf()
+        request.version = "not-a-version"
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch(request)
+            responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 1
+        assert responses[0].HasField("nack")
+        assert "Unparseable version" in responses[0].nack.reason

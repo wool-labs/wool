@@ -31,7 +31,7 @@ from uuid import UUID
 import cloudpickle
 
 import wool
-from wool.runtime import protobuf as pb
+from wool import protocol
 from wool.runtime.event import Event
 
 Args = Tuple
@@ -205,7 +205,7 @@ class Task(Generic[W]):
         return False
 
     @classmethod
-    def from_protobuf(cls, task: pb.task.Task) -> Task:
+    def from_protobuf(cls, task: protocol.task.Task) -> Task:
         return cls(
             id=UUID(task.id),
             callable=cloudpickle.loads(task.callable),
@@ -214,14 +214,12 @@ class Task(Generic[W]):
             caller=UUID(task.caller) if task.caller else None,
             proxy=cloudpickle.loads(task.proxy),
             timeout=task.timeout if task.timeout else 0,
-            filename=task.filename if task.filename else None,
-            function=task.function if task.function else None,
-            line_no=task.line_no if task.line_no else None,
             tag=task.tag if task.tag else None,
         )
 
-    def to_protobuf(self) -> pb.task.Task:
-        return pb.task.Task(
+    def to_protobuf(self) -> protocol.task.Task:
+        return protocol.task.Task(
+            version=protocol.__version__,
             id=str(self.id),
             callable=cloudpickle.dumps(self.callable),
             args=cloudpickle.dumps(self.args),
@@ -230,9 +228,6 @@ class Task(Generic[W]):
             proxy=cloudpickle.dumps(self.proxy),
             proxy_id=str(self.proxy.id),
             timeout=int(self.timeout) if self.timeout else 0,
-            filename=self.filename if self.filename else "",
-            function=self.function if self.function else "",
-            line_no=self.line_no if self.line_no else 0,
             tag=self.tag if self.tag else "",
         )
 

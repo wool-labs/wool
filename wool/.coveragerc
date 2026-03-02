@@ -1,9 +1,10 @@
 [run]
 source = src/wool
-omit = 
+omit =
     src/wool/__init__.py
     src/wool/cli.py
-    src/wool/runtime/protobuf/*
+    src/wool/protocol/*
+
 
 [report]
 show_missing = true

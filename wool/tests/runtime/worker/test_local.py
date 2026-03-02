@@ -295,7 +295,8 @@ class TestLocalWorker:
 
         mocker.patch("grpc.aio.insecure_channel", return_value=mock_channel)
         mocker.patch(
-            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+            "wool.runtime.worker.local.protocol.worker.WorkerStub",
+            return_value=mock_stub,
         )
 
         await worker.stop()
@@ -362,7 +363,8 @@ class TestLocalWorker:
 
         mocker.patch("grpc.aio.insecure_channel", return_value=mock_channel)
         mocker.patch(
-            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+            "wool.runtime.worker.local.protocol.worker.WorkerStub",
+            return_value=mock_stub,
         )
 
         # Should raise - error is not caught in LocalWorker._stop
@@ -487,7 +489,8 @@ class TestLocalWorker:
             "grpc.aio.secure_channel", return_value=mock_channel
         )
         mocker.patch(
-            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+            "wool.runtime.worker.local.protocol.worker.WorkerStub",
+            return_value=mock_stub,
         )
 
         await worker.stop()
@@ -531,7 +534,8 @@ class TestLocalWorker:
             "grpc.aio.insecure_channel", return_value=mock_channel
         )
         mocker.patch(
-            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+            "wool.runtime.worker.local.protocol.worker.WorkerStub",
+            return_value=mock_stub,
         )
 
         await worker.stop()
@@ -575,7 +579,8 @@ class TestLocalWorker:
             "grpc.aio.secure_channel", return_value=mock_channel
         )
         mocker.patch(
-            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+            "wool.runtime.worker.local.protocol.worker.WorkerStub",
+            return_value=mock_stub,
         )
 
         await worker.stop()
@@ -619,7 +624,8 @@ class TestLocalWorker:
             "grpc.aio.secure_channel", return_value=mock_channel
         )
         mocker.patch(
-            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+            "wool.runtime.worker.local.protocol.worker.WorkerStub",
+            return_value=mock_stub,
         )
 
         await worker.stop()
@@ -663,7 +669,8 @@ class TestLocalWorker:
         mocker.patch("grpc.aio.secure_channel", return_value=mock_channel)
         mocker.patch("grpc.aio.insecure_channel", return_value=mock_channel)
         mocker.patch(
-            "wool.runtime.worker.local.pb.worker.WorkerStub", return_value=mock_stub
+            "wool.runtime.worker.local.protocol.worker.WorkerStub",
+            return_value=mock_stub,
         )
 
         # Full lifecycle
