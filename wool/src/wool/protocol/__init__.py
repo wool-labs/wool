@@ -1,6 +1,13 @@
 import os
 import sys
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version
 from typing import Protocol
+
+try:
+    __version__ = version("wool")
+except PackageNotFoundError:
+    __version__ = "unknown"
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 

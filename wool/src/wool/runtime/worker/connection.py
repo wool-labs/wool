@@ -13,13 +13,15 @@ from typing import cast
 import cloudpickle
 import grpc.aio
 
-from wool.runtime import protobuf as pb
+from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.base import resolve_channel_credentials
 
-_DispatchCall: TypeAlias = grpc.aio.UnaryStreamCall[pb.task.Task, pb.worker.Response]
+_DispatchCall: TypeAlias = grpc.aio.UnaryStreamCall[
+    protocol.task.Task, protocol.worker.Response
+]
 
 _T = TypeVar("_T")
 
@@ -29,7 +31,7 @@ class _Channel:
     """Internal holder for a pooled gRPC channel and its resources."""
 
     channel: grpc.aio.Channel
-    stub: pb.worker.WorkerStub
+    stub: protocol.worker.WorkerStub
     semaphore: asyncio.Semaphore
 
     async def close(self):
@@ -55,7 +57,8 @@ def _channel_factory(key):
         channel = grpc.aio.secure_channel(target, resolved, options=options)
     else:
         channel = grpc.aio.insecure_channel(target, options=options)
-    return _Channel(channel, pb.worker.WorkerStub(channel), asyncio.Semaphore(limit))
+    stub = protocol.worker.WorkerStub(channel)
+    return _Channel(channel, stub, asyncio.Semaphore(limit))
 
 
 async def _channel_finalizer(channel: _Channel):
@@ -290,7 +293,7 @@ class WorkerConnection:
         task: Task,
         *,
         timeout: float | None = None,
-    ) -> AsyncGenerator[pb.task.Result, None]:
+    ) -> AsyncGenerator[protocol.task.Result, None]:
         """Dispatch a task to the remote worker for execution.
 
         Sends the task to the worker via gRPC, waits for acknowledgment,
@@ -340,7 +343,7 @@ class WorkerConnection:
             raise
 
         await _channel_pool.release(self._key)
-        return cast(AsyncGenerator[pb.task.Result, None], gen)
+        return cast(AsyncGenerator[protocol.task.Result, None], gen)
 
     async def close(self):
         """Close the connection and release all pooled resources.
@@ -361,6 +364,10 @@ class WorkerConnection:
                 call: _DispatchCall = ch.stub.dispatch(task.to_protobuf())
                 try:
                     response = await anext(aiter(call))
+                    if response.HasField("nack"):
+                        raise RpcError(
+                            details=f"Task rejected by worker: {response.nack.reason}"
+                        )
                     if not response.HasField("ack"):
                         raise UnexpectedResponse(
                             f"Expected 'ack' response, "
@@ -379,7 +386,7 @@ class WorkerConnection:
 
     async def _execute(
         self, call: _DispatchCall
-    ) -> AsyncGenerator[pb.task.Result | None, None]:
+    ) -> AsyncGenerator[protocol.task.Result | None, None]:
         ch = await _channel_pool.acquire(self._key)
         try:
             yield  # Priming yield — signals dispatch() that ref is held

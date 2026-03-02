@@ -37,7 +37,7 @@ class TestSignalHandlers:
         # Mock pb.worker.StopRequest
         mock_stop_request = MagicMock()
         mocker.patch(
-            "wool.runtime.worker.process.pb.worker.StopRequest",
+            "wool.runtime.worker.process.protocol.worker.StopRequest",
             return_value=mock_stop_request,
         )
 
@@ -82,7 +82,7 @@ class TestSignalHandlers:
         # Mock pb.worker.StopRequest
         mock_stop_request = MagicMock()
         mocker.patch(
-            "wool.runtime.worker.process.pb.worker.StopRequest",
+            "wool.runtime.worker.process.protocol.worker.StopRequest",
             return_value=mock_stop_request,
         )
 

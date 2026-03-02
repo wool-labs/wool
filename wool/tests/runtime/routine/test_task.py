@@ -11,7 +11,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 import wool
-from wool.runtime import protobuf as pb
+from wool import protocol
 from wool.runtime.event import Event
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskEvent
@@ -207,7 +207,8 @@ class TestTask:
         args = (1, 2, 3)
         kwargs = {"key": "value"}
 
-        pb_task = pb.task.Task(
+        pb_task = protocol.task.Task(
+            version="0.1.0",
             id=str(task_id),
             callable=cloudpickle.dumps(sample_async_callable),
             args=cloudpickle.dumps(args),
@@ -216,9 +217,6 @@ class TestTask:
             proxy=cloudpickle.dumps(picklable_proxy),
             proxy_id=str(picklable_proxy.id),
             timeout=30,
-            filename="test.py",
-            function="test_function",
-            line_no=42,
             tag="test_tag",
         )
 
@@ -234,9 +232,6 @@ class TestTask:
         assert task.caller == caller_id
         assert task.proxy.id == picklable_proxy.id
         assert task.timeout == 30
-        assert task.filename == "test.py"
-        assert task.function == "test_function"
-        assert task.line_no == 42
         assert task.tag == "test_tag"
 
     @pytest.mark.asyncio
@@ -257,7 +252,7 @@ class TestTask:
         args = ()
         kwargs = {}
 
-        pb_task = pb.task.Task(
+        pb_task = protocol.task.Task(
             id=str(task_id),
             callable=cloudpickle.dumps(sample_async_callable),
             args=cloudpickle.dumps(args),
@@ -266,9 +261,6 @@ class TestTask:
             proxy=cloudpickle.dumps(picklable_proxy),
             proxy_id=str(picklable_proxy.id),
             timeout=0,
-            filename="",
-            function="",
-            line_no=0,
             tag="",
         )
 
@@ -279,9 +271,6 @@ class TestTask:
         assert task.id == task_id
         assert task.caller is None
         assert task.timeout == 0
-        assert task.filename is None
-        assert task.function is None
-        assert task.line_no is None
         assert task.tag is None
 
     def test_to_protobuf_all_fields(
@@ -307,9 +296,6 @@ class TestTask:
             proxy=picklable_proxy,
             caller=caller_id,
             timeout=30,
-            filename="test.py",
-            function="test_function",
-            line_no=42,
             tag="test_tag",
         )
 
@@ -317,6 +303,7 @@ class TestTask:
         pb_task = task.to_protobuf()
 
         # Assert
+        assert pb_task.version != ""
         assert pb_task.id == str(task.id)
         deserialized_callable = cloudpickle.loads(pb_task.callable)
         assert callable(deserialized_callable)
@@ -328,9 +315,6 @@ class TestTask:
         assert deserialized_proxy.id == task.proxy.id
         assert pb_task.proxy_id == str(task.proxy.id)
         assert pb_task.timeout == 30
-        assert pb_task.filename == "test.py"
-        assert pb_task.function == "test_function"
-        assert pb_task.line_no == 42
         assert pb_task.tag == "test_tag"
 
     def test_to_protobuf_none_optionals(
@@ -355,9 +339,6 @@ class TestTask:
             proxy=picklable_proxy,
             caller=None,
             timeout=0,
-            filename=None,
-            function=None,
-            line_no=None,
             tag=None,
         )
 
@@ -367,10 +348,79 @@ class TestTask:
         # Assert
         assert pb_task.caller == ""
         assert pb_task.timeout == 0
-        assert pb_task.filename == ""
-        assert pb_task.function == ""
-        assert pb_task.line_no == 0
         assert pb_task.tag == ""
+
+    def test_to_protobuf_with_version_field(
+        self, sample_async_callable, picklable_proxy, clear_event_handlers
+    ):
+        """Test to_protobuf includes protocol version in version field.
+
+        Given:
+            A Task instance
+        When:
+            to_protobuf() is called
+        Then:
+            The protobuf Task contains the protocol version in the
+            version field.
+        """
+        # Arrange
+        task = Task(
+            id=uuid4(),
+            callable=sample_async_callable,
+            args=(),
+            kwargs={},
+            proxy=picklable_proxy,
+        )
+
+        # Act
+        pb_task = task.to_protobuf()
+
+        # Assert
+        assert pb_task.version == protocol.__version__
+
+    @settings(
+        max_examples=50,
+        deadline=None,
+    )
+    @given(
+        version=st.from_regex(r"\d{1,3}\.\d{1,3}(rc\d{1,3}|\.\d{1,3})", fullmatch=True),
+    )
+    def test_from_protobuf_with_version_roundtrip(self, version):
+        """Test version field round-trips through protobuf serialization.
+
+        Given:
+            Any PEP 440-like version string
+        When:
+            A protobuf Task with that version is serialized
+        Then:
+            The version field is preserved on the wire.
+        """
+        # Arrange
+        proxy = PicklableProxy()
+
+        async def test_callable():
+            return "result"
+
+        pb_task = protocol.task.Task(
+            version=version,
+            id=str(uuid4()),
+            callable=cloudpickle.dumps(test_callable),
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            caller="",
+            proxy=cloudpickle.dumps(proxy),
+            proxy_id=str(proxy.id),
+            timeout=0,
+            tag="",
+        )
+
+        # Act — serialize to bytes and parse back
+        wire_bytes = pb_task.SerializeToString()
+        parsed = protocol.task.Task()
+        parsed.ParseFromString(wire_bytes)
+
+        # Assert
+        assert parsed.version == version
 
     @pytest.mark.asyncio
     async def test_dispatch_successful_execution(
@@ -594,9 +644,6 @@ class TestTask:
         task_id=st.uuids(),
         timeout=st.integers(min_value=0, max_value=3600),
         caller_id=st.one_of(st.none(), st.uuids()),
-        filename=st.one_of(st.none(), st.text(min_size=1, max_size=50)),
-        function=st.one_of(st.none(), st.text(min_size=1, max_size=50)),
-        line_no=st.one_of(st.none(), st.integers(min_value=1, max_value=10000)),
         tag=st.one_of(st.none(), st.text(min_size=1, max_size=100)),
     )
     @pytest.mark.asyncio
@@ -605,9 +652,6 @@ class TestTask:
         task_id,
         timeout,
         caller_id,
-        filename,
-        function,
-        line_no,
         tag,
     ):
         """Property-based test: Task serialization round-trip.
@@ -636,9 +680,6 @@ class TestTask:
             proxy=proxy,
             timeout=timeout,
             caller=caller_id,
-            filename=filename,
-            function=function,
-            line_no=line_no,
             tag=tag,
         )
 
@@ -655,9 +696,6 @@ class TestTask:
         assert deserialized_task.caller == original_task.caller
         assert deserialized_task.proxy.id == original_task.proxy.id
         assert deserialized_task.timeout == original_task.timeout
-        assert deserialized_task.filename == original_task.filename
-        assert deserialized_task.function == original_task.function
-        assert deserialized_task.line_no == original_task.line_no
         assert deserialized_task.tag == original_task.tag
 
     # Async Generator Tests via dispatch()

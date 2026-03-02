@@ -11,20 +11,11 @@ service Worker {
 
 message Response {
     oneof payload {
-        Ack ack = 1;
-        Nack nack = 2;
+        task.Ack ack = 1;
+        task.Nack nack = 2;
         task.Result result = 3;
         task.Exception exception = 4;
     }
-}
-
-message Ack {
-    // Acknowledgment that the task was received and processing started
-}
-
-message Nack {
-    // Negative acknowledgment indicating the task was rejected
-    string reason = 1;
 }
 
 message StopRequest {
