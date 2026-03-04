@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package wool.runtime.protobuf.task;
+
+message Task {
+    string version = 1;
+    string id = 2;
+    string caller = 3;
+    string tag = 4;
+    string proxy_id = 5;
+    bytes proxy = 6;
+    bytes callable = 7;
+    bytes args = 8;
+    bytes kwargs = 9;
+    int32 timeout = 10;
+}
+
+// Minimal envelope for pre-deserialization metadata extraction.
+// Used by interceptors to parse fields 1–4 from any Task wire
+// format without touching the cloudpickle payload bytes.
+message TaskEnvelope {
+    string version = 1;
+    string id = 2;
+    string caller = 3;
+    string tag = 4;
+}
+
+message Result {
+    bytes dump = 1;
+}
+
+message Exception {
+    bytes dump = 1;
+}
+
+message Worker {
+    string id = 1;
+    string address = 2;
+}
+
+message Ack {
+    // Acknowledgment that the task was received and processing started
+    string version = 1;
+}
+
+message Nack {
+    // Negative acknowledgment indicating the task was rejected
+    string reason = 1;
+}

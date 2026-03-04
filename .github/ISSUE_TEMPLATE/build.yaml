@@ -1,0 +1,25 @@
+name: Build
+description: Propose a build system or dependency change.
+labels: ["build"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What build system or dependency change is needed?
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this change needed?
+    validations:
+      required: true
+  - type: textarea
+    id: affected-code
+    attributes:
+      label: Affected code
+      description: Which build files, configs, or dependencies are affected?
+    validations:
+      required: false
