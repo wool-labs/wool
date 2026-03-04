@@ -1,5 +1,6 @@
 import logging
 from abc import ABC
+from time import time_ns
 
 import pytest
 from hypothesis import given
@@ -779,6 +780,30 @@ class TestEvent:
         _, timestamp, _ = event_spy.calls[0]
         assert isinstance(timestamp, int)
         assert timestamp > 0
+
+    def test_emit_with_wall_clock_timestamp(self, concrete_event_class, event_spy):
+        """Test emit produces wall-clock timestamp.
+
+        Given:
+            A handler registered for an event type
+        When:
+            The event is emitted between two time_ns() calls
+        Then:
+            It should produce a timestamp within the bracketing range
+        """
+        # Arrange
+        Event._handlers["test-event"] = [event_spy]
+        event = concrete_event_class("test-event")
+
+        # Act
+        before = time_ns()
+        event.emit()
+        Event.flush()
+        after = time_ns()
+
+        # Assert
+        _, timestamp, _ = event_spy.calls[0]
+        assert before <= timestamp <= after
 
     def test_multiple_handler_invocation_order(self, concrete_event_class):
         """Test multiple handler invocation order.
