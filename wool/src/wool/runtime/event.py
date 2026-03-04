@@ -5,7 +5,7 @@ import logging
 import threading
 from abc import ABC
 from inspect import iscoroutinefunction
-from time import perf_counter_ns
+from time import time_ns
 from typing import Any
 from typing import Callable
 from typing import Protocol
@@ -57,8 +57,7 @@ class EventHandler(Protocol):
         :param event:
             The emitted event instance.
         :param timestamp:
-            Nanosecond-precision timestamp from perf_counter_ns()
-            captured at emission time.
+            Nanosecond-precision wall-clock timestamp captured at emission time.
         :param context:
             Optional metadata passed by emitter via emit(context=...).
         """
@@ -87,8 +86,7 @@ class AsyncEventHandler(Protocol):
         :param event:
             The emitted event instance.
         :param timestamp:
-            Nanosecond-precision timestamp from perf_counter_ns()
-            captured at emission time.
+            Nanosecond-precision wall-clock timestamp captured at emission time.
         :param context:
             Optional metadata passed by emitter via emit(context=...).
         """
@@ -159,7 +157,7 @@ class _EventHandlerThread:
         :param event:
             The emitted event instance.
         :param timestamp:
-            Nanosecond-precision timestamp captured at emission time.
+            Nanosecond-precision wall-clock timestamp captured at emission time.
         :param context:
             Optional metadata passed by emitter.
         """
@@ -317,7 +315,7 @@ class Event(ABC):
             object. Should be JSON-serializable for debugging purposes.
         """
         if handlers := self._handlers.get(self.type):
-            timestamp = perf_counter_ns()
+            timestamp = time_ns()
             for handler in handlers:
                 _handler_thread.schedule(handler, self, timestamp, context)
 
