@@ -5,16 +5,25 @@ package wool.runtime.protobuf.worker;
 import "task.proto";
 
 service Worker {
-    rpc dispatch (task.Task) returns (stream Response);
+    rpc dispatch (stream Request) returns (stream Response);
     rpc stop (StopRequest) returns (Void);
+}
+
+message Request {
+    oneof payload {
+        task.Task task = 1;
+        Void next = 2;
+        task.Message send = 3;
+        task.Message throw = 4;
+    }
 }
 
 message Response {
     oneof payload {
         task.Ack ack = 1;
         task.Nack nack = 2;
-        task.Result result = 3;
-        task.Exception exception = 4;
+        task.Message result = 3;
+        task.Message exception = 4;
     }
 }
 
