@@ -18,6 +18,7 @@ from grpc.aio import ServicerContext
 import wool
 from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.routine.task import IterationEvent
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskEvent
 
@@ -340,19 +341,23 @@ class WorkerService(protocol.worker.WorkerServicer):
             )
 
             try:
+                step = 0
                 async for request in request_iterator:
                     if request.HasField("next"):
+                        iter_kind = "next"
                         worker_loop.call_soon_threadsafe(
                             request_queue.put_nowait,
                             ("next", None),
                         )
                     elif request.HasField("send"):
+                        iter_kind = "send"
                         value = cloudpickle.loads(request.send.dump)
                         worker_loop.call_soon_threadsafe(
                             request_queue.put_nowait,
                             ("send", value),
                         )
                     elif request.HasField("throw"):
+                        iter_kind = "throw"
                         exc = cloudpickle.loads(request.throw.dump)
                         worker_loop.call_soon_threadsafe(
                             request_queue.put_nowait,
@@ -361,7 +366,23 @@ class WorkerService(protocol.worker.WorkerServicer):
                     else:
                         continue
 
+                    IterationEvent(
+                        "task-iteration-started",
+                        task=work_task,
+                        kind=iter_kind,
+                        step=step,
+                    ).emit()
+
                     result = await result_queue.get()
+
+                    IterationEvent(
+                        "task-iteration-completed",
+                        task=work_task,
+                        kind=iter_kind,
+                        step=step,
+                    ).emit()
+
+                    step += 1
 
                     if result is _SENTINEL:
                         break
