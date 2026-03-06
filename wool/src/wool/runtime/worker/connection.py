@@ -15,6 +15,7 @@ import grpc.aio
 
 from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.routine.task import IterationEvent
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.base import resolve_channel_credentials
@@ -88,6 +89,7 @@ class _DispatchStream(Generic[_T]):
     def __init__(self, call: _DispatchCall, task: Task):
         self._call = call
         self._task = task
+        self._step = 0
         self._iter = aiter(call)
         self._closed = False
         self._running = False
@@ -119,9 +121,17 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
+            IterationEvent(
+                "task-iteration-initiated",
+                task=self._task,
+                kind="next",
+                step=self._step,
+            ).emit()
             request = protocol.worker.Request(next=protocol.worker.Void())
             await self._call.write(request)
-            return await self._read_next()
+            result = await self._read_next()
+            self._step += 1
+            return result
         finally:
             self._running = False
 
@@ -194,10 +204,18 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
+            IterationEvent(
+                "task-iteration-initiated",
+                task=self._task,
+                kind="send",
+                step=self._step,
+            ).emit()
             dump = cloudpickle.dumps(value)
             request = protocol.worker.Request(send=protocol.task.Message(dump=dump))
             await self._call.write(request)
-            return await self._read_next()
+            result = await self._read_next()
+            self._step += 1
+            return result
         finally:
             self._running = False
 
@@ -228,6 +246,13 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
+            IterationEvent(
+                "task-iteration-initiated",
+                task=self._task,
+                kind="throw",
+                step=self._step,
+            ).emit()
+
             if isinstance(typ, BaseException):
                 exc = typ
             elif val is not None:
@@ -238,7 +263,9 @@ class _DispatchStream(Generic[_T]):
             dump = cloudpickle.dumps(exc)
             request = protocol.worker.Request(throw=protocol.task.Message(dump=dump))
             await self._call.write(request)
-            return await self._read_next()
+            result = await self._read_next()
+            self._step += 1
+            return result
         finally:
             self._running = False
 
