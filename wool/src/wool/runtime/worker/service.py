@@ -116,22 +116,25 @@ class WorkerService(protocol.worker.WorkerServicer):
         return _ReadOnlyEvent(self._stopped)
 
     async def dispatch(
-        self, request: protocol.task.Task, context: ServicerContext
+        self,
+        request_iterator: AsyncIterator[protocol.worker.Request],
+        context: ServicerContext,
     ) -> AsyncIterator[protocol.worker.Response]:
         """Execute a task in the current event loop.
 
-        Deserializes the incoming task into a :class:`Task`
-        instance, schedules it for execution in the current asyncio
-        event loop, and yields responses for acknowledgment and result.
+        Reads the first :class:`~wool.protocol.worker.Request` from
+        the bidirectional stream to obtain the :class:`Task`, then
+        schedules it for execution. For async generators, subsequent
+        ``Message`` frames are forwarded into the generator via
+        ``asend()``.
 
-        :param request:
-            The protobuf task message containing the serialized task
-            data.
+        :param request_iterator:
+            The incoming bidirectional request stream.
         :param context:
             The :class:`grpc.aio.ServicerContext` for this request.
         :yields:
             First yields an Ack Response when task processing begins,
-            then yields a Response containing the task result.
+            then yields Response(s) containing the task result(s).
 
         .. note::
             Emits a :class:`TaskEvent` when the task is
@@ -142,19 +145,22 @@ class WorkerService(protocol.worker.WorkerServicer):
                 StatusCode.UNAVAILABLE, "Worker service is shutting down"
             )
 
-        with self._tracker(Task.from_protobuf(request)) as task:
+        first = await anext(aiter(request_iterator))
+        work_task = Task.from_protobuf(first.task)
+
+        with self._tracker(work_task, request_iterator) as task:
             ack = protocol.task.Ack(version=protocol.__version__)
             yield protocol.worker.Response(ack=ack)
             try:
                 if isasyncgen(task):
                     async for result in task:
-                        result = protocol.task.Result(dump=cloudpickle.dumps(result))
+                        result = protocol.task.Message(dump=cloudpickle.dumps(result))
                         yield protocol.worker.Response(result=result)
                 elif isinstance(task, asyncio.Task):
-                    result = protocol.task.Result(dump=cloudpickle.dumps(await task))
+                    result = protocol.task.Message(dump=cloudpickle.dumps(await task))
                     yield protocol.worker.Response(result=result)
             except (Exception, asyncio.CancelledError) as e:
-                exception = protocol.task.Exception(dump=cloudpickle.dumps(e))
+                exception = protocol.task.Message(dump=cloudpickle.dumps(e))
                 yield protocol.worker.Response(exception=exception)
 
     async def stop(
@@ -264,55 +270,114 @@ class WorkerService(protocol.worker.WorkerServicer):
                     worker_loop.call_soon_threadsafe(worker_task.cancel)
                 raise
 
-    async def _stream_from_worker(self, work_task: Task):
+    async def _stream_from_worker(
+        self,
+        work_task: Task,
+        request_iterator: AsyncIterator[protocol.worker.Request],
+    ):
         """Run a streaming task on the shared worker event loop.
 
-        Offloads async generator execution to a dedicated worker event loop
-        and streams results back to the main event loop via an async queue.
-        Context variables are propagated from the calling context to the worker loop.
+        Offloads async generator execution to a dedicated worker event
+        loop. Client requests (``next``, ``send``, ``throw``) are read
+        from *request_iterator* on the main loop, forwarded to the
+        worker loop via a queue, and the resulting values are returned
+        to the main loop for yielding.
 
         :param work_task:
             The :class:`Task` instance containing an async
             generator.
+        :param request_iterator:
+            The incoming bidirectional request stream for reading
+            client-driven iteration commands.
         :yields:
             Values yielded by the async generator, streamed from
             the worker loop.
         """
         main_loop = asyncio.get_running_loop()
         ctx = contextvars.copy_context()
+        request_queue: asyncio.Queue = asyncio.Queue()
         result_queue: asyncio.Queue = asyncio.Queue()
-        exception_holder: list = [None]
 
         async with self._loop_pool.get("worker") as (worker_loop, _):
 
-            async def collect_results():
+            async def worker_dispatch():
+                gen = work_task.callable(*work_task.args, **work_task.kwargs)
                 try:
-                    async for value in work_task._stream():
-                        main_loop.call_soon_threadsafe(result_queue.put_nowait, value)
-                except Exception as e:
-                    exception_holder[0] = e
+                    while True:
+                        cmd = await request_queue.get()
+                        if cmd is _SENTINEL:
+                            break
+                        kind, payload = cmd
+                        try:
+                            if kind == "next":
+                                value = await gen.asend(None)
+                            elif kind == "send":
+                                value = await gen.asend(payload)
+                            elif kind == "throw":
+                                value = await gen.athrow(type(payload), payload)
+                            else:
+                                continue
+                        except StopAsyncIteration:
+                            main_loop.call_soon_threadsafe(
+                                result_queue.put_nowait, _SENTINEL
+                            )
+                            return
+                        except BaseException as e:
+                            main_loop.call_soon_threadsafe(
+                                result_queue.put_nowait, ("error", e)
+                            )
+                            return
+                        else:
+                            main_loop.call_soon_threadsafe(
+                                result_queue.put_nowait,
+                                ("value", value),
+                            )
                 finally:
-                    if main_loop.is_running():
-                        main_loop.call_soon_threadsafe(
-                            result_queue.put_nowait, _SENTINEL
-                        )
+                    await gen.aclose()
 
-            coro = collect_results()
             worker_loop.call_soon_threadsafe(
-                lambda: worker_loop.create_task(coro, context=ctx)
+                lambda: worker_loop.create_task(worker_dispatch(), context=ctx)
             )
 
-            while True:
-                value = await result_queue.get()
-                if value is _SENTINEL:
-                    break
-                yield value
+            try:
+                async for request in request_iterator:
+                    if request.HasField("next"):
+                        worker_loop.call_soon_threadsafe(
+                            request_queue.put_nowait,
+                            ("next", None),
+                        )
+                    elif request.HasField("send"):
+                        value = cloudpickle.loads(request.send.dump)
+                        worker_loop.call_soon_threadsafe(
+                            request_queue.put_nowait,
+                            ("send", value),
+                        )
+                    elif request.HasField("throw"):
+                        exc = cloudpickle.loads(request.throw.dump)
+                        worker_loop.call_soon_threadsafe(
+                            request_queue.put_nowait,
+                            ("throw", exc),
+                        )
+                    else:
+                        continue
 
-            if exception_holder[0]:
-                raise exception_holder[0]
+                    result = await result_queue.get()
+
+                    if result is _SENTINEL:
+                        break
+                    tag, payload = result
+                    if tag == "error":
+                        raise payload
+                    yield payload
+            finally:
+                worker_loop.call_soon_threadsafe(request_queue.put_nowait, _SENTINEL)
 
     @contextmanager
-    def _tracker(self, work_task: Task):
+    def _tracker(
+        self,
+        work_task: Task,
+        request_iterator: AsyncIterator[protocol.worker.Request],
+    ):
         """Context manager for tracking running tasks.
 
         Manages the lifecycle of a task execution, adding it to the
@@ -325,8 +390,11 @@ class WorkerService(protocol.worker.WorkerServicer):
 
         :param work_task:
             The :class:`Task` instance to execute and track.
+        :param request_iterator:
+            The incoming bidirectional request stream.
         :yields:
-            The :class:`asyncio.Task` or async generator for the wool task.
+            The :class:`asyncio.Task` or async generator for the
+            wool task.
 
         .. note::
             Emits a :class:`TaskEvent` with type "task-scheduled"
@@ -340,7 +408,7 @@ class WorkerService(protocol.worker.WorkerServicer):
             watcher = _Task(task)
         elif isasyncgenfunction(work_task.callable):
             # Async generator -> stream from worker loop via queue
-            task = self._stream_from_worker(work_task)
+            task = self._stream_from_worker(work_task, request_iterator)
             watcher = _AsyncGen(task)
         else:
             raise ValueError("Expected coroutine function or async generator function")
