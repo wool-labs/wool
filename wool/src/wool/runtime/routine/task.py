@@ -364,12 +364,71 @@ class TaskEvent(Event):
 
 
 # public
+IterationEventKind = Literal["next", "send", "throw"]
+"""
+Identifies the operation that drove an iteration of a streaming
+dispatch.
+
+- ``"next"``: The client called ``__anext__()`` or the server
+  received a ``next`` frame.
+- ``"send"``: The client called ``asend(value)`` or the server
+  received a ``send`` frame.
+- ``"throw"``: The client called ``athrow(exc)`` or the server
+  received a ``throw`` frame.
+"""
+
+
+# public
+class IterationEvent(TaskEvent):
+    """Lifecycle event for a single iteration of a streaming dispatch.
+
+    Emitted at three points during each iteration round-trip:
+
+    * ``"task-iteration-initiated"`` — on the client, before writing
+      the request to the gRPC stream.
+    * ``"task-iteration-started"`` — on the server, after forwarding
+      the command to the worker loop.
+    * ``"task-iteration-completed"`` — on the server, after receiving
+      the result from the worker loop.
+
+    :param type:
+        One of the ``task-iteration-*`` event types.
+    :param task:
+        The :class:`Task` associated with this iteration.
+    :param kind:
+        The operation kind (``"next"``, ``"send"``, or
+        ``"throw"``).
+    :param step:
+        Zero-based step index of this iteration within the
+        stream.
+    """
+
+    kind: IterationEventKind
+    step: int
+
+    def __init__(
+        self,
+        type: TaskEventType,
+        /,
+        task: Task,
+        kind: IterationEventKind,
+        step: int,
+    ) -> None:
+        super().__init__(type, task=task)
+        self.kind = kind
+        self.step = step
+
+
+# public
 TaskEventType = Literal[
     "task-created",
     "task-scheduled",
     "task-started",
     "task-stopped",
     "task-completed",
+    "task-iteration-initiated",
+    "task-iteration-started",
+    "task-iteration-completed",
 ]
 """
 Defines the types of events that can occur during the lifecycle of a Wool
@@ -386,6 +445,15 @@ task.
     Emitted when a task stops execution.
 - "task-completed":
     Emitted when a task completes execution.
+- "task-iteration-initiated":
+    Emitted on the client before writing an iteration request to the
+    gRPC stream.
+- "task-iteration-started":
+    Emitted on the server after forwarding the iteration command to
+    the worker loop.
+- "task-iteration-completed":
+    Emitted on the server after receiving the iteration result from
+    the worker loop.
 """
 
 
