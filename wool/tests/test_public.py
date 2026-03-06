@@ -44,6 +44,8 @@ def test_public_api_completeness():
         "NoWorkersAvailable",
         "RoundRobinLoadBalancer",
         # Routines
+        "IterationEvent",
+        "IterationEventKind",
         "Task",
         "TaskEvent",
         "TaskEventHandler",

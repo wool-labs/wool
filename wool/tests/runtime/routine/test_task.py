@@ -13,6 +13,7 @@ from hypothesis import strategies as st
 import wool
 from wool import protocol
 from wool.runtime.event import Event
+from wool.runtime.routine.task import IterationEvent
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskEvent
 from wool.runtime.routine.task import TaskException
@@ -1394,3 +1395,70 @@ class TestCurrentTask:
             # (except the first one which has no caller)
             if i > 0:
                 assert tasks[i].caller == tasks[i - 1].id
+
+
+class TestIterationEvent:
+    """Tests for IterationEvent class."""
+
+    def test_inherits_task_event(self, sample_task, clear_event_handlers):
+        """Test IterationEvent inherits from TaskEvent.
+
+        Given:
+            An IterationEvent instance
+        When:
+            Checked for inheritance
+        Then:
+            It is an instance of TaskEvent
+        """
+        task = sample_task()
+        event = IterationEvent(
+            "task-iteration-initiated", task=task, kind="next", step=0
+        )
+
+        assert isinstance(event, TaskEvent)
+
+    def test_attributes(self, sample_task, clear_event_handlers):
+        """Test IterationEvent stores kind and step attributes.
+
+        Given:
+            An IterationEvent with kind="send" and step=3
+        When:
+            Attributes are accessed
+        Then:
+            kind is "send", step is 3, type is set correctly,
+            and task is the associated Task
+        """
+        task = sample_task()
+        event = IterationEvent("task-iteration-started", task=task, kind="send", step=3)
+
+        assert event.type == "task-iteration-started"
+        assert event.task is task
+        assert event.kind == "send"
+        assert event.step == 3
+
+    def test_emits_to_handler(self, sample_task, event_spy, clear_event_handlers):
+        """Test IterationEvent emits to registered handlers.
+
+        Given:
+            A handler registered for "task-iteration-completed"
+        When:
+            An IterationEvent with that type is emitted
+        Then:
+            The handler receives the event with correct attributes
+        """
+        TaskEvent._handlers["task-iteration-completed"] = [event_spy]
+
+        task = sample_task()
+        event = IterationEvent(
+            "task-iteration-completed", task=task, kind="throw", step=5
+        )
+        event.emit()
+
+        Event.flush()
+
+        assert len(event_spy.calls) == 1
+        emitted_event, timestamp, context = event_spy.calls[0]
+        assert emitted_event.type == "task-iteration-completed"
+        assert emitted_event.kind == "throw"
+        assert emitted_event.step == 5
+        assert emitted_event.task is task
