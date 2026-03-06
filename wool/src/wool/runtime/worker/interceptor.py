@@ -84,7 +84,7 @@ class VersionInterceptor(grpc.aio.ServerInterceptor):
                 async for raw in request_iterator:
                     yield original_deserializer(raw)
 
-            async for response in original_handler(chained_iterator(), context):  # pyright: ignore[reportGeneralTypeIssues]
+            async for response in original_handler(chained_iterator(), context):  # pyright: ignore[reportArgumentType, reportGeneralTypeIssues]
                 yield response
 
         return grpc.stream_stream_rpc_method_handler(
