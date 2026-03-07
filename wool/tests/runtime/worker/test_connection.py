@@ -1,4 +1,5 @@
 import asyncio
+import re
 from typing import Callable
 from typing import Coroutine
 from uuid import uuid4
@@ -1431,6 +1432,77 @@ class TestDispatchStream:
         assert str(thrown) == "test_error"
 
     @pytest.mark.asyncio
+    async def test_athrow_with_exception_type(self, mocker: MockerFixture):
+        """Test _DispatchStream athrow() accepts a bare exception type.
+
+        Given:
+            A _DispatchStream with a bidi call
+        When:
+            athrow() is called with an exception type (not an instance)
+        Then:
+            It serializes a ValueError instance and writes a
+            Request(throw=...) to the stream.
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            yield protocol.worker.Response(
+                result=protocol.task.Message(dump=cloudpickle.dumps("ok"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+
+        # Act
+        await stream.athrow(ValueError)
+
+        # Assert
+        written_request = mock_call.write.call_args[0][0]
+        thrown = cloudpickle.loads(written_request.throw.dump)
+        assert isinstance(thrown, ValueError)
+
+    @pytest.mark.asyncio
+    async def test_athrow_with_exception_type_and_value(self, mocker: MockerFixture):
+        """Test _DispatchStream athrow() accepts a type and value pair.
+
+        Given:
+            A _DispatchStream with a bidi call
+        When:
+            athrow() is called with an exception type and an instance
+        Then:
+            It serializes the provided instance and writes a
+            Request(throw=...) to the stream.
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            yield protocol.worker.Response(
+                result=protocol.task.Message(dump=cloudpickle.dumps("ok"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+
+        # Act
+        await stream.athrow(ValueError, ValueError("msg"))
+
+        # Assert
+        written_request = mock_call.write.call_args[0][0]
+        thrown = cloudpickle.loads(written_request.throw.dump)
+        assert isinstance(thrown, ValueError)
+        assert str(thrown) == "msg"
+
+    @pytest.mark.asyncio
     async def test_athrow_when_closed(self, mocker: MockerFixture):
         """Test _DispatchStream athrow() raises StopAsyncIteration when closed.
 
@@ -1456,6 +1528,92 @@ class TestDispatchStream:
             await stream.athrow(ValueError, ValueError("test"))
 
         mock_call.write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_anext_while_already_running(self, mocker: MockerFixture):
+        """Test _DispatchStream __anext__() re-entrancy guard matches native.
+
+        Given:
+            A native async generator's RuntimeError message for anext()
+            re-entrancy, and a _DispatchStream with _running=True
+        When:
+            __anext__() is called on each
+        Then:
+            Both raise RuntimeError with the same message.
+        """
+        # Native CPython uses this exact message for anext() re-entrancy.
+        native_msg = "anext(): asynchronous generator is already running"
+
+        # Arrange — _DispatchStream
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+        stream._running = True
+
+        # Act & Assert
+        with pytest.raises(RuntimeError, match=re.escape(native_msg)):
+            await stream.__anext__()
+
+    @pytest.mark.asyncio
+    async def test_asend_while_already_running(self, mocker: MockerFixture):
+        """Test _DispatchStream asend() re-entrancy guard matches native.
+
+        Given:
+            The native async generator RuntimeError message for asend()
+            re-entrancy, and a _DispatchStream with _running=True
+        When:
+            asend() is called on each
+        Then:
+            Both raise RuntimeError with the same message (native
+            asend reuses the ``anext():`` prefix).
+        """
+        # Native asend reuses the anext() prefix.
+        native_msg = "anext(): asynchronous generator is already running"
+
+        # Arrange — _DispatchStream
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+        stream._running = True
+
+        # Act & Assert
+        with pytest.raises(RuntimeError, match=re.escape(native_msg)):
+            await stream.asend("value")
+
+    @pytest.mark.asyncio
+    async def test_athrow_while_already_running(self, mocker: MockerFixture):
+        """Test _DispatchStream athrow() re-entrancy guard matches native.
+
+        Given:
+            The native async generator RuntimeError message for athrow()
+            re-entrancy, and a _DispatchStream with _running=True
+        When:
+            athrow() is called on each
+        Then:
+            Both raise RuntimeError with the same message (native
+            athrow uses the ``athrow():`` prefix).
+        """
+        # Native athrow uses athrow() prefix.
+        native_msg = "athrow(): asynchronous generator is already running"
+
+        # Arrange — _DispatchStream
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+        stream._running = True
+
+        # Act & Assert
+        with pytest.raises(RuntimeError, match=re.escape(native_msg)):
+            await stream.athrow(ValueError("err"))
 
     @pytest.mark.asyncio
     @settings(
