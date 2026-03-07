@@ -8,6 +8,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
+from wool.runtime.routine.task import do_dispatch
 from wool.runtime.routine.wrapper import routine
 
 
@@ -40,6 +41,64 @@ async def foo_gen(x):
 
 assert foo_gen.__qualname__ == "foo_gen"
 assert foo_gen.__module__ == "runtime.routine.test_wrapper"
+
+
+@routine
+async def echo_send(n):
+    """Async generator that echoes sent values back."""
+    value = yield "ready"
+    for _ in range(n):
+        value = yield f"echo:{value}"
+
+
+@routine
+async def accumulator():
+    """Async generator that accumulates sent integers."""
+    total = 0
+    total = yield total
+    while True:
+        total = yield total
+
+
+@routine
+async def stop_on_signal():
+    """Async generator that stops when sent 'stop'."""
+    hint = yield "waiting"
+    while hint != "stop":
+        hint = yield f"got:{hint}"
+
+
+class Resettable(Exception):
+    """Custom exception for athrow tests."""
+
+
+@routine
+async def resilient_counter(start):
+    """Async generator that resets its counter on Resettable."""
+    count = start
+    while True:
+        try:
+            _ = yield count
+        except Resettable:
+            count = 0
+            continue
+        count += 1
+
+
+@routine
+async def fragile_gen():
+    """Async generator that does not handle thrown exceptions."""
+    yield "one"
+    yield "two"
+
+
+@routine
+async def catch_and_return():
+    """Async generator that catches a throw and then returns."""
+    try:
+        yield "before"
+    except Resettable:
+        return
 
 
 class Foo:
@@ -567,3 +626,267 @@ class TestRoutine:
 
         # Assert cleanup happened
         assert mock_stream.aclose_called
+
+    # ── Bilateral streaming tests (BS-xxx) ───────────────────────
+
+    @pytest.mark.asyncio
+    async def test_routine_asend_with_single_value(self):
+        """Test asend forwards a single value to the generator.
+
+        Given:
+            A @routine-decorated async generator that echoes sent
+            values.
+        When:
+            asend() is called with a non-None value after the first
+            __anext__().
+        Then:
+            It should yield back the sent value.
+        """
+        with do_dispatch(False):
+            # Arrange
+            gen = echo_send(1)
+
+            # Act
+            first = await gen.__anext__()
+            echoed = await gen.asend("hello")
+
+            # Assert
+            assert first == "ready"
+            assert echoed == "echo:hello"
+            await gen.aclose()
+
+    @pytest.mark.asyncio
+    async def test_routine_asend_with_multiple_values(self):
+        """Test asend forwards multiple values in sequence.
+
+        Given:
+            A @routine-decorated async generator that accumulates
+            sent integers.
+        When:
+            asend() is called multiple times in sequence.
+        Then:
+            It should forward each sent value and yield updated
+            state.
+        """
+        with do_dispatch(False):
+            # Arrange
+            gen = accumulator()
+
+            # Act
+            initial = await gen.__anext__()
+            r1 = await gen.asend(10)
+            r2 = await gen.asend(20)
+            r3 = await gen.asend(30)
+
+            # Assert
+            assert initial == 0
+            assert r1 == 10
+            assert r2 == 20
+            assert r3 == 30
+            await gen.aclose()
+
+    @pytest.mark.asyncio
+    async def test_routine_asend_with_termination_signal(self):
+        """Test asend causing generator exhaustion.
+
+        Given:
+            A @routine-decorated async generator that stops when
+            sent "stop".
+        When:
+            asend() is called with "stop".
+        Then:
+            It should raise StopAsyncIteration after the generator
+            returns.
+        """
+        with do_dispatch(False):
+            # Arrange
+            gen = stop_on_signal()
+            await gen.__anext__()  # "waiting"
+
+            # Act
+            got = await gen.asend("continue")
+            assert got == "got:continue"
+
+            # Act & Assert
+            with pytest.raises(StopAsyncIteration):
+                await gen.asend("stop")
+
+    @pytest.mark.asyncio
+    async def test_routine_anext_with_implicit_none_send(self):
+        """Test __anext__() works as implicit None send.
+
+        Given:
+            A @routine-decorated async generator yielding its first
+            value.
+        When:
+            __anext__() is called (no prior send).
+        Then:
+            It should yield the first value with None as the implicit
+            send.
+        """
+        with do_dispatch(False):
+            # Arrange
+            gen = echo_send(2)
+
+            # Act
+            first = await gen.__anext__()
+            second = await gen.__anext__()
+
+            # Assert
+            assert first == "ready"
+            assert second == "echo:None"
+            await gen.aclose()
+
+    @pytest.mark.asyncio
+    async def test_routine_athrow_with_handled_exception(self):
+        """Test athrow with an exception the generator catches.
+
+        Given:
+            A @routine-decorated async generator that catches
+            Resettable and yields a recovery value.
+        When:
+            athrow() is called with Resettable.
+        Then:
+            It should yield the recovery value instead of propagating
+            the exception.
+        """
+        with do_dispatch(False):
+            # Arrange
+            gen = resilient_counter(5)
+            v1 = await gen.__anext__()
+            assert v1 == 5
+
+            # Act
+            recovered = await gen.athrow(Resettable)
+
+            # Assert
+            assert recovered == 0
+            await gen.aclose()
+
+    @pytest.mark.asyncio
+    async def test_routine_athrow_with_unhandled_exception(self):
+        """Test athrow with an exception the generator does not catch.
+
+        Given:
+            A @routine-decorated async generator that does not catch
+            the thrown exception.
+        When:
+            athrow() is called with an unhandled exception.
+        Then:
+            It should propagate the exception to the caller.
+        """
+        with do_dispatch(False):
+            # Arrange
+            gen = fragile_gen()
+            await gen.__anext__()  # "one"
+
+            # Act & Assert
+            with pytest.raises(Resettable):
+                await gen.athrow(Resettable)
+
+    @pytest.mark.asyncio
+    async def test_routine_athrow_with_generator_return(self):
+        """Test athrow causing the generator to return.
+
+        Given:
+            A @routine-decorated async generator that catches a
+            thrown exception and then returns.
+        When:
+            athrow() is called causing the generator to return after
+            handling.
+        Then:
+            It should raise StopAsyncIteration.
+        """
+        with do_dispatch(False):
+            # Arrange
+            gen = catch_and_return()
+            v = await gen.__anext__()
+            assert v == "before"
+
+            # Act & Assert
+            with pytest.raises(StopAsyncIteration):
+                await gen.athrow(Resettable)
+
+    @pytest.mark.asyncio
+    async def test_routine_aclose_with_partial_consumption(self):
+        """Test aclose on a partially consumed generator.
+
+        Given:
+            A @routine-decorated async generator that is partially
+            consumed.
+        When:
+            aclose() is called before exhaustion.
+        Then:
+            It should close cleanly and subsequent __anext__() should
+            raise StopAsyncIteration.
+        """
+        with do_dispatch(False):
+            # Arrange
+            gen = echo_send(5)
+            await gen.__anext__()  # "ready"
+
+            # Act
+            await gen.aclose()
+
+            # Assert
+            with pytest.raises(StopAsyncIteration):
+                await gen.__anext__()
+
+    @pytest.mark.asyncio
+    async def test_routine_interleaved_send_and_throw(self):
+        """Test interleaving asend and athrow calls.
+
+        Given:
+            A @routine-decorated async generator with bilateral
+            protocol.
+        When:
+            asend() is called, then athrow(), then asend() again.
+        Then:
+            It should correctly alternate between send and throw
+            forwarding.
+        """
+        with do_dispatch(False):
+            # Arrange
+            gen = resilient_counter(0)
+            v = await gen.__anext__()
+            assert v == 0
+
+            # Act — send to advance
+            v = await gen.asend(None)
+            assert v == 1
+            v = await gen.asend(None)
+            assert v == 2
+
+            # Act — throw to reset
+            v = await gen.athrow(Resettable)
+            assert v == 0
+
+            # Act — send again after reset
+            v = await gen.asend(None)
+            assert v == 1
+
+            # Assert final state
+            await gen.aclose()
+
+    @pytest.mark.asyncio
+    async def test_routine_async_for_backward_compatibility(self):
+        """Test async for iteration still works after refactor.
+
+        Given:
+            A @routine-decorated async generator using async for
+            iteration.
+        When:
+            The generator is consumed via async for (not asend or
+            athrow).
+        Then:
+            It should yield all values identically to the pre-change
+            behavior.
+        """
+        with do_dispatch(False):
+            # Act
+            result = []
+            async for value in foo_gen(5):
+                result.append(value)
+
+            # Assert
+            assert result == [0, 1, 2, 3, 4]
