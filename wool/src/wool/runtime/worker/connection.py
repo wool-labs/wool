@@ -243,7 +243,7 @@ class _DispatchStream(Generic[_T]):
         if self._closed:
             raise StopAsyncIteration
         if self._running:
-            raise RuntimeError("anext(): asynchronous generator is already running")
+            raise RuntimeError("athrow(): asynchronous generator is already running")
         self._running = True
         try:
             IterationEvent(
