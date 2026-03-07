@@ -15,12 +15,13 @@ import grpc.aio
 
 from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.routine.task import IterationEvent
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.base import resolve_channel_credentials
 
-_DispatchCall: TypeAlias = grpc.aio.UnaryStreamCall[
-    protocol.task.Task, protocol.worker.Response
+_DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[
+    protocol.worker.Request, protocol.worker.Response
 ]
 
 _T = TypeVar("_T")
@@ -85,10 +86,13 @@ class _DispatchStream(Generic[_T]):
         The underlying gRPC response stream.
     """
 
-    def __init__(self, call: _DispatchCall):
+    def __init__(self, call: _DispatchCall, task: Task):
         self._call = call
+        self._task = task
+        self._step = 0
         self._iter = aiter(call)
         self._closed = False
+        self._running = False
 
     def __aiter__(self) -> AsyncIterator[_T]:
         """Return self as the async iterator."""
@@ -97,10 +101,15 @@ class _DispatchStream(Generic[_T]):
     async def __anext__(self) -> _T:
         """Get the next response from the stream.
 
+        Sends a ``next`` request to the server to advance the remote
+        generator, then reads and returns the next result.
+
         :returns:
             The next task result from the worker.
         :raises StopAsyncIteration:
             When the stream is exhausted or after aclose() is called.
+        :raises RuntimeError:
+            If another iteration is already in progress.
         :raises UnexpectedResponse:
             If the response is neither a result nor an exception.
         :raises Exception:
@@ -108,7 +117,33 @@ class _DispatchStream(Generic[_T]):
         """
         if self._closed:
             raise StopAsyncIteration
+        if self._running:
+            raise RuntimeError("anext(): asynchronous generator is already running")
+        self._running = True
+        try:
+            IterationEvent(
+                "task-iteration-initiated",
+                task=self._task,
+                kind="next",
+                step=self._step,
+            ).emit()
+            request = protocol.worker.Request(next=protocol.worker.Void())
+            await self._call.write(request)
+            result = await self._read_next()
+            self._step += 1
+            return result
+        finally:
+            self._running = False
 
+    async def _read_next(self) -> _T:
+        """Read the next response from the stream without writing.
+
+        Used by :meth:`asend` and :meth:`athrow` which have already
+        written their own request to the stream.
+
+        :returns:
+            The next task result from the worker.
+        """
         try:
             response = await anext(self._iter)
             if response.HasField("result"):
@@ -148,38 +183,91 @@ class _DispatchStream(Generic[_T]):
             pass
 
     async def asend(self, value):
-        """Send a value into the async generator (not supported).
+        """Send a value into the remote async generator.
+
+        Serializes *value*, writes it as a ``Message`` frame to the
+        bidirectional stream, and returns the next yielded result.
 
         :param value:
             The value to send into the generator.
-        :raises NotImplementedError:
-            Bidirectional communication via asend() is not yet supported
-            for distributed async generators. Use pull-based iteration with
-            __anext__() instead.
+        :returns:
+            The next yielded value from the remote generator.
+        :raises StopAsyncIteration:
+            When the remote generator is exhausted or the stream
+            has been closed.
+        :raises RuntimeError:
+            If another iteration is already in progress.
         """
-        raise NotImplementedError(
-            "asend() is not supported for distributed async generators. "
-            "Only pull-based iteration via __anext__() and aclose() are supported."
-        )
+        if self._closed:
+            raise StopAsyncIteration
+        if self._running:
+            raise RuntimeError("anext(): asynchronous generator is already running")
+        self._running = True
+        try:
+            IterationEvent(
+                "task-iteration-initiated",
+                task=self._task,
+                kind="send",
+                step=self._step,
+            ).emit()
+            dump = cloudpickle.dumps(value)
+            request = protocol.worker.Request(send=protocol.task.Message(dump=dump))
+            await self._call.write(request)
+            result = await self._read_next()
+            self._step += 1
+            return result
+        finally:
+            self._running = False
 
     async def athrow(self, typ, val=None, tb=None):
-        """Throw an exception into the async generator (not supported).
+        """Throw an exception into the remote async generator.
+
+        Serializes the exception and sends it as a ``Message`` frame.
+        The remote generator receives the exception via ``athrow()``
+        and may handle or propagate it.
 
         :param typ:
-            The exception type to throw.
+            The exception type or instance to throw.
         :param val:
-            The exception value.
+            The exception value (if *typ* is a type).
         :param tb:
             The exception traceback.
-        :raises NotImplementedError:
-            Bidirectional communication via athrow() is not yet supported
-            for distributed async generators. Exceptions can only be raised
-            from the worker side during iteration.
+        :returns:
+            The next yielded value from the remote generator.
+        :raises StopAsyncIteration:
+            When the remote generator is exhausted or the stream
+            has been closed.
+        :raises RuntimeError:
+            If another iteration is already in progress.
         """
-        raise NotImplementedError(
-            "athrow() is not supported for distributed async generators. "
-            "Only pull-based iteration via __anext__() and aclose() are supported."
-        )
+        if self._closed:
+            raise StopAsyncIteration
+        if self._running:
+            raise RuntimeError("athrow(): asynchronous generator is already running")
+        self._running = True
+        try:
+            IterationEvent(
+                "task-iteration-initiated",
+                task=self._task,
+                kind="throw",
+                step=self._step,
+            ).emit()
+
+            if isinstance(typ, BaseException):
+                exc = typ
+            elif val is not None:
+                exc = val
+            else:
+                exc = typ()
+
+            dump = cloudpickle.dumps(exc)
+            request = protocol.worker.Request(throw=protocol.task.Message(dump=dump))
+            await self._call.write(request)
+            result = await self._read_next()
+            self._step += 1
+            return result
+        finally:
+            self._running = False
 
 
 # public
@@ -293,7 +381,7 @@ class WorkerConnection:
         task: Task,
         *,
         timeout: float | None = None,
-    ) -> AsyncGenerator[protocol.task.Result, None]:
+    ) -> AsyncGenerator[protocol.task.Message, None]:
         """Dispatch a task to the remote worker for execution.
 
         Sends the task to the worker via gRPC, waits for acknowledgment,
@@ -336,14 +424,14 @@ class WorkerConnection:
                 else:
                     raise RpcError(code, details) from error
 
-            gen = self._execute(call)
+            gen = self._execute(call, task)
             await gen.__anext__()  # Prime: _execute acquires its own ref
         except BaseException:
             await _channel_pool.release(self._key)
             raise
 
         await _channel_pool.release(self._key)
-        return cast(AsyncGenerator[protocol.task.Result, None], gen)
+        return cast(AsyncGenerator[protocol.task.Message, None], gen)
 
     async def close(self):
         """Close the connection and release all pooled resources.
@@ -361,8 +449,10 @@ class WorkerConnection:
         async with asyncio.timeout(timeout):
             await ch.semaphore.acquire()
             try:
-                call: _DispatchCall = ch.stub.dispatch(task.to_protobuf())
+                call: _DispatchCall = ch.stub.dispatch()
                 try:
+                    request = protocol.worker.Request(task=task.to_protobuf())
+                    await call.write(request)
                     response = await anext(aiter(call))
                     if response.HasField("nack"):
                         raise RpcError(
@@ -385,12 +475,12 @@ class WorkerConnection:
         return call
 
     async def _execute(
-        self, call: _DispatchCall
-    ) -> AsyncGenerator[protocol.task.Result | None, None]:
+        self, call: _DispatchCall, task: Task
+    ) -> AsyncGenerator[protocol.task.Message | None, None]:
         ch = await _channel_pool.acquire(self._key)
         try:
             yield  # Priming yield — signals dispatch() that ref is held
-            stream = _DispatchStream(call)
+            stream = _DispatchStream(call, task)
             try:
                 async for result in stream:
                     yield result

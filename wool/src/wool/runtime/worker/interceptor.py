@@ -24,15 +24,24 @@ class VersionInterceptor(grpc.aio.ServerInterceptor):
         if handler is None or not handler_call_details.method.endswith("/dispatch"):
             return handler
 
-        original_handler = handler.unary_stream
+        original_handler = handler.stream_stream
         original_deserializer = handler.request_deserializer
         assert original_handler is not None
         assert original_deserializer is not None
 
-        async def version_checked_handler(request_bytes, context):
+        async def version_checked_handler(request_iterator, context):
+            # Read the first raw request to extract the version envelope
+            first_bytes = await anext(aiter(request_iterator))
+
+            # The first Request message wraps a Task; parse the Task
+            # envelope from the nested task bytes.
+            request_msg = protocol.worker.Request()
+            request_msg.ParseFromString(first_bytes)
+            task_bytes = request_msg.task.SerializeToString()
+
             envelope = protocol.task.TaskEnvelope()
             try:
-                envelope.ParseFromString(request_bytes)
+                envelope.ParseFromString(task_bytes)
             except Exception:
                 yield protocol.worker.Response(
                     nack=protocol.task.Nack(reason="Failed to parse version envelope")
@@ -66,11 +75,19 @@ class VersionInterceptor(grpc.aio.ServerInterceptor):
                 )
                 return
 
-            request = original_deserializer(request_bytes)
-            async for response in original_handler(request, context):  # pyright: ignore[reportGeneralTypeIssues]
+            # Re-assemble a chained iterator: yield the deserialized
+            # first request, then the rest of the stream.
+            first_request = original_deserializer(first_bytes)
+
+            async def chained_iterator():
+                yield first_request
+                async for raw in request_iterator:
+                    yield original_deserializer(raw)
+
+            async for response in original_handler(chained_iterator(), context):  # pyright: ignore[reportArgumentType, reportGeneralTypeIssues]
                 yield response
 
-        return grpc.unary_stream_rpc_method_handler(
+        return grpc.stream_stream_rpc_method_handler(
             version_checked_handler,
             request_deserializer=None,
             response_serializer=handler.response_serializer,

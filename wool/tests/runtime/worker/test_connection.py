@@ -1,4 +1,5 @@
 import asyncio
+import re
 from typing import Callable
 from typing import Coroutine
 from uuid import uuid4
@@ -12,8 +13,12 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
+import wool
 from wool import protocol
+from wool.runtime.event import Event
+from wool.runtime.routine.task import IterationEvent
 from wool.runtime.routine.task import Task
+from wool.runtime.routine.task import TaskEvent
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
@@ -77,7 +82,7 @@ def mock_grpc_call(mocker: MockerFixture):
     """
 
     def create_call(stream_iterator, cancel_raises=False):
-        """Create a mock gRPC call object.
+        """Create a mock gRPC call object for bidi-streaming.
 
         Args:
             stream_iterator: The async iterator to wrap
@@ -85,6 +90,8 @@ def mock_grpc_call(mocker: MockerFixture):
         """
         mock_call = mocker.MagicMock()
         mock_call.__aiter__ = lambda _: stream_iterator
+        mock_call.write = mocker.AsyncMock()
+        mock_call.done_writing = mocker.AsyncMock()
 
         if cancel_raises:
             mock_call.cancel = mocker.MagicMock(
@@ -135,7 +142,7 @@ class TestWorkerConnection:
         responses = (
             protocol.worker.Response(ack=protocol.task.Ack()),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("test_result"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("test_result"))
             ),
         )
         mock_call = mock_grpc_call(async_stream(responses))
@@ -177,7 +184,7 @@ class TestWorkerConnection:
         responses = (
             protocol.worker.Response(ack=protocol.task.Ack()),
             protocol.worker.Response(
-                exception=protocol.task.Exception(
+                exception=protocol.task.Message(
                     dump=cloudpickle.dumps(ValueError("task_error"))
                 )
             ),
@@ -214,7 +221,7 @@ class TestWorkerConnection:
         # Arrange
         responses = (
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("unexpected"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("unexpected"))
             ),
         )
         mock_call = mock_grpc_call(async_stream(responses))
@@ -454,7 +461,7 @@ class TestWorkerConnection:
             protocol.worker.Response(ack=protocol.task.Ack()),
             asyncio.sleep(10),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("done"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("done"))
             ),
         )
 
@@ -579,7 +586,7 @@ class TestWorkerConnection:
             execution_started.set,
             asyncio.sleep(10),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("done"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("done"))
             ),
         )
 
@@ -643,13 +650,13 @@ class TestWorkerConnection:
         responses = (
             protocol.worker.Response(ack=protocol.task.Ack()),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("result_1"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("result_1"))
             ),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("result_2"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("result_2"))
             ),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("result_3"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("result_3"))
             ),
         )
         mock_call = mock_grpc_call(async_stream(responses))
@@ -688,13 +695,13 @@ class TestWorkerConnection:
         responses = (
             protocol.worker.Response(ack=protocol.task.Ack()),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("result_1"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("result_1"))
             ),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("result_2"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("result_2"))
             ),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("result_3"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("result_3"))
             ),
         )
         mock_call = mock_grpc_call(async_stream(responses))
@@ -732,7 +739,7 @@ class TestWorkerConnection:
         responses = (
             protocol.worker.Response(ack=protocol.task.Ack(version="1.0.0")),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("test_result"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("test_result"))
             ),
         )
         mock_call = mock_grpc_call(async_stream(responses))
@@ -807,7 +814,7 @@ class TestResourceLifetime:
         responses = (
             protocol.worker.Response(ack=protocol.task.Ack()),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("value"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("value"))
             ),
         )
         mock_call = mock_grpc_call(async_stream(responses))
@@ -849,7 +856,7 @@ class TestResourceLifetime:
         responses = (
             protocol.worker.Response(ack=protocol.task.Ack()),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("done"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("done"))
             ),
         )
         mock_call = mock_grpc_call(async_stream(responses))
@@ -892,7 +899,7 @@ class TestResourceLifetime:
         responses = (
             protocol.worker.Response(ack=protocol.task.Ack()),
             protocol.worker.Response(
-                exception=protocol.task.Exception(
+                exception=protocol.task.Message(
                     dump=cloudpickle.dumps(RuntimeError("boom"))
                 )
             ),
@@ -936,7 +943,7 @@ class TestResourceLifetime:
         responses = (
             protocol.worker.Response(ack=protocol.task.Ack()),
             protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("done"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("done"))
             ),
         )
         mock_call = mock_grpc_call(async_stream(responses))
@@ -977,13 +984,13 @@ class TestResourceLifetime:
             responses = (
                 protocol.worker.Response(ack=protocol.task.Ack()),
                 protocol.worker.Response(
-                    result=protocol.task.Result(dump=cloudpickle.dumps("ok"))
+                    result=protocol.task.Message(dump=cloudpickle.dumps("ok"))
                 ),
             )
             return mock_grpc_call(async_stream(responses))
 
         mock_stub = mocker.MagicMock()
-        mock_stub.dispatch = mocker.MagicMock(side_effect=lambda _: make_call())
+        mock_stub.dispatch = mocker.MagicMock(side_effect=lambda: make_call())
         mocker.patch.object(protocol.worker, "WorkerStub", return_value=mock_stub)
 
         conn_a = WorkerConnection("localhost:50051", limit=10)
@@ -1019,7 +1026,9 @@ class TestDispatchStream:
         mock_call = mocker.MagicMock()
 
         # Act
-        stream = _DispatchStream(mock_call)
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
 
         # Assert
         assert stream._call == mock_call
@@ -1040,7 +1049,9 @@ class TestDispatchStream:
         from wool.runtime.worker.connection import _DispatchStream
 
         mock_call = mocker.MagicMock()
-        stream = _DispatchStream(mock_call)
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
 
         # Act
         result = stream.__aiter__()
@@ -1050,32 +1061,38 @@ class TestDispatchStream:
 
     @pytest.mark.asyncio
     async def test_anext_with_result(self, mocker: MockerFixture):
-        """Test _DispatchStream __anext__ with response containing result.
+        """Test _DispatchStream __anext__ writes next request and returns result.
 
         Given:
-            A _DispatchStream with response containing result
+            A _DispatchStream with a bidi call returning a result
         When:
             __anext__ is called
         Then:
-            Returns deserialized result value
+            It writes a Request(next=Void()) then reads and returns the next result
         """
         # Arrange
         from wool.runtime.worker.connection import _DispatchStream
 
         async def mock_iter():
             yield protocol.worker.Response(
-                result=protocol.task.Result(dump=cloudpickle.dumps("test_value"))
+                result=protocol.task.Message(dump=cloudpickle.dumps("test_value"))
             )
 
         mock_call = mocker.MagicMock()
         mock_call.__aiter__ = lambda _: mock_iter()
-        stream = _DispatchStream(mock_call)
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
 
         # Act
         result = await stream.__anext__()
 
         # Assert
         assert result == "test_value"
+        mock_call.write.assert_awaited_once()
+        written_request = mock_call.write.call_args[0][0]
+        assert written_request.HasField("next")
 
     @pytest.mark.asyncio
     async def test_anext_with_exception(self, mocker: MockerFixture):
@@ -1086,7 +1103,7 @@ class TestDispatchStream:
         When:
             __anext__ is called
         Then:
-            Raises the deserialized exception
+            Writes a next request and raises the deserialized exception
         """
         # Arrange
         from wool.runtime.worker.connection import _DispatchStream
@@ -1095,12 +1112,15 @@ class TestDispatchStream:
 
         async def mock_iter():
             yield protocol.worker.Response(
-                exception=protocol.task.Exception(dump=cloudpickle.dumps(test_exception))
+                exception=protocol.task.Message(dump=cloudpickle.dumps(test_exception))
             )
 
         mock_call = mocker.MagicMock()
         mock_call.__aiter__ = lambda _: mock_iter()
-        stream = _DispatchStream(mock_call)
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
 
         # Act & Assert
         with pytest.raises(ValueError, match="test error"):
@@ -1115,7 +1135,7 @@ class TestDispatchStream:
         When:
             __anext__ is called
         Then:
-            Raises UnexpectedResponse with descriptive message
+            Writes a next request, raises UnexpectedResponse with descriptive message
         """
         # Arrange
         from wool.runtime.worker.connection import UnexpectedResponse
@@ -1127,7 +1147,10 @@ class TestDispatchStream:
         mock_call = mocker.MagicMock()
         mock_call.__aiter__ = lambda _: mock_iter()
         mock_call.cancel = mocker.MagicMock()
-        stream = _DispatchStream(mock_call)
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
 
         # Act & Assert
         with pytest.raises(
@@ -1153,7 +1176,9 @@ class TestDispatchStream:
         from wool.runtime.worker.connection import _DispatchStream
 
         mock_call = mocker.MagicMock()
-        stream = _DispatchStream(mock_call)
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
         stream._closed = True
 
         # Act & Assert
@@ -1181,7 +1206,10 @@ class TestDispatchStream:
         mock_call = mocker.MagicMock()
         mock_call.__aiter__ = lambda _: mock_iter()
         mock_call.cancel = mocker.MagicMock()
-        stream = _DispatchStream(mock_call)
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
 
         # Act & Assert
         with pytest.raises(RuntimeError, match="Iteration failed"):
@@ -1211,7 +1239,10 @@ class TestDispatchStream:
         mock_call = mocker.MagicMock()
         mock_call.__aiter__ = lambda _: mock_iter()
         mock_call.cancel = mocker.MagicMock(side_effect=Exception("Cancel failed"))
-        stream = _DispatchStream(mock_call)
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
 
         # Act & Assert - should raise original error, not cancel error
         with pytest.raises(RuntimeError, match="Original error"):
@@ -1233,7 +1264,9 @@ class TestDispatchStream:
 
         mock_call = mocker.MagicMock()
         mock_call.cancel = mocker.MagicMock()
-        stream = _DispatchStream(mock_call)
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
 
         # Act
         await stream.aclose()
@@ -1258,7 +1291,9 @@ class TestDispatchStream:
 
         mock_call = mocker.MagicMock()
         mock_call.cancel = mocker.MagicMock()
-        stream = _DispatchStream(mock_call)
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
         stream._closed = True
 
         # Act
@@ -1283,7 +1318,9 @@ class TestDispatchStream:
 
         mock_call = mocker.MagicMock()
         mock_call.cancel = mocker.MagicMock(side_effect=Exception("Cancel failed"))
-        stream = _DispatchStream(mock_call)
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
 
         # Act - should not raise
         await stream.aclose()
@@ -1292,46 +1329,291 @@ class TestDispatchStream:
         assert stream._closed
 
     @pytest.mark.asyncio
-    async def test_asend_not_implemented(self, mocker: MockerFixture):
-        """Test _DispatchStream asend() raises NotImplementedError.
+    async def test_asend_writes_send_and_reads_next(self, mocker: MockerFixture):
+        """Test _DispatchStream asend() writes a send Request and reads next result.
 
         Given:
-            A _DispatchStream instance
+            A _DispatchStream with a bidi call
         When:
-            asend() is called with any value
+            asend() is called with a value
         Then:
-            Raises NotImplementedError with descriptive message
+            It serializes the value, writes a Request(send=...) to the
+            stream, and returns the next result.
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            yield protocol.worker.Response(
+                result=protocol.task.Message(dump=cloudpickle.dumps("response_value"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+
+        # Act
+        result = await stream.asend("send_value")
+
+        # Assert
+        assert result == "response_value"
+        mock_call.write.assert_awaited_once()
+        written_request = mock_call.write.call_args[0][0]
+        assert written_request.HasField("send")
+        assert cloudpickle.loads(written_request.send.dump) == "send_value"
+
+    @pytest.mark.asyncio
+    async def test_asend_when_closed(self, mocker: MockerFixture):
+        """Test _DispatchStream asend() raises StopAsyncIteration when closed.
+
+        Given:
+            A closed _DispatchStream
+        When:
+            asend() is called
+        Then:
+            It raises StopAsyncIteration without writing.
         """
         # Arrange
         from wool.runtime.worker.connection import _DispatchStream
 
         mock_call = mocker.MagicMock()
-        stream = _DispatchStream(mock_call)
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+        stream._closed = True
 
         # Act & Assert
-        with pytest.raises(NotImplementedError, match="asend\\(\\) is not supported"):
+        with pytest.raises(StopAsyncIteration):
+            await stream.asend("value")
+
+        mock_call.write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_athrow_writes_throw_and_reads_next(self, mocker: MockerFixture):
+        """Test _DispatchStream athrow() writes a throw Request and reads next result.
+
+        Given:
+            A _DispatchStream with a bidi call
+        When:
+            athrow() is called with an exception instance
+        Then:
+            It serializes the exception, writes a Request(throw=...) to the
+            stream, and returns the next result.
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            yield protocol.worker.Response(
+                result=protocol.task.Message(dump=cloudpickle.dumps("after_throw"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+
+        # Act
+        result = await stream.athrow(ValueError("test_error"))
+
+        # Assert
+        assert result == "after_throw"
+        mock_call.write.assert_awaited_once()
+        written_request = mock_call.write.call_args[0][0]
+        assert written_request.HasField("throw")
+        thrown = cloudpickle.loads(written_request.throw.dump)
+        assert isinstance(thrown, ValueError)
+        assert str(thrown) == "test_error"
+
+    @pytest.mark.asyncio
+    async def test_athrow_with_exception_type(self, mocker: MockerFixture):
+        """Test _DispatchStream athrow() accepts a bare exception type.
+
+        Given:
+            A _DispatchStream with a bidi call
+        When:
+            athrow() is called with an exception type (not an instance)
+        Then:
+            It serializes a ValueError instance and writes a
+            Request(throw=...) to the stream.
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            yield protocol.worker.Response(
+                result=protocol.task.Message(dump=cloudpickle.dumps("ok"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+
+        # Act
+        await stream.athrow(ValueError)
+
+        # Assert
+        written_request = mock_call.write.call_args[0][0]
+        thrown = cloudpickle.loads(written_request.throw.dump)
+        assert isinstance(thrown, ValueError)
+
+    @pytest.mark.asyncio
+    async def test_athrow_with_exception_type_and_value(self, mocker: MockerFixture):
+        """Test _DispatchStream athrow() accepts a type and value pair.
+
+        Given:
+            A _DispatchStream with a bidi call
+        When:
+            athrow() is called with an exception type and an instance
+        Then:
+            It serializes the provided instance and writes a
+            Request(throw=...) to the stream.
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            yield protocol.worker.Response(
+                result=protocol.task.Message(dump=cloudpickle.dumps("ok"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+
+        # Act
+        await stream.athrow(ValueError, ValueError("msg"))
+
+        # Assert
+        written_request = mock_call.write.call_args[0][0]
+        thrown = cloudpickle.loads(written_request.throw.dump)
+        assert isinstance(thrown, ValueError)
+        assert str(thrown) == "msg"
+
+    @pytest.mark.asyncio
+    async def test_athrow_when_closed(self, mocker: MockerFixture):
+        """Test _DispatchStream athrow() raises StopAsyncIteration when closed.
+
+        Given:
+            A closed _DispatchStream
+        When:
+            athrow() is called
+        Then:
+            It raises StopAsyncIteration without writing.
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+        stream._closed = True
+
+        # Act & Assert
+        with pytest.raises(StopAsyncIteration):
+            await stream.athrow(ValueError, ValueError("test"))
+
+        mock_call.write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_anext_while_already_running(self, mocker: MockerFixture):
+        """Test _DispatchStream __anext__() re-entrancy guard matches native.
+
+        Given:
+            A native async generator's RuntimeError message for anext()
+            re-entrancy, and a _DispatchStream with _running=True
+        When:
+            __anext__() is called on each
+        Then:
+            Both raise RuntimeError with the same message.
+        """
+        # Native CPython uses this exact message for anext() re-entrancy.
+        native_msg = "anext(): asynchronous generator is already running"
+
+        # Arrange — _DispatchStream
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+        stream._running = True
+
+        # Act & Assert
+        with pytest.raises(RuntimeError, match=re.escape(native_msg)):
+            await stream.__anext__()
+
+    @pytest.mark.asyncio
+    async def test_asend_while_already_running(self, mocker: MockerFixture):
+        """Test _DispatchStream asend() re-entrancy guard matches native.
+
+        Given:
+            The native async generator RuntimeError message for asend()
+            re-entrancy, and a _DispatchStream with _running=True
+        When:
+            asend() is called on each
+        Then:
+            Both raise RuntimeError with the same message (native
+            asend reuses the ``anext():`` prefix).
+        """
+        # Native asend reuses the anext() prefix.
+        native_msg = "anext(): asynchronous generator is already running"
+
+        # Arrange — _DispatchStream
+        from wool.runtime.worker.connection import _DispatchStream
+
+        mock_call = mocker.MagicMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+        stream._running = True
+
+        # Act & Assert
+        with pytest.raises(RuntimeError, match=re.escape(native_msg)):
             await stream.asend("value")
 
     @pytest.mark.asyncio
-    async def test_athrow_not_implemented(self, mocker: MockerFixture):
-        """Test _DispatchStream athrow() raises NotImplementedError.
+    async def test_athrow_while_already_running(self, mocker: MockerFixture):
+        """Test _DispatchStream athrow() re-entrancy guard matches native.
 
         Given:
-            A _DispatchStream instance
+            The native async generator RuntimeError message for athrow()
+            re-entrancy, and a _DispatchStream with _running=True
         When:
-            athrow() is called with exception info
+            athrow() is called on each
         Then:
-            Raises NotImplementedError with descriptive message
+            Both raise RuntimeError with the same message (native
+            athrow uses the ``athrow():`` prefix).
         """
-        # Arrange
+        # Native athrow uses athrow() prefix.
+        native_msg = "athrow(): asynchronous generator is already running"
+
+        # Arrange — _DispatchStream
         from wool.runtime.worker.connection import _DispatchStream
 
         mock_call = mocker.MagicMock()
-        stream = _DispatchStream(mock_call)
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+        stream._running = True
 
         # Act & Assert
-        with pytest.raises(NotImplementedError, match="athrow\\(\\) is not supported"):
-            await stream.athrow(ValueError, ValueError("test"))
+        with pytest.raises(RuntimeError, match=re.escape(native_msg)):
+            await stream.athrow(ValueError("err"))
 
     @pytest.mark.asyncio
     @settings(
@@ -1356,13 +1638,16 @@ class TestDispatchStream:
         async def mock_iter():
             for i in range(response_count):
                 yield protocol.worker.Response(
-                    result=protocol.task.Result(dump=cloudpickle.dumps(i))
+                    result=protocol.task.Message(dump=cloudpickle.dumps(i))
                 )
 
         mock_call = mocker.MagicMock()
         mock_call.__aiter__ = lambda _: mock_iter()
         mock_call.cancel = mocker.MagicMock()
-        stream = _DispatchStream(mock_call)
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
 
         # Act - iterate partway and close
         results = []
@@ -1377,3 +1662,268 @@ class TestDispatchStream:
         assert stream._closed
         if response_count > 0:
             assert len(results) <= min(2, response_count)
+
+    @pytest.mark.asyncio
+    async def test_anext_writes_next_request_before_reading(self, mocker: MockerFixture):
+        """Test _DispatchStream __anext__ writes next request then reads.
+
+        Given:
+            A _DispatchStream with a bidi call returning a result
+        When:
+            __anext__() is called
+        Then:
+            It writes a Request(next=Void()) then reads and returns
+            the next result
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        async def mock_iter():
+            yield protocol.worker.Response(
+                result=protocol.task.Message(dump=cloudpickle.dumps("value"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+
+        # Act
+        result = await stream.__anext__()
+
+        # Assert
+        assert result == "value"
+        mock_call.write.assert_awaited_once()
+        written = mock_call.write.call_args[0][0]
+        assert written.HasField("next")
+
+    @pytest.mark.asyncio
+    async def test_anext_pull_only_multiple_values(self, mocker: MockerFixture):
+        """Test _DispatchStream __anext__ pulling multiple values.
+
+        Given:
+            A _DispatchStream with a bidi call returning 3 results
+        When:
+            __anext__() is called 3 times
+        Then:
+            Each call writes a next request and returns the
+            corresponding result in order
+        """
+        # Arrange
+        from wool.runtime.worker.connection import _DispatchStream
+
+        values = ["first", "second", "third"]
+
+        async def mock_iter():
+            for v in values:
+                yield protocol.worker.Response(
+                    result=protocol.task.Message(dump=cloudpickle.dumps(v))
+                )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+        stream = _DispatchStream(mock_call, mock_task)
+
+        # Act
+        results = []
+        for _ in range(3):
+            results.append(await stream.__anext__())
+
+        # Assert
+        assert results == values
+        assert mock_call.write.await_count == 3
+        for call in mock_call.write.call_args_list:
+            assert call[0][0].HasField("next")
+
+
+@pytest.fixture
+def clear_iteration_handlers():
+    """Clears iteration event handlers before and after each test."""
+    saved = TaskEvent._handlers.copy()
+    TaskEvent._handlers.clear()
+    yield
+    TaskEvent._handlers = saved
+
+
+@pytest.fixture
+def iteration_spy():
+    """Spy for tracking IterationEvent emissions."""
+    calls = []
+
+    def spy(event, timestamp, context=None):
+        calls.append((event, timestamp, context))
+
+    spy.calls = calls
+    return spy
+
+
+class TestDispatchStreamIterationEvents:
+    """Tests for IterationEvent emission in _DispatchStream."""
+
+    @pytest.mark.asyncio
+    async def test_anext_emits_iteration_initiated_event(
+        self, mocker: MockerFixture, iteration_spy, clear_iteration_handlers
+    ):
+        """Test __anext__ emits task-iteration-initiated event.
+
+        Given:
+            A _DispatchStream with a task
+        When:
+            __anext__ is called
+        Then:
+            A task-iteration-initiated event is emitted with kind="next"
+            and step=0
+        """
+        from wool.runtime.worker.connection import _DispatchStream
+
+        TaskEvent._handlers["task-iteration-initiated"] = [iteration_spy]
+
+        async def mock_iter():
+            yield protocol.worker.Response(
+                result=protocol.task.Message(dump=cloudpickle.dumps("val"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+
+        stream = _DispatchStream(mock_call, mock_task)
+        await stream.__anext__()
+
+        Event.flush()
+
+        assert len(iteration_spy.calls) == 1
+        event = iteration_spy.calls[0][0]
+        assert isinstance(event, IterationEvent)
+        assert event.kind == "next"
+        assert event.step == 0
+        assert event.task is mock_task
+
+    @pytest.mark.asyncio
+    async def test_asend_emits_iteration_initiated_event(
+        self, mocker: MockerFixture, iteration_spy, clear_iteration_handlers
+    ):
+        """Test asend() emits task-iteration-initiated event.
+
+        Given:
+            A _DispatchStream with a task
+        When:
+            asend() is called
+        Then:
+            A task-iteration-initiated event is emitted with kind="send"
+            and step=0
+        """
+        from wool.runtime.worker.connection import _DispatchStream
+
+        TaskEvent._handlers["task-iteration-initiated"] = [iteration_spy]
+
+        async def mock_iter():
+            yield protocol.worker.Response(
+                result=protocol.task.Message(dump=cloudpickle.dumps("echo"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+
+        stream = _DispatchStream(mock_call, mock_task)
+        await stream.asend("hello")
+
+        Event.flush()
+
+        assert len(iteration_spy.calls) == 1
+        event = iteration_spy.calls[0][0]
+        assert isinstance(event, IterationEvent)
+        assert event.kind == "send"
+        assert event.step == 0
+
+    @pytest.mark.asyncio
+    async def test_athrow_emits_iteration_initiated_event(
+        self, mocker: MockerFixture, iteration_spy, clear_iteration_handlers
+    ):
+        """Test athrow() emits task-iteration-initiated event.
+
+        Given:
+            A _DispatchStream with a task
+        When:
+            athrow() is called
+        Then:
+            A task-iteration-initiated event is emitted with kind="throw"
+            and step=0
+        """
+        from wool.runtime.worker.connection import _DispatchStream
+
+        TaskEvent._handlers["task-iteration-initiated"] = [iteration_spy]
+
+        async def mock_iter():
+            yield protocol.worker.Response(
+                result=protocol.task.Message(dump=cloudpickle.dumps("recovered"))
+            )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+
+        stream = _DispatchStream(mock_call, mock_task)
+        await stream.athrow(ValueError("test"))
+
+        Event.flush()
+
+        assert len(iteration_spy.calls) == 1
+        event = iteration_spy.calls[0][0]
+        assert isinstance(event, IterationEvent)
+        assert event.kind == "throw"
+        assert event.step == 0
+
+    @pytest.mark.asyncio
+    async def test_iteration_initiated_step_increments(
+        self, mocker: MockerFixture, iteration_spy, clear_iteration_handlers
+    ):
+        """Test step increments across multiple iterations.
+
+        Given:
+            A _DispatchStream with a task yielding 3 values
+        When:
+            __anext__ is called 3 times
+        Then:
+            Events are emitted with step 0, 1, 2
+        """
+        from wool.runtime.worker.connection import _DispatchStream
+
+        TaskEvent._handlers["task-iteration-initiated"] = [iteration_spy]
+
+        values = ["a", "b", "c"]
+
+        async def mock_iter():
+            for v in values:
+                yield protocol.worker.Response(
+                    result=protocol.task.Message(dump=cloudpickle.dumps(v))
+                )
+
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: mock_iter()
+        mock_call.write = mocker.AsyncMock()
+        mock_task = mocker.MagicMock()
+        mock_task.callable = lambda: None
+
+        stream = _DispatchStream(mock_call, mock_task)
+        for _ in range(3):
+            await stream.__anext__()
+
+        Event.flush()
+
+        assert len(iteration_spy.calls) == 3
+        for i, (event, _, _) in enumerate(iteration_spy.calls):
+            assert event.step == i
+            assert event.kind == "next"

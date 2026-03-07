@@ -19,6 +19,8 @@ from pytest_mock import MockerFixture
 from wool import protocol
 from wool.protocol.worker import WorkerStub
 from wool.protocol.worker import add_WorkerServicer_to_server
+from wool.runtime.event import Event
+from wool.runtime.routine.task import IterationEvent
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskEvent
 from wool.runtime.worker.interceptor import VersionInterceptor
@@ -98,11 +100,13 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
         proxy=mock_proxy,
     )
 
-    request = wool_task.to_protobuf()
+    request = protocol.worker.Request(task=wool_task.to_protobuf())
 
     # Start the service and dispatch the task
     async with grpc_aio_stub(servicer=service) as stub:
-        stream = stub.dispatch(request)
+        stream = stub.dispatch()
+        await stream.write(request)
+        await stream.done_writing()
 
         # Wait for the ack to confirm task is dispatched
         async for response in stream:
@@ -249,13 +253,15 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
 
         emit_spy = mocker.spy(TaskEvent, "emit")
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             responses = [r async for r in stream]
 
         # Assert
@@ -301,13 +307,15 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
 
         emit_spy = mocker.spy(TaskEvent, "emit")
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             responses = [r async for r in stream]
 
         # Assert
@@ -366,11 +374,13 @@ class TestWorkerService:
                 proxy=mock_proxy,
             )
 
-            request = wool_task.to_protobuf()
+            request = protocol.worker.Request(task=wool_task.to_protobuf())
 
             # Act & Assert
             with pytest.raises(grpc.RpcError) as exc_info:
-                stream = stub.dispatch(request)
+                stream = stub.dispatch()
+                await stream.write(request)
+                await stream.done_writing()
                 async for _ in stream:
                     pass
 
@@ -428,11 +438,13 @@ class TestWorkerService:
                 proxy=mock_proxy,
             )
 
-            request = wool_task.to_protobuf()
+            request = protocol.worker.Request(task=wool_task.to_protobuf())
 
             # Act & Assert
             with pytest.raises(grpc.RpcError) as exc_info:
-                stream = stub.dispatch(request)
+                stream = stub.dispatch()
+                await stream.write(request)
+                await stream.done_writing()
                 async for _ in stream:
                     pass
 
@@ -476,12 +488,14 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
 
         # Act & Assert
         async with grpc_aio_stub() as stub:
             with pytest.raises(grpc.RpcError) as exc_info:
-                stream = stub.dispatch(request)
+                stream = stub.dispatch()
+                await stream.write(request)
+                await stream.done_writing()
                 async for _ in stream:
                     pass
 
@@ -523,12 +537,14 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
 
         # Act
         async with grpc_aio_stub() as stub:
             # Start the task dispatch stream
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             async for response in stream:
                 assert response.HasField("ack")
                 break
@@ -584,12 +600,14 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
 
         # Act
         async with grpc_aio_stub() as stub:
             # Start the task dispatch stream
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             async for response in stream:
                 assert response.HasField("ack")
                 break
@@ -645,11 +663,13 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             responses = [r async for r in stream]
 
         # Assert
@@ -825,7 +845,7 @@ class TestWorkerService:
         Given:
             A service receiving task with async generator callable
         When:
-            dispatch() is called and iterated
+            The client sends Request(next=Void()) for each yield
         Then:
             Yields acknowledgment, then multiple result responses from generator in order
         """
@@ -846,23 +866,36 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
 
         emit_spy = mocker.spy(TaskEvent, "emit")
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
-            responses = [r async for r in stream]
+            stream = stub.dispatch()
+            await stream.write(request)
+
+            # Read ack
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            # Send next requests and collect results
+            results = []
+            for _ in range(3):
+                await stream.write(next_request)
+                response = await anext(aiter(stream))
+                assert response.HasField("result")
+                results.append(cloudpickle.loads(response.result.dump))
+
+            # Send one more next to exhaust the generator
+            await stream.write(next_request)
+            await stream.done_writing()
+            remaining = [r async for r in stream]
 
         # Assert
-        assert len(responses) == 4  # 1 ack + 3 results
-        assert responses[0].HasField("ack")
-
-        for i, response in enumerate(responses[1:]):
-            assert response.HasField("result")
-            result = cloudpickle.loads(response.result.dump)
-            assert result == f"gen_value_{i}"
+        assert results == ["gen_value_0", "gen_value_1", "gen_value_2"]
+        assert len(remaining) == 0
 
         # Verify task-scheduled event was emitted
         emit_spy.assert_called()
@@ -880,9 +913,9 @@ class TestWorkerService:
         Given:
             A service with async generator task that raises during iteration
         When:
-            dispatch() is called and iterated
+            The client sends next requests and the generator raises
         Then:
-            Yields ack, then exception response containing the raised exception
+            Yields ack, the first result, then exception response containing the raised exception
         """
 
         # Arrange
@@ -901,22 +934,31 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
-            responses = [r async for r in stream]
+            stream = stub.dispatch()
+            await stream.write(request)
 
-        # Assert
-        assert len(responses) == 3  # 1 ack + 1 result + 1 exception
-        assert responses[0].HasField("ack")
-        assert responses[1].HasField("result")
-        assert cloudpickle.loads(responses[1].result.dump) == "first_value"
-        assert responses[2].HasField("exception")
-        exception = cloudpickle.loads(responses[2].exception.dump)
-        assert isinstance(exception, ValueError)
-        assert str(exception) == "Generator error"
+            # Read ack
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            # First next: yields "first_value"
+            await stream.write(next_request)
+            response = await anext(aiter(stream))
+            assert response.HasField("result")
+            assert cloudpickle.loads(response.result.dump) == "first_value"
+
+            # Second next: generator raises
+            await stream.write(next_request)
+            response = await anext(aiter(stream))
+            assert response.HasField("exception")
+            exception = cloudpickle.loads(response.exception.dump)
+            assert isinstance(exception, ValueError)
+            assert str(exception) == "Generator error"
 
     @pytest.mark.asyncio
     @pytest.mark.dependency("test_dispatch_task_that_returns")
@@ -928,7 +970,7 @@ class TestWorkerService:
         Given:
             A service with async generator task
         When:
-            dispatch() is called and fully consumed
+            The client sends next requests until exhaustion
         Then:
             Yields acknowledgment, all results, then stream ends cleanly
         """
@@ -949,20 +991,35 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
-            responses = [r async for r in stream]
+            stream = stub.dispatch()
+            await stream.write(request)
 
-        # Assert
-        assert len(responses) == 3  # 1 ack + 2 results
-        assert responses[0].HasField("ack")
-        assert responses[1].HasField("result")
-        assert cloudpickle.loads(responses[1].result.dump) == 0
-        assert responses[2].HasField("result")
-        assert cloudpickle.loads(responses[2].result.dump) == 1
+            # Read ack
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            # Read first result
+            await stream.write(next_request)
+            response = await anext(aiter(stream))
+            assert response.HasField("result")
+            assert cloudpickle.loads(response.result.dump) == 0
+
+            # Read second result
+            await stream.write(next_request)
+            response = await anext(aiter(stream))
+            assert response.HasField("result")
+            assert cloudpickle.loads(response.result.dump) == 1
+
+            # Exhaust the generator
+            await stream.write(next_request)
+            await stream.done_writing()
+            remaining = [r async for r in stream]
+            assert len(remaining) == 0
 
     @pytest.mark.asyncio
     @pytest.mark.dependency("test_dispatch_task_that_returns")
@@ -974,9 +1031,9 @@ class TestWorkerService:
         Given:
             A service with async generator task yielding zero values
         When:
-            dispatch() is called and iterated
+            The client sends a next request
         Then:
-            Yields acknowledgment, then immediately ends without result responses
+            Yields acknowledgment, then stream ends without result responses
         """
 
         # Arrange
@@ -995,16 +1052,25 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
-            responses = [r async for r in stream]
+            stream = stub.dispatch()
+            await stream.write(request)
+
+            # Read ack
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            # Send next - generator is empty, should end
+            await stream.write(next_request)
+            await stream.done_writing()
+            remaining = [r async for r in stream]
 
         # Assert
-        assert len(responses) == 1  # only ack
-        assert responses[0].HasField("ack")
+        assert len(remaining) == 0
 
     @pytest.mark.asyncio
     @pytest.mark.dependency("test_dispatch_task_that_returns")
@@ -1036,11 +1102,13 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             responses = [r async for r in stream]
 
         # Assert
@@ -1086,18 +1154,22 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
 
             # Read ack
             async for response in stream:
                 assert response.HasField("ack")
                 break
 
-            # Read first result to confirm generator is active
+            # Send next to advance generator and read first result
+            await stream.write(next_request)
             async for response in stream:
                 assert response.HasField("result")
                 assert cloudpickle.loads(response.result.dump) == "first_value"
@@ -1233,11 +1305,13 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             responses = [r async for r in stream]
 
         # Assert
@@ -1276,12 +1350,14 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
-        request.ClearField("version")
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        request.task.ClearField("version")
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             responses = [r async for r in stream]
 
         # Assert
@@ -1339,13 +1415,15 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
         # Override version field to simulate incompatible client
-        request.version = f"{client_major}.0.0"
+        request.task.version = f"{client_major}.0.0"
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             responses = [r async for r in stream]
 
         # Assert
@@ -1404,12 +1482,14 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
-        request.version = f"{major}.{client_minor}.0"
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        request.task.version = f"{major}.{client_minor}.0"
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             responses = [r async for r in stream]
 
         # Assert
@@ -1448,15 +1528,754 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        request = wool_task.to_protobuf()
-        request.version = "not-a-version"
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        request.task.version = "not-a-version"
 
         # Act
         async with grpc_aio_stub() as stub:
-            stream = stub.dispatch(request)
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
             responses = [r async for r in stream]
 
         # Assert
         assert len(responses) == 1
         assert responses[0].HasField("nack")
         assert "Unparseable version" in responses[0].nack.reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_task")
+    async def test_dispatch_async_generator_with_send(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() forwards send requests into async generator via asend().
+
+        Given:
+            A service receiving an async generator task
+        When:
+            The client sends Request(next=...) then Request(send=...)
+            frames after the initial Task
+        Then:
+            The generator receives the sent values via asend() and
+            yields responses driven by those values.
+        """
+
+        # Arrange
+        async def echo_generator():
+            value = yield "ready"
+            while value is not None:
+                value = yield f"echo:{value}"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=echo_generator,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+
+            # Read ack
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            # Send next to get first yield ("ready")
+            await stream.write(next_request)
+            response = await anext(aiter(stream))
+            assert response.HasField("result")
+            assert cloudpickle.loads(response.result.dump) == "ready"
+
+            # Send "hello" and read response
+            msg = protocol.worker.Request(
+                send=protocol.task.Message(dump=cloudpickle.dumps("hello"))
+            )
+            await stream.write(msg)
+            response = await anext(aiter(stream))
+            assert response.HasField("result")
+            assert cloudpickle.loads(response.result.dump) == "echo:hello"
+
+            # Send "world" and read response
+            msg = protocol.worker.Request(
+                send=protocol.task.Message(dump=cloudpickle.dumps("world"))
+            )
+            await stream.write(msg)
+            response = await anext(aiter(stream))
+            assert response.HasField("result")
+            assert cloudpickle.loads(response.result.dump) == "echo:world"
+
+            # Send None to terminate the generator
+            msg = protocol.worker.Request(
+                send=protocol.task.Message(dump=cloudpickle.dumps(None))
+            )
+            await stream.write(msg)
+            await stream.done_writing()
+
+            # Stream should end cleanly
+            remaining = [r async for r in stream]
+            assert len(remaining) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_task")
+    async def test_dispatch_async_generator_send_then_close(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() handles client closing stream after sends.
+
+        Given:
+            A service receiving an async generator task with send support
+        When:
+            The client sends values then closes the write side
+        Then:
+            The server does not advance the generator further after
+            the stream closes.
+        """
+
+        # Arrange
+        async def counting_generator():
+            count = 0
+            while count < 5:
+                received = yield count
+                if received is not None:
+                    count = received
+                else:
+                    count += 1
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=counting_generator,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+
+            # Read ack
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            # Send next to get first yield (0)
+            await stream.write(next_request)
+            response = await anext(aiter(stream))
+            assert response.HasField("result")
+            assert cloudpickle.loads(response.result.dump) == 0
+
+            # Send 2 to jump the counter
+            msg = protocol.worker.Request(
+                send=protocol.task.Message(dump=cloudpickle.dumps(2))
+            )
+            await stream.write(msg)
+            response = await anext(aiter(stream))
+            assert response.HasField("result")
+            assert cloudpickle.loads(response.result.dump) == 2
+
+            # Close the write side; server should not advance further
+            await stream.done_writing()
+
+            # Stream should end cleanly (no more responses)
+            remaining = [r async for r in stream]
+            assert len(remaining) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_task")
+    async def test_dispatch_pull_only_async_generator(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() with a pull-only async generator (no send type).
+
+        Given:
+            A service receiving a pull-only async generator task
+        When:
+            The client sends Request(next=Void()) for each yield
+        Then:
+            Each next request produces the next yielded value in order
+        """
+
+        # Arrange
+        async def pull_only():
+            yield "alpha"
+            yield "beta"
+            yield "gamma"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=pull_only,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+
+            # Read ack
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            # Pull each value
+            results = []
+            for _ in range(3):
+                await stream.write(next_request)
+                response = await anext(aiter(stream))
+                assert response.HasField("result")
+                results.append(cloudpickle.loads(response.result.dump))
+
+            # Exhaust
+            await stream.write(next_request)
+            await stream.done_writing()
+            remaining = [r async for r in stream]
+
+        # Assert
+        assert results == ["alpha", "beta", "gamma"]
+        assert len(remaining) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_task")
+    async def test_dispatch_pull_only_async_generator_partial_consumption(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() with partial consumption of a pull-only async generator.
+
+        Given:
+            A service with a pull-only async generator yielding 5 values
+        When:
+            The client sends 2 next requests then closes the stream
+        Then:
+            Only 2 result responses are received and the generator is
+            cleaned up
+        """
+
+        # Arrange
+        async def five_values():
+            for i in range(5):
+                yield i
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=five_values,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+
+            # Read ack
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            # Pull only 2 values
+            results = []
+            for _ in range(2):
+                await stream.write(next_request)
+                response = await anext(aiter(stream))
+                assert response.HasField("result")
+                results.append(cloudpickle.loads(response.result.dump))
+
+            # Close the stream without exhausting
+            await stream.done_writing()
+            remaining = [r async for r in stream]
+
+        # Assert
+        assert results == [0, 1]
+        assert len(remaining) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_with_send")
+    async def test_dispatch_async_generator_interleaved_next_and_send(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() with interleaved next and send requests.
+
+        Given:
+            A service with an async generator that accepts send values
+        When:
+            The client alternates between next and send requests
+        Then:
+            next advances with asend(None), send advances with the
+            provided value
+        """
+
+        # Arrange
+        async def accumulator():
+            total = 0
+            while True:
+                received = yield total
+                if received is not None:
+                    total += received
+                else:
+                    total += 1
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=accumulator,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+
+            # Read ack
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            # next -> yields 0 (initial total)
+            await stream.write(next_request)
+            response = await anext(aiter(stream))
+            assert cloudpickle.loads(response.result.dump) == 0
+
+            # send 10 -> yields 10
+            msg = protocol.worker.Request(
+                send=protocol.task.Message(dump=cloudpickle.dumps(10))
+            )
+            await stream.write(msg)
+            response = await anext(aiter(stream))
+            assert cloudpickle.loads(response.result.dump) == 10
+
+            # next (asend(None)) -> yields 11 (total + 1)
+            await stream.write(next_request)
+            response = await anext(aiter(stream))
+            assert cloudpickle.loads(response.result.dump) == 11
+
+            # send 5 -> yields 16
+            msg = protocol.worker.Request(
+                send=protocol.task.Message(dump=cloudpickle.dumps(5))
+            )
+            await stream.write(msg)
+            response = await anext(aiter(stream))
+            assert cloudpickle.loads(response.result.dump) == 16
+
+            await stream.done_writing()
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_task")
+    async def test_dispatch_async_generator_throw_terminates(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test dispatch() with a throw request that terminates the generator.
+
+        Given:
+            A service with an async generator task
+        When:
+            The client sends a throw request with a ValueError
+        Then:
+            The generator receives the exception and the server yields
+            an exception response
+        """
+
+        # Arrange
+        async def simple_generator():
+            yield "first"
+            yield "second"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=simple_generator,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+
+            # Read ack
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            # Get first yield
+            await stream.write(next_request)
+            response = await anext(aiter(stream))
+            assert response.HasField("result")
+            assert cloudpickle.loads(response.result.dump) == "first"
+
+            # Throw ValueError into the generator
+            throw_request = protocol.worker.Request(
+                throw=protocol.task.Message(
+                    dump=cloudpickle.dumps(ValueError("injected"))
+                )
+            )
+            await stream.write(throw_request)
+            response = await anext(aiter(stream))
+            assert response.HasField("exception")
+            exception = cloudpickle.loads(response.exception.dump)
+            assert isinstance(exception, ValueError)
+            assert str(exception) == "injected"
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_task")
+    async def test_stream_dispatch_emits_iteration_events(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test stream dispatch emits started/completed iteration events.
+
+        Given:
+            A service with an async generator task
+        When:
+            The client sends 2 next requests
+        Then:
+            task-iteration-started and task-iteration-completed events
+            are emitted for each iteration with correct kind and step
+        """
+
+        # Arrange
+        async def two_values():
+            yield "first"
+            yield "second"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=two_values,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        saved = TaskEvent._handlers.copy()
+        TaskEvent._handlers.clear()
+
+        iteration_calls = []
+
+        def spy(event, timestamp, context=None):
+            iteration_calls.append((event, timestamp, context))
+
+        TaskEvent._handlers["task-iteration-started"] = [spy]
+        TaskEvent._handlers["task-iteration-completed"] = [spy]
+
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
+
+        try:
+            # Act
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(request)
+                response = await anext(aiter(stream))
+                assert response.HasField("ack")
+
+                for _ in range(2):
+                    await stream.write(next_request)
+                    await anext(aiter(stream))
+
+                await stream.write(next_request)
+                await stream.done_writing()
+                [r async for r in stream]
+
+            Event.flush()
+
+            # Assert — 3 iterations: 2 that yield + 1 exhaustion
+            started = [
+                e for e, _, _ in iteration_calls if e.type == "task-iteration-started"
+            ]
+            completed = [
+                e for e, _, _ in iteration_calls if e.type == "task-iteration-completed"
+            ]
+            assert len(started) == 3
+            assert len(completed) == 3
+            for i, (s, c) in enumerate(zip(started, completed)):
+                assert s.kind == "next"
+                assert s.step == i
+                assert c.kind == "next"
+                assert c.step == i
+        finally:
+            TaskEvent._handlers = saved
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_with_send")
+    async def test_stream_dispatch_send_emits_iteration_events(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test send-driven iteration emits events with kind="send".
+
+        Given:
+            A service with an echo async generator task
+        When:
+            The client sends a next then a send request
+        Then:
+            Iteration events record "next" for the first and "send"
+            for the second
+        """
+
+        # Arrange
+        async def echo_gen():
+            value = yield "ready"
+            yield f"echo:{value}"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=echo_gen,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        saved = TaskEvent._handlers.copy()
+        TaskEvent._handlers.clear()
+
+        iteration_calls = []
+
+        def spy(event, timestamp, context=None):
+            iteration_calls.append((event, timestamp, context))
+
+        TaskEvent._handlers["task-iteration-started"] = [spy]
+        TaskEvent._handlers["task-iteration-completed"] = [spy]
+
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
+
+        try:
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(request)
+                response = await anext(aiter(stream))
+                assert response.HasField("ack")
+
+                # next
+                await stream.write(next_request)
+                await anext(aiter(stream))
+
+                # send
+                msg = protocol.worker.Request(
+                    send=protocol.task.Message(dump=cloudpickle.dumps("hello"))
+                )
+                await stream.write(msg)
+                await anext(aiter(stream))
+
+                await stream.done_writing()
+                [r async for r in stream]
+
+            Event.flush()
+
+            started = [
+                e for e, _, _ in iteration_calls if e.type == "task-iteration-started"
+            ]
+            assert len(started) == 2
+            assert started[0].kind == "next"
+            assert started[0].step == 0
+            assert started[1].kind == "send"
+            assert started[1].step == 1
+        finally:
+            TaskEvent._handlers = saved
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_throw_terminates")
+    async def test_stream_dispatch_throw_emits_iteration_events(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test throw-driven iteration emits events with kind="throw".
+
+        Given:
+            A service with an async generator task
+        When:
+            The client sends a next then a throw request
+        Then:
+            Iteration events record "next" for the first and "throw"
+            for the second
+        """
+
+        # Arrange
+        async def gen():
+            yield "first"
+            yield "second"
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=gen,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        saved = TaskEvent._handlers.copy()
+        TaskEvent._handlers.clear()
+
+        iteration_calls = []
+
+        def spy(event, timestamp, context=None):
+            iteration_calls.append((event, timestamp, context))
+
+        TaskEvent._handlers["task-iteration-started"] = [spy]
+        TaskEvent._handlers["task-iteration-completed"] = [spy]
+
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
+
+        try:
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(request)
+                response = await anext(aiter(stream))
+                assert response.HasField("ack")
+
+                # next
+                await stream.write(next_request)
+                await anext(aiter(stream))
+
+                # throw
+                throw_request = protocol.worker.Request(
+                    throw=protocol.task.Message(
+                        dump=cloudpickle.dumps(ValueError("boom"))
+                    )
+                )
+                await stream.write(throw_request)
+                response = await anext(aiter(stream))
+                assert response.HasField("exception")
+
+                await stream.done_writing()
+                [r async for r in stream]
+
+            Event.flush()
+
+            started = [
+                e for e, _, _ in iteration_calls if e.type == "task-iteration-started"
+            ]
+            assert len(started) == 2
+            assert started[0].kind == "next"
+            assert started[0].step == 0
+            assert started[1].kind == "throw"
+            assert started[1].step == 1
+        finally:
+            TaskEvent._handlers = saved
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("test_dispatch_async_generator_raises_during_iteration")
+    async def test_stream_dispatch_iteration_events_on_error(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test iteration events are emitted even when generator errors.
+
+        Given:
+            A service with an async generator that raises on second next
+        When:
+            The client sends two next requests
+        Then:
+            Both started and completed events are emitted for both
+            iterations, including the one that errors
+        """
+
+        # Arrange
+        async def failing_gen():
+            yield "ok"
+            raise RuntimeError("fail")
+
+        mock_proxy = mocker.MagicMock()
+        mock_proxy.id = "test-proxy-id"
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=failing_gen,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        saved = TaskEvent._handlers.copy()
+        TaskEvent._handlers.clear()
+
+        iteration_calls = []
+
+        def spy(event, timestamp, context=None):
+            iteration_calls.append((event, timestamp, context))
+
+        TaskEvent._handlers["task-iteration-started"] = [spy]
+        TaskEvent._handlers["task-iteration-completed"] = [spy]
+
+        request = protocol.worker.Request(task=wool_task.to_protobuf())
+        next_request = protocol.worker.Request(next=protocol.worker.Void())
+
+        try:
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(request)
+                response = await anext(aiter(stream))
+                assert response.HasField("ack")
+
+                # First next: ok
+                await stream.write(next_request)
+                response = await anext(aiter(stream))
+                assert response.HasField("result")
+
+                # Second next: generator raises
+                await stream.write(next_request)
+                response = await anext(aiter(stream))
+                assert response.HasField("exception")
+
+                await stream.done_writing()
+                [r async for r in stream]
+
+            Event.flush()
+
+            started = [
+                e for e, _, _ in iteration_calls if e.type == "task-iteration-started"
+            ]
+            completed = [
+                e for e, _, _ in iteration_calls if e.type == "task-iteration-completed"
+            ]
+            assert len(started) == 2
+            assert len(completed) == 2
+            assert completed[1].step == 1
+        finally:
+            TaskEvent._handlers = saved

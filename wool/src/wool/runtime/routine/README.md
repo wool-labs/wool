@@ -57,15 +57,33 @@ def on_task(event: wool.TaskEvent, timestamp: int, context=None) -> None:
 
 `TaskEventType` defines the valid event type literals:
 
-| Event type         | When emitted                                |
-| ------------------ | ------------------------------------------- |
-| `task-created`     | Task dataclass is instantiated.             |
-| `task-scheduled`   | Worker service begins executing the task.   |
-| `task-started`     | Asyncio handle enters the task's context.   |
-| `task-stopped`     | Asyncio handle exits the task's context.    |
-| `task-completed`   | Asyncio task finishes (success or failure). |
+| Event type                    | When emitted                                               |
+| ----------------------------- | ---------------------------------------------------------- |
+| `task-created`                | Task dataclass is instantiated.                            |
+| `task-scheduled`              | Worker service begins executing the task.                  |
+| `task-started`                | Asyncio handle enters the task's context.                  |
+| `task-stopped`                | Asyncio handle exits the task's context.                   |
+| `task-completed`              | Asyncio task finishes (success or failure).                |
+| `task-iteration-initiated`    | Client is about to write an iteration request to the gRPC stream.  |
+| `task-iteration-started`      | Server forwards the iteration command to the worker loop.  |
+| `task-iteration-completed`    | Server receives the iteration result from the worker loop. |
 
 `TaskEventHandler` is the protocol for handler callables.
+
+### Iteration events
+
+The three `task-iteration-*` event types track individual iterations of a streaming (async generator) dispatch. They are carried by `IterationEvent`, a `TaskEvent` subclass with two additional fields:
+
+- **kind** (`IterationEventKind`) — the operation that drove the iteration: `"next"`, `"send"`, or `"throw"`.
+- **step** (`int`) — zero-based iteration index within the stream.
+
+Together, the three event types enable two latency measurements per iteration: network dispatch latency (`initiated` → `started`) and worker execution latency (`started` → `completed`).
+
+```python
+@wool.IterationEvent.handler("task-iteration-started", "task-iteration-completed")
+def on_iteration(event: wool.IterationEvent, timestamp: int, context=None) -> None:
+    print(f"[{event.type}] step={event.step} kind={event.kind}")
+```
 
 ## Task exceptions
 
@@ -116,9 +134,15 @@ sequenceDiagram
             Worker -->> Routine: serialized result
             Routine ->> Routine: deserialize result
             Routine -->> Caller: return result
-        else Async generator
-            loop Each yielded result
-                Worker -->> Routine: serialized result
+        else Async generator (bidirectional)
+            loop Each iteration
+                Caller ->> Routine: next / send / throw
+                Note over Routine: emit task-iteration-initiated
+                Routine ->> Worker: iteration request [gRPC write]
+                Note over Worker: emit task-iteration-started
+                Worker ->> Worker: advance generator
+                Note over Worker: emit task-iteration-completed
+                Worker -->> Routine: serialized result [gRPC read]
                 Routine ->> Routine: deserialize result
                 Routine -->> Caller: yield result
             end

@@ -162,11 +162,10 @@ Context variables are propagated from the gRPC loop to the worker loop. Coroutin
 
 ### Dispatch protocol
 
-The `dispatch` RPC is server-streaming. The response sequence is:
+The `dispatch` RPC is bidirectional-streaming. Both coroutines and async generators share the same stream, but differ in how iteration proceeds:
 
-1. **Ack** — confirms the worker accepted the task.
-2. **Result(s)** — one result for coroutines, multiple for async generators.
-3. **Exception** — if the task raises, the serialized exception replaces the result.
+- **Coroutines** — the server sends an ack followed by a single result (or exception). The client does not write after the initial request.
+- **Async generators** — the server sends an ack, then the client drives each iteration by writing a command frame (`next`, `send`, or `throw`). The server advances the generator and responds with the yielded value (or exception) before waiting for the next command. The generator advances only on receipt of a client command.
 
 ### Shutdown timeout
 

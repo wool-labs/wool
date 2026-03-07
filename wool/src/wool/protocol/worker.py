@@ -1,4 +1,5 @@
 try:
+    from wool.protocol.worker_pb2 import Request
     from wool.protocol.worker_pb2 import Response
     from wool.protocol.worker_pb2 import StopRequest
     from wool.protocol.worker_pb2 import Void
@@ -12,6 +13,7 @@ except ImportError as e:
     raise ProtobufImportError(e) from e
 
 __all__ = [
+    "Request",
     "Response",
     "StopRequest",
     "Void",

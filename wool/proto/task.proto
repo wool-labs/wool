@@ -25,11 +25,7 @@ message TaskEnvelope {
     string tag = 4;
 }
 
-message Result {
-    bytes dump = 1;
-}
-
-message Exception {
+message Message {
     bytes dump = 1;
 }
 
