@@ -62,9 +62,8 @@ def routine(fn: C) -> C:
     the next value. This enables efficient processing of large or
     infinite sequences without server-side buffering.
 
-    - **Supported operations**: ``__anext__()``, ``aclose()``
-    - **Unsupported operations**: ``asend()``, ``athrow()`` (raise
-      :exc:`NotImplementedError`)
+    - **Supported operations**: ``__anext__()``, ``asend()``,
+      ``athrow()``, ``aclose()``
     - **Cleanup**: Calling ``aclose()`` or breaking out of iteration
       properly cancels the remote worker task
 
@@ -181,8 +180,23 @@ def routine(fn: C) -> C:
                 assert isasyncgen(stream)
 
             try:
-                async for result in stream:
-                    yield result
+                sent = None
+                result = await stream.__anext__()
+                while True:
+                    try:
+                        sent = yield result
+                    except GeneratorExit:
+                        await stream.aclose()
+                        return
+                    except BaseException as exc:
+                        result = await stream.athrow(type(exc), exc)
+                    else:
+                        if sent is None:
+                            result = await stream.__anext__()
+                        else:
+                            result = await stream.asend(sent)
+            except StopAsyncIteration:
+                return
             finally:
                 await stream.aclose()
 
@@ -251,14 +265,29 @@ async def _stream(fn, parent, *args, **kwargs):
         gen = fn.__func__(*args, **kwargs)
     else:
         gen = fn(*args, **kwargs)
-    while True:
+    try:
+        sent = None
         with do_dispatch(True):
+            result = await gen.__anext__()
+        while True:
             try:
-                result = await anext(gen)
-            except StopAsyncIteration:
-                break
-
-        yield result
+                sent = yield result
+            except GeneratorExit:
+                await gen.aclose()
+                return
+            except BaseException as exc:
+                with do_dispatch(True):
+                    result = await gen.athrow(type(exc), exc)
+            else:
+                with do_dispatch(True):
+                    if sent is None:
+                        result = await gen.__anext__()
+                    else:
+                        result = await gen.asend(sent)
+    except StopAsyncIteration:
+        return
+    finally:
+        await gen.aclose()
 
 
 async def _execute(fn, parent, *args, **kwargs):
