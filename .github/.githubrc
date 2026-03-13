@@ -1,0 +1,1 @@
+alias cicd="$PWD/scripts/git-cicd.sh"
