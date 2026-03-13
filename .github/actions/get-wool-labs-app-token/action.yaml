@@ -1,0 +1,38 @@
+name: get-wool-labs-app-token
+description: "Obtain a GitHub App installation access token to use in place of a PAT"
+inputs:
+  app-id:
+    description: "The ID of the GitHub App"
+    required: true
+  app-installation-id:
+    description: "The installation ID of the GitHub App"
+    required: true
+  app-private-key:
+    description: "The private key of the GitHub App"
+    required: true
+outputs:
+  access-token:
+    description: "Access token to use in place of a PAT"
+    value: ${{ steps.generate-access-token.outputs.access-token }}
+
+runs:
+  using: "composite"
+  steps:
+  - name: Generate Access Token
+    id: generate-access-token
+    shell: bash
+    env:
+      INPUT_PRIVATE_KEY: ${{ inputs.app-private-key }}
+      INPUT_INSTALLATION_ID: ${{ inputs.app-installation-id }}
+      INPUT_APP_ID: ${{ inputs.app-id }}
+    run: |
+      key_file=$(mktemp)
+      chmod 600 "$key_file"
+      printf '%s' "$INPUT_PRIVATE_KEY" > "$key_file"
+      trap 'rm -f "$key_file"' EXIT
+      access_token="$(APP_INSTALLATION_ID="$INPUT_INSTALLATION_ID" \
+            APP_ID="$INPUT_APP_ID" \
+            SIGNING_KEY_PATH="$key_file" \
+            .github/scripts/generate-github-access-token.sh)"
+      echo "::add-mask::$access_token"
+      echo "access-token=$access_token" >> $GITHUB_OUTPUT
