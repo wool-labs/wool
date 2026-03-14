@@ -148,18 +148,6 @@ async with wool.WorkerPool(size=4, credentials=creds):
     result = await my_routine()
 ```
 
-## Task lifecycle events
-
-Wool emits events at each stage of a task's lifecycle. Register handlers to observe execution without modifying task code:
-
-```python
-@wool.TaskEvent.handler("task-created", "task-completed")
-def on_task(event: wool.TaskEvent, timestamp: int, context=None) -> None:
-    ...
-```
-
-Available event types: `task-created`, `task-scheduled`, `task-started`, `task-stopped`, `task-completed`, `task-iteration-initiated`, `task-iteration-started`, `task-iteration-completed`.
-
 ## Error handling
 
 Exceptions raised within a routine are captured as a `TaskException` and re-raised on the caller side, preserving the original exception type and traceback:
