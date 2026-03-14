@@ -1388,9 +1388,7 @@ class TestWorkerProcess:
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mock_grpc_server = mocker.patch(
-            "grpc.aio.server", return_value=mock_server
-        )
+        mock_grpc_server = mocker.patch("grpc.aio.server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.stopped.wait = mocker.AsyncMock()
@@ -1438,9 +1436,7 @@ class TestWorkerProcess:
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mock_grpc_server = mocker.patch(
-            "grpc.aio.server", return_value=mock_server
-        )
+        mock_grpc_server = mocker.patch("grpc.aio.server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.stopped.wait = mocker.AsyncMock()

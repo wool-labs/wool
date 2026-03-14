@@ -163,9 +163,7 @@ def test_do_dispatch_with_nested_contexts():
 
 
 @pytest.mark.asyncio
-async def test_current_task_inside_task_context(
-    sample_task, mock_worker_proxy_cache
-):
+async def test_current_task_inside_task_context(sample_task, mock_worker_proxy_cache):
     """Test current_task returns the active Task during dispatch.
 
     Given:
@@ -236,9 +234,7 @@ async def test_current_task_with_nested_task_contexts(sample_task):
 )
 @given(depth=st.integers(min_value=2, max_value=5))
 @pytest.mark.asyncio
-async def test_current_task_with_variable_nesting_depth(
-    depth, sample_task
-):
+async def test_current_task_with_variable_nesting_depth(depth, sample_task):
     """Test nested task context tracking at variable depth.
 
     Given:
@@ -282,9 +278,7 @@ class TestTask:
     """Tests for :py:class:`Task`."""
 
     @pytest.mark.asyncio
-    async def test___post_init___inside_task_context(
-        self, sample_task
-    ):
+    async def test___post_init___inside_task_context(self, sample_task):
         """Test post-init sets caller inside a task context.
 
         Given:
@@ -322,9 +316,7 @@ class TestTask:
         assert task.caller is None
 
     @pytest.mark.asyncio
-    async def test___enter___with_coroutine_callable(
-        self, sample_task
-    ):
+    async def test___enter___with_coroutine_callable(self, sample_task):
         """Test __enter__ returns a callable for coroutine tasks.
 
         Given:
@@ -343,9 +335,7 @@ class TestTask:
             assert callable(run_method)
 
     @pytest.mark.asyncio
-    async def test___enter___with_async_generator(
-        self, sample_task
-    ):
+    async def test___enter___with_async_generator(self, sample_task):
         """Test __enter__ returns a callable for generator tasks.
 
         Given:
@@ -368,9 +358,7 @@ class TestTask:
             assert callable(run_method)
 
     @pytest.mark.asyncio
-    async def test___enter___with_invalid_callable(
-        self, sample_task
-    ):
+    async def test___enter___with_invalid_callable(self, sample_task):
         """Test __enter__ raises ValueError for non-async callable.
 
         Given:
@@ -666,9 +654,7 @@ class TestTask:
         assert task.timeout == 0
         assert task.tag is None
 
-    def test_to_protobuf_all_fields(
-        self, sample_async_callable, picklable_proxy
-    ):
+    def test_to_protobuf_all_fields(self, sample_async_callable, picklable_proxy):
         """Test to_protobuf serializes all fields correctly.
 
         Given:
@@ -711,9 +697,7 @@ class TestTask:
         assert pb_task.timeout == 30
         assert pb_task.tag == "test_tag"
 
-    def test_to_protobuf_none_optionals(
-        self, sample_async_callable, picklable_proxy
-    ):
+    def test_to_protobuf_none_optionals(self, sample_async_callable, picklable_proxy):
         """Test to_protobuf serializes None optionals as defaults.
 
         Given:
@@ -851,9 +835,7 @@ class TestTask:
         assert result == 8
 
     @pytest.mark.asyncio
-    async def test_dispatch_without_proxy_pool_raises_error(
-        self, sample_task
-    ):
+    async def test_dispatch_without_proxy_pool_raises_error(self, sample_task):
         """Test dispatch raises RuntimeError without a proxy pool.
 
         Given:
@@ -873,9 +855,7 @@ class TestTask:
         ):
             await task.dispatch()
 
-    def test_to_protobuf_with_unpicklable_callable_fails(
-        self, picklable_proxy
-    ):
+    def test_to_protobuf_with_unpicklable_callable_fails(self, picklable_proxy):
         """Test to_protobuf fails with an unpicklable callable.
 
         Given:
