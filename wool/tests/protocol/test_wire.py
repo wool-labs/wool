@@ -2,7 +2,6 @@ import pytest
 
 from wool import protocol
 
-
 EXPECTED_MESSAGE_EXPORTS = [
     "Ack",
     "Message",

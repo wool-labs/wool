@@ -195,9 +195,7 @@ class TestLocalWorker:
         mock_process.pid = 12345
         mock_process.start.return_value = None
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker()
 
@@ -224,9 +222,7 @@ class TestLocalWorker:
         mock_process.pid = 12345
         mock_process.start.return_value = None
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker()
 
@@ -253,9 +249,7 @@ class TestLocalWorker:
         mock_process.pid = 12345
         mock_process.start.return_value = None
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker("gpu", "ml", region="us-west")
 
@@ -288,9 +282,7 @@ class TestLocalWorker:
         mock_process.pid = 12345
         mock_process.start.return_value = None
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker()
 
@@ -315,9 +307,7 @@ class TestLocalWorker:
         mock_process.pid = None
         mock_process.start.return_value = None
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker()
 
@@ -342,9 +332,7 @@ class TestLocalWorker:
         mock_process.pid = 99999
         mock_process.start.return_value = None
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker()
 
@@ -372,9 +360,7 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker()
         await worker.start()
@@ -384,9 +370,7 @@ class TestLocalWorker:
         mock_stub.stop = mocker.AsyncMock()
 
         mocker.patch.object(grpc.aio, "insecure_channel", return_value=mock_channel)
-        mocker.patch.object(
-            protocol, "WorkerStub", return_value=mock_stub
-        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
         # Act
         await worker.stop()
@@ -412,9 +396,7 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = False
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker()
         await worker.start()
@@ -445,9 +427,7 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker()
         await worker.start()
@@ -457,9 +437,7 @@ class TestLocalWorker:
         mock_stub.stop = mocker.AsyncMock(side_effect=Exception("gRPC error"))
 
         mocker.patch.object(grpc.aio, "insecure_channel", return_value=mock_channel)
-        mocker.patch.object(
-            protocol, "WorkerStub", return_value=mock_stub
-        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
         # Act & assert
         with pytest.raises(Exception, match="gRPC error"):
@@ -517,9 +495,7 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = False
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker(credentials=worker_credentials)
 
@@ -547,9 +523,7 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = False
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker()
 
@@ -579,9 +553,7 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker(credentials=worker_credentials)
         await worker.start()
@@ -593,9 +565,7 @@ class TestLocalWorker:
         mock_secure_channel = mocker.patch.object(
             grpc.aio, "secure_channel", return_value=mock_channel
         )
-        mocker.patch.object(
-            protocol, "WorkerStub", return_value=mock_stub
-        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
         # Act
         await worker.stop()
@@ -623,9 +593,7 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker()
         await worker.start()
@@ -637,9 +605,7 @@ class TestLocalWorker:
         mock_insecure_channel = mocker.patch.object(
             grpc.aio, "insecure_channel", return_value=mock_channel
         )
-        mocker.patch.object(
-            protocol, "WorkerStub", return_value=mock_stub
-        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
         # Act
         await worker.stop()
@@ -665,9 +631,7 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker(credentials=worker_credentials_one_way)
         await worker.start()
@@ -681,9 +645,7 @@ class TestLocalWorker:
         mock_secure_channel = mocker.patch.object(
             grpc.aio, "secure_channel", return_value=mock_channel
         )
-        mocker.patch.object(
-            protocol, "WorkerStub", return_value=mock_stub
-        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
         # Act
         await worker.stop()
@@ -712,9 +674,7 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         worker = LocalWorker(credentials=worker_credentials_callable)
         await worker.start()
@@ -726,9 +686,7 @@ class TestLocalWorker:
         mock_secure_channel = mocker.patch.object(
             grpc.aio, "secure_channel", return_value=mock_channel
         )
-        mocker.patch.object(
-            protocol, "WorkerStub", return_value=mock_stub
-        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
         # Act
         await worker.stop()
@@ -762,18 +720,14 @@ class TestLocalWorker:
         mock_process.start.return_value = None
         mock_process.is_alive.side_effect = [True, False]
 
-        mocker.patch.object(
-            local_module, "WorkerProcess", return_value=mock_process
-        )
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         mock_channel = mocker.MagicMock()
         mock_stub = mocker.MagicMock()
         mock_stub.stop = mocker.AsyncMock()
         mocker.patch.object(grpc.aio, "secure_channel", return_value=mock_channel)
         mocker.patch.object(grpc.aio, "insecure_channel", return_value=mock_channel)
-        mocker.patch.object(
-            protocol, "WorkerStub", return_value=mock_stub
-        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
         # Act
         worker = LocalWorker(credentials=creds)

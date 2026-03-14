@@ -457,9 +457,7 @@ class TestWorkerConnection:
         responses = (
             protocol.Response(ack=protocol.Ack()),
             asyncio.sleep(10),
-            protocol.Response(
-                result=protocol.Message(dump=cloudpickle.dumps("done"))
-            ),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
         )
 
         long_running_call = mock_grpc_call(async_stream(responses))
@@ -582,9 +580,7 @@ class TestWorkerConnection:
             protocol.Response(ack=protocol.Ack()),
             execution_started.set,
             asyncio.sleep(10),
-            protocol.Response(
-                result=protocol.Message(dump=cloudpickle.dumps("done"))
-            ),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
         )
 
         mock_call = mock_grpc_call(async_stream(responses), cancel_raises=cancel_raises)
@@ -850,9 +846,7 @@ class TestWorkerConnection:
         # Arrange
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(
-                result=protocol.Message(dump=cloudpickle.dumps("first"))
-            ),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("first"))),
             protocol.Response(
                 result=protocol.Message(dump=cloudpickle.dumps("recovered"))
             ),
@@ -893,9 +887,7 @@ class TestWorkerConnection:
         # Arrange
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(
-                result=protocol.Message(dump=cloudpickle.dumps("value"))
-            ),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("value"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -935,9 +927,7 @@ class TestWorkerConnection:
 
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(
-                result=protocol.Message(dump=cloudpickle.dumps("done"))
-            ),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -979,9 +969,7 @@ class TestWorkerConnection:
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(
-                exception=protocol.Message(
-                    dump=cloudpickle.dumps(RuntimeError("boom"))
-                )
+                exception=protocol.Message(dump=cloudpickle.dumps(RuntimeError("boom")))
             ),
         )
         mock_call = mock_grpc_call(async_stream(responses))
@@ -1022,9 +1010,7 @@ class TestWorkerConnection:
 
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(
-                result=protocol.Message(dump=cloudpickle.dumps("done"))
-            ),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -1063,9 +1049,7 @@ class TestWorkerConnection:
         def make_call():
             responses = (
                 protocol.Response(ack=protocol.Ack()),
-                protocol.Response(
-                    result=protocol.Message(dump=cloudpickle.dumps("ok"))
-                ),
+                protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
             )
             return mock_grpc_call(async_stream(responses))
 
@@ -1108,9 +1092,7 @@ class TestWorkerConnection:
 
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(
-                result=protocol.Message(dump=cloudpickle.dumps("ok"))
-            ),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -1161,9 +1143,7 @@ class TestWorkerConnection:
 
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(
-                result=protocol.Message(dump=cloudpickle.dumps("ok"))
-            ),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 

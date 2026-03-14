@@ -1679,9 +1679,7 @@ class TestWorkerPool:
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
         )
-        pool = WorkerPool(
-            worker=mock_worker_factory, size=1, options=custom_options
-        )
+        pool = WorkerPool(worker=mock_worker_factory, size=1, options=custom_options)
 
         # Act
         async with pool:

@@ -329,9 +329,7 @@ class TestWorkerService:
         async with service_fixture as (service, event, stub):
             # Initiate stop (service enters stopping state)
             # Use wait=0 to immediately cancel tasks, but we'll check before tasks finish
-            stop_task = asyncio.ensure_future(
-                stub.stop(protocol.StopRequest(timeout=5))
-            )
+            stop_task = asyncio.ensure_future(stub.stop(protocol.StopRequest(timeout=5)))
 
             await asyncio.wait_for(service.stopping.wait(), 1)
             assert not service.stopped.is_set()
@@ -693,9 +691,7 @@ class TestWorkerService:
         # Arrange
         async with service_fixture as (service, event, stub):
             # Initiate stop (service enters stopping state)
-            stop_task = asyncio.ensure_future(
-                stub.stop(protocol.StopRequest(timeout=5))
-            )
+            stop_task = asyncio.ensure_future(stub.stop(protocol.StopRequest(timeout=5)))
 
             # Wait for service to enter stopping state
             await asyncio.wait_for(service.stopping.wait(), 1)
@@ -1522,9 +1518,7 @@ class TestWorkerService:
             assert cloudpickle.loads(response.result.dump) == "echo:world"
 
             # Send None to terminate the generator
-            msg = protocol.Request(
-                send=protocol.Message(dump=cloudpickle.dumps(None))
-            )
+            msg = protocol.Request(send=protocol.Message(dump=cloudpickle.dumps(None)))
             await stream.write(msg)
             await stream.done_writing()
 
@@ -1586,9 +1580,7 @@ class TestWorkerService:
             assert cloudpickle.loads(response.result.dump) == 0
 
             # Send 2 to jump the counter
-            msg = protocol.Request(
-                send=protocol.Message(dump=cloudpickle.dumps(2))
-            )
+            msg = protocol.Request(send=protocol.Message(dump=cloudpickle.dumps(2)))
             await stream.write(msg)
             response = await anext(aiter(stream))
             assert response.HasField("result")
@@ -1771,9 +1763,7 @@ class TestWorkerService:
             assert cloudpickle.loads(response.result.dump) == 0
 
             # send 10 -> yields 10
-            msg = protocol.Request(
-                send=protocol.Message(dump=cloudpickle.dumps(10))
-            )
+            msg = protocol.Request(send=protocol.Message(dump=cloudpickle.dumps(10)))
             await stream.write(msg)
             response = await anext(aiter(stream))
             assert cloudpickle.loads(response.result.dump) == 10
@@ -1784,9 +1774,7 @@ class TestWorkerService:
             assert cloudpickle.loads(response.result.dump) == 11
 
             # send 5 -> yields 16
-            msg = protocol.Request(
-                send=protocol.Message(dump=cloudpickle.dumps(5))
-            )
+            msg = protocol.Request(send=protocol.Message(dump=cloudpickle.dumps(5)))
             await stream.write(msg)
             response = await anext(aiter(stream))
             assert cloudpickle.loads(response.result.dump) == 16
@@ -1843,9 +1831,7 @@ class TestWorkerService:
 
             # Throw ValueError into the generator
             throw_request = protocol.Request(
-                throw=protocol.Message(
-                    dump=cloudpickle.dumps(ValueError("injected"))
-                )
+                throw=protocol.Message(dump=cloudpickle.dumps(ValueError("injected")))
             )
             await stream.write(throw_request)
             response = await anext(aiter(stream))
@@ -2104,9 +2090,7 @@ class TestWorkerService:
             result2 = cloudpickle.loads(response.result.dump)
 
             # Send None to terminate
-            msg = protocol.Request(
-                send=protocol.Message(dump=cloudpickle.dumps(None))
-            )
+            msg = protocol.Request(send=protocol.Message(dump=cloudpickle.dumps(None)))
             await stream.write(msg)
             await stream.done_writing()
             [r async for r in stream]

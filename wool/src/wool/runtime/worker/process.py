@@ -181,10 +181,15 @@ class WorkerProcess(Process):
         starts listening for incoming connections.
         """
         grpc_options = [
-            ("grpc.max_receive_message_length", self._options.max_receive_message_length),
+            (
+                "grpc.max_receive_message_length",
+                self._options.max_receive_message_length,
+            ),
             ("grpc.max_send_message_length", self._options.max_send_message_length),
         ]
-        server = grpc.aio.server(interceptors=[VersionInterceptor()], options=grpc_options)
+        server = grpc.aio.server(
+            interceptors=[VersionInterceptor()], options=grpc_options
+        )
         credentials = resolve_server_credentials(self._credentials)
         address = self._address(self._host, self._port)
 

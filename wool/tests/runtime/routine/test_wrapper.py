@@ -927,9 +927,7 @@ async def test_routine_with_coroutine_tag(
     async def mock_stream():
         yield 42
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(
-        return_value=mock_stream()
-    )
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
 
     # Act
     await foo(1, 2)
@@ -962,9 +960,7 @@ async def test_routine_with_async_generator_tag(
         yield 0
         yield 1
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(
-        return_value=mock_stream()
-    )
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
 
     # Act
     result = []
@@ -973,10 +969,7 @@ async def test_routine_with_async_generator_tag(
 
     # Assert
     task = mock_proxy_context.dispatch.call_args[0][0]
-    expected = (
-        f"{foo_gen.__module__}.{foo_gen.__qualname__}"
-        f":{expected_lineno}"
-    )
+    expected = f"{foo_gen.__module__}.{foo_gen.__qualname__}:{expected_lineno}"
     assert task.tag == expected
 
 
@@ -995,13 +988,12 @@ async def test_routine_with_large_arguments(
     Then:
         The task tag length should remain under 200 characters.
     """
+
     # Arrange
     async def mock_stream():
         yield 0
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(
-        return_value=mock_stream()
-    )
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
 
     # Act
     await foo(b"\x00" * 1_000_000, 0)
@@ -1032,9 +1024,7 @@ async def test_routine_with_source_line_in_tag(
     async def mock_stream():
         yield 42
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(
-        return_value=mock_stream()
-    )
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
 
     # Act
     await foo(1, 2)
@@ -1058,13 +1048,12 @@ async def test_routine_with_instance_method_tag(
     Then:
         The task tag should include the class-qualified name.
     """
+
     # Arrange
     async def mock_stream():
         yield 10
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(
-        return_value=mock_stream()
-    )
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
 
     # Act
     await Foo().foo(5)
@@ -1088,13 +1077,12 @@ async def test_routine_with_classmethod_tag(
     Then:
         The task tag should include the class-qualified name.
     """
+
     # Arrange
     async def mock_stream():
         yield 15
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(
-        return_value=mock_stream()
-    )
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
 
     # Act
     await Foo.bar(5)
@@ -1118,13 +1106,12 @@ async def test_routine_with_staticmethod_tag(
     Then:
         The task tag should include the class-qualified name.
     """
+
     # Arrange
     async def mock_stream():
         yield 20
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(
-        return_value=mock_stream()
-    )
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
 
     # Act
     await Foo.baz(5)
@@ -1148,14 +1135,13 @@ async def test_routine_with_async_generator_method_tag(
     Then:
         The task tag should include the class-qualified name.
     """
+
     # Arrange
     async def mock_stream():
         yield 0
         yield 2
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(
-        return_value=mock_stream()
-    )
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
 
     # Act
     async for _ in Foo().foo_gen(2):
@@ -1204,13 +1190,12 @@ async def test_routine_with_keyword_arguments(
     Then:
         The task tag should not contain ``=``.
     """
+
     # Arrange
     async def mock_stream():
         yield 42
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(
-        return_value=mock_stream()
-    )
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
 
     # Act
     await foo(x=1, y=2)
@@ -1241,16 +1226,12 @@ async def test_routine_with_no_arguments(
     async def mock_stream():
         yield "async_result"
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(
-        return_value=mock_stream()
-    )
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
 
     # Act
     await bar()
 
     # Assert
     task = mock_proxy_context.dispatch.call_args[0][0]
-    expected = (
-        f"{bar.__module__}.{bar.__qualname__}:{expected_lineno}"
-    )
+    expected = f"{bar.__module__}.{bar.__qualname__}:{expected_lineno}"
     assert task.tag == expected

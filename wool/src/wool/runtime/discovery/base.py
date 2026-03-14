@@ -16,6 +16,7 @@ from typing import TypeVar
 from typing import runtime_checkable
 
 from wool.protocol import WorkerMetadata as WorkerMetadataProtobuf
+
 T: Final = TypeVar("T")
 
 # public
