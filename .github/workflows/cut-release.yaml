@@ -64,6 +64,11 @@ jobs:
             echo "Error: main is not up to date with master" >&2
             exit 1
           fi
+      - name: Configure git with app token
+        env:
+          APP_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
+        run: |
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $(echo -n "x-access-token:${APP_TOKEN}" | base64)"
       - name: Create release branch
         id: cut-release-branch
         env:
@@ -76,6 +81,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: release
+          token: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
       - name: Tag version
         env:
           VERSION: ${{ steps.cut-release-branch.outputs.version }}
