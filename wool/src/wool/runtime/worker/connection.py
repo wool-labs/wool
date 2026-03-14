@@ -19,9 +19,7 @@ from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.base import resolve_channel_credentials
 
-_DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[
-    protocol.Request, protocol.Response
-]
+_DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
 
 _T = TypeVar("_T")
 

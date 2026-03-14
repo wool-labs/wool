@@ -382,9 +382,7 @@ class WorkerPool:
 
         tasks = []
         for _ in range(size):
-            worker = factory(
-                *tags, credentials=self._credentials, options=self._options
-            )
+            worker = factory(*tags, credentials=self._credentials, options=self._options)
 
             async def start(worker):
                 await worker.start()
