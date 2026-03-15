@@ -174,6 +174,13 @@ The load balancer decides which worker handles each dispatched task. The `Worker
 
 Wool ships with `RoundRobinLoadBalancer` (the default), which maintains a per-context index that cycles through the ordered worker list. On each dispatch it tries the worker at the current index: on success, it advances the index and returns the result stream; on transient error, it skips to the next worker; on non-transient error, it evicts the worker from the context. It gives up after one full cycle of all workers.
 
+Custom load balancers are supported via structural subtyping — implement the `LoadBalancerLike` protocol and pass it to `WorkerPool`:
+
+```python
+async with wool.WorkerPool(size=4, loadbalancer=my_balancer):
+    result = await my_routine()
+```
+
 ### Transient vs. non-transient errors
 
 Transient errors are the gRPC status codes `UNAVAILABLE`, `DEADLINE_EXCEEDED`, and `RESOURCE_EXHAUSTED` — temporary conditions that may resolve on retry to the same or another worker. Non-transient errors are all other gRPC failures (e.g., `INVALID_ARGUMENT`, `PERMISSION_DENIED`) indicating persistent problems. The load balancer skips transient-error workers but evicts non-transient-error workers from the pool.
@@ -182,12 +189,13 @@ Transient errors are the gRPC status codes `UNAVAILABLE`, `DEADLINE_EXCEEDED`, a
 
 A `WorkerConnection` is a gRPC client managing a pooled channel to a single worker address. It serializes and sends a task over a bidirectional stream, waits for an acknowledgment, then returns an async generator that streams results back. A semaphore caps concurrent dispatches, and gRPC errors are classified as transient or non-transient for the load balancer.
 
-Custom load balancers are supported via structural subtyping — implement the `LoadBalancerLike` protocol and pass it to `WorkerPool`:
+Channels are pooled with reference counting and a 60-second TTL. A dispatch acquires a pool reference, and the result stream holds its own reference to keep the channel alive during streaming. There is no pool-level health checking — dead channels are detected reactively when a dispatch attempt fails, and the failed worker is removed from the load balancer context by the error classification logic.
 
-```python
-async with wool.WorkerPool(size=4, loadbalancer=my_balancer):
-    result = await my_routine()
-```
+### Connection failure detection
+
+Wool does not actively monitor connection health — detection is reactive. When a connection breaks, the next gRPC read or write on the stream raises an `RpcError`, which flows through the same transient/non-transient classification as any other gRPC failure. On the client side, a dead worker typically surfaces as `UNAVAILABLE` (transient), causing the load balancer to skip to the next worker. On the worker side, a disconnected client is detected when the stream iterator terminates, at which point the worker closes the running generator if one is active.
+
+gRPC runs over HTTP/2, which provides connection-level error signaling via GOAWAY and RST_STREAM frames. When a peer drops abruptly, the OS eventually closes the TCP socket and the HTTP/2 layer surfaces the broken connection to gRPC as a stream error. Wool does not currently configure gRPC keepalive pings, so a silently dead connection (no TCP reset) may not be detected until the next read or write attempt.
 
 ## Security
 
