@@ -1,0 +1,195 @@
+name: Manual release
+description: Tag, build, and publish a release from a specific commit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Commit SHA to tag
+        type: string
+        required: true
+      bump:
+        description: Version segment to bump
+        type: choice
+        options:
+          - patch
+          - minor
+        default: patch
+
+concurrency:
+  group: manual-release
+  cancel-in-progress: false
+
+jobs:
+  validate-inputs:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate commit SHA format
+        env:
+          COMMIT: ${{ github.event.inputs.commit }}
+        run: |
+          if [[ ! "$COMMIT" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "ERROR: Invalid commit SHA: $COMMIT" >&2
+            echo "Must be a 7-40 character hex string." >&2
+            exit 1
+          fi
+      - name: Verify commit exists on master
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.event.inputs.commit }}
+        run: |
+          if ! gh api "repos/${REPO}/commits/${COMMIT}" --silent 2>/dev/null; then
+            echo "ERROR: Commit $COMMIT not found in repository." >&2
+            exit 1
+          fi
+          branches=$(gh api "repos/${REPO}/commits/${COMMIT}/branches-where-head" --jq '.[].name' 2>/dev/null || true)
+          if ! echo "$branches" | grep -qx "master"; then
+            echo "ERROR: Commit $COMMIT is not reachable from master." >&2
+            exit 1
+          fi
+
+  bump-version:
+    name: Bump version
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump-version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit }}
+          fetch-depth: 0
+      - uses: ./.github/actions/get-wool-labs-app-token
+        id: get-wool-labs-app-token
+        with:
+          app-id: ${{ secrets.WOOL_LABS_APP_ID }}
+          app-installation-id: ${{ secrets.WOOL_LABS_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.WOOL_LABS_PRIVATE_KEY }}
+      - name: Bump version
+        id: bump-version
+        env:
+          GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
+          REPO: ${{ github.repository }}
+          BUMP: ${{ github.event.inputs.bump }}
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git fetch --tags
+          old_version=$(git describe --tags $(git rev-list --tags --max-count=1))
+          new_version=$(.github/scripts/bump-version.sh "$BUMP" "$old_version")
+          echo "Bumping $old_version to $new_version"
+          echo "version=$new_version" >> $GITHUB_OUTPUT
+
+  tag-version:
+    name: Tag version
+    needs: bump-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit }}
+      - uses: ./.github/actions/get-wool-labs-app-token
+        id: get-wool-labs-app-token
+        with:
+          app-id: ${{ secrets.WOOL_LABS_APP_ID }}
+          app-installation-id: ${{ secrets.WOOL_LABS_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.WOOL_LABS_PRIVATE_KEY }}
+      - name: Create tag
+        env:
+          GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
+          REPO: ${{ github.repository }}
+          NEW_VERSION: ${{ needs.bump-version.outputs.version }}
+          COMMIT: ${{ github.event.inputs.commit }}
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          echo "Tagging $NEW_VERSION at $COMMIT"
+          git tag "$NEW_VERSION"
+          git push origin "$NEW_VERSION"
+
+  build-release:
+    name: Build release
+    needs:
+      - bump-version
+      - tag-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        source: [wool]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit }}
+      - uses: ./.github/actions/build-release
+        with:
+          source: ${{ matrix.source }}
+          version: ${{ needs.bump-version.outputs.version }}
+
+  create-github-release:
+    name: Create GitHub release
+    needs:
+      - bump-version
+      - tag-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.bump-version.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release create "$VERSION" \
+            --repo "$REPO" \
+            --generate-notes
+
+  publish-github-release:
+    name: Publish release to GitHub
+    needs:
+      - bump-version
+      - tag-version
+      - build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    strategy:
+      matrix:
+        source: [wool]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit }}
+      - uses: ./.github/actions/publish-github-release
+        with:
+          source: ${{ matrix.source }}
+          version: ${{ needs.bump-version.outputs.version }}
+
+  publish-pypi-release:
+    name: Publish release to PyPI
+    needs:
+      - bump-version
+      - tag-version
+      - build-release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    strategy:
+      matrix:
+        source: [wool]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit }}
+      - uses: ./.github/actions/publish-pypi-release
+        with:
+          source: ${{ matrix.source }}
+          version: ${{ needs.bump-version.outputs.version }}
+          pypi-token: ${{ secrets.PYPI_TOKEN }}
