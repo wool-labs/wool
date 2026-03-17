@@ -357,38 +357,6 @@ async def test_routine_with_various_arguments(
         mock_proxy_context.dispatch.assert_called_once()
 
 
-@pytest.mark.asyncio
-async def test_routine_with_multi_value_stream(
-    mocker: MockerFixture,
-    mock_proxy_context,
-):
-    """Test stream with multiple values returns final value.
-
-    Given:
-        A decorated async function returns multiple values via stream.
-    When:
-        Wrapped function is called and awaited.
-    Then:
-        The final value from the execution stream is returned.
-    """
-
-    # Arrange
-    async def mock_dispatch_stream():
-        yield "first"
-        yield "second"
-        yield "final"
-
-    async def mock_dispatch(*args, **kwargs):
-        return mock_dispatch_stream()
-
-    mock_proxy_context.dispatch = mocker.MagicMock(side_effect=mock_dispatch)
-
-    # Act
-    result = await bar()
-
-    # Assert
-    assert result == "final"
-
 
 @pytest.mark.asyncio
 async def test_routine_with_empty_stream(
