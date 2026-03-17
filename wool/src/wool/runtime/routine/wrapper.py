@@ -305,10 +305,7 @@ async def _execute(fn, parent, *args, **kwargs):
 
 
 async def _stream_to_coroutine(stream):
-    result = None
-    async for result in stream:
-        continue
-    return result
+    return await anext(stream, None)
 
 
 def _resolve(
