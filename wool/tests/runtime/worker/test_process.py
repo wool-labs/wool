@@ -1,6 +1,7 @@
 import signal
 
 import grpc
+import grpc.aio
 import pytest
 from hypothesis import HealthCheck
 from hypothesis import given
@@ -8,6 +9,8 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool.runtime.worker import process as process_module
+from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.process import WorkerProcess
 from wool.runtime.worker.process import _proxy_factory
@@ -977,7 +980,7 @@ class TestWorkerProcess:
         """Test single insecure port for insecure workers.
 
         Given:
-            WorkerProcess with server_credentials=None
+            WorkerProcess with credentials=None
         When:
             Process is started and server is configured
         Then:
@@ -1000,7 +1003,7 @@ class TestWorkerProcess:
 
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
-        process = WorkerProcess(host="127.0.0.1", port=0, server_credentials=None)
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
 
         mocker.patch.object(process._set_port, "send")
         mocker.patch.object(process._set_port, "close")
@@ -1016,7 +1019,7 @@ class TestWorkerProcess:
         """Test single secure port for secure workers.
 
         Given:
-            WorkerProcess with valid ServerCredentials
+            WorkerProcess with valid WorkerCredentials
         When:
             Process is started and server is configured
         Then:
@@ -1027,7 +1030,9 @@ class TestWorkerProcess:
             b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         )
         dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
-        server_creds = grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+        creds = WorkerCredentials(
+            ca_cert=dummy_cert, worker_key=dummy_key, worker_cert=dummy_cert
+        )
 
         mock_server = mocker.MagicMock()
         mock_server.add_secure_port = mocker.MagicMock(return_value=50051)
@@ -1045,9 +1050,7 @@ class TestWorkerProcess:
 
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
-        process = WorkerProcess(
-            host="127.0.0.1", port=0, server_credentials=server_creds
-        )
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
         mocker.patch.object(process._set_port, "send")
         mocker.patch.object(process._set_port, "close")
@@ -1059,58 +1062,11 @@ class TestWorkerProcess:
         mock_server.add_secure_port.assert_called_once()
         mock_server.add_insecure_port.assert_not_called()
 
-    def test_serve_callable_credentials_resolved(self, mocker):
-        """Test callable credential resolution.
-
-        Given:
-            WorkerProcess with callable ServerCredentials
-        When:
-            Process is started and server is configured
-        Then:
-            Credentials are resolved and add_secure_port is called with resolved credentials
-        """
-        # Arrange
-        dummy_key = (
-            b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
-        )
-        dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
-
-        def server_creds_factory():
-            return grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
-
-        mock_server = mocker.MagicMock()
-        mock_server.add_secure_port = mocker.MagicMock(return_value=50051)
-        mock_server.start = mocker.AsyncMock()
-        mock_server.stop = mocker.AsyncMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
-
-        mock_service = mocker.MagicMock()
-        mock_service.configure_server = mocker.AsyncMock(return_value=50051)
-        mock_service.stopped.wait = mocker.AsyncMock()
-        mocker.patch(
-            "wool.runtime.worker.process.WorkerService", return_value=mock_service
-        )
-
-        mocker.patch("wool.runtime.worker.process._signal_handlers")
-
-        process = WorkerProcess(
-            host="127.0.0.1", port=0, server_credentials=server_creds_factory
-        )
-
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
-
-        # Act
-        process.run()
-
-        # Assert
-        mock_server.add_secure_port.assert_called_once()
-
     def test_serve_secure_worker_random_port_assignment(self, mocker):
         """Test random port assignment for secure worker.
 
         Given:
-            WorkerProcess with ServerCredentials and port=0
+            WorkerProcess with WorkerCredentials and port=0
         When:
             Process is started
         Then:
@@ -1121,7 +1077,9 @@ class TestWorkerProcess:
             b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         )
         dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
-        server_creds = grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+        creds = WorkerCredentials(
+            ca_cert=dummy_cert, worker_key=dummy_key, worker_cert=dummy_cert
+        )
 
         mock_server = mocker.MagicMock()
         mock_server.add_secure_port = mocker.MagicMock(return_value=54321)
@@ -1138,9 +1096,7 @@ class TestWorkerProcess:
 
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
-        process = WorkerProcess(
-            host="127.0.0.1", port=0, server_credentials=server_creds
-        )
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
         sent_ports = []
         mocker.patch.object(
@@ -1181,7 +1137,7 @@ class TestWorkerProcess:
 
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
-        process = WorkerProcess(host="127.0.0.1", port=0, server_credentials=None)
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
 
         sent_ports = []
         mocker.patch.object(
@@ -1200,7 +1156,7 @@ class TestWorkerProcess:
         """Test no dual-port architecture.
 
         Given:
-            WorkerProcess with ServerCredentials
+            WorkerProcess with WorkerCredentials
         When:
             Process is started and port is retrieved
         Then:
@@ -1211,7 +1167,9 @@ class TestWorkerProcess:
             b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         )
         dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
-        server_creds = grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+        creds = WorkerCredentials(
+            ca_cert=dummy_cert, worker_key=dummy_key, worker_cert=dummy_cert
+        )
 
         mock_server = mocker.MagicMock()
         mock_server.add_secure_port = mocker.MagicMock(return_value=50051)
@@ -1229,9 +1187,7 @@ class TestWorkerProcess:
 
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
-        process = WorkerProcess(
-            host="127.0.0.1", port=0, server_credentials=server_creds
-        )
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
         mocker.patch.object(process._set_port, "send")
         mocker.patch.object(process._set_port, "close")
@@ -1247,7 +1203,7 @@ class TestWorkerProcess:
         """Test no insecure localhost backdoor.
 
         Given:
-            Running WorkerProcess with ServerCredentials
+            Running WorkerProcess with WorkerCredentials
         When:
             Attempt to connect via insecure channel to the port
         Then:
@@ -1258,7 +1214,9 @@ class TestWorkerProcess:
             b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         )
         dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
-        server_creds = grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+        creds = WorkerCredentials(
+            ca_cert=dummy_cert, worker_key=dummy_key, worker_cert=dummy_cert
+        )
 
         mock_server = mocker.MagicMock()
         mock_server.add_secure_port = mocker.MagicMock(return_value=50051)
@@ -1276,9 +1234,7 @@ class TestWorkerProcess:
 
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
-        process = WorkerProcess(
-            host="127.0.0.1", port=0, server_credentials=server_creds
-        )
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
         mocker.patch.object(process._set_port, "send")
         mocker.patch.object(process._set_port, "close")
@@ -1307,9 +1263,11 @@ class TestWorkerProcess:
                 b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
             )
             dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
-            server_creds = grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
+            creds = WorkerCredentials(
+                ca_cert=dummy_cert, worker_key=dummy_key, worker_cert=dummy_cert
+            )
         else:
-            server_creds = None
+            creds = None
 
         mock_server = mocker.MagicMock()
         mock_server.add_secure_port = mocker.MagicMock(return_value=50051)
@@ -1327,9 +1285,7 @@ class TestWorkerProcess:
 
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
-        process = WorkerProcess(
-            host="127.0.0.1", port=0, server_credentials=server_creds
-        )
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
         mocker.patch.object(process._set_port, "send")
         mocker.patch.object(process._set_port, "close")
@@ -1478,3 +1434,105 @@ class TestWorkerProcess:
             ("grpc.max_send_message_length", 25 * 1024 * 1024),
         ]
         assert call_kwargs["options"] == expected
+
+    def test_run_sets_worker_credentials_contextvar(self, mocker):
+        """Test run sets WorkerCredentials ContextVar when credentials are provided.
+
+        Given:
+            A WorkerProcess with valid WorkerCredentials.
+        When:
+            run() is called and the server lifecycle executes.
+        Then:
+            WorkerCredentials.current() should return the credentials
+            during the server lifecycle.
+        """
+        # Arrange
+        dummy_key = (
+            b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
+        )
+        dummy_cert = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
+        creds = WorkerCredentials(
+            ca_cert=dummy_cert, worker_key=dummy_key, worker_cert=dummy_cert
+        )
+
+        captured_current = []
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch.object(process_module, "ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_secure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+
+        mock_service = mocker.MagicMock()
+
+        async def capture_current():
+            captured_current.append(CredentialContext.current())
+
+        mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
+        mocker.patch.object(
+            process_module, "WorkerService", return_value=mock_service
+        )
+
+        mocker.patch.object(process_module, "_signal_handlers")
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
+
+        mocker.patch.object(process._set_port, "send")
+        mocker.patch.object(process._set_port, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        assert len(captured_current) == 1
+        assert captured_current[0] is creds
+
+    def test_run_does_not_set_contextvar_when_credentials_none(self, mocker):
+        """Test run does not set WorkerCredentials ContextVar without credentials.
+
+        Given:
+            A WorkerProcess with credentials=None.
+        When:
+            run() is called and the server lifecycle executes.
+        Then:
+            WorkerCredentials.current() should return None during
+            the server lifecycle.
+        """
+        # Arrange
+        captured_current = []
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch.object(process_module, "ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+
+        mock_service = mocker.MagicMock()
+
+        async def capture_current():
+            captured_current.append(CredentialContext.current())
+
+        mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
+        mocker.patch.object(
+            process_module, "WorkerService", return_value=mock_service
+        )
+
+        mocker.patch.object(process_module, "_signal_handlers")
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
+
+        mocker.patch.object(process._set_port, "send")
+        mocker.patch.object(process._set_port, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        assert len(captured_current) == 1
+        assert captured_current[0] is None

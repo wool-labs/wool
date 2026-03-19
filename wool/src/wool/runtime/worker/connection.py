@@ -15,9 +15,7 @@ import grpc.aio
 from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
-from wool.runtime.worker.base import ChannelCredentialsType
 from wool.runtime.worker.base import WorkerOptions
-from wool.runtime.worker.base import resolve_channel_credentials
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
 
@@ -46,13 +44,12 @@ def _channel_factory(key):
         A new :class:`_Channel` instance.
     """
     target, credentials, limit, worker_options = key
-    resolved = resolve_channel_credentials(credentials)
     options = [
         ("grpc.max_receive_message_length", worker_options.max_receive_message_length),
         ("grpc.max_send_message_length", worker_options.max_send_message_length),
     ]
-    if resolved is not None:
-        channel = grpc.aio.secure_channel(target, resolved, options=options)
+    if credentials is not None:
+        channel = grpc.aio.secure_channel(target, credentials, options=options)
     else:
         channel = grpc.aio.insecure_channel(target, options=options)
     stub = protocol.WorkerStub(channel)
@@ -343,7 +340,7 @@ class WorkerConnection:
         target: str,
         *,
         limit: int = 100,
-        credentials: ChannelCredentialsType = None,
+        credentials: grpc.ChannelCredentials | None = None,
         options: WorkerOptions | None = None,
     ):
         if limit <= 0:

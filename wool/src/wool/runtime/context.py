@@ -9,13 +9,10 @@ from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 
 if TYPE_CHECKING:
-    from wool.runtime.worker.auth import WorkerCredentials
+    from wool import protocol
 
 dispatch_timeout: Final[ContextVar[float | None]] = ContextVar(
     "dispatch_timeout", default=None
-)
-credentials: Final[ContextVar[WorkerCredentials | None]] = ContextVar(
-    "credentials", default=None
 )
 
 
@@ -23,29 +20,22 @@ credentials: Final[ContextVar[WorkerCredentials | None]] = ContextVar(
 class RuntimeContext:
     """Runtime context for configuring Wool behavior.
 
-    Provides context-managed configuration for dispatch timeout and
-    worker credentials, allowing defaults to be set for all workers
-    within a context.
+    Provides context-managed configuration for dispatch timeout,
+    allowing defaults to be set for all workers within a context.
 
     :param dispatch_timeout:
         Default timeout for task dispatch operations.
-    :param credentials:
-        Default WorkerCredentials for secure worker connections.
     """
 
     _dispatch_timeout: float | None | UndefinedType
     _dispatch_timeout_token: Token | UndefinedType
-    _credentials: WorkerCredentials | None | UndefinedType
-    _credentials_token: Token | UndefinedType
 
     def __init__(
         self,
         *,
         dispatch_timeout: float | None | UndefinedType = Undefined,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
     ):
         self._dispatch_timeout = dispatch_timeout
-        self._credentials = credentials
 
     def __enter__(self):
         if self._dispatch_timeout is not Undefined:
@@ -53,22 +43,14 @@ class RuntimeContext:
         else:
             self._dispatch_timeout_token = Undefined
 
-        if self._credentials is not Undefined:
-            self._credentials_token = credentials.set(self._credentials)
-        else:
-            self._credentials_token = Undefined
-
         return self
 
     def __exit__(self, *_):
         if self._dispatch_timeout_token is not Undefined:
             dispatch_timeout.reset(self._dispatch_timeout_token)
 
-        if self._credentials_token is not Undefined:
-            credentials.reset(self._credentials_token)
-
     @classmethod
-    def get_current(cls) -> "RuntimeContext":
+    def get_current(cls) -> RuntimeContext:
         """Get the current runtime context.
 
         Returns a RuntimeContext instance with the current context values.
@@ -76,16 +58,40 @@ class RuntimeContext:
         :returns:
             RuntimeContext with current context variable values.
         """
-        ctx = cls()
-        ctx._dispatch_timeout = dispatch_timeout.get()
-        ctx._credentials = credentials.get()
-        return ctx
+        return cls(dispatch_timeout=dispatch_timeout.get())
 
-    @property
-    def credentials(self) -> WorkerCredentials | None:
-        """Get the current worker credentials.
+    def to_protobuf(self) -> protocol.RuntimeContext:
+        """Serialize the wire-safe subset of this context to protobuf.
+
+        Only ``dispatch_timeout`` is propagated over the wire.
 
         :returns:
-            The WorkerCredentials instance, or None if not set.
+            A protobuf ``RuntimeContext`` message.
         """
-        return credentials.get() if self._credentials is Undefined else self._credentials
+        from wool import protocol
+
+        dt = self._dispatch_timeout
+        if dt is Undefined:
+            dt = dispatch_timeout.get()
+        pb = protocol.RuntimeContext()
+        if dt is not None:
+            pb.dispatch_timeout = dt
+        return pb
+
+    @classmethod
+    def from_protobuf(cls, context: protocol.RuntimeContext) -> RuntimeContext:
+        """Reconstruct a ``RuntimeContext`` from a protobuf message.
+
+        No runtime import of ``protocol`` is needed here — the message
+        is received as a parameter rather than constructed.
+
+        :param context:
+            A protobuf ``RuntimeContext`` message.
+        :returns:
+            A ``RuntimeContext`` instance.
+        """
+        return cls(
+            dispatch_timeout=context.dispatch_timeout
+            if context.HasField("dispatch_timeout")
+            else None,
+        )

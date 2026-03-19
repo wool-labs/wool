@@ -1,4 +1,5 @@
 import datetime
+import pickle
 from dataclasses import FrozenInstanceError
 
 import grpc
@@ -122,8 +123,6 @@ def temp_cert_files(test_certificates, tmp_path):
 
 class TestWorkerCredentials:
     """Test suite for WorkerCredentials credential management."""
-
-    # === WTC-001 through WTC-006: Basic instantiation tests ===
 
     def test___init___with_mtls(self, test_certificates):
         """Test basic instantiation with mTLS.
@@ -258,8 +257,6 @@ class TestWorkerCredentials:
         # Assert
         assert creds.mutual is True
 
-    # === WTC-007 through WTC-010: Error handling ===
-
     def test_from_files_missing_ca_cert(self, temp_cert_files):
         """Test missing CA file error handling.
 
@@ -343,15 +340,13 @@ class TestWorkerCredentials:
             # Restore permissions for cleanup
             restricted_file.chmod(0o644)
 
-    # === WTC-011 through WTC-017: Credential property tests ===
-
     def test_server_credentials_with_mtls(self, test_certificates):
         """Test server credentials property for mTLS.
 
         Given:
             WorkerCredentials with mutual=True.
         When:
-            server_credentials property is accessed.
+            server_credentials() method is called.
         Then:
             Returns grpc.ServerCredentials configured for mTLS.
         """
@@ -362,7 +357,7 @@ class TestWorkerCredentials:
         )
 
         # Act
-        server_creds = creds.server_credentials
+        server_creds = creds.server_credentials()
 
         # Assert
         assert isinstance(server_creds, grpc.ServerCredentials)
@@ -373,7 +368,7 @@ class TestWorkerCredentials:
         Given:
             WorkerCredentials with mutual=False.
         When:
-            server_credentials property is accessed.
+            server_credentials() method is called.
         Then:
             Returns grpc.ServerCredentials configured for one-way TLS.
         """
@@ -384,7 +379,7 @@ class TestWorkerCredentials:
         )
 
         # Act
-        server_creds = creds.server_credentials
+        server_creds = creds.server_credentials()
 
         # Assert
         assert isinstance(server_creds, grpc.ServerCredentials)
@@ -395,7 +390,7 @@ class TestWorkerCredentials:
         Given:
             WorkerCredentials with mutual=True.
         When:
-            client_credentials property is accessed.
+            client_credentials() method is called.
         Then:
             Returns grpc.ChannelCredentials with worker cert and key.
         """
@@ -406,7 +401,7 @@ class TestWorkerCredentials:
         )
 
         # Act
-        client_creds = creds.client_credentials
+        client_creds = creds.client_credentials()
 
         # Assert
         assert isinstance(client_creds, grpc.ChannelCredentials)
@@ -417,7 +412,7 @@ class TestWorkerCredentials:
         Given:
             WorkerCredentials with mutual=False.
         When:
-            client_credentials property is accessed.
+            client_credentials() method is called.
         Then:
             Returns grpc.ChannelCredentials without worker cert (anonymous).
         """
@@ -428,7 +423,7 @@ class TestWorkerCredentials:
         )
 
         # Act
-        client_creds = creds.client_credentials
+        client_creds = creds.client_credentials()
 
         # Assert
         assert isinstance(client_creds, grpc.ChannelCredentials)
@@ -441,8 +436,8 @@ class TestWorkerCredentials:
         Given:
             Same certificate files used for server and client.
         When:
-            Both server_credentials and client_credentials properties
-            are accessed.
+            Both server_credentials() and client_credentials() methods
+            are called.
         Then:
             Both return valid credentials using the same underlying
             certificates.
@@ -454,20 +449,20 @@ class TestWorkerCredentials:
         )
 
         # Act
-        server_creds = creds.server_credentials
-        client_creds = creds.client_credentials
+        server_creds = creds.server_credentials()
+        client_creds = creds.client_credentials()
 
         # Assert
         assert isinstance(server_creds, grpc.ServerCredentials)
         assert isinstance(client_creds, grpc.ChannelCredentials)
 
     def test_server_credentials_idempotent_access(self, test_certificates):
-        """Test server credentials property idempotency.
+        """Test server credentials method idempotency.
 
         Given:
             WorkerCredentials with valid certificates.
         When:
-            server_credentials property is accessed multiple times.
+            server_credentials() method is called multiple times.
         Then:
             Returns consistent grpc.ServerCredentials on each access.
         """
@@ -478,8 +473,8 @@ class TestWorkerCredentials:
         )
 
         # Act
-        server_creds_1 = creds.server_credentials
-        server_creds_2 = creds.server_credentials
+        server_creds_1 = creds.server_credentials()
+        server_creds_2 = creds.server_credentials()
 
         # Assert
         # Should return credentials each time (may not be same object)
@@ -487,12 +482,12 @@ class TestWorkerCredentials:
         assert isinstance(server_creds_2, grpc.ServerCredentials)
 
     def test_client_credentials_idempotent_access(self, test_certificates):
-        """Test client credentials property idempotency.
+        """Test client credentials method idempotency.
 
         Given:
             WorkerCredentials with valid certificates.
         When:
-            client_credentials property is accessed multiple times.
+            client_credentials() method is called multiple times.
         Then:
             Returns consistent grpc.ChannelCredentials on each access.
         """
@@ -503,31 +498,29 @@ class TestWorkerCredentials:
         )
 
         # Act
-        client_creds_1 = creds.client_credentials
-        client_creds_2 = creds.client_credentials
+        client_creds_1 = creds.client_credentials()
+        client_creds_2 = creds.client_credentials()
 
         # Assert
         # Should return credentials each time (may not be same object)
         assert isinstance(client_creds_1, grpc.ChannelCredentials)
         assert isinstance(client_creds_2, grpc.ChannelCredentials)
 
-    # === WTC-018: Property-based test for credential property idempotency ===
-
     @given(mutual=st.booleans())
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test_server_credentials_and_client_credentials_type_consistency(
         self, mutual, test_certificates
     ):
-        """Test property-based credential property idempotency.
+        """Test credential method idempotency across mutual flag values.
 
         Given:
             WorkerCredentials with valid certificates and any mutual
             flag value.
         When:
-            server_credentials and client_credentials are accessed
+            server_credentials() and client_credentials() are called
             multiple times.
         Then:
-            Both properties consistently return the same credential
+            Both methods consistently return the same credential
             types.
         """
         # Arrange
@@ -537,10 +530,10 @@ class TestWorkerCredentials:
         )
 
         # Act
-        server1 = creds.server_credentials
-        server2 = creds.server_credentials
-        client1 = creds.client_credentials
-        client2 = creds.client_credentials
+        server1 = creds.server_credentials()
+        server2 = creds.server_credentials()
+        client1 = creds.client_credentials()
+        client2 = creds.client_credentials()
 
         # Assert
         assert isinstance(server1, grpc.ServerCredentials)
@@ -549,3 +542,67 @@ class TestWorkerCredentials:
         assert isinstance(client2, grpc.ChannelCredentials)
         assert type(server1) == type(server2)
         assert type(client1) == type(client2)
+
+    @given(mutual=st.booleans())
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test_pickle_roundtrip(self, mutual, test_certificates):
+        """Test WorkerCredentials survives pickle roundtrip.
+
+        Given:
+            WorkerCredentials with valid certificates and any mutual
+            flag value.
+        When:
+            The instance is pickled and unpickled.
+        Then:
+            It should produce an equal instance that still builds
+            valid gRPC credentials.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=mutual
+        )
+
+        # Act
+        restored = pickle.loads(pickle.dumps(creds))
+
+        # Assert
+        assert restored == creds
+        assert isinstance(restored.server_credentials(), grpc.ServerCredentials)
+        assert isinstance(restored.client_credentials(), grpc.ChannelCredentials)
+
+    def test___enter___not_supported(self, test_certificates):
+        """Test WorkerCredentials does not support context manager protocol.
+
+        Given:
+            A WorkerCredentials instance.
+        When:
+            Used in a with statement.
+        Then:
+            It should raise TypeError.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act & assert
+        with pytest.raises(TypeError):
+            with creds:
+                pass
+
+    def test_current_not_supported(self):
+        """Test WorkerCredentials does not expose current() classmethod.
+
+        Given:
+            The WorkerCredentials class.
+        When:
+            WorkerCredentials.current() is called.
+        Then:
+            It should raise AttributeError.
+        """
+        # Act & assert
+        with pytest.raises(AttributeError):
+            WorkerCredentials.current()
+

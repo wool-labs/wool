@@ -37,6 +37,9 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
         self._index = {}
         self._lock = Lock()
 
+    def __reduce__(self):
+        return (self.__class__, ())
+
     async def dispatch(
         self,
         task: Task,

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
+from contextvars import Token
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import grpc
+
+_current: ContextVar[WorkerCredentials | None] = ContextVar(
+    "worker_credentials", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -101,9 +107,8 @@ class WorkerCredentials:
             mutual=mutual,
         )
 
-    @property
     def server_credentials(self) -> grpc.ServerCredentials:
-        """Server credentials for accepting connections.
+        """Build server credentials for accepting connections.
 
         Returns server credentials configured based on the ``mutual`` flag.
         Use when the worker is acting as a server accepting connections.
@@ -135,9 +140,8 @@ class WorkerCredentials:
             require_client_auth=self.mutual,
         )
 
-    @property
     def client_credentials(self) -> grpc.ChannelCredentials:
-        """Client credentials for making connections.
+        """Build client credentials for making connections.
 
         Returns client credentials configured based on the ``mutual`` flag.
         Use when the worker is acting as a client connecting to servers.
@@ -162,3 +166,37 @@ class WorkerCredentials:
             private_key=self.worker_key if self.mutual else None,
             certificate_chain=self.worker_cert if self.mutual else None,
         )
+
+
+class CredentialContext:
+    """Internal context manager for propagating WorkerCredentials via ContextVar.
+
+    Used by WorkerProcess._serve() to set credentials in worker subprocesses
+    and by WorkerProxy.__init__() to resolve credentials from context.
+    Not part of the public API.
+    """
+
+    def __init__(self, credentials: WorkerCredentials) -> None:
+        self._credentials = credentials
+        self._token: Token | None = None
+
+    def __enter__(self) -> CredentialContext:
+        self._token = _current.set(self._credentials)
+        return self
+
+    def __exit__(self, *_) -> None:
+        if self._token is None:
+            raise RuntimeError(
+                "__exit__ called without matching __enter__"
+            )
+        _current.reset(self._token)
+        self._token = None
+
+    @classmethod
+    def current(cls) -> WorkerCredentials | None:
+        """Get the current worker credentials from the context.
+
+        :returns:
+            The active WorkerCredentials, or None if no context is set.
+        """
+        return _current.get()

@@ -110,7 +110,7 @@ class TestLocalWorker:
         When:
             LocalWorker is instantiated.
         Then:
-            WorkerProcess is called with options=None.
+            WorkerProcess is called with options=None and credentials=None.
         """
         # Arrange
         MockWorkerProcess = mocker.patch.object(local_module, "WorkerProcess")
@@ -121,6 +121,7 @@ class TestLocalWorker:
         # Assert
         MockWorkerProcess.assert_called_once()
         assert MockWorkerProcess.call_args.kwargs["options"] is None
+        assert MockWorkerProcess.call_args.kwargs["credentials"] is None
 
     def test___init___with_custom_options(self, mocker):
         """Test custom WorkerOptions are forwarded to WorkerProcess.
@@ -653,46 +654,6 @@ class TestLocalWorker:
         # Assert
         mock_secure_channel.assert_called_once()
         mock_stub.stop.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_stop_resolves_callable_channel_credentials(
-        self, mocker, worker_credentials_callable
-    ):
-        """Test callable ChannelCredentials resolution on stop.
-
-        Given:
-            LocalWorker with callable ChannelCredentials in WorkerCredentials
-        When:
-            Worker is stopped
-        Then:
-            Callable is resolved before creating secure channel
-        """
-        # Arrange
-        mock_process = mocker.MagicMock(spec=WorkerProcess)
-        mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
-        mock_process.start.return_value = None
-        mock_process.is_alive.return_value = True
-
-        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
-
-        worker = LocalWorker(credentials=worker_credentials_callable)
-        await worker.start()
-
-        mock_channel = mocker.MagicMock()
-        mock_stub = mocker.MagicMock()
-        mock_stub.stop = mocker.AsyncMock()
-
-        mock_secure_channel = mocker.patch.object(
-            grpc.aio, "secure_channel", return_value=mock_channel
-        )
-        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
-
-        # Act
-        await worker.stop()
-
-        # Assert
-        mock_secure_channel.assert_called_once()
 
     @pytest.mark.parametrize("mutual", [True, False], ids=["mtls", "one_way_tls"])
     @pytest.mark.asyncio

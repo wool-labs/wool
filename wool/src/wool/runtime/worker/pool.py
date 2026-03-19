@@ -12,13 +12,10 @@ from typing import Coroutine
 from typing import Final
 from typing import overload
 
-from wool.runtime.context import RuntimeContext
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.typing import Factory
-from wool.runtime.typing import Undefined
-from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
@@ -165,7 +162,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
     ):
         """
@@ -182,7 +179,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: WorkerCredentials | None = None,
     ):
         """
         Connect to an existing pool of workers discovered by the
@@ -200,7 +197,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
     ):
         """
@@ -218,25 +215,12 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
     ):
         self._workers = {}
         self._options = options
-
-        # Resolve credentials: explicit parameter overrides runtime context
-        if credentials is Undefined:
-            ctx = RuntimeContext.get_current()
-            credentials = ctx.credentials
-        else:
-            credentials = credentials
-
-        if credentials is not None:
-            self._credentials = credentials
-            self._client_credentials = credentials.client_credentials
-        else:
-            self._credentials = None
-            self._client_credentials = None
+        self._credentials = credentials
 
         match (size, discovery):
             case (size, discovery) if size is not None and discovery is not None:
@@ -266,7 +250,7 @@ class WorkerPool:
                             async with WorkerProxy(
                                 discovery=discovery_svc.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
-                                credentials=self._client_credentials,
+                                credentials=self._credentials,
                                 options=self._options,
                             ):
                                 yield
@@ -296,7 +280,7 @@ class WorkerPool:
                             async with WorkerProxy(
                                 discovery=discovery.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
-                                credentials=self._client_credentials,
+                                credentials=self._credentials,
                                 options=self._options,
                             ):
                                 yield
@@ -312,7 +296,7 @@ class WorkerPool:
                         async with WorkerProxy(
                             discovery=discovery_svc.subscriber,
                             loadbalancer=loadbalancer,
-                            credentials=self._client_credentials,
+                            credentials=self._credentials,
                             options=self._options,
                         ):
                             yield
@@ -339,7 +323,7 @@ class WorkerPool:
                             async with WorkerProxy(
                                 discovery=discovery.subscriber,
                                 loadbalancer=loadbalancer,
-                                credentials=self._client_credentials,
+                                credentials=self._credentials,
                                 options=self._options,
                             ):
                                 yield

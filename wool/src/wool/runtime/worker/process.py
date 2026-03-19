@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing as _mp
 import signal
@@ -15,9 +16,9 @@ import grpc.aio
 import wool
 from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.worker.base import ServerCredentialsType
+from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.base import WorkerOptions
-from wool.runtime.worker.base import resolve_server_credentials
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
 
@@ -48,8 +49,8 @@ class WorkerProcess(Process):
         Graceful shutdown timeout in seconds.
     :param proxy_pool_ttl:
         Proxy pool TTL in seconds.
-    :param server_credentials:
-        Optional gRPC server credentials for TLS/mTLS.
+    :param credentials:
+        Optional worker credentials for TLS/mTLS.
     :param options:
         gRPC message size options. Defaults to
         :class:`WorkerOptions` with 100 MB limits.
@@ -64,7 +65,7 @@ class WorkerProcess(Process):
     _set_port: Connection
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
-    _credentials: ServerCredentialsType
+    _credentials: WorkerCredentials | None
     _options: WorkerOptions
 
     def __init__(
@@ -74,7 +75,7 @@ class WorkerProcess(Process):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
-        server_credentials: ServerCredentialsType = None,
+        credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
         **kwargs,
     ):
@@ -91,7 +92,7 @@ class WorkerProcess(Process):
         if proxy_pool_ttl <= 0:
             raise ValueError("Proxy pool TTL must be positive")
         self._proxy_pool_ttl = proxy_pool_ttl
-        self._credentials = server_credentials
+        self._credentials = credentials
         self._options = options or WorkerOptions()
         self._get_port, self._set_port = Pipe(duplex=False)
 
@@ -183,43 +184,53 @@ class WorkerProcess(Process):
         requests. It creates a gRPC server, adds the worker service, and
         starts listening for incoming connections.
         """
-        grpc_options = [
-            (
-                "grpc.max_receive_message_length",
-                self._options.max_receive_message_length,
-            ),
-            ("grpc.max_send_message_length", self._options.max_send_message_length),
-        ]
-        server = grpc.aio.server(
-            interceptors=[VersionInterceptor()], options=grpc_options
+        creds_ctx = (
+            CredentialContext(self._credentials)
+            if self._credentials is not None
+            else contextlib.nullcontext()
         )
-        credentials = resolve_server_credentials(self._credentials)
-        address = self._address(self._host, self._port)
+        with creds_ctx:
+            grpc_options = [
+                (
+                    "grpc.max_receive_message_length",
+                    self._options.max_receive_message_length,
+                ),
+                ("grpc.max_send_message_length", self._options.max_send_message_length),
+            ]
+            server = grpc.aio.server(
+                interceptors=[VersionInterceptor()], options=grpc_options
+            )
+            credentials = (
+                self._credentials.server_credentials()
+                if self._credentials is not None
+                else None
+            )
+            address = self._address(self._host, self._port)
 
-        if credentials is not None:
-            port = server.add_secure_port(address, credentials)
-        else:
-            port = server.add_insecure_port(address)
+            if credentials is not None:
+                port = server.add_secure_port(address, credentials)
+            else:
+                port = server.add_insecure_port(address)
 
-        service = WorkerService()
-        protocol.add_to_server[protocol.WorkerServicer](service, server)
+            service = WorkerService()
+            protocol.add_to_server[protocol.WorkerServicer](service, server)
 
-        with _signal_handlers(service):
-            try:
-                await server.start()
-                logger.info(f"Worker gRPC server started on port {port}")
+            with _signal_handlers(service):
                 try:
-                    self._set_port.send(port)
+                    await server.start()
+                    logger.info(f"Worker gRPC server started on port {port}")
+                    try:
+                        self._set_port.send(port)
+                    finally:
+                        self._set_port.close()
+                    await service.stopped.wait()
+                    logger.info("Worker service stopped, shutting down server")
+                except Exception as e:
+                    logger.exception(f"Worker server error: {type(e).__name__}: {e}")
+                    raise
                 finally:
-                    self._set_port.close()
-                await service.stopped.wait()
-                logger.info("Worker service stopped, shutting down server")
-            except Exception as e:
-                logger.exception(f"Worker server error: {type(e).__name__}: {e}")
-                raise
-            finally:
-                logger.info("Worker server stopping with grace period")
-                await server.stop(grace=self._shutdown_grace_period)
+                    logger.info("Worker server stopping with grace period")
+                    await server.stop(grace=self._shutdown_grace_period)
 
     def _address(self, host, port) -> str:
         """Format network address for the given port.

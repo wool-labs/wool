@@ -11,10 +11,8 @@ The inner ``guess`` routine demonstrates bilateral streaming; the outer
 ``@wool.routine`` that calls ``guess`` on a (potentially different)
 worker, driving the conversation loop server-side.
 
-To run:
-
-pip install wool
-python demo/hello_world.py
+To run: 
+>>> python demo/hello_world.py
 """
 
 from __future__ import annotations

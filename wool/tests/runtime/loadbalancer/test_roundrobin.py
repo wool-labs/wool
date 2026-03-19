@@ -74,6 +74,32 @@ class TestRoundRobinLoadBalancer:
         # Act & assert
         assert isinstance(RoundRobinLoadBalancer(), LoadBalancerLike)
 
+    def test___reduce___with_populated_index(self):
+        """Test pickle roundtrip excludes runtime connection state.
+
+        Given:
+            A RoundRobinLoadBalancer with a populated _index
+        When:
+            Pickled and unpickled
+        Then:
+            It should restore with an empty _index and a fresh _lock
+        """
+        # Arrange
+        import pickle
+        from asyncio import Lock
+
+        lb = RoundRobinLoadBalancer()
+        context = LoadBalancerContext()
+        lb._index[context] = 3
+
+        # Act
+        restored = pickle.loads(pickle.dumps(lb))
+
+        # Assert
+        assert isinstance(restored, RoundRobinLoadBalancer)
+        assert restored._index == {}
+        assert isinstance(restored._lock, Lock)
+
     @pytest.mark.asyncio
     async def test_dispatch_with_empty_context(
         self,
