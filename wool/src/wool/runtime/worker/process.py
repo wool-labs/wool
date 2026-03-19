@@ -17,6 +17,7 @@ import wool
 from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
@@ -184,7 +185,7 @@ class WorkerProcess(Process):
         starts listening for incoming connections.
         """
         creds_ctx = (
-            self._credentials
+            CredentialContext(self._credentials)
             if self._credentials is not None
             else contextlib.nullcontext()
         )

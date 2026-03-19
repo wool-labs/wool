@@ -10,6 +10,7 @@ from hypothesis import strategies as st
 
 from wool.runtime.worker import process as process_module
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.process import WorkerProcess
 from wool.runtime.worker.process import _proxy_factory
@@ -1468,7 +1469,7 @@ class TestWorkerProcess:
         mock_service = mocker.MagicMock()
 
         async def capture_current():
-            captured_current.append(WorkerCredentials.current())
+            captured_current.append(CredentialContext.current())
 
         mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
         mocker.patch.object(
@@ -1515,7 +1516,7 @@ class TestWorkerProcess:
         mock_service = mocker.MagicMock()
 
         async def capture_current():
-            captured_current.append(WorkerCredentials.current())
+            captured_current.append(CredentialContext.current())
 
         mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
         mocker.patch.object(
