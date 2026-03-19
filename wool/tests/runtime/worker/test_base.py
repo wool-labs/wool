@@ -2,11 +2,8 @@ import uuid
 from types import MappingProxyType
 from typing import Any
 
-import grpc
 import pytest
-from hypothesis import HealthCheck
 from hypothesis import given
-from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool.runtime.discovery.base import WorkerMetadata
@@ -14,7 +11,6 @@ from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.base import WorkerOptions
-from wool.runtime.worker.base import resolve_channel_credentials
 
 
 class TestWorkerOptions:
@@ -561,159 +557,3 @@ class TestWorkerFactory:
 
         # Assert
         assert not isinstance(not_a_factory, WorkerFactory)
-
-
-# Fixtures for credential resolver tests
-@pytest.fixture
-def channel_credentials():
-    """Create grpc.ChannelCredentials for testing.
-
-    Returns:
-        grpc.ChannelCredentials configured for testing
-    """
-    # Create minimal SSL channel credentials
-    return grpc.ssl_channel_credentials()
-
-
-@pytest.mark.parametrize(
-    "input_value,expected_result",
-    [
-        (None, None),
-        pytest.param(
-            "channel_credentials",
-            "channel_credentials",
-            id="direct_credentials",
-        ),
-    ],
-)
-def test_resolve_channel_credentials_direct_values(
-    input_value,
-    expected_result,
-    channel_credentials,
-):
-    """Test resolve_channel_credentials with direct values.
-
-    Given:
-        None or ChannelCredentials instance
-    When:
-        resolve_channel_credentials is called
-    Then:
-        Returns the input unchanged
-    """
-    # Arrange
-    if input_value == "channel_credentials":
-        input_value = channel_credentials
-        expected_result = channel_credentials
-
-    # Act
-    result = resolve_channel_credentials(input_value)
-
-    # Assert
-    assert result is expected_result
-
-
-@pytest.mark.parametrize(
-    "return_value,expected_result",
-    [
-        (None, None),
-        pytest.param(
-            "channel_credentials",
-            "channel_credentials",
-            id="valid_credentials",
-        ),
-    ],
-)
-def test_resolve_channel_credentials_callable_valid_returns(
-    return_value,
-    expected_result,
-    channel_credentials,
-):
-    """Test resolve_channel_credentials with callable returning valid values.
-
-    Given:
-        Callable returning None or ChannelCredentials
-    When:
-        resolve_channel_credentials is called
-    Then:
-        Returns result from calling the callable
-    """
-    # Arrange
-    if return_value == "channel_credentials":
-        return_value = channel_credentials
-        expected_result = channel_credentials
-    callable_creds = lambda: return_value
-
-    # Act
-    result = resolve_channel_credentials(callable_creds)
-
-    # Assert
-    assert result is expected_result
-
-
-@pytest.mark.parametrize(
-    "invalid_value,error_pattern",
-    [
-        ("invalid", "Channel credentials callable"),
-        (42, r"grpc\.ChannelCredentials.*got <class 'int'>"),
-    ],
-)
-def test_resolve_channel_credentials_callable_invalid_returns(
-    invalid_value,
-    error_pattern,
-):
-    """Test resolve_channel_credentials with callable returning invalid types.
-
-    Given:
-        Callable returning non-ChannelCredentials type
-    When:
-        resolve_channel_credentials is called
-    Then:
-        Raises TypeError with appropriate message
-    """
-    # Arrange
-    callable_creds = lambda: invalid_value
-
-    # Act & assert
-    with pytest.raises(TypeError, match=error_pattern):
-        resolve_channel_credentials(callable_creds)
-
-
-@given(
-    input_type=st.sampled_from(["none", "direct", "callable_none", "callable_creds"]),
-    call_count=st.integers(min_value=1, max_value=5),
-)
-@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_resolve_channel_credentials_idempotency_and_type_safety(
-    input_type,
-    call_count,
-    channel_credentials,
-):
-    """Test resolve_channel_credentials idempotency and type safety.
-
-    Given:
-        Any valid input (None, credentials, or callable)
-    When:
-        resolve_channel_credentials is called multiple times
-    Then:
-        All results are identical (idempotent) and are
-        ChannelCredentials or None (type safe).
-    """
-    # Arrange
-    if input_type == "none":
-        input_val = None
-    elif input_type == "direct":
-        input_val = channel_credentials
-    elif input_type == "callable_none":
-        input_val = lambda: None
-    else:  # callable_creds
-        input_val = lambda: channel_credentials
-
-    # Act
-    results = [resolve_channel_credentials(input_val) for _ in range(call_count)]
-
-    # Assert
-    assert all(r == results[0] for r in results), "Results must be identical"
-    for result in results:
-        assert result is None or isinstance(result, grpc.ChannelCredentials), (
-            "Result must be ChannelCredentials or None"
-        )
