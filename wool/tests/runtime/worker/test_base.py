@@ -15,7 +15,6 @@ from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.base import resolve_channel_credentials
-from wool.runtime.worker.base import resolve_server_credentials
 
 
 class TestWorkerOptions:
@@ -566,20 +565,6 @@ class TestWorkerFactory:
 
 # Fixtures for credential resolver tests
 @pytest.fixture
-def server_credentials():
-    """Create grpc.ServerCredentials for testing.
-
-    Returns:
-        grpc.ServerCredentials configured for testing
-    """
-    # Create dummy server credentials with a dummy key-cert pair
-    # In tests, we don't need valid certificates, just valid credential objects
-    dummy_key = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z\n-----END RSA PRIVATE KEY-----"
-    dummy_cert = b"-----BEGIN CERTIFICATE-----\nMIIC0jCC\n-----END CERTIFICATE-----"
-    return grpc.ssl_server_credentials([(dummy_key, dummy_cert)])
-
-
-@pytest.fixture
 def channel_credentials():
     """Create grpc.ChannelCredentials for testing.
 
@@ -588,146 +573,6 @@ def channel_credentials():
     """
     # Create minimal SSL channel credentials
     return grpc.ssl_channel_credentials()
-
-
-@pytest.mark.parametrize(
-    "input_value,expected_result",
-    [
-        (None, None),
-        pytest.param(
-            "server_credentials",
-            "server_credentials",
-            id="direct_credentials",
-        ),
-    ],
-)
-def test_resolve_server_credentials_direct_values(
-    input_value, expected_result, server_credentials
-):
-    """Test resolve_server_credentials with direct values.
-
-    Given:
-        None or ServerCredentials instance
-    When:
-        resolve_server_credentials is called
-    Then:
-        Returns the input unchanged
-    """
-    # Arrange
-    if input_value == "server_credentials":
-        input_value = server_credentials
-        expected_result = server_credentials
-
-    # Act
-    result = resolve_server_credentials(input_value)
-
-    # Assert
-    assert result is expected_result
-
-
-@pytest.mark.parametrize(
-    "return_value,expected_result",
-    [
-        (None, None),
-        pytest.param(
-            "server_credentials",
-            "server_credentials",
-            id="valid_credentials",
-        ),
-    ],
-)
-def test_resolve_server_credentials_callable_valid_returns(
-    return_value, expected_result, server_credentials
-):
-    """Test resolve_server_credentials with callable returning valid values.
-
-    Given:
-        Callable returning None or ServerCredentials
-    When:
-        resolve_server_credentials is called
-    Then:
-        Returns result from calling the callable
-    """
-    # Arrange
-    if return_value == "server_credentials":
-        return_value = server_credentials
-        expected_result = server_credentials
-    callable_creds = lambda: return_value
-
-    # Act
-    result = resolve_server_credentials(callable_creds)
-
-    # Assert
-    assert result is expected_result
-
-
-@pytest.mark.parametrize(
-    "invalid_value,error_pattern",
-    [
-        ("invalid", "Server credentials callable"),
-        (42, r"grpc\.ServerCredentials.*got <class 'int'>"),
-    ],
-)
-def test_resolve_server_credentials_callable_invalid_returns(
-    invalid_value,
-    error_pattern,
-):
-    """Test resolve_server_credentials with callable returning invalid types.
-
-    Given:
-        Callable returning non-ServerCredentials type
-    When:
-        resolve_server_credentials is called
-    Then:
-        Raises TypeError with appropriate message
-    """
-    # Arrange
-    callable_creds = lambda: invalid_value
-
-    # Act & assert
-    with pytest.raises(TypeError, match=error_pattern):
-        resolve_server_credentials(callable_creds)
-
-
-@given(
-    input_type=st.sampled_from(["none", "direct", "callable_none", "callable_creds"]),
-    call_count=st.integers(min_value=1, max_value=5),
-)
-@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_resolve_server_credentials_idempotency_and_type_safety(
-    input_type,
-    call_count,
-    server_credentials,
-):
-    """Test resolve_server_credentials idempotency and type safety.
-
-    Given:
-        Any valid input (None, credentials, or callable)
-    When:
-        resolve_server_credentials is called multiple times
-    Then:
-        All results are identical (idempotent) and are
-        ServerCredentials or None (type safe).
-    """
-    # Arrange
-    if input_type == "none":
-        input_val = None
-    elif input_type == "direct":
-        input_val = server_credentials
-    elif input_type == "callable_none":
-        input_val = lambda: None
-    else:  # callable_creds
-        input_val = lambda: server_credentials
-
-    # Act
-    results = [resolve_server_credentials(input_val) for _ in range(call_count)]
-
-    # Assert
-    assert all(r == results[0] for r in results), "Results must be identical"
-    for result in results:
-        assert result is None or isinstance(result, grpc.ServerCredentials), (
-            "Result must be ServerCredentials or None"
-        )
 
 
 @pytest.mark.parametrize(

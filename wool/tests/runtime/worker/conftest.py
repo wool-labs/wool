@@ -585,31 +585,3 @@ def worker_credentials_one_way(test_certificates):
     return WorkerCredentials(
         ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=False
     )
-
-
-@pytest.fixture
-def worker_credentials_callable(test_certificates):
-    """Provide WorkerCredentials with callable credentials for testing.
-
-    Returns:
-        WorkerCredentials with callable server and client credentials
-    """
-    key_pem, cert_pem, ca_pem = test_certificates
-
-    def server_factory():
-        return grpc.ssl_server_credentials(
-            private_key_certificate_chain_pairs=[(key_pem, cert_pem)],
-            root_certificates=ca_pem,
-            require_client_auth=True,
-        )
-
-    def client_factory():
-        return grpc.ssl_channel_credentials(
-            root_certificates=ca_pem, private_key=key_pem, certificate_chain=cert_pem
-        )
-
-    # Create a WorkerCredentials-like object with callable properties
-    # Since WorkerCredentials is frozen, we need to create it differently
-    return WorkerCredentials(
-        ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=True
-    )

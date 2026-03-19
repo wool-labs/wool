@@ -15,9 +15,8 @@ import grpc.aio
 import wool
 from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.worker.base import ServerCredentialsType
+from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerOptions
-from wool.runtime.worker.base import resolve_server_credentials
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
 
@@ -48,8 +47,8 @@ class WorkerProcess(Process):
         Graceful shutdown timeout in seconds.
     :param proxy_pool_ttl:
         Proxy pool TTL in seconds.
-    :param server_credentials:
-        Optional gRPC server credentials for TLS/mTLS.
+    :param credentials:
+        Optional worker credentials for TLS/mTLS.
     :param options:
         gRPC message size options. Defaults to
         :class:`WorkerOptions` with 100 MB limits.
@@ -64,7 +63,7 @@ class WorkerProcess(Process):
     _set_port: Connection
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
-    _credentials: ServerCredentialsType
+    _credentials: WorkerCredentials | None
     _options: WorkerOptions
 
     def __init__(
@@ -74,7 +73,7 @@ class WorkerProcess(Process):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
-        server_credentials: ServerCredentialsType = None,
+        credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
         **kwargs,
     ):
@@ -91,7 +90,7 @@ class WorkerProcess(Process):
         if proxy_pool_ttl <= 0:
             raise ValueError("Proxy pool TTL must be positive")
         self._proxy_pool_ttl = proxy_pool_ttl
-        self._credentials = server_credentials
+        self._credentials = credentials
         self._options = options or WorkerOptions()
         self._get_port, self._set_port = Pipe(duplex=False)
 
@@ -193,7 +192,11 @@ class WorkerProcess(Process):
         server = grpc.aio.server(
             interceptors=[VersionInterceptor()], options=grpc_options
         )
-        credentials = resolve_server_credentials(self._credentials)
+        credentials = (
+            self._credentials.server_credentials()
+            if self._credentials is not None
+            else None
+        )
         address = self._address(self._host, self._port)
 
         if credentials is not None:
