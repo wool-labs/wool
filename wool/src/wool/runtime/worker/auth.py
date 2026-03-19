@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextvars import ContextVar
 from contextvars import Token
 from dataclasses import dataclass
-from dataclasses import field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -62,30 +61,6 @@ class WorkerCredentials:
     worker_key: bytes
     worker_cert: bytes
     mutual: bool = True
-    _token: Token | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
-
-    def __enter__(self) -> WorkerCredentials:
-        object.__setattr__(self, "_token", _current.set(self))
-        return self
-
-    def __exit__(self, *_) -> None:
-        if self._token is None:
-            raise RuntimeError(
-                "__exit__ called without matching __enter__"
-            )
-        _current.reset(self._token)
-        object.__setattr__(self, "_token", None)
-
-    @classmethod
-    def current(cls) -> WorkerCredentials | None:
-        """Get the current worker credentials from the context.
-
-        :returns:
-            The active WorkerCredentials, or None if no context is set.
-        """
-        return _current.get()
 
     @classmethod
     def from_files(
@@ -191,3 +166,37 @@ class WorkerCredentials:
             private_key=self.worker_key if self.mutual else None,
             certificate_chain=self.worker_cert if self.mutual else None,
         )
+
+
+class CredentialContext:
+    """Internal context manager for propagating WorkerCredentials via ContextVar.
+
+    Used by WorkerProcess._serve() to set credentials in worker subprocesses
+    and by WorkerProxy.__init__() to resolve credentials from context.
+    Not part of the public API.
+    """
+
+    def __init__(self, credentials: WorkerCredentials) -> None:
+        self._credentials = credentials
+        self._token: Token | None = None
+
+    def __enter__(self) -> CredentialContext:
+        self._token = _current.set(self._credentials)
+        return self
+
+    def __exit__(self, *_) -> None:
+        if self._token is None:
+            raise RuntimeError(
+                "__exit__ called without matching __enter__"
+            )
+        _current.reset(self._token)
+        self._token = None
+
+    @classmethod
+    def current(cls) -> WorkerCredentials | None:
+        """Get the current worker credentials from the context.
+
+        :returns:
+            The active WorkerCredentials, or None if no context is set.
+        """
+        return _current.get()

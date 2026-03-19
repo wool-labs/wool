@@ -30,6 +30,7 @@ from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.connection import WorkerConnection
 
@@ -247,7 +248,7 @@ class WorkerProxy:
         self._started = False
         self._loadbalancer = loadbalancer
         if credentials is Undefined:
-            self._credentials = WorkerCredentials.current()
+            self._credentials = CredentialContext.current()
         else:
             self._credentials = credentials
         self._options = options
@@ -307,7 +308,7 @@ class WorkerProxy:
         Creates a new WorkerProxy instance with the same discovery stream,
         load balancer type, and options, then sets the preserved proxy ID
         on the new object.  Credentials are NOT serialized — the restored
-        proxy resolves them from :meth:`WorkerCredentials.current`.
+        proxy resolves them from the active credential context.
 
         :returns:
             Tuple of (callable, args) for unpickling.

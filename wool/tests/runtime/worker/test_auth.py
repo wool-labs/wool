@@ -571,31 +571,15 @@ class TestWorkerCredentials:
         assert isinstance(restored.server_credentials(), grpc.ServerCredentials)
         assert isinstance(restored.client_credentials(), grpc.ChannelCredentials)
 
-    def test_current_without_active_context(self):
-        """Test current() returns None outside context manager.
-
-        Given:
-            No WorkerCredentials context manager is active.
-        When:
-            WorkerCredentials.current() is called.
-        Then:
-            It should return None.
-        """
-        # Act
-        result = WorkerCredentials.current()
-
-        # Assert
-        assert result is None
-
-    def test___enter___sets_current(self, test_certificates):
-        """Test __enter__ sets current() to the instance.
+    def test___enter___not_supported(self, test_certificates):
+        """Test WorkerCredentials does not support context manager protocol.
 
         Given:
             A WorkerCredentials instance.
         When:
-            Used as a context manager.
+            Used in a with statement.
         Then:
-            It should set current() to the instance inside the block.
+            It should raise TypeError.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
@@ -604,55 +588,21 @@ class TestWorkerCredentials:
         )
 
         # Act & assert
-        with creds:
-            assert WorkerCredentials.current() is creds
+        with pytest.raises(TypeError):
+            with creds:
+                pass
 
-    def test___exit___resets_current(self, test_certificates):
-        """Test __exit__ resets current() to previous value.
-
-        Given:
-            A WorkerCredentials instance used as a context manager.
-        When:
-            The context manager exits.
-        Then:
-            It should reset current() to None.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
-        )
-
-        # Act
-        with creds:
-            pass
-
-        # Assert
-        assert WorkerCredentials.current() is None
-
-    def test___enter___with_nested_contexts(self, test_certificates):
-        """Test nested context managers restore outer credentials on inner exit.
+    def test_current_not_supported(self):
+        """Test WorkerCredentials does not expose current() classmethod.
 
         Given:
-            Two WorkerCredentials instances used as nested context managers.
+            The WorkerCredentials class.
         When:
-            The inner context manager exits.
+            WorkerCredentials.current() is called.
         Then:
-            It should restore current() to the outer credentials.
+            It should raise AttributeError.
         """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        outer = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=True
-        )
-        inner = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=False
-        )
-
         # Act & assert
-        with outer:
-            assert WorkerCredentials.current() is outer
-            with inner:
-                assert WorkerCredentials.current() is inner
-            assert WorkerCredentials.current() is outer
-        assert WorkerCredentials.current() is None
+        with pytest.raises(AttributeError):
+            WorkerCredentials.current()
+
