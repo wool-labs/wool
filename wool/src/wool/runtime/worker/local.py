@@ -9,11 +9,8 @@ import grpc.aio
 from wool import protocol
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker.auth import WorkerCredentials
-from wool.runtime.worker.base import ChannelCredentialsType
-from wool.runtime.worker.base import ServerCredentialsType
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
-from wool.runtime.worker.base import resolve_channel_credentials
 from wool.runtime.worker.process import WorkerProcess
 
 
@@ -70,8 +67,7 @@ class LocalWorker(Worker):
     """
 
     _worker_process: WorkerProcess
-    _server_credentials: ServerCredentialsType
-    _client_credentials: ChannelCredentialsType
+    _credentials: WorkerCredentials | None
 
     def __init__(
         self,
@@ -85,21 +81,13 @@ class LocalWorker(Worker):
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
-
-        # Extract server and client credentials
-        if credentials is not None:
-            self._server_credentials = credentials.server_credentials
-            self._client_credentials = credentials.client_credentials
-        else:
-            self._server_credentials = None
-            self._client_credentials = None
-
+        self._credentials = credentials
         self._worker_process = WorkerProcess(
             host=host,
             port=port,
             shutdown_grace_period=shutdown_grace_period,
             proxy_pool_ttl=proxy_pool_ttl,
-            server_credentials=self._server_credentials,
+            credentials=credentials,
             options=options,
         )
 
@@ -138,7 +126,7 @@ class LocalWorker(Worker):
             version=protocol.__version__,
             tags=frozenset(self._tags),
             extra=MappingProxyType(self._extra),
-            secure=self._server_credentials is not None,
+            secure=self._credentials is not None,
         )
 
     async def _stop(self, timeout: float | None):
@@ -157,12 +145,10 @@ class LocalWorker(Worker):
             assert self.address
 
             # Create appropriate channel based on available credentials
-            credentials = resolve_channel_credentials(self._client_credentials)
-            if credentials is not None:
-                # Secure worker with mTLS: use client credentials
+            if self._credentials is not None:
+                credentials = self._credentials.client_credentials()
                 channel = grpc.aio.secure_channel(self.address, credentials)
             else:
-                # Insecure worker: use insecure channel
                 channel = grpc.aio.insecure_channel(self.address)
 
             stub = protocol.WorkerStub(channel)

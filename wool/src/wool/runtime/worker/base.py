@@ -21,13 +21,6 @@ from wool.runtime.discovery.base import WorkerMetadata
 if TYPE_CHECKING:
     from wool.runtime.worker.auth import WorkerCredentials
 
-# Type aliases for credentials
-ServerCredentialsType: TypeAlias = Union[
-    grpc.ServerCredentials,
-    Callable[[], grpc.ServerCredentials],
-    None,
-]
-
 ChannelCredentialsType: TypeAlias = Union[
     grpc.ChannelCredentials,
     Callable[[], grpc.ChannelCredentials],
@@ -52,32 +45,6 @@ class WorkerOptions:
 
     max_receive_message_length: int = 100 * 1024 * 1024
     max_send_message_length: int = 100 * 1024 * 1024
-
-
-def resolve_server_credentials(
-    credentials: ServerCredentialsType,
-) -> grpc.ServerCredentials | None:
-    """Resolve server credentials from object or callable.
-
-    :param credentials:
-        Server credentials object, callable, or None.
-    :returns:
-        Resolved server credentials or None.
-    :raises TypeError:
-        If callable doesn't return proper credentials type.
-    """
-    if credentials is None:
-        return None
-    elif callable(credentials):
-        result = credentials()
-        if result is not None and not isinstance(result, grpc.ServerCredentials):
-            raise TypeError(
-                f"Server credentials callable must return grpc.ServerCredentials "
-                f"or None, got {type(result)}"
-            )
-        return result
-    else:
-        return credentials
 
 
 def resolve_channel_credentials(

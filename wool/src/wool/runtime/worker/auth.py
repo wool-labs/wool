@@ -101,9 +101,8 @@ class WorkerCredentials:
             mutual=mutual,
         )
 
-    @property
     def server_credentials(self) -> grpc.ServerCredentials:
-        """Server credentials for accepting connections.
+        """Build server credentials for accepting connections.
 
         Returns server credentials configured based on the ``mutual`` flag.
         Use when the worker is acting as a server accepting connections.
@@ -135,9 +134,8 @@ class WorkerCredentials:
             require_client_auth=self.mutual,
         )
 
-    @property
     def client_credentials(self) -> grpc.ChannelCredentials:
-        """Client credentials for making connections.
+        """Build client credentials for making connections.
 
         Returns client credentials configured based on the ``mutual`` flag.
         Use when the worker is acting as a client connecting to servers.

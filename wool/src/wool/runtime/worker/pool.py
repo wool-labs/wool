@@ -231,12 +231,12 @@ class WorkerPool:
         else:
             credentials = credentials
 
-        if credentials is not None:
-            self._credentials = credentials
-            self._client_credentials = credentials.client_credentials
-        else:
-            self._credentials = None
-            self._client_credentials = None
+        self._credentials = credentials
+        self._client_credentials = (
+            credentials.client_credentials()
+            if credentials is not None
+            else None
+        )
 
         match (size, discovery):
             case (size, discovery) if size is not None and discovery is not None:
