@@ -2,6 +2,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from wool import protocol
 from wool.runtime.context import RuntimeContext
 from wool.runtime.context import dispatch_timeout
 from wool.runtime.typing import Undefined
@@ -469,3 +470,171 @@ class TestRuntimeContext:
 
         # Cleanup
         dispatch_timeout.set(original_value)
+
+    def test_to_protobuf_with_dispatch_timeout(self):
+        """Test to_protobuf serializes dispatch_timeout.
+
+        Given:
+            A RuntimeContext with dispatch_timeout=5.0
+        When:
+            to_protobuf() is called
+        Then:
+            It should return a protobuf message with dispatch_timeout=5.0
+        """
+        # Arrange
+        context = RuntimeContext(dispatch_timeout=5.0)
+
+        # Act
+        pb = context.to_protobuf()
+
+        # Assert
+        assert pb.dispatch_timeout == 5.0
+
+    def test_to_protobuf_with_none_dispatch_timeout(self):
+        """Test to_protobuf leaves field unset for None.
+
+        Given:
+            A RuntimeContext with dispatch_timeout=None
+        When:
+            to_protobuf() is called
+        Then:
+            It should return a protobuf message with dispatch_timeout unset
+        """
+        # Arrange
+        context = RuntimeContext(dispatch_timeout=None)
+
+        # Act
+        pb = context.to_protobuf()
+
+        # Assert
+        assert not pb.HasField("dispatch_timeout")
+
+    def test_to_protobuf_with_undefined_dispatch_timeout_reads_contextvar(self):
+        """Test to_protobuf falls back to the ContextVar when Undefined.
+
+        Given:
+            A RuntimeContext with no explicit dispatch_timeout and the
+            dispatch_timeout ContextVar set to 3.5
+        When:
+            to_protobuf() is called
+        Then:
+            It should read the current value from the ContextVar
+        """
+        # Arrange
+        original_value = dispatch_timeout.get()
+        dispatch_timeout.set(3.5)
+        context = RuntimeContext()
+
+        # Act
+        pb = context.to_protobuf()
+
+        # Assert
+        assert pb.dispatch_timeout == 3.5
+
+        # Cleanup
+        dispatch_timeout.set(original_value)
+
+    def test_from_protobuf_with_dispatch_timeout(self):
+        """Test from_protobuf deserializes dispatch_timeout.
+
+        Given:
+            A protobuf RuntimeContext message with dispatch_timeout=12.0
+        When:
+            RuntimeContext.from_protobuf() is called
+        Then:
+            It should return a RuntimeContext with dispatch_timeout=12.0
+        """
+        # Arrange
+        pb = protocol.RuntimeContext(dispatch_timeout=12.0)
+
+        # Act
+        context = RuntimeContext.from_protobuf(pb)
+
+        # Assert
+        with context:
+            assert dispatch_timeout.get() == 12.0
+
+    def test_from_protobuf_with_zero_dispatch_timeout(self):
+        """Test from_protobuf preserves zero dispatch_timeout.
+
+        Given:
+            A protobuf RuntimeContext message with dispatch_timeout=0.0
+        When:
+            RuntimeContext.from_protobuf() is called
+        Then:
+            It should return a RuntimeContext with dispatch_timeout=0.0
+        """
+        # Arrange
+        pb = protocol.RuntimeContext(dispatch_timeout=0.0)
+
+        # Act
+        context = RuntimeContext.from_protobuf(pb)
+
+        # Assert
+        with context:
+            assert dispatch_timeout.get() == 0.0
+
+    def test_from_protobuf_with_unset_dispatch_timeout(self):
+        """Test from_protobuf maps unset field to None.
+
+        Given:
+            A protobuf RuntimeContext message with dispatch_timeout unset
+        When:
+            RuntimeContext.from_protobuf() is called
+        Then:
+            It should return a RuntimeContext with dispatch_timeout=None
+        """
+        # Arrange
+        pb = protocol.RuntimeContext()
+
+        # Act
+        context = RuntimeContext.from_protobuf(pb)
+
+        # Assert
+        with context:
+            assert dispatch_timeout.get() is None
+
+    def test_to_protobuf_from_protobuf_roundtrip(self):
+        """Test protobuf roundtrip preserves dispatch_timeout.
+
+        Given:
+            A RuntimeContext with dispatch_timeout=8.5
+        When:
+            Serialized via to_protobuf() then deserialized via from_protobuf()
+        Then:
+            It should preserve dispatch_timeout through the roundtrip
+        """
+        # Arrange
+        original = RuntimeContext(dispatch_timeout=8.5)
+
+        # Act
+        restored = RuntimeContext.from_protobuf(original.to_protobuf())
+
+        # Assert
+        with restored:
+            assert dispatch_timeout.get() == 8.5
+
+    @given(
+        timeout=st.floats(
+            min_value=0.0, max_value=1000.0, allow_nan=False, allow_infinity=False
+        )
+    )
+    def test_to_protobuf_from_protobuf_roundtrip_property(self, timeout):
+        """Test protobuf roundtrip with arbitrary non-negative floats.
+
+        Given:
+            Any non-negative float dispatch_timeout (including 0.0)
+        When:
+            Serialized via to_protobuf() then deserialized via from_protobuf()
+        Then:
+            It should equal the original value
+        """
+        # Arrange
+        original = RuntimeContext(dispatch_timeout=timeout)
+
+        # Act
+        restored = RuntimeContext.from_protobuf(original.to_protobuf())
+
+        # Assert
+        with restored:
+            assert dispatch_timeout.get() == timeout

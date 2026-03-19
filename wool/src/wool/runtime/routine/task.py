@@ -29,6 +29,7 @@ import cloudpickle
 
 import wool
 from wool import protocol
+from wool.runtime.context import RuntimeContext
 
 Args = Tuple
 Kwargs = Dict
@@ -116,6 +117,10 @@ class Task(Generic[W]):
         Line number where the task was defined.
     :param tag:
         Optional descriptive tag for the task.
+    :param context:
+        RuntimeContext snapshot captured at task creation time.
+        Propagated over the wire so workers can restore the caller's
+        runtime settings (e.g. dispatch_timeout) before execution.
     """
 
     id: UUID
@@ -130,6 +135,7 @@ class Task(Generic[W]):
     function: str | None = None
     line_no: int | None = None
     tag: str | None = None
+    context: RuntimeContext | None = None
 
     def __post_init__(self, **kwargs):
         """
@@ -144,6 +150,8 @@ class Task(Generic[W]):
             )
         if caller := _current_task.get():
             self.caller = caller.id
+        if self.context is None:
+            self.context = RuntimeContext.get_current()
 
     def __enter__(self) -> Callable[[], Coroutine | AsyncGenerator]:
         """
@@ -199,6 +207,18 @@ class Task(Generic[W]):
 
     @classmethod
     def from_protobuf(cls, task: protocol.Task) -> Task:
+        """Deserialize a Task from a protobuf message.
+
+        :param task:
+            A protobuf ``Task`` message.
+        :returns:
+            A :class:`Task` instance with all fields restored.
+        """
+        context = (
+            RuntimeContext.from_protobuf(task.context)
+            if task.HasField("context")
+            else None
+        )
         return cls(
             id=UUID(task.id),
             callable=cloudpickle.loads(task.callable),
@@ -208,6 +228,7 @@ class Task(Generic[W]):
             proxy=cloudpickle.loads(task.proxy),
             timeout=task.timeout if task.timeout else 0,
             tag=task.tag if task.tag else None,
+            context=context,
         )
 
     def to_protobuf(self) -> protocol.Task:
@@ -222,6 +243,7 @@ class Task(Generic[W]):
             proxy_id=str(self.proxy.id),
             timeout=int(self.timeout) if self.timeout else 0,
             tag=self.tag if self.tag else "",
+            context=self.context.to_protobuf() if self.context else None,
         )
 
     def dispatch(self) -> W:
@@ -249,10 +271,12 @@ class Task(Generic[W]):
             # Set the proxy in context variable for nested task dispatch
             token = wool.__proxy__.set(proxy)
             try:
-                with self:
-                    with do_dispatch(False):
-                        await asyncio.sleep(0)
-                        return await self.callable(*self.args, **self.kwargs)
+                assert self.context is not None
+                with self.context:
+                    with self:
+                        with do_dispatch(False):
+                            await asyncio.sleep(0)
+                            return await self.callable(*self.args, **self.kwargs)
             finally:
                 wool.__proxy__.reset(token)
 
@@ -277,12 +301,14 @@ class Task(Generic[W]):
                     # Set the proxy in context variable for nested task dispatch
                     token = wool.__proxy__.set(proxy)
                     try:
-                        with self:
-                            with do_dispatch(False):
-                                try:
-                                    result = await anext(gen)
-                                except StopAsyncIteration:
-                                    break
+                        assert self.context is not None
+                        with self.context:
+                            with self:
+                                with do_dispatch(False):
+                                    try:
+                                        result = await anext(gen)
+                                    except StopAsyncIteration:
+                                        break
                     finally:
                         wool.__proxy__.reset(token)
 
