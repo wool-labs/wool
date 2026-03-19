@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing as _mp
 import signal
 import sys
 from contextlib import contextmanager
 from functools import partial
-from multiprocessing import Pipe
-from multiprocessing import Process
 from multiprocessing.connection import Connection
 from typing import TYPE_CHECKING
 
@@ -24,6 +23,10 @@ from wool.runtime.worker.service import WorkerService
 
 if TYPE_CHECKING:
     from wool.runtime.worker.proxy import WorkerProxy
+
+_ctx = _mp.get_context("spawn")
+Pipe = _ctx.Pipe
+Process = _ctx.Process
 
 logger = logging.getLogger(__name__)
 

@@ -7,6 +7,7 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
+from wool.runtime.worker import process as process_module
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.process import WorkerProcess
 from wool.runtime.worker.process import _proxy_factory
@@ -265,6 +266,24 @@ class TestWorkerProcess:
         # Assert
         assert process.host == "127.0.0.1"
         assert process.address is None
+
+    def test___init___uses_spawn_context(self):
+        """Test WorkerProcess uses spawn multiprocessing context.
+
+        Given:
+            Default parameters
+        When:
+            WorkerProcess is instantiated
+        Then:
+            It should be an instance of SpawnProcess from the spawn context
+        """
+        import multiprocessing.context
+
+        # Act
+        process = WorkerProcess()
+
+        # Assert
+        assert isinstance(process, multiprocessing.context.SpawnProcess)
 
     def test___init___raises_error_for_blank_host(self):
         """Test WorkerProcess initialization raises error for blank host.
@@ -559,7 +578,7 @@ class TestWorkerProcess:
         When:
             start() is called
         Then:
-            It should call multiprocessing.Process.start
+            It should call Process.start
         """
         # Arrange
         mock_get_port = mocker.MagicMock()
@@ -571,7 +590,7 @@ class TestWorkerProcess:
             return_value=(mock_get_port, mock_set_port),
         )
 
-        mock_parent_start = mocker.patch("multiprocessing.Process.start")
+        mock_parent_start = mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
 
@@ -604,7 +623,7 @@ class TestWorkerProcess:
             return_value=(mock_get_port, mock_set_port),
         )
 
-        mocker.patch("multiprocessing.Process.start")
+        mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
 
@@ -634,7 +653,7 @@ class TestWorkerProcess:
             return_value=(mock_get_port, mock_set_port),
         )
 
-        mocker.patch("multiprocessing.Process.start")
+        mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
         mock_terminate = mocker.patch.object(process, "terminate")
@@ -669,7 +688,7 @@ class TestWorkerProcess:
             return_value=(mock_get_port, mock_set_port),
         )
 
-        mocker.patch("multiprocessing.Process.start")
+        mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
 
