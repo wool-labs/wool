@@ -1146,3 +1146,146 @@ class TestLocalDiscoverySubscriber:
 
         # Assert
         assert unpickled.namespace == namespace
+
+    @pytest.mark.asyncio
+    async def test___aiter___with_concurrent_namespaces(self):
+        """Test concurrent subscribers on different namespaces do not collide.
+
+        Given:
+            Two LocalDiscovery instances with different namespaces
+        When:
+            Both subscribers async-iterate simultaneously
+        Then:
+            It should deliver events to both without RuntimeError or
+            BlockingIOError.
+        """
+        # Arrange
+        ns_a = f"test-concurrent-a-{uuid.uuid4()}"
+        ns_b = f"test-concurrent-b-{uuid.uuid4()}"
+        worker_a = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="host-a:50051",
+            pid=111,
+            version="1.0",
+        )
+        worker_b = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="host-b:50052",
+            pid=222,
+            version="1.0",
+        )
+
+        events_a: list = []
+        events_b: list = []
+        received_a = asyncio.Event()
+        received_b = asyncio.Event()
+        started_a = asyncio.Event()
+        started_b = asyncio.Event()
+
+        async def collect(subscriber, events, received, started):
+            started.set()
+            async for event in subscriber:
+                events.append(event)
+                received.set()
+                break
+
+        with LocalDiscovery(ns_a) as discovery_a, LocalDiscovery(ns_b) as discovery_b:
+            publisher_a = discovery_a.publisher
+            publisher_b = discovery_b.publisher
+            subscriber_a = discovery_a.subscribe(poll_interval=0.05)
+            subscriber_b = discovery_b.subscribe(poll_interval=0.05)
+
+            async with publisher_a, publisher_b:
+                task_a = asyncio.create_task(collect(subscriber_a, events_a, received_a, started_a))
+                task_b = asyncio.create_task(collect(subscriber_b, events_b, received_b, started_b))
+                await asyncio.gather(started_a.wait(), started_b.wait())
+
+                # Act
+                await publisher_a.publish("worker-added", worker_a)
+                await publisher_b.publish("worker-added", worker_b)
+
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(received_a.wait(), received_b.wait()),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    pytest.fail("Concurrent subscribers did not both receive events")
+                finally:
+                    for t in (task_a, task_b):
+                        t.cancel()
+                        try:
+                            await t
+                        except asyncio.CancelledError:
+                            pass
+
+        # Assert
+        assert len(events_a) == 1
+        assert events_a[0].metadata.uid == worker_a.uid
+        assert len(events_b) == 1
+        assert events_b[0].metadata.uid == worker_b.uid
+
+    @pytest.mark.asyncio
+    async def test___aiter___with_multiple_subscribers_same_namespace(
+        self, namespace, metadata
+    ):
+        """Test two subscribers on the same namespace receive events independently.
+
+        Given:
+            Two Subscribers on the same namespace
+        When:
+            A worker is published
+        Then:
+            It should deliver the worker-added event to both subscribers
+            independently.
+        """
+        # Arrange
+        events_1: list = []
+        events_2: list = []
+        received_1 = asyncio.Event()
+        received_2 = asyncio.Event()
+        started_1 = asyncio.Event()
+        started_2 = asyncio.Event()
+
+        async def collect(subscriber, events, received, started):
+            started.set()
+            async for event in subscriber:
+                events.append(event)
+                received.set()
+                break
+
+        with LocalDiscovery(namespace) as discovery:
+            publisher = discovery.publisher
+            subscriber_1 = discovery.subscribe(poll_interval=0.05)
+            subscriber_2 = discovery.subscribe(poll_interval=0.05)
+
+            async with publisher:
+                task_1 = asyncio.create_task(collect(subscriber_1, events_1, received_1, started_1))
+                task_2 = asyncio.create_task(collect(subscriber_2, events_2, received_2, started_2))
+                await asyncio.gather(started_1.wait(), started_2.wait())
+
+                # Act
+                await publisher.publish("worker-added", metadata)
+
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(received_1.wait(), received_2.wait()),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    pytest.fail("Both subscribers did not receive the event")
+                finally:
+                    for t in (task_1, task_2):
+                        t.cancel()
+                        try:
+                            await t
+                        except asyncio.CancelledError:
+                            pass
+
+        # Assert
+        assert len(events_1) == 1
+        assert events_1[0].type == "worker-added"
+        assert events_1[0].metadata.uid == metadata.uid
+        assert len(events_2) == 1
+        assert events_2[0].type == "worker-added"
+        assert events_2[0].metadata.uid == metadata.uid
