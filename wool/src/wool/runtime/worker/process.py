@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing as _mp
 import signal
@@ -182,47 +183,53 @@ class WorkerProcess(Process):
         requests. It creates a gRPC server, adds the worker service, and
         starts listening for incoming connections.
         """
-        grpc_options = [
-            (
-                "grpc.max_receive_message_length",
-                self._options.max_receive_message_length,
-            ),
-            ("grpc.max_send_message_length", self._options.max_send_message_length),
-        ]
-        server = grpc.aio.server(
-            interceptors=[VersionInterceptor()], options=grpc_options
-        )
-        credentials = (
-            self._credentials.server_credentials()
+        creds_ctx = (
+            self._credentials
             if self._credentials is not None
-            else None
+            else contextlib.nullcontext()
         )
-        address = self._address(self._host, self._port)
+        with creds_ctx:
+            grpc_options = [
+                (
+                    "grpc.max_receive_message_length",
+                    self._options.max_receive_message_length,
+                ),
+                ("grpc.max_send_message_length", self._options.max_send_message_length),
+            ]
+            server = grpc.aio.server(
+                interceptors=[VersionInterceptor()], options=grpc_options
+            )
+            credentials = (
+                self._credentials.server_credentials()
+                if self._credentials is not None
+                else None
+            )
+            address = self._address(self._host, self._port)
 
-        if credentials is not None:
-            port = server.add_secure_port(address, credentials)
-        else:
-            port = server.add_insecure_port(address)
+            if credentials is not None:
+                port = server.add_secure_port(address, credentials)
+            else:
+                port = server.add_insecure_port(address)
 
-        service = WorkerService()
-        protocol.add_to_server[protocol.WorkerServicer](service, server)
+            service = WorkerService()
+            protocol.add_to_server[protocol.WorkerServicer](service, server)
 
-        with _signal_handlers(service):
-            try:
-                await server.start()
-                logger.info(f"Worker gRPC server started on port {port}")
+            with _signal_handlers(service):
                 try:
-                    self._set_port.send(port)
+                    await server.start()
+                    logger.info(f"Worker gRPC server started on port {port}")
+                    try:
+                        self._set_port.send(port)
+                    finally:
+                        self._set_port.close()
+                    await service.stopped.wait()
+                    logger.info("Worker service stopped, shutting down server")
+                except Exception as e:
+                    logger.exception(f"Worker server error: {type(e).__name__}: {e}")
+                    raise
                 finally:
-                    self._set_port.close()
-                await service.stopped.wait()
-                logger.info("Worker service stopped, shutting down server")
-            except Exception as e:
-                logger.exception(f"Worker server error: {type(e).__name__}: {e}")
-                raise
-            finally:
-                logger.info("Worker server stopping with grace period")
-                await server.stop(grace=self._shutdown_grace_period)
+                    logger.info("Worker server stopping with grace period")
+                    await server.stop(grace=self._shutdown_grace_period)
 
     def _address(self, host, port) -> str:
         """Format network address for the given port.

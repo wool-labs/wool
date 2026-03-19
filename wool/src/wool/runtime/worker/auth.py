@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
+from contextvars import Token
 from dataclasses import dataclass
+from dataclasses import field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import grpc
+
+_current: ContextVar[WorkerCredentials | None] = ContextVar(
+    "worker_credentials", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,30 @@ class WorkerCredentials:
     worker_key: bytes
     worker_cert: bytes
     mutual: bool = True
+    _token: Token | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def __enter__(self) -> WorkerCredentials:
+        object.__setattr__(self, "_token", _current.set(self))
+        return self
+
+    def __exit__(self, *_) -> None:
+        if self._token is None:
+            raise RuntimeError(
+                "__exit__ called without matching __enter__"
+            )
+        _current.reset(self._token)
+        object.__setattr__(self, "_token", None)
+
+    @classmethod
+    def current(cls) -> WorkerCredentials | None:
+        """Get the current worker credentials from the context.
+
+        :returns:
+            The active WorkerCredentials, or None if no context is set.
+        """
+        return _current.get()
 
     @classmethod
     def from_files(
