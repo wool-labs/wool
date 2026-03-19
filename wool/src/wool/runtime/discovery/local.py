@@ -801,4 +801,6 @@ def _watchdog_path(namespace: str) -> Path:
     :returns:
         Path to the notification file for this namespace.
     """
-    return Path(tempfile.gettempdir()) / f"wool-notify-{namespace}"
+    directory = Path(tempfile.gettempdir()) / f"wool-{namespace}"
+    directory.mkdir(exist_ok=True)
+    return directory / "notify"
