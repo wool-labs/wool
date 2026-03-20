@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import weakref
 import traceback
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -10,6 +12,7 @@ from dataclasses import dataclass
 from inspect import isasyncgenfunction
 from inspect import iscoroutinefunction
 from types import TracebackType
+from typing import Any
 from typing import AsyncGenerator
 from typing import ContextManager
 from typing import Coroutine
@@ -24,6 +27,7 @@ from typing import cast
 from typing import overload
 from typing import runtime_checkable
 from uuid import UUID
+from uuid import uuid4
 
 import cloudpickle
 
@@ -36,6 +40,87 @@ Kwargs = Dict
 Timeout = SupportsInt
 Routine: TypeAlias = Coroutine | AsyncGenerator
 W = TypeVar("W", bound=Routine)
+
+
+# public
+@runtime_checkable
+class Serializer(Protocol):
+    """Protocol for pluggable serialization of Task payload fields."""
+
+    def dumps(self, obj: Any) -> bytes: ...
+
+    def loads(self, data: bytes) -> Any: ...
+
+
+class _PassthroughKey:
+    """Weak-referenceable key for the passthrough store."""
+
+    __slots__ = ("__weakref__", "token")
+
+    def __init__(self, token: UUID | None = None):
+        self.token = token if token is not None else uuid4()
+
+    def __hash__(self):
+        return hash(self.token)
+
+    def __eq__(self, other):
+        return isinstance(other, _PassthroughKey) and self.token == other.token
+
+
+class PassthroughSerializer:
+    """In-process serializer that avoids pickling entirely.
+
+    Each instance acts as a scope guard for one dispatch.
+    ``dumps`` creates a weakly-referenceable key, stores the object
+    in a module-level :class:`~weakref.WeakKeyDictionary`, and
+    retains a strong reference to the key on ``self``.  When the
+    serializer goes out of scope the keys are garbage-collected and
+    the weak-dict entries are removed automatically.
+
+    ``loads`` is static — it reconstructs the key from the bytes
+    token in the protobuf message and pops the entry from the store.
+
+    All instances hash and compare equal so that
+    ``_pickle_serializer``'s LRU cache hits on every call.
+    """
+
+    def __init__(self):
+        self._keys: list[_PassthroughKey] = []
+
+    def __hash__(self):
+        return hash(PassthroughSerializer)
+
+    def __eq__(self, other):
+        return isinstance(other, PassthroughSerializer)
+
+    def __reduce__(self):
+        return (PassthroughSerializer, ())
+
+    def dumps(self, obj: Any) -> bytes:
+        key = _PassthroughKey()
+        self._keys.append(key)
+        _passthrough_store[key] = obj
+        return key.token.bytes
+
+    @staticmethod
+    def loads(data: bytes) -> Any:
+        key = _PassthroughKey(UUID(bytes=data))
+        return _passthrough_store.pop(key)
+
+
+_passthrough_store: weakref.WeakKeyDictionary[_PassthroughKey, Any] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+@functools.lru_cache(maxsize=8)
+def _pickle_serializer(s: Serializer) -> bytes:
+    return cloudpickle.dumps(s)
+
+
+@functools.lru_cache(maxsize=8)
+def _unpickle_serializer(data: bytes) -> Serializer:
+    return cloudpickle.loads(data)
 
 
 _do_dispatch: ContextVar[bool] = ContextVar("_do_dispatch", default=True)
@@ -209,6 +294,9 @@ class Task(Generic[W]):
     def from_protobuf(cls, task: protocol.Task) -> Task:
         """Deserialize a Task from a protobuf message.
 
+        .. note::
+            The payload's serializer is unpickled and cached for subsequent calls.
+
         :param task:
             A protobuf ``Task`` message.
         :returns:
@@ -219,32 +307,62 @@ class Task(Generic[W]):
             if task.HasField("context")
             else None
         )
+        if task.HasField("serializer"):
+            s = _unpickle_serializer(task.serializer)
+            loads = s.loads
+            if isinstance(s, PassthroughSerializer):
+                proxy_loads = s.loads
+            else:
+                proxy_loads = cloudpickle.loads
+        else:
+            loads = cloudpickle.loads
+            proxy_loads = cloudpickle.loads
         return cls(
             id=UUID(task.id),
-            callable=cloudpickle.loads(task.callable),
-            args=cloudpickle.loads(task.args),
-            kwargs=cloudpickle.loads(task.kwargs),
+            callable=loads(task.callable),
+            args=loads(task.args),
+            kwargs=loads(task.kwargs),
             caller=UUID(task.caller) if task.caller else None,
-            proxy=cloudpickle.loads(task.proxy),
+            proxy=proxy_loads(task.proxy),
             timeout=task.timeout if task.timeout else 0,
             tag=task.tag if task.tag else None,
             context=context,
         )
 
-    def to_protobuf(self) -> protocol.Task:
-        return protocol.Task(
+    def to_protobuf(self, serializer: Serializer | None = None) -> protocol.Task:
+        """Serialize this Task to a protobuf message.
+
+        :param serializer:
+            Optional serializer for the callable and its arguments. When ``None`` (the
+            default), ``cloudpickle`` is used and the protobuf ``serializer`` field is
+            left unset. When provided, the serializer is pickled into the ``serializer``
+            field so that :meth:`from_protobuf` can use it on the receiving side.
+
+            .. note::
+                If specified, the serializer is pickled and cached for subsequent calls.
+        :returns:
+            A protobuf ``Task`` message.
+        """
+        dumps = serializer.dumps if serializer is not None else cloudpickle.dumps
+        proxy_dumps = (
+            dumps if isinstance(serializer, PassthroughSerializer) else cloudpickle.dumps
+        )
+        task_msg = protocol.Task(
             version=protocol.__version__,
             id=str(self.id),
-            callable=cloudpickle.dumps(self.callable),
-            args=cloudpickle.dumps(self.args),
-            kwargs=cloudpickle.dumps(self.kwargs),
+            callable=dumps(self.callable),
+            args=dumps(self.args),
+            kwargs=dumps(self.kwargs),
             caller=str(self.caller) if self.caller else "",
-            proxy=cloudpickle.dumps(self.proxy),
+            proxy=proxy_dumps(self.proxy),
             proxy_id=str(self.proxy.id),
             timeout=int(self.timeout) if self.timeout else 0,
             tag=self.tag if self.tag else "",
             context=self.context.to_protobuf() if self.context else None,
         )
+        if serializer is not None:
+            task_msg.serializer = _pickle_serializer(serializer)
+        return task_msg
 
     def dispatch(self) -> W:
         if isasyncgenfunction(self.callable):

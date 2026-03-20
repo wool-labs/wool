@@ -1,15 +1,29 @@
+from uuid import uuid4
+
 import grpc.aio
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
 from wool import protocol
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker import local as local_module
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.process import WorkerProcess
+
+
+def _make_metadata(address="127.0.0.1:50051", pid=12345, secure=False) -> WorkerMetadata:
+    """Build a minimal WorkerMetadata for mock processes."""
+    return WorkerMetadata(
+        uid=uuid4(),
+        address=address,
+        pid=pid,
+        version="1.0.0",
+        secure=secure,
+    )
 
 
 class TestLocalWorker:
@@ -193,7 +207,7 @@ class TestLocalWorker:
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata()
         mock_process.start.return_value = None
 
         mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
@@ -220,7 +234,7 @@ class TestLocalWorker:
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata()
         mock_process.start.return_value = None
 
         mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
@@ -234,20 +248,31 @@ class TestLocalWorker:
         mock_process.start.assert_called_once_with(timeout=60.0)
 
     @pytest.mark.asyncio
-    async def test_start_creates_metadata(self, mocker):
-        """Test _start method creates WorkerMetadata.
+    async def test_start_uses_metadata_from_process(self, mocker):
+        """Test _start method uses WorkerMetadata from the process.
 
         Given:
             A LocalWorker with tags and extra metadata
         When:
             start() is called
         Then:
-            It should create WorkerMetadata with correct data
+            It should use the WorkerMetadata returned by the process
         """
         # Arrange
+        from types import MappingProxyType
+
+        from wool.runtime.discovery.base import WorkerMetadata
+
+        expected_metadata = WorkerMetadata(
+            uid=uuid4(),
+            address="192.168.1.100:50051",
+            pid=12345,
+            version="1.0.0",
+            tags=frozenset({"gpu", "ml"}),
+            extra=MappingProxyType({"region": "us-west"}),
+        )
         mock_process = mocker.MagicMock(spec=WorkerProcess)
-        mock_process.address = "192.168.1.100:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = expected_metadata
         mock_process.start.return_value = None
 
         mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
@@ -258,20 +283,15 @@ class TestLocalWorker:
         await worker.start()
 
         # Assert
-        assert worker.metadata is not None
-        assert worker.metadata.uid == worker.uid
-        assert worker.metadata.address == "192.168.1.100:50051"
-        assert worker.metadata.pid == 12345
-        assert "gpu" in worker.metadata.tags
-        assert "ml" in worker.metadata.tags
-        assert worker.metadata.extra["region"] == "us-west"
+        assert worker.metadata is expected_metadata
 
     @pytest.mark.asyncio
-    async def test_start_raises_error_if_no_address(self, mocker):
-        """Test _start raises error if WorkerProcess has no address.
+    async def test_start_raises_error_if_no_metadata(self, mocker):
+        """Test _start raises error if WorkerProcess has no metadata.
 
         Given:
-            A LocalWorker where WorkerProcess.start doesn't set address
+            A LocalWorker where WorkerProcess.start does not
+            populate metadata
         When:
             start() is called
         Then:
@@ -279,8 +299,7 @@ class TestLocalWorker:
         """
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
-        mock_process.address = None
-        mock_process.pid = 12345
+        mock_process.metadata = None
         mock_process.start.return_value = None
 
         mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
@@ -288,32 +307,7 @@ class TestLocalWorker:
         worker = LocalWorker()
 
         # Act & assert
-        with pytest.raises(RuntimeError, match="no address"):
-            await worker.start()
-
-    @pytest.mark.asyncio
-    async def test_start_raises_error_if_no_pid(self, mocker):
-        """Test _start raises error if WorkerProcess has no PID.
-
-        Given:
-            A LocalWorker where WorkerProcess.start doesn't set PID
-        When:
-            start() is called
-        Then:
-            It should raise RuntimeError
-        """
-        # Arrange
-        mock_process = mocker.MagicMock(spec=WorkerProcess)
-        mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = None
-        mock_process.start.return_value = None
-
-        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
-
-        worker = LocalWorker()
-
-        # Act & assert
-        with pytest.raises(RuntimeError, match="no PID"):
+        with pytest.raises(RuntimeError, match="no metadata"):
             await worker.start()
 
     @pytest.mark.asyncio
@@ -328,9 +322,13 @@ class TestLocalWorker:
             It should correctly parse host and port
         """
         # Arrange
+        from types import MappingProxyType
+
+        from wool.runtime.discovery.base import WorkerMetadata
+
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "0.0.0.0:8080"
-        mock_process.pid = 99999
+        mock_process.metadata = _make_metadata(address="0.0.0.0:8080", pid=99999)
         mock_process.start.return_value = None
 
         mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
@@ -357,7 +355,7 @@ class TestLocalWorker:
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata()
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
@@ -393,7 +391,7 @@ class TestLocalWorker:
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata()
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = False
 
@@ -424,7 +422,7 @@ class TestLocalWorker:
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata()
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
@@ -492,7 +490,7 @@ class TestLocalWorker:
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata(secure=True)
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = False
 
@@ -520,7 +518,7 @@ class TestLocalWorker:
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata()
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = False
 
@@ -550,7 +548,7 @@ class TestLocalWorker:
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata()
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
@@ -590,7 +588,7 @@ class TestLocalWorker:
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata()
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
@@ -628,7 +626,7 @@ class TestLocalWorker:
         # Arrange
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata()
         mock_process.start.return_value = None
         mock_process.is_alive.return_value = True
 
@@ -677,7 +675,7 @@ class TestLocalWorker:
 
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
-        mock_process.pid = 12345
+        mock_process.metadata = _make_metadata()
         mock_process.start.return_value = None
         mock_process.is_alive.side_effect = [True, False]
 
