@@ -12,8 +12,10 @@ from typing import cast
 import cloudpickle
 import grpc.aio
 
+import wool
 from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.base import WorkerOptions
 
@@ -388,10 +390,24 @@ class WorkerConnection:
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
 
+        # Self-dispatch optimisation: when dispatching to the current
+        # worker process, use a PassthroughSerializer so the four
+        # payload fields (callable, args, kwargs, proxy) are stored
+        # in-process instead of being cloudpickled.  The request
+        # still travels through gRPC so the full streaming protocol
+        # is preserved.
+        metadata = wool.__worker_metadata__.get()
+        if metadata is not None and metadata.address == self._target:
+            serializer = PassthroughSerializer()
+            pb_task = task.to_protobuf(serializer=serializer)
+        else:
+            serializer = None
+            pb_task = task.to_protobuf()
+
         ch = await _channel_pool.acquire(self._key)
         try:
             try:
-                call = await self._dispatch(ch, task, timeout)
+                call = await self._dispatch(ch, pb_task, timeout)
             except grpc.RpcError as error:
                 code = error.code()
                 details = error.details() or str(error)
@@ -421,13 +437,13 @@ class WorkerConnection:
         except KeyError:
             pass
 
-    async def _dispatch(self, ch, task, timeout):
+    async def _dispatch(self, ch, pb_task, timeout):
         async with asyncio.timeout(timeout):
             await ch.semaphore.acquire()
             try:
                 call: _DispatchCall = ch.stub.dispatch()
                 try:
-                    request = protocol.Request(task=task.to_protobuf())
+                    request = protocol.Request(task=pb_task)
                     await call.write(request)
                     response = await anext(aiter(call))
                     if response.HasField("nack"):
@@ -482,3 +498,4 @@ class WorkerConnection:
                 ch.semaphore.release()
         finally:
             await _channel_pool.release(self._key)
+

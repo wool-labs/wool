@@ -4,8 +4,10 @@ import asyncio
 import contextlib
 import logging
 import multiprocessing as _mp
+import os
 import signal
 import sys
+import uuid
 from contextlib import contextmanager
 from functools import partial
 from multiprocessing.connection import Connection
@@ -15,9 +17,10 @@ import grpc.aio
 
 import wool
 from wool import protocol
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import CredentialContext
+from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
@@ -140,8 +143,10 @@ class WorkerProcess(Process):
         if timeout is not None and timeout <= 0:
             raise ValueError("Timeout must be positive")
         super().start()
-        if self._get_port.poll(timeout=timeout):
-            self._port = self._get_port.recv()
+        if self._get_metadata.poll(timeout=timeout):
+            self._metadata = self._get_metadata.recv()
+            assert self._metadata is not None
+            self._port = int(self._metadata.address.rsplit(":", 1)[1])
         else:
             self.terminate()
             self.join()
@@ -219,6 +224,19 @@ class WorkerProcess(Process):
                 try:
                     await server.start()
                     logger.info(f"Worker gRPC server started on port {port}")
+
+                    # Publish worker identity for self-dispatch detection
+                    wool.__worker_metadata__.set(
+                        WorkerMetadata(
+                            uid=uuid.uuid4(),
+                            address=self._address(self._host, port),
+                            pid=os.getpid(),
+                            version=protocol.__version__,
+                            secure=self._credentials is not None,
+                        )
+                    )
+                    wool.__worker_service__.set(service)
+
                     try:
                         self._set_port.send(port)
                     finally:
