@@ -12,6 +12,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
+import wool
 from wool import protocol
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
@@ -1168,3 +1169,150 @@ class TestWorkerConnection:
             "grpc.max_send_message_length",
             50 * 1024 * 1024,
         ) in call_options
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_self_dispatch(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test self-dispatch sends protobuf with serializer field set.
+
+        Given:
+            A WorkerConnection whose target matches the current
+            worker's address
+        When:
+            dispatch() is called
+        Then:
+            It should set the serializer field on the protobuf
+            Task and not call cloudpickle.dumps for payload fields
+        """
+        # Arrange
+        target = "localhost:50051"
+        wool.__worker_metadata__.set(
+            wool.WorkerMetadata(
+                uid=uuid4(),
+                address=target,
+                pid=1,
+                version="1.0.0",
+            )
+        )
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        spy = mocker.patch.object(cloudpickle, "dumps", wraps=cloudpickle.dumps)
+
+        connection = WorkerConnection(target)
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert
+        assert results == ["result"]
+        first_write = mock_call.write.call_args_list[0][0][0]
+        assert first_write.task.HasField("serializer")
+        pickled_objects = [c.args[0] for c in spy.call_args_list]
+        assert sample_task.callable not in pickled_objects
+        assert sample_task.args not in pickled_objects
+        assert sample_task.proxy not in pickled_objects
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_address_mismatch(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch uses cloudpickle when addresses do not match.
+
+        Given:
+            A WorkerConnection whose target differs from the current
+            worker's address
+        When:
+            dispatch() is called
+        Then:
+            It should use cloudpickle and not set the serializer
+            field
+        """
+        # Arrange
+        wool.__worker_metadata__.set(
+            wool.WorkerMetadata(
+                uid=uuid4(),
+                address="10.0.0.1:50051",
+                pid=1,
+                version="1.0.0",
+            )
+        )
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                result=protocol.Message(dump=cloudpickle.dumps("grpc_result"))
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051")
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert
+        assert results == ["grpc_result"]
+        first_write = mock_call.write.call_args_list[0][0][0]
+        assert not first_write.task.HasField("serializer")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_without_worker_metadata(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch uses cloudpickle when not in a worker process.
+
+        Given:
+            A WorkerConnection and no worker metadata set
+            (non-worker process)
+        When:
+            dispatch() is called
+        Then:
+            It should use cloudpickle and not set the serializer
+            field
+        """
+        # Arrange
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                result=protocol.Message(dump=cloudpickle.dumps("grpc_result"))
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051")
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert
+        assert results == ["grpc_result"]
+        first_write = mock_call.write.call_args_list[0][0][0]
+        assert not first_write.task.HasField("serializer")

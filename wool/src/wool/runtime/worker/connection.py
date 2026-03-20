@@ -367,6 +367,14 @@ class WorkerConnection:
         concurrency limits and applies timeout to the dispatch phase only
         (semaphore acquisition and acknowledgment).
 
+        .. note::
+
+           When dispatching to the current worker process (self-dispatch),
+           a :class:`PassthroughSerializer` is used so the four payload
+           fields (callable, args, kwargs, proxy) are stored in-process
+           instead of being cloudpickled.  The request still travels
+           through gRPC so the full streaming protocol is preserved.
+
         :param task:
             The :class:`Task` instance to dispatch to the worker.
         :param timeout:
@@ -390,24 +398,19 @@ class WorkerConnection:
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
 
-        # Self-dispatch optimisation: when dispatching to the current
-        # worker process, use a PassthroughSerializer so the four
-        # payload fields (callable, args, kwargs, proxy) are stored
-        # in-process instead of being cloudpickled.  The request
-        # still travels through gRPC so the full streaming protocol
-        # is preserved.
-        metadata = wool.__worker_metadata__.get()
-        if metadata is not None and metadata.address == self._target:
+        if (
+            metadata := wool.__worker_metadata__.get()
+        ) is not None and metadata.address == self._target:
             serializer = PassthroughSerializer()
-            pb_task = task.to_protobuf(serializer=serializer)
         else:
             serializer = None
-            pb_task = task.to_protobuf()
 
         ch = await _channel_pool.acquire(self._key)
         try:
             try:
-                call = await self._dispatch(ch, pb_task, timeout)
+                call = await self._dispatch(
+                    ch, task.to_protobuf(serializer=serializer), timeout
+                )
             except grpc.RpcError as error:
                 code = error.code()
                 details = error.details() or str(error)
@@ -437,13 +440,18 @@ class WorkerConnection:
         except KeyError:
             pass
 
-    async def _dispatch(self, ch, pb_task, timeout):
+    async def _dispatch(
+        self,
+        channel: _Channel,
+        task_msg: protocol.Task,
+        timeout: float | None,
+    ) -> _DispatchCall:
         async with asyncio.timeout(timeout):
-            await ch.semaphore.acquire()
+            await channel.semaphore.acquire()
             try:
-                call: _DispatchCall = ch.stub.dispatch()
+                call: _DispatchCall = channel.stub.dispatch()
                 try:
-                    request = protocol.Request(task=pb_task)
+                    request = protocol.Request(task=task_msg)
                     await call.write(request)
                     response = await anext(aiter(call))
                     if response.HasField("nack"):
@@ -462,7 +470,7 @@ class WorkerConnection:
                         pass
                     raise
             except (Exception, asyncio.CancelledError):
-                ch.semaphore.release()
+                channel.semaphore.release()
                 raise
         return call
 
@@ -498,4 +506,3 @@ class WorkerConnection:
                 ch.semaphore.release()
         finally:
             await _channel_pool.release(self._key)
-

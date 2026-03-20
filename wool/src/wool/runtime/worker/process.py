@@ -11,7 +11,9 @@ import uuid
 from contextlib import contextmanager
 from functools import partial
 from multiprocessing.connection import Connection
+from types import MappingProxyType
 from typing import TYPE_CHECKING
+from typing import Any
 
 import grpc.aio
 
@@ -64,8 +66,9 @@ class WorkerProcess(Process):
     """
 
     _port: int | None
-    _get_port: Connection
-    _set_port: Connection
+    _get_metadata: Connection
+    _set_metadata: Connection
+    _metadata: WorkerMetadata | None
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
     _credentials: WorkerCredentials | None
@@ -74,12 +77,15 @@ class WorkerProcess(Process):
     def __init__(
         self,
         *args,
+        uid: uuid.UUID | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
         credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
+        tags: frozenset[str] = frozenset(),
+        extra: MappingProxyType[str, Any] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -97,16 +103,28 @@ class WorkerProcess(Process):
         self._proxy_pool_ttl = proxy_pool_ttl
         self._credentials = credentials
         self._options = options or WorkerOptions()
-        self._get_port, self._set_port = Pipe(duplex=False)
+        self._uid = uid if uid is not None else uuid.uuid4()
+        self._tags = tags
+        self._extra = extra if extra is not None else MappingProxyType({})
+        self._metadata = None
+        self._get_metadata, self._set_metadata = Pipe(duplex=False)
 
     @property
     def address(self) -> str | None:
         """The network address where the gRPC server is listening.
 
+        After :meth:`start`, the address comes from the
+        :class:`WorkerMetadata` returned by the child process.
+        Before start, returns ``host:port`` when a fixed port was
+        given, or ``None`` when port is 0 (random).
+
         :returns:
-            The address in "host:port" format, or None if not started.
+            The address in "host:port" format, or None if not started
+            and port is 0.
         """
-        return self._address(self._host, self._port) if self._port else None
+        if self._metadata is not None:
+            return self._metadata.address
+        return None
 
     @property
     def host(self) -> str | None:
@@ -126,12 +144,22 @@ class WorkerProcess(Process):
         """
         return self._port or None
 
+    @property
+    def metadata(self) -> WorkerMetadata | None:
+        """The worker metadata received from the child process.
+
+        :returns:
+            :class:`WorkerMetadata` once started, or ``None``.
+        """
+        return self._metadata
+
     def start(self, *, timeout: float | None = None):
         """Start the worker process.
 
-        Launches the worker process and waits until it has started
-        listening on a port. After starting, the :attr:`address`
-        property will contain the actual network address.
+        Launches the worker process and waits until it has reported
+        its :class:`WorkerMetadata` back via pipe. After starting,
+        the :attr:`metadata` and :attr:`address` properties are
+        populated.
 
         :param timeout:
             Maximum time in seconds to wait for worker process startup.
@@ -153,7 +181,7 @@ class WorkerProcess(Process):
             raise RuntimeError(
                 f"Worker process failed to start within {timeout} seconds"
             )
-        self._get_port.close()
+        self._get_metadata.close()
 
     def run(self) -> None:
         """Run the worker process.
@@ -225,22 +253,22 @@ class WorkerProcess(Process):
                     await server.start()
                     logger.info(f"Worker gRPC server started on port {port}")
 
-                    # Publish worker identity for self-dispatch detection
-                    wool.__worker_metadata__.set(
-                        WorkerMetadata(
-                            uid=uuid.uuid4(),
-                            address=self._address(self._host, port),
-                            pid=os.getpid(),
-                            version=protocol.__version__,
-                            secure=self._credentials is not None,
-                        )
+                    metadata = WorkerMetadata(
+                        uid=self._uid,
+                        address=self._address(self._host, port),
+                        pid=os.getpid(),
+                        version=protocol.__version__,
+                        tags=self._tags,
+                        extra=self._extra,
+                        secure=self._credentials is not None,
                     )
+                    wool.__worker_metadata__.set(metadata)
                     wool.__worker_service__.set(service)
 
                     try:
-                        self._set_port.send(port)
+                        self._set_metadata.send(metadata)
                     finally:
-                        self._set_port.close()
+                        self._set_metadata.close()
                     await service.stopped.wait()
                     logger.info("Worker service stopped, shutting down server")
                 except Exception as e:

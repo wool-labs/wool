@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-import weakref
 import traceback
+import weakref
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -64,7 +64,9 @@ class _PassthroughKey:
         return hash(self.token)
 
     def __eq__(self, other):
-        return isinstance(other, _PassthroughKey) and self.token == other.token
+        if not isinstance(other, _PassthroughKey):
+            return super().__eq__(other)
+        return self.token == other.token
 
 
 class PassthroughSerializer:
@@ -91,6 +93,10 @@ class PassthroughSerializer:
         return hash(PassthroughSerializer)
 
     def __eq__(self, other):
+        # Required by _pickle_serializer's lru_cache: all instances
+        # share the same hash, so __eq__ must confirm the match for
+        # the cache to hit instead of treating each instance as a
+        # separate key.
         return isinstance(other, PassthroughSerializer)
 
     def __reduce__(self):
@@ -331,6 +337,12 @@ class Task(Generic[W]):
 
     def to_protobuf(self, serializer: Serializer | None = None) -> protocol.Task:
         """Serialize this Task to a protobuf message.
+
+        The serializer itself is pickled via :func:`_pickle_serializer`
+        which uses an LRU cache keyed on the serializer instance.
+        :class:`PassthroughSerializer` instances all hash and compare
+        equal, so repeated calls hit the cache and avoid redundant
+        pickling.
 
         :param serializer:
             Optional serializer for the callable and its arguments. When ``None`` (the
