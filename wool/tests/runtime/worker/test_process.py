@@ -9,6 +9,7 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
+from wool import protocol
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker import process as process_module
 from wool.runtime.worker.auth import CredentialContext
@@ -560,7 +561,7 @@ class TestWorkerProcess:
             address="127.0.0.1:50051",
             pid=12345,
             version="1.0.0",
-        )
+        ).to_protobuf().SerializeToString()
         mock_set_meta = mocker.MagicMock()
         mocker.patch(
             "wool.runtime.worker.process.Pipe",
@@ -598,7 +599,7 @@ class TestWorkerProcess:
             address="127.0.0.1:50051",
             pid=12345,
             version="1.0.0",
-        )
+        ).to_protobuf().SerializeToString()
         mock_set_meta = mocker.MagicMock()
         mocker.patch(
             "wool.runtime.worker.process.Pipe",
@@ -668,7 +669,7 @@ class TestWorkerProcess:
             address="127.0.0.1:50051",
             pid=12345,
             version="1.0.0",
-        )
+        ).to_protobuf().SerializeToString()
         mock_set_meta = mocker.MagicMock()
         mocker.patch(
             "wool.runtime.worker.process.Pipe",
@@ -829,8 +830,11 @@ class TestWorkerProcess:
         mock_server.start.assert_called_once()
         mock_send.assert_called_once()
         sent = mock_send.call_args[0][0]
-        assert isinstance(sent, WorkerMetadata)
-        assert sent.address == "127.0.0.1:50051"
+        assert isinstance(sent, bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent)
+        )
+        assert deserialized.address == "127.0.0.1:50051"
         mock_close.assert_called_once()
         mock_service.stopped.wait.assert_called_once()
         mock_server.stop.assert_called_once_with(grace=30.0)
@@ -875,8 +879,11 @@ class TestWorkerProcess:
         # Assert
         mock_send.assert_called_once()
         sent = mock_send.call_args[0][0]
-        assert isinstance(sent, WorkerMetadata)
-        assert sent.address == "0.0.0.0:8080"
+        assert isinstance(sent, bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent)
+        )
+        assert deserialized.address == "0.0.0.0:8080"
 
     def test_run_closes_pipe_even_on_error(self, mocker):
         """Test run closes pipe even if send fails.
@@ -1099,8 +1106,11 @@ class TestWorkerProcess:
 
         # Assert
         assert len(sent_metadata) == 1
-        assert isinstance(sent_metadata[0], WorkerMetadata)
-        assert sent_metadata[0].address == "127.0.0.1:54321"
+        assert isinstance(sent_metadata[0], bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent_metadata[0])
+        )
+        assert deserialized.address == "127.0.0.1:54321"
 
     def test_serve_insecure_worker_random_port_assignment(self, mocker):
         """Test random port assignment for insecure worker.
@@ -1141,8 +1151,11 @@ class TestWorkerProcess:
 
         # Assert
         assert len(sent_metadata) == 1
-        assert isinstance(sent_metadata[0], WorkerMetadata)
-        assert sent_metadata[0].address == "127.0.0.1:54322"
+        assert isinstance(sent_metadata[0], bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent_metadata[0])
+        )
+        assert deserialized.address == "127.0.0.1:54322"
 
     def test_serve_no_dual_port_architecture(self, mocker):
         """Test no dual-port architecture.

@@ -172,7 +172,11 @@ class WorkerProcess(Process):
             raise ValueError("Timeout must be positive")
         super().start()
         if self._get_metadata.poll(timeout=timeout):
-            self._metadata = self._get_metadata.recv()
+            self._metadata = WorkerMetadata.from_protobuf(
+                protocol.WorkerMetadata.FromString(
+                    self._get_metadata.recv()
+                )
+            )
             assert self._metadata is not None
             self._port = int(self._metadata.address.rsplit(":", 1)[1])
         else:
@@ -266,7 +270,9 @@ class WorkerProcess(Process):
                     wool.__worker_service__.set(service)
 
                     try:
-                        self._set_metadata.send(metadata)
+                        self._set_metadata.send(
+                            metadata.to_protobuf().SerializeToString()
+                        )
                     finally:
                         self._set_metadata.close()
                     await service.stopped.wait()
