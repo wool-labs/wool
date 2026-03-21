@@ -67,17 +67,17 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 ```markdown
 # <title>
 
-## Summary
+## Description
 
 <What is the bug? Steps to reproduce if applicable.>
+
+## Expected behavior
+
+<What did you expect to happen?>
 
 ## Root cause
 
 <What is causing the bug? Include relevant code snippets.>
-
-## Affected code
-
-<Which files, modules, or components are affected?>
 ```
 
 **Feature** (label: `feature`):
@@ -85,7 +85,7 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 ```markdown
 # <title>
 
-## Summary
+## Description
 
 <What is the feature? Describe the desired behavior.>
 
@@ -93,9 +93,9 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 
 <Why is this feature needed? What problem does it solve?>
 
-## Affected code
+## Expected outcome
 
-<Which files, modules, or components would be affected?>
+<What should be true when this is done?>
 ```
 
 **Refactor** (label: `refactor`):
@@ -103,7 +103,7 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 ```markdown
 # <title>
 
-## Summary
+## Description
 
 <What should be restructured and what does the end state look like?>
 
@@ -111,9 +111,9 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 
 <Why is this restructuring needed?>
 
-## Affected code
+## Expected outcome
 
-<Which files, modules, or components are affected?>
+<What should be true when this is done?>
 ```
 
 **Test** (label: `test`):
@@ -121,7 +121,7 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 ```markdown
 # <title>
 
-## Summary
+## Description
 
 <What needs to be tested or what test infrastructure is needed?>
 
@@ -129,9 +129,9 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 
 <Why is this test work needed? What gap does it fill?>
 
-## Affected code
+## Expected outcome
 
-<Which files, modules, or components are affected?>
+<What should be true when this is done?>
 ```
 
 **CI/CD** (label: `cicd`):
@@ -139,7 +139,7 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 ```markdown
 # <title>
 
-## Summary
+## Description
 
 <What CI/CD change is needed?>
 
@@ -147,9 +147,9 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 
 <Why is this change needed? What does it improve?>
 
-## Affected code
+## Expected outcome
 
-<Which workflows, pipelines, or config files are affected?>
+<What should be true when this is done?>
 ```
 
 **Build** (label: `build`):
@@ -157,7 +157,7 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 ```markdown
 # <title>
 
-## Summary
+## Description
 
 <What build system or dependency change is needed?>
 
@@ -165,12 +165,14 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 
 <Why is this change needed?>
 
-## Affected code
+## Expected outcome
 
-<Which build files, configs, or dependencies are affected?>
+<What should be true when this is done?>
 ```
 
-The **Affected code** section MAY be omitted if it is not relevant.
+For issue types backed by a GitHub form template (Bug, Feature), the **Expected outcome** / **Expected behavior** section is required by the form and MUST be included. For fallback-only templates (Refactor, Test, CI/CD, Build), the section MAY be omitted if it is not relevant.
+
+When the project defines a GitHub issue form template in `.github/ISSUE_TEMPLATE/` that matches the issue type (e.g., `bug.yaml` for bugs, `feature.yaml` for features), the skill MUST mirror the form template's section structure instead of using the built-in Markdown template above. The built-in Markdown templates serve as a fallback for issue types that do not have a corresponding GitHub form template.
 
 The draft MUST be shown to the user and iterated until they approve.
 
