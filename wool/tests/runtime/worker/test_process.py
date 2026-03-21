@@ -1,5 +1,6 @@
 import signal
 import uuid
+from types import MappingProxyType
 
 import grpc
 import grpc.aio
@@ -686,6 +687,48 @@ class TestWorkerProcess:
         # Assert
         mock_get_meta.close.assert_called_once()
 
+    def test_start_deserializes_metadata_with_extra_from_pipe(self, mocker):
+        """Test start deserializes metadata with extra and tags from pipe.
+
+        Given:
+            A pipe returning protobuf bytes encoding extra and tags
+        When:
+            start() is called
+        Then:
+            It should populate metadata.extra as MappingProxyType
+            and metadata.tags as frozenset
+        """
+        # Arrange
+        metadata_bytes = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50051",
+            pid=12345,
+            version="1.0.0",
+            tags=frozenset({"gpu"}),
+            extra=MappingProxyType({"key": "value"}),
+        ).to_protobuf().SerializeToString()
+
+        mock_get_meta = mocker.MagicMock()
+        mock_get_meta.poll.return_value = True
+        mock_get_meta.recv.return_value = metadata_bytes
+        mock_set_meta = mocker.MagicMock()
+        mocker.patch(
+            "wool.runtime.worker.process.Pipe",
+            return_value=(mock_get_meta, mock_set_meta),
+        )
+
+        mocker.patch.object(process_module.Process, "start")
+
+        process = WorkerProcess()
+
+        # Act
+        process.start()
+
+        # Assert
+        assert process.metadata.extra == MappingProxyType({"key": "value"})
+        assert isinstance(process.metadata.extra, MappingProxyType)
+        assert process.metadata.tags == frozenset({"gpu"})
+
     @pytest.mark.asyncio
     async def test__proxy_factory_starts_proxy_when_not_started(self, mocker):
         """Test _proxy_factory starts proxy when not already started.
@@ -884,6 +927,61 @@ class TestWorkerProcess:
             protocol.WorkerMetadata.FromString(sent)
         )
         assert deserialized.address == "0.0.0.0:8080"
+
+    def test_run_with_extra_and_tags_serializes_complete_metadata(
+        self, mocker
+    ):
+        """Test run serializes metadata including extra and tags to pipe.
+
+        Given:
+            A WorkerProcess with extra=MappingProxyType({"k": "v"})
+            and tags=frozenset({"gpu"})
+        When:
+            run() executes
+        Then:
+            It should send protobuf bytes that deserialize to
+            WorkerMetadata with matching extra and tags
+        """
+        # Arrange
+        process = WorkerProcess(
+            extra=MappingProxyType({"k": "v"}),
+            tags=frozenset({"gpu"}),
+        )
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch("wool.runtime.worker.process.ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch("grpc.aio.server", return_value=mock_server)
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService",
+            return_value=mock_service,
+        )
+
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        mock_send = mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        mock_send.assert_called_once()
+        sent = mock_send.call_args[0][0]
+        assert isinstance(sent, bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent)
+        )
+        assert deserialized.extra == MappingProxyType({"k": "v"})
+        assert isinstance(deserialized.extra, MappingProxyType)
+        assert deserialized.tags == frozenset({"gpu"})
 
     def test_run_closes_pipe_even_on_error(self, mocker):
         """Test run closes pipe even if send fails.
