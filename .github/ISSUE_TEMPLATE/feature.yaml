@@ -22,4 +22,4 @@ body:
       label: Expected outcome
       description: What should be true when this is done?
     validations:
-      required: false
+      required: true

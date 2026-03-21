@@ -170,7 +170,7 @@ Prose in issue bodies MUST NOT be hard-wrapped at a fixed column width. Write ea
 <What should be true when this is done?>
 ```
 
-The **Expected outcome** (or **Expected behavior** in bug templates) section MAY be omitted if it is not relevant.
+For issue types backed by a GitHub form template (Bug, Feature), the **Expected outcome** / **Expected behavior** section is required by the form and MUST be included. For fallback-only templates (Refactor, Test, CI/CD, Build), the section MAY be omitted if it is not relevant.
 
 When the project defines a GitHub issue form template in `.github/ISSUE_TEMPLATE/` that matches the issue type (e.g., `bug.yaml` for bugs, `feature.yaml` for features), the skill MUST mirror the form template's section structure instead of using the built-in Markdown template above. The built-in Markdown templates serve as a fallback for issue types that do not have a corresponding GitHub form template.
 
