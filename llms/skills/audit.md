@@ -16,7 +16,7 @@ Spawn a fresh subagent to evaluate whether a skill's requirements were met durin
 
 ## Pipeline Context
 
-This skill is a **cross-cutting quality gate** invoked at the end of every SDLC pipeline stage: `/issue` → audit → `/pr` → audit → `/implement` → audit → `/commit` → audit → `/pr` (update) → audit → `/review` → audit.
+This skill is a **cross-cutting quality gate** invoked at the end of every SDLC pipeline stage: `/issue` → audit → `/implement` → audit → `/test` → audit → `/commit` → audit → `/pr` → audit → `/review` → audit.
 
 ## Arguments
 
