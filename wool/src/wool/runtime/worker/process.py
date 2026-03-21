@@ -85,7 +85,7 @@ class WorkerProcess(Process):
         credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
         tags: frozenset[str] = frozenset(),
-        extra: MappingProxyType[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -105,7 +105,7 @@ class WorkerProcess(Process):
         self._options = options or WorkerOptions()
         self._uid = uid if uid is not None else uuid.uuid4()
         self._tags = tags
-        self._extra = extra if extra is not None else MappingProxyType({})
+        self._extra = extra if extra is not None else {}
         self._metadata = None
         self._get_metadata, self._set_metadata = Pipe(duplex=False)
 
@@ -263,7 +263,7 @@ class WorkerProcess(Process):
                         pid=os.getpid(),
                         version=protocol.__version__,
                         tags=self._tags,
-                        extra=self._extra,
+                        extra=MappingProxyType(self._extra),
                         secure=self._credentials is not None,
                     )
                     wool.__worker_metadata__.set(metadata)

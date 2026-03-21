@@ -983,6 +983,55 @@ class TestWorkerProcess:
         assert isinstance(deserialized.extra, MappingProxyType)
         assert deserialized.tags == frozenset({"gpu"})
 
+    def test_run_with_dict_extra_produces_mapping_proxy(self, mocker):
+        """Test run wraps dict extra as MappingProxyType in metadata.
+
+        Given:
+            A WorkerProcess with extra={"key": "value"}
+        When:
+            run() executes
+        Then:
+            It should send WorkerMetadata with extra as
+            MappingProxyType({"key": "value"}) through the pipe
+        """
+        # Arrange
+        process = WorkerProcess(extra={"key": "value"})
+
+        mocker.patch.object(process_module.wool, "__proxy_pool__")
+        mocker.patch.object(process_module, "ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch.object(
+            process_module,
+            "WorkerService",
+            return_value=mock_service,
+        )
+
+        mocker.patch.object(process_module, "_signal_handlers")
+
+        mock_send = mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        mock_send.assert_called_once()
+        sent = mock_send.call_args[0][0]
+        assert isinstance(sent, bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent)
+        )
+        assert isinstance(deserialized.extra, MappingProxyType)
+        assert deserialized.extra == {"key": "value"}
+
     def test_run_closes_pipe_even_on_error(self, mocker):
         """Test run closes pipe even if send fails.
 

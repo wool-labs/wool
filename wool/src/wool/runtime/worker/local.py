@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from types import MappingProxyType
 from typing import Any
 
 import grpc.aio
@@ -90,7 +89,7 @@ class LocalWorker(Worker):
             credentials=credentials,
             options=options,
             tags=frozenset(self._tags),
-            extra=MappingProxyType(self._extra),
+            extra=self._extra,
         )
 
     @property
