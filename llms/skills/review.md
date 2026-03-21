@@ -17,7 +17,7 @@ Fetch a pull request, analyze its diff against project guides and source context
 
 ## Pipeline Context
 
-This skill is part of the development workflow pipeline: `/issue` → `/pr` → `/implement` → `/commit` → `/pr` (update) → `/review`. This skill is the **sixth** stage, invoked after the PR has been updated and is ready for review.
+This skill is part of the development workflow pipeline: `/issue` → `/implement` → `/test` → `/commit` → `/pr` → `/review`. This skill is the **sixth** stage, invoked after the PR has been created and is ready for review.
 
 ## Arguments
 

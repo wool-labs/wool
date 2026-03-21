@@ -19,7 +19,7 @@ This skill transforms a messy working tree into a clean sequence of atomic, well
 
 ## Pipeline Context
 
-This skill is part of the development workflow pipeline: `/issue` → `/pr` → `/implement` → `/commit` → `/pr` (update). This skill is the **fourth** stage.
+This skill is part of the development workflow pipeline: `/issue` → `/implement` → `/test` → `/commit` → `/pr`. This skill is the **fourth** stage. The implement, test, and commit steps are iterative — they can be invoked multiple times for a given issue.
 
 ## Workflow
 
@@ -31,7 +31,7 @@ This skill is part of the development workflow pipeline: `/issue` → `/pr` → 
 4. Plan the commits
 5. Stage and commit sequentially
 6. Review and present
-7. Prompt the user to move onto the PR update step
+7. Prompt the user to move onto the PR step
 
 ### 1. Verify git state
 
@@ -157,25 +157,13 @@ git merge --ff-only {original-branch}-staging
 git branch -d {original-branch}-staging
 ```
 
-If the original branch contains a placeholder empty commit (e.g., `chore: Open draft PR for #<number>` created by the `/pr` skill), it MUST be dropped during the merge so the final history is clean. Use rebase instead of fast-forward merge:
-
-```bash
-git checkout {original-branch}
-git rebase --onto {original-branch}~1 {original-branch} {original-branch}-staging
-git checkout -B {original-branch} {original-branch}-staging
-git branch -d {original-branch}-staging
-```
-
 Or if they prefer to review as a PR first, they can push the staging branch and open a pull request against the original branch.
-
-If the current branch is associated with a PR, the user SHOULD be prompted with the next pipeline step: "Ready to update the PR? Run `/pr <number>` to sync the PR description with the committed changes."
 
 ---
 
-### 7. Prompt the user to move onto the PR update step
+### 7. Prompt the user to move onto the PR step
 
-1. Prompt the user to invoke the `/pr` skill to update the PR description: check off completed implementation steps, refresh the test cases table, and update the summary to reflect what was actually implemented. Ask the user: "Ready to update the PR description? Run `/pr <number>` to update the PR description to reflect the implementation." DO NOT proceed on your own.
-2. Inform the user that the branch is ready for review and the PR can be marked ready via `gh pr ready <number>`.
+The user MUST be prompted with the next pipeline step: "Ready to create the PR? Run `/pr <number>` to review the changes and open a draft pull request." DO NOT proceed on your own.
 
 ## Commit Message Style Guide
 
