@@ -40,6 +40,7 @@ def test_public_api_completeness():
         "LoadBalancerLike",
         "NoWorkersAvailable",
         "RoundRobinLoadBalancer",
+        "Serializer",
         "Task",
         "TaskException",
         "current_task",

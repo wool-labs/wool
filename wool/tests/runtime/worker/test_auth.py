@@ -605,4 +605,3 @@ class TestWorkerCredentials:
         # Act & assert
         with pytest.raises(AttributeError):
             WorkerCredentials.current()
-

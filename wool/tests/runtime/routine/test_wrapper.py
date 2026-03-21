@@ -357,7 +357,6 @@ async def test_routine_with_various_arguments(
         mock_proxy_context.dispatch.assert_called_once()
 
 
-
 @pytest.mark.asyncio
 async def test_routine_with_empty_stream(
     mocker: MockerFixture,
