@@ -15,7 +15,7 @@ Create a well-structured GitHub issue, either from a prepared `.issue.md` file o
 
 ## Pipeline Context
 
-This skill is part of the development workflow pipeline: `/issue` → `/pr` → `/implement` → `/commit` → `/pr` (update). This skill is the **first** stage.
+This skill is part of the development workflow pipeline: `/issue` → `/implement` → `/test` → `/commit` → `/pr`. This skill is the **first** stage. The implement, test, and commit steps are iterative — they can be invoked multiple times for a given issue.
 
 ## Workflow
 
@@ -29,7 +29,7 @@ This skill is part of the development workflow pipeline: `/issue` → `/pr` → 
 6. Push the issue
 7. Clean up `.issue.md` (if applicable)
 8. Return the issue URL
-9. Prompt the user to move onto the PR step
+9. Prompt the user to move onto the implement step
 
 ### 1. Determine the source
 
@@ -220,8 +220,8 @@ rm .issue.md
 
 The issue URL returned by `gh issue create` MUST be printed so the user can access it directly.
 
-The user SHOULD be prompted with the next pipeline step: "Ready to plan this? Run `/pr <number>` to create a branch and draft PR."
+The user SHOULD be prompted with the next pipeline step: "Ready to implement? Run `/implement <number>` to create a branch and start planning."
 
-### 9. Prompt the user to move onto the PR step
+### 9. Prompt the user to move onto the implement step
 
-The user MUST be prompted with the next pipeline step: "Ready to plan this? Run `/pr <number>` to create a branch and draft PR." When working from a fork, note that `<number>` refers to the issue on the upstream repo. DO NOT proceed on your own.
+The user MUST be prompted with the next pipeline step: "Ready to implement? Run `/implement <number>` to create a branch and start planning." When working from a fork, note that `<number>` refers to the issue on the upstream repo. DO NOT proceed on your own.
