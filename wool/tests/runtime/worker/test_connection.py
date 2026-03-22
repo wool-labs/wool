@@ -626,6 +626,71 @@ class TestWorkerConnection:
         await connection.close()
 
     @pytest.mark.asyncio
+    async def test_close_clears_uds_pool_entry(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test close clears UDS channel pool entry after self-dispatch.
+
+        Given:
+            A WorkerConnection that has dispatched over UDS
+        When:
+            close() is called
+        Then:
+            It should clear both the TCP and UDS pool entries
+        """
+        # Arrange
+        target = "localhost:50051"
+        uds_target = "unix:/tmp/wool-test.sock"
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address=target,
+            pid=1,
+            version="1.0.0",
+        )
+        wool.__worker_uds_address__ = uds_target
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                result=protocol.Message(dump=cloudpickle.dumps("result"))
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        mock_channel = mocker.AsyncMock()
+        mocker.patch.object(
+            grpc.aio, "insecure_channel", return_value=mock_channel
+        )
+
+        connection = WorkerConnection(target, limit=10)
+
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        from wool.runtime.worker import connection as connection_module
+
+        clear_spy = mocker.patch.object(
+            connection_module._channel_pool, "clear", mocker.AsyncMock()
+        )
+
+        # Act
+        await connection.close()
+
+        # Assert
+        cleared_keys = [c.args[0] for c in clear_spy.call_args_list]
+        assert len(cleared_keys) == 2
+        assert (target, None, 10, connection._options) in cleared_keys
+        assert (uds_target, None, 10, connection._options) in cleared_keys
+
+    @pytest.mark.asyncio
     async def test_dispatch_task_that_yields_multiple_results(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
@@ -1191,13 +1256,11 @@ class TestWorkerConnection:
         """
         # Arrange
         target = "localhost:50051"
-        wool.__worker_metadata__.set(
-            wool.WorkerMetadata(
-                uid=uuid4(),
-                address=target,
-                pid=1,
-                version="1.0.0",
-            )
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address=target,
+            pid=1,
+            version="1.0.0",
         )
 
         responses = (
@@ -1229,6 +1292,74 @@ class TestWorkerConnection:
         assert sample_task.proxy not in pickled_objects
 
     @pytest.mark.asyncio
+    async def test_dispatch_with_self_dispatch_over_uds(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test self-dispatch uses UDS channel when UDS address is set.
+
+        Given:
+            A WorkerConnection whose target matches the current
+            worker's address and a UDS address is available
+        When:
+            dispatch() is called
+        Then:
+            It should create the gRPC channel with the UDS address
+            and None credentials
+        """
+        # Arrange
+        target = "localhost:50051"
+        uds_target = "unix:/tmp/wool-test.sock"
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address=target,
+            pid=1,
+            version="1.0.0",
+        )
+        wool.__worker_uds_address__ = uds_target
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        mock_channel = mocker.AsyncMock()
+        channel_spy = mocker.patch.object(
+            grpc.aio, "insecure_channel", return_value=mock_channel
+        )
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+
+        spy = mocker.patch.object(cloudpickle, "dumps", wraps=cloudpickle.dumps)
+
+        connection = WorkerConnection(target)
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert
+        assert results == ["result"]
+        channel_spy.assert_called()
+        uds_calls = [c for c in channel_spy.call_args_list if c.args[0] == uds_target]
+        assert len(uds_calls) >= 1
+        secure_spy.assert_not_called()
+        first_write = mock_call.write.call_args_list[0][0][0]
+        assert first_write.task.HasField("serializer")
+        pickled_objects = [c.args[0] for c in spy.call_args_list]
+        assert sample_task.callable not in pickled_objects
+
+    @pytest.mark.asyncio
     async def test_dispatch_with_address_mismatch(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
@@ -1244,13 +1375,11 @@ class TestWorkerConnection:
             field
         """
         # Arrange
-        wool.__worker_metadata__.set(
-            wool.WorkerMetadata(
-                uid=uuid4(),
-                address="10.0.0.1:50051",
-                pid=1,
-                version="1.0.0",
-            )
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address="10.0.0.1:50051",
+            pid=1,
+            version="1.0.0",
         )
 
         responses = (

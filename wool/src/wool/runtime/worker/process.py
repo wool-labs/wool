@@ -6,7 +6,9 @@ import logging
 import multiprocessing as _mp
 import os
 import signal
+import socket
 import sys
+import tempfile
 import uuid
 from contextlib import contextmanager
 from functools import partial
@@ -14,6 +16,7 @@ from multiprocessing.connection import Connection
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Final
 
 import grpc.aio
 
@@ -35,6 +38,8 @@ Pipe = _ctx.Pipe
 Process = _ctx.Process
 
 logger = logging.getLogger(__name__)
+
+_HAS_UDS: Final[bool] = hasattr(socket, "AF_UNIX")
 
 
 class WorkerProcess(Process):
@@ -173,9 +178,7 @@ class WorkerProcess(Process):
         super().start()
         if self._get_metadata.poll(timeout=timeout):
             self._metadata = WorkerMetadata.from_protobuf(
-                protocol.WorkerMetadata.FromString(
-                    self._get_metadata.recv()
-                )
+                protocol.WorkerMetadata.FromString(self._get_metadata.recv())
             )
             assert self._metadata is not None
             self._port = int(self._metadata.address.rsplit(":", 1)[1])
@@ -249,6 +252,15 @@ class WorkerProcess(Process):
             else:
                 port = server.add_insecure_port(address)
 
+            uds_address = None
+            if _HAS_UDS:
+                uds_path = os.path.join(tempfile.gettempdir(), f"wool-{self._uid}.sock")
+                uds_target = f"unix:{uds_path}"
+                with contextlib.suppress(OSError):
+                    os.unlink(uds_path)
+                server.add_insecure_port(uds_target)
+                uds_address = uds_target
+
             service = WorkerService()
             protocol.add_to_server[protocol.WorkerServicer](service, server)
 
@@ -266,7 +278,8 @@ class WorkerProcess(Process):
                         extra=MappingProxyType(self._extra),
                         secure=self._credentials is not None,
                     )
-                    wool.__worker_metadata__.set(metadata)
+                    wool.__worker_metadata__ = metadata
+                    wool.__worker_uds_address__ = uds_address
                     wool.__worker_service__.set(service)
 
                     try:
@@ -283,6 +296,10 @@ class WorkerProcess(Process):
                 finally:
                     logger.info("Worker server stopping with grace period")
                     await server.stop(grace=self._shutdown_grace_period)
+                    if uds_address is not None:
+                        uds_path = uds_address.removeprefix("unix:")
+                        with contextlib.suppress(OSError):
+                            os.unlink(uds_path)
 
     def _address(self, host, port) -> str:
         """Format network address for the given port.

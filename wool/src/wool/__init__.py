@@ -53,9 +53,9 @@ __proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar
     "__proxy_pool__", default=None
 )
 
-__worker_metadata__: Final[ContextVar[WorkerMetadata | None]] = ContextVar(
-    "__worker_metadata__", default=None
-)
+__worker_metadata__: WorkerMetadata | None = None
+
+__worker_uds_address__: str | None = None
 
 __worker_service__: Final[ContextVar[WorkerService | None]] = ContextVar(
     "__worker_service__", default=None
