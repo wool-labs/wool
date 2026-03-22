@@ -66,5 +66,6 @@ jobs:
         env:
           NAMESPACE: ${{ matrix.namespace }}
         run: |
+          ulimit -n 65536
           cd ${{ env.NAMESPACE }}
           uv run pytest

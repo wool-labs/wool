@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from types import MappingProxyType
 from typing import Any
 
 import grpc.aio
 
 from wool import protocol
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
@@ -83,12 +81,15 @@ class LocalWorker(Worker):
         super().__init__(*tags, **extra)
         self._credentials = credentials
         self._worker_process = WorkerProcess(
+            uid=self._uid,
             host=host,
             port=port,
             shutdown_grace_period=shutdown_grace_period,
             proxy_pool_ttl=proxy_pool_ttl,
             credentials=credentials,
             options=options,
+            tags=frozenset(self._tags),
+            extra=self._extra,
         )
 
     @property
@@ -114,20 +115,9 @@ class LocalWorker(Worker):
         await loop.run_in_executor(
             None, lambda t: self._worker_process.start(timeout=t), timeout
         )
-        if not self._worker_process.address:
-            raise RuntimeError("Worker process failed to start - no address")
-        if not self._worker_process.pid:
-            raise RuntimeError("Worker process failed to start - no PID")
-
-        self._info = WorkerMetadata(
-            uid=self._uid,
-            address=self._worker_process.address,
-            pid=self._worker_process.pid,
-            version=protocol.__version__,
-            tags=frozenset(self._tags),
-            extra=MappingProxyType(self._extra),
-            secure=self._credentials is not None,
-        )
+        self._info = self._worker_process.metadata
+        if self._info is None:
+            raise RuntimeError("Worker process failed to start - no metadata")
 
     async def _stop(self, timeout: float | None):
         """Stop the worker process and unregister it from the pool.
@@ -151,5 +141,8 @@ class LocalWorker(Worker):
             else:
                 channel = grpc.aio.insecure_channel(self.address)
 
-            stub = protocol.WorkerStub(channel)
-            await stub.stop(protocol.StopRequest(timeout=timeout))
+            try:
+                stub = protocol.WorkerStub(channel)
+                await stub.stop(protocol.StopRequest(timeout=timeout))
+            finally:
+                await channel.close()

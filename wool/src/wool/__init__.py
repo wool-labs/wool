@@ -21,6 +21,7 @@ from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.routine.task import Serializer
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
 from wool.runtime.routine.task import current_task
@@ -52,6 +53,14 @@ __proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar
     "__proxy_pool__", default=None
 )
 
+__worker_metadata__: WorkerMetadata | None = None
+
+__worker_uds_address__: str | None = None
+
+__worker_service__: Final[ContextVar[WorkerService | None]] = ContextVar(
+    "__worker_service__", default=None
+)
+
 __all__ = [
     # Connection
     "RpcError",
@@ -66,6 +75,7 @@ __all__ = [
     "NoWorkersAvailable",
     "RoundRobinLoadBalancer",
     # Routines
+    "Serializer",
     "Task",
     "TaskException",
     "current_task",

@@ -186,9 +186,7 @@ class CredentialContext:
 
     def __exit__(self, *_) -> None:
         if self._token is None:
-            raise RuntimeError(
-                "__exit__ called without matching __enter__"
-            )
+            raise RuntimeError("__exit__ called without matching __enter__")
         _current.reset(self._token)
         self._token = None
 

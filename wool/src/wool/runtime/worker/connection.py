@@ -12,12 +12,15 @@ from typing import cast
 import cloudpickle
 import grpc.aio
 
+import wool
 from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.base import WorkerOptions
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
+_PoolKey: TypeAlias = tuple[str, grpc.ChannelCredentials | None, int, WorkerOptions]
 
 _T = TypeVar("_T")
 
@@ -351,6 +354,7 @@ class WorkerConnection:
         self._limit = limit
         self._options = options if options is not None else WorkerOptions()
         self._key = (target, credentials, limit, self._options)
+        self._uds_key: _PoolKey | None = None
 
     async def dispatch(
         self,
@@ -364,6 +368,14 @@ class WorkerConnection:
         and returns an async iterator that streams back results. Respects
         concurrency limits and applies timeout to the dispatch phase only
         (semaphore acquisition and acknowledgment).
+
+        .. note::
+
+           When dispatching to the current worker process (self-dispatch),
+           a :class:`PassthroughSerializer` is used so the four payload
+           fields (callable, args, kwargs, proxy) are stored in-process
+           instead of being cloudpickled.  The request still travels
+           through gRPC so the full streaming protocol is preserved.
 
         :param task:
             The :class:`Task` instance to dispatch to the worker.
@@ -388,10 +400,25 @@ class WorkerConnection:
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
 
-        ch = await _channel_pool.acquire(self._key)
+        if (
+            metadata := wool.__worker_metadata__
+        ) is not None and metadata.address == self._target:
+            serializer = PassthroughSerializer()
+            if (uds_address := wool.__worker_uds_address__) is not None:
+                key = (uds_address, None, self._limit, self._options)
+                self._uds_key = key
+            else:
+                key = self._key
+        else:
+            serializer = None
+            key = self._key
+
+        channel = await _channel_pool.acquire(key)
         try:
             try:
-                call = await self._dispatch(ch, task, timeout)
+                call = await self._dispatch(
+                    channel, task.to_protobuf(serializer=serializer), timeout
+                )
             except grpc.RpcError as error:
                 code = error.code()
                 details = error.details() or str(error)
@@ -400,34 +427,44 @@ class WorkerConnection:
                 else:
                     raise RpcError(code, details) from error
 
-            gen = self._execute(call, task)
-            await gen.__anext__()  # Prime: _execute acquires its own ref
+            stream = self._execute(call, task, key)
+            await stream.__anext__()  # Prime: _execute acquires its own ref
         except BaseException:
-            await _channel_pool.release(self._key)
+            await _channel_pool.release(key)
             raise
 
-        await _channel_pool.release(self._key)
-        return cast(AsyncGenerator[protocol.Message, None], gen)
+        await _channel_pool.release(key)
+        return cast(AsyncGenerator[protocol.Message, None], stream)
 
     async def close(self):
         """Close the connection and release all pooled resources.
 
-        Clears the pooled channel entry for this connection's key.
-        Idempotent: safe to call multiple times or on connections
-        that were never used.
+        Clears the pooled channel entries for both the TCP key and,
+        if a UDS address is available, the UDS key. Idempotent: safe
+        to call multiple times or on connections that were never used.
         """
         try:
             await _channel_pool.clear(self._key)
         except KeyError:
             pass
-
-    async def _dispatch(self, ch, task, timeout):
-        async with asyncio.timeout(timeout):
-            await ch.semaphore.acquire()
+        if self._uds_key is not None:
             try:
-                call: _DispatchCall = ch.stub.dispatch()
+                await _channel_pool.clear(self._uds_key)
+            except KeyError:
+                pass
+
+    async def _dispatch(
+        self,
+        channel: _Channel,
+        task_msg: protocol.Task,
+        timeout: float | None,
+    ) -> _DispatchCall:
+        async with asyncio.timeout(timeout):
+            await channel.semaphore.acquire()
+            try:
+                call: _DispatchCall = channel.stub.dispatch()
                 try:
-                    request = protocol.Request(task=task.to_protobuf())
+                    request = protocol.Request(task=task_msg)
                     await call.write(request)
                     response = await anext(aiter(call))
                     if response.HasField("nack"):
@@ -446,14 +483,14 @@ class WorkerConnection:
                         pass
                     raise
             except (Exception, asyncio.CancelledError):
-                ch.semaphore.release()
+                channel.semaphore.release()
                 raise
         return call
 
     async def _execute(
-        self, call: _DispatchCall, task: Task
+        self, call: _DispatchCall, task: Task, key: _PoolKey
     ) -> AsyncGenerator[protocol.Message | None, None]:
-        ch = await _channel_pool.acquire(self._key)
+        channel = await _channel_pool.acquire(key)
         try:
             yield  # Priming yield — signals dispatch() that ref is held
             stream = _DispatchStream(call, task)
@@ -479,6 +516,6 @@ class WorkerConnection:
                     pass
                 raise
             finally:
-                ch.semaphore.release()
+                channel.semaphore.release()
         finally:
-            await _channel_pool.release(self._key)
+            await _channel_pool.release(key)

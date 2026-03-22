@@ -4,20 +4,28 @@ import asyncio
 import contextlib
 import logging
 import multiprocessing as _mp
+import os
 import signal
+import socket
 import sys
+import tempfile
+import uuid
 from contextlib import contextmanager
 from functools import partial
 from multiprocessing.connection import Connection
+from types import MappingProxyType
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import Final
 
 import grpc.aio
 
 import wool
 from wool import protocol
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import CredentialContext
+from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
@@ -30,6 +38,8 @@ Pipe = _ctx.Pipe
 Process = _ctx.Process
 
 logger = logging.getLogger(__name__)
+
+_HAS_UDS: Final[bool] = hasattr(socket, "AF_UNIX")
 
 
 class WorkerProcess(Process):
@@ -61,8 +71,9 @@ class WorkerProcess(Process):
     """
 
     _port: int | None
-    _get_port: Connection
-    _set_port: Connection
+    _get_metadata: Connection
+    _set_metadata: Connection
+    _metadata: WorkerMetadata | None
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
     _credentials: WorkerCredentials | None
@@ -71,12 +82,15 @@ class WorkerProcess(Process):
     def __init__(
         self,
         *args,
+        uid: uuid.UUID | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
         credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
+        tags: frozenset[str] = frozenset(),
+        extra: dict[str, Any] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -94,16 +108,28 @@ class WorkerProcess(Process):
         self._proxy_pool_ttl = proxy_pool_ttl
         self._credentials = credentials
         self._options = options or WorkerOptions()
-        self._get_port, self._set_port = Pipe(duplex=False)
+        self._uid = uid if uid is not None else uuid.uuid4()
+        self._tags = tags
+        self._extra = extra if extra is not None else {}
+        self._metadata = None
+        self._get_metadata, self._set_metadata = Pipe(duplex=False)
 
     @property
     def address(self) -> str | None:
         """The network address where the gRPC server is listening.
 
+        After :meth:`start`, the address comes from the
+        :class:`WorkerMetadata` returned by the child process.
+        Before start, returns ``host:port`` when a fixed port was
+        given, or ``None`` when port is 0 (random).
+
         :returns:
-            The address in "host:port" format, or None if not started.
+            The address in "host:port" format, or None if not started
+            and port is 0.
         """
-        return self._address(self._host, self._port) if self._port else None
+        if self._metadata is not None:
+            return self._metadata.address
+        return None
 
     @property
     def host(self) -> str | None:
@@ -123,12 +149,22 @@ class WorkerProcess(Process):
         """
         return self._port or None
 
+    @property
+    def metadata(self) -> WorkerMetadata | None:
+        """The worker metadata received from the child process.
+
+        :returns:
+            :class:`WorkerMetadata` once started, or ``None``.
+        """
+        return self._metadata
+
     def start(self, *, timeout: float | None = None):
         """Start the worker process.
 
-        Launches the worker process and waits until it has started
-        listening on a port. After starting, the :attr:`address`
-        property will contain the actual network address.
+        Launches the worker process and waits until it has reported
+        its :class:`WorkerMetadata` back via pipe. After starting,
+        the :attr:`metadata` and :attr:`address` properties are
+        populated.
 
         :param timeout:
             Maximum time in seconds to wait for worker process startup.
@@ -140,15 +176,19 @@ class WorkerProcess(Process):
         if timeout is not None and timeout <= 0:
             raise ValueError("Timeout must be positive")
         super().start()
-        if self._get_port.poll(timeout=timeout):
-            self._port = self._get_port.recv()
+        if self._get_metadata.poll(timeout=timeout):
+            self._metadata = WorkerMetadata.from_protobuf(
+                protocol.WorkerMetadata.FromString(self._get_metadata.recv())
+            )
+            assert self._metadata is not None
+            self._port = int(self._metadata.address.rsplit(":", 1)[1])
         else:
             self.terminate()
             self.join()
             raise RuntimeError(
                 f"Worker process failed to start within {timeout} seconds"
             )
-        self._get_port.close()
+        self._get_metadata.close()
 
     def run(self) -> None:
         """Run the worker process.
@@ -212,6 +252,15 @@ class WorkerProcess(Process):
             else:
                 port = server.add_insecure_port(address)
 
+            uds_address = None
+            if _HAS_UDS:
+                uds_path = os.path.join(tempfile.gettempdir(), f"wool-{self._uid}.sock")
+                uds_target = f"unix:{uds_path}"
+                with contextlib.suppress(OSError):
+                    os.unlink(uds_path)
+                server.add_insecure_port(uds_target)
+                uds_address = uds_target
+
             service = WorkerService()
             protocol.add_to_server[protocol.WorkerServicer](service, server)
 
@@ -219,10 +268,26 @@ class WorkerProcess(Process):
                 try:
                     await server.start()
                     logger.info(f"Worker gRPC server started on port {port}")
+
+                    metadata = WorkerMetadata(
+                        uid=self._uid,
+                        address=self._address(self._host, port),
+                        pid=os.getpid(),
+                        version=protocol.__version__,
+                        tags=self._tags,
+                        extra=MappingProxyType(self._extra),
+                        secure=self._credentials is not None,
+                    )
+                    wool.__worker_metadata__ = metadata
+                    wool.__worker_uds_address__ = uds_address
+                    wool.__worker_service__.set(service)
+
                     try:
-                        self._set_port.send(port)
+                        self._set_metadata.send(
+                            metadata.to_protobuf().SerializeToString()
+                        )
                     finally:
-                        self._set_port.close()
+                        self._set_metadata.close()
                     await service.stopped.wait()
                     logger.info("Worker service stopped, shutting down server")
                 except Exception as e:
@@ -231,6 +296,10 @@ class WorkerProcess(Process):
                 finally:
                     logger.info("Worker server stopping with grace period")
                     await server.stop(grace=self._shutdown_grace_period)
+                    if uds_address is not None:
+                        uds_path = uds_address.removeprefix("unix:")
+                        with contextlib.suppress(OSError):
+                            os.unlink(uds_path)
 
     def _address(self, host, port) -> str:
         """Format network address for the given port.

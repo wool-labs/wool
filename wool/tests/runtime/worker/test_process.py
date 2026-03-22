@@ -1,4 +1,6 @@
 import signal
+import uuid
+from types import MappingProxyType
 
 import grpc
 import grpc.aio
@@ -8,9 +10,11 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
+from wool import protocol
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker import process as process_module
-from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import CredentialContext
+from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.process import WorkerProcess
 from wool.runtime.worker.process import _proxy_factory
@@ -247,7 +251,7 @@ class TestWorkerProcess:
         # Assert
         assert process.host == "0.0.0.0"
         assert process.port == 8080
-        assert process.address == "0.0.0.0:8080"
+        assert process.address is None
 
     @given(
         grace_period=st.floats(min_value=0.1, max_value=300.0),
@@ -360,21 +364,21 @@ class TestWorkerProcess:
         # Act & assert
         assert process.address is None
 
-    def test_address_returns_formatted_string_when_port_is_set(self):
-        """Test address property returns formatted string when port is set.
+    def test_address_before_start(self):
+        """Test address property returns None before start.
 
         Given:
-            A WorkerProcess with a non-zero port
+            A WorkerProcess that has not been started
         When:
             The address property is accessed
         Then:
-            It should return formatted "host:port" string
+            It should return None regardless of configured port
         """
         # Arrange
         process = WorkerProcess(host="192.168.1.100", port=50051)
 
         # Act & assert
-        assert process.address == "192.168.1.100:50051"
+        assert process.address is None
 
     def test_host_returns_configured_host(self):
         """Test host property returns the configured host.
@@ -440,40 +444,7 @@ class TestWorkerProcess:
 
         # Assert
         assert process.port == port
-        assert process.address and f":{port}" in process.address
-
-    @given(
-        host=st.one_of(
-            st.ip_addresses(v=4).map(str),
-            st.from_regex(
-                r"^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?)*$",
-                fullmatch=True,
-            ),
-        ),
-        port=st.integers(min_value=1, max_value=65535),
-    )
-    def test_address_parsing_roundtrip(self, host, port):
-        """Test address formatting and parsing is reversible.
-
-        Given:
-            Random valid host and port combinations
-        When:
-            Address is formatted via WorkerProcess
-        Then:
-            Parsing the address should recover original host and port
-        """
-        # Act
-        process = WorkerProcess(host=host, port=port)
-        address = process.address
-
-        # Assert
-        assert address
-
-        parsed_host, parsed_port_str = address.split(":")
-        parsed_port = int(parsed_port_str)
-
-        assert parsed_host == host
-        assert parsed_port == port
+        assert process.address is None
 
     @given(
         host=st.one_of(
@@ -500,7 +471,7 @@ class TestWorkerProcess:
 
         # Assert
         assert process.host == host
-        assert host in process.address
+        assert process.address is None
 
     @given(port=st.one_of(st.integers(max_value=-1), st.integers(min_value=65536)))
     def test___init___rejects_invalid_ports(self, port):
@@ -584,13 +555,22 @@ class TestWorkerProcess:
             It should call Process.start
         """
         # Arrange
-        mock_get_port = mocker.MagicMock()
-        mock_get_port.poll.return_value = True
-        mock_get_port.recv.return_value = 50051
-        mock_set_port = mocker.MagicMock()
+        mock_get_meta = mocker.MagicMock()
+        mock_get_meta.poll.return_value = True
+        mock_get_meta.recv.return_value = (
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="127.0.0.1:50051",
+                pid=12345,
+                version="1.0.0",
+            )
+            .to_protobuf()
+            .SerializeToString()
+        )
+        mock_set_meta = mocker.MagicMock()
         mocker.patch(
             "wool.runtime.worker.process.Pipe",
-            return_value=(mock_get_port, mock_set_port),
+            return_value=(mock_get_meta, mock_set_meta),
         )
 
         mock_parent_start = mocker.patch.object(process_module.Process, "start")
@@ -602,9 +582,9 @@ class TestWorkerProcess:
 
         # Assert
         mock_parent_start.assert_called_once()
-        mock_get_port.poll.assert_called_once_with(timeout=60.0)
-        mock_get_port.recv.assert_called_once()
-        mock_get_port.close.assert_called_once()
+        mock_get_meta.poll.assert_called_once_with(timeout=60.0)
+        mock_get_meta.recv.assert_called_once()
+        mock_get_meta.close.assert_called_once()
 
     def test_start_receives_port_from_pipe(self, mocker):
         """Test start receives port from pipe and updates address.
@@ -617,13 +597,22 @@ class TestWorkerProcess:
             It should receive the port and provide correct address
         """
         # Arrange
-        mock_get_port = mocker.MagicMock()
-        mock_get_port.poll.return_value = True
-        mock_get_port.recv.return_value = 50051
-        mock_set_port = mocker.MagicMock()
+        mock_get_meta = mocker.MagicMock()
+        mock_get_meta.poll.return_value = True
+        mock_get_meta.recv.return_value = (
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="127.0.0.1:50051",
+                pid=12345,
+                version="1.0.0",
+            )
+            .to_protobuf()
+            .SerializeToString()
+        )
+        mock_set_meta = mocker.MagicMock()
         mocker.patch(
             "wool.runtime.worker.process.Pipe",
-            return_value=(mock_get_port, mock_set_port),
+            return_value=(mock_get_meta, mock_set_meta),
         )
 
         mocker.patch.object(process_module.Process, "start")
@@ -648,12 +637,12 @@ class TestWorkerProcess:
             It should raise RuntimeError and terminate the process
         """
         # Arrange
-        mock_get_port = mocker.MagicMock()
-        mock_get_port.poll.return_value = False
-        mock_set_port = mocker.MagicMock()
+        mock_get_meta = mocker.MagicMock()
+        mock_get_meta.poll.return_value = False
+        mock_set_meta = mocker.MagicMock()
         mocker.patch(
             "wool.runtime.worker.process.Pipe",
-            return_value=(mock_get_port, mock_set_port),
+            return_value=(mock_get_meta, mock_set_meta),
         )
 
         mocker.patch.object(process_module.Process, "start")
@@ -682,13 +671,22 @@ class TestWorkerProcess:
             It should close the pipe connection
         """
         # Arrange
-        mock_get_port = mocker.MagicMock()
-        mock_get_port.poll.return_value = True
-        mock_get_port.recv.return_value = 50051
-        mock_set_port = mocker.MagicMock()
+        mock_get_meta = mocker.MagicMock()
+        mock_get_meta.poll.return_value = True
+        mock_get_meta.recv.return_value = (
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="127.0.0.1:50051",
+                pid=12345,
+                version="1.0.0",
+            )
+            .to_protobuf()
+            .SerializeToString()
+        )
+        mock_set_meta = mocker.MagicMock()
         mocker.patch(
             "wool.runtime.worker.process.Pipe",
-            return_value=(mock_get_port, mock_set_port),
+            return_value=(mock_get_meta, mock_set_meta),
         )
 
         mocker.patch.object(process_module.Process, "start")
@@ -699,7 +697,53 @@ class TestWorkerProcess:
         process.start()
 
         # Assert
-        mock_get_port.close.assert_called_once()
+        mock_get_meta.close.assert_called_once()
+
+    def test_start_deserializes_metadata_with_extra_from_pipe(self, mocker):
+        """Test start deserializes metadata with extra and tags from pipe.
+
+        Given:
+            A pipe returning protobuf bytes encoding extra and tags
+        When:
+            start() is called
+        Then:
+            It should populate metadata.extra as MappingProxyType
+            and metadata.tags as frozenset
+        """
+        # Arrange
+        metadata_bytes = (
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="127.0.0.1:50051",
+                pid=12345,
+                version="1.0.0",
+                tags=frozenset({"gpu"}),
+                extra=MappingProxyType({"key": "value"}),
+            )
+            .to_protobuf()
+            .SerializeToString()
+        )
+
+        mock_get_meta = mocker.MagicMock()
+        mock_get_meta.poll.return_value = True
+        mock_get_meta.recv.return_value = metadata_bytes
+        mock_set_meta = mocker.MagicMock()
+        mocker.patch(
+            "wool.runtime.worker.process.Pipe",
+            return_value=(mock_get_meta, mock_set_meta),
+        )
+
+        mocker.patch.object(process_module.Process, "start")
+
+        process = WorkerProcess()
+
+        # Act
+        process.start()
+
+        # Assert
+        assert process.metadata.extra == MappingProxyType({"key": "value"})
+        assert isinstance(process.metadata.extra, MappingProxyType)
+        assert process.metadata.tags == frozenset({"gpu"})
 
     @pytest.mark.asyncio
     async def test__proxy_factory_starts_proxy_when_not_started(self, mocker):
@@ -827,8 +871,8 @@ class TestWorkerProcess:
 
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
-        mock_send = mocker.patch.object(process._set_port, "send")
-        mock_close = mocker.patch.object(process._set_port, "close")
+        mock_send = mocker.patch.object(process._set_metadata, "send")
+        mock_close = mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
@@ -843,7 +887,13 @@ class TestWorkerProcess:
         mock_proxy_pool.set.assert_called_once_with(mock_resource_pool)
 
         mock_server.start.assert_called_once()
-        mock_send.assert_called_once_with(50051)
+        mock_send.assert_called_once()
+        sent = mock_send.call_args[0][0]
+        assert isinstance(sent, bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent)
+        )
+        assert deserialized.address == "127.0.0.1:50051"
         mock_close.assert_called_once()
         mock_service.stopped.wait.assert_called_once()
         mock_server.stop.assert_called_once_with(grace=30.0)
@@ -879,14 +929,122 @@ class TestWorkerProcess:
 
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
-        mock_send = mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mock_send = mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
 
         # Assert
-        mock_send.assert_called_once_with(8080)
+        mock_send.assert_called_once()
+        sent = mock_send.call_args[0][0]
+        assert isinstance(sent, bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent)
+        )
+        assert deserialized.address == "0.0.0.0:8080"
+
+    def test_run_with_extra_and_tags_serializes_complete_metadata(self, mocker):
+        """Test run serializes metadata including extra and tags to pipe.
+
+        Given:
+            A WorkerProcess with extra=MappingProxyType({"k": "v"})
+            and tags=frozenset({"gpu"})
+        When:
+            run() executes
+        Then:
+            It should send protobuf bytes that deserialize to
+            WorkerMetadata with matching extra and tags
+        """
+        # Arrange
+        process = WorkerProcess(
+            extra=MappingProxyType({"k": "v"}),
+            tags=frozenset({"gpu"}),
+        )
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch("wool.runtime.worker.process.ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch("grpc.aio.server", return_value=mock_server)
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService",
+            return_value=mock_service,
+        )
+
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        mock_send = mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        mock_send.assert_called_once()
+        sent = mock_send.call_args[0][0]
+        assert isinstance(sent, bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent)
+        )
+        assert deserialized.extra == MappingProxyType({"k": "v"})
+        assert isinstance(deserialized.extra, MappingProxyType)
+        assert deserialized.tags == frozenset({"gpu"})
+
+    def test_run_with_dict_extra_produces_mapping_proxy(self, mocker):
+        """Test run wraps dict extra as MappingProxyType in metadata.
+
+        Given:
+            A WorkerProcess with extra={"key": "value"}
+        When:
+            run() executes
+        Then:
+            It should send WorkerMetadata with extra as
+            MappingProxyType({"key": "value"}) through the pipe
+        """
+        # Arrange
+        process = WorkerProcess(extra={"key": "value"})
+
+        mocker.patch.object(process_module.wool, "__proxy_pool__")
+        mocker.patch.object(process_module, "ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch.object(
+            process_module,
+            "WorkerService",
+            return_value=mock_service,
+        )
+
+        mocker.patch.object(process_module, "_signal_handlers")
+
+        mock_send = mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        mock_send.assert_called_once()
+        sent = mock_send.call_args[0][0]
+        assert isinstance(sent, bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent)
+        )
+        assert isinstance(deserialized.extra, MappingProxyType)
+        assert deserialized.extra == {"key": "value"}
 
     def test_run_closes_pipe_even_on_error(self, mocker):
         """Test run closes pipe even if send fails.
@@ -920,9 +1078,9 @@ class TestWorkerProcess:
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
         mocker.patch.object(
-            process._set_port, "send", side_effect=Exception("Pipe error")
+            process._set_metadata, "send", side_effect=Exception("Pipe error")
         )
-        mock_close = mocker.patch.object(process._set_port, "close")
+        mock_close = mocker.patch.object(process._set_metadata, "close")
 
         # Act & assert
         with pytest.raises(Exception, match="Pipe error"):
@@ -965,8 +1123,8 @@ class TestWorkerProcess:
 
         mocker.patch("wool.runtime.worker.process._signal_handlers")
 
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act & assert
         with pytest.raises(Exception, match="Service error"):
@@ -977,16 +1135,18 @@ class TestWorkerProcess:
     # === SINGLE-PORT ARCHITECTURE TESTS ===
 
     def test_serve_insecure_worker_single_port(self, mocker):
-        """Test single insecure port for insecure workers.
+        """Test single insecure TCP port for insecure workers.
 
         Given:
-            WorkerProcess with credentials=None
+            WorkerProcess with credentials=None and UDS disabled
         When:
             Process is started and server is configured
         Then:
             Only add_insecure_port is called, add_secure_port is not called
         """
         # Arrange
+        mocker.patch.object(process_module, "_HAS_UDS", False)
+
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
         mock_server.add_secure_port = mocker.MagicMock()
@@ -1005,8 +1165,8 @@ class TestWorkerProcess:
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
 
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
@@ -1016,16 +1176,18 @@ class TestWorkerProcess:
         mock_server.add_secure_port.assert_not_called()
 
     def test_serve_secure_worker_single_port(self, mocker):
-        """Test single secure port for secure workers.
+        """Test single secure TCP port for secure workers.
 
         Given:
-            WorkerProcess with valid WorkerCredentials
+            WorkerProcess with valid WorkerCredentials and UDS disabled
         When:
             Process is started and server is configured
         Then:
             Only add_secure_port is called with credentials, add_insecure_port is not called
         """
         # Arrange
+        mocker.patch.object(process_module, "_HAS_UDS", False)
+
         dummy_key = (
             b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         )
@@ -1052,8 +1214,8 @@ class TestWorkerProcess:
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
@@ -1098,18 +1260,22 @@ class TestWorkerProcess:
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
-        sent_ports = []
+        sent_metadata = []
         mocker.patch.object(
-            process._set_port, "send", side_effect=lambda x: sent_ports.append(x)
+            process._set_metadata, "send", side_effect=lambda x: sent_metadata.append(x)
         )
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
 
         # Assert
-        assert len(sent_ports) == 1
-        assert sent_ports[0] == 54321
+        assert len(sent_metadata) == 1
+        assert isinstance(sent_metadata[0], bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent_metadata[0])
+        )
+        assert deserialized.address == "127.0.0.1:54321"
 
     def test_serve_insecure_worker_random_port_assignment(self, mocker):
         """Test random port assignment for insecure worker.
@@ -1139,30 +1305,36 @@ class TestWorkerProcess:
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
 
-        sent_ports = []
+        sent_metadata = []
         mocker.patch.object(
-            process._set_port, "send", side_effect=lambda x: sent_ports.append(x)
+            process._set_metadata, "send", side_effect=lambda x: sent_metadata.append(x)
         )
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
 
         # Assert
-        assert len(sent_ports) == 1
-        assert sent_ports[0] == 54322
+        assert len(sent_metadata) == 1
+        assert isinstance(sent_metadata[0], bytes)
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent_metadata[0])
+        )
+        assert deserialized.address == "127.0.0.1:54322"
 
     def test_serve_no_dual_port_architecture(self, mocker):
-        """Test no dual-port architecture.
+        """Test no dual TCP port architecture.
 
         Given:
-            WorkerProcess with WorkerCredentials
+            WorkerProcess with WorkerCredentials and UDS disabled
         When:
             Process is started and port is retrieved
         Then:
-            Port number matches the secure port, no additional localhost port exists
+            Port number matches the secure port, no additional TCP port exists
         """
         # Arrange
+        mocker.patch.object(process_module, "_HAS_UDS", False)
+
         dummy_key = (
             b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         )
@@ -1189,8 +1361,8 @@ class TestWorkerProcess:
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
@@ -1200,16 +1372,18 @@ class TestWorkerProcess:
         assert mock_server.add_secure_port.call_count == 1
 
     def test_serve_no_insecure_backdoor(self, mocker):
-        """Test no insecure localhost backdoor.
+        """Test no insecure TCP backdoor.
 
         Given:
-            Running WorkerProcess with WorkerCredentials
+            Running WorkerProcess with WorkerCredentials and UDS disabled
         When:
             Attempt to connect via insecure channel to the port
         Then:
-            Connection fails or is rejected (no insecure fallback port)
+            Connection fails or is rejected (no insecure TCP fallback port)
         """
         # Arrange
+        mocker.patch.object(process_module, "_HAS_UDS", False)
+
         dummy_key = (
             b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         )
@@ -1236,8 +1410,8 @@ class TestWorkerProcess:
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
@@ -1248,16 +1422,18 @@ class TestWorkerProcess:
     @given(has_credentials=st.booleans())
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test_single_port_invariant(self, has_credentials, mocker):
-        """Test single-port invariant property.
+        """Test single TCP port invariant property.
 
         Given:
-            Any WorkerProcess with valid or None credentials
+            Any WorkerProcess with valid or None credentials and UDS disabled
         When:
             Process is started and configured
         Then:
-            Exactly one port is bound (either secure or insecure, never both)
+            Exactly one TCP port is bound (either secure or insecure, never both)
         """
         # Arrange
+        mocker.patch.object(process_module, "_HAS_UDS", False)
+
         if has_credentials:
             dummy_key = (
                 b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
@@ -1287,8 +1463,8 @@ class TestWorkerProcess:
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
@@ -1296,7 +1472,7 @@ class TestWorkerProcess:
         # Assert
         secure_calls = mock_server.add_secure_port.call_count
         insecure_calls = mock_server.add_insecure_port.call_count
-        assert secure_calls + insecure_calls == 1, "Exactly one port must be bound"
+        assert secure_calls + insecure_calls == 1, "Exactly one TCP port must be bound"
 
         if has_credentials:
             assert secure_calls == 1, "Secure worker must use secure port"
@@ -1372,8 +1548,8 @@ class TestWorkerProcess:
             return_value=mock_service,
         )
         mocker.patch("wool.runtime.worker.process._signal_handlers")
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
@@ -1420,8 +1596,8 @@ class TestWorkerProcess:
             return_value=mock_service,
         )
         mocker.patch("wool.runtime.worker.process._signal_handlers")
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
@@ -1472,16 +1648,14 @@ class TestWorkerProcess:
             captured_current.append(CredentialContext.current())
 
         mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
-        mocker.patch.object(
-            process_module, "WorkerService", return_value=mock_service
-        )
+        mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
 
         mocker.patch.object(process_module, "_signal_handlers")
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
 
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
@@ -1519,16 +1693,14 @@ class TestWorkerProcess:
             captured_current.append(CredentialContext.current())
 
         mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
-        mocker.patch.object(
-            process_module, "WorkerService", return_value=mock_service
-        )
+        mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
 
         mocker.patch.object(process_module, "_signal_handlers")
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
 
-        mocker.patch.object(process._set_port, "send")
-        mocker.patch.object(process._set_port, "close")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()

@@ -1196,8 +1196,12 @@ class TestLocalDiscoverySubscriber:
             subscriber_b = discovery_b.subscribe(poll_interval=0.05)
 
             async with publisher_a, publisher_b:
-                task_a = asyncio.create_task(collect(subscriber_a, events_a, received_a, started_a))
-                task_b = asyncio.create_task(collect(subscriber_b, events_b, received_b, started_b))
+                task_a = asyncio.create_task(
+                    collect(subscriber_a, events_a, received_a, started_a)
+                )
+                task_b = asyncio.create_task(
+                    collect(subscriber_b, events_b, received_b, started_b)
+                )
                 await asyncio.gather(started_a.wait(), started_b.wait())
 
                 # Act
@@ -1260,8 +1264,12 @@ class TestLocalDiscoverySubscriber:
             subscriber_2 = discovery.subscribe(poll_interval=0.05)
 
             async with publisher:
-                task_1 = asyncio.create_task(collect(subscriber_1, events_1, received_1, started_1))
-                task_2 = asyncio.create_task(collect(subscriber_2, events_2, received_2, started_2))
+                task_1 = asyncio.create_task(
+                    collect(subscriber_1, events_1, received_1, started_1)
+                )
+                task_2 = asyncio.create_task(
+                    collect(subscriber_2, events_2, received_2, started_2)
+                )
                 await asyncio.gather(started_1.wait(), started_2.wait())
 
                 # Act

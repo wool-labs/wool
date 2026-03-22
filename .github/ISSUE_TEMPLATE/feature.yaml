@@ -3,9 +3,9 @@ description: Propose a new feature or capability.
 labels: ["feature"]
 body:
   - type: textarea
-    id: summary
+    id: description
     attributes:
-      label: Summary
+      label: Description
       description: What is the feature? Describe the desired behavior.
     validations:
       required: true
@@ -17,9 +17,9 @@ body:
     validations:
       required: true
   - type: textarea
-    id: affected-code
+    id: expected-outcome
     attributes:
-      label: Affected code
-      description: Which files, modules, or components would be affected?
+      label: Expected outcome
+      description: What should be true when this is done?
     validations:
-      required: false
+      required: true

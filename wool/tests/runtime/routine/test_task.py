@@ -13,6 +13,8 @@ from hypothesis import strategies as st
 from wool import protocol
 from wool.runtime.context import RuntimeContext
 from wool.runtime.context import dispatch_timeout
+from wool.runtime.routine.task import PassthroughSerializer
+from wool.runtime.routine.task import Serializer
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
 from wool.runtime.routine.task import WorkerProxyLike
@@ -31,9 +33,6 @@ class _PicklableProxy:
             yield "result"
 
         return _stream()
-
-
-# --- Protocol conformance test classes ---
 
 
 class TestWorkerProxyLike:
@@ -106,9 +105,6 @@ class TestWorkerProxyLike:
             )
 
 
-# --- Module-level do_dispatch tests ---
-
-
 def test_do_dispatch_with_default_context():
     """Test do_dispatch returns True with no active context.
 
@@ -159,9 +155,6 @@ def test_do_dispatch_with_nested_contexts():
             assert do_dispatch() is False
         assert do_dispatch() is True
     assert do_dispatch() is True
-
-
-# --- Module-level current_task tests ---
 
 
 @pytest.mark.asyncio
@@ -271,9 +264,6 @@ async def test_current_task_with_variable_nesting_depth(depth, sample_task):
 
     # After exiting all contexts, current_task should be None
     assert current_task() is None
-
-
-# --- TestTask ---
 
 
 class TestTask:
@@ -564,8 +554,8 @@ class TestTask:
         )
 
         # Act
-        pb_task = original_task.to_protobuf()
-        deserialized_task = Task.from_protobuf(pb_task)
+        task_msg = original_task.to_protobuf()
+        deserialized_task = Task.from_protobuf(task_msg)
 
         # Assert
         assert deserialized_task.id == original_task.id
@@ -644,7 +634,7 @@ class TestTask:
         args = (1, 2, 3)
         kwargs = {"key": "value"}
 
-        pb_task = protocol.Task(
+        task_msg = protocol.Task(
             version="0.1.0",
             id=str(task_id),
             callable=cloudpickle.dumps(sample_async_callable),
@@ -658,7 +648,7 @@ class TestTask:
         )
 
         # Act
-        task = Task.from_protobuf(pb_task)
+        task = Task.from_protobuf(task_msg)
 
         # Assert
         assert task.id == task_id
@@ -690,7 +680,7 @@ class TestTask:
         args = ()
         kwargs = {}
 
-        pb_task = protocol.Task(
+        task_msg = protocol.Task(
             id=str(task_id),
             callable=cloudpickle.dumps(sample_async_callable),
             args=cloudpickle.dumps(args),
@@ -703,7 +693,7 @@ class TestTask:
         )
 
         # Act
-        task = Task.from_protobuf(pb_task)
+        task = Task.from_protobuf(task_msg)
 
         # Assert
         assert task.id == task_id
@@ -737,22 +727,22 @@ class TestTask:
         )
 
         # Act
-        pb_task = task.to_protobuf()
+        task_msg = task.to_protobuf()
 
         # Assert
-        assert pb_task.version != ""
-        assert pb_task.id == str(task.id)
-        deserialized_callable = cloudpickle.loads(pb_task.callable)
+        assert task_msg.version != ""
+        assert task_msg.id == str(task.id)
+        deserialized_callable = cloudpickle.loads(task_msg.callable)
         assert callable(deserialized_callable)
         assert deserialized_callable.__name__ == task.callable.__name__
-        assert cloudpickle.loads(pb_task.args) == task.args
-        assert cloudpickle.loads(pb_task.kwargs) == task.kwargs
-        assert pb_task.caller == str(caller_id)
-        deserialized_proxy = cloudpickle.loads(pb_task.proxy)
+        assert cloudpickle.loads(task_msg.args) == task.args
+        assert cloudpickle.loads(task_msg.kwargs) == task.kwargs
+        assert task_msg.caller == str(caller_id)
+        deserialized_proxy = cloudpickle.loads(task_msg.proxy)
         assert deserialized_proxy.id == task.proxy.id
-        assert pb_task.proxy_id == str(task.proxy.id)
-        assert pb_task.timeout == 30
-        assert pb_task.tag == "test_tag"
+        assert task_msg.proxy_id == str(task.proxy.id)
+        assert task_msg.timeout == 30
+        assert task_msg.tag == "test_tag"
 
     def test_to_protobuf_none_optionals(self, sample_async_callable, picklable_proxy):
         """Test to_protobuf serializes None optionals as defaults.
@@ -779,12 +769,12 @@ class TestTask:
         )
 
         # Act
-        pb_task = task.to_protobuf()
+        task_msg = task.to_protobuf()
 
         # Assert
-        assert pb_task.caller == ""
-        assert pb_task.timeout == 0
-        assert pb_task.tag == ""
+        assert task_msg.caller == ""
+        assert task_msg.timeout == 0
+        assert task_msg.tag == ""
 
     def test_to_protobuf_with_version_field(
         self, sample_async_callable, picklable_proxy
@@ -809,10 +799,10 @@ class TestTask:
         )
 
         # Act
-        pb_task = task.to_protobuf()
+        task_msg = task.to_protobuf()
 
         # Assert
-        assert pb_task.version == protocol.__version__
+        assert task_msg.version == protocol.__version__
 
     def test_to_protobuf_includes_runtime_context(
         self, sample_async_callable, picklable_proxy
@@ -838,11 +828,11 @@ class TestTask:
             )
 
         # Act
-        pb_task = task.to_protobuf()
+        task_msg = task.to_protobuf()
 
         # Assert
-        assert pb_task.HasField("context")
-        assert pb_task.context.dispatch_timeout == 7.5
+        assert task_msg.HasField("context")
+        assert task_msg.context.dispatch_timeout == 7.5
 
     def test_from_protobuf_restores_runtime_context(
         self, sample_async_callable, picklable_proxy
@@ -859,7 +849,7 @@ class TestTask:
             carrying dispatch_timeout=12.0
         """
         # Arrange
-        pb_task = protocol.Task(
+        task_msg = protocol.Task(
             version="0.1.0",
             id=str(uuid4()),
             callable=cloudpickle.dumps(sample_async_callable),
@@ -874,7 +864,7 @@ class TestTask:
         )
 
         # Act
-        task = Task.from_protobuf(pb_task)
+        task = Task.from_protobuf(task_msg)
 
         # Assert
         assert task.context is not None
@@ -896,7 +886,7 @@ class TestTask:
             (dispatch_timeout=None)
         """
         # Arrange
-        pb_task = protocol.Task(
+        task_msg = protocol.Task(
             version="0.1.0",
             id=str(uuid4()),
             callable=cloudpickle.dumps(sample_async_callable),
@@ -910,7 +900,7 @@ class TestTask:
         )
 
         # Act
-        task = Task.from_protobuf(pb_task)
+        task = Task.from_protobuf(task_msg)
 
         # Assert
         assert task.context is not None
@@ -971,7 +961,7 @@ class TestTask:
         async def test_callable():
             return "result"
 
-        pb_task = protocol.Task(
+        task_msg = protocol.Task(
             version=version,
             id=str(uuid4()),
             callable=cloudpickle.dumps(test_callable),
@@ -985,7 +975,7 @@ class TestTask:
         )
 
         # Act
-        wire_bytes = pb_task.SerializeToString()
+        wire_bytes = task_msg.SerializeToString()
         parsed = protocol.Task()
         parsed.ParseFromString(wire_bytes)
 
@@ -1472,8 +1462,292 @@ class TestTask:
         assert observed_timeout is not sentinel
         assert observed_timeout is None
 
+    def test_to_protobuf_without_serializer(
+        self, sample_async_callable, picklable_proxy
+    ):
+        """Test to_protobuf without serializer omits the serializer field.
 
-# --- TestTaskException ---
+        Given:
+            A Task instance
+        When:
+            ``to_protobuf()`` is called with no serializer argument
+        Then:
+            It should not set the ``serializer`` field on the
+            protobuf message
+        """
+        # Arrange
+        task = Task(
+            id=uuid4(),
+            callable=sample_async_callable,
+            args=(),
+            kwargs={},
+            proxy=picklable_proxy,
+        )
+
+        # Act
+        task_msg = task.to_protobuf()
+
+        # Assert
+        assert not task_msg.HasField("serializer")
+
+    def test_to_protobuf_with_serializer(self, sample_async_callable, picklable_proxy):
+        """Test to_protobuf with serializer sets the serializer field.
+
+        Given:
+            A Task instance and a PassthroughSerializer
+        When:
+            ``to_protobuf(serializer=...)`` is called
+        Then:
+            It should set the ``serializer`` field on the protobuf
+            message
+        """
+        # Arrange
+        task = Task(
+            id=uuid4(),
+            callable=sample_async_callable,
+            args=(),
+            kwargs={},
+            proxy=picklable_proxy,
+        )
+        serializer = PassthroughSerializer()
+
+        # Act
+        task_msg = task.to_protobuf(serializer=serializer)
+
+        # Assert
+        assert task_msg.HasField("serializer")
+
+    def test_from_protobuf_without_serializer_field(
+        self, sample_async_callable, picklable_proxy
+    ):
+        """Test from_protobuf without serializer field uses cloudpickle.
+
+        Given:
+            A protobuf Task with no serializer field (standard
+            cloudpickle encoding)
+        When:
+            ``from_protobuf()`` is called
+        Then:
+            It should deserialize all fields correctly using
+            cloudpickle
+        """
+        # Arrange
+        task_id = uuid4()
+        args = (1, 2, 3)
+        kwargs = {"key": "value"}
+
+        task_msg = protocol.Task(
+            version="0.1.0",
+            id=str(task_id),
+            callable=cloudpickle.dumps(sample_async_callable),
+            args=cloudpickle.dumps(args),
+            kwargs=cloudpickle.dumps(kwargs),
+            caller="",
+            proxy=cloudpickle.dumps(picklable_proxy),
+            proxy_id=str(picklable_proxy.id),
+            timeout=0,
+            tag="",
+        )
+
+        # Act
+        task = Task.from_protobuf(task_msg)
+
+        # Assert
+        assert task.id == task_id
+        assert task.args == args
+        assert task.kwargs == kwargs
+
+    @settings(max_examples=50, deadline=None)
+    @given(
+        task_id=st.uuids(),
+        timeout=st.integers(min_value=0, max_value=3600),
+        caller_id=st.one_of(st.none(), st.uuids()),
+        tag=st.one_of(st.none(), st.text(min_size=1, max_size=100)),
+    )
+    @pytest.mark.asyncio
+    async def test_from_protobuf_with_passthrough_serializer(
+        self,
+        task_id,
+        timeout,
+        caller_id,
+        tag,
+    ):
+        """Test from_protobuf restores identity with PassthroughSerializer.
+
+        Given:
+            A Task serialized via ``to_protobuf(serializer=...)``
+            with a PassthroughSerializer
+        When:
+            ``from_protobuf()`` is called on the resulting message
+        Then:
+            It should produce a deserialized task equal to the
+            original in all public attributes, and the protobuf
+            ``serializer`` field should be present
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        proxy = _PicklableProxy()
+        args = (1, "test", [1, 2, 3])
+        kwargs = {"key": "value", "number": 42}
+
+        original_task = Task(
+            id=task_id,
+            callable=test_callable,
+            args=args,
+            kwargs=kwargs,
+            proxy=proxy,
+            timeout=timeout,
+            caller=caller_id,
+            tag=tag,
+        )
+        serializer = PassthroughSerializer()
+        task_msg = original_task.to_protobuf(serializer=serializer)
+
+        # Act
+        deserialized_task = Task.from_protobuf(task_msg)
+
+        # Assert
+        assert task_msg.HasField("serializer")
+        assert deserialized_task.id == original_task.id
+        assert deserialized_task.callable is original_task.callable
+        assert deserialized_task.args is original_task.args
+        assert deserialized_task.kwargs is original_task.kwargs
+        assert deserialized_task.caller == original_task.caller
+        assert deserialized_task.proxy is original_task.proxy
+        assert deserialized_task.timeout == original_task.timeout
+        assert deserialized_task.tag == original_task.tag
+
+
+class TestPassthroughSerializer:
+    """Tests for :py:class:`PassthroughSerializer`."""
+
+    def test_dumps_with_object(self):
+        """Test dumps returns a 16-byte token.
+
+        Given:
+            An arbitrary Python object
+        When:
+            ``dumps`` is called
+        Then:
+            It should return a 16-byte bytes token
+        """
+        # Arrange
+        serializer = PassthroughSerializer()
+        obj = {"key": [1, 2, 3]}
+
+        # Act
+        data = serializer.dumps(obj)
+
+        # Assert
+        assert isinstance(data, bytes)
+        assert len(data) == 16
+
+    def test_dumps_with_distinct_objects(self):
+        """Test dumps returns unique tokens for distinct objects.
+
+        Given:
+            Two distinct Python objects
+        When:
+            ``dumps`` is called on each
+        Then:
+            It should return different tokens for each object
+        """
+        # Arrange
+        serializer = PassthroughSerializer()
+        obj_a = "alpha"
+        obj_b = "beta"
+
+        # Act
+        token_a = serializer.dumps(obj_a)
+        token_b = serializer.dumps(obj_b)
+
+        # Assert
+        assert token_a != token_b
+
+    def test_loads_with_stored_object(self):
+        """Test loads retrieves the original object by identity.
+
+        Given:
+            An arbitrary Python object stored via ``dumps``
+        When:
+            ``loads`` is called with the returned token
+        Then:
+            It should return the exact same object (identity, not
+            equality)
+        """
+        # Arrange
+        serializer = PassthroughSerializer()
+        obj = {"key": [1, 2, 3]}
+        data = serializer.dumps(obj)
+
+        # Act
+        result = serializer.loads(data)
+
+        # Assert
+        assert result is obj
+
+    def test_loads_after_prior_consumption(self):
+        """Test loads consumes the stored entry.
+
+        Given:
+            An object serialized via ``dumps``
+        When:
+            ``loads`` is called twice with the same data
+        Then:
+            It should raise ``KeyError`` on the second call because
+            the entry was consumed
+        """
+        # Arrange
+        serializer = PassthroughSerializer()
+        data = serializer.dumps("ephemeral")
+
+        # Act
+        serializer.loads(data)
+
+        # Act & assert
+        with pytest.raises(KeyError):
+            serializer.loads(data)
+
+    def test_isinstance_with_serializer_protocol(self):
+        """Test PassthroughSerializer satisfies the Serializer protocol.
+
+        Given:
+            A PassthroughSerializer instance
+        When:
+            Checked against the Serializer protocol via isinstance
+        Then:
+            It should be recognized as a Serializer
+        """
+        # Arrange & act
+        serializer = PassthroughSerializer()
+
+        # Assert
+        assert isinstance(serializer, Serializer)
+
+    def test_cloudpickle_roundtrip(self):
+        """Test PassthroughSerializer survives cloudpickle serialization.
+
+        Given:
+            A PassthroughSerializer instance
+        When:
+            Serialized and deserialized via cloudpickle
+        Then:
+            It should produce a functional PassthroughSerializer
+        """
+        # Arrange
+        original = PassthroughSerializer()
+
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(original))
+        obj = {"test": True}
+        data = restored.dumps(obj)
+        result = restored.loads(data)
+
+        # Assert
+        assert result is obj
 
 
 class TestTaskException:
