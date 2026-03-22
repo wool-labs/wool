@@ -393,17 +393,40 @@ Use `@st.composite` strategies that draw from per-dimension `st.sampled_from(Enu
 
 ### xfail for Known Bugs
 
-Scenarios that hit known bugs MUST use `pytest.xfail()` in the test body (not `skip`, not filtered out) with a reference to the issue number:
+Scenarios that hit known bugs MUST be registered in a `_KnownBug` data structure and handled by an `xfail_known_bugs` fixture (not `skip`, not filtered out). Each entry defines a `match` predicate, a `raises` tuple constraining the expected failure mode, a `reason` referencing the issue, and optional `retries` with a `retryable` predicate for transient errors:
 
 ```python
-def _xfail_known_bugs(scenario):
-    if scenario.credential is not CredentialType.INSECURE:
-        pytest.xfail("credential pickling across subprocess boundary (#60)")
-    if scenario.pool_mode in _NESTED_MODES:
-        pytest.xfail("resource collision with nested pools (#62)")
+@dataclass(frozen=True)
+class _KnownBug:
+    match: Callable[[Scenario], bool]
+    raises: tuple[type[BaseException], ...]
+    reason: str
+    retries: int = 0
+    backoff: float = 0.5
+    retryable: Callable[[BaseException], bool] = lambda _: False
+
+_KNOWN_BUGS: list[_KnownBug] = [
+    _KnownBug(
+        match=lambda s: s.shape in _NESTED_SHAPES,
+        raises=(grpc.RpcError, TimeoutError),
+        reason="grpcio race condition (#41483)",
+        retries=3,
+        retryable=lambda e: (
+            isinstance(e, grpc.RpcError)
+            and e.code() == grpc.StatusCode.INTERNAL
+        ),
+    ),
+]
 ```
 
-This keeps the scenarios visible in the test output (as `xfail`, not silently missing) and automatically surfaces when a bug fix causes them to pass unexpectedly (`xpass`).
+The fixture wraps the test body, catches matching exceptions, retries transient ones with exponential backoff, and calls `pytest.xfail()` when retries are exhausted or the error is non-retryable. Unmatched exceptions propagate as real failures. Tests use the fixture as an async callable:
+
+```python
+async def test_dispatch(scenario, xfail_known_bugs):
+    async def body():
+        ...
+    await xfail_known_bugs(scenario, body)
+```
 
 The distinction from permanent filter exclusions: filtered combinations are documented limitations that will not be fixed. `xfail` combinations are bugs with open issues that will eventually pass.
 
