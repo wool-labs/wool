@@ -141,5 +141,8 @@ class LocalWorker(Worker):
             else:
                 channel = grpc.aio.insecure_channel(self.address)
 
-            stub = protocol.WorkerStub(channel)
-            await stub.stop(protocol.StopRequest(timeout=timeout))
+            try:
+                stub = protocol.WorkerStub(channel)
+                await stub.stop(protocol.StopRequest(timeout=timeout))
+            finally:
+                await channel.close()

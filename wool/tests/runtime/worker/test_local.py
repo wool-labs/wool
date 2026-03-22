@@ -365,6 +365,7 @@ class TestLocalWorker:
         await worker.start()
 
         mock_channel = mocker.MagicMock()
+        mock_channel.close = mocker.AsyncMock()
         mock_stub = mocker.MagicMock()
         mock_stub.stop = mocker.AsyncMock()
 
@@ -432,6 +433,7 @@ class TestLocalWorker:
         await worker.start()
 
         mock_channel = mocker.MagicMock()
+        mock_channel.close = mocker.AsyncMock()
         mock_stub = mocker.MagicMock()
         mock_stub.stop = mocker.AsyncMock(side_effect=Exception("gRPC error"))
 
@@ -558,6 +560,7 @@ class TestLocalWorker:
         await worker.start()
 
         mock_channel = mocker.MagicMock()
+        mock_channel.close = mocker.AsyncMock()
         mock_stub = mocker.MagicMock()
         mock_stub.stop = mocker.AsyncMock()
 
@@ -598,6 +601,7 @@ class TestLocalWorker:
         await worker.start()
 
         mock_channel = mocker.MagicMock()
+        mock_channel.close = mocker.AsyncMock()
         mock_stub = mocker.MagicMock()
         mock_stub.stop = mocker.AsyncMock()
 
@@ -638,6 +642,7 @@ class TestLocalWorker:
         assert worker.metadata is not None
 
         mock_channel = mocker.MagicMock()
+        mock_channel.close = mocker.AsyncMock()
         mock_stub = mocker.MagicMock()
         mock_stub.stop = mocker.AsyncMock()
 
@@ -682,6 +687,7 @@ class TestLocalWorker:
         mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
 
         mock_channel = mocker.MagicMock()
+        mock_channel.close = mocker.AsyncMock()
         mock_stub = mocker.MagicMock()
         mock_stub.stop = mocker.AsyncMock()
         mocker.patch.object(grpc.aio, "secure_channel", return_value=mock_channel)

@@ -246,3 +246,175 @@ pytest <path> -lf
 ```
 
 If your project uses a runner wrapper (e.g., `uv run`, `poetry run`), prefix accordingly — see project instructions.
+
+## 14. Integration Testing
+
+Integration tests exercise real cross-boundary interactions — real subprocesses, real network I/O, real serialization — and MUST NOT mock the system under test. They complement unit tests by validating that assembled subsystems work together correctly.
+
+### Marker
+
+All integration tests MUST be marked with a dedicated marker (e.g., `@pytest.mark.integration`) to enable selective execution:
+
+```sh
+# Run only integration tests
+pytest -m integration -x
+
+# Run everything except integration tests
+pytest -m "not integration" -x
+```
+
+The marker MUST be registered in `pyproject.toml` under `[tool.pytest.ini_options]`.
+
+### Test Style
+
+Integration tests follow the same conventions as unit tests: Given-When-Then docstrings on test functions and methods (not fixtures or helpers), AAA phase comments, and `@pytest.mark.asyncio` for async tests.
+
+### File Layout
+
+Integration tests live in a dedicated `tests/integration/` package:
+
+```
+tests/integration/
+    __init__.py         (empty)
+    conftest.py         (scenario model, enums, filter, builder, fixtures)
+    routines.py         (decorated functions exercised by integration tests)
+    test_scenario.py    (unit tests for the Scenario model itself)
+    test_pool_composition.py (builder tests — one per pool/discovery mode)
+    test_integration.py (pairwise parametrized + Hypothesis exploration)
+```
+
+### Routine Module
+
+Test routines — functions decorated with the project's dispatch decorator — MUST live in a non-test module (e.g., `routines.py`, no `test_` prefix) so pytest does not collect them. This module defines all the callable targets that integration tests dispatch through the real runtime. Organize routines by the dimensions they exercise (e.g., coroutine vs async generator, module function vs instance method vs classmethod vs staticmethod).
+
+### Dimensions and Enums
+
+Each orthogonal axis identified by the test skill (see `llms/skills/test.md` section 6) becomes a separate `Enum`:
+
+```python
+class RoutineShape(Enum):
+    COROUTINE = auto()
+    ASYNC_GEN = auto()
+    # ...
+
+class PoolMode(Enum):
+    DEFAULT = auto()
+    EPHEMERAL = auto()
+    DURABLE = auto()
+    # ...
+```
+
+### Composable Scenario Model
+
+Model each scenario as a frozen dataclass with one field per dimension, all defaulting to `None`. Implement `__or__` for algebraic merge (right side wins on `None` fields, raises `ValueError` on conflicting non-`None` values), `is_complete` to check all fields are set, and `__str__` returning dash-separated enum member names for pytest IDs:
+
+```python
+@dataclass(frozen=True)
+class Scenario:
+    shape: RoutineShape | None = None
+    pool_mode: PoolMode | None = None
+    # ...
+
+    def __or__(self, other: Scenario) -> Scenario:
+        """Merge two partial scenarios; raise on conflicts."""
+
+    @property
+    def is_complete(self) -> bool:
+        """True when all dimensions are set."""
+```
+
+Write unit tests for the Scenario model itself (`__or__` with disjoint fields, conflicting fields, identical values, empty merge, completeness checks). These are fast, synchronous tests that validate the test infrastructure before trusting it for real integration tests.
+
+### Filter Function
+
+A `filter_func` encodes cross-dimension constraints — combinations that are structurally invalid and MUST be excluded from generation:
+
+- **Structural constraints** — e.g., discovery protocol is required for durable modes, forbidden for ephemeral modes.
+- **Permanent exclusions** — combinations that are documented limitations (not bugs). For example, factory forms that are not picklable when the runtime requires serialization. These MUST be excluded in the filter with a comment referencing the issue or documentation.
+
+Bugs expected to be fixed MUST NOT be filtered — use `xfail` instead (see below).
+
+### Builder
+
+Implement a builder — typically an async context manager — that takes a complete `Scenario` and resolves each dimension to its concrete runtime value:
+
+```python
+@asynccontextmanager
+async def build_from_scenario(scenario, shared_fixtures):
+    """Resolve all dimensions and yield the running system."""
+    assert scenario.is_complete
+    # Resolve each dimension to concrete values...
+    async with system:
+        yield system
+```
+
+Some modes may require special handling. For example, a "durable" mode where the system only discovers external processes (doesn't spawn them) needs a helper that manually starts processes and registers them before creating the durable system under test.
+
+Implement a separate `invoke` function that maps the scenario's callable shape and binding to the correct invocation protocol (await, async for, asend, athrow, aclose) and asserts the expected result.
+
+Write builder tests — one per major mode — that construct a complete scenario, build the system, dispatch a simple call, and assert the result. These validate that each mode works in isolation before combining them in the pairwise suite.
+
+### Pairwise Covering Arrays
+
+Use `allpairspy.AllPairs` with the `filter_func` to generate a deterministic covering array that exercises all pairwise dimension combinations:
+
+```python
+from allpairspy import AllPairs
+
+PAIRWISE_SCENARIOS = [
+    Scenario(shape=row[0], pool_mode=row[1], ...)
+    for row in AllPairs(
+        [list(Dim1), list(Dim2), ...],
+        filter_func=my_filter,
+    )
+]
+```
+
+Parametrize with `@pytest.mark.parametrize("scenario", PAIRWISE_SCENARIOS, ids=str)`.
+
+### Hypothesis Exploration
+
+Use `@st.composite` strategies that draw from per-dimension `st.sampled_from(Enum)` with conditional filtering matching the `filter_func` logic. Apply the same permanent exclusions as the filter. Decorate tests with:
+
+```python
+@settings(
+    max_examples=50,
+    deadline=None,
+    suppress_health_check=[
+        HealthCheck.function_scoped_fixture,
+        HealthCheck.too_slow,
+    ],
+)
+@example(scenario=Scenario(...))  # Smoke test with known-good config
+@given(scenario=scenarios_strategy())
+```
+
+`deadline=None` prevents false positives from subprocess startup latency. `suppress_health_check` allows function-scoped fixtures and slow tests inherent to integration testing.
+
+### xfail for Known Bugs
+
+Scenarios that hit known bugs MUST use `pytest.xfail()` in the test body (not `skip`, not filtered out) with a reference to the issue number:
+
+```python
+def _xfail_known_bugs(scenario):
+    if scenario.credential is not CredentialType.INSECURE:
+        pytest.xfail("credential pickling across subprocess boundary (#60)")
+    if scenario.pool_mode in _NESTED_MODES:
+        pytest.xfail("resource collision with nested pools (#62)")
+```
+
+This keeps the scenarios visible in the test output (as `xfail`, not silently missing) and automatically surfaces when a bug fix causes them to pass unexpectedly (`xpass`).
+
+The distinction from permanent filter exclusions: filtered combinations are documented limitations that will not be fixed. `xfail` combinations are bugs with open issues that will eventually pass.
+
+### Cleanup
+
+Autouse fixtures MUST clear shared state between tests — connection pools, context variables, cached singletons, temporary files. These fixtures live in the integration `conftest.py` and mirror any equivalent cleanup fixtures from the unit test suite to prevent cross-test contamination.
+
+### Three Test Layers
+
+Integration test files SHOULD follow this progression:
+
+1. **Scenario model unit tests** — fast, synchronous tests for `__or__`, `is_complete`, `__str__`. Validate the test infrastructure itself.
+2. **Builder/composition tests** — one async test per major system mode. Validate that each mode works in isolation before combining.
+3. **Pairwise + Hypothesis** — combinatorial tests covering all pairwise dimension interactions and random exploration. These are the main integration tests.

@@ -39,6 +39,7 @@ requires-python = ">=3.11"
 
 [project.optional-dependencies]
 dev = [
+    "allpairspy",
     "cryptography",
     "debugpy",
     "hypothesis",
@@ -83,6 +84,9 @@ path = "../build-hooks/metadata.py"
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--cov --cov-config=.coveragerc"
+markers = [
+    "integration: end-to-end integration tests against real WorkerPool",
+]
 
 [tool.ruff]
 line-length = 89
