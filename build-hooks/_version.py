@@ -247,6 +247,8 @@ class PreReleaseVersionSegment:
             return False
         elif not isinstance(other, PreReleaseVersionSegment):
             return super().__lt__(other)
+        elif not other.__PreReleaseVersionSegment_value__:
+            return True
         elif len(self.__PreReleaseVersionSegment_value__) < len(
             other.__PreReleaseVersionSegment_value__
         ):
