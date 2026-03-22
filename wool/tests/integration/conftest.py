@@ -10,12 +10,14 @@ import asyncio
 import datetime
 import ipaddress
 import uuid
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import fields
 from enum import Enum
 from enum import auto
 
+import grpc
 import pytest
 import pytest_asyncio
 from allpairspy import AllPairs
@@ -484,6 +486,43 @@ _NESTED_SHAPES = (
 )
 
 
+@dataclass(frozen=True)
+class _KnownBug:
+    """A known bug that should be treated as an expected failure.
+
+    When ``retryable`` returns True for a caught exception, the test
+    body is re-executed up to ``retries`` times with exponential
+    backoff before falling through to xfail. Exceptions that match
+    ``raises`` but not ``retryable`` xfail immediately.
+    """
+
+    match: Callable[[Scenario], bool]
+    raises: tuple[type[BaseException], ...]
+    reason: str
+    retries: int = 0
+    backoff: float = 0.5
+    retryable: Callable[[BaseException], bool] = lambda _: False
+
+
+def _is_grpc_internal(exc: BaseException) -> bool:
+    return isinstance(exc, grpc.RpcError) and exc.code() == grpc.StatusCode.INTERNAL
+
+
+_KNOWN_BUGS: list[_KnownBug] = [
+    _KnownBug(
+        match=lambda s: s.shape in _NESTED_SHAPES,
+        raises=(grpc.RpcError, TimeoutError),
+        reason=(
+            "grpcio 1.78 PollerCompletionQueue thundering herd race "
+            "(https://github.com/grpc/grpc/pull/41483)"
+        ),
+        retries=3,
+        backoff=0.5,
+        retryable=_is_grpc_internal,
+    ),
+]
+
+
 def _pairwise_filter(row):
     """Filter invalid dimension combinations.
 
@@ -714,3 +753,42 @@ def _clear_proxy_context():
     yield
     wool.__proxy__.reset(proxy_token)
     wool.__proxy_pool__.reset(pool_token)
+
+
+@pytest.fixture
+def xfail_known_bugs():
+    """Run a test body with retry and xfail for known bugs.
+
+    Returns an async callable. Usage::
+
+        await xfail_known_bugs(scenario, body)
+
+    where ``body`` is a no-argument async callable containing the
+    test logic. If the body raises an exception matching a known
+    bug's ``retryable`` predicate, it is retried with exponential
+    backoff. After retries are exhausted (or for non-retryable
+    matches against ``raises``), the test is marked as xfail.
+    Unmatched exceptions propagate normally.
+    """
+
+    async def run(scenario, body):
+        bugs = [b for b in _KNOWN_BUGS if b.match(scenario)]
+        if not bugs:
+            return await body()
+
+        max_retries = max(b.retries for b in bugs)
+        backoff = min(b.backoff for b in bugs)
+
+        for attempt in range(max_retries + 1):
+            try:
+                return await body()
+            except BaseException as exc:
+                matching = next((b for b in bugs if isinstance(exc, b.raises)), None)
+                if matching is None:
+                    raise
+                if attempt < max_retries and matching.retryable(exc):
+                    await asyncio.sleep(backoff * (2**attempt))
+                    continue
+                pytest.xfail(f"{matching.reason}: {exc}")
+
+    return run

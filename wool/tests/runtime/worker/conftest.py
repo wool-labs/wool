@@ -68,18 +68,20 @@ def _clear_proxy_context():
 
 @pytest.fixture(autouse=True)
 def _clear_worker_context():
-    """Reset worker identity context vars between tests.
+    """Reset worker identity state between tests.
 
-    Prevents ContextVar leakage from tests that set
+    Prevents leakage from tests that set
     ``wool.__worker_metadata__`` or ``wool.__worker_service__``
     for self-dispatch testing.
     """
     import wool
 
-    meta_token = wool.__worker_metadata__.set(None)
+    wool.__worker_metadata__ = None
+    wool.__worker_uds_address__ = None
     svc_token = wool.__worker_service__.set(None)
     yield
-    wool.__worker_metadata__.reset(meta_token)
+    wool.__worker_metadata__ = None
+    wool.__worker_uds_address__ = None
     wool.__worker_service__.reset(svc_token)
 
 

@@ -557,12 +557,16 @@ class TestWorkerProcess:
         # Arrange
         mock_get_meta = mocker.MagicMock()
         mock_get_meta.poll.return_value = True
-        mock_get_meta.recv.return_value = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="127.0.0.1:50051",
-            pid=12345,
-            version="1.0.0",
-        ).to_protobuf().SerializeToString()
+        mock_get_meta.recv.return_value = (
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="127.0.0.1:50051",
+                pid=12345,
+                version="1.0.0",
+            )
+            .to_protobuf()
+            .SerializeToString()
+        )
         mock_set_meta = mocker.MagicMock()
         mocker.patch(
             "wool.runtime.worker.process.Pipe",
@@ -595,12 +599,16 @@ class TestWorkerProcess:
         # Arrange
         mock_get_meta = mocker.MagicMock()
         mock_get_meta.poll.return_value = True
-        mock_get_meta.recv.return_value = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="127.0.0.1:50051",
-            pid=12345,
-            version="1.0.0",
-        ).to_protobuf().SerializeToString()
+        mock_get_meta.recv.return_value = (
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="127.0.0.1:50051",
+                pid=12345,
+                version="1.0.0",
+            )
+            .to_protobuf()
+            .SerializeToString()
+        )
         mock_set_meta = mocker.MagicMock()
         mocker.patch(
             "wool.runtime.worker.process.Pipe",
@@ -665,12 +673,16 @@ class TestWorkerProcess:
         # Arrange
         mock_get_meta = mocker.MagicMock()
         mock_get_meta.poll.return_value = True
-        mock_get_meta.recv.return_value = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="127.0.0.1:50051",
-            pid=12345,
-            version="1.0.0",
-        ).to_protobuf().SerializeToString()
+        mock_get_meta.recv.return_value = (
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="127.0.0.1:50051",
+                pid=12345,
+                version="1.0.0",
+            )
+            .to_protobuf()
+            .SerializeToString()
+        )
         mock_set_meta = mocker.MagicMock()
         mocker.patch(
             "wool.runtime.worker.process.Pipe",
@@ -699,14 +711,18 @@ class TestWorkerProcess:
             and metadata.tags as frozenset
         """
         # Arrange
-        metadata_bytes = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="127.0.0.1:50051",
-            pid=12345,
-            version="1.0.0",
-            tags=frozenset({"gpu"}),
-            extra=MappingProxyType({"key": "value"}),
-        ).to_protobuf().SerializeToString()
+        metadata_bytes = (
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="127.0.0.1:50051",
+                pid=12345,
+                version="1.0.0",
+                tags=frozenset({"gpu"}),
+                extra=MappingProxyType({"key": "value"}),
+            )
+            .to_protobuf()
+            .SerializeToString()
+        )
 
         mock_get_meta = mocker.MagicMock()
         mock_get_meta.poll.return_value = True
@@ -928,9 +944,7 @@ class TestWorkerProcess:
         )
         assert deserialized.address == "0.0.0.0:8080"
 
-    def test_run_with_extra_and_tags_serializes_complete_metadata(
-        self, mocker
-    ):
+    def test_run_with_extra_and_tags_serializes_complete_metadata(self, mocker):
         """Test run serializes metadata including extra and tags to pipe.
 
         Given:
@@ -1121,16 +1135,18 @@ class TestWorkerProcess:
     # === SINGLE-PORT ARCHITECTURE TESTS ===
 
     def test_serve_insecure_worker_single_port(self, mocker):
-        """Test single insecure port for insecure workers.
+        """Test single insecure TCP port for insecure workers.
 
         Given:
-            WorkerProcess with credentials=None
+            WorkerProcess with credentials=None and UDS disabled
         When:
             Process is started and server is configured
         Then:
             Only add_insecure_port is called, add_secure_port is not called
         """
         # Arrange
+        mocker.patch.object(process_module, "_HAS_UDS", False)
+
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
         mock_server.add_secure_port = mocker.MagicMock()
@@ -1160,16 +1176,18 @@ class TestWorkerProcess:
         mock_server.add_secure_port.assert_not_called()
 
     def test_serve_secure_worker_single_port(self, mocker):
-        """Test single secure port for secure workers.
+        """Test single secure TCP port for secure workers.
 
         Given:
-            WorkerProcess with valid WorkerCredentials
+            WorkerProcess with valid WorkerCredentials and UDS disabled
         When:
             Process is started and server is configured
         Then:
             Only add_secure_port is called with credentials, add_insecure_port is not called
         """
         # Arrange
+        mocker.patch.object(process_module, "_HAS_UDS", False)
+
         dummy_key = (
             b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         )
@@ -1305,16 +1323,18 @@ class TestWorkerProcess:
         assert deserialized.address == "127.0.0.1:54322"
 
     def test_serve_no_dual_port_architecture(self, mocker):
-        """Test no dual-port architecture.
+        """Test no dual TCP port architecture.
 
         Given:
-            WorkerProcess with WorkerCredentials
+            WorkerProcess with WorkerCredentials and UDS disabled
         When:
             Process is started and port is retrieved
         Then:
-            Port number matches the secure port, no additional localhost port exists
+            Port number matches the secure port, no additional TCP port exists
         """
         # Arrange
+        mocker.patch.object(process_module, "_HAS_UDS", False)
+
         dummy_key = (
             b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         )
@@ -1352,16 +1372,18 @@ class TestWorkerProcess:
         assert mock_server.add_secure_port.call_count == 1
 
     def test_serve_no_insecure_backdoor(self, mocker):
-        """Test no insecure localhost backdoor.
+        """Test no insecure TCP backdoor.
 
         Given:
-            Running WorkerProcess with WorkerCredentials
+            Running WorkerProcess with WorkerCredentials and UDS disabled
         When:
             Attempt to connect via insecure channel to the port
         Then:
-            Connection fails or is rejected (no insecure fallback port)
+            Connection fails or is rejected (no insecure TCP fallback port)
         """
         # Arrange
+        mocker.patch.object(process_module, "_HAS_UDS", False)
+
         dummy_key = (
             b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         )
@@ -1400,16 +1422,18 @@ class TestWorkerProcess:
     @given(has_credentials=st.booleans())
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test_single_port_invariant(self, has_credentials, mocker):
-        """Test single-port invariant property.
+        """Test single TCP port invariant property.
 
         Given:
-            Any WorkerProcess with valid or None credentials
+            Any WorkerProcess with valid or None credentials and UDS disabled
         When:
             Process is started and configured
         Then:
-            Exactly one port is bound (either secure or insecure, never both)
+            Exactly one TCP port is bound (either secure or insecure, never both)
         """
         # Arrange
+        mocker.patch.object(process_module, "_HAS_UDS", False)
+
         if has_credentials:
             dummy_key = (
                 b"-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
@@ -1448,7 +1472,7 @@ class TestWorkerProcess:
         # Assert
         secure_calls = mock_server.add_secure_port.call_count
         insecure_calls = mock_server.add_insecure_port.call_count
-        assert secure_calls + insecure_calls == 1, "Exactly one port must be bound"
+        assert secure_calls + insecure_calls == 1, "Exactly one TCP port must be bound"
 
         if has_credentials:
             assert secure_calls == 1, "Secure worker must use secure port"

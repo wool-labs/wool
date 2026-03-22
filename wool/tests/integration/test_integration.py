@@ -24,21 +24,11 @@ from .conftest import scenarios_strategy
 
 _INTEGRATION_TIMEOUT = 30
 
-_NESTED_SHAPES = {RoutineShape.NESTED_COROUTINE, RoutineShape.NESTED_ASYNC_GEN}
-
-
-def _xfail_known_bugs(scenario):
-    if scenario.shape in _NESTED_SHAPES:
-        pytest.xfail(
-            "grpcio 1.78 PollerCompletionQueue thundering herd race "
-            "(https://github.com/grpc/grpc/pull/41483)"
-        )
-
 
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", PAIRWISE_SCENARIOS, ids=str)
-async def test_dispatch_pairwise(scenario, credentials_map):
+async def test_dispatch_pairwise(scenario, credentials_map, xfail_known_bugs):
     """Test routine dispatch across pairwise scenario combinations.
 
     Given:
@@ -48,12 +38,14 @@ async def test_dispatch_pairwise(scenario, credentials_map):
     Then:
         It should return the expected result for the given routine shape.
     """
-    _xfail_known_bugs(scenario)
 
     # Arrange, act, & assert
-    async with asyncio.timeout(_INTEGRATION_TIMEOUT):
-        async with build_pool_from_scenario(scenario, credentials_map):
-            await invoke_routine(scenario)
+    async def body():
+        async with asyncio.timeout(_INTEGRATION_TIMEOUT):
+            async with build_pool_from_scenario(scenario, credentials_map):
+                await invoke_routine(scenario)
+
+    await xfail_known_bugs(scenario, body)
 
 
 @pytest.mark.integration
@@ -91,7 +83,7 @@ async def test_dispatch_pairwise(scenario, credentials_map):
     )
 )
 @given(scenario=scenarios_strategy())
-async def test_dispatch_hypothesis(scenario, credentials_map):
+async def test_dispatch_hypothesis(scenario, credentials_map, xfail_known_bugs):
     """Test routine dispatch with Hypothesis-generated scenarios.
 
     Given:
@@ -101,9 +93,11 @@ async def test_dispatch_hypothesis(scenario, credentials_map):
     Then:
         It should return the expected result for the given routine shape.
     """
-    _xfail_known_bugs(scenario)
 
     # Arrange, act, & assert
-    async with asyncio.timeout(_INTEGRATION_TIMEOUT):
-        async with build_pool_from_scenario(scenario, credentials_map):
-            await invoke_routine(scenario)
+    async def body():
+        async with asyncio.timeout(_INTEGRATION_TIMEOUT):
+            async with build_pool_from_scenario(scenario, credentials_map):
+                await invoke_routine(scenario)
+
+    await xfail_known_bugs(scenario, body)
