@@ -176,41 +176,6 @@ class TestPoolComposition:
         assert result == 3
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_durable_joined_lan(
-        self, credentials_map
-    ):
-        """Test building a pool with DURABLE_JOINED mode and LAN_CALLABLE.
-
-        Given:
-            A complete scenario using DURABLE_JOINED pool mode with
-            LAN_CALLABLE discovery, where a separate LanDiscovery
-            instance discovers externally published workers.
-        When:
-            A pool is built and a coroutine routine is dispatched.
-        Then:
-            It should return the correct result via the separate
-            LanDiscovery.
-        """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.DURABLE_JOINED,
-            discovery=DiscoveryFactory.LAN_CALLABLE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-        )
-
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
-
-        # Assert
-        assert result == 3
-
-    @pytest.mark.asyncio
     async def test_build_pool_from_scenario_with_restrictive_opts(self, credentials_map):
         """Test building a pool with restrictive message size options.
 

@@ -368,9 +368,8 @@ _LOCAL_FACTORIES = (
 def _resolve_joiner(namespace, factory):
     """Resolve a DiscoveryFactory into a joiner discovery object.
 
-    For LOCAL variants, uses the given namespace (same as the owner),
-    triggering the non-owner fallback path in ``LocalDiscovery.__enter__``.
-    For LAN variants, creates a separate LanDiscovery instance.
+    Uses the given namespace (same as the owner), triggering the non-owner
+    fallback path in ``LocalDiscovery.__enter__``.
 
     Returns ``(discovery_obj, entered_cm_or_None)``. The caller must
     exit the CM (if non-None) when done.
@@ -392,51 +391,26 @@ def _resolve_joiner(namespace, factory):
                     yield d
 
             return _acm(), None
-        case DiscoveryFactory.LAN_DIRECT:
-            from wool.runtime.discovery.lan import LanDiscovery
-
-            return LanDiscovery(), None
-        case DiscoveryFactory.LAN_CALLABLE:
-            from wool.runtime.discovery.lan import LanDiscovery
-
-            return (lambda: LanDiscovery()), None  # noqa: E731
-        case DiscoveryFactory.LAN_ASYNC_CM:
-            from wool.runtime.discovery.lan import LanDiscovery
-
-            @asynccontextmanager
-            async def _acm():
-                yield LanDiscovery()
-
-            return _acm(), None
 
 
 @asynccontextmanager
 async def _durable_joined_pool_context(discovery_factory, lb, creds, options):
     """Create a DURABLE pool that joins an externally owned namespace.
 
-    Sets up an owner that creates workers and publishes them, then resolves
-    a joiner discovery from the D3 factory form. For LOCAL variants, the
+    Sets up an owner ``LocalDiscovery`` that creates workers and publishes
+    them, then resolves a joiner discovery from the D3 factory form. The
     joiner reuses the owner's namespace, exercising the non-owner fallback
-    path in ``LocalDiscovery.__enter__``. For LAN variants, a separate
-    publisher advertises the worker; the joiner discovers it via zeroconf.
+    path in ``LocalDiscovery.__enter__``.
     """
-    is_local = discovery_factory in _LOCAL_FACTORIES
     namespace = f"joined-{uuid.uuid4().hex[:12]}"
 
     worker = LocalWorker(credentials=creds, options=options)
     await worker.start()
 
-    _owner_cm = None
+    owner = LocalDiscovery(namespace)
+    owner.__enter__()
     try:
-        if is_local:
-            _owner_cm = LocalDiscovery(namespace)
-            _owner_cm.__enter__()
-            publisher = _owner_cm.publisher
-        else:
-            from wool.runtime.discovery.lan import LanDiscovery as _Lan
-
-            publisher = _Lan.Publisher()
-
+        publisher = owner.publisher
         async with publisher:
             await publisher.publish("worker-added", worker.metadata)
             joiner, _joiner_cm = _resolve_joiner(
@@ -457,8 +431,7 @@ async def _durable_joined_pool_context(discovery_factory, lb, creds, options):
                 await publisher.publish("worker-dropped", worker.metadata)
     finally:
         await worker.stop()
-        if _owner_cm is not None:
-            _owner_cm.__exit__(None, None, None)
+        owner.__exit__(None, None, None)
 
 
 async def invoke_routine(scenario):
@@ -642,6 +615,8 @@ def _pairwise_filter(row):
     - D3 must be NONE when D2 is DEFAULT, EPHEMERAL, DURABLE, or NESTED_*
       (DURABLE manages its own LocalDiscovery internally)
     - D3 must NOT be NONE when D2 is HYBRID or DURABLE_JOINED
+    - D3 must be a LOCAL_* variant when D2 is DURABLE_JOINED
+      (LanDiscovery does not support namespacing)
     - D4 must not be ASYNC_CM (pre-called async CM instances are not
       picklable inside WorkerProxy.__reduce__; documented limitation,
       see #61)
@@ -668,6 +643,11 @@ def _pairwise_filter(row):
         if needs_discovery and discovery is DiscoveryFactory.NONE:
             return False
         if forbids_discovery and discovery is not DiscoveryFactory.NONE:
+            return False
+        if (
+            pool_mode is PoolMode.DURABLE_JOINED
+            and discovery not in _LOCAL_FACTORIES
+        ):
             return False
     if len(row) > 3:
         lb = row[3]
@@ -731,7 +711,9 @@ def scenarios_strategy(draw):
         PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
     )
 
-    if needs_discovery:
+    if pool_mode is PoolMode.DURABLE_JOINED:
+        discovery = draw(st.sampled_from(list(_LOCAL_FACTORIES)))
+    elif needs_discovery:
         discovery = draw(
             st.sampled_from(
                 [d for d in DiscoveryFactory if d is not DiscoveryFactory.NONE]
