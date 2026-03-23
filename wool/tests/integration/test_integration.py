@@ -28,7 +28,7 @@ _INTEGRATION_TIMEOUT = 30
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", PAIRWISE_SCENARIOS, ids=str)
-async def test_dispatch_pairwise(scenario, credentials_map, xfail_known_bugs):
+async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal):
     """Test routine dispatch across pairwise scenario combinations.
 
     Given:
@@ -45,7 +45,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, xfail_known_bugs):
             async with build_pool_from_scenario(scenario, credentials_map):
                 await invoke_routine(scenario)
 
-    await xfail_known_bugs(scenario, body)
+    await retry_grpc_internal(body)
 
 
 @pytest.mark.integration
@@ -83,7 +83,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, xfail_known_bugs):
     )
 )
 @given(scenario=scenarios_strategy())
-async def test_dispatch_hypothesis(scenario, credentials_map, xfail_known_bugs):
+async def test_dispatch_hypothesis(scenario, credentials_map, retry_grpc_internal):
     """Test routine dispatch with Hypothesis-generated scenarios.
 
     Given:
@@ -100,4 +100,4 @@ async def test_dispatch_hypothesis(scenario, credentials_map, xfail_known_bugs):
             async with build_pool_from_scenario(scenario, credentials_map):
                 await invoke_routine(scenario)
 
-    await xfail_known_bugs(scenario, body)
+    await retry_grpc_internal(body)
