@@ -314,6 +314,119 @@ class TestLocalDiscovery:
         with discovery as ctx:
             assert ctx is discovery
 
+    def test___enter___with_existing_namespace(self, namespace):
+        """Test LocalDiscovery joins an existing namespace without error.
+
+        Given:
+            A LocalDiscovery that owns a namespace
+        When:
+            A second LocalDiscovery enters the same namespace via with
+        Then:
+            It should succeed without raising FileExistsError.
+        """
+        # Arrange
+        with LocalDiscovery(namespace):
+            # Act & assert
+            with LocalDiscovery(namespace) as joiner:
+                assert joiner is not None
+
+    def test___exit___as_non_owner(self, namespace):
+        """Test non-owner exit leaves shared memory accessible to owner.
+
+        Given:
+            An owner and a non-owner sharing a namespace
+        When:
+            The non-owner exits via with
+        Then:
+            It should close without unlinking, leaving the shared
+            memory accessible to the owner.
+        """
+        # Arrange
+        with LocalDiscovery(namespace) as owner:
+            with LocalDiscovery(namespace):
+                pass  # non-owner enters and exits
+
+            # Act — verify the owner can still use the address space
+            publisher = LocalDiscovery.Publisher(namespace)
+
+            # Assert — publishing succeeds, proving shared memory
+            # was not unlinked by the non-owner
+            worker = WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="localhost:50051",
+                pid=123,
+                version="1.0",
+            )
+            loop = asyncio.new_event_loop()
+            try:
+
+                async def publish():
+                    async with publisher:
+                        await publisher.publish("worker-added", worker)
+
+                loop.run_until_complete(publish())
+            finally:
+                loop.close()
+
+    @pytest.mark.asyncio
+    async def test___enter___non_owner_discovers_workers(self, namespace):
+        """Test non-owner can discover workers published by the owner.
+
+        Given:
+            An owner and a non-owner sharing a namespace
+        When:
+            A worker is published by the owner and discovered through
+            the non-owner's subscriber
+        Then:
+            It should yield the worker-added event with matching
+            metadata.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="localhost:50051",
+            pid=123,
+            version="1.0",
+        )
+        events = []
+        event_received = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                events.append(event)
+                event_received.set()
+                break
+
+        with LocalDiscovery(namespace):
+            with LocalDiscovery(namespace) as joiner:
+                publisher = LocalDiscovery.Publisher(namespace)
+                subscriber = joiner.subscribe(poll_interval=0.05)
+
+                # Act
+                async with publisher:
+                    await publisher.publish("worker-added", worker)
+
+                    task = asyncio.create_task(collect(subscriber))
+                    try:
+                        await asyncio.wait_for(
+                            event_received.wait(), timeout=2.0
+                        )
+                    except asyncio.TimeoutError:
+                        pytest.fail(
+                            "Worker not discovered via non-owner within timeout"
+                        )
+                    finally:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+
+        # Assert
+        assert len(events) == 1
+        assert events[0].type == "worker-added"
+        assert events[0].metadata.uid == worker.uid
+
 
 class TestLocalDiscoveryPublisher:
     """Tests for LocalDiscovery.Publisher class.
