@@ -10,7 +10,6 @@ import asyncio
 import datetime
 import ipaddress
 import uuid
-from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import fields
@@ -486,41 +485,12 @@ _NESTED_SHAPES = (
 )
 
 
-@dataclass(frozen=True)
-class _KnownBug:
-    """A known bug that should be treated as an expected failure.
-
-    When ``retryable`` returns True for a caught exception, the test
-    body is re-executed up to ``retries`` times with exponential
-    backoff before falling through to xfail. Exceptions that match
-    ``raises`` but not ``retryable`` xfail immediately.
-    """
-
-    match: Callable[[Scenario], bool]
-    raises: tuple[type[BaseException], ...]
-    reason: str
-    retries: int = 0
-    backoff: float = 0.5
-    retryable: Callable[[BaseException], bool] = lambda _: False
-
-
 def _is_grpc_internal(exc: BaseException) -> bool:
     return isinstance(exc, grpc.RpcError) and exc.code() == grpc.StatusCode.INTERNAL
 
 
-_KNOWN_BUGS: list[_KnownBug] = [
-    _KnownBug(
-        match=lambda s: s.shape in _NESTED_SHAPES,
-        raises=(grpc.RpcError, TimeoutError),
-        reason=(
-            "grpcio 1.78 PollerCompletionQueue thundering herd race "
-            "(https://github.com/grpc/grpc/pull/41483)"
-        ),
-        retries=3,
-        backoff=0.5,
-        retryable=_is_grpc_internal,
-    ),
-]
+_GRPC_INTERNAL_RETRIES = 3
+_GRPC_INTERNAL_BACKOFF = 0.5
 
 
 def _pairwise_filter(row):
@@ -756,39 +726,33 @@ def _clear_proxy_context():
 
 
 @pytest.fixture
-def xfail_known_bugs():
-    """Run a test body with retry and xfail for known bugs.
+def retry_grpc_internal():
+    """Retry a test body on transient internal gRPC errors.
 
     Returns an async callable. Usage::
 
-        await xfail_known_bugs(scenario, body)
+        await retry_grpc_internal(body)
 
     where ``body`` is a no-argument async callable containing the
-    test logic. If the body raises an exception matching a known
-    bug's ``retryable`` predicate, it is retried with exponential
-    backoff. After retries are exhausted (or for non-retryable
-    matches against ``raises``), the test is marked as xfail.
-    Unmatched exceptions propagate normally.
+    test logic. Internal gRPC errors (``StatusCode.INTERNAL``) are
+    retried with exponential backoff to tolerate the grpcio
+    PollerCompletionQueue thundering-herd race. All other exceptions
+    propagate immediately. If retries are exhausted the last
+    exception propagates as a real test failure.
     """
 
-    async def run(scenario, body):
-        bugs = [b for b in _KNOWN_BUGS if b.match(scenario)]
-        if not bugs:
-            return await body()
-
-        max_retries = max(b.retries for b in bugs)
-        backoff = min(b.backoff for b in bugs)
-
-        for attempt in range(max_retries + 1):
+    async def run(body):
+        for attempt in range(_GRPC_INTERNAL_RETRIES + 1):
             try:
                 return await body()
             except BaseException as exc:
-                matching = next((b for b in bugs if isinstance(exc, b.raises)), None)
-                if matching is None:
+                if not _is_grpc_internal(exc):
                     raise
-                if attempt < max_retries and matching.retryable(exc):
-                    await asyncio.sleep(backoff * (2**attempt))
+                if attempt < _GRPC_INTERNAL_RETRIES:
+                    await asyncio.sleep(
+                        _GRPC_INTERNAL_BACKOFF * (2**attempt)
+                    )
                     continue
-                pytest.xfail(f"{matching.reason}: {exc}")
+                raise
 
     return run
