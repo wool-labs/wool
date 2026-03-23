@@ -344,9 +344,6 @@ def test_is_version_compatible_different_major():
 class TestWorkerProxy:
     """Comprehensive test suite for WorkerProxy."""
 
-    # =========================================================================
-    # Constructor Tests
-    # =========================================================================
 
     def test___init___discovery_and_loadbalancer(
         self, mock_discovery_service, mock_load_balancer_factory
@@ -522,9 +519,128 @@ class TestWorkerProxy:
         with pytest.raises(ValueError, match="Must specify either a workerpool URI"):
             WorkerProxy()
 
-    # =========================================================================
-    # Lifecycle Tests
-    # =========================================================================
+
+
+    def test___init___with_sync_cm_loadbalancer_warns(
+        self, mock_discovery_service
+    ):
+        """Test UserWarning for sync CM loadbalancer.
+
+        Given:
+            A sync context manager instance as loadbalancer.
+        When:
+            WorkerProxy is instantiated.
+        Then:
+            It should emit a UserWarning mentioning 'loadbalancer'.
+        """
+        # Arrange
+        class SyncCM:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        # Act & assert
+        with pytest.warns(UserWarning, match="loadbalancer"):
+            WorkerProxy(
+                discovery=mock_discovery_service, loadbalancer=SyncCM()
+            )
+
+    def test___init___with_async_cm_loadbalancer_warns(
+        self, mock_discovery_service
+    ):
+        """Test UserWarning for async CM loadbalancer.
+
+        Given:
+            An async context manager instance as loadbalancer.
+        When:
+            WorkerProxy is instantiated.
+        Then:
+            It should emit a UserWarning mentioning 'loadbalancer'.
+        """
+        # Arrange
+        class AsyncCM:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        # Act & assert
+        with pytest.warns(UserWarning, match="loadbalancer"):
+            WorkerProxy(
+                discovery=mock_discovery_service, loadbalancer=AsyncCM()
+            )
+
+    def test___init___with_sync_cm_discovery_warns(self):
+        """Test UserWarning for sync CM discovery.
+
+        Given:
+            A sync context manager instance as discovery.
+        When:
+            WorkerProxy is instantiated.
+        Then:
+            It should emit a UserWarning mentioning 'discovery'.
+        """
+        # Arrange
+        class SyncCM:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        # Act & assert
+        with pytest.warns(UserWarning, match="discovery"):
+            WorkerProxy(discovery=SyncCM())
+
+    def test___init___with_async_cm_discovery_warns(self):
+        """Test UserWarning for async CM discovery.
+
+        Given:
+            An async context manager instance as discovery.
+        When:
+            WorkerProxy is instantiated.
+        Then:
+            It should emit a UserWarning mentioning 'discovery'.
+        """
+        # Arrange
+        class AsyncCM:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        # Act & assert
+        with pytest.warns(UserWarning, match="discovery"):
+            WorkerProxy(discovery=AsyncCM())
+
+    def test___init___with_callable_loadbalancer_no_warning(
+        self, mock_discovery_service
+    ):
+        """Test no UserWarning for callable loadbalancer.
+
+        Given:
+            A callable (non-CM) as loadbalancer.
+        When:
+            WorkerProxy is instantiated.
+        Then:
+            It should not emit a UserWarning.
+        """
+        # Arrange, act, & assert
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            WorkerProxy(
+                discovery=mock_discovery_service,
+                loadbalancer=wp.RoundRobinLoadBalancer,
+            )
+
+        user_warnings = [
+            w for w in caught if issubclass(w.category, UserWarning)
+        ]
+        assert user_warnings == []
 
     @pytest.mark.asyncio
     async def test___aenter___lifecycle(self, mock_discovery_service):
@@ -829,9 +945,6 @@ class TestWorkerProxy:
         # Cleanup
         await proxy.stop()
 
-    # =========================================================================
-    # Discovery Integration Tests
-    # =========================================================================
 
     @pytest.mark.asyncio
     async def test_discovers_workers_from_service(self, mock_discovery_service):
@@ -969,9 +1082,6 @@ class TestWorkerProxy:
         # Cleanup
         await proxy.stop()
 
-    # =========================================================================
-    # Task Dispatch Tests
-    # =========================================================================
 
     @pytest.mark.asyncio
     async def test_dispatch_delegates_to_loadbalancer(
@@ -1228,9 +1338,6 @@ class TestWorkerProxy:
         # Cleanup
         await proxy.stop()
 
-    # =========================================================================
-    # Static Worker Configuration Tests
-    # =========================================================================
 
     @pytest.mark.asyncio
     async def test_proxy_with_static_workers_list(self):
@@ -1295,9 +1402,6 @@ class TestWorkerProxy:
         # After exit, proxy should be stopped
         assert not proxy.started
 
-    # =========================================================================
-    # Properties Tests
-    # =========================================================================
 
     @pytest.mark.asyncio
     async def test_workers_property_returns_workers_list(
@@ -1400,9 +1504,6 @@ class TestWorkerProxy:
         # Proxy should not equal non-WorkerProxy objects
         assert proxy1 != non_proxy
 
-    # =========================================================================
-    # Serialization Tests
-    # =========================================================================
 
     @pytest.mark.asyncio
     async def test_cloudpickle_serialization_with_services(self):
@@ -1630,6 +1731,119 @@ class TestWorkerProxy:
         assert insecure_worker not in restored_proxy.workers
         await restored_proxy.stop()
 
+    def test_cloudpickle_serialization_with_sync_cm_loadbalancer_raises(
+        self, mock_discovery_service
+    ):
+        """Test TypeError when pickling proxy with sync CM loadbalancer.
+
+        Given:
+            A WorkerProxy with a sync context manager instance as
+            loadbalancer.
+        When:
+            cloudpickle serialization is attempted.
+        Then:
+            It should raise TypeError mentioning 'loadbalancer'.
+        """
+        # Arrange
+        class SyncCM:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        with pytest.warns(UserWarning):
+            proxy = WorkerProxy(
+                discovery=mock_discovery_service,
+                loadbalancer=SyncCM(),
+            )
+
+        # Act & assert
+        with pytest.raises(TypeError, match="loadbalancer"):
+            cloudpickle.dumps(proxy)
+
+    def test_cloudpickle_serialization_with_async_cm_loadbalancer_raises(
+        self, mock_discovery_service
+    ):
+        """Test TypeError when pickling proxy with async CM loadbalancer.
+
+        Given:
+            A WorkerProxy with an async context manager instance as
+            loadbalancer.
+        When:
+            cloudpickle serialization is attempted.
+        Then:
+            It should raise TypeError mentioning 'loadbalancer'.
+        """
+        # Arrange
+        class AsyncCM:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        with pytest.warns(UserWarning):
+            proxy = WorkerProxy(
+                discovery=mock_discovery_service,
+                loadbalancer=AsyncCM(),
+            )
+
+        # Act & assert
+        with pytest.raises(TypeError, match="loadbalancer"):
+            cloudpickle.dumps(proxy)
+
+    def test_cloudpickle_serialization_with_sync_cm_discovery_raises(self):
+        """Test TypeError when pickling proxy with sync CM discovery.
+
+        Given:
+            A WorkerProxy with a sync context manager instance as
+            discovery.
+        When:
+            cloudpickle serialization is attempted.
+        Then:
+            It should raise TypeError mentioning 'discovery'.
+        """
+        # Arrange
+        class SyncCM:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        with pytest.warns(UserWarning):
+            proxy = WorkerProxy(discovery=SyncCM())
+
+        # Act & assert
+        with pytest.raises(TypeError, match="discovery"):
+            cloudpickle.dumps(proxy)
+
+    def test_cloudpickle_serialization_with_async_cm_discovery_raises(self):
+        """Test TypeError when pickling proxy with async CM discovery.
+
+        Given:
+            A WorkerProxy with an async context manager instance as
+            discovery.
+        When:
+            cloudpickle serialization is attempted.
+        Then:
+            It should raise TypeError mentioning 'discovery'.
+        """
+        # Arrange
+        class AsyncCM:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        with pytest.warns(UserWarning):
+            proxy = WorkerProxy(discovery=AsyncCM())
+
+        # Act & assert
+        with pytest.raises(TypeError, match="discovery"):
+            cloudpickle.dumps(proxy)
     @pytest.mark.asyncio
     async def test_explicit_credentials_parameter_overrides_contextvar(
         self, mock_proxy_session, worker_credentials, mocker: MockerFixture
@@ -1768,248 +1982,7 @@ class TestWorkerProxy:
         assert secure_worker not in proxy.workers
         await proxy.stop()
 
-    # =========================================================================
-    # Picklability Constraint Tests
-    # =========================================================================
 
-    def test___init___with_sync_cm_loadbalancer_warns(
-        self, mock_discovery_service
-    ):
-        """Test UserWarning for sync CM loadbalancer.
-
-        Given:
-            A sync context manager instance as loadbalancer.
-        When:
-            WorkerProxy is instantiated.
-        Then:
-            It should emit a UserWarning mentioning 'loadbalancer'.
-        """
-        # Arrange
-        class SyncCM:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                pass
-
-        # Act & assert
-        with pytest.warns(UserWarning, match="loadbalancer"):
-            WorkerProxy(
-                discovery=mock_discovery_service, loadbalancer=SyncCM()
-            )
-
-    def test___init___with_async_cm_loadbalancer_warns(
-        self, mock_discovery_service
-    ):
-        """Test UserWarning for async CM loadbalancer.
-
-        Given:
-            An async context manager instance as loadbalancer.
-        When:
-            WorkerProxy is instantiated.
-        Then:
-            It should emit a UserWarning mentioning 'loadbalancer'.
-        """
-        # Arrange
-        class AsyncCM:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        # Act & assert
-        with pytest.warns(UserWarning, match="loadbalancer"):
-            WorkerProxy(
-                discovery=mock_discovery_service, loadbalancer=AsyncCM()
-            )
-
-    def test___init___with_sync_cm_discovery_warns(self):
-        """Test UserWarning for sync CM discovery.
-
-        Given:
-            A sync context manager instance as discovery.
-        When:
-            WorkerProxy is instantiated.
-        Then:
-            It should emit a UserWarning mentioning 'discovery'.
-        """
-        # Arrange
-        class SyncCM:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                pass
-
-        # Act & assert
-        with pytest.warns(UserWarning, match="discovery"):
-            WorkerProxy(discovery=SyncCM())
-
-    def test___init___with_async_cm_discovery_warns(self):
-        """Test UserWarning for async CM discovery.
-
-        Given:
-            An async context manager instance as discovery.
-        When:
-            WorkerProxy is instantiated.
-        Then:
-            It should emit a UserWarning mentioning 'discovery'.
-        """
-        # Arrange
-        class AsyncCM:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        # Act & assert
-        with pytest.warns(UserWarning, match="discovery"):
-            WorkerProxy(discovery=AsyncCM())
-
-    def test___init___with_callable_loadbalancer_no_warning(
-        self, mock_discovery_service
-    ):
-        """Test no UserWarning for callable loadbalancer.
-
-        Given:
-            A callable (non-CM) as loadbalancer.
-        When:
-            WorkerProxy is instantiated.
-        Then:
-            It should not emit a UserWarning.
-        """
-        # Arrange, act, & assert
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            WorkerProxy(
-                discovery=mock_discovery_service,
-                loadbalancer=wp.RoundRobinLoadBalancer,
-            )
-
-        user_warnings = [
-            w for w in caught if issubclass(w.category, UserWarning)
-        ]
-        assert user_warnings == []
-
-    def test_cloudpickle_serialization_with_sync_cm_loadbalancer_raises(
-        self, mock_discovery_service
-    ):
-        """Test TypeError when pickling proxy with sync CM loadbalancer.
-
-        Given:
-            A WorkerProxy with a sync context manager instance as
-            loadbalancer.
-        When:
-            cloudpickle serialization is attempted.
-        Then:
-            It should raise TypeError mentioning 'loadbalancer'.
-        """
-        # Arrange
-        class SyncCM:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                pass
-
-        with pytest.warns(UserWarning):
-            proxy = WorkerProxy(
-                discovery=mock_discovery_service,
-                loadbalancer=SyncCM(),
-            )
-
-        # Act & assert
-        with pytest.raises(TypeError, match="loadbalancer"):
-            cloudpickle.dumps(proxy)
-
-    def test_cloudpickle_serialization_with_async_cm_loadbalancer_raises(
-        self, mock_discovery_service
-    ):
-        """Test TypeError when pickling proxy with async CM loadbalancer.
-
-        Given:
-            A WorkerProxy with an async context manager instance as
-            loadbalancer.
-        When:
-            cloudpickle serialization is attempted.
-        Then:
-            It should raise TypeError mentioning 'loadbalancer'.
-        """
-        # Arrange
-        class AsyncCM:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        with pytest.warns(UserWarning):
-            proxy = WorkerProxy(
-                discovery=mock_discovery_service,
-                loadbalancer=AsyncCM(),
-            )
-
-        # Act & assert
-        with pytest.raises(TypeError, match="loadbalancer"):
-            cloudpickle.dumps(proxy)
-
-    def test_cloudpickle_serialization_with_sync_cm_discovery_raises(self):
-        """Test TypeError when pickling proxy with sync CM discovery.
-
-        Given:
-            A WorkerProxy with a sync context manager instance as
-            discovery.
-        When:
-            cloudpickle serialization is attempted.
-        Then:
-            It should raise TypeError mentioning 'discovery'.
-        """
-        # Arrange
-        class SyncCM:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                pass
-
-        with pytest.warns(UserWarning):
-            proxy = WorkerProxy(discovery=SyncCM())
-
-        # Act & assert
-        with pytest.raises(TypeError, match="discovery"):
-            cloudpickle.dumps(proxy)
-
-    def test_cloudpickle_serialization_with_async_cm_discovery_raises(self):
-        """Test TypeError when pickling proxy with async CM discovery.
-
-        Given:
-            A WorkerProxy with an async context manager instance as
-            discovery.
-        When:
-            cloudpickle serialization is attempted.
-        Then:
-            It should raise TypeError mentioning 'discovery'.
-        """
-        # Arrange
-        class AsyncCM:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        with pytest.warns(UserWarning):
-            proxy = WorkerProxy(discovery=AsyncCM())
-
-        # Act & assert
-        with pytest.raises(TypeError, match="discovery"):
-            cloudpickle.dumps(proxy)
-
-    # =========================================================================
-    # Validation Tests
-    # =========================================================================
 
     @pytest.mark.asyncio
     async def test_start_invalid_loadbalancer_type_raises_error(
@@ -2061,9 +2034,6 @@ class TestWorkerProxy:
         with pytest.raises(ValueError):
             await proxy.start()
 
-    # =========================================================================
-    # Security Filtering Tests
-    # =========================================================================
 
     @pytest.mark.asyncio
     async def test_security_filter_with_credentials(
@@ -2171,9 +2141,6 @@ class TestWorkerProxy:
         )
         assert filter_fn(secure_matching) is False
 
-    # =========================================================================
-    # Property-Based Tests
-    # =========================================================================
 
     @given(worker_count=st.integers(min_value=0, max_value=10))
     @settings(
