@@ -235,15 +235,14 @@ class LocalDiscovery(Discovery):
 
         assert self._address_space.buf
         if self._owner:
-            self._cleanup = atexit.register(
-                lambda: self._address_space.unlink()
-            )
+            self._cleanup = atexit.register(lambda: self._address_space.unlink())
             for i in range(size):
                 self._address_space.buf[i] = 0
         return self
 
     def __exit__(self, *_):
         if self._owner:
+            self._address_space.close()
             self._address_space.unlink()
             atexit.unregister(self._cleanup)
         else:
