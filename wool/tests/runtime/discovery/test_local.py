@@ -330,7 +330,8 @@ class TestLocalDiscovery:
             with LocalDiscovery(namespace) as joiner:
                 assert joiner is not None
 
-    def test___exit___as_non_owner(self, namespace):
+    @pytest.mark.asyncio
+    async def test___exit___as_non_owner(self, namespace):
         """Test non-owner exit leaves shared memory accessible to owner.
 
         Given:
@@ -342,31 +343,22 @@ class TestLocalDiscovery:
             memory accessible to the owner.
         """
         # Arrange
-        with LocalDiscovery(namespace) as owner:
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="localhost:50051",
+            pid=123,
+            version="1.0",
+        )
+
+        with LocalDiscovery(namespace):
             with LocalDiscovery(namespace):
                 pass  # non-owner enters and exits
 
-            # Act — verify the owner can still use the address space
+            # Act & assert — publishing succeeds, proving shared
+            # memory was not unlinked by the non-owner
             publisher = LocalDiscovery.Publisher(namespace)
-
-            # Assert — publishing succeeds, proving shared memory
-            # was not unlinked by the non-owner
-            worker = WorkerMetadata(
-                uid=uuid.uuid4(),
-                address="localhost:50051",
-                pid=123,
-                version="1.0",
-            )
-            loop = asyncio.new_event_loop()
-            try:
-
-                async def publish():
-                    async with publisher:
-                        await publisher.publish("worker-added", worker)
-
-                loop.run_until_complete(publish())
-            finally:
-                loop.close()
+            async with publisher:
+                await publisher.publish("worker-added", worker)
 
     @pytest.mark.asyncio
     async def test___enter___non_owner_discovers_workers(self, namespace):
