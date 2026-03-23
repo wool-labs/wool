@@ -142,8 +142,21 @@ class WorkerPool:
         Worker factory callable. Defaults to :class:`LocalWorker`.
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
+
+        .. caution::
+
+           Pre-called context manager instances are not picklable and
+           will cause nested routine dispatch to fail.  Pass a callable
+           returning the context manager instead.  See :data:`Factory`.
+
     :param discovery:
         Discovery service instance, factory, or context manager.
+
+        .. caution::
+
+           Pre-called context manager instances are not picklable and
+           will cause nested routine dispatch to fail.  Pass a callable
+           returning the context manager instead.  See :data:`Factory`.
     :param credentials:
         Optional channel credentials for TLS/mTLS connections to workers.
     :raises ValueError:

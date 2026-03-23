@@ -168,10 +168,24 @@ class WorkerProxy:
         Additional tags for filtering discovered workers.
     :param discovery:
         Discovery service or event stream.
+
+        .. caution::
+
+           Pre-called context manager instances are not picklable and
+           will cause nested routine dispatch to fail.  Pass a callable
+           returning the context manager instead.  See :data:`Factory`.
+
     :param workers:
         Static worker list for direct connection.
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
+
+        .. caution::
+
+           Pre-called context manager instances are not picklable and
+           will cause nested routine dispatch to fail.  Pass a callable
+           returning the context manager instead.  See :data:`Factory`.
+
     :param credentials:
         Optional channel credentials for TLS/mTLS connections to workers.
     """
