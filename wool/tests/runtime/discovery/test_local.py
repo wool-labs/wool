@@ -361,7 +361,7 @@ class TestLocalDiscovery:
                 await publisher.publish("worker-added", worker)
 
     @pytest.mark.asyncio
-    async def test___enter___non_owner_discovers_workers(self, namespace):
+    async def test_subscribe_with_non_owner_discovery(self, namespace):
         """Test non-owner can discover workers published by the owner.
 
         Given:
@@ -400,13 +400,9 @@ class TestLocalDiscovery:
 
                     task = asyncio.create_task(collect(subscriber))
                     try:
-                        await asyncio.wait_for(
-                            event_received.wait(), timeout=2.0
-                        )
+                        await asyncio.wait_for(event_received.wait(), timeout=2.0)
                     except asyncio.TimeoutError:
-                        pytest.fail(
-                            "Worker not discovered via non-owner within timeout"
-                        )
+                        pytest.fail("Worker not discovered via non-owner within timeout")
                     finally:
                         task.cancel()
                         try:

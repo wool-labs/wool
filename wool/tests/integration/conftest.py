@@ -391,6 +391,8 @@ def _resolve_joiner(namespace, factory):
                     yield d
 
             return _acm(), None
+        case _:
+            raise ValueError(f"Unsupported factory for joiner: {factory}")
 
 
 @asynccontextmanager
@@ -406,32 +408,31 @@ async def _durable_joined_pool_context(discovery_factory, lb, creds, options):
 
     worker = LocalWorker(credentials=creds, options=options)
     await worker.start()
-
-    owner = LocalDiscovery(namespace)
-    owner.__enter__()
     try:
-        publisher = owner.publisher
-        async with publisher:
-            await publisher.publish("worker-added", worker.metadata)
-            joiner, _joiner_cm = _resolve_joiner(
-                namespace, discovery_factory
-            )
-            try:
-                pool = WorkerPool(
-                    discovery=joiner,
-                    loadbalancer=lb,
-                    credentials=creds,
-                    options=options,
-                )
-                async with pool:
-                    yield pool
-            finally:
-                if _joiner_cm is not None:
-                    _joiner_cm.__exit__(None, None, None)
-                await publisher.publish("worker-dropped", worker.metadata)
+        owner = LocalDiscovery(namespace)
+        owner.__enter__()
+        try:
+            publisher = owner.publisher
+            async with publisher:
+                await publisher.publish("worker-added", worker.metadata)
+                joiner, _joiner_cm = _resolve_joiner(namespace, discovery_factory)
+                try:
+                    pool = WorkerPool(
+                        discovery=joiner,
+                        loadbalancer=lb,
+                        credentials=creds,
+                        options=options,
+                    )
+                    async with pool:
+                        yield pool
+                finally:
+                    if _joiner_cm is not None:
+                        _joiner_cm.__exit__(None, None, None)
+                    await publisher.publish("worker-dropped", worker.metadata)
+        finally:
+            owner.__exit__(None, None, None)
     finally:
         await worker.stop()
-        owner.__exit__(None, None, None)
 
 
 async def invoke_routine(scenario):
@@ -644,10 +645,7 @@ def _pairwise_filter(row):
             return False
         if forbids_discovery and discovery is not DiscoveryFactory.NONE:
             return False
-        if (
-            pool_mode is PoolMode.DURABLE_JOINED
-            and discovery not in _LOCAL_FACTORIES
-        ):
+        if pool_mode is PoolMode.DURABLE_JOINED and discovery not in _LOCAL_FACTORIES:
             return False
     if len(row) > 3:
         lb = row[3]
