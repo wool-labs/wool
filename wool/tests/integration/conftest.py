@@ -54,6 +54,7 @@ class PoolMode(Enum):
     DEFAULT = auto()
     EPHEMERAL = auto()
     DURABLE = auto()
+    DURABLE_JOINED = auto()
     HYBRID = auto()
     NESTED_DEFAULT_IN_EPHEMERAL = auto()
     NESTED_EPHEMERAL_IN_EPHEMERAL = auto()
@@ -211,7 +212,10 @@ async def build_pool_from_scenario(scenario, credentials_map):
     discovery_obj = None
     _local_cm = None
 
-    if scenario.discovery is not DiscoveryFactory.NONE:
+    if (
+        scenario.discovery is not DiscoveryFactory.NONE
+        and scenario.pool_mode is not PoolMode.DURABLE_JOINED
+    ):
         namespace = f"integration-{uuid.uuid4().hex[:12]}"
 
         match scenario.discovery:
@@ -261,6 +265,11 @@ async def build_pool_from_scenario(scenario, credentials_map):
         try:
             if scenario.pool_mode is PoolMode.DURABLE:
                 async with _durable_pool_context(lb, creds, options) as pool:
+                    yield pool
+            elif scenario.pool_mode is PoolMode.DURABLE_JOINED:
+                async with _durable_joined_pool_context(
+                    scenario.discovery, lb, creds, options
+                ) as pool:
                     yield pool
             else:
                 pool_kwargs = {
@@ -345,6 +354,84 @@ async def _durable_pool_context(lb, creds, options):
                     await publisher.publish("worker-dropped", worker.metadata)
         finally:
             await worker.stop()
+
+
+_LOCAL_FACTORIES = (
+    DiscoveryFactory.LOCAL_DIRECT,
+    DiscoveryFactory.LOCAL_CALLABLE,
+    DiscoveryFactory.LOCAL_SYNC_CM,
+    DiscoveryFactory.LOCAL_ASYNC_CM,
+)
+
+
+def _resolve_joiner(namespace, factory):
+    """Resolve a DiscoveryFactory into a joiner discovery object.
+
+    Uses the given namespace (same as the owner), triggering the non-owner
+    fallback path in ``LocalDiscovery.__enter__``.
+
+    Returns ``(discovery_obj, entered_cm_or_None)``. The caller must
+    exit the CM (if non-None) when done.
+    """
+    match factory:
+        case DiscoveryFactory.LOCAL_DIRECT:
+            cm = LocalDiscovery(namespace)
+            cm.__enter__()
+            return _DirectDiscovery(cm), cm
+        case DiscoveryFactory.LOCAL_CALLABLE:
+            return (lambda: LocalDiscovery(namespace)), None  # noqa: E731
+        case DiscoveryFactory.LOCAL_SYNC_CM:
+            return LocalDiscovery(namespace), None
+        case DiscoveryFactory.LOCAL_ASYNC_CM:
+
+            @asynccontextmanager
+            async def _acm():
+                with LocalDiscovery(namespace) as d:
+                    yield d
+
+            return _acm(), None
+        case _:
+            raise ValueError(f"Unsupported factory for joiner: {factory}")
+
+
+@asynccontextmanager
+async def _durable_joined_pool_context(discovery_factory, lb, creds, options):
+    """Create a DURABLE pool that joins an externally owned namespace.
+
+    Sets up an owner ``LocalDiscovery`` that creates workers and publishes
+    them, then resolves a joiner discovery from the D3 factory form. The
+    joiner reuses the owner's namespace, exercising the non-owner fallback
+    path in ``LocalDiscovery.__enter__``.
+    """
+    namespace = f"joined-{uuid.uuid4().hex[:12]}"
+
+    worker = LocalWorker(credentials=creds, options=options)
+    await worker.start()
+    try:
+        owner = LocalDiscovery(namespace)
+        owner.__enter__()
+        try:
+            publisher = owner.publisher
+            async with publisher:
+                await publisher.publish("worker-added", worker.metadata)
+                joiner, _joiner_cm = _resolve_joiner(namespace, discovery_factory)
+                try:
+                    pool = WorkerPool(
+                        discovery=joiner,
+                        loadbalancer=lb,
+                        credentials=creds,
+                        options=options,
+                    )
+                    async with pool:
+                        yield pool
+                finally:
+                    if _joiner_cm is not None:
+                        _joiner_cm.__exit__(None, None, None)
+                    await publisher.publish("worker-dropped", worker.metadata)
+        finally:
+            owner.__exit__(None, None, None)
+    finally:
+        await worker.stop()
 
 
 async def invoke_routine(scenario):
@@ -498,7 +585,9 @@ def _pairwise_filter(row):
 
     - D3 must be NONE when D2 is DEFAULT, EPHEMERAL, DURABLE, or NESTED_*
       (DURABLE manages its own LocalDiscovery internally)
-    - D3 must NOT be NONE when D2 is HYBRID
+    - D3 must NOT be NONE when D2 is HYBRID or DURABLE_JOINED
+    - D3 must be a LOCAL_* variant when D2 is DURABLE_JOINED
+      (LanDiscovery does not support namespacing)
     - D4 must not be ASYNC_CM (pre-called async CM instances are not
       picklable inside WorkerProxy.__reduce__; documented limitation,
       see #61)
@@ -511,7 +600,10 @@ def _pairwise_filter(row):
     if len(row) > 2:
         pool_mode = row[1]
         discovery = row[2]
-        needs_discovery = pool_mode in (PoolMode.HYBRID,)
+        needs_discovery = pool_mode in (
+            PoolMode.HYBRID,
+            PoolMode.DURABLE_JOINED,
+        )
         forbids_discovery = pool_mode in (
             PoolMode.DEFAULT,
             PoolMode.EPHEMERAL,
@@ -522,6 +614,8 @@ def _pairwise_filter(row):
         if needs_discovery and discovery is DiscoveryFactory.NONE:
             return False
         if forbids_discovery and discovery is not DiscoveryFactory.NONE:
+            return False
+        if pool_mode is PoolMode.DURABLE_JOINED and discovery not in _LOCAL_FACTORIES:
             return False
     if len(row) > 3:
         lb = row[3]
@@ -573,7 +667,10 @@ def scenarios_strategy(draw):
     shape = draw(st.sampled_from(RoutineShape))
     pool_mode = draw(st.sampled_from(PoolMode))
 
-    needs_discovery = pool_mode in (PoolMode.HYBRID,)
+    needs_discovery = pool_mode in (
+        PoolMode.HYBRID,
+        PoolMode.DURABLE_JOINED,
+    )
     forbids_discovery = pool_mode in (
         PoolMode.DEFAULT,
         PoolMode.EPHEMERAL,
@@ -582,7 +679,9 @@ def scenarios_strategy(draw):
         PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
     )
 
-    if needs_discovery:
+    if pool_mode is PoolMode.DURABLE_JOINED:
+        discovery = draw(st.sampled_from(list(_LOCAL_FACTORIES)))
+    elif needs_discovery:
         discovery = draw(
             st.sampled_from(
                 [d for d in DiscoveryFactory if d is not DiscoveryFactory.NONE]

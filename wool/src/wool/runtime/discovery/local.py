@@ -219,20 +219,34 @@ class LocalDiscovery(Discovery):
 
     def __enter__(self) -> Self:
         size = self._capacity * 4
-        self._address_space = SharedMemory(
-            name=_short_hash(self._namespace),
-            create=True,
-            size=size,
-        )
+        try:
+            self._address_space = SharedMemory(
+                name=_short_hash(self._namespace),
+                create=True,
+                size=size,
+            )
+            self._owner = True
+        except FileExistsError:
+            self._address_space = SharedMemory(
+                name=_short_hash(self._namespace),
+                create=False,
+            )
+            self._owner = False
+
         assert self._address_space.buf
-        self._cleanup = atexit.register(lambda: self._address_space.unlink())
-        for i in range(size):
-            self._address_space.buf[i] = 0
+        if self._owner:
+            self._cleanup = atexit.register(lambda: self._address_space.unlink())
+            for i in range(size):
+                self._address_space.buf[i] = 0
         return self
 
     def __exit__(self, *_):
-        self._address_space.unlink()
-        atexit.unregister(self._cleanup)
+        if self._owner:
+            self._address_space.close()
+            self._address_space.unlink()
+            atexit.unregister(self._cleanup)
+        else:
+            self._address_space.close()
 
     @property
     def namespace(self):
