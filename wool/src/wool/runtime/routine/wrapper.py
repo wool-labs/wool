@@ -197,7 +197,7 @@ def routine(fn: C) -> C:
                         await stream.aclose()
                         return
                     except BaseException as exc:
-                        result = await stream.athrow(type(exc), exc)
+                        result = await stream.athrow(exc)
                     else:
                         if sent is None:
                             result = await stream.__anext__()
@@ -281,7 +281,7 @@ async def _stream(fn, parent, *args, **kwargs):
                 return
             except BaseException as exc:
                 with do_dispatch(True):
-                    result = await gen.athrow(type(exc), exc)
+                    result = await gen.athrow(exc)
             else:
                 with do_dispatch(True):
                     if sent is None:
