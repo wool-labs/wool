@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+import warnings
 from typing import TYPE_CHECKING
 from typing import AsyncContextManager
 from typing import AsyncGenerator
@@ -261,6 +262,27 @@ class WorkerProxy:
         self._id: uuid.UUID = uuid.uuid4()
         self._started = False
         self._loadbalancer = loadbalancer
+
+        if isinstance(loadbalancer, (ContextManager, AsyncContextManager)):
+            warnings.warn(
+                "Passing a context manager instance as 'loadbalancer' is "
+                "not picklable and will fail during nested routine "
+                "dispatch. Wrap it in a callable instead "
+                "(e.g., loadbalancer=my_cm instead of "
+                "loadbalancer=my_cm()).",
+                UserWarning,
+                stacklevel=2,
+            )
+        if isinstance(discovery, (ContextManager, AsyncContextManager)):
+            warnings.warn(
+                "Passing a context manager instance as 'discovery' is "
+                "not picklable and will fail during nested routine "
+                "dispatch. Wrap it in a callable instead "
+                "(e.g., discovery=my_cm instead of discovery=my_cm()).",
+                UserWarning,
+                stacklevel=2,
+            )
+
         if credentials is Undefined:
             self._credentials = CredentialContext.current()
         else:
@@ -326,7 +348,22 @@ class WorkerProxy:
 
         :returns:
             Tuple of (callable, args) for unpickling.
+        :raises TypeError:
+            If ``loadbalancer`` or ``discovery`` is a context manager
+            instance, which cannot be pickled.
         """
+        for name, value in (
+            ("loadbalancer", self._loadbalancer),
+            ("discovery", self._discovery),
+        ):
+            if isinstance(value, (ContextManager, AsyncContextManager)):
+                raise TypeError(
+                    f"Cannot pickle WorkerProxy: the '{name}' parameter "
+                    f"is a context manager instance ({type(value).__name__}), "
+                    f"which is not picklable. Wrap it in a callable "
+                    f"instead (e.g., {name}=my_cm instead of "
+                    f"{name}=my_cm())."
+                )
 
         def _restore_proxy(discovery, loadbalancer, options, proxy_id):
             proxy = WorkerProxy(
