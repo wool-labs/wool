@@ -381,7 +381,9 @@ class WorkerPool:
             self._workers[worker] = stop(worker)
 
         try:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if errors := [r for r in results if isinstance(r, Exception)]:
+                raise ExceptionGroup("worker spawn failures", errors)
             yield [w.metadata for w in self._workers if w.metadata]
         finally:
             tasks = [asyncio.create_task(stop) for stop in self._workers.values()]
