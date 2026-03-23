@@ -148,6 +148,13 @@ class WorkerPool:
         Optional channel credentials for TLS/mTLS connections to workers.
     :raises ValueError:
         If configuration is invalid or CPU count unavailable.
+
+    .. caution::
+
+       Pre-called context manager instances passed as ``loadbalancer``
+       or ``discovery`` are not picklable and will cause nested routine
+       dispatch to fail.  Pass a callable returning the context manager
+       instead.  See :data:`Factory`.
     """
 
     _workers: Final[dict[WorkerLike, Coroutine]]
