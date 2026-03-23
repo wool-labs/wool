@@ -1,4 +1,5 @@
 import asyncio
+import warnings
 from inspect import getsourcelines
 from inspect import isasyncgen
 
@@ -781,6 +782,38 @@ async def test_routine_with_athrow_causing_return():
         # Act & assert
         with pytest.raises(StopAsyncIteration):
             await gen.athrow(Resettable)
+
+
+@pytest.mark.asyncio
+async def test_routine_with_athrow_no_deprecation_warning():
+    """Test athrow does not emit a DeprecationWarning.
+
+    Given:
+        A @routine-decorated async generator that catches a thrown
+        exception and yields a recovery value.
+    When:
+        athrow() is called with the exception.
+    Then:
+        It should not emit a DeprecationWarning.
+    """
+    with do_dispatch(False):
+        # Arrange
+        gen = resilient_counter(5)
+        await gen.__anext__()
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await gen.athrow(Resettable)
+
+        # Assert
+        deprecations = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert deprecations == [], (
+            f"Unexpected DeprecationWarning(s): {deprecations}"
+        )
+        await gen.aclose()
 
 
 @pytest.mark.asyncio
