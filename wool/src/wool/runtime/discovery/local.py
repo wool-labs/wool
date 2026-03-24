@@ -788,7 +788,7 @@ async def _lock(namespace: str):
         The namespace identifying the shared memory region to lock.
     """
     lock_name = _short_hash(namespace)
-    lock_path = Path(tempfile.gettempdir()) / f"wool-lock-{lock_name}"
+    lock_path = Path(tempfile.gettempdir()).resolve() / f"wool-lock-{lock_name}"
 
     with open(lock_path, "w") as lock_file:
         while True:
@@ -815,6 +815,6 @@ def _watchdog_path(namespace: str) -> Path:
     :returns:
         Path to the notification file for this namespace.
     """
-    directory = Path(tempfile.gettempdir()) / f"wool-{namespace}"
+    directory = Path(tempfile.gettempdir()).resolve() / f"wool-{namespace}"
     directory.mkdir(exist_ok=True)
     return directory / "notify"
