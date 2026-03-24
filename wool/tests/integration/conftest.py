@@ -239,17 +239,21 @@ async def build_pool_from_scenario(scenario, credentials_map):
             case DiscoveryFactory.LAN_DIRECT:
                 from wool.runtime.discovery.lan import LanDiscovery
 
-                discovery_obj = LanDiscovery()
+                lan_ns = f"integration-lan-{uuid.uuid4().hex[:12]}"
+                discovery_obj = LanDiscovery(lan_ns)
             case DiscoveryFactory.LAN_CALLABLE:
                 from wool.runtime.discovery.lan import LanDiscovery
 
-                discovery_obj = lambda: LanDiscovery()  # noqa: E731
+                lan_ns = f"integration-lan-{uuid.uuid4().hex[:12]}"
+                discovery_obj = lambda: LanDiscovery(lan_ns)  # noqa: E731
             case DiscoveryFactory.LAN_ASYNC_CM:
                 from wool.runtime.discovery.lan import LanDiscovery
 
+                lan_ns = f"integration-lan-{uuid.uuid4().hex[:12]}"
+
                 @asynccontextmanager
                 async def _lan_async_cm():
-                    discovery = LanDiscovery()
+                    discovery = LanDiscovery(lan_ns)
                     yield discovery
 
                 discovery_obj = _lan_async_cm()

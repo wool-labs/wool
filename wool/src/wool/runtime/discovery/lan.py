@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import socket
 from asyncio import Queue
@@ -8,9 +9,9 @@ from types import MappingProxyType
 from typing import AsyncIterator
 from typing import Dict
 from typing import Final
-from typing import Literal
 from typing import Tuple
 from uuid import UUID
+from uuid import uuid4
 
 from zeroconf import IPVersion
 from zeroconf import ServiceInfo
@@ -32,11 +33,22 @@ from wool.runtime.discovery.base import WorkerMetadata
 class LanDiscovery(Discovery):
     """Zeroconf DNS-SD discovery for network-wide worker pools.
 
-    Workers are advertised as DNS-SD service records
-    (``_wool._tcp.local.``) on the local network. Subscribers
-    browse for these services and receive events as workers come
-    and go. No central coordinator required.
+    Workers are advertised as DNS-SD service records on the local
+    network. Subscribers browse for these services and receive events
+    as workers come and go. No central coordinator required.
 
+    Each instance is scoped to a namespace that determines the DNS-SD
+    service type used for registration and browsing. Only publishers
+    and subscribers sharing the same namespace see each other's
+    announcements. When no namespace is provided, a UUID-based
+    namespace is auto-generated so that each instance is isolated by
+    default.
+
+    :param namespace:
+        Namespace identifier for discovery isolation. Publishers
+        and subscribers using the same namespace will see each
+        other's worker announcements. Defaults to a UUID-based
+        auto-generated namespace.
     :param filter:
         Optional default predicate function to filter workers.
         Used by :py:attr:`subscriber` and as the default for
@@ -46,7 +58,7 @@ class LanDiscovery(Discovery):
 
     .. code-block:: python
 
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery("my-pool").publisher
         async with publisher:
             await publisher.publish("worker-added", metadata)
 
@@ -54,20 +66,33 @@ class LanDiscovery(Discovery):
 
     .. code-block:: python
 
-        discovery = LanDiscovery()
+        discovery = LanDiscovery("my-pool")
         async for event in discovery.subscriber:
             print(f"Discovered worker: {event.metadata}")
     """
 
+    _namespace: Final[str]
     _filter: Final[PredicateFunction | None]
-    service_type: Literal["_wool._tcp.local."] = "_wool._tcp.local."
+    _service_type: Final[str]
 
     def __init__(
         self,
+        namespace: str | None = None,
         *,
         filter: PredicateFunction | None = None,
     ):
+        self._namespace = namespace or f"pool-{uuid4().hex}"
         self._filter = filter
+        self._service_type = _namespaced_service_type(self._namespace)
+
+    @property
+    def namespace(self) -> str:
+        """The namespace identifier for this discovery service.
+
+        :returns:
+            The namespace string.
+        """
+        return self._namespace
 
     @property
     def publisher(self) -> DiscoveryPublisherLike:
@@ -76,7 +101,7 @@ class LanDiscovery(Discovery):
         :returns:
             A publisher instance for broadcasting worker events.
         """
-        return self.Publisher()
+        return self.Publisher(self._service_type)
 
     @property
     def subscriber(self) -> DiscoverySubscriberLike:
@@ -102,7 +127,10 @@ class LanDiscovery(Discovery):
             A subscriber instance that receives filtered worker
             discovery events.
         """
-        return self.Subscriber(filter if filter is not None else self._filter)
+        return self.Subscriber(
+            self._service_type,
+            filter if filter is not None else self._filter,
+        )
 
     class Publisher:
         """Publisher for broadcasting worker discovery events.
@@ -115,13 +143,16 @@ class LanDiscovery(Discovery):
         Uses AsyncZeroconf for non-blocking service registration and
         management. Services are advertised on localhost (127.0.0.1) to
         avoid network warnings during development.
+
+        :param service_type:
+            The DNS-SD service type string for this namespace.
         """
 
         aiozc: AsyncZeroconf | None
         services: Dict[str, ServiceInfo]
-        service_type: Literal["_wool._tcp.local."] = "_wool._tcp.local."
 
-        def __init__(self):
+        def __init__(self, service_type: str):
+            self.service_type = service_type
             self.aiozc = None
             self.services = {}
 
@@ -296,6 +327,8 @@ class LanDiscovery(Discovery):
         changes and converts Zeroconf events into Wool discovery
         events.
 
+        :param service_type:
+            The DNS-SD service type string for this namespace.
         :param filter:
             Optional predicate function to filter workers. Only workers
             for which the predicate returns True will be included in
@@ -303,12 +336,13 @@ class LanDiscovery(Discovery):
         """
 
         _filter: Final[PredicateFunction[WorkerMetadata] | None]
-        service_type: Literal["_wool._tcp.local."] = "_wool._tcp.local."
 
         def __init__(
             self,
+            service_type: str,
             filter: PredicateFunction[WorkerMetadata] | None = None,
         ) -> None:
+            self.service_type = service_type
             self._filter = filter
 
         def __aiter__(self) -> AsyncIterator[DiscoveryEvent]:
@@ -337,6 +371,7 @@ class LanDiscovery(Discovery):
                     aiozc.zeroconf,
                     self.service_type,
                     listener=self._Listener(
+                        service_type=self.service_type,
                         aiozc=aiozc,
                         event_queue=event_queue,
                         service_cache=service_cache,
@@ -356,6 +391,8 @@ class LanDiscovery(Discovery):
         class _Listener(ServiceListener):
             """Zeroconf listener that delivers worker service events.
 
+            :param service_type:
+                The DNS-SD service type string for this namespace.
             :param aiozc:
                 The AsyncZeroconf instance to use for async service
                 info retrieval.
@@ -375,11 +412,13 @@ class LanDiscovery(Discovery):
 
             def __init__(
                 self,
+                service_type: str,
                 aiozc: AsyncZeroconf,
                 event_queue: Queue[DiscoveryEvent],
                 predicate: PredicateFunction[WorkerMetadata],
                 service_cache: Dict[str, WorkerMetadata],
             ) -> None:
+                self._service_type = service_type
                 self.aiozc = aiozc
                 self._event_queue = event_queue
                 self._predicate = predicate
@@ -388,12 +427,12 @@ class LanDiscovery(Discovery):
 
             def add_service(self, zc: Zeroconf, type_: str, name: str):  # noqa: ARG002
                 """Called by Zeroconf when a service is added."""
-                if type_ == LanDiscovery.service_type:
+                if type_ == self._service_type:
                     asyncio.create_task(self._handle_add_service(type_, name))
 
             def remove_service(self, zc: Zeroconf, type_: str, name: str):  # noqa: ARG002
                 """Called by Zeroconf when a service is removed."""
-                if type_ == LanDiscovery.service_type:
+                if type_ == self._service_type:
                     if worker := self._service_cache.pop(name, None):
                         asyncio.create_task(
                             self._event_queue.put(
@@ -403,7 +442,7 @@ class LanDiscovery(Discovery):
 
             def update_service(self, zc: Zeroconf, type_, name):  # noqa: ARG002
                 """Called by Zeroconf when a service is updated."""
-                if type_ == LanDiscovery.service_type:
+                if type_ == self._service_type:
                     asyncio.create_task(self._handle_update_service(type_, name))
 
             async def _handle_add_service(self, type_: str, name: str):
@@ -469,6 +508,24 @@ class LanDiscovery(Discovery):
                     pass
 
 
+def _namespaced_service_type(namespace: str) -> str:
+    """Derive a DNS-SD service type from a namespace string.
+
+    Produces a deterministic service type by appending a short hash of
+    the namespace to the base ``_wool`` label. The resulting label is
+    at most 13 characters, within the DNS-SD 15-character limit.
+
+    :param namespace:
+        The namespace identifier.
+    :returns:
+        A service type string like ``_wool-a1b2c3._tcp.local.``.
+    """
+    short = hashlib.md5(
+        namespace.encode(), usedforsecurity=False
+    ).hexdigest()[:6]
+    return f"_wool-{short}._tcp.local."
+
+
 def _serialize_metadata(
     info: WorkerMetadata,
 ) -> dict[str, str | None]:
@@ -525,7 +582,7 @@ def _deserialize_metadata(info: ServiceInfo) -> WorkerMetadata:
     if "secure" in properties and properties["secure"]:
         secure = properties["secure"].lower() == "true"
 
-    # Extract UID from service name (format: "<uuid>._wool._tcp.local.")
+    # Extract UID from service name (format: "<uuid>.<service_type>")
     service_name = info.name
     uid_str = service_name.split(".")[0]
 
