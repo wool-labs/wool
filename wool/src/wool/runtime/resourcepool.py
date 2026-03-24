@@ -222,6 +222,43 @@ class ResourcePool(Generic[T]):
         """
         return Resource(self, key)
 
+    def get_or_create_sync(
+        self, key: Any, factory: Callable[[Any], T] | None = None
+    ) -> T:
+        """Synchronously get or create a cached resource.
+
+        Returns the cached object for *key* if it exists, incrementing
+        its reference count.  On cache miss, calls *factory* (or the
+        pool's default factory) with *key* to create and cache a new
+        object.
+
+        .. note::
+            Safe to call from synchronous code only when the factory
+            requires no I/O.  Does not acquire the async lock —
+            callers must ensure no concurrent async operations on the
+            same key.
+
+        :param key:
+            The cache key.
+        :param factory:
+            Optional factory override.  Falls back to the pool's
+            default factory.
+        :returns:
+            The cached or newly created object.
+        """
+        if key in self._cache:
+            entry = self._cache[key]
+            entry.reference_count += 1
+            if entry.cleanup is not None and not entry.cleanup.done():
+                entry.cleanup.cancel()
+                entry.cleanup = None
+            return entry.obj
+
+        f = factory or self._factory
+        obj = cast(T, f(key))
+        self._cache[key] = self.CacheEntry(obj=obj, reference_count=1)
+        return obj
+
     async def acquire(self, key: Any) -> T:
         """
         Internal acquire method - acquires a reference to the cached object.
