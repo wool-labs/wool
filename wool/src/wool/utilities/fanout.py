@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import weakref
-from typing import AsyncIterable
+from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Final
 from typing import Generic
@@ -23,16 +23,14 @@ class Fanout(Generic[T]):
     it to every other consumer's queue.
 
     :param source:
-        The async iterable to multicast.
+        The async generator to multicast.
     """
 
-    def __init__(self, source: AsyncIterable[T]) -> None:
+    def __init__(self, source: AsyncGenerator[T]) -> None:
         self._source = source
         self._lock = asyncio.Lock()
         self._iterator: AsyncIterator[T] | None = None
-        self._consumers: weakref.WeakSet[FanoutConsumer[T]] = (
-            weakref.WeakSet()
-        )
+        self._consumers: weakref.WeakSet[FanoutConsumer[T]] = weakref.WeakSet()
 
     def consumer(self) -> FanoutConsumer[T]:
         """Create a new independent consumer.
@@ -51,12 +49,11 @@ class Fanout(Generic[T]):
         After cleanup, any active consumer will receive
         :exc:`StopAsyncIteration` on its next pull.
         """
-        it, self._iterator = self._iterator, None
-        if it is not None:
-            try:
-                await it.aclose()
-            except Exception:
-                pass
+        self._iterator = None
+        try:
+            await self._source.aclose()
+        except Exception:
+            pass
         for c in list(self._consumers):
             c._queue.put_nowait(_SENTINEL)
 

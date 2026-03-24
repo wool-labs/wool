@@ -432,6 +432,10 @@ class WorkerService(protocol.WorkerServicer):
         try:
             if proxy_pool := wool.__proxy_pool__.get():
                 await proxy_pool.clear()
+            from wool.runtime.discovery import __subscriber_pool__
+
+            if subscriber_pool := __subscriber_pool__.get():
+                await subscriber_pool.clear()
         finally:
             await self._loop_pool.clear()
             self._stopped.set()

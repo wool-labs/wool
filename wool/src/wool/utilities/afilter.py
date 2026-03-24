@@ -44,6 +44,9 @@ class afilter:
         self._predicate = predicate
         self._inner = inner
 
+    def __reduce__(self) -> tuple:
+        return (afilter, (self._predicate, self._inner))
+
     def __aiter__(self) -> AsyncIterator[DiscoveryEvent]:
         return self._filter()
 
@@ -59,17 +62,13 @@ class afilter:
             if event.type == "worker-dropped":
                 if was_tracked:
                     del tracked[uid]
-                    yield DiscoveryEvent(
-                        "worker-dropped", metadata=worker
-                    )
+                    yield DiscoveryEvent("worker-dropped", metadata=worker)
             elif passes and not was_tracked:
                 tracked[uid] = worker
                 yield DiscoveryEvent("worker-added", metadata=worker)
             elif passes and was_tracked:
                 tracked[uid] = worker
-                yield DiscoveryEvent(
-                    "worker-updated", metadata=worker
-                )
+                yield DiscoveryEvent("worker-updated", metadata=worker)
             elif not passes and was_tracked:
                 old = tracked.pop(uid)
                 yield DiscoveryEvent("worker-dropped", metadata=old)
