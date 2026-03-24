@@ -1228,6 +1228,59 @@ class TestLocalDiscoverySubscriber:
         assert len(events) >= 1
         assert events[0].type == "worker-added"
 
+    @pytest.mark.asyncio
+    async def test___aiter___with_watchdog_notification(self, namespace, metadata):
+        """Test subscriber discovers workers via watchdog filesystem notification.
+
+        Given:
+            A subscriber with no poll_interval (watchdog-only, no polling fallback)
+        When:
+            A worker is published
+        Then:
+            It should yield the event promptly via filesystem notification,
+            proving the watchdog on_modified path comparison works with
+            resolved symlinks.
+        """
+        # Arrange
+        events = []
+        event_received = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                events.append(event)
+                event_received.set()
+                break
+
+        with LocalDiscovery(namespace):
+            publisher = LocalDiscovery.Publisher(namespace)
+            subscriber = LocalDiscovery.Subscriber(namespace)
+
+            async with publisher:
+                task = asyncio.create_task(collect(subscriber))
+                await asyncio.sleep(0.05)
+
+                # Act
+                await publisher.publish("worker-added", metadata)
+
+                try:
+                    await asyncio.wait_for(event_received.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pytest.fail(
+                        "Worker not discovered via watchdog notification "
+                        "within timeout — symlink path mismatch? (see #115)"
+                    )
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        # Assert
+        assert len(events) == 1
+        assert events[0].type == "worker-added"
+        assert events[0].metadata.uid == metadata.uid
+
     def test___reduce___pickle_roundtrip(self, namespace):
         """Test Subscriber pickle roundtrip via cloudpickle.
 
