@@ -6,14 +6,9 @@ from inspect import getsourcelines
 from inspect import isasyncgen
 from inspect import isasyncgenfunction
 from inspect import iscoroutinefunction
-from sys import modules
-from types import ModuleType
 from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import Coroutine
-from typing import ParamSpec
-from typing import Tuple
-from typing import Type
 from typing import TypeVar
 from typing import cast
 from uuid import uuid4
@@ -27,8 +22,6 @@ if TYPE_CHECKING:
     from wool.runtime.worker.proxy import WorkerProxy
 
 C = TypeVar("C", bound=Callable[..., Coroutine | AsyncGenerator])
-P = ParamSpec("P")
-R = TypeVar("R")
 
 
 # public
@@ -140,37 +133,26 @@ def routine(fn: C) -> C:
                 async for value in fibonacci_series(10):
                     print(value)  # 0, 1, 1, 2, 3, 5, 8, 13, 21, 34
     """
-    # Check if function is a coroutine or async generator
-    is_valid = (
-        iscoroutinefunction(fn)
-        or isasyncgenfunction(fn)
-        or (
-            isinstance(fn, (classmethod, staticmethod))
-            and (iscoroutinefunction(fn.__func__) or isasyncgenfunction(fn.__func__))
-        )
-    )
-    if not is_valid:
-        raise ValueError("Expected a coroutine function or async generator function")
-
     if isinstance(fn, (classmethod, staticmethod)):
-        wrapped_fn = fn.__func__
-    else:
-        wrapped_fn = fn
+        raise ValueError(
+            "@wool.routine must be applied before "
+            "@classmethod/@staticmethod"
+        )
+
+    if not iscoroutinefunction(fn) and not isasyncgenfunction(fn):
+        raise ValueError(
+            "Expected a coroutine function or async generator function"
+        )
 
     try:
-        _, lineno = getsourcelines(wrapped_fn)
+        _, lineno = getsourcelines(fn)
     except OSError:
         lineno = 0
 
-    if isasyncgenfunction(wrapped_fn):
+    if isasyncgenfunction(fn):
 
-        @wraps(wrapped_fn)
+        @wraps(fn)
         async def async_generator_wrapper(*args, **kwargs):
-            # Handle static and class methods in a picklable way.
-            parent, function = _resolve(fn)
-            assert parent is not None
-            assert callable(function)
-
             if do_dispatch():
                 proxy = wool.__proxy__.get()
                 assert proxy
@@ -179,12 +161,12 @@ def routine(fn: C) -> C:
                     async_generator_wrapper.__module__,
                     async_generator_wrapper.__qualname__,
                     lineno,
-                    function,
+                    fn,
                     *args,
                     **kwargs,
                 )
             else:
-                stream = _stream(fn, parent, *args, **kwargs)
+                stream = _stream(fn, *args, **kwargs)
                 assert isasyncgen(stream)
 
             try:
@@ -212,13 +194,8 @@ def routine(fn: C) -> C:
 
     else:
 
-        @wraps(wrapped_fn)
+        @wraps(fn)
         async def coroutine_wrapper(*args, **kwargs):
-            # Handle static and class methods in a picklable way.
-            parent, function = _resolve(fn)
-            assert parent is not None
-            assert callable(function)
-
             if do_dispatch():
                 proxy = wool.__proxy__.get()
                 assert proxy
@@ -227,15 +204,13 @@ def routine(fn: C) -> C:
                     coroutine_wrapper.__module__,
                     coroutine_wrapper.__qualname__,
                     lineno,
-                    function,
+                    fn,
                     *args,
                     **kwargs,
                 )
-                coro = _stream_to_coroutine(stream)
+                return await _stream_to_coroutine(stream)
             else:
-                coro = _execute(fn, parent, *args, **kwargs)
-
-            return await coro
+                return await _execute(fn, *args, **kwargs)
 
         return cast(C, coroutine_wrapper)
 
@@ -262,13 +237,8 @@ def _dispatch(
     return proxy.dispatch(task, timeout=ctx.dispatch_timeout.get())
 
 
-async def _stream(fn, parent, *args, **kwargs):
-    if isinstance(fn, classmethod):
-        gen = fn.__func__(parent, *args, **kwargs)
-    elif isinstance(fn, staticmethod):
-        gen = fn.__func__(*args, **kwargs)
-    else:
-        gen = fn(*args, **kwargs)
+async def _stream(fn, *args, **kwargs):
+    gen = fn(*args, **kwargs)
     try:
         sent = None
         with do_dispatch(True):
@@ -294,28 +264,10 @@ async def _stream(fn, parent, *args, **kwargs):
         await gen.aclose()
 
 
-async def _execute(fn, parent, *args, **kwargs):
+async def _execute(fn, *args, **kwargs):
     with do_dispatch(True):
-        if isinstance(fn, classmethod):
-            return await fn.__func__(parent, *args, **kwargs)
-        elif isinstance(fn, staticmethod):
-            return await fn.__func__(*args, **kwargs)
-        else:
-            return await fn(*args, **kwargs)
+        return await fn(*args, **kwargs)
 
 
 async def _stream_to_coroutine(stream):
     return await anext(stream, None)
-
-
-def _resolve(
-    method: Callable[P, R] | classmethod | staticmethod,
-) -> Tuple[Type | ModuleType | None, Callable[P, R]]:
-    scope = modules[method.__module__]
-    parent = None
-    for name in method.__qualname__.split("."):
-        parent = scope
-        scope = getattr(scope, name)
-        assert scope
-    assert isinstance(parent, (Type, ModuleType))
-    return parent, cast(Callable[P, R], scope)
