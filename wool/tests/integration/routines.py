@@ -113,27 +113,27 @@ class Routines:
         while True:
             yield "alive"
 
-    @wool.routine
     @classmethod
+    @wool.routine
     async def class_add(cls, a: int, b: int) -> int:
         """Class method coroutine."""
         return a + b
 
-    @wool.routine
     @classmethod
+    @wool.routine
     async def class_gen(cls, n: int):
         """Class method async generator."""
         for i in range(n):
             yield i
 
-    @wool.routine
     @staticmethod
+    @wool.routine
     async def static_add(a: int, b: int) -> int:
         """Static method coroutine."""
         return a + b
 
-    @wool.routine
     @staticmethod
+    @wool.routine
     async def static_gen(n: int):
         """Static method async generator."""
         for i in range(n):
