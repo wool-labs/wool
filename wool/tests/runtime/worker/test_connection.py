@@ -655,9 +655,7 @@ class TestWorkerConnection:
 
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(
-                result=protocol.Message(dump=cloudpickle.dumps("result"))
-            ),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -666,9 +664,7 @@ class TestWorkerConnection:
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
         mock_channel = mocker.AsyncMock()
-        mocker.patch.object(
-            grpc.aio, "insecure_channel", return_value=mock_channel
-        )
+        mocker.patch.object(grpc.aio, "insecure_channel", return_value=mock_channel)
 
         connection = WorkerConnection(target, limit=10)
 
