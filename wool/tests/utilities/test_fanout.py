@@ -106,19 +106,15 @@ class TestFanout:
         # Arrange
         closed = False
 
-        class _TrackedSource:
-            def __aiter__(self):
-                return self._gen()
+        async def tracked_source():
+            nonlocal closed
+            try:
+                while True:
+                    yield "item"
+            finally:
+                closed = True
 
-            async def _gen(self):
-                nonlocal closed
-                try:
-                    while True:
-                        yield "item"
-                finally:
-                    closed = True
-
-        fanout = Fanout(_TrackedSource())
+        fanout = Fanout(tracked_source())
         consumer = fanout.consumer()
         await anext(consumer)  # initialise the iterator
 
@@ -140,6 +136,7 @@ class TestFanout:
             It should swallow the exception and still signal
             consumers with a sentinel.
         """
+
         # Arrange
         class _FailingSource:
             def __aiter__(self):
@@ -365,6 +362,7 @@ class TestFanoutConsumer:
             The consumer that waited for the lock should receive
             the item from its queue via the double-check path.
         """
+
         # Arrange — source suspends so the event loop can
         # schedule both consumers before the first completes.
         class _SuspendingSource:
@@ -380,9 +378,7 @@ class TestFanoutConsumer:
         consumer_b = fanout.consumer()
 
         # Act — concurrent pulls force the double-check path
-        results = await asyncio.gather(
-            anext(consumer_a), anext(consumer_b)
-        )
+        results = await asyncio.gather(anext(consumer_a), anext(consumer_b))
 
         # Assert — both receive the same item
         assert results == ["item", "item"]
@@ -401,6 +397,7 @@ class TestFanoutConsumer:
             from the source, the other via the SENTINEL placed in
             its queue during the lock double-check.
         """
+
         # Arrange — source suspends then exhausts, allowing the
         # event loop to interleave both consumers before either
         # completes.
