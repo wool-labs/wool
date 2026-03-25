@@ -40,14 +40,34 @@ def routine(fn: C) -> C:
         The decorated function that dispatches to the worker pool when
         called.
     :raises ValueError:
-        If the decorated function is not a coroutine function or async
-        generator function.
+        If the decorated function is a ``classmethod`` or
+        ``staticmethod`` descriptor (apply ``@wool.routine`` before
+        the descriptor decorator), or if the decorated function is
+        not a coroutine function or async generator function.
 
     .. note::
         Decorated functions behave like regular coroutines or async
         generators and can be awaited, iterated over, and cancelled
         normally. Task execution occurs transparently across the
         distributed worker pool.
+
+    .. note::
+        When using ``@wool.routine`` on a ``@classmethod`` or
+        ``@staticmethod``, apply ``@wool.routine`` first (innermost)
+        and the descriptor decorator second (outermost). The routine
+        decorator operates on the raw function and cannot unwrap
+        descriptor objects.
+
+        .. code-block:: python
+
+            class MyService:
+                @classmethod
+                @wool.routine
+                async def fetch(cls, key: str) -> bytes: ...
+
+                @staticmethod
+                @wool.routine
+                async def ping() -> bool: ...
 
     **Async Generator Support:**
 
@@ -135,14 +155,11 @@ def routine(fn: C) -> C:
     """
     if isinstance(fn, (classmethod, staticmethod)):
         raise ValueError(
-            "@wool.routine must be applied before "
-            "@classmethod/@staticmethod"
+            "@wool.routine must be applied before @classmethod/@staticmethod"
         )
 
     if not iscoroutinefunction(fn) and not isasyncgenfunction(fn):
-        raise ValueError(
-            "Expected a coroutine function or async generator function"
-        )
+        raise ValueError("Expected a coroutine function or async generator function")
 
     try:
         _, lineno = getsourcelines(fn)
