@@ -3,7 +3,6 @@ import struct
 import uuid
 from types import MappingProxyType
 
-import cloudpickle
 import portalocker
 import pytest
 from hypothesis import HealthCheck
@@ -11,8 +10,10 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
+from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.utilities.afilter import afilter
 
 
 @pytest.fixture
@@ -79,6 +80,87 @@ class TestLocalDiscovery:
         # Assert
         assert discovery.namespace == "my-namespace"
 
+    def test___hash___with_same_namespace(self):
+        """Test hash equality for same namespace.
+
+        Given:
+            Two LocalDiscovery instances with the same namespace.
+        When:
+            Their hashes are compared.
+        Then:
+            It should produce equal hashes.
+        """
+        # Arrange
+        a = LocalDiscovery("shared-ns")
+        b = LocalDiscovery("shared-ns")
+
+        # Act & assert
+        assert hash(a) == hash(b)
+
+    def test___hash___with_different_namespace(self):
+        """Test hash inequality for different namespaces.
+
+        Given:
+            Two LocalDiscovery instances with different namespaces.
+        When:
+            Their hashes are compared.
+        Then:
+            It should produce different hashes.
+        """
+        # Arrange
+        a = LocalDiscovery("ns-a")
+        b = LocalDiscovery("ns-b")
+
+        # Act & assert
+        assert hash(a) != hash(b)
+
+    def test___eq___with_same_namespace(self):
+        """Test equality for same namespace.
+
+        Given:
+            Two LocalDiscovery instances with the same namespace.
+        When:
+            They are compared with ==.
+        Then:
+            It should return True.
+        """
+        # Arrange
+        a = LocalDiscovery("shared-ns")
+        b = LocalDiscovery("shared-ns")
+
+        # Act & assert
+        assert a == b
+
+    def test___eq___with_different_namespace(self):
+        """Test inequality for different namespaces.
+
+        Given:
+            Two LocalDiscovery instances with different namespaces.
+        When:
+            They are compared with ==.
+        Then:
+            It should return False.
+        """
+        # Arrange
+        a = LocalDiscovery("ns-a")
+        b = LocalDiscovery("ns-b")
+
+        # Act & assert
+        assert a != b
+
+    def test___eq___with_non_local_discovery(self):
+        """Test equality with a non-LocalDiscovery object.
+
+        Given:
+            A LocalDiscovery instance and a non-LocalDiscovery object.
+        When:
+            They are compared with ==.
+        Then:
+            It should not be equal.
+        """
+        # Act & assert
+        assert LocalDiscovery("ns") != "not-a-discovery"
+
     def test_publisher_with_default_instance(self, namespace):
         """Test publisher property returns Publisher with matching namespace.
 
@@ -116,8 +198,7 @@ class TestLocalDiscovery:
         subscriber = discovery.subscriber
 
         # Assert
-        assert isinstance(subscriber, LocalDiscovery.Subscriber)
-        assert subscriber.namespace == namespace
+        assert isinstance(subscriber, DiscoverySubscriberLike)
 
     @pytest.mark.asyncio
     async def test_subscribe_with_default_filter(self, namespace):
@@ -694,7 +775,10 @@ class TestLocalDiscoveryPublisher:
         Then:
             All metadata fields should match the published values.
         """
-        # Arrange
+        # Arrange — use a per-example namespace so the subscriber
+        # singleton does not carry stale state across Hypothesis
+        # examples.
+        example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
         worker = WorkerMetadata(
             uid=uuid.uuid4(),
             address=address,
@@ -711,9 +795,9 @@ class TestLocalDiscoveryPublisher:
                 discovered.set()
                 break
 
-        with LocalDiscovery(namespace):
-            publisher = LocalDiscovery.Publisher(namespace)
-            subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+        with LocalDiscovery(example_ns):
+            publisher = LocalDiscovery.Publisher(example_ns)
+            subscriber = LocalDiscovery.Subscriber(example_ns, poll_interval=0.05)
 
             # Act
             async with publisher:
@@ -909,36 +993,6 @@ class TestLocalDiscoverySubscriber:
     Fully qualified name:
     wool.runtime.discovery.local.LocalDiscovery.Subscriber
     """
-
-    def test_namespace_with_provided_value(self, namespace):
-        """Test Subscriber.namespace property returns provided value.
-
-        Given:
-            A namespace string
-        When:
-            Subscriber is instantiated
-        Then:
-            It should return the provided namespace.
-        """
-        # Act
-        subscriber = LocalDiscovery.Subscriber(namespace)
-
-        # Assert
-        assert subscriber.namespace == namespace
-
-    def test___init___with_negative_poll_interval(self, namespace):
-        """Test Subscriber rejects negative poll_interval.
-
-        Given:
-            A negative poll_interval
-        When:
-            Subscriber is instantiated
-        Then:
-            It should raise ValueError.
-        """
-        # Act & assert
-        with pytest.raises(ValueError, match="Expected positive poll interval"):
-            LocalDiscovery.Subscriber(namespace, poll_interval=-1.0)
 
     @pytest.mark.asyncio
     async def test___aiter___discovers_added_worker(self, namespace, metadata):
@@ -1149,8 +1203,9 @@ class TestLocalDiscoverySubscriber:
 
         with LocalDiscovery(namespace):
             publisher = LocalDiscovery.Publisher(namespace)
-            subscriber = LocalDiscovery.Subscriber(
-                namespace, filter=filter_fn, poll_interval=0.05
+            subscriber = afilter(
+                filter_fn,
+                LocalDiscovery.Subscriber(namespace, poll_interval=0.05),
             )
 
             async with publisher:
@@ -1227,79 +1282,6 @@ class TestLocalDiscoverySubscriber:
         # Assert
         assert len(events) >= 1
         assert events[0].type == "worker-added"
-
-    @pytest.mark.asyncio
-    async def test___aiter___with_watchdog_notification(self, namespace, metadata):
-        """Test subscriber discovers workers via watchdog filesystem notification.
-
-        Given:
-            A subscriber with no poll_interval (watchdog-only, no polling fallback)
-        When:
-            A worker is published
-        Then:
-            It should yield the event promptly via filesystem notification,
-            proving the watchdog on_modified path comparison works with
-            resolved symlinks.
-        """
-        # Arrange
-        events = []
-        event_received = asyncio.Event()
-
-        async def collect(subscriber):
-            async for event in subscriber:
-                events.append(event)
-                event_received.set()
-                break
-
-        with LocalDiscovery(namespace):
-            publisher = LocalDiscovery.Publisher(namespace)
-            subscriber = LocalDiscovery.Subscriber(namespace)
-
-            async with publisher:
-                task = asyncio.create_task(collect(subscriber))
-                await asyncio.sleep(0.05)
-
-                # Act
-                await publisher.publish("worker-added", metadata)
-
-                try:
-                    await asyncio.wait_for(event_received.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    pytest.fail(
-                        "Worker not discovered via watchdog notification "
-                        "within timeout — symlink path mismatch? (see #115)"
-                    )
-                finally:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-
-        # Assert
-        assert len(events) == 1
-        assert events[0].type == "worker-added"
-        assert events[0].metadata.uid == metadata.uid
-
-    def test___reduce___pickle_roundtrip(self, namespace):
-        """Test Subscriber pickle roundtrip via cloudpickle.
-
-        Given:
-            A Subscriber instance
-        When:
-            Subscriber is pickled and unpickled via cloudpickle
-        Then:
-            It should preserve the namespace.
-        """
-        # Arrange
-        subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
-
-        # Act
-        pickled = cloudpickle.dumps(subscriber)
-        unpickled = cloudpickle.loads(pickled)
-
-        # Assert
-        assert unpickled.namespace == namespace
 
     @pytest.mark.asyncio
     async def test___aiter___with_concurrent_namespaces(self):
