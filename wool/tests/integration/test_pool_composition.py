@@ -141,6 +141,41 @@ class TestPoolComposition:
         assert result == 3
 
     @pytest.mark.asyncio
+    async def test_build_pool_from_scenario_with_durable_joined_local(
+        self, credentials_map
+    ):
+        """Test building a pool with DURABLE_JOINED mode and LOCAL_CALLABLE.
+
+        Given:
+            A complete scenario using DURABLE_JOINED pool mode with
+            LOCAL_CALLABLE discovery, where a non-owner joiner
+            discovers workers through an existing namespace.
+        When:
+            A pool is built and a coroutine routine is dispatched.
+        Then:
+            It should return the correct result via the non-owner
+            LocalDiscovery.
+        """
+        # Arrange
+        scenario = Scenario(
+            shape=RoutineShape.COROUTINE,
+            pool_mode=PoolMode.DURABLE_JOINED,
+            discovery=DiscoveryFactory.LOCAL_CALLABLE,
+            lb=LbFactory.CLASS_REF,
+            credential=CredentialType.INSECURE,
+            options=WorkerOptionsKind.DEFAULT,
+            timeout=TimeoutKind.NONE,
+            binding=RoutineBinding.MODULE_FUNCTION,
+        )
+
+        # Act
+        async with build_pool_from_scenario(scenario, credentials_map):
+            result = await invoke_routine(scenario)
+
+        # Assert
+        assert result == 3
+
+    @pytest.mark.asyncio
     async def test_build_pool_from_scenario_with_restrictive_opts(self, credentials_map):
         """Test building a pool with restrictive message size options.
 
@@ -192,6 +227,40 @@ class TestPoolComposition:
             credential=CredentialType.INSECURE,
             options=WorkerOptionsKind.DEFAULT,
             timeout=TimeoutKind.VIA_RUNTIME_CONTEXT,
+            binding=RoutineBinding.MODULE_FUNCTION,
+        )
+
+        # Act
+        async with build_pool_from_scenario(scenario, credentials_map):
+            result = await invoke_routine(scenario)
+
+        # Assert
+        assert result == 3
+
+    @pytest.mark.asyncio
+    async def test_build_pool_from_scenario_with_shared_discovery(self, credentials_map):
+        """Test two pools sharing the same discovery subscriber.
+
+        Given:
+            Two WorkerPool instances sharing the same LocalDiscovery
+            with one externally started worker, exercising
+            SubscriberMeta caching and _SharedSubscription fan-out.
+        When:
+            Both pools are entered and a coroutine is dispatched
+            through the primary pool.
+        Then:
+            It should discover the worker and return the correct
+            result.
+        """
+        # Arrange
+        scenario = Scenario(
+            shape=RoutineShape.COROUTINE,
+            pool_mode=PoolMode.DURABLE_SHARED,
+            discovery=DiscoveryFactory.NONE,
+            lb=LbFactory.CLASS_REF,
+            credential=CredentialType.INSECURE,
+            options=WorkerOptionsKind.DEFAULT,
+            timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
         )
 

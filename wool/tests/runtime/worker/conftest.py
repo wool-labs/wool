@@ -114,6 +114,18 @@ def worker_extra():
     return {"region": "us-west-2", "instance_type": "t3.large"}
 
 
+def _make_worker_metadata(*tags: str) -> WorkerMetadata:
+    """Build a valid WorkerMetadata with a fresh UUID."""
+    return WorkerMetadata(
+        uid=uuid.uuid4(),
+        address="localhost:50051",
+        pid=12345,
+        version="1.0.0",
+        tags=frozenset(tags),
+        extra=MappingProxyType({}),
+    )
+
+
 # ============================================================================
 # Mock Fixtures for WorkerPool and WorkerProxy Testing
 # ============================================================================
@@ -338,17 +350,14 @@ def mock_worker_proxy(mocker: MockerFixture):
 @pytest.fixture
 def mock_local_worker(mocker: MockerFixture):
     """Mock LocalWorker for isolation from worker process management."""
-    worker_count = [0]  # Counter for unique UIDs
+    real_cls = wp.LocalWorker  # Capture before patching
     workers = []  # Store all created workers
 
     def create_worker(*args, **kwargs):
-        mock_worker = mocker.MagicMock()
+        mock_worker = mocker.MagicMock(spec=real_cls)
         mock_worker.start = mocker.AsyncMock()
         mock_worker.stop = mocker.AsyncMock()
-        mock_worker.metadata = mocker.MagicMock()
-        worker_count[0] += 1
-        mock_worker.metadata.uid = f"test-worker-{worker_count[0]}"
-        mock_worker.metadata.address = f"localhost:{50050 + worker_count[0]}"
+        mock_worker.metadata = _make_worker_metadata(*args)
         workers.append(mock_worker)
         return mock_worker
 

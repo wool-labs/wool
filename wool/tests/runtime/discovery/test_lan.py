@@ -10,8 +10,13 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from zeroconf import ServiceInfo
 
+from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.lan import LanDiscovery
+from wool.utilities.afilter import afilter
+
+_TEST_NAMESPACE = "test-namespace"
+_TEST_SERVICE_TYPE = "_wool-c6c84a._tcp.local."
 
 
 @pytest.fixture
@@ -61,22 +66,135 @@ class TestLanDiscovery:
     Fully qualified name: wool.runtime.discovery.lan.LanDiscovery
     """
 
-    def test___init___with_default_service_type(self):
-        """Test LanDiscovery default service type.
+    def test___init___with_auto_generated_namespace(self):
+        """Test LanDiscovery auto-generates a namespace.
 
         Given:
-            No arguments
+            No namespace argument
         When:
             LanDiscovery is instantiated
         Then:
-            It should have service_type equal to
-            "_wool._tcp.local.".
+            It should have a namespace starting with "pool-".
         """
         # Act
         discovery = LanDiscovery()
 
         # Assert
-        assert discovery.service_type == "_wool._tcp.local."
+        assert discovery.namespace.startswith("pool-")
+
+    def test___init___with_explicit_namespace(self):
+        """Test LanDiscovery stores an explicit namespace.
+
+        Given:
+            An explicit namespace string
+        When:
+            LanDiscovery is instantiated with that namespace
+        Then:
+            It should return the provided namespace.
+        """
+        # Act
+        discovery = LanDiscovery("my-pool")
+
+        # Assert
+        assert discovery.namespace == "my-pool"
+
+    def test___init___with_unique_auto_namespaces(self):
+        """Test auto-generated namespaces are unique.
+
+        Given:
+            Two LanDiscovery instances with no namespace argument
+        When:
+            Both are instantiated
+        Then:
+            Their namespace values should differ.
+        """
+        # Act
+        d1 = LanDiscovery()
+        d2 = LanDiscovery()
+
+        # Assert
+        assert d1.namespace != d2.namespace
+
+    def test___hash___with_same_namespace(self):
+        """Test hash equality for same namespace.
+
+        Given:
+            Two LanDiscovery instances with the same namespace.
+        When:
+            Their hashes are compared.
+        Then:
+            It should produce equal hashes.
+        """
+        # Arrange
+        a = LanDiscovery("shared-ns")
+        b = LanDiscovery("shared-ns")
+
+        # Act & assert
+        assert hash(a) == hash(b)
+
+    def test___hash___with_different_namespace(self):
+        """Test hash inequality for different namespaces.
+
+        Given:
+            Two LanDiscovery instances with different namespaces.
+        When:
+            Their hashes are compared.
+        Then:
+            It should produce different hashes.
+        """
+        # Arrange
+        a = LanDiscovery("ns-a")
+        b = LanDiscovery("ns-b")
+
+        # Act & assert
+        assert hash(a) != hash(b)
+
+    def test___eq___with_same_namespace(self):
+        """Test equality for same namespace.
+
+        Given:
+            Two LanDiscovery instances with the same namespace.
+        When:
+            They are compared with ==.
+        Then:
+            It should return True.
+        """
+        # Arrange
+        a = LanDiscovery("shared-ns")
+        b = LanDiscovery("shared-ns")
+
+        # Act & assert
+        assert a == b
+
+    def test___eq___with_different_namespace(self):
+        """Test inequality for different namespaces.
+
+        Given:
+            Two LanDiscovery instances with different namespaces.
+        When:
+            They are compared with ==.
+        Then:
+            It should return False.
+        """
+        # Arrange
+        a = LanDiscovery("ns-a")
+        b = LanDiscovery("ns-b")
+
+        # Act & assert
+        assert a != b
+
+    def test___eq___with_non_lan_discovery(self):
+        """Test equality with a non-LanDiscovery object.
+
+        Given:
+            A LanDiscovery instance and a non-LanDiscovery object.
+        When:
+            They are compared with ==.
+        Then:
+            It should not be equal.
+        """
+        # Act & assert
+        assert LanDiscovery("ns") != "not-a-discovery"
 
     def test_publisher_with_default_instance(self):
         """Test publisher property returns Publisher instance.
@@ -114,7 +232,7 @@ class TestLanDiscovery:
         subscriber = discovery.subscriber
 
         # Assert
-        assert isinstance(subscriber, LanDiscovery.Subscriber)
+        assert isinstance(subscriber, DiscoverySubscriberLike)
 
     @pytest.mark.asyncio
     async def test_subscribe_with_default_filter(self, worker_factory):
@@ -132,8 +250,8 @@ class TestLanDiscovery:
         def predicate(w):
             return w.address.endswith(":50051")
 
-        discovery = LanDiscovery(filter=predicate)
-        publisher = LanDiscovery.Publisher()
+        discovery = LanDiscovery(_TEST_NAMESPACE, filter=predicate)
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
         subscriber = discovery.subscribe()
 
         worker_match = worker_factory(
@@ -192,8 +310,8 @@ class TestLanDiscovery:
         def predicate(w):
             return w.address.endswith(":50051")
 
-        discovery = LanDiscovery()
-        publisher = LanDiscovery.Publisher()
+        discovery = LanDiscovery(_TEST_NAMESPACE)
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
         subscriber = discovery.subscribe(filter=predicate)
 
         worker_match = worker_factory(
@@ -236,6 +354,47 @@ class TestLanDiscovery:
         assert len(events) >= 1
         assert all(e.metadata.address.endswith(":50051") for e in events)
 
+    @pytest.mark.asyncio
+    async def test_subscribe_with_namespace_isolation(self, metadata):
+        """Test subscribers on different namespaces are isolated.
+
+        Given:
+            Two LanDiscovery instances with different namespaces, a
+            publisher on namespace A, and a subscriber on namespace B
+        When:
+            The publisher publishes a worker
+        Then:
+            The subscriber on namespace B should not receive the event.
+        """
+        # Arrange
+        discovery_a = LanDiscovery("ns-alpha")
+        discovery_b = LanDiscovery("ns-beta")
+        publisher = discovery_a.publisher
+        subscriber = discovery_b.subscriber
+
+        events = []
+
+        async def collect():
+            async for event in subscriber:
+                events.append(event)
+
+        # Act
+        async with publisher:
+            task = asyncio.create_task(collect())
+            await asyncio.sleep(0.1)
+
+            await publisher.publish("worker-added", metadata)
+            await asyncio.sleep(1.0)
+
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # Assert
+        assert events == []
+
 
 class TestLanDiscoveryPublisher:
     """Tests for LanDiscovery.Publisher class.
@@ -255,7 +414,7 @@ class TestLanDiscoveryPublisher:
             It should be None.
         """
         # Act
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
 
         # Assert
         assert publisher.aiozc is None
@@ -273,7 +432,7 @@ class TestLanDiscoveryPublisher:
             exit.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
 
         # Act & assert
         async with publisher:
@@ -293,17 +452,17 @@ class TestLanDiscoveryPublisher:
             It should register the worker as a DNS-SD service.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
 
         # Act
         async with publisher:
             await publisher.publish("worker-added", metadata)
 
             # Assert
-            service_name = f"{metadata.uid}._wool._tcp.local."
+            service_name = f"{metadata.uid}.{_TEST_SERVICE_TYPE}"
             assert publisher.aiozc is not None
             service_info = await publisher.aiozc.async_get_service_info(
-                "_wool._tcp.local.",
+                _TEST_SERVICE_TYPE,
                 service_name,
             )
             assert service_info is not None
@@ -321,7 +480,7 @@ class TestLanDiscoveryPublisher:
             It should unregister the worker service.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
 
         # Act
         async with publisher:
@@ -345,7 +504,7 @@ class TestLanDiscoveryPublisher:
             It should update the worker service properties.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
         updated_worker = WorkerMetadata(
             uid=metadata.uid,
             address=metadata.address,
@@ -377,7 +536,7 @@ class TestLanDiscoveryPublisher:
             It should raise RuntimeError.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
 
         # Act & assert
         with pytest.raises(RuntimeError, match="not properly initialized"):
@@ -395,7 +554,7 @@ class TestLanDiscoveryPublisher:
             It should raise RuntimeError.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
 
         # Act & assert
         async with publisher:
@@ -421,7 +580,7 @@ class TestLanDiscoveryPublisher:
             keyed by UID string.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
 
         # Act
         async with publisher:
@@ -441,22 +600,6 @@ class TestLanDiscoverySubscriber:
     wool.runtime.discovery.lan.LanDiscovery.Subscriber
     """
 
-    def test_service_type_with_default_value(self):
-        """Test Subscriber service_type constant.
-
-        Given:
-            A Subscriber instance
-        When:
-            service_type is accessed
-        Then:
-            It should be "_wool._tcp.local.".
-        """
-        # Act
-        subscriber = LanDiscovery.Subscriber()
-
-        # Assert
-        assert subscriber.service_type == "_wool._tcp.local."
-
     @pytest.mark.asyncio
     async def test___aiter___discovers_added_worker(self, metadata):
         """Test async for yields worker-added event.
@@ -470,8 +613,8 @@ class TestLanDiscoverySubscriber:
             metadata.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
-        subscriber = LanDiscovery.Subscriber()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
 
         events = []
         worker_discovered = asyncio.Event()
@@ -518,8 +661,8 @@ class TestLanDiscoverySubscriber:
             It should yield a worker-dropped event.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
-        subscriber = LanDiscovery.Subscriber()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
 
         events = []
         worker_dropped = asyncio.Event()
@@ -569,8 +712,8 @@ class TestLanDiscoverySubscriber:
             It should yield a worker-updated event with new metadata.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
-        subscriber = LanDiscovery.Subscriber()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
 
         updated_worker = WorkerMetadata(
             uid=metadata.uid,
@@ -628,12 +771,12 @@ class TestLanDiscoverySubscriber:
             It should yield only matching workers.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
 
         def filter_fn(w):
             return w.address.endswith(":50051")
 
-        subscriber = LanDiscovery.Subscriber(filter=filter_fn)
+        subscriber = afilter(filter_fn, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
 
         worker_match = worker_factory(
             address="127.0.0.1:50051", tags=frozenset(["match"])
@@ -689,9 +832,9 @@ class TestLanDiscoverySubscriber:
             Each iterator should receive events independently.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
-        subscriber1 = LanDiscovery.Subscriber()
-        subscriber2 = LanDiscovery.Subscriber()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
+        subscriber1 = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
+        subscriber2 = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
 
         events1 = []
         events2 = []
@@ -749,12 +892,12 @@ class TestLanDiscoverySubscriber:
             now-filtered worker.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
 
         def filter_fn(w):
             return "gpu" in w.tags
 
-        subscriber = LanDiscovery.Subscriber(filter=filter_fn)
+        subscriber = afilter(filter_fn, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
 
         worker = worker_factory(address="127.0.0.1:50051", tags=frozenset(["gpu"]))
 
@@ -815,12 +958,12 @@ class TestLanDiscoverySubscriber:
             worker.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
 
         def filter_fn(w):
             return "gpu" in w.tags
 
-        subscriber = LanDiscovery.Subscriber(filter=filter_fn)
+        subscriber = afilter(filter_fn, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
 
         worker = worker_factory(address="127.0.0.1:50051", tags=frozenset(["cpu"]))
 
@@ -883,8 +1026,8 @@ class TestLanDiscoverySubscriber:
             with matching metadata.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
-        subscriber = LanDiscovery.Subscriber()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
 
         events = []
         worker_discovered = asyncio.Event()
@@ -972,8 +1115,8 @@ class TestLanDiscoverySubscriber:
             tags=tags,
             extra=MappingProxyType({}),
         )
-        publisher = LanDiscovery.Publisher()
-        subscriber = LanDiscovery.Subscriber()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
 
         events = []
         discovered = asyncio.Event()
@@ -1003,9 +1146,12 @@ class TestLanDiscoverySubscriber:
                 except asyncio.CancelledError:
                     pass
 
-        # Assert
+        # Assert — events[-1] is the matched event (collect breaks
+        # after finding worker.uid); earlier entries may be stale
+        # because the shared Zeroconf browser persists across
+        # hypothesis examples.
         assert len(events) >= 1
-        event = events[0]
+        event = events[-1]
         assert event.metadata.uid == worker.uid
         assert event.metadata.pid == worker.pid
         assert event.metadata.version == worker.version
@@ -1026,13 +1172,13 @@ class TestLanDiscoverySubscriber:
             It should only yield the valid worker's event.
         """
         # Arrange
-        publisher = LanDiscovery.Publisher()
-        subscriber = LanDiscovery.Subscriber()
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
 
         malformed_uid = uuid.uuid4()
-        malformed_name = f"{malformed_uid}._wool._tcp.local."
+        malformed_name = f"{malformed_uid}.{_TEST_SERVICE_TYPE}"
         malformed_service = ServiceInfo(
-            "_wool._tcp.local.",
+            _TEST_SERVICE_TYPE,
             malformed_name,
             addresses=[socket.inet_aton("127.0.0.1")],
             port=9999,

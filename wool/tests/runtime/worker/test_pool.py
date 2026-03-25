@@ -7,7 +7,9 @@ subprocess overhead and ensure deterministic behavior.
 
 import asyncio
 import time
+import uuid
 from contextlib import contextmanager
+from types import MappingProxyType
 from typing import cast
 
 import pytest
@@ -20,9 +22,22 @@ from pytest_mock import MockerFixture
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
+from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
+
+
+def _make_worker_metadata(*tags: str) -> WorkerMetadata:
+    """Build a valid WorkerMetadata with a fresh UUID."""
+    return WorkerMetadata(
+        uid=uuid.uuid4(),
+        address="localhost:50051",
+        pid=12345,
+        version="1.0.0",
+        tags=frozenset(tags),
+        extra=MappingProxyType({}),
+    )
 
 
 class TestWorkerPool:
@@ -245,10 +260,10 @@ class TestWorkerPool:
         """
         # Arrange
         spy_factory = mocker.MagicMock()
-        mock_worker = mocker.MagicMock()
+        mock_worker = mocker.MagicMock(spec=LocalWorker)
         mock_worker.start = mocker.AsyncMock()
         mock_worker.stop = mocker.AsyncMock()
-        mock_worker.metadata = mocker.MagicMock()
+        mock_worker.metadata = _make_worker_metadata()
         spy_factory.return_value = mock_worker
 
         # Act
@@ -275,10 +290,10 @@ class TestWorkerPool:
         """
         # Arrange
         spy_factory = mocker.MagicMock()
-        mock_worker = mocker.MagicMock()
+        mock_worker = mocker.MagicMock(spec=LocalWorker)
         mock_worker.start = mocker.AsyncMock()
         mock_worker.stop = mocker.AsyncMock()
-        mock_worker.metadata = mocker.MagicMock()
+        mock_worker.metadata = _make_worker_metadata()
         spy_factory.return_value = mock_worker
 
         # Act
@@ -430,32 +445,34 @@ class TestWorkerPool:
         mock_worker_proxy.__aexit__.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test___aenter___with_worker_startup_failure(
-        self,
-        mock_shared_memory,
-        mock_worker_proxy,
-        mock_local_worker,
-        mock_discovery_service,
-    ):
-        """Test handle startup failure gracefully and clean up.
+    async def test___aenter___with_worker_startup_failure(self, mocker: MockerFixture):
+        """Test raise the spawn exception before yielding.
 
         Given:
             A worker that fails during startup
         When:
             WorkerPool is used as context manager
         Then:
-            Should handle startup failure gracefully and clean up
+            It should raise the spawn exception before yielding
         """
+
         # Arrange
-        mock_local_worker.start.side_effect = RuntimeError("Worker startup failed")
+        def failing_factory(*tags, credentials=None, options=None):
+            worker = mocker.MagicMock()
+            worker.start = mocker.AsyncMock(
+                side_effect=RuntimeError("Worker startup failed")
+            )
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = mocker.MagicMock()
+            return worker
 
         # Act & assert
-        async with WorkerPool(size=1) as pool:
-            # Pool should still be created even if workers fail to start
-            assert pool is not None
+        with pytest.raises(ExceptionGroup) as exc_info:
+            async with WorkerPool(worker=failing_factory, size=1):
+                pass
 
-        # Assert: Cleanup still happened
-        mock_worker_proxy.__aexit__.assert_called_once()
+        assert len(exc_info.value.exceptions) == 1
+        assert "Worker startup failed" in str(exc_info.value.exceptions[0])
 
     @pytest.mark.asyncio
     async def test___aexit___handles_exceptions_gracefully(
@@ -584,14 +601,14 @@ class TestWorkerPool:
 
     @pytest.mark.asyncio
     async def test_start_with_failing_worker(self, mocker: MockerFixture):
-        """Test the pool starts successfully (failures are captured, not propagated).
+        """Test the spawn exception propagates to the caller.
 
         Given:
             A WorkerPool with a failing worker factory
         When:
             The pool is started
         Then:
-            The pool starts successfully (failures are captured, not propagated)
+            It should raise the spawn exception before yielding
         """
 
         # Arrange
@@ -606,11 +623,83 @@ class TestWorkerPool:
 
         pool = WorkerPool(worker=failing_factory, size=1)
 
-        # Act & assert - pool starts even with failing workers
-        # (WorkerPool uses return_exceptions=True to handle failures gracefully)
-        async with pool:
-            # Pool context manager completes successfully
-            pass
+        # Act & assert
+        with pytest.raises(ExceptionGroup) as exc_info:
+            async with pool:
+                pass
+
+        assert len(exc_info.value.exceptions) == 1
+        assert "Mock worker startup failed" in str(exc_info.value.exceptions[0])
+
+    @pytest.mark.asyncio
+    async def test_start_with_all_workers_failing(self, mocker: MockerFixture):
+        """Test multiple spawn failures raise ExceptionGroup.
+
+        Given:
+            A WorkerPool with size=3 where all workers fail to start
+        When:
+            The pool is used as async context manager
+        Then:
+            It should raise ExceptionGroup containing all 3 failures
+        """
+
+        # Arrange
+        def failing_factory(*tags, credentials=None, options=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock(
+                side_effect=RuntimeError("Worker startup failed")
+            )
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = mocker.MagicMock()
+            return worker
+
+        pool = WorkerPool(worker=failing_factory, size=3)
+
+        # Act & assert
+        with pytest.raises(ExceptionGroup) as exc_info:
+            async with pool:
+                pass
+
+        assert len(exc_info.value.exceptions) == 3
+
+    @pytest.mark.asyncio
+    async def test_start_with_partial_worker_failure(self, mocker: MockerFixture):
+        """Test partial spawn failure raises ExceptionGroup with single error.
+
+        Given:
+            A WorkerPool with size=3 where 1 of 3 workers fails to start
+        When:
+            The pool is used as async context manager
+        Then:
+            It should raise ExceptionGroup containing the single failure
+        """
+
+        # Arrange
+        call_count = 0
+
+        def mixed_factory(*tags, credentials=None, options=None):
+            nonlocal call_count
+            call_count += 1
+            worker = mocker.MagicMock(spec=LocalWorker)
+            if call_count == 2:
+                worker.start = mocker.AsyncMock(
+                    side_effect=RuntimeError("Worker 2 failed")
+                )
+            else:
+                worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        pool = WorkerPool(worker=mixed_factory, size=3)
+
+        # Act & assert
+        with pytest.raises(ExceptionGroup) as exc_info:
+            async with pool:
+                pass
+
+        assert len(exc_info.value.exceptions) == 1
+        assert "Worker 2 failed" in str(exc_info.value.exceptions[0])
 
     @pytest.mark.asyncio
     async def test_stop_terminates_workers(self, mock_worker_factory):
@@ -694,10 +783,6 @@ class TestWorkerPool:
         Then:
             Pool context manager should complete successfully
         """
-        # Arrange
-        mock_local_worker.metadata.uid = "worker-123"
-        mock_local_worker.metadata.address = "localhost:50051"
-
         # Act
         async with WorkerPool(size=2) as pool:
             assert pool is not None
@@ -726,10 +811,10 @@ class TestWorkerPool:
             Should use the custom factory for worker creation
         """
         # Arrange
-        custom_worker = mocker.MagicMock()
+        custom_worker = mocker.MagicMock(spec=LocalWorker)
         custom_worker.start = mocker.AsyncMock()
         custom_worker.stop = mocker.AsyncMock()
-        custom_worker.metadata = mocker.MagicMock()
+        custom_worker.metadata = _make_worker_metadata()
 
         def custom_factory(*args, credentials=None, options=None):
             return cast(LocalWorker, custom_worker)

@@ -1,4 +1,5 @@
 import asyncio
+import warnings
 from inspect import getsourcelines
 from inspect import isasyncgen
 
@@ -113,8 +114,8 @@ class Foo:
     assert foo.__qualname__ == "Foo.foo"
     assert foo.__module__ == "runtime.routine.test_wrapper"
 
-    @routine
     @classmethod
+    @routine
     async def bar(cls, x):
         """Class method."""
         return x * 3
@@ -122,8 +123,8 @@ class Foo:
     assert bar.__qualname__ == "Foo.bar"
     assert bar.__module__ == "runtime.routine.test_wrapper"
 
-    @routine
     @staticmethod
+    @routine
     async def baz(x):
         """Static method."""
         return x * 4
@@ -140,8 +141,8 @@ class Foo:
     assert foo_gen.__qualname__ == "Foo.foo_gen"
     assert foo_gen.__module__ == "runtime.routine.test_wrapper"
 
-    @routine
     @classmethod
+    @routine
     async def bar_gen(cls, x):
         """Async generator class method."""
         for i in range(x):
@@ -150,8 +151,8 @@ class Foo:
     assert bar_gen.__qualname__ == "Foo.bar_gen"
     assert bar_gen.__module__ == "runtime.routine.test_wrapper"
 
-    @routine
     @staticmethod
+    @routine
     async def baz_gen(x):
         """Async generator static method."""
         for i in range(x):
@@ -199,6 +200,44 @@ def test_routine_with_invalid_types(function_type):
 
                 @routine  # type: ignore[arg-type]
                 class InvalidFoo: ...
+
+
+@settings(
+    max_examples=20,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(
+    descriptor_type=st.sampled_from(["classmethod", "staticmethod"]),
+)
+def test_routine_with_descriptor_types(descriptor_type):
+    """Test @routine rejects classmethod and staticmethod descriptors.
+
+    Given:
+        The @routine decorator applied to a classmethod or
+        staticmethod descriptor (wrong decorator order).
+    When:
+        The decorator is applied.
+    Then:
+        It should raise ``ValueError`` indicating the correct
+        decorator order.
+    """
+    # Arrange, act, & assert
+    with pytest.raises(ValueError, match="@wool.routine must be applied before"):
+        match descriptor_type:
+            case "classmethod":
+
+                @routine  # type: ignore[arg-type]
+                @classmethod
+                async def invalid_cls(cls):
+                    return cls
+
+            case "staticmethod":
+
+                @routine  # type: ignore[arg-type]
+                @staticmethod
+                async def invalid_static():
+                    return True
 
 
 @settings(
@@ -781,6 +820,34 @@ async def test_routine_with_athrow_causing_return():
         # Act & assert
         with pytest.raises(StopAsyncIteration):
             await gen.athrow(Resettable)
+
+
+@pytest.mark.asyncio
+async def test_routine_with_athrow_no_deprecation_warning():
+    """Test athrow does not emit a DeprecationWarning.
+
+    Given:
+        A @routine-decorated async generator that catches a thrown
+        exception and yields a recovery value.
+    When:
+        athrow() is called with the exception.
+    Then:
+        It should not emit a DeprecationWarning.
+    """
+    with do_dispatch(False):
+        # Arrange
+        gen = resilient_counter(5)
+        await gen.__anext__()
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await gen.athrow(Resettable)
+
+        # Assert
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert deprecations == [], f"Unexpected DeprecationWarning(s): {deprecations}"
+        await gen.aclose()
 
 
 @pytest.mark.asyncio

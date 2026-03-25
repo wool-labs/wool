@@ -10,7 +10,6 @@ import asyncio
 import datetime
 import ipaddress
 import uuid
-from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import fields
@@ -55,6 +54,8 @@ class PoolMode(Enum):
     DEFAULT = auto()
     EPHEMERAL = auto()
     DURABLE = auto()
+    DURABLE_JOINED = auto()
+    DURABLE_SHARED = auto()
     HYBRID = auto()
     NESTED_DEFAULT_IN_EPHEMERAL = auto()
     NESTED_EPHEMERAL_IN_EPHEMERAL = auto()
@@ -212,7 +213,10 @@ async def build_pool_from_scenario(scenario, credentials_map):
     discovery_obj = None
     _local_cm = None
 
-    if scenario.discovery is not DiscoveryFactory.NONE:
+    if (
+        scenario.discovery is not DiscoveryFactory.NONE
+        and scenario.pool_mode is not PoolMode.DURABLE_JOINED
+    ):
         namespace = f"integration-{uuid.uuid4().hex[:12]}"
 
         match scenario.discovery:
@@ -236,17 +240,21 @@ async def build_pool_from_scenario(scenario, credentials_map):
             case DiscoveryFactory.LAN_DIRECT:
                 from wool.runtime.discovery.lan import LanDiscovery
 
-                discovery_obj = LanDiscovery()
+                lan_ns = f"integration-lan-{uuid.uuid4().hex[:12]}"
+                discovery_obj = LanDiscovery(lan_ns)
             case DiscoveryFactory.LAN_CALLABLE:
                 from wool.runtime.discovery.lan import LanDiscovery
 
-                discovery_obj = lambda: LanDiscovery()  # noqa: E731
+                lan_ns = f"integration-lan-{uuid.uuid4().hex[:12]}"
+                discovery_obj = lambda: LanDiscovery(lan_ns)  # noqa: E731
             case DiscoveryFactory.LAN_ASYNC_CM:
                 from wool.runtime.discovery.lan import LanDiscovery
 
+                lan_ns = f"integration-lan-{uuid.uuid4().hex[:12]}"
+
                 @asynccontextmanager
                 async def _lan_async_cm():
-                    discovery = LanDiscovery()
+                    discovery = LanDiscovery(lan_ns)
                     yield discovery
 
                 discovery_obj = _lan_async_cm()
@@ -262,6 +270,14 @@ async def build_pool_from_scenario(scenario, credentials_map):
         try:
             if scenario.pool_mode is PoolMode.DURABLE:
                 async with _durable_pool_context(lb, creds, options) as pool:
+                    yield pool
+            elif scenario.pool_mode is PoolMode.DURABLE_SHARED:
+                async with _durable_shared_pool_context(lb, creds, options) as pool:
+                    yield pool
+            elif scenario.pool_mode is PoolMode.DURABLE_JOINED:
+                async with _durable_joined_pool_context(
+                    scenario.discovery, lb, creds, options
+                ) as pool:
                     yield pool
             else:
                 pool_kwargs = {
@@ -346,6 +362,125 @@ async def _durable_pool_context(lb, creds, options):
                     await publisher.publish("worker-dropped", worker.metadata)
         finally:
             await worker.stop()
+
+
+@asynccontextmanager
+async def _durable_shared_pool_context(lb, creds, options):
+    """Create two pools sharing the same LocalDiscovery subscriber.
+
+    Exercises ``SubscriberMeta`` singleton caching and
+    ``_SharedSubscription`` fan-out: both pools call
+    ``Subscriber(namespace)`` through the metaclass, the second
+    hits the cache and gets a separate ``_SharedSubscription``
+    backed by the same raw subscriber and source iterator.
+    """
+    namespace = f"shared-{uuid.uuid4().hex[:12]}"
+    with LocalDiscovery(namespace) as discovery:
+        worker = LocalWorker(credentials=creds, options=options)
+        await worker.start()
+        try:
+            publisher = discovery.publisher
+            async with publisher:
+                await publisher.publish("worker-added", worker.metadata)
+                try:
+                    shared = _DirectDiscovery(discovery)
+                    pool_a = WorkerPool(
+                        discovery=shared,
+                        loadbalancer=lb,
+                        credentials=creds,
+                        options=options,
+                    )
+                    pool_b = WorkerPool(
+                        discovery=shared,
+                        loadbalancer=lb,
+                        credentials=creds,
+                        options=options,
+                    )
+                    async with pool_a:
+                        async with pool_b:
+                            yield pool_a
+                finally:
+                    await publisher.publish("worker-dropped", worker.metadata)
+        finally:
+            await worker.stop()
+
+
+_LOCAL_FACTORIES = (
+    DiscoveryFactory.LOCAL_DIRECT,
+    DiscoveryFactory.LOCAL_CALLABLE,
+    DiscoveryFactory.LOCAL_SYNC_CM,
+    DiscoveryFactory.LOCAL_ASYNC_CM,
+)
+
+
+def _resolve_joiner(namespace, factory):
+    """Resolve a DiscoveryFactory into a joiner discovery object.
+
+    Uses the given namespace (same as the owner), triggering the non-owner
+    fallback path in ``LocalDiscovery.__enter__``.
+
+    Returns ``(discovery_obj, entered_cm_or_None)``. The caller must
+    exit the CM (if non-None) when done.
+    """
+    match factory:
+        case DiscoveryFactory.LOCAL_DIRECT:
+            cm = LocalDiscovery(namespace)
+            cm.__enter__()
+            return _DirectDiscovery(cm), cm
+        case DiscoveryFactory.LOCAL_CALLABLE:
+            return (lambda: LocalDiscovery(namespace)), None  # noqa: E731
+        case DiscoveryFactory.LOCAL_SYNC_CM:
+            return LocalDiscovery(namespace), None
+        case DiscoveryFactory.LOCAL_ASYNC_CM:
+
+            @asynccontextmanager
+            async def _acm():
+                with LocalDiscovery(namespace) as d:
+                    yield d
+
+            return _acm(), None
+        case _:
+            raise ValueError(f"Unsupported factory for joiner: {factory}")
+
+
+@asynccontextmanager
+async def _durable_joined_pool_context(discovery_factory, lb, creds, options):
+    """Create a DURABLE pool that joins an externally owned namespace.
+
+    Sets up an owner ``LocalDiscovery`` that creates workers and publishes
+    them, then resolves a joiner discovery from the D3 factory form. The
+    joiner reuses the owner's namespace, exercising the non-owner fallback
+    path in ``LocalDiscovery.__enter__``.
+    """
+    namespace = f"joined-{uuid.uuid4().hex[:12]}"
+
+    worker = LocalWorker(credentials=creds, options=options)
+    await worker.start()
+    try:
+        owner = LocalDiscovery(namespace)
+        owner.__enter__()
+        try:
+            publisher = owner.publisher
+            async with publisher:
+                await publisher.publish("worker-added", worker.metadata)
+                joiner, _joiner_cm = _resolve_joiner(namespace, discovery_factory)
+                try:
+                    pool = WorkerPool(
+                        discovery=joiner,
+                        loadbalancer=lb,
+                        credentials=creds,
+                        options=options,
+                    )
+                    async with pool:
+                        yield pool
+                finally:
+                    if _joiner_cm is not None:
+                        _joiner_cm.__exit__(None, None, None)
+                    await publisher.publish("worker-dropped", worker.metadata)
+        finally:
+            owner.__exit__(None, None, None)
+    finally:
+        await worker.stop()
 
 
 async def invoke_routine(scenario):
@@ -486,41 +621,12 @@ _NESTED_SHAPES = (
 )
 
 
-@dataclass(frozen=True)
-class _KnownBug:
-    """A known bug that should be treated as an expected failure.
-
-    When ``retryable`` returns True for a caught exception, the test
-    body is re-executed up to ``retries`` times with exponential
-    backoff before falling through to xfail. Exceptions that match
-    ``raises`` but not ``retryable`` xfail immediately.
-    """
-
-    match: Callable[[Scenario], bool]
-    raises: tuple[type[BaseException], ...]
-    reason: str
-    retries: int = 0
-    backoff: float = 0.5
-    retryable: Callable[[BaseException], bool] = lambda _: False
-
-
 def _is_grpc_internal(exc: BaseException) -> bool:
     return isinstance(exc, grpc.RpcError) and exc.code() == grpc.StatusCode.INTERNAL
 
 
-_KNOWN_BUGS: list[_KnownBug] = [
-    _KnownBug(
-        match=lambda s: s.shape in _NESTED_SHAPES,
-        raises=(grpc.RpcError, TimeoutError),
-        reason=(
-            "grpcio 1.78 PollerCompletionQueue thundering herd race "
-            "(https://github.com/grpc/grpc/pull/41483)"
-        ),
-        retries=3,
-        backoff=0.5,
-        retryable=_is_grpc_internal,
-    ),
-]
+_GRPC_INTERNAL_RETRIES = 3
+_GRPC_INTERNAL_BACKOFF = 0.5
 
 
 def _pairwise_filter(row):
@@ -528,7 +634,9 @@ def _pairwise_filter(row):
 
     - D3 must be NONE when D2 is DEFAULT, EPHEMERAL, DURABLE, or NESTED_*
       (DURABLE manages its own LocalDiscovery internally)
-    - D3 must NOT be NONE when D2 is HYBRID
+    - D3 must NOT be NONE when D2 is HYBRID or DURABLE_JOINED
+    - D3 must be a LOCAL_* variant when D2 is DURABLE_JOINED
+      (LanDiscovery does not support namespacing)
     - D4 must not be ASYNC_CM (pre-called async CM instances are not
       picklable inside WorkerProxy.__reduce__; documented limitation,
       see #61)
@@ -541,17 +649,23 @@ def _pairwise_filter(row):
     if len(row) > 2:
         pool_mode = row[1]
         discovery = row[2]
-        needs_discovery = pool_mode in (PoolMode.HYBRID,)
+        needs_discovery = pool_mode in (
+            PoolMode.HYBRID,
+            PoolMode.DURABLE_JOINED,
+        )
         forbids_discovery = pool_mode in (
             PoolMode.DEFAULT,
             PoolMode.EPHEMERAL,
             PoolMode.DURABLE,
+            PoolMode.DURABLE_SHARED,
             PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
             PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
         )
         if needs_discovery and discovery is DiscoveryFactory.NONE:
             return False
         if forbids_discovery and discovery is not DiscoveryFactory.NONE:
+            return False
+        if pool_mode is PoolMode.DURABLE_JOINED and discovery not in _LOCAL_FACTORIES:
             return False
     if len(row) > 3:
         lb = row[3]
@@ -603,16 +717,22 @@ def scenarios_strategy(draw):
     shape = draw(st.sampled_from(RoutineShape))
     pool_mode = draw(st.sampled_from(PoolMode))
 
-    needs_discovery = pool_mode in (PoolMode.HYBRID,)
+    needs_discovery = pool_mode in (
+        PoolMode.HYBRID,
+        PoolMode.DURABLE_JOINED,
+    )
     forbids_discovery = pool_mode in (
         PoolMode.DEFAULT,
         PoolMode.EPHEMERAL,
         PoolMode.DURABLE,
+        PoolMode.DURABLE_SHARED,
         PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
         PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
     )
 
-    if needs_discovery:
+    if pool_mode is PoolMode.DURABLE_JOINED:
+        discovery = draw(st.sampled_from(list(_LOCAL_FACTORIES)))
+    elif needs_discovery:
         discovery = draw(
             st.sampled_from(
                 [d for d in DiscoveryFactory if d is not DiscoveryFactory.NONE]
@@ -748,47 +868,43 @@ async def _clear_channel_pool():
 @pytest.fixture(autouse=True)
 def _clear_proxy_context():
     """Reset proxy context vars between tests."""
+    from wool.runtime.discovery import __subscriber_pool__
+
     proxy_token = wool.__proxy__.set(None)
     pool_token = wool.__proxy_pool__.set(None)
+    sub_token = __subscriber_pool__.set(None)
     yield
     wool.__proxy__.reset(proxy_token)
     wool.__proxy_pool__.reset(pool_token)
+    __subscriber_pool__.reset(sub_token)
 
 
 @pytest.fixture
-def xfail_known_bugs():
-    """Run a test body with retry and xfail for known bugs.
+def retry_grpc_internal():
+    """Retry a test body on transient internal gRPC errors.
 
     Returns an async callable. Usage::
 
-        await xfail_known_bugs(scenario, body)
+        await retry_grpc_internal(body)
 
     where ``body`` is a no-argument async callable containing the
-    test logic. If the body raises an exception matching a known
-    bug's ``retryable`` predicate, it is retried with exponential
-    backoff. After retries are exhausted (or for non-retryable
-    matches against ``raises``), the test is marked as xfail.
-    Unmatched exceptions propagate normally.
+    test logic. Internal gRPC errors (``StatusCode.INTERNAL``) are
+    retried with exponential backoff to tolerate the grpcio
+    PollerCompletionQueue thundering-herd race. All other exceptions
+    propagate immediately. If retries are exhausted the last
+    exception propagates as a real test failure.
     """
 
-    async def run(scenario, body):
-        bugs = [b for b in _KNOWN_BUGS if b.match(scenario)]
-        if not bugs:
-            return await body()
-
-        max_retries = max(b.retries for b in bugs)
-        backoff = min(b.backoff for b in bugs)
-
-        for attempt in range(max_retries + 1):
+    async def run(body):
+        for attempt in range(_GRPC_INTERNAL_RETRIES + 1):
             try:
                 return await body()
             except BaseException as exc:
-                matching = next((b for b in bugs if isinstance(exc, b.raises)), None)
-                if matching is None:
+                if not _is_grpc_internal(exc):
                     raise
-                if attempt < max_retries and matching.retryable(exc):
-                    await asyncio.sleep(backoff * (2**attempt))
+                if attempt < _GRPC_INTERNAL_RETRIES:
+                    await asyncio.sleep(_GRPC_INTERNAL_BACKOFF * (2**attempt))
                     continue
-                pytest.xfail(f"{matching.reason}: {exc}")
+                raise
 
     return run
