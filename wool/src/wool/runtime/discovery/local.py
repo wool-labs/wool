@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from contextlib import contextmanager
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
+from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Callable
 from typing import Final
@@ -29,7 +30,9 @@ from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
 from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.discovery.pool import SubscriberMeta
 from wool.runtime.resourcepool import ResourcePool
+from wool.utilities.afilter import afilter
 
 REF_WIDTH: Final = 16
 NULL_REF: Final = b"\x00" * REF_WIDTH
@@ -248,6 +251,14 @@ class LocalDiscovery(Discovery):
         else:
             self._address_space.close()
 
+    def __hash__(self) -> int:
+        return hash((type(self), self._namespace))
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, LocalDiscovery):
+            return self._namespace == other._namespace
+        return NotImplemented
+
     @property
     def namespace(self):
         """The namespace identifier for this discovery service.
@@ -297,11 +308,14 @@ class LocalDiscovery(Discovery):
             A subscriber instance that receives filtered worker
             discovery events.
         """
-        return self.Subscriber(
+        effective = filter if filter is not None else self._filter
+        subscriber = self.Subscriber(
             self._namespace,
-            filter if filter is not None else self._filter,
             poll_interval=poll_interval,
         )
+        if effective is not None:
+            return afilter(effective, subscriber)
+        return subscriber
 
     class Publisher:
         """Publisher for broadcasting worker discovery events.
@@ -546,7 +560,7 @@ class LocalDiscovery(Discovery):
                 pass  # pragma: no cover
             atexit.unregister(self._cleanups.pop(shared_memory.name))
 
-    class Subscriber:
+    class Subscriber(metaclass=SubscriberMeta):
         """Subscriber for receiving worker discovery events.
 
         Subscribes to worker :class:`discovery events <~wool.DiscoveryEvent>`
@@ -560,60 +574,64 @@ class LocalDiscovery(Discovery):
         of changes. Falls back to periodic polling if notifications are
         delayed or missed.
 
+        Instances are cached as singletons by
+        :class:`~wool.runtime.discovery.pool.SubscriberMeta` — two
+        calls with the same ``namespace`` and ``poll_interval`` return
+        the same object.
+
         :param namespace:
             The namespace identifier for the shared memory region.
-        :param filter:
-            Optional predicate function to filter workers. Only workers for
-            which the predicate returns True will be included in events.
         :param poll_interval:
             Maximum polling interval in seconds for when filesystem
             notifications are delayed or missed.
         """
 
-        _filter: Final[PredicateFunction | None]
         _namespace: Final[str]
         _poll_interval: Final[float | None]
 
         def __init__(
             self,
             namespace: str,
-            filter: PredicateFunction | None = None,
             *,
             poll_interval: float | None = None,
         ):
             self._namespace = namespace
-            self._filter = filter
             if poll_interval is not None and poll_interval < 0:
                 raise ValueError(f"Expected positive poll interval, got {poll_interval}")
             self._poll_interval = poll_interval
 
+        @classmethod
+        def _cache_key(cls, namespace: str, *, poll_interval: float | None = None):
+            return (cls, namespace, poll_interval)
+
+        async def _shutdown(self) -> None:
+            """Clean up shared subscription state for this subscriber."""
+
         def __reduce__(self):
-            return type(self), (self._namespace, self._filter)
+            return type(self), (self._namespace,)
 
         def __aiter__(self) -> AsyncIterator[DiscoveryEvent]:
-            return self._event_stream(self._filter)
+            return self._event_stream()
 
         @property
         def namespace(self):
             """The namespace identifier for this subscriber."""
             return self._namespace
 
-        async def _event_stream(
-            self, filter: PredicateFunction | None = None
-        ) -> AsyncIterator[DiscoveryEvent]:
-            """Monitor shared memory for worker changes via filesystem notifications.
+        async def _event_stream(self) -> AsyncGenerator[DiscoveryEvent, None]:
+            """Monitor shared memory for worker changes via filesystem
+            notifications.
 
-            Sets up a watchdog filesystem observer to monitor the notification
-            file for modifications. When publishers touch the file (after
-            updating shared memory), the observer triggers scanning of the
-            shared memory address space. Falls back to periodic polling in
-            case notifications are delayed or missed.
+            Sets up a watchdog filesystem observer to monitor the
+            notification file for modifications. When publishers touch
+            the file (after updating shared memory), the observer
+            triggers scanning of the shared memory address space. Falls
+            back to periodic polling in case notifications are delayed
+            or missed.
 
-            :param filter:
-                Optional predicate function to filter workers. Only workers for
-                which the predicate returns True will be included in events.
             :yields:
-                Discovery events as changes are detected in shared memory.
+                Discovery events as changes are detected in shared
+                memory.
             """
             cached_workers: dict[str, WorkerMetadata] = {}
             notification = asyncio.Event()
@@ -639,14 +657,14 @@ class LocalDiscovery(Discovery):
                                 if slot != NULL_REF:
                                     ref = _WorkerReference.from_bytes(slot)
                                     metadata = self._deserialize_metadata(str(ref))
-                                    if filter is None or filter(metadata):
-                                        discovered_workers[str(metadata.uid)] = metadata
+                                    discovered_workers[str(metadata.uid)] = metadata
 
                             for event in self._diff(cached_workers, discovered_workers):
                                 yield event
                         try:
                             await asyncio.wait_for(
-                                notification.wait(), timeout=self._poll_interval
+                                notification.wait(),
+                                timeout=self._poll_interval,
                             )
                         except asyncio.TimeoutError:
                             pass

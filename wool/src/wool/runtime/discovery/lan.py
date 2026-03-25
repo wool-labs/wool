@@ -6,6 +6,7 @@ import json
 import socket
 from asyncio import Queue
 from types import MappingProxyType
+from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Dict
 from typing import Final
@@ -27,6 +28,8 @@ from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
 from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.discovery.pool import SubscriberMeta
+from wool.utilities.afilter import afilter
 
 
 # public
@@ -85,6 +88,14 @@ class LanDiscovery(Discovery):
         self._filter = filter
         self._service_type = _namespaced_service_type(self._namespace)
 
+    def __hash__(self) -> int:
+        return hash((type(self), self._namespace))
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, LanDiscovery):
+            return self._namespace == other._namespace
+        return NotImplemented
+
     @property
     def namespace(self) -> str:
         """The namespace identifier for this discovery service.
@@ -127,10 +138,11 @@ class LanDiscovery(Discovery):
             A subscriber instance that receives filtered worker
             discovery events.
         """
-        return self.Subscriber(
-            self._service_type,
-            filter if filter is not None else self._filter,
-        )
+        effective = filter if filter is not None else self._filter
+        subscriber = self.Subscriber(self._service_type)
+        if effective is not None:
+            return afilter(effective, subscriber)
+        return subscriber
 
     class Publisher:
         """Publisher for broadcasting worker discovery events.
@@ -311,7 +323,7 @@ class LanDiscovery(Discovery):
 
             return socket.inet_aton(socket.gethostbyname(host)), port
 
-    class Subscriber:
+    class Subscriber(metaclass=SubscriberMeta):
         """Subscriber for receiving worker discovery events.
 
         Subscribes to worker :class:`discovery events
@@ -319,36 +331,33 @@ class LanDiscovery(Discovery):
         local network. As workers register and unregister their
         services, the subscriber yields corresponding events.
 
-        Each call to ``__aiter__`` creates an isolated iterator with its
-        own state. Multiple concurrent iterations from the same
-        subscriber instance are fully independent.
+        Each call to ``__aiter__`` creates an isolated consumer that
+        receives events from a shared underlying Zeroconf browser via
+        :class:`~wool.runtime.discovery.pool._SharedSubscription`.
+        Multiple concurrent iterations are fully independent.
 
-        Uses AsyncZeroconf's service browser to monitor for service
-        changes and converts Zeroconf events into Wool discovery
-        events.
+        Instances are cached as singletons by
+        :class:`~wool.runtime.discovery.pool.SubscriberMeta` — two
+        calls with the same ``service_type`` return the same object.
 
         :param service_type:
             The DNS-SD service type string for this namespace.
-        :param filter:
-            Optional predicate function to filter workers. Only workers
-            for which the predicate returns True will be included in
-            events.
         """
 
-        _filter: Final[PredicateFunction[WorkerMetadata] | None]
-
-        def __init__(
-            self,
-            service_type: str,
-            filter: PredicateFunction[WorkerMetadata] | None = None,
-        ) -> None:
+        def __init__(self, service_type: str) -> None:
             self.service_type = service_type
-            self._filter = filter
+
+        @classmethod
+        def _cache_key(cls, service_type: str) -> tuple:
+            return (cls, service_type)
+
+        async def _shutdown(self) -> None:
+            """Clean up shared subscription state for this subscriber."""
 
         def __aiter__(self) -> AsyncIterator[DiscoveryEvent]:
             return self._event_stream()
 
-        async def _event_stream(self) -> AsyncIterator[DiscoveryEvent]:
+        async def _event_stream(self) -> AsyncGenerator[DiscoveryEvent, None]:
             """Stream discovery events from the network.
 
             Creates isolated state for this iteration including its own
@@ -357,13 +366,13 @@ class LanDiscovery(Discovery):
             completes or is interrupted.
 
             :yields:
-                Discovery events as workers are added, updated, or removed.
+                Discovery events as workers are added, updated, or
+                removed.
             """
-            # Create isolated state for this iterator
             event_queue: Queue[DiscoveryEvent] = Queue()
             service_cache: Dict[str, WorkerMetadata] = {}
 
-            # Configure zeroconf to use localhost only to avoid network warnings
+            # Configure zeroconf to use localhost only
             aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
 
             try:
@@ -375,7 +384,6 @@ class LanDiscovery(Discovery):
                         aiozc=aiozc,
                         event_queue=event_queue,
                         service_cache=service_cache,
-                        predicate=self._filter or (lambda _: True),
                     ),
                 )
 
@@ -401,13 +409,10 @@ class LanDiscovery(Discovery):
             :param service_cache:
                 Cache to track service properties for pre/post event
                 states.
-            :param predicate:
-                Function to filter which workers to track.
             """
 
             aiozc: AsyncZeroconf
             _event_queue: Queue[DiscoveryEvent]
-            _service_addresses: Dict[str, str]
             _service_cache: Dict[str, WorkerMetadata]
 
             def __init__(
@@ -415,14 +420,11 @@ class LanDiscovery(Discovery):
                 service_type: str,
                 aiozc: AsyncZeroconf,
                 event_queue: Queue[DiscoveryEvent],
-                predicate: PredicateFunction[WorkerMetadata],
                 service_cache: Dict[str, WorkerMetadata],
             ) -> None:
                 self._service_type = service_type
                 self.aiozc = aiozc
                 self._event_queue = event_queue
-                self._predicate = predicate
-                self._service_addresses = {}
                 self._service_cache = service_cache
 
             def add_service(self, zc: Zeroconf, type_: str, name: str):  # noqa: ARG002
@@ -460,10 +462,10 @@ class LanDiscovery(Discovery):
                     except ValueError:
                         return
 
-                    if self._predicate(metadata):
-                        self._service_cache[name] = metadata
-                        event = DiscoveryEvent("worker-added", metadata=metadata)
-                        await self._event_queue.put(event)
+                    self._service_cache[name] = metadata
+                    await self._event_queue.put(
+                        DiscoveryEvent("worker-added", metadata=metadata)
+                    )
                 except Exception:  # pragma: no cover
                     pass
 
@@ -483,27 +485,15 @@ class LanDiscovery(Discovery):
                         return
 
                     if name not in self._service_cache:
-                        # New worker that wasn't tracked before
-                        if self._predicate(metadata):
-                            self._service_cache[name] = metadata
-                            event = DiscoveryEvent("worker-added", metadata=metadata)
-                            await self._event_queue.put(event)
+                        self._service_cache[name] = metadata
+                        await self._event_queue.put(
+                            DiscoveryEvent("worker-added", metadata=metadata)
+                        )
                     else:
-                        # Existing tracked worker
-                        old_worker = self._service_cache[name]
-                        if self._predicate(metadata):
-                            # Still satisfies filter, update cache and emit update
-                            self._service_cache[name] = metadata
-                            event = DiscoveryEvent("worker-updated", metadata=metadata)
-                            await self._event_queue.put(event)
-                        else:
-                            # No longer satisfies filter, remove and emit removal
-                            del self._service_cache[name]
-                            removal_event = DiscoveryEvent(
-                                "worker-dropped", metadata=old_worker
-                            )
-                            await self._event_queue.put(removal_event)
-
+                        self._service_cache[name] = metadata
+                        await self._event_queue.put(
+                            DiscoveryEvent("worker-updated", metadata=metadata)
+                        )
                 except Exception:  # pragma: no cover
                     pass
 
@@ -520,9 +510,7 @@ def _namespaced_service_type(namespace: str) -> str:
     :returns:
         A service type string like ``_wool-a1b2c3._tcp.local.``.
     """
-    short = hashlib.md5(
-        namespace.encode(), usedforsecurity=False
-    ).hexdigest()[:6]
+    short = hashlib.md5(namespace.encode(), usedforsecurity=False).hexdigest()[:6]
     return f"_wool-{short}._tcp.local."
 
 

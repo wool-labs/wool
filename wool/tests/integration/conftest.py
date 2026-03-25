@@ -55,6 +55,7 @@ class PoolMode(Enum):
     EPHEMERAL = auto()
     DURABLE = auto()
     DURABLE_JOINED = auto()
+    DURABLE_SHARED = auto()
     HYBRID = auto()
     NESTED_DEFAULT_IN_EPHEMERAL = auto()
     NESTED_EPHEMERAL_IN_EPHEMERAL = auto()
@@ -270,6 +271,9 @@ async def build_pool_from_scenario(scenario, credentials_map):
             if scenario.pool_mode is PoolMode.DURABLE:
                 async with _durable_pool_context(lb, creds, options) as pool:
                     yield pool
+            elif scenario.pool_mode is PoolMode.DURABLE_SHARED:
+                async with _durable_shared_pool_context(lb, creds, options) as pool:
+                    yield pool
             elif scenario.pool_mode is PoolMode.DURABLE_JOINED:
                 async with _durable_joined_pool_context(
                     scenario.discovery, lb, creds, options
@@ -354,6 +358,47 @@ async def _durable_pool_context(lb, creds, options):
                     )
                     async with pool:
                         yield pool
+                finally:
+                    await publisher.publish("worker-dropped", worker.metadata)
+        finally:
+            await worker.stop()
+
+
+@asynccontextmanager
+async def _durable_shared_pool_context(lb, creds, options):
+    """Create two pools sharing the same LocalDiscovery subscriber.
+
+    Exercises ``SubscriberMeta`` singleton caching and
+    ``_SharedSubscription`` fan-out: both pools call
+    ``Subscriber(namespace)`` through the metaclass, the second
+    hits the cache and gets a separate ``_SharedSubscription``
+    backed by the same raw subscriber and source iterator.
+    """
+    namespace = f"shared-{uuid.uuid4().hex[:12]}"
+    with LocalDiscovery(namespace) as discovery:
+        worker = LocalWorker(credentials=creds, options=options)
+        await worker.start()
+        try:
+            publisher = discovery.publisher
+            async with publisher:
+                await publisher.publish("worker-added", worker.metadata)
+                try:
+                    shared = _DirectDiscovery(discovery)
+                    pool_a = WorkerPool(
+                        discovery=shared,
+                        loadbalancer=lb,
+                        credentials=creds,
+                        options=options,
+                    )
+                    pool_b = WorkerPool(
+                        discovery=shared,
+                        loadbalancer=lb,
+                        credentials=creds,
+                        options=options,
+                    )
+                    async with pool_a:
+                        async with pool_b:
+                            yield pool_a
                 finally:
                     await publisher.publish("worker-dropped", worker.metadata)
         finally:
@@ -612,6 +657,7 @@ def _pairwise_filter(row):
             PoolMode.DEFAULT,
             PoolMode.EPHEMERAL,
             PoolMode.DURABLE,
+            PoolMode.DURABLE_SHARED,
             PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
             PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
         )
@@ -679,6 +725,7 @@ def scenarios_strategy(draw):
         PoolMode.DEFAULT,
         PoolMode.EPHEMERAL,
         PoolMode.DURABLE,
+        PoolMode.DURABLE_SHARED,
         PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
         PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
     )
@@ -821,11 +868,15 @@ async def _clear_channel_pool():
 @pytest.fixture(autouse=True)
 def _clear_proxy_context():
     """Reset proxy context vars between tests."""
+    from wool.runtime.discovery import __subscriber_pool__
+
     proxy_token = wool.__proxy__.set(None)
     pool_token = wool.__proxy_pool__.set(None)
+    sub_token = __subscriber_pool__.set(None)
     yield
     wool.__proxy__.reset(proxy_token)
     wool.__proxy_pool__.reset(pool_token)
+    __subscriber_pool__.reset(sub_token)
 
 
 @pytest.fixture
@@ -852,9 +903,7 @@ def retry_grpc_internal():
                 if not _is_grpc_internal(exc):
                     raise
                 if attempt < _GRPC_INTERNAL_RETRIES:
-                    await asyncio.sleep(
-                        _GRPC_INTERNAL_BACKOFF * (2**attempt)
-                    )
+                    await asyncio.sleep(_GRPC_INTERNAL_BACKOFF * (2**attempt))
                     continue
                 raise
 

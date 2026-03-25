@@ -236,3 +236,37 @@ class TestPoolComposition:
 
         # Assert
         assert result == 3
+
+    @pytest.mark.asyncio
+    async def test_build_pool_from_scenario_with_shared_discovery(self, credentials_map):
+        """Test two pools sharing the same discovery subscriber.
+
+        Given:
+            Two WorkerPool instances sharing the same LocalDiscovery
+            with one externally started worker, exercising
+            SubscriberMeta caching and _SharedSubscription fan-out.
+        When:
+            Both pools are entered and a coroutine is dispatched
+            through the primary pool.
+        Then:
+            It should discover the worker and return the correct
+            result.
+        """
+        # Arrange
+        scenario = Scenario(
+            shape=RoutineShape.COROUTINE,
+            pool_mode=PoolMode.DURABLE_SHARED,
+            discovery=DiscoveryFactory.NONE,
+            lb=LbFactory.CLASS_REF,
+            credential=CredentialType.INSECURE,
+            options=WorkerOptionsKind.DEFAULT,
+            timeout=TimeoutKind.NONE,
+            binding=RoutineBinding.MODULE_FUNCTION,
+        )
+
+        # Act
+        async with build_pool_from_scenario(scenario, credentials_map):
+            result = await invoke_routine(scenario)
+
+        # Assert
+        assert result == 3

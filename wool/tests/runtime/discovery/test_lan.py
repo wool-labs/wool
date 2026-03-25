@@ -10,8 +10,10 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from zeroconf import ServiceInfo
 
+from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.lan import LanDiscovery
+from wool.utilities.afilter import afilter
 
 _TEST_NAMESPACE = "test-namespace"
 _TEST_SERVICE_TYPE = "_wool-c6c84a._tcp.local."
@@ -113,6 +115,87 @@ class TestLanDiscovery:
         # Assert
         assert d1.namespace != d2.namespace
 
+    def test___hash___with_same_namespace(self):
+        """Test hash equality for same namespace.
+
+        Given:
+            Two LanDiscovery instances with the same namespace.
+        When:
+            Their hashes are compared.
+        Then:
+            It should produce equal hashes.
+        """
+        # Arrange
+        a = LanDiscovery("shared-ns")
+        b = LanDiscovery("shared-ns")
+
+        # Act & assert
+        assert hash(a) == hash(b)
+
+    def test___hash___with_different_namespace(self):
+        """Test hash inequality for different namespaces.
+
+        Given:
+            Two LanDiscovery instances with different namespaces.
+        When:
+            Their hashes are compared.
+        Then:
+            It should produce different hashes.
+        """
+        # Arrange
+        a = LanDiscovery("ns-a")
+        b = LanDiscovery("ns-b")
+
+        # Act & assert
+        assert hash(a) != hash(b)
+
+    def test___eq___with_same_namespace(self):
+        """Test equality for same namespace.
+
+        Given:
+            Two LanDiscovery instances with the same namespace.
+        When:
+            They are compared with ==.
+        Then:
+            It should return True.
+        """
+        # Arrange
+        a = LanDiscovery("shared-ns")
+        b = LanDiscovery("shared-ns")
+
+        # Act & assert
+        assert a == b
+
+    def test___eq___with_different_namespace(self):
+        """Test inequality for different namespaces.
+
+        Given:
+            Two LanDiscovery instances with different namespaces.
+        When:
+            They are compared with ==.
+        Then:
+            It should return False.
+        """
+        # Arrange
+        a = LanDiscovery("ns-a")
+        b = LanDiscovery("ns-b")
+
+        # Act & assert
+        assert a != b
+
+    def test___eq___with_non_lan_discovery(self):
+        """Test equality with a non-LanDiscovery object.
+
+        Given:
+            A LanDiscovery instance and a non-LanDiscovery object.
+        When:
+            They are compared with ==.
+        Then:
+            It should not be equal.
+        """
+        # Act & assert
+        assert LanDiscovery("ns") != "not-a-discovery"
+
     def test_publisher_with_default_instance(self):
         """Test publisher property returns Publisher instance.
 
@@ -149,7 +232,7 @@ class TestLanDiscovery:
         subscriber = discovery.subscriber
 
         # Assert
-        assert isinstance(subscriber, LanDiscovery.Subscriber)
+        assert isinstance(subscriber, DiscoverySubscriberLike)
 
     @pytest.mark.asyncio
     async def test_subscribe_with_default_filter(self, worker_factory):
@@ -517,22 +600,6 @@ class TestLanDiscoverySubscriber:
     wool.runtime.discovery.lan.LanDiscovery.Subscriber
     """
 
-    def test_service_type_with_provided_value(self):
-        """Test Subscriber stores the provided service type.
-
-        Given:
-            A service type string
-        When:
-            Subscriber is instantiated with that service type
-        Then:
-            It should store the provided service type.
-        """
-        # Act
-        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
-
-        # Assert
-        assert subscriber.service_type == _TEST_SERVICE_TYPE
-
     @pytest.mark.asyncio
     async def test___aiter___discovers_added_worker(self, metadata):
         """Test async for yields worker-added event.
@@ -709,7 +776,7 @@ class TestLanDiscoverySubscriber:
         def filter_fn(w):
             return w.address.endswith(":50051")
 
-        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE, filter=filter_fn)
+        subscriber = afilter(filter_fn, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
 
         worker_match = worker_factory(
             address="127.0.0.1:50051", tags=frozenset(["match"])
@@ -830,7 +897,7 @@ class TestLanDiscoverySubscriber:
         def filter_fn(w):
             return "gpu" in w.tags
 
-        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE, filter=filter_fn)
+        subscriber = afilter(filter_fn, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
 
         worker = worker_factory(address="127.0.0.1:50051", tags=frozenset(["gpu"]))
 
@@ -896,7 +963,7 @@ class TestLanDiscoverySubscriber:
         def filter_fn(w):
             return "gpu" in w.tags
 
-        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE, filter=filter_fn)
+        subscriber = afilter(filter_fn, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
 
         worker = worker_factory(address="127.0.0.1:50051", tags=frozenset(["cpu"]))
 
@@ -1079,9 +1146,12 @@ class TestLanDiscoverySubscriber:
                 except asyncio.CancelledError:
                     pass
 
-        # Assert
+        # Assert — events[-1] is the matched event (collect breaks
+        # after finding worker.uid); earlier entries may be stale
+        # because the shared Zeroconf browser persists across
+        # hypothesis examples.
         assert len(events) >= 1
-        event = events[0]
+        event = events[-1]
         assert event.metadata.uid == worker.uid
         assert event.metadata.pid == worker.pid
         assert event.metadata.version == worker.version
