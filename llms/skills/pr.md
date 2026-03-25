@@ -87,23 +87,42 @@ Analyze all committed source and test changes. Understand what was implemented, 
 
 ### 4. Draft the PR description
 
+#### 4a. Detect a PR template
+
+Before drafting, check whether the repository provides a PR template:
+
+```bash
+cat "$(git rev-parse --show-toplevel)/.github/pull_request_template.md" 2>/dev/null
+```
+
+- **If the file exists** — read its section headings (lines starting with `##`) and use them as the scaffold for the PR body. Populate each section contextually based on the diff analysis from step 3. Any guidance inside HTML comments (`<!-- ... -->`) informs what content belongs in that section but MUST NOT appear in the final PR body.
+- **If the file does not exist** — fall back to the built-in three-section format defined below.
+
+The remaining rules in this step apply regardless of whether a template is used.
+
+#### 4b. Title
+
 The PR title MUST match the associated issue title exactly with ` — Closes #<number>` appended to the end.
+
+#### 4c. Body prose rules
 
 All PR description prose MUST be written in the imperative mood — "Add retry logic" not "Adds retry logic" or "Added retry logic". This applies to the title, summary, and proposed changes. Descriptions of the current state of the system are exempt and SHOULD use present tense — "The registry stores entries in memory" not "Store entries in memory".
 
 Prose in PR descriptions MUST NOT be hard-wrapped at a fixed column width. Write each sentence or logical phrase as a single unwrapped line. Markdown renderers handle line wrapping automatically — manual line breaks inside paragraphs create unnecessary diffs and awkward rendering.
 
-The PR description MUST contain a **Summary** and **Proposed changes** section. A **Test cases** section MUST be included when the PR contains code changes; it MAY be omitted for PRs that only modify documentation, configuration, or other non-code files.
+#### 4d. Built-in section format (fallback)
+
+When no PR template file is detected, the PR description MUST contain a **Summary** and **Proposed changes** section. A **Test cases** section MUST be included when the PR contains code changes; it MAY be omitted for PRs that only modify documentation, configuration, or other non-code files.
 
 **Summary** — A recap of what was implemented, the high-level approach, and any trade-offs worth noting. The summary is based on the actual diff, not the issue body. The summary MUST end with `Closes #<number>` to link the issue.
 
-**Proposed changes** — Subsections for each logical change, derived from the committed diff. Design rationale and before/after code snippets SHOULD be included where useful.
+**Proposed changes** — Subsections for each logical change, derived from the committed diff. Design rationale SHOULD be included where useful.
 
-**Test cases** (code changes only) — A Given-When-Then table summarizing the test coverage from committed test files. Read the test files and generate a table in this format:
+**Test cases** (code changes only) — An enumerated Given-When-Then table summarizing the test coverage from committed test files. Read the test files and generate a table in this format:
 
-| Test Suite | Test ID | Given | When | Then | Coverage Target |
-|------------|---------|-------|------|------|-----------------|
-| `TestParser` | PA-001 | A parser with default config | Empty input is processed | Returns an empty result | Default behavior |
+| # | Test Suite | Given | When | Then | Coverage Target |
+|---|------------|-------|------|------|-----------------|
+| 1 | `TestParser` | A parser with default config | Empty input is processed | Returns an empty result | Default behavior |
 
 The first word of every plain-language table entry MUST be capitalized. Table entries MUST NOT end with punctuation (no trailing periods, commas, etc.). Code spans in entries (e.g., `` `foo.bar()` is called ``) are exempt from the capitalization rule.
 
