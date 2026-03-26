@@ -126,6 +126,4 @@ message ChannelOptions {
     int32 compression = 8;
 }
 
-message WorkerEndpoint {}
-
 message Void {}
