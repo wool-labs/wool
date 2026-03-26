@@ -12,7 +12,6 @@ EXPECTED_MESSAGE_EXPORTS = [
     "Task",
     "TaskEnvelope",
     "Void",
-    "WorkerEndpoint",
     "WorkerMetadata",
 ]
 

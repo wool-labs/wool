@@ -23,7 +23,6 @@ try:
     from wool.protocol.wire_pb2 import Task
     from wool.protocol.wire_pb2 import TaskEnvelope
     from wool.protocol.wire_pb2 import Void
-    from wool.protocol.wire_pb2 import WorkerEndpoint
     from wool.protocol.wire_pb2 import WorkerMetadata
     from wool.protocol.wire_pb2_grpc import WorkerServicer
     from wool.protocol.wire_pb2_grpc import WorkerStub
@@ -55,7 +54,6 @@ __all__ = [
     "Task",
     "TaskEnvelope",
     "Void",
-    "WorkerEndpoint",
     "WorkerMetadata",
     "WorkerServicer",
     "WorkerStub",
