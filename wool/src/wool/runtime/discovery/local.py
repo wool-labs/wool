@@ -29,9 +29,9 @@ from wool.runtime.discovery.base import DiscoveryEventType
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.pool import SubscriberMeta
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
 
 REF_WIDTH: Final = 16

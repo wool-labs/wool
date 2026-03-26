@@ -17,10 +17,10 @@ from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
-from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.base import ChannelOptions
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
-_PoolKey: TypeAlias = tuple[str, grpc.ChannelCredentials | None, int, WorkerOptions]
+_PoolKey: TypeAlias = tuple[str, grpc.ChannelCredentials | None, ChannelOptions]
 
 _T = TypeVar("_T")
 
@@ -42,21 +42,33 @@ def _channel_factory(key):
     """Create a new :class:`_Channel` for the given pool key.
 
     :param key:
-        Tuple of ``(target, credentials, limit, options)``.
+        Tuple of ``(target, credentials, options)``.
     :returns:
         A new :class:`_Channel` instance.
     """
-    target, credentials, limit, worker_options = key
-    options = [
-        ("grpc.max_receive_message_length", worker_options.max_receive_message_length),
-        ("grpc.max_send_message_length", worker_options.max_send_message_length),
+    target, credentials, options = key
+    grpc_options = [
+        ("grpc.max_receive_message_length", options.max_receive_message_length),
+        ("grpc.max_send_message_length", options.max_send_message_length),
+        ("grpc.keepalive_time_ms", options.keepalive_time_ms),
+        ("grpc.keepalive_timeout_ms", options.keepalive_timeout_ms),
+        (
+            "grpc.keepalive_permit_without_calls",
+            int(options.keepalive_permit_without_calls),
+        ),
+        ("grpc.http2.max_pings_without_data", options.max_pings_without_data),
+        ("grpc.max_concurrent_streams", options.max_concurrent_streams),
+        (
+            "grpc.default_compression_algorithm",
+            options.compression.value,
+        ),
     ]
     if credentials is not None:
-        channel = grpc.aio.secure_channel(target, credentials, options=options)
+        channel = grpc.aio.secure_channel(target, credentials, options=grpc_options)
     else:
-        channel = grpc.aio.insecure_channel(target, options=options)
+        channel = grpc.aio.insecure_channel(target, options=grpc_options)
     stub = protocol.WorkerStub(channel)
-    return _Channel(channel, stub, asyncio.Semaphore(limit))
+    return _Channel(channel, stub, asyncio.Semaphore(options.max_concurrent_streams))
 
 
 async def _channel_finalizer(channel: _Channel):
@@ -298,7 +310,7 @@ class WorkerConnection:
     """gRPC connection to a worker for task dispatch.
 
     Acquires pooled gRPC channels keyed by ``(target, credentials,
-    limit, options)``.  Each :meth:`dispatch` call obtains a reference-counted
+    options)``.  Each :meth:`dispatch` call obtains a reference-counted
     channel from the module-level pool, primes an async generator that
     holds its own reference, then releases the dispatch-scope reference.
     The channel stays alive until the caller finishes consuming the
@@ -323,13 +335,14 @@ class WorkerConnection:
         - ``unix:path`` - Unix domain socket
 
         Examples: ``localhost:50051``, ``192.0.2.1:50051``
-    :param limit:
-        Maximum concurrent task dispatches.
     :param credentials:
         Optional channel credentials for TLS/mTLS connections.
     :param options:
-        Optional worker options controlling gRPC message
-        size limits. See :class:`WorkerOptions` for defaults.
+        Optional channel options controlling gRPC message
+        size limits, keepalive, concurrency, and compression.
+        See :class:`ChannelOptions` for defaults.  The
+        ``max_concurrent_streams`` field sizes the per-channel
+        concurrency semaphore.
     """
 
     TRANSIENT_ERRORS: Final = {
@@ -342,18 +355,13 @@ class WorkerConnection:
         self,
         target: str,
         *,
-        limit: int = 100,
         credentials: grpc.ChannelCredentials | None = None,
-        options: WorkerOptions | None = None,
+        options: ChannelOptions | None = None,
     ):
-        if limit <= 0:
-            raise ValueError("Limit must be positive")
-
         self._target = target
         self._credentials = credentials
-        self._limit = limit
-        self._options = options if options is not None else WorkerOptions()
-        self._key = (target, credentials, limit, self._options)
+        self._options = options if options is not None else ChannelOptions()
+        self._key: _PoolKey = (target, credentials, self._options)
         self._uds_key: _PoolKey | None = None
 
     async def dispatch(
@@ -405,7 +413,7 @@ class WorkerConnection:
         ) is not None and metadata.address == self._target:
             serializer = PassthroughSerializer()
             if (uds_address := wool.__worker_uds_address__) is not None:
-                key = (uds_address, None, self._limit, self._options)
+                key = (uds_address, None, self._options)
                 self._uds_key = key
             else:
                 key = self._key
