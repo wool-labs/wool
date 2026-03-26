@@ -7,12 +7,12 @@ import pytest
 
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.discovery.base import DiscoveryEvent
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.pool import SubscriberMeta
 from wool.runtime.discovery.pool import _pool_factory
 from wool.runtime.discovery.pool import _SharedSubscription
 from wool.runtime.discovery.pool import _subscriber_factories
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.worker.metadata import WorkerMetadata
 
 
 class _StubSubscriber(metaclass=SubscriberMeta):

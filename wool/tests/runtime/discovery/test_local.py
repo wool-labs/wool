@@ -11,8 +11,8 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool.runtime.discovery.base import DiscoverySubscriberLike
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
 
 

@@ -11,8 +11,8 @@ from hypothesis import strategies as st
 from zeroconf import ServiceInfo
 
 from wool.runtime.discovery.base import DiscoverySubscriberLike
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.lan import LanDiscovery
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
 
 _TEST_NAMESPACE = "test-namespace"

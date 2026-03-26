@@ -22,9 +22,8 @@ from pytest_mock import MockerFixture
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
-from wool.runtime.discovery.base import WorkerMetadata
-from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.local import LocalWorker
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import WorkerPool
 
 
@@ -1704,21 +1703,21 @@ class TestWorkerPool:
                 pass
 
     @pytest.mark.asyncio
-    async def test___aenter___with_default_options(
+    async def test___aenter___does_not_pass_options_to_proxy(
         self,
         mocker: MockerFixture,
         mock_worker_factory,
         mock_local_worker,
         mock_worker_proxy,
     ):
-        """Test pool startup forwards options=None to WorkerProxy.
+        """Test pool startup does not pass options to WorkerProxy.
 
         Given:
-            A WorkerPool with no options parameter.
+            A WorkerPool with default configuration
         When:
-            The pool is entered as an async context.
+            The pool is entered as an async context
         Then:
-            It should forward options=None to WorkerProxy.
+            It should not pass an options parameter to WorkerProxy
         """
         # Arrange
         import wool.runtime.worker.pool as wp
@@ -1735,42 +1734,4 @@ class TestWorkerPool:
         # Assert
         mock_proxy_cls.assert_called_once()
         _, proxy_kwargs = mock_proxy_cls.call_args
-        assert proxy_kwargs.get("options") is None
-
-    @pytest.mark.asyncio
-    async def test___aenter___with_custom_options(
-        self,
-        mocker: MockerFixture,
-        mock_worker_factory,
-        mock_local_worker,
-        mock_worker_proxy,
-    ):
-        """Test pool startup forwards custom options to WorkerProxy.
-
-        Given:
-            A WorkerPool with a custom WorkerOptions instance.
-        When:
-            The pool is entered as an async context.
-        Then:
-            It should forward the custom options to WorkerProxy.
-        """
-        # Arrange
-        import wool.runtime.worker.pool as wp
-
-        custom_options = WorkerOptions(
-            max_receive_message_length=200 * 1024 * 1024,
-            max_send_message_length=50 * 1024 * 1024,
-        )
-        mock_proxy_cls = mocker.patch.object(
-            wp, "WorkerProxy", return_value=mock_worker_proxy
-        )
-        pool = WorkerPool(worker=mock_worker_factory, size=1, options=custom_options)
-
-        # Act
-        async with pool:
-            pass
-
-        # Assert
-        mock_proxy_cls.assert_called_once()
-        _, proxy_kwargs = mock_proxy_cls.call_args
-        assert proxy_kwargs["options"] is custom_options
+        assert "options" not in proxy_kwargs
