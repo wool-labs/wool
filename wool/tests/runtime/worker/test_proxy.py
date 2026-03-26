@@ -22,13 +22,13 @@ from pytest_mock import MockerFixture
 import wool.runtime.worker.proxy as wp
 from wool import protocol
 from wool.runtime.discovery.base import DiscoveryEvent
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.auth import CredentialContext
-from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.proxy import WorkerProxy
 from wool.runtime.worker.proxy import is_version_compatible
 from wool.runtime.worker.proxy import parse_version
@@ -1073,6 +1073,155 @@ class TestWorkerProxy:
         await proxy.stop()
 
     @pytest.mark.asyncio
+    async def test_sentinel_passes_metadata_options_to_connection(
+        self, mocker: MockerFixture
+    ):
+        """Test sentinel creates WorkerConnection with metadata options.
+
+        Given:
+            A WorkerProxy with a discovery stream yielding a worker-added
+            event whose metadata has options=ChannelOptions(keepalive_time_ms=60000)
+        When:
+            The sentinel processes the event
+        Then:
+            It should create WorkerConnection with
+            options=ChannelOptions(keepalive_time_ms=60000) from the
+            event metadata
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        channel_opts = ChannelOptions(keepalive_time_ms=60000)
+        metadata = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.100:50051",
+            pid=1001,
+            version="1.0.0",
+            options=channel_opts,
+        )
+        mock_conn_cls = mocker.patch.object(
+            wp, "WorkerConnection", return_value=mocker.MagicMock()
+        )
+        events = [DiscoveryEvent("worker-added", metadata=metadata)]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        mock_conn_cls.assert_called_once_with(
+            metadata.address,
+            credentials=None,
+            options=channel_opts,
+        )
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_sentinel_passes_none_options_for_legacy_workers(
+        self, mocker: MockerFixture
+    ):
+        """Test sentinel creates WorkerConnection with options=None for legacy workers.
+
+        Given:
+            A WorkerProxy with a discovery stream yielding a worker-added
+            event whose metadata has options=None
+        When:
+            The sentinel processes the event
+        Then:
+            It should create WorkerConnection with options=None
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        metadata = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.100:50051",
+            pid=1001,
+            version="1.0.0",
+            options=None,
+        )
+        mock_conn_cls = mocker.patch.object(
+            wp, "WorkerConnection", return_value=mocker.MagicMock()
+        )
+        events = [DiscoveryEvent("worker-added", metadata=metadata)]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        mock_conn_cls.assert_called_once_with(
+            metadata.address,
+            credentials=None,
+            options=None,
+        )
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_sentinel_passes_updated_options_on_worker_updated(
+        self, mocker: MockerFixture
+    ):
+        """Test sentinel creates WorkerConnection with updated metadata options.
+
+        Given:
+            A WorkerProxy with a discovery stream yielding a worker-added
+            event followed by a worker-updated event whose metadata has
+            options=ChannelOptions(keepalive_time_ms=90000)
+        When:
+            The sentinel processes the events
+        Then:
+            It should create WorkerConnection with
+            options=ChannelOptions(keepalive_time_ms=90000) for the
+            updated event
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        worker_uid = uuid.uuid4()
+        initial_opts = ChannelOptions(keepalive_time_ms=60000)
+        updated_opts = ChannelOptions(keepalive_time_ms=90000)
+        initial_metadata = WorkerMetadata(
+            uid=worker_uid,
+            address="192.168.1.100:50051",
+            pid=1001,
+            version="1.0.0",
+            options=initial_opts,
+        )
+        updated_metadata = WorkerMetadata(
+            uid=worker_uid,
+            address="192.168.1.100:50051",
+            pid=1001,
+            version="1.0.0",
+            options=updated_opts,
+        )
+        mock_conn_cls = mocker.patch.object(
+            wp, "WorkerConnection", return_value=mocker.MagicMock()
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=initial_metadata),
+            DiscoveryEvent("worker-updated", metadata=updated_metadata),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert mock_conn_cls.call_count == 2
+        _, updated_kwargs = mock_conn_cls.call_args_list[1]
+        assert updated_kwargs["options"] == updated_opts
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
     async def test_dispatch_delegates_to_loadbalancer(
         self,
         spy_loadbalancer_with_workers,
@@ -1588,29 +1737,24 @@ class TestWorkerProxy:
             assert unpickled_proxy.id == proxy.id
 
     @pytest.mark.asyncio
-    async def test_cloudpickle_serialization_preserves_options(
+    async def test_cloudpickle_serialization_preserves_proxy_id(
         self, mock_proxy_session, mocker: MockerFixture
     ):
-        """Test pickle roundtrip preserves options and proxy ID.
+        """Test pickle roundtrip preserves proxy ID.
 
         Given:
-            A started WorkerProxy with custom WorkerOptions.
+            A started WorkerProxy with discovery and load balancer.
         When:
             Cloudpickle serialization and deserialization are performed.
         Then:
-            It should preserve options and proxy ID on the restored proxy.
+            It should preserve the proxy ID on the restored proxy.
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
-        options = WorkerOptions(
-            max_receive_message_length=50 * 1024 * 1024,
-            max_send_message_length=50 * 1024 * 1024,
-        )
         discovery_service = LocalDiscovery("test-pool").subscriber
         proxy = WorkerProxy(
             discovery=discovery_service,
             loadbalancer=wp.RoundRobinLoadBalancer,
-            options=options,
         )
 
         # Act
@@ -1622,8 +1766,7 @@ class TestWorkerProxy:
         assert isinstance(unpickled_proxy, WorkerProxy)
         assert unpickled_proxy.id == proxy.id
         assert unpickled_proxy.started is False
-        # Verify options survived: a second roundtrip still produces
-        # a valid proxy (options are picklable and preserved)
+        # Verify a second roundtrip still produces a valid proxy
         repickled = cloudpickle.loads(cloudpickle.dumps(unpickled_proxy))
         assert repickled.id == proxy.id
 
@@ -2287,92 +2430,6 @@ class TestWorkerProxy:
         # Assert
         assert isinstance(proxy, WorkerProxy)
         assert not proxy.started
-
-    @pytest.mark.asyncio
-    async def test___aenter___with_default_options(
-        self, mocker: MockerFixture, mock_discovery_service
-    ):
-        """Test proxy forwards options=None to WorkerConnection.
-
-        Given:
-            A WorkerProxy with no options parameter.
-        When:
-            The proxy is started and a worker-added event is processed.
-        Then:
-            It should create WorkerConnection with options=None.
-        """
-        # Arrange
-        mock_conn_cls = mocker.patch.object(
-            wp, "WorkerConnection", return_value=mocker.MagicMock()
-        )
-        await mock_discovery_service.start()
-
-        worker = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="192.168.1.100:50051",
-            pid=1001,
-            version="1.0.0",
-            tags=frozenset(["test"]),
-            extra=MappingProxyType({}),
-        )
-
-        # Act
-        proxy = WorkerProxy(discovery=mock_discovery_service)
-        async with proxy:
-            mock_discovery_service.inject_worker_added(worker)
-            await asyncio.sleep(0.2)
-
-        await mock_discovery_service.stop()
-
-        # Assert
-        mock_conn_cls.assert_called()
-        _, kwargs = mock_conn_cls.call_args
-        assert kwargs["options"] is None
-
-    @pytest.mark.asyncio
-    async def test___aenter___with_custom_options(
-        self, mocker: MockerFixture, mock_discovery_service
-    ):
-        """Test proxy forwards custom options to WorkerConnection.
-
-        Given:
-            A WorkerProxy with a custom WorkerOptions instance.
-        When:
-            The proxy is started and a worker-added event is processed.
-        Then:
-            It should create WorkerConnection with the custom options.
-        """
-        # Arrange
-        custom_options = WorkerOptions(
-            max_receive_message_length=200 * 1024 * 1024,
-            max_send_message_length=50 * 1024 * 1024,
-        )
-        mock_conn_cls = mocker.patch.object(
-            wp, "WorkerConnection", return_value=mocker.MagicMock()
-        )
-        await mock_discovery_service.start()
-
-        worker = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="192.168.1.100:50051",
-            pid=1001,
-            version="1.0.0",
-            tags=frozenset(["test"]),
-            extra=MappingProxyType({}),
-        )
-
-        # Act
-        proxy = WorkerProxy(discovery=mock_discovery_service, options=custom_options)
-        async with proxy:
-            mock_discovery_service.inject_worker_added(worker)
-            await asyncio.sleep(0.2)
-
-        await mock_discovery_service.stop()
-
-        # Assert
-        mock_conn_cls.assert_called()
-        _, kwargs = mock_conn_cls.call_args
-        assert kwargs["options"] is custom_options
 
 
 # ============================================================================

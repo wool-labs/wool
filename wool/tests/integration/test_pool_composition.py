@@ -207,6 +207,38 @@ class TestPoolComposition:
         assert result == 3
 
     @pytest.mark.asyncio
+    async def test_build_pool_from_scenario_with_keepalive_opts(self, credentials_map):
+        """Test building a pool with keepalive worker options.
+
+        Given:
+            A complete scenario using KEEPALIVE worker options (10s ping
+            interval, 5s timeout).
+        When:
+            A pool is built and a small-payload coroutine is dispatched.
+        Then:
+            It should return the correct result with keepalive options
+            active on both server and client.
+        """
+        # Arrange
+        scenario = Scenario(
+            shape=RoutineShape.COROUTINE,
+            pool_mode=PoolMode.DEFAULT,
+            discovery=DiscoveryFactory.NONE,
+            lb=LbFactory.CLASS_REF,
+            credential=CredentialType.INSECURE,
+            options=WorkerOptionsKind.KEEPALIVE,
+            timeout=TimeoutKind.NONE,
+            binding=RoutineBinding.MODULE_FUNCTION,
+        )
+
+        # Act
+        async with build_pool_from_scenario(scenario, credentials_map):
+            result = await invoke_routine(scenario)
+
+        # Assert
+        assert result == 3
+
+    @pytest.mark.asyncio
     async def test_build_pool_from_scenario_with_dispatch_timeout(self, credentials_map):
         """Test building a pool with dispatch_timeout via RuntimeContext.
 

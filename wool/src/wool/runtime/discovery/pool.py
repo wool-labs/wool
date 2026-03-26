@@ -8,8 +8,8 @@ from typing import ClassVar
 
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.discovery.base import DiscoveryEvent
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.fanout import Fanout
 
 _subscriber_factories: dict[Any, Callable[[Any], Any]] = {}

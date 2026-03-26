@@ -31,8 +31,8 @@ from pytest_mock import MockerFixture
 
 import wool.runtime.worker.pool as wp
 from wool.runtime.discovery.base import DiscoveryEvent
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.metadata import WorkerMetadata
 
 
 @pytest_asyncio.fixture(autouse=True)

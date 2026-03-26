@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from dataclasses import fields
 from enum import Enum
 from enum import auto
+from functools import partial
 
 import grpc
 import pytest
@@ -33,6 +34,7 @@ from wool.runtime.context import RuntimeContext
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
@@ -88,6 +90,7 @@ class CredentialType(Enum):
 class WorkerOptionsKind(Enum):
     DEFAULT = auto()
     RESTRICTIVE = auto()
+    KEEPALIVE = auto()
 
 
 class TimeoutKind(Enum):
@@ -188,11 +191,22 @@ async def build_pool_from_scenario(scenario, credentials_map):
 
     if scenario.options is WorkerOptionsKind.RESTRICTIVE:
         options = WorkerOptions(
-            max_receive_message_length=64 * 1024,
-            max_send_message_length=64 * 1024,
+            channel=ChannelOptions(
+                max_receive_message_length=64 * 1024,
+                max_send_message_length=64 * 1024,
+            ),
+        )
+    elif scenario.options is WorkerOptionsKind.KEEPALIVE:
+        options = WorkerOptions(
+            channel=ChannelOptions(
+                keepalive_time_ms=10000,
+                keepalive_timeout_ms=5000,
+                keepalive_permit_without_calls=True,
+            ),
+            http2_min_recv_ping_interval_without_data_ms=5000,
         )
     else:
-        options = None
+        options = WorkerOptions()
 
     lb: object
     match scenario.lb:
@@ -283,7 +297,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
                 pool_kwargs = {
                     "loadbalancer": lb,
                     "credentials": creds,
-                    "options": options,
+                    "worker": partial(LocalWorker, options=options),
                 }
                 match scenario.pool_mode:
                     case PoolMode.DEFAULT:
@@ -316,7 +330,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
                         nested_pool = WorkerPool(
                             size=nested_size,
                             credentials=creds,
-                            options=options,
+                            worker=partial(LocalWorker, options=options),
                         )
                         async with nested_pool:
                             yield pool
@@ -354,7 +368,6 @@ async def _durable_pool_context(lb, creds, options):
                         discovery=_DirectDiscovery(discovery),
                         loadbalancer=lb,
                         credentials=creds,
-                        options=options,
                     )
                     async with pool:
                         yield pool
@@ -388,13 +401,11 @@ async def _durable_shared_pool_context(lb, creds, options):
                         discovery=shared,
                         loadbalancer=lb,
                         credentials=creds,
-                        options=options,
                     )
                     pool_b = WorkerPool(
                         discovery=shared,
                         loadbalancer=lb,
                         credentials=creds,
-                        options=options,
                     )
                     async with pool_a:
                         async with pool_b:
@@ -469,7 +480,6 @@ async def _durable_joined_pool_context(discovery_factory, lb, creds, options):
                         discovery=joiner,
                         loadbalancer=lb,
                         credentials=creds,
-                        options=options,
                     )
                     async with pool:
                         yield pool

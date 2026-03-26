@@ -6,12 +6,13 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from wool import protocol
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker import local as local_module
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.local import LocalWorker
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.process import WorkerProcess
 
 
@@ -150,8 +151,10 @@ class TestLocalWorker:
         # Arrange
         MockWorkerProcess = mocker.patch.object(local_module, "WorkerProcess")
         opts = WorkerOptions(
-            max_receive_message_length=50 * 1024 * 1024,
-            max_send_message_length=25 * 1024 * 1024,
+            channel=ChannelOptions(
+                max_receive_message_length=50 * 1024 * 1024,
+                max_send_message_length=25 * 1024 * 1024,
+            ),
         )
 
         # Act
@@ -261,7 +264,7 @@ class TestLocalWorker:
         # Arrange
         from types import MappingProxyType
 
-        from wool.runtime.discovery.base import WorkerMetadata
+        from wool.runtime.worker.metadata import WorkerMetadata
 
         expected_metadata = WorkerMetadata(
             uid=uuid4(),
@@ -324,7 +327,7 @@ class TestLocalWorker:
         # Arrange
         from types import MappingProxyType
 
-        from wool.runtime.discovery.base import WorkerMetadata
+        from wool.runtime.worker.metadata import WorkerMetadata
 
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "0.0.0.0:8080"

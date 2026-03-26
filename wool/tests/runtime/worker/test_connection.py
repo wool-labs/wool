@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import cloudpickle
 import grpc
+import grpc.aio
 import pytest
 from hypothesis import HealthCheck
 from hypothesis import given
@@ -16,7 +17,7 @@ import wool
 from wool import protocol
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
-from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
@@ -106,22 +107,6 @@ def mock_grpc_call(mocker: MockerFixture):
 
 class TestWorkerConnection:
     @pytest.mark.asyncio
-    @given(limit=st.integers(max_value=0))
-    async def test___init___with_invalid_limit(self, limit: int):
-        """Test WorkerConnection initialization with invalid limit.
-
-        Given:
-            An invalid limit value (0 or negative)
-        When:
-            WorkerConnection is instantiated
-        Then:
-            It should raise ValueError with appropriate message
-        """
-        # Act & assert
-        with pytest.raises(ValueError, match="Limit must be positive"):
-            WorkerConnection("localhost:50051", limit=limit)
-
-    @pytest.mark.asyncio
     async def test_dispatch_task_that_returns(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
@@ -150,7 +135,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act
         results = []
@@ -194,7 +181,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act & assert
         with pytest.raises(ValueError, match="task_error"):
@@ -229,7 +218,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act & assert
         with pytest.raises(UnexpectedResponse, match="Expected 'ack' response"):
@@ -273,7 +264,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act & assert
         with pytest.raises(
@@ -321,7 +314,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(side_effect=mock_rpc_error)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act & assert
         with pytest.raises(TransientRpcError):
@@ -367,7 +362,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(side_effect=mock_rpc_error)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act & assert
         with pytest.raises(RpcError):
@@ -388,7 +385,9 @@ class TestWorkerConnection:
             It should raise ValueError and not attempt dispatch
         """
         # Arrange
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         async def test_callable():
             return "test"
@@ -431,7 +430,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act & assert
         with pytest.raises(TimeoutError):
@@ -467,7 +468,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=long_running_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=1)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=1)
+        )
 
         async def consume_slot():
             async for _ in await connection.dispatch(sample_task):
@@ -532,7 +535,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act
         async def run_dispatch():
@@ -590,7 +595,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act
         async def run_dispatch():
@@ -619,7 +626,9 @@ class TestWorkerConnection:
             It should complete without error each time
         """
         # Arrange
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act & assert — should not raise on repeated calls
         await connection.close()
@@ -666,7 +675,9 @@ class TestWorkerConnection:
         mock_channel = mocker.AsyncMock()
         mocker.patch.object(grpc.aio, "insecure_channel", return_value=mock_channel)
 
-        connection = WorkerConnection(target, limit=10)
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         async for _ in await connection.dispatch(sample_task):
             pass
@@ -683,8 +694,8 @@ class TestWorkerConnection:
         # Assert
         cleared_keys = [c.args[0] for c in clear_spy.call_args_list]
         assert len(cleared_keys) == 2
-        assert (target, None, 10, connection._options) in cleared_keys
-        assert (uds_target, None, 10, connection._options) in cleared_keys
+        assert (target, None, connection._options) in cleared_keys
+        assert (uds_target, None, connection._options) in cleared_keys
 
     @pytest.mark.asyncio
     async def test_dispatch_task_that_yields_multiple_results(
@@ -720,7 +731,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act
         results = []
@@ -765,7 +778,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act
         results = []
@@ -803,7 +818,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act
         results = []
@@ -840,7 +857,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act & assert
         with pytest.raises(RpcError, match="Task rejected by worker"):
@@ -919,7 +938,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act
         gen = await connection.dispatch(sample_task)
@@ -957,7 +978,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act — obtain the stream, then consume later
         stream = await connection.dispatch(sample_task)
@@ -997,7 +1020,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act
         async for _ in await connection.dispatch(sample_task):
@@ -1040,7 +1065,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act
         with pytest.raises(RuntimeError, match="boom"):
@@ -1080,7 +1107,9 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", limit=10)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         async for _ in await connection.dispatch(sample_task):
             pass
@@ -1119,8 +1148,12 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(side_effect=lambda: make_call())
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        conn_a = WorkerConnection("localhost:50051", limit=10)
-        conn_b = WorkerConnection("localhost:50051", limit=10)
+        conn_a = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        conn_b = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
 
         # Act
         async for _ in await conn_a.dispatch(sample_task):
@@ -1135,21 +1168,21 @@ class TestWorkerConnection:
     async def test_dispatch_with_default_options(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch creates gRPC channel with default WorkerOptions.
+        """Test dispatch creates gRPC channel with default ChannelOptions.
 
         Given:
             A WorkerConnection with no options parameter.
         When:
             A task is dispatched.
         Then:
-            It should create a gRPC channel with default WorkerOptions
+            It should create a gRPC channel with default ChannelOptions
             sizes.
         """
         # Arrange
-        defaults = WorkerOptions()
+        defaults = ChannelOptions()
         mock_channel = mocker.AsyncMock()
-        mock_insecure = mocker.patch(
-            "grpc.aio.insecure_channel", return_value=mock_channel
+        mock_insecure = mocker.patch.object(
+            grpc.aio, "insecure_channel", return_value=mock_channel
         )
 
         responses = (
@@ -1184,23 +1217,23 @@ class TestWorkerConnection:
     async def test_dispatch_with_custom_options(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch creates gRPC channel with custom WorkerOptions.
+        """Test dispatch creates gRPC channel with custom ChannelOptions.
 
         Given:
-            A WorkerConnection with custom WorkerOptions message sizes.
+            A WorkerConnection with custom ChannelOptions message sizes.
         When:
             A task is dispatched.
         Then:
             It should create a gRPC channel with the custom sizes.
         """
         # Arrange
-        custom_options = WorkerOptions(
+        custom_options = ChannelOptions(
             max_receive_message_length=200 * 1024 * 1024,
             max_send_message_length=50 * 1024 * 1024,
         )
         mock_channel = mocker.AsyncMock()
-        mock_insecure = mocker.patch(
-            "grpc.aio.insecure_channel", return_value=mock_channel
+        mock_insecure = mocker.patch.object(
+            grpc.aio, "insecure_channel", return_value=mock_channel
         )
 
         responses = (
@@ -1230,6 +1263,146 @@ class TestWorkerConnection:
             "grpc.max_send_message_length",
             50 * 1024 * 1024,
         ) in call_options
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_custom_keepalive_options(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch creates gRPC channel with custom keepalive options.
+
+        Given:
+            A WorkerConnection with custom keepalive options
+        When:
+            A task is dispatched
+        Then:
+            It should create a gRPC channel whose options include all
+            keepalive entries with the custom values
+        """
+        # Arrange
+        opts = ChannelOptions(
+            keepalive_time_ms=60000,
+            keepalive_timeout_ms=10000,
+            keepalive_permit_without_calls=False,
+        )
+        mock_channel = mocker.AsyncMock()
+        mock_insecure = mocker.patch.object(
+            grpc.aio, "insecure_channel", return_value=mock_channel
+        )
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", options=opts)
+
+        # Act
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        # Assert
+        mock_insecure.assert_called_once()
+        call_options = mock_insecure.call_args[1]["options"]
+        assert ("grpc.keepalive_time_ms", 60000) in call_options
+        assert ("grpc.keepalive_timeout_ms", 10000) in call_options
+        assert ("grpc.keepalive_permit_without_calls", 0) in call_options
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_default_keepalive_options(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch includes default keepalive options in channel.
+
+        Given:
+            A WorkerConnection with default ChannelOptions
+        When:
+            A task is dispatched
+        Then:
+            It should include all keepalive options with default values
+        """
+        # Arrange
+        opts = ChannelOptions()
+        mock_channel = mocker.AsyncMock()
+        mock_insecure = mocker.patch.object(
+            grpc.aio, "insecure_channel", return_value=mock_channel
+        )
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", options=opts)
+
+        # Act
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        # Assert
+        mock_insecure.assert_called_once()
+        call_options = mock_insecure.call_args[1]["options"]
+        assert ("grpc.keepalive_time_ms", 30000) in call_options
+        assert ("grpc.keepalive_timeout_ms", 30000) in call_options
+        assert ("grpc.keepalive_permit_without_calls", 1) in call_options
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_custom_transport_options(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch creates gRPC channel with custom transport options.
+
+        Given:
+            A WorkerConnection with custom max_pings_without_data,
+            max_concurrent_streams, and compression=Gzip
+        When:
+            A task is dispatched
+        Then:
+            It should create a gRPC channel whose options include all
+            three transport entries with the custom values
+        """
+        # Arrange
+        opts = ChannelOptions(
+            max_pings_without_data=5,
+            max_concurrent_streams=50,
+            compression=grpc.Compression.Gzip,
+        )
+        mock_channel = mocker.AsyncMock()
+        mock_insecure = mocker.patch.object(
+            grpc.aio, "insecure_channel", return_value=mock_channel
+        )
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection("localhost:50051", options=opts)
+
+        # Act
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        # Assert
+        mock_insecure.assert_called_once()
+        call_options = mock_insecure.call_args[1]["options"]
+        assert ("grpc.http2.max_pings_without_data", 5) in call_options
+        assert ("grpc.max_concurrent_streams", 50) in call_options
+        assert ("grpc.default_compression_algorithm", 2) in call_options
 
     @pytest.mark.asyncio
     async def test_dispatch_with_self_dispatch(

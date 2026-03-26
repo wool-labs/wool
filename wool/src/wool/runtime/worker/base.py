@@ -4,6 +4,7 @@ import uuid
 from abc import ABC
 from abc import abstractmethod
 from dataclasses import dataclass
+from dataclasses import field
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Final
@@ -11,29 +12,108 @@ from typing import Protocol
 from typing import final
 from typing import runtime_checkable
 
-from wool.runtime.discovery.base import WorkerMetadata
+import grpc
 
 if TYPE_CHECKING:
     from wool.runtime.worker.auth import WorkerCredentials
+    from wool.runtime.worker.metadata import WorkerMetadata
 
 
 # public
 @dataclass(frozen=True)
-class WorkerOptions:
-    """Options for gRPC worker server and channel configuration.
+class ChannelOptions:
+    """Options for gRPC channel configuration.
 
-    Controls the maximum message sizes for gRPC communication.
-    Defaults match the client-side channel factory values to
-    ensure symmetric limits between server and client.
+    Controls the maximum message sizes and keepalive behaviour for
+    gRPC channels.  Workers advertise these options via
+    :class:`~wool.runtime.discovery.base.WorkerMetadata` so that
+    clients connect with compatible settings automatically.
 
     :param max_receive_message_length:
         Maximum inbound message size in bytes.
     :param max_send_message_length:
         Maximum outbound message size in bytes.
+    :param keepalive_time_ms:
+        Interval in milliseconds between HTTP/2 keepalive pings.
+    :param keepalive_timeout_ms:
+        Time in milliseconds to wait for a keepalive ping response
+        before considering the connection dead.
+    :param keepalive_permit_without_calls:
+        If ``True``, send keepalive pings even when there are no
+        active RPCs.
+    :param max_pings_without_data:
+        Maximum keepalive pings allowed when no data or header
+        frames have been sent.
+    :param max_concurrent_streams:
+        Maximum concurrent HTTP/2 streams per connection.  Also
+        used by the client to size its per-channel concurrency
+        semaphore.
+    :param compression:
+        Default compression algorithm for messages.
     """
 
     max_receive_message_length: int = 100 * 1024 * 1024
     max_send_message_length: int = 100 * 1024 * 1024
+    keepalive_time_ms: int = 30_000
+    keepalive_timeout_ms: int = 30_000
+    keepalive_permit_without_calls: bool = True
+    max_pings_without_data: int = 2
+    max_concurrent_streams: int = 100
+    compression: grpc.Compression = grpc.Compression.NoCompression
+
+
+# public
+@dataclass(frozen=True)
+class WorkerOptions:
+    """Options for gRPC worker server configuration.
+
+    Composes :class:`ChannelOptions` (advertised to clients) with
+    server-side settings that are not communicated over the wire.
+
+    :param channel:
+        Channel options advertised to connecting clients.
+    :param http2_min_recv_ping_interval_without_data_ms:
+        Server-side minimum allowed interval in milliseconds
+        between client keepalive pings when there is no data
+        being sent.
+    :param max_ping_strikes:
+        Maximum keepalive ping violations before the server
+        sends GOAWAY.
+    :param max_connection_idle_ms:
+        Server idle timeout in milliseconds before closing the
+        connection.  ``None`` uses gRPC's default (infinite).
+    :param max_connection_age_ms:
+        Maximum connection lifespan in milliseconds before the
+        server forces a reconnect.  ``None`` uses gRPC's default
+        (infinite).
+    :param max_connection_age_grace_ms:
+        Grace period in milliseconds for in-flight RPCs after
+        max connection age is reached.  ``None`` uses gRPC's
+        default (infinite).
+    """
+
+    channel: ChannelOptions = field(default_factory=ChannelOptions)
+    http2_min_recv_ping_interval_without_data_ms: int = 30_000
+    max_ping_strikes: int = 2
+    max_connection_idle_ms: int | None = None
+    max_connection_age_ms: int | None = None
+    max_connection_age_grace_ms: int | None = None
+
+    def __post_init__(self):
+        """Validate keepalive option compatibility.
+
+        :raises ValueError:
+            If ``channel.keepalive_time_ms`` is less than
+            ``http2_min_recv_ping_interval_without_data_ms``.
+        """
+        if (
+            self.channel.keepalive_time_ms
+            < self.http2_min_recv_ping_interval_without_data_ms
+        ):
+            raise ValueError(
+                "keepalive_time_ms must be >= "
+                "http2_min_recv_ping_interval_without_data_ms"
+            )
 
 
 # public
@@ -49,7 +129,6 @@ class WorkerFactory(Protocol):
         self,
         *tags: str,
         credentials: WorkerCredentials | None = None,
-        options: WorkerOptions | None = None,
     ) -> WorkerLike:
         """Create a new worker instance.
 
@@ -158,7 +237,7 @@ class Worker(ABC):
     .. code-block:: python
 
         from wool.runtime.worker.base import Worker
-        from wool.runtime.discovery.base import WorkerMetadata
+        from wool.runtime.worker.metadata import WorkerMetadata
 
 
         class CustomWorker(Worker):
