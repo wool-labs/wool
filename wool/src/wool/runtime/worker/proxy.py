@@ -22,7 +22,6 @@ from packaging.version import Version
 import wool
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoverySubscriberLike
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerLike
@@ -32,8 +31,8 @@ from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
-from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.metadata import WorkerMetadata
 
 if TYPE_CHECKING:
     from wool.runtime.routine.task import Task
@@ -205,7 +204,6 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
-        options: WorkerOptions | None = None,
     ): ...
 
     @overload
@@ -217,7 +215,6 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
-        options: WorkerOptions | None = None,
     ): ...
 
     @overload
@@ -229,7 +226,6 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
-        options: WorkerOptions | None = None,
     ): ...
 
     def __init__(
@@ -244,7 +240,6 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
-        options: WorkerOptions | None = None,
     ):
         if not (pool_uri or discovery or workers):
             raise ValueError(
@@ -280,7 +275,6 @@ class WorkerProxy:
             self._credentials = CredentialContext.current()
         else:
             self._credentials = credentials
-        self._options = options
 
         # Create security filter based on resolved credentials
         security_filter = self._create_security_filter(self._credentials)
@@ -334,10 +328,10 @@ class WorkerProxy:
     def __reduce__(self) -> tuple:
         """Return constructor args for unpickling with proxy ID preserved.
 
-        Creates a new WorkerProxy instance with the same discovery stream,
-        load balancer type, and options, then sets the preserved proxy ID
-        on the new object.  Credentials are NOT serialized — the restored
-        proxy resolves them from the active credential context.
+        Creates a new WorkerProxy instance with the same discovery stream
+        and load balancer type, then sets the preserved proxy ID on the
+        new object.  Credentials are NOT serialized — the restored proxy
+        resolves them from the active credential context.
 
         :returns:
             Tuple of (callable, args) for unpickling.
@@ -358,18 +352,17 @@ class WorkerProxy:
                     f"{name}=my_cm())."
                 )
 
-        def _restore_proxy(discovery, loadbalancer, options, proxy_id):
+        def _restore_proxy(discovery, loadbalancer, proxy_id):
             proxy = WorkerProxy(
                 discovery=discovery,
                 loadbalancer=loadbalancer,
-                options=options,
             )
             proxy._id = proxy_id
             return proxy
 
         return (
             _restore_proxy,
-            (self._discovery, self._loadbalancer, self._options, self._id),
+            (self._discovery, self._loadbalancer, self._id),
         )
 
     @property
@@ -552,23 +545,17 @@ class WorkerProxy:
         )
         async for event in self._discovery_stream:
             match event.type:
-                case "worker-added":
-                    self._loadbalancer_context.add_worker(
-                        event.metadata,
-                        WorkerConnection(
-                            event.metadata.address,
-                            credentials=client_credentials,
-                            options=self._options,
-                        ),
+                case "worker-added" | "worker-updated":
+                    connection = WorkerConnection(
+                        event.metadata.address,
+                        credentials=client_credentials,
+                        options=event.metadata.options,
                     )
-                case "worker-updated":
-                    self._loadbalancer_context.update_worker(
-                        event.metadata,
-                        WorkerConnection(
-                            event.metadata.address,
-                            credentials=client_credentials,
-                            options=self._options,
-                        ),
-                    )
+                    if event.type == "worker-added":
+                        self._loadbalancer_context.add_worker(event.metadata, connection)
+                    else:
+                        self._loadbalancer_context.update_worker(
+                            event.metadata, connection
+                        )
                 case "worker-dropped":
                     self._loadbalancer_context.remove_worker(event.metadata)

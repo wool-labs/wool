@@ -156,7 +156,7 @@ Workers discover each other through pluggable discovery backends with no central
 
 ### Discovery events
 
-A `DiscoveryEvent` pairs a type — one of `worker-added`, `worker-dropped`, or `worker-updated` — with the affected worker's `WorkerMetadata` (UID, address, pid, version, tags, security flag). Discovery subscribers yield these events as the set of known workers changes.
+A `DiscoveryEvent` pairs a type — one of `worker-added`, `worker-dropped`, or `worker-updated` — with the affected worker's `WorkerMetadata` (UID, address, pid, version, tags, security flag, and transport options). Discovery subscribers yield these events as the set of known workers changes.
 
 ### Built-in protocols
 
@@ -185,17 +185,53 @@ async with wool.WorkerPool(size=4, loadbalancer=my_balancer):
 
 Transient errors are the gRPC status codes `UNAVAILABLE`, `DEADLINE_EXCEEDED`, and `RESOURCE_EXHAUSTED` — temporary conditions that may resolve on retry to the same or another worker. Non-transient errors are all other gRPC failures (e.g., `INVALID_ARGUMENT`, `PERMISSION_DENIED`) indicating persistent problems. The load balancer skips transient-error workers but evicts non-transient-error workers from the pool.
 
-### Worker connections
+### Self-describing worker connections
 
-A `WorkerConnection` is a gRPC client managing a pooled channel to a single worker address. It serializes and sends a task over a bidirectional stream, waits for an acknowledgment, then returns an async generator that streams results back. A semaphore caps concurrent dispatches, and gRPC errors are classified as transient or non-transient for the load balancer.
+Workers are self-describing: each worker advertises its gRPC transport configuration via `ChannelOptions` in its `WorkerMetadata`. When a client discovers a worker, it reads the advertised options and configures its channel to match — message sizes, keepalive intervals, concurrency limits, and compression are all set automatically. There is no separate client-side configuration step; the worker's metadata is the single source of truth for how to connect to it.
+
+A `WorkerConnection` is a gRPC client managing a pooled channel to a single worker address. It serializes and sends a task over a bidirectional stream, waits for an acknowledgment, then returns an async generator that streams results back. The channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`, and gRPC errors are classified as transient or non-transient for the load balancer.
 
 Channels are pooled with reference counting and a 60-second TTL. A dispatch acquires a pool reference, and the result stream holds its own reference to keep the channel alive during streaming. There is no pool-level health checking — dead channels are detected reactively when a dispatch attempt fails, and the failed worker is removed from the load balancer context by the error classification logic.
 
+### Transport configuration
+
+Transport options are split into two tiers:
+
+- **`ChannelOptions`** — settings that both the server and client apply symmetrically. Workers advertise these via `WorkerMetadata` so clients connect with identical settings. Includes message sizes (`max_receive_message_length`, `max_send_message_length`), keepalive (`keepalive_time_ms`, `keepalive_timeout_ms`, `keepalive_permit_without_calls`, `max_pings_without_data`), flow control (`max_concurrent_streams`), and compression (`compression`).
+
+- **`WorkerOptions`** — composes a `ChannelOptions` instance with server-only settings that are not communicated to clients: `http2_min_recv_ping_interval_without_data_ms` (minimum allowed client ping interval), `max_ping_strikes` (ping violations before GOAWAY), and optional connection lifecycle limits (`max_connection_idle_ms`, `max_connection_age_ms`, `max_connection_age_grace_ms`).
+
+All options default to gRPC's own defaults. Pass a `WorkerOptions` instance to `LocalWorker` or `WorkerProcess` to customize:
+
+```python
+from wool.runtime.worker.base import ChannelOptions, WorkerOptions
+from wool.runtime.worker.local import LocalWorker
+
+options = WorkerOptions(
+    channel=ChannelOptions(
+        keepalive_time_ms=10_000,
+        keepalive_timeout_ms=5_000,
+        max_concurrent_streams=50,
+    ),
+    max_connection_idle_ms=300_000,
+)
+
+async with wool.WorkerPool(
+    size=4,
+    worker=lambda *tags, credentials=None: LocalWorker(
+        *tags, credentials=credentials, options=options,
+    ),
+):
+    result = await my_routine()
+```
+
 ### Connection failure detection
 
-Wool does not actively monitor connection health — detection is reactive. When a connection breaks, the next gRPC read or write on the stream raises an `RpcError`, which flows through the same transient/non-transient classification as any other gRPC failure. On the client side, a dead worker typically surfaces as `UNAVAILABLE` (transient), causing the load balancer to skip to the next worker. On the worker side, a disconnected client is detected when the stream iterator terminates, at which point the worker closes the running generator if one is active.
+gRPC runs over HTTP/2, which provides connection-level error signaling via GOAWAY and RST_STREAM frames. When a peer drops abruptly, the OS eventually closes the TCP socket and the HTTP/2 layer surfaces the broken connection to gRPC as a stream error.
 
-gRPC runs over HTTP/2, which provides connection-level error signaling via GOAWAY and RST_STREAM frames. When a peer drops abruptly, the OS eventually closes the TCP socket and the HTTP/2 layer surfaces the broken connection to gRPC as a stream error. Wool does not currently configure gRPC keepalive pings, so a silently dead connection (no TCP reset) may not be detected until the next read or write attempt.
+Wool configures HTTP/2 keepalive pings on both client and server channels. When keepalive is enabled (the default), both sides send periodic PING frames and expect a PONG response within `keepalive_timeout_ms`. If no response arrives, the connection is considered dead and gRPC raises an error on the next operation. This detects silently dead connections — where the remote peer is unreachable but no TCP reset was received — without waiting for the next application-level read or write.
+
+On the client side, a dead worker surfaces as `UNAVAILABLE` (transient), causing the load balancer to skip to the next worker. On the worker side, a disconnected client is detected when the stream iterator terminates, at which point the worker closes the running generator if one is active.
 
 ## Security
 

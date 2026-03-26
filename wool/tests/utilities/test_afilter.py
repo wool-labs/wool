@@ -6,7 +6,7 @@ import cloudpickle
 import pytest
 
 from wool.runtime.discovery.base import DiscoveryEvent
-from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
 
 

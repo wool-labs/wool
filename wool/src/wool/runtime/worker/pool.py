@@ -19,7 +19,6 @@ from wool.runtime.typing import Factory
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
-from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.proxy import LoadBalancerLike
 from wool.runtime.worker.proxy import RoundRobinLoadBalancer
@@ -170,7 +169,6 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
-        options: WorkerOptions | None = None,
     ):
         """
         Create an ephemeral pool of workers, spawning the specified
@@ -205,7 +203,6 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
-        options: WorkerOptions | None = None,
     ):
         """
         Create a hybrid pool that spawns local workers and discovers
@@ -223,10 +220,8 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
-        options: WorkerOptions | None = None,
     ):
         self._workers = {}
-        self._options = options
         self._credentials = credentials
 
         match (size, discovery):
@@ -258,7 +253,6 @@ class WorkerPool:
                                 discovery=discovery_svc.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
-                                options=self._options,
                             ):
                                 yield
                     finally:
@@ -288,7 +282,6 @@ class WorkerPool:
                                 discovery=discovery.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
-                                options=self._options,
                             ):
                                 yield
 
@@ -304,7 +297,6 @@ class WorkerPool:
                             discovery=discovery_svc.subscriber,
                             loadbalancer=loadbalancer,
                             credentials=self._credentials,
-                            options=self._options,
                         ):
                             yield
                     finally:
@@ -331,7 +323,6 @@ class WorkerPool:
                                 discovery=discovery.subscriber,
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
-                                options=self._options,
                             ):
                                 yield
 
@@ -373,7 +364,7 @@ class WorkerPool:
 
         tasks = []
         for _ in range(size):
-            worker = factory(*tags, credentials=self._credentials, options=self._options)
+            worker = factory(*tags, credentials=self._credentials)
 
             async def start(worker):
                 await worker.start()
@@ -398,8 +389,8 @@ class WorkerPool:
             await self._exit_context(publisher_ctx)
 
     def _default_worker_factory(self):
-        def factory(*tags, credentials=None, options=None):
-            return LocalWorker(*tags, credentials=credentials, options=options)
+        def factory(*tags, credentials=None):
+            return LocalWorker(*tags, credentials=credentials)
 
         return factory
 

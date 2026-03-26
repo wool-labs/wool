@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 try:
     from wool.protocol.wire_pb2 import Ack
+    from wool.protocol.wire_pb2 import ChannelOptions
     from wool.protocol.wire_pb2 import Message
     from wool.protocol.wire_pb2 import Nack
     from wool.protocol.wire_pb2 import Request
@@ -22,7 +23,6 @@ try:
     from wool.protocol.wire_pb2 import Task
     from wool.protocol.wire_pb2 import TaskEnvelope
     from wool.protocol.wire_pb2 import Void
-    from wool.protocol.wire_pb2 import WorkerEndpoint
     from wool.protocol.wire_pb2 import WorkerMetadata
     from wool.protocol.wire_pb2_grpc import WorkerServicer
     from wool.protocol.wire_pb2_grpc import WorkerStub
@@ -44,6 +44,7 @@ add_to_server: dict[type[WorkerServicer], AddServicerToServerProtocol] = {
 
 __all__ = [
     "Ack",
+    "ChannelOptions",
     "Message",
     "Nack",
     "Request",
@@ -53,7 +54,6 @@ __all__ = [
     "Task",
     "TaskEnvelope",
     "Void",
-    "WorkerEndpoint",
     "WorkerMetadata",
     "WorkerServicer",
     "WorkerStub",

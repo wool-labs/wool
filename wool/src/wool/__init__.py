@@ -13,7 +13,6 @@ from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
@@ -36,6 +35,7 @@ from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.local import LocalWorker
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.proxy import WorkerProxy
 from wool.runtime.worker.service import WorkerService

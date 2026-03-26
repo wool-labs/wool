@@ -7,8 +7,8 @@ from typing import Final
 from typing import Protocol
 from typing import runtime_checkable
 
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.metadata import WorkerMetadata
 
 if TYPE_CHECKING:
     from wool.runtime.routine.task import Task

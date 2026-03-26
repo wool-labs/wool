@@ -22,12 +22,12 @@ import grpc.aio
 
 import wool
 from wool import protocol
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.interceptor import VersionInterceptor
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.service import WorkerService
 
 if TYPE_CHECKING:
@@ -230,13 +230,46 @@ class WorkerProcess(Process):
             else contextlib.nullcontext()
         )
         with creds_ctx:
+            channel = self._options.channel
             grpc_options = [
                 (
                     "grpc.max_receive_message_length",
-                    self._options.max_receive_message_length,
+                    channel.max_receive_message_length,
                 ),
-                ("grpc.max_send_message_length", self._options.max_send_message_length),
+                ("grpc.max_send_message_length", channel.max_send_message_length),
+                ("grpc.keepalive_time_ms", channel.keepalive_time_ms),
+                ("grpc.keepalive_timeout_ms", channel.keepalive_timeout_ms),
+                (
+                    "grpc.keepalive_permit_without_calls",
+                    int(channel.keepalive_permit_without_calls),
+                ),
+                ("grpc.http2.max_pings_without_data", channel.max_pings_without_data),
+                ("grpc.max_concurrent_streams", channel.max_concurrent_streams),
+                (
+                    "grpc.default_compression_algorithm",
+                    channel.compression.value,
+                ),
+                (
+                    "grpc.http2.min_recv_ping_interval_without_data_ms",
+                    self._options.http2_min_recv_ping_interval_without_data_ms,
+                ),
+                ("grpc.http2.max_ping_strikes", self._options.max_ping_strikes),
             ]
+            if self._options.max_connection_idle_ms is not None:
+                grpc_options.append(
+                    ("grpc.max_connection_idle_ms", self._options.max_connection_idle_ms)
+                )
+            if self._options.max_connection_age_ms is not None:
+                grpc_options.append(
+                    ("grpc.max_connection_age_ms", self._options.max_connection_age_ms)
+                )
+            if self._options.max_connection_age_grace_ms is not None:
+                grpc_options.append(
+                    (
+                        "grpc.max_connection_age_grace_ms",
+                        self._options.max_connection_age_grace_ms,
+                    )
+                )
             server = grpc.aio.server(
                 interceptors=[VersionInterceptor()], options=grpc_options
             )
@@ -277,6 +310,7 @@ class WorkerProcess(Process):
                         tags=self._tags,
                         extra=MappingProxyType(self._extra),
                         secure=self._credentials is not None,
+                        options=self._options.channel,
                     )
                     wool.__worker_metadata__ = metadata
                     wool.__worker_uds_address__ = uds_address

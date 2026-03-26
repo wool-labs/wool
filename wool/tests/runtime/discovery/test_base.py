@@ -2,6 +2,7 @@ import uuid
 from types import MappingProxyType
 from typing import AsyncIterator
 
+import grpc
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -13,7 +14,8 @@ from wool.runtime.discovery.base import DiscoveryEventType
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
-from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.metadata import WorkerMetadata
 
 
 @pytest.fixture
@@ -92,6 +94,7 @@ class TestWorkerMetadata:
         # Assert
         assert worker.tags == frozenset()
         assert worker.extra == MappingProxyType({})
+        assert worker.options == ChannelOptions()
 
     def test_hash(self):
         """Test WorkerMetadata hash is based on uid only.
@@ -153,6 +156,7 @@ class TestWorkerMetadata:
         assert worker.version == "1.0.0"
         assert worker.tags == frozenset(["test", "worker"])
         assert worker.extra == MappingProxyType({"key": "value"})
+        assert worker.options == ChannelOptions()
 
     def test_from_protobuf_invalid_uuid(self):
         """Test from_protobuf() with invalid UUID string.
@@ -196,6 +200,98 @@ class TestWorkerMetadata:
         assert protobuf.version == "1.0.0"
         assert set(protobuf.tags) == {"test", "worker"}
         assert dict(protobuf.extra) == {"key": "value"}
+        assert protobuf.HasField("connection")
+
+    def test_to_protobuf_with_options(self):
+        """Test to_protobuf() sets connection sub-message with default options.
+
+        Given:
+            A WorkerMetadata with options=ChannelOptions()
+        When:
+            Converting to protobuf
+        Then:
+            It should populate the connection sub-message with default option values
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="localhost:50051",
+            pid=12345,
+            version="1.0.0",
+            options=ChannelOptions(),
+        )
+
+        # Act
+        protobuf = worker.to_protobuf()
+
+        # Assert
+        assert protobuf.HasField("connection")
+        assert protobuf.connection.keepalive_time_ms == 30000
+        assert protobuf.connection.keepalive_timeout_ms == 30000
+        assert protobuf.connection.keepalive_permit_without_calls is True
+
+    def test_from_protobuf_with_options_roundtrip(self):
+        """Test options roundtrip through protobuf serialization.
+
+        Given:
+            A WorkerMetadata with options=ChannelOptions(keepalive_time_ms=60000)
+        When:
+            to_protobuf() and from_protobuf() roundtrip
+        Then:
+            It should preserve the ChannelOptions with keepalive_time_ms=60000
+        """
+        # Arrange
+        options = ChannelOptions(keepalive_time_ms=60000)
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="localhost:50051",
+            pid=12345,
+            version="1.0.0",
+            options=options,
+        )
+
+        # Act
+        protobuf = worker.to_protobuf()
+        restored = WorkerMetadata.from_protobuf(protobuf)
+
+        # Assert
+        assert restored.options == options
+
+    def test_from_protobuf_with_transport_options_roundtrip(self):
+        """Test options roundtrip with all transport-layer fields.
+
+        Given:
+            A WorkerMetadata with options including max_pings_without_data,
+            max_concurrent_streams, and compression=Gzip
+        When:
+            to_protobuf() and from_protobuf() roundtrip
+        Then:
+            It should preserve all ChannelOptions fields including the
+            new transport-layer fields
+        """
+        # Arrange
+        options = ChannelOptions(
+            max_pings_without_data=5,
+            max_concurrent_streams=50,
+            compression=grpc.Compression.Gzip,
+        )
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="localhost:50051",
+            pid=12345,
+            version="1.0.0",
+            options=options,
+        )
+
+        # Act
+        protobuf = worker.to_protobuf()
+        restored = WorkerMetadata.from_protobuf(protobuf)
+
+        # Assert
+        assert restored.options == options
+        assert restored.options.max_pings_without_data == 5
+        assert restored.options.max_concurrent_streams == 50
+        assert restored.options.compression is grpc.Compression.Gzip
 
     def test_to_protobuf_with_secure_flag_roundtrip(self):
         """Test secure=True roundtrip through protobuf serialization.
@@ -227,12 +323,27 @@ class TestWorkerMetadata:
         address=st.from_regex(r"^[a-zA-Z0-9._-]+:[0-9]+$", fullmatch=True),
         pid=st.integers(min_value=1, max_value=2147483647),
         version=st.text(min_size=1),
+        options=st.builds(
+            ChannelOptions,
+            max_receive_message_length=st.integers(
+                min_value=1, max_value=200 * 1024 * 1024
+            ),
+            max_send_message_length=st.integers(
+                min_value=1, max_value=200 * 1024 * 1024
+            ),
+            keepalive_time_ms=st.integers(min_value=1000, max_value=300_000),
+            keepalive_timeout_ms=st.integers(min_value=1000, max_value=300_000),
+            keepalive_permit_without_calls=st.booleans(),
+            max_pings_without_data=st.integers(min_value=0, max_value=10),
+            max_concurrent_streams=st.integers(min_value=1, max_value=1000),
+            compression=st.sampled_from(grpc.Compression),
+        ),
     )
-    def test_roundtrip_conversion(self, address, pid, version):
+    def test_roundtrip_conversion(self, address, pid, version, options):
         """Test round-trip conversion preserves WorkerMetadata data.
 
         Given:
-            A WorkerMetadata instance with arbitrary field values
+            A WorkerMetadata instance with arbitrary field values including optional ChannelOptions drawn from the full domain
         When:
             Converting to protobuf and back to WorkerMetadata
         Then:
@@ -245,6 +356,7 @@ class TestWorkerMetadata:
             address=address,
             pid=pid,
             version=version,
+            options=options,
         )
 
         # Act
@@ -258,6 +370,7 @@ class TestWorkerMetadata:
         assert deserialized.version == original.version
         assert deserialized.tags == original.tags
         assert deserialized.extra == original.extra
+        assert deserialized.options == original.options
 
 
 class TestDiscoveryEvent:

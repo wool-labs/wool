@@ -11,11 +11,12 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool import protocol
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.worker import process as process_module
 from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.process import WorkerProcess
 from wool.runtime.worker.process import _proxy_factory
 from wool.runtime.worker.process import _proxy_finalizer
@@ -860,7 +861,7 @@ class TestWorkerProcess:
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.stopped.wait = mocker.AsyncMock()
@@ -918,7 +919,7 @@ class TestWorkerProcess:
         mock_server.add_insecure_port = mocker.MagicMock(return_value=8080)
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.stopped.wait = mocker.AsyncMock()
@@ -969,7 +970,7 @@ class TestWorkerProcess:
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.stopped.wait = mocker.AsyncMock()
@@ -1066,7 +1067,7 @@ class TestWorkerProcess:
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.stopped.wait = mocker.AsyncMock()
@@ -1110,7 +1111,7 @@ class TestWorkerProcess:
         mock_server.start = mocker.AsyncMock()
         mock_stop = mocker.AsyncMock()
         mock_server.stop = mock_stop
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.stopped.wait = mocker.AsyncMock(
@@ -1152,7 +1153,7 @@ class TestWorkerProcess:
         mock_server.add_secure_port = mocker.MagicMock()
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.configure_server = mocker.AsyncMock(return_value=50051)
@@ -1201,7 +1202,7 @@ class TestWorkerProcess:
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
         mock_server.add_insecure_port = mocker.MagicMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.configure_server = mocker.AsyncMock(return_value=50051)
@@ -1247,7 +1248,7 @@ class TestWorkerProcess:
         mock_server.add_secure_port = mocker.MagicMock(return_value=54321)
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.configure_server = mocker.AsyncMock(return_value=54321)
@@ -1292,7 +1293,7 @@ class TestWorkerProcess:
         mock_server.add_insecure_port = mocker.MagicMock(return_value=54322)
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.configure_server = mocker.AsyncMock(return_value=54322)
@@ -1348,7 +1349,7 @@ class TestWorkerProcess:
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
         mock_server.add_insecure_port = mocker.MagicMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.configure_server = mocker.AsyncMock(return_value=50051)
@@ -1397,7 +1398,7 @@ class TestWorkerProcess:
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
         mock_server.add_insecure_port = mocker.MagicMock()
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.configure_server = mocker.AsyncMock(return_value=50051)
@@ -1450,7 +1451,7 @@ class TestWorkerProcess:
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
-        mocker.patch("grpc.aio.server", return_value=mock_server)
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
 
         mock_service = mocker.MagicMock()
         mock_service.configure_server = mocker.AsyncMock(return_value=50051)
@@ -1501,7 +1502,7 @@ class TestWorkerProcess:
         """Test WorkerProcess construction with custom WorkerOptions.
 
         Given:
-            A WorkerOptions instance with custom message sizes
+            A WorkerOptions instance with custom channel message sizes
         When:
             WorkerProcess is instantiated with that options parameter
         Then:
@@ -1509,8 +1510,10 @@ class TestWorkerProcess:
         """
         # Arrange
         opts = WorkerOptions(
-            max_receive_message_length=50 * 1024 * 1024,
-            max_send_message_length=25 * 1024 * 1024,
+            channel=ChannelOptions(
+                max_receive_message_length=50 * 1024 * 1024,
+                max_send_message_length=25 * 1024 * 1024,
+            ),
         )
 
         # Act
@@ -1539,7 +1542,9 @@ class TestWorkerProcess:
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mock_grpc_server = mocker.patch("grpc.aio.server", return_value=mock_server)
+        mock_grpc_server = mocker.patch.object(
+            grpc.aio, "server", return_value=mock_server
+        )
 
         mock_service = mocker.MagicMock()
         mock_service.stopped.wait = mocker.AsyncMock()
@@ -1560,6 +1565,14 @@ class TestWorkerProcess:
         expected = [
             ("grpc.max_receive_message_length", 100 * 1024 * 1024),
             ("grpc.max_send_message_length", 100 * 1024 * 1024),
+            ("grpc.keepalive_time_ms", 30000),
+            ("grpc.keepalive_timeout_ms", 30000),
+            ("grpc.keepalive_permit_without_calls", 1),
+            ("grpc.http2.max_pings_without_data", 2),
+            ("grpc.max_concurrent_streams", 100),
+            ("grpc.default_compression_algorithm", 0),
+            ("grpc.http2.min_recv_ping_interval_without_data_ms", 30000),
+            ("grpc.http2.max_ping_strikes", 2),
         ]
         assert call_kwargs["options"] == expected
 
@@ -1567,7 +1580,7 @@ class TestWorkerProcess:
         """Test run passes custom WorkerOptions to gRPC server.
 
         Given:
-            A WorkerProcess with custom WorkerOptions
+            A WorkerProcess with custom channel message sizes
         When:
             run() is called
         Then:
@@ -1575,8 +1588,10 @@ class TestWorkerProcess:
         """
         # Arrange
         opts = WorkerOptions(
-            max_receive_message_length=50 * 1024 * 1024,
-            max_send_message_length=25 * 1024 * 1024,
+            channel=ChannelOptions(
+                max_receive_message_length=50 * 1024 * 1024,
+                max_send_message_length=25 * 1024 * 1024,
+            ),
         )
         process = WorkerProcess(options=opts)
 
@@ -1587,7 +1602,9 @@ class TestWorkerProcess:
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
         mock_server.start = mocker.AsyncMock()
         mock_server.stop = mocker.AsyncMock()
-        mock_grpc_server = mocker.patch("grpc.aio.server", return_value=mock_server)
+        mock_grpc_server = mocker.patch.object(
+            grpc.aio, "server", return_value=mock_server
+        )
 
         mock_service = mocker.MagicMock()
         mock_service.stopped.wait = mocker.AsyncMock()
@@ -1608,8 +1625,275 @@ class TestWorkerProcess:
         expected = [
             ("grpc.max_receive_message_length", 50 * 1024 * 1024),
             ("grpc.max_send_message_length", 25 * 1024 * 1024),
+            ("grpc.keepalive_time_ms", 30000),
+            ("grpc.keepalive_timeout_ms", 30000),
+            ("grpc.keepalive_permit_without_calls", 1),
+            ("grpc.http2.max_pings_without_data", 2),
+            ("grpc.max_concurrent_streams", 100),
+            ("grpc.default_compression_algorithm", 0),
+            ("grpc.http2.min_recv_ping_interval_without_data_ms", 30000),
+            ("grpc.http2.max_ping_strikes", 2),
         ]
         assert call_kwargs["options"] == expected
+
+    def test_run_with_all_keepalive_options(self, mocker):
+        """Test run passes all keepalive options to gRPC server.
+
+        Given:
+            A WorkerProcess with all four keepalive options set.
+        When:
+            run() is called.
+        Then:
+            It should pass all four keepalive options alongside message
+            sizes to grpc.aio.server.
+        """
+        # Arrange
+        opts = WorkerOptions(
+            channel=ChannelOptions(
+                keepalive_time_ms=30000,
+                keepalive_timeout_ms=10000,
+                keepalive_permit_without_calls=True,
+            ),
+            http2_min_recv_ping_interval_without_data_ms=20000,
+        )
+        process = WorkerProcess(options=opts)
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch("wool.runtime.worker.process.ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mock_grpc_server = mocker.patch.object(
+            grpc.aio, "server", return_value=mock_server
+        )
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService",
+            return_value=mock_service,
+        )
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        mock_grpc_server.assert_called_once()
+        call_kwargs = mock_grpc_server.call_args.kwargs
+        options = call_kwargs["options"]
+        assert ("grpc.keepalive_time_ms", 30000) in options
+        assert ("grpc.keepalive_timeout_ms", 10000) in options
+        assert ("grpc.keepalive_permit_without_calls", 1) in options
+        assert (
+            "grpc.http2.min_recv_ping_interval_without_data_ms",
+            20000,
+        ) in options
+
+    def test_run_with_default_keepalive_options(self, mocker):
+        """Test run includes default keepalive options in gRPC server.
+
+        Given:
+            A WorkerProcess with default WorkerOptions
+        When:
+            run() is called
+        Then:
+            It should include all keepalive options with default values
+        """
+        # Arrange
+        process = WorkerProcess()
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch("wool.runtime.worker.process.ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mock_grpc_server = mocker.patch.object(
+            grpc.aio, "server", return_value=mock_server
+        )
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService",
+            return_value=mock_service,
+        )
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        mock_grpc_server.assert_called_once()
+        call_kwargs = mock_grpc_server.call_args.kwargs
+        options = call_kwargs["options"]
+        assert ("grpc.keepalive_time_ms", 30000) in options
+        assert ("grpc.keepalive_timeout_ms", 30000) in options
+        assert ("grpc.keepalive_permit_without_calls", 1) in options
+        assert ("grpc.http2.min_recv_ping_interval_without_data_ms", 30000) in options
+
+    def test_run_with_lifecycle_options(self, mocker):
+        """Test run includes lifecycle options when set.
+
+        Given:
+            A WorkerProcess with max_connection_idle_ms=60000,
+            max_connection_age_ms=120000, and
+            max_connection_age_grace_ms=5000
+        When:
+            run() is called
+        Then:
+            It should include all three lifecycle options in the
+            gRPC server options
+        """
+        # Arrange
+        opts = WorkerOptions(
+            max_connection_idle_ms=60000,
+            max_connection_age_ms=120000,
+            max_connection_age_grace_ms=5000,
+        )
+        process = WorkerProcess(options=opts)
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch("wool.runtime.worker.process.ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mock_grpc_server = mocker.patch.object(
+            grpc.aio, "server", return_value=mock_server
+        )
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService",
+            return_value=mock_service,
+        )
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        mock_grpc_server.assert_called_once()
+        call_kwargs = mock_grpc_server.call_args.kwargs
+        options = call_kwargs["options"]
+        assert ("grpc.max_connection_idle_ms", 60000) in options
+        assert ("grpc.max_connection_age_ms", 120000) in options
+        assert ("grpc.max_connection_age_grace_ms", 5000) in options
+
+    def test_run_without_lifecycle_options(self, mocker):
+        """Test run omits lifecycle options when None.
+
+        Given:
+            A WorkerProcess with default WorkerOptions (lifecycle=None)
+        When:
+            run() is called
+        Then:
+            It should not include any lifecycle options in the gRPC
+            server options
+        """
+        # Arrange
+        process = WorkerProcess()
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch("wool.runtime.worker.process.ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mock_grpc_server = mocker.patch.object(
+            grpc.aio, "server", return_value=mock_server
+        )
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService",
+            return_value=mock_service,
+        )
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        mock_grpc_server.assert_called_once()
+        call_kwargs = mock_grpc_server.call_args.kwargs
+        option_keys = [k for k, _ in call_kwargs["options"]]
+        assert "grpc.max_connection_idle_ms" not in option_keys
+        assert "grpc.max_connection_age_ms" not in option_keys
+        assert "grpc.max_connection_age_grace_ms" not in option_keys
+
+    def test_run_serializes_channel_options_in_metadata(self, mocker):
+        """Test run sets options on metadata matching the channel config.
+
+        Given:
+            A WorkerProcess with custom WorkerOptions containing
+            non-default ChannelOptions
+        When:
+            run() executes
+        Then:
+            It should send metadata via pipe whose options field
+            equals the custom ChannelOptions
+        """
+        # Arrange
+        channel = ChannelOptions(
+            max_receive_message_length=50 * 1024 * 1024,
+            keepalive_time_ms=60000,
+            keepalive_timeout_ms=15000,
+        )
+        opts = WorkerOptions(channel=channel)
+        process = WorkerProcess(options=opts)
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch("wool.runtime.worker.process.ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService",
+            return_value=mock_service,
+        )
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+
+        sent_metadata = []
+        mocker.patch.object(
+            process._set_metadata,
+            "send",
+            side_effect=lambda x: sent_metadata.append(x),
+        )
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        assert len(sent_metadata) == 1
+        deserialized = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent_metadata[0])
+        )
+        assert deserialized.options == channel
 
     def test_run_sets_worker_credentials_contextvar(self, mocker):
         """Test run sets WorkerCredentials ContextVar when credentials are provided.

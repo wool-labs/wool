@@ -2,50 +2,80 @@ import uuid
 from types import MappingProxyType
 from typing import Any
 
+import grpc
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from wool.runtime.discovery.base import WorkerMetadata
+from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.metadata import WorkerMetadata
 
 
-class TestWorkerOptions:
-    """Test suite for WorkerOptions dataclass."""
+class TestChannelOptions:
+    """Test suite for ChannelOptions dataclass."""
 
     def test___init___with_default_values(self):
-        """Test WorkerOptions default constructor yields 100 MB limits.
+        """Test ChannelOptions default constructor yields 100 MB limits.
 
         Given:
             No custom parameters
         When:
-            WorkerOptions is instantiated
+            ChannelOptions is instantiated
         Then:
-            Both max_receive_message_length and max_send_message_length
-            should be 100 MB
+            All fields should have their default values
         """
         # Act
-        opts = WorkerOptions()
+        opts = ChannelOptions()
 
         # Assert
         assert opts.max_receive_message_length == 100 * 1024 * 1024
         assert opts.max_send_message_length == 100 * 1024 * 1024
+        assert opts.keepalive_time_ms == 30_000
+        assert opts.keepalive_timeout_ms == 30_000
+        assert opts.keepalive_permit_without_calls is True
+        assert opts.max_pings_without_data == 2
+        assert opts.max_concurrent_streams == 100
+        assert opts.compression is grpc.Compression.NoCompression
 
-    def test___init___with_custom_values(self):
-        """Test WorkerOptions with custom values for both attributes.
+    def test___init___with_custom_transport_options(self):
+        """Test ChannelOptions with custom transport options.
+
+        Given:
+            Custom max_pings_without_data, max_concurrent_streams,
+            and compression values
+        When:
+            ChannelOptions is instantiated with those values
+        Then:
+            All three fields should reflect the provided values
+        """
+        # Act
+        opts = ChannelOptions(
+            max_pings_without_data=5,
+            max_concurrent_streams=50,
+            compression=grpc.Compression.Gzip,
+        )
+
+        # Assert
+        assert opts.max_pings_without_data == 5
+        assert opts.max_concurrent_streams == 50
+        assert opts.compression is grpc.Compression.Gzip
+
+    def test___init___with_custom_message_sizes(self):
+        """Test ChannelOptions with custom message size values.
 
         Given:
             Custom max_receive_message_length and max_send_message_length
         When:
-            WorkerOptions is instantiated with those values
+            ChannelOptions is instantiated with those values
         Then:
             Both attributes should reflect the custom values
         """
         # Act
-        opts = WorkerOptions(
+        opts = ChannelOptions(
             max_receive_message_length=50 * 1024 * 1024,
             max_send_message_length=25 * 1024 * 1024,
         )
@@ -55,22 +85,256 @@ class TestWorkerOptions:
         assert opts.max_send_message_length == 25 * 1024 * 1024
 
     def test___init___with_partial_override(self):
-        """Test WorkerOptions with only one attribute overridden.
+        """Test ChannelOptions with only one attribute overridden.
 
         Given:
             Custom max_receive_message_length only
         When:
-            WorkerOptions is instantiated with that value
+            ChannelOptions is instantiated with that value
         Then:
             max_receive_message_length should reflect the custom value
             and max_send_message_length should keep the default
         """
         # Act
-        opts = WorkerOptions(max_receive_message_length=200 * 1024 * 1024)
+        opts = ChannelOptions(max_receive_message_length=200 * 1024 * 1024)
 
         # Assert
         assert opts.max_receive_message_length == 200 * 1024 * 1024
         assert opts.max_send_message_length == 100 * 1024 * 1024
+
+    def test___init___with_keepalive_time_and_timeout(self):
+        """Test ChannelOptions with custom keepalive time and timeout.
+
+        Given:
+            Custom keepalive_time_ms and keepalive_timeout_ms values
+        When:
+            ChannelOptions is instantiated with those values
+        Then:
+            Both fields should reflect the custom values
+        """
+        # Act
+        opts = ChannelOptions(
+            keepalive_time_ms=30000,
+            keepalive_timeout_ms=10000,
+        )
+
+        # Assert
+        assert opts.keepalive_time_ms == 30000
+        assert opts.keepalive_timeout_ms == 10000
+
+    def test___init___with_keepalive_permit_without_calls_disabled(self):
+        """Test ChannelOptions with keepalive_permit_without_calls disabled.
+
+        Given:
+            keepalive_permit_without_calls set to False
+        When:
+            ChannelOptions is instantiated
+        Then:
+            It should store False for keepalive_permit_without_calls
+        """
+        # Act
+        opts = ChannelOptions(keepalive_permit_without_calls=False)
+
+        # Assert
+        assert opts.keepalive_permit_without_calls is False
+
+    def test___init___with_all_keepalive_options(self):
+        """Test ChannelOptions with all keepalive fields set.
+
+        Given:
+            All three keepalive parameters specified
+        When:
+            ChannelOptions is instantiated
+        Then:
+            All fields should reflect the provided values
+        """
+        # Act
+        opts = ChannelOptions(
+            keepalive_time_ms=30000,
+            keepalive_timeout_ms=10000,
+            keepalive_permit_without_calls=True,
+        )
+
+        # Assert
+        assert opts.keepalive_time_ms == 30000
+        assert opts.keepalive_timeout_ms == 10000
+        assert opts.keepalive_permit_without_calls is True
+
+
+class TestWorkerOptions:
+    """Test suite for WorkerOptions dataclass."""
+
+    def test___init___with_default_values(self):
+        """Test WorkerOptions default constructor yields default ChannelOptions.
+
+        Given:
+            No custom parameters
+        When:
+            WorkerOptions is instantiated
+        Then:
+            It should contain default ChannelOptions and default
+            http2_min_recv_ping_interval_without_data_ms
+        """
+        # Act
+        opts = WorkerOptions()
+
+        # Assert
+        assert opts.channel == ChannelOptions()
+        assert opts.http2_min_recv_ping_interval_without_data_ms == 30_000
+        assert opts.max_ping_strikes == 2
+        assert opts.max_connection_idle_ms is None
+        assert opts.max_connection_age_ms is None
+        assert opts.max_connection_age_grace_ms is None
+
+    def test___init___with_custom_server_only_options(self):
+        """Test WorkerOptions with custom server-only fields.
+
+        Given:
+            Custom max_ping_strikes and all three lifecycle options
+        When:
+            WorkerOptions is instantiated with those values
+        Then:
+            All four server-only fields should reflect the provided values
+        """
+        # Act
+        opts = WorkerOptions(
+            max_ping_strikes=5,
+            max_connection_idle_ms=60000,
+            max_connection_age_ms=120000,
+            max_connection_age_grace_ms=5000,
+        )
+
+        # Assert
+        assert opts.max_ping_strikes == 5
+        assert opts.max_connection_idle_ms == 60000
+        assert opts.max_connection_age_ms == 120000
+        assert opts.max_connection_age_grace_ms == 5000
+
+    def test___init___with_custom_channel_options(self):
+        """Test WorkerOptions with custom ChannelOptions.
+
+        Given:
+            A ChannelOptions instance with custom message sizes
+        When:
+            WorkerOptions is instantiated with that ChannelOptions
+        Then:
+            The channel field should reflect the custom values
+        """
+        # Act
+        channel = ChannelOptions(
+            max_receive_message_length=50 * 1024 * 1024,
+            max_send_message_length=25 * 1024 * 1024,
+        )
+        opts = WorkerOptions(channel=channel)
+
+        # Assert
+        assert opts.channel.max_receive_message_length == 50 * 1024 * 1024
+        assert opts.channel.max_send_message_length == 25 * 1024 * 1024
+
+    def test___init___with_custom_http2_min_ping_interval(self):
+        """Test WorkerOptions with custom http2_min_recv_ping_interval_without_data_ms.
+
+        Given:
+            A custom http2_min_recv_ping_interval_without_data_ms value
+        When:
+            WorkerOptions is instantiated
+        Then:
+            It should store the custom value
+        """
+        # Act
+        opts = WorkerOptions(http2_min_recv_ping_interval_without_data_ms=20000)
+
+        # Assert
+        assert opts.http2_min_recv_ping_interval_without_data_ms == 20000
+
+    def test___init___with_keepalive_time_below_min_ping_interval(self):
+        """Test WorkerOptions raises ValueError when channel.keepalive_time_ms < http2_min_recv_ping_interval_without_data_ms.
+
+        Given:
+            A ChannelOptions with keepalive_time_ms=5000 and http2_min_recv_ping_interval_without_data_ms=10000
+        When:
+            WorkerOptions is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="keepalive_time_ms must be >= http2_min_recv_ping_interval_without_data_ms",
+        ):
+            WorkerOptions(
+                channel=ChannelOptions(keepalive_time_ms=5000),
+                http2_min_recv_ping_interval_without_data_ms=10000,
+            )
+
+    def test___init___with_keepalive_time_equal_to_min_ping_interval(self):
+        """Test WorkerOptions accepts channel.keepalive_time_ms equal to http2_min_recv_ping_interval_without_data_ms.
+
+        Given:
+            A ChannelOptions with keepalive_time_ms=10000 and http2_min_recv_ping_interval_without_data_ms=10000
+        When:
+            WorkerOptions is instantiated
+        Then:
+            It should succeed without error
+        """
+        # Act
+        opts = WorkerOptions(
+            channel=ChannelOptions(keepalive_time_ms=10000),
+            http2_min_recv_ping_interval_without_data_ms=10000,
+        )
+
+        # Assert
+        assert opts.channel.keepalive_time_ms == 10000
+        assert opts.http2_min_recv_ping_interval_without_data_ms == 10000
+
+    def test___init___with_keepalive_time_above_min_ping_interval(self):
+        """Test WorkerOptions accepts channel.keepalive_time_ms above http2_min_recv_ping_interval_without_data_ms.
+
+        Given:
+            A ChannelOptions with keepalive_time_ms=20000 and http2_min_recv_ping_interval_without_data_ms=10000
+        When:
+            WorkerOptions is instantiated
+        Then:
+            It should succeed without error
+        """
+        # Act
+        opts = WorkerOptions(
+            channel=ChannelOptions(keepalive_time_ms=20000),
+            http2_min_recv_ping_interval_without_data_ms=10000,
+        )
+
+        # Assert
+        assert opts.channel.keepalive_time_ms == 20000
+        assert opts.http2_min_recv_ping_interval_without_data_ms == 10000
+
+    @given(
+        keepalive_time_ms=st.integers(min_value=1, max_value=300000),
+        min_ping_interval=st.integers(min_value=1, max_value=300000),
+    )
+    def test___init___validation_property(self, keepalive_time_ms, min_ping_interval):
+        """Test WorkerOptions validation invariant across arbitrary values.
+
+        Given:
+            Arbitrary positive keepalive_time_ms and http2_min_recv_ping_interval_without_data_ms
+        When:
+            WorkerOptions is instantiated
+        Then:
+            It should raise ValueError iff keepalive_time_ms < http2_min_recv_ping_interval_without_data_ms
+        """
+        # Act & assert
+        if keepalive_time_ms < min_ping_interval:
+            with pytest.raises(ValueError):
+                WorkerOptions(
+                    channel=ChannelOptions(keepalive_time_ms=keepalive_time_ms),
+                    http2_min_recv_ping_interval_without_data_ms=min_ping_interval,
+                )
+        else:
+            opts = WorkerOptions(
+                channel=ChannelOptions(keepalive_time_ms=keepalive_time_ms),
+                http2_min_recv_ping_interval_without_data_ms=min_ping_interval,
+            )
+            assert opts.channel.keepalive_time_ms == keepalive_time_ms
+            assert opts.http2_min_recv_ping_interval_without_data_ms == min_ping_interval
 
 
 class ConcreteWorker(Worker):

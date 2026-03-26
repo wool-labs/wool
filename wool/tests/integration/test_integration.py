@@ -82,6 +82,18 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         RoutineBinding.MODULE_FUNCTION,
     )
 )
+@example(
+    scenario=Scenario(
+        RoutineShape.COROUTINE,
+        PoolMode.DEFAULT,
+        DiscoveryFactory.NONE,
+        LbFactory.CLASS_REF,
+        CredentialType.INSECURE,
+        WorkerOptionsKind.KEEPALIVE,
+        TimeoutKind.NONE,
+        RoutineBinding.MODULE_FUNCTION,
+    )
+)
 @given(scenario=scenarios_strategy())
 async def test_dispatch_hypothesis(scenario, credentials_map, retry_grpc_internal):
     """Test routine dispatch with Hypothesis-generated scenarios.

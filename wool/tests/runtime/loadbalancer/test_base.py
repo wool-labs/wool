@@ -4,11 +4,11 @@ from uuid import uuid4
 from hypothesis import given
 from hypothesis import strategies as st
 
-from wool.runtime.discovery.base import WorkerMetadata
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.metadata import WorkerMetadata
 
 
 @st.composite

@@ -60,7 +60,7 @@ async with wool.WorkerPool(size=4, discovery=wool.LanDiscovery()):
 | Property | Type | Description |
 | -------- | ---- | ----------- |
 | `uid` | `UUID` | Unique identifier assigned at construction. |
-| `metadata` | `WorkerMetadata \| None` | Full metadata including address, tags, and version. `None` before `start()`. |
+| `metadata` | `WorkerMetadata \| None` | Full metadata including address, tags, version, and transport options. `None` before `start()`. |
 | `tags` | `set[str]` | Capability tags for filtering and selection. |
 | `extra` | `dict[str, Any]` | Arbitrary key-value metadata. |
 | `address` | `str \| None` | gRPC target address (e.g. `"host:port"`, `"unix:path"`). `None` before `start()`. |
@@ -195,9 +195,45 @@ Worker subprocesses can dispatch tasks to other workers. Each subprocess is conf
 | Discovery | `discovery` | Accepts any `DiscoverySubscriberLike` or `Factory` thereof. |
 | Static | `workers` | Takes a sequence of `WorkerMetadata` directly — no discovery needed. |
 
+### Self-describing connections
+
+Workers are self-describing: each worker advertises its gRPC transport configuration via `ChannelOptions` in its `WorkerMetadata`. When a client discovers a worker, it reads the advertised options and configures its channel to match — message sizes, keepalive intervals, concurrency limits, and compression are all set automatically. There is no separate client-side configuration step; the worker's metadata is the single source of truth for how to connect to it.
+
 ### Connection pooling
 
-`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, limit)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Each channel enforces semaphore-based concurrency limiting (default 100 concurrent dispatches).
+`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`.
+
+### Transport configuration
+
+Transport options are split into two tiers:
+
+- **`ChannelOptions`** — settings that both the server and client apply symmetrically. Workers advertise these via `WorkerMetadata` so clients connect with identical settings. Includes message sizes (`max_receive_message_length`, `max_send_message_length`), keepalive (`keepalive_time_ms`, `keepalive_timeout_ms`, `keepalive_permit_without_calls`, `max_pings_without_data`), flow control (`max_concurrent_streams`), and compression (`compression`).
+
+- **`WorkerOptions`** — composes a `ChannelOptions` instance with server-only settings that are not communicated to clients: `http2_min_recv_ping_interval_without_data_ms` (minimum allowed client ping interval), `max_ping_strikes` (ping violations before GOAWAY), and optional connection lifecycle limits (`max_connection_idle_ms`, `max_connection_age_ms`, `max_connection_age_grace_ms`).
+
+All options default to gRPC's own defaults. Pass a `WorkerOptions` instance to `LocalWorker` or `WorkerProcess` to customize:
+
+```python
+from wool.runtime.worker.base import ChannelOptions, WorkerOptions
+from wool.runtime.worker.local import LocalWorker
+
+options = WorkerOptions(
+    channel=ChannelOptions(
+        keepalive_time_ms=10_000,
+        keepalive_timeout_ms=5_000,
+        max_concurrent_streams=50,
+    ),
+    max_connection_idle_ms=300_000,
+)
+
+async with wool.WorkerPool(
+    size=4,
+    worker=lambda *tags, credentials=None: LocalWorker(
+        *tags, credentials=credentials, options=options,
+    ),
+):
+    result = await my_routine()
+```
 
 ### Error classification
 

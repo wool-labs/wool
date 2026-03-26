@@ -93,8 +93,37 @@ message WorkerMetadata {
 
     // Whether the worker requires secure TLS/mTLS connections
     bool secure = 7;
+
+    // gRPC channel configuration advertised by the worker.
+    // Clients use these settings when connecting to this worker.
+    ChannelOptions connection = 8;
 }
 
-message WorkerEndpoint {}
+message ChannelOptions {
+    // Maximum inbound message size in bytes.
+    int32 max_receive_message_length = 1;
+
+    // Maximum outbound message size in bytes.
+    int32 max_send_message_length = 2;
+
+    // Interval in milliseconds between HTTP/2 keepalive pings.
+    int32 keepalive_time_ms = 3;
+
+    // Time in milliseconds to wait for a keepalive pong before
+    // considering the connection dead.
+    int32 keepalive_timeout_ms = 4;
+
+    // Whether to send keepalive pings with no active RPCs.
+    bool keepalive_permit_without_calls = 5;
+
+    // Max keepalive pings allowed when no data/header frames are sent.
+    int32 max_pings_without_data = 6;
+
+    // Max concurrent HTTP/2 streams per connection.
+    int32 max_concurrent_streams = 7;
+
+    // Default compression algorithm (maps to grpc.Compression enum value).
+    int32 compression = 8;
+}
 
 message Void {}
