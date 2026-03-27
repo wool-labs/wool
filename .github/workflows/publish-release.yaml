@@ -226,7 +226,7 @@ jobs:
           GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
           REPO: ${{ github.repository }}
         run: |
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $(echo -n "x-access-token:${GH_TOKEN}" | base64)"
           git fetch --unshallow
           if [[ -n $(git ls-remote --heads origin release) ]]; then
             git push origin --delete release
