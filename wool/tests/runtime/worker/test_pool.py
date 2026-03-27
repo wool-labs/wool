@@ -1735,3 +1735,296 @@ class TestWorkerPool:
         mock_proxy_cls.assert_called_once()
         _, proxy_kwargs = mock_proxy_cls.call_args
         assert "options" not in proxy_kwargs
+
+    def test___init___with_lease(self):
+        """Test instantiation with size and lease.
+
+        Given:
+            A size of 4 and lease of 8
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(size=4, lease=8)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_lease_and_no_size(self, mocker: MockerFixture):
+        """Test lease without size in durable mode.
+
+        Given:
+            A discovery service and lease of 8 with no size specified
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act
+        pool = WorkerPool(discovery=mock_discovery, lease=8)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_zero_lease_and_size(self):
+        """Test zero lease with size is accepted.
+
+        Given:
+            A size of 4 and lease of 0
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(size=4, lease=0)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_zero_lease_discovery_only(self, mocker: MockerFixture):
+        """Test zero lease with discovery-only pool is rejected.
+
+        Given:
+            A discovery service and lease of 0 with no size
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Lease must be positive for discovery-only pools",
+        ):
+            WorkerPool(discovery=mock_discovery, lease=0)
+
+    def test___init___with_negative_lease(self):
+        """Test negative lease is rejected.
+
+        Given:
+            A negative lease value
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Lease must be non-negative"):
+            WorkerPool(size=4, lease=-1)
+
+    @pytest.mark.asyncio
+    async def test___aenter___hybrid_mode_forwards_lease(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_discovery_service_for_pool,
+    ):
+        """Test hybrid mode forwards lease to WorkerProxy.
+
+        Given:
+            A WorkerPool with size=2, lease=4, and discovery
+        When:
+            The pool context is entered
+        Then:
+            It should pass lease=6 (size + lease) to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+        discovery_service = mock_discovery_service_for_pool
+
+        # Act
+        async with WorkerPool(size=2, lease=4, discovery=discovery_service):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["lease"] == 6  # size(2) + lease(4)
+
+    @pytest.mark.asyncio
+    async def test___aenter___ephemeral_mode_forwards_lease(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test ephemeral mode forwards lease to WorkerProxy.
+
+        Given:
+            A WorkerPool with size=2 and lease=4 without discovery
+        When:
+            The pool context is entered
+        Then:
+            It should pass lease=6 (size + lease) to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(size=2, lease=4):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["lease"] == 6  # size(2) + lease(4)
+
+    @pytest.mark.asyncio
+    async def test___aenter___durable_mode_forwards_lease(
+        self,
+        mocker: MockerFixture,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test durable mode forwards lease to WorkerProxy.
+
+        Given:
+            A WorkerPool with discovery only and lease=6
+        When:
+            The pool context is entered
+        Then:
+            It should pass lease=6 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+        discovery_service = mock_discovery_service_for_pool
+
+        # Act
+        async with WorkerPool(discovery=discovery_service, lease=6):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["lease"] == 6
+
+    @pytest.mark.asyncio
+    async def test___aenter___no_lease_forwards_none(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test no lease forwards lease=None to WorkerProxy.
+
+        Given:
+            A WorkerPool with plain int size and no lease
+        When:
+            The pool context is entered
+        Then:
+            It should pass lease=None to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(size=2):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["lease"] is None
+
+    @pytest.mark.asyncio
+    async def test___aenter___default_mode_forwards_lease(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test default mode forwards size + lease to WorkerProxy.
+
+        Given:
+            A WorkerPool with no explicit size or discovery and lease=4
+        When:
+            The pool context is entered
+        Then:
+            It should pass lease=cpu_count + 4 to WorkerProxy
+        """
+        # Arrange
+        import os
+
+        import wool.runtime.worker.pool as wp
+
+        mocker.patch.object(os, "cpu_count", return_value=2)
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(lease=4):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["lease"] == 6  # cpu_count(2) + lease(4)
+
+    @given(
+        size=st.integers(min_value=1, max_value=20),
+        lease=st.integers(min_value=0, max_value=20),
+    )
+    def test___init___accepts_valid_size_and_lease(self, size, lease):
+        """Test valid size and lease combinations are accepted.
+
+        Given:
+            Any positive size and any non-negative lease
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create pool successfully
+        """
+        # Act
+        pool = WorkerPool(size=size, lease=lease)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    @given(lease=st.integers(min_value=-100, max_value=-1))
+    def test___init___rejects_negative_lease_pbt(self, lease):
+        """Test negative lease values are rejected.
+
+        Given:
+            Any negative lease value
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Lease must be non-negative",
+        ):
+            WorkerPool(size=1, lease=lease)
