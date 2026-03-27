@@ -137,6 +137,10 @@ class WorkerPool:
         Capability tags for spawned workers.
     :param size:
         Number of workers to spawn (0 = CPU count).
+    :param lease:
+        Maximum number of additionally discovered workers to admit to the pool.
+        The total pool capacity is ``size + lease`` when both are set, or just
+        ``lease`` for external pools. Defaults to ``None`` (unbounded).
     :param worker:
         Worker factory callable. Defaults to :class:`LocalWorker`.
     :param loadbalancer:
@@ -163,6 +167,7 @@ class WorkerPool:
         self,
         *tags: str,
         size: int = 0,
+        lease: int | None = None,
         worker: WorkerFactory = LocalWorker,
         discovery: None = None,
         loadbalancer: (
@@ -180,6 +185,7 @@ class WorkerPool:
     def __init__(
         self,
         *,
+        lease: int | None = None,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
@@ -197,6 +203,7 @@ class WorkerPool:
         self,
         *tags: str,
         size: int = 0,
+        lease: int | None = None,
         worker: WorkerFactory = LocalWorker,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
@@ -214,6 +221,7 @@ class WorkerPool:
         self,
         *tags: str,
         size: int | None = None,
+        lease: int | None = None,
         worker: WorkerFactory | None = None,
         discovery: DiscoveryLike | Factory[DiscoveryLike] | None = None,
         loadbalancer: (
@@ -224,15 +232,13 @@ class WorkerPool:
         self._workers = {}
         self._credentials = credentials
 
+        if lease is not None and lease < 0:
+            raise ValueError("Lease must be non-negative")
+
         match (size, discovery):
             case (size, discovery) if size is not None and discovery is not None:
-                if size == 0:
-                    cpu_count = os.cpu_count()
-                    if cpu_count is None:
-                        raise ValueError("Unable to determine CPU count")
-                    size = cpu_count
-                elif size < 0:
-                    raise ValueError("Size must be non-negative")
+                size = _resolve_size(size)
+                max_workers = size + lease if lease is not None else None
 
                 @asynccontextmanager
                 async def create_proxy():
@@ -253,19 +259,15 @@ class WorkerPool:
                                 discovery=discovery_svc.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
+                                lease=max_workers,
                             ):
                                 yield
                     finally:
                         await self._exit_context(discovery_ctx)
 
             case (size, None) if size is not None:
-                if size == 0:
-                    cpu_count = os.cpu_count()
-                    if cpu_count is None:
-                        raise ValueError("Unable to determine CPU count")
-                    size = cpu_count
-                elif size < 0:
-                    raise ValueError("Size must be non-negative")
+                size = _resolve_size(size)
+                max_workers = size + lease if lease is not None else None
 
                 namespace = f"pool-{uuid.uuid4().hex}"
 
@@ -282,10 +284,13 @@ class WorkerPool:
                                 discovery=discovery.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
+                                lease=max_workers,
                             ):
                                 yield
 
             case (None, discovery) if discovery is not None:
+                if lease is not None and lease == 0:
+                    raise ValueError("Lease must be positive for discovery-only pools")
 
                 @asynccontextmanager
                 async def create_proxy():
@@ -297,16 +302,15 @@ class WorkerPool:
                             discovery=discovery_svc.subscriber,
                             loadbalancer=loadbalancer,
                             credentials=self._credentials,
+                            lease=lease,
                         ):
                             yield
                     finally:
                         await self._exit_context(discovery_ctx)
 
             case (None, None):
-                cpu_count = os.cpu_count()
-                if cpu_count is None:
-                    raise ValueError("Unable to determine CPU count")
-                size = cpu_count
+                size = _resolve_size(0)
+                max_workers = size + lease if lease is not None else None
 
                 namespace = f"pool-{uuid.uuid4().hex}"
 
@@ -323,6 +327,7 @@ class WorkerPool:
                                 discovery=discovery.subscriber,
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
+                                lease=max_workers,
                             ):
                                 yield
 
@@ -415,6 +420,17 @@ class WorkerPool:
             await ctx.__aexit__(*sys.exc_info())
         elif isinstance(ctx, ContextManager):
             ctx.__exit__(*sys.exc_info())
+
+
+def _resolve_size(size: int) -> int:
+    if size == 0:
+        cpu_count = os.cpu_count()
+        if cpu_count is None:
+            raise ValueError("Unable to determine CPU count")
+        size = cpu_count
+    elif size < 0:
+        raise ValueError("Size must be non-negative")
+    return size
 
 
 def _predicate(tags):

@@ -33,6 +33,20 @@ from wool.runtime.worker.proxy import WorkerProxy
 from wool.runtime.worker.proxy import is_version_compatible
 from wool.runtime.worker.proxy import parse_version
 
+
+async def _drain_discovery(proxy, *, expect, timeout=2.0):
+    """Wait until proxy.workers reaches the expected count or times out.
+
+    Yields the event loop in a tight loop so the sentinel can process
+    events from a finite ReducibleAsyncIterator without a hard sleep.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while len(proxy.workers) != expect:
+        if asyncio.get_event_loop().time() > deadline:
+            break
+        await asyncio.sleep(0)
+
+
 # ============================================================================
 # Test Fixtures
 # ============================================================================
@@ -1220,6 +1234,330 @@ class TestWorkerProxy:
 
         # Cleanup
         await proxy.stop()
+
+    def test___init___with_zero_lease_raises(self, mock_discovery_service):
+        """Test zero lease is rejected.
+
+        Given:
+            A discovery service and lease of 0
+        When:
+            WorkerProxy is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Lease must be a positive, non-zero integer",
+        ):
+            WorkerProxy(discovery=mock_discovery_service, lease=0)
+
+    def test___init___with_negative_lease_raises(self, mock_discovery_service):
+        """Test negative lease is rejected.
+
+        Given:
+            A discovery service and lease of -1
+        When:
+            WorkerProxy is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Lease must be a positive, non-zero integer",
+        ):
+            WorkerProxy(discovery=mock_discovery_service, lease=-1)
+
+    def test___init___with_positive_lease_accepted(self, mock_discovery_service):
+        """Test positive lease is accepted.
+
+        Given:
+            A discovery service and lease of 5
+        When:
+            WorkerProxy is instantiated
+        Then:
+            It should create the proxy successfully
+        """
+        # Act
+        proxy = WorkerProxy(discovery=mock_discovery_service, lease=5)
+
+        # Assert
+        assert isinstance(proxy, WorkerProxy)
+
+    @pytest.mark.asyncio
+    async def test_start_caps_discovered_workers_at_lease(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test sentinel respects lease cap on worker-added events.
+
+        Given:
+            A WorkerProxy with lease=2 and a discovery stream with
+            3 worker-added events
+        When:
+            The sentinel processes all events
+        Then:
+            It should accept only 2 workers, ignoring the 3rd
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+            )
+            for i in range(3)
+        ]
+        events = [DiscoveryEvent("worker-added", metadata=w) for w in workers]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lease=2)
+
+        # Act
+        await proxy.start()
+        await _drain_discovery(proxy, expect=2)
+
+        # Assert
+        assert len(proxy.workers) == 2
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_accepts_all_workers_when_lease_none(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test sentinel accepts all workers when lease is None.
+
+        Given:
+            A WorkerProxy with lease=None and a discovery stream
+            with 3 worker-added events
+        When:
+            The sentinel processes all events
+        Then:
+            It should accept all 3 workers
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+            )
+            for i in range(3)
+        ]
+        events = [DiscoveryEvent("worker-added", metadata=w) for w in workers]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lease=None)
+
+        # Act
+        await proxy.start()
+        await _drain_discovery(proxy, expect=3)
+
+        # Assert
+        assert len(proxy.workers) == 3
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_allows_worker_updated_at_capacity(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test sentinel processes worker-updated events even at capacity.
+
+        Given:
+            A WorkerProxy with lease=2, already at capacity,
+            receiving a worker-updated event
+        When:
+            The sentinel processes the update event
+        Then:
+            It should process the update without being blocked by the cap
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        worker1 = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+        )
+        worker2 = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=worker1),
+            DiscoveryEvent("worker-added", metadata=worker2),
+            DiscoveryEvent("worker-updated", metadata=worker1),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lease=2)
+
+        # Act
+        await proxy.start()
+        await _drain_discovery(proxy, expect=2)
+
+        # Assert
+        assert len(proxy.workers) == 2
+        assert worker1 in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_accepts_worker_after_drop_frees_capacity(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test drop restores capacity for a subsequent worker-added event.
+
+        Given:
+            A WorkerProxy with lease=2, at capacity with 2 workers,
+            then one worker is dropped followed by a new worker-added
+        When:
+            The proxy processes all events
+        Then:
+            It should accept the new worker after the drop
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        worker1 = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+        )
+        worker2 = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+        worker3 = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.3:50051",
+            pid=1003,
+            version="1.0.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=worker1),
+            DiscoveryEvent("worker-added", metadata=worker2),
+            DiscoveryEvent("worker-dropped", metadata=worker1),
+            DiscoveryEvent("worker-added", metadata=worker3),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lease=2)
+
+        # Act
+        await proxy.start()
+        await _drain_discovery(proxy, expect=2)
+
+        # Assert — worker3 was accepted after worker1 was dropped
+        assert len(proxy.workers) == 2
+        assert worker2 in proxy.workers
+        assert worker3 in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_drops_update_for_rejected_worker(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test worker-updated for a cap-rejected worker is silently dropped.
+
+        Given:
+            A WorkerProxy with lease=1 and a discovery stream where
+            worker2 is rejected by the cap, then a worker-updated
+            event arrives for worker2
+        When:
+            The proxy processes all events
+        Then:
+            It should not add worker2 via the update event
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        worker1 = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+        )
+        worker2 = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=worker1),
+            DiscoveryEvent("worker-added", metadata=worker2),  # rejected
+            DiscoveryEvent("worker-updated", metadata=worker2),  # dropped
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lease=1)
+
+        # Act
+        await proxy.start()
+        await _drain_discovery(proxy, expect=1)
+
+        # Assert — only worker1 is present; worker2 was never admitted
+        assert len(proxy.workers) == 1
+        assert worker1 in proxy.workers
+        assert worker2 not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_cloudpickle_serialization_preserves_lease(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test pickle round-trip preserves lease cap behavior.
+
+        Given:
+            A WorkerProxy with lease=2 and a discovery stream
+            with 3 worker-added events
+        When:
+            The proxy is pickled, unpickled, started, and processes
+            the discovery events
+        Then:
+            It should cap at 2 workers, proving the limit survived
+            the round-trip
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+            )
+            for i in range(3)
+        ]
+        events = [DiscoveryEvent("worker-added", metadata=w) for w in workers]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(
+            discovery=discovery,
+            loadbalancer=wp.RoundRobinLoadBalancer,
+            lease=2,
+        )
+
+        # Act — pickle round-trip, then start the restored proxy
+        pickled_data = cloudpickle.dumps(proxy)
+        restored = cloudpickle.loads(pickled_data)
+        await restored.start()
+        await _drain_discovery(restored, expect=2)
+
+        # Assert — restored proxy enforces the cap
+        assert len(restored.workers) == 2
+        await restored.stop()
 
     @pytest.mark.asyncio
     async def test_dispatch_delegates_to_loadbalancer(
