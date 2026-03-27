@@ -142,7 +142,17 @@ async with wool.WorkerPool(size=4, discovery=wool.LanDiscovery()):
     result = await my_routine()
 ```
 
-`size` controls how many workers are spawned by the pool — it does not cap the total number of workers available. In Hybrid mode, additional workers may join via discovery beyond the initial `size`.
+`size` controls how many workers are spawned by the pool — it does not cap the total number of workers available. In Hybrid mode, additional workers may join via discovery beyond the initial `size`. The `lease` parameter caps how many additional discovered workers the pool will accept. The total pool capacity is `size + lease` when both are set. The lease count is a cap on admission, not a reservation — discovered workers may serve multiple pools simultaneously, and there is no guarantee that a leased slot will remain filled for the life of the pool:
+
+```python
+# Spawn 4 local workers, accept up to 4 more from discovery (8 total)
+async with wool.WorkerPool(size=4, lease=4, discovery=wool.LanDiscovery()):
+    result = await my_routine()
+
+# Durable pool capped at 10 discovered workers
+async with wool.WorkerPool(discovery=wool.LanDiscovery(), lease=10):
+    result = await my_routine()
+```
 
 ## Workers
 
