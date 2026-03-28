@@ -323,7 +323,10 @@ class LanDiscovery(Discovery):
 
             return socket.inet_aton(socket.gethostbyname(host)), port
 
-    class Subscriber(metaclass=SubscriberMeta):
+    class Subscriber(
+        metaclass=SubscriberMeta,
+        key=lambda cls, service_type: (cls, service_type),
+    ):
         """Subscriber for receiving worker discovery events.
 
         Subscribes to worker :class:`discovery events
@@ -346,10 +349,6 @@ class LanDiscovery(Discovery):
 
         def __init__(self, service_type: str) -> None:
             self.service_type = service_type
-
-        @classmethod
-        def _cache_key(cls, service_type: str) -> tuple:
-            return (cls, service_type)
 
         async def _shutdown(self) -> None:
             """Clean up shared subscription state for this subscriber."""

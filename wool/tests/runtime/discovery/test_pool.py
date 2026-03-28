@@ -15,15 +15,14 @@ from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.metadata import WorkerMetadata
 
 
-class _StubSubscriber(metaclass=SubscriberMeta):
+class _StubSubscriber(
+    metaclass=SubscriberMeta,
+    key=lambda cls, key_value: (cls, key_value),
+):
     """Minimal subscriber stub for testing SubscriberMeta."""
 
     def __init__(self, key_value: str) -> None:
         self.key_value = key_value
-
-    @classmethod
-    def _cache_key(cls, key_value: str):
-        return (cls, key_value)
 
     def __reduce__(self):
         return type(self), (self.key_value,)
@@ -105,13 +104,12 @@ class TestSubscriberMeta:
         # Arrange
         events = [_make_event(address=f"127.0.0.1:{50051 + i}") for i in range(3)]
 
-        class _EventStub(metaclass=SubscriberMeta):
+        class _EventStub(
+            metaclass=SubscriberMeta,
+            key=lambda cls, tag: (cls, tag),
+        ):
             def __init__(self, tag):
                 self.tag = tag
-
-            @classmethod
-            def _cache_key(cls, tag):
-                return (cls, tag)
 
             async def _shutdown(self):
                 pass
@@ -157,14 +155,13 @@ class TestSubscriberMeta:
         event_a = _make_event(address="10.0.0.1:1")
         event_b = _make_event(address="10.0.0.2:2")
 
-        class _IsoStub(metaclass=SubscriberMeta):
+        class _IsoStub(
+            metaclass=SubscriberMeta,
+            key=lambda cls, tag, event: (cls, tag),
+        ):
             def __init__(self, tag, event):
                 self.tag = tag
                 self._event = event
-
-            @classmethod
-            def _cache_key(cls, tag, event):
-                return (cls, tag)
 
             async def _shutdown(self):
                 pass
@@ -205,6 +202,89 @@ class TestSubscriberMeta:
 
         # Assert
         assert __subscriber_pool__.get() is not None
+
+    def test___new___with_key_callable_receiving_cls(self):
+        """Test key callable receives the class as its first argument.
+
+        Given:
+            A subscriber class defined with a key callable that
+            includes cls in the returned tuple.
+        When:
+            The class is instantiated.
+        Then:
+            It should produce a _SharedSubscription whose cache key
+            was computed using the class itself.
+        """
+        # Arrange
+        captured = {}
+
+        def capture_key(cls, value):
+            captured["cls"] = cls
+            captured["value"] = value
+            return (cls, value)
+
+        class _CaptureSub(
+            metaclass=SubscriberMeta,
+            key=capture_key,
+        ):
+            def __init__(self, value):
+                self.value = value
+
+            async def _shutdown(self):
+                pass
+
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                yield  # pragma: no cover
+
+        # Act
+        result = _CaptureSub("test-val")
+
+        # Assert
+        assert isinstance(result, _SharedSubscription)
+        assert captured["cls"] is _CaptureSub
+        assert captured["value"] == "test-val"
+
+    def test___new___with_inherited_key(self):
+        """Test subclass inherits key callable from parent.
+
+        Given:
+            A parent subscriber class defined with a key callable
+            and a subclass that does not pass its own key.
+        When:
+            The subclass is instantiated.
+        Then:
+            It should inherit the parent's key callable and return
+            a _SharedSubscription.
+        """
+
+        # Arrange
+        class _Parent(
+            metaclass=SubscriberMeta,
+            key=lambda cls, tag: (cls, tag),
+        ):
+            def __init__(self, tag):
+                self.tag = tag
+
+            async def _shutdown(self):
+                pass
+
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                yield  # pragma: no cover
+
+        class _Child(_Parent):
+            pass
+
+        # Act
+        result = _Child("child-tag")
+
+        # Assert
+        assert isinstance(result, _SharedSubscription)
 
 
 class TestSharedSubscription:
