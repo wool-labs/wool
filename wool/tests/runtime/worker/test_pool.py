@@ -190,6 +190,103 @@ class TestWorkerPool:
         # Assert
         assert isinstance(pool, WorkerPool)
 
+    def test___init___size_negative_emits_warning_and_raises(self):
+        """Test deprecated size with negative value emits warning and raises.
+
+        Given:
+            The deprecated 'size' parameter with value -1
+        When:
+            WorkerPool is initialized
+        Then:
+            It should emit a DeprecationWarning and raise ValueError
+        """
+        # Act & assert
+        with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
+            with pytest.raises(ValueError, match="Spawn must be non-negative"):
+                WorkerPool(size=-1)
+
+    def test___init___size_zero_resolves_cpu_count(self, mocker: MockerFixture):
+        """Test deprecated size=0 resolves to CPU count.
+
+        Given:
+            The deprecated 'size' parameter with value 0 and CPU count available
+        When:
+            WorkerPool is initialized
+        Then:
+            It should emit a DeprecationWarning and create a valid pool
+        """
+        # Arrange
+        mocker.patch("os.cpu_count", return_value=4)
+
+        # Act
+        with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
+            pool = WorkerPool(size=0)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___size_with_discovery_creates_hybrid(self, mocker: MockerFixture):
+        """Test deprecated size with discovery creates hybrid pool.
+
+        Given:
+            The deprecated 'size' parameter and a discovery service
+        When:
+            WorkerPool is initialized
+        Then:
+            It should emit a DeprecationWarning and create a valid pool
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act
+        with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
+            pool = WorkerPool(size=2, discovery=mock_discovery)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___size_with_lease(self):
+        """Test deprecated size combined with lease.
+
+        Given:
+            The deprecated 'size' parameter with value 4 and lease of 8
+        When:
+            WorkerPool is initialized
+        Then:
+            It should emit a DeprecationWarning and create a valid pool
+        """
+        # Act
+        with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
+            pool = WorkerPool(size=4, lease=8)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___size_warns_at_caller_frame(self):
+        """Test deprecation warning points to the caller's frame.
+
+        Given:
+            The deprecated 'size' parameter is passed
+        When:
+            WorkerPool is initialized
+        Then:
+            It should emit a warning whose filename is the test file
+        """
+        # Arrange
+        import warnings
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", DeprecationWarning)
+            WorkerPool(size=4)
+
+        # Assert
+        deprecation_warnings = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecation_warnings) == 1
+        assert "test_pool.py" in deprecation_warnings[0].filename
+
     def test___init___with_zero_spawn_and_available_cpu_count(
         self, mocker: MockerFixture
     ):
@@ -1819,7 +1916,7 @@ class TestWorkerPool:
         # Assert
         assert isinstance(pool, WorkerPool)
 
-    def test___init___with_lease_and_no_size(self, mocker: MockerFixture):
+    def test___init___with_lease_and_no_spawn(self, mocker: MockerFixture):
         """Test lease without spawn in durable mode.
 
         Given:
@@ -1838,7 +1935,7 @@ class TestWorkerPool:
         # Assert
         assert isinstance(pool, WorkerPool)
 
-    def test___init___with_zero_lease_and_size(self):
+    def test___init___with_zero_lease_and_spawn(self):
         """Test zero lease with spawn is accepted.
 
         Given:
