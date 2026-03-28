@@ -90,7 +90,7 @@ When no `loadbalancer` argument is provided, `WorkerPool` uses `RoundRobinLoadBa
 ```python
 import wool
 
-async with wool.WorkerPool(size=4):
+async with wool.WorkerPool(spawn=4):
     result = await my_routine()
 ```
 
@@ -103,6 +103,6 @@ import wool
 
 balancer = LeastLoadedBalancer()
 
-async with wool.WorkerPool(size=4, loadbalancer=balancer):
+async with wool.WorkerPool(spawn=4, loadbalancer=balancer):
     result = await my_routine()
 ```
