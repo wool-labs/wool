@@ -132,10 +132,10 @@ protocol. Spawned workers are published and made available to other clients:
 import wool
 
 # Local
-async with wool.WorkerPool(size=4, discovery=wool.LocalDiscovery("my-namespace")):
+async with wool.WorkerPool(spawn=4, discovery=wool.LocalDiscovery("my-namespace")):
     result = await my_routine()
 
 # LAN
-async with wool.WorkerPool(size=4, discovery=wool.LanDiscovery()):
+async with wool.WorkerPool(spawn=4, discovery=wool.LanDiscovery()):
     result = await my_routine()
 ```

@@ -41,7 +41,7 @@ async def add(x: int, y: int) -> int:
 
 
 async def main():
-    async with wool.WorkerPool(size=4):
+    async with wool.WorkerPool(spawn=4):
         result = await add(1, 2)
         print(result)  # 3
 
@@ -107,12 +107,12 @@ Task serialization has two layers. [cloudpickle](https://github.com/cloudpipe/cl
 
 `WorkerPool` is the main entry point for running routines. It orchestrates worker subprocess lifecycles, discovery, and load-balanced dispatch. The pool supports four configurations depending on which arguments are provided:
 
-| Mode | `size` | `discovery` | Behavior |
-| ---- | ------ | ----------- | -------- |
-| Default | omitted | omitted | Spawns `cpu_count` local workers with internal `LocalDiscovery`. |
-| Ephemeral | set | omitted | Spawns N local workers with internal `LocalDiscovery`. |
-| Durable | omitted | set | No workers spawned; connects to existing workers via discovery. |
-| Hybrid | set | set | Spawns local workers and discovers remote workers through the same protocol. |
+| Mode | `spawn` | `discovery` | `lease` | Behavior |
+| ---- | ------- | ----------- | ------- | -------- |
+| Default | omitted | omitted | optional | Spawns `cpu_count` local workers with internal `LocalDiscovery`. |
+| Ephemeral | set | omitted | optional | Spawns N local workers with internal `LocalDiscovery`. |
+| Durable | omitted | set | optional | No workers spawned; connects to existing workers via discovery. |
+| Hybrid | set | set | optional | Spawns local workers and discovers remote workers through the same protocol. |
 
 **Default** — no arguments needed:
 
@@ -124,7 +124,7 @@ async with wool.WorkerPool():
 **Ephemeral** — spawn a fixed number of local workers, optionally with tags:
 
 ```python
-async with wool.WorkerPool("gpu-capable", size=4):
+async with wool.WorkerPool("gpu-capable", spawn=4):
     result = await gpu_task()
 ```
 
@@ -138,11 +138,23 @@ async with wool.WorkerPool(discovery=wool.LanDiscovery()):
 **Hybrid** — spawn local workers and discover remote ones:
 
 ```python
-async with wool.WorkerPool(size=4, discovery=wool.LanDiscovery()):
+async with wool.WorkerPool(spawn=4, discovery=wool.LanDiscovery()):
     result = await my_routine()
 ```
 
-`size` controls how many workers are spawned by the pool — it does not cap the total number of workers available. In Hybrid mode, additional workers may join via discovery beyond the initial `size`.
+`spawn` controls how many workers the pool starts — it does not cap the total number of workers available. In Hybrid mode, additional workers may join via discovery beyond the initial `spawn`.
+
+`lease` caps how many additionally discovered workers the pool will admit. The total pool capacity is `spawn + lease` when both are set, or just `lease` for discovery-only pools. Defaults to `None` (unbounded). The lease count is a cap on admission, not a reservation — discovered workers may serve multiple pools simultaneously, and there is no guarantee that a leased slot will remain filled for the life of the pool.
+
+```python
+# Spawn 4 local workers, accept up to 4 more from discovery (8 total)
+async with wool.WorkerPool(spawn=4, lease=4, discovery=wool.LanDiscovery()):
+    result = await my_routine()
+
+# Durable pool capped at 10 discovered workers
+async with wool.WorkerPool(discovery=wool.LanDiscovery(), lease=10):
+    result = await my_routine()
+```
 
 ## Workers
 
@@ -177,7 +189,7 @@ Wool ships with `RoundRobinLoadBalancer` (the default), which maintains a per-co
 Custom load balancers are supported via structural subtyping — implement the `LoadBalancerLike` protocol and pass it to `WorkerPool`:
 
 ```python
-async with wool.WorkerPool(size=4, loadbalancer=my_balancer):
+async with wool.WorkerPool(spawn=4, loadbalancer=my_balancer):
     result = await my_routine()
 ```
 
@@ -217,7 +229,7 @@ options = WorkerOptions(
 )
 
 async with wool.WorkerPool(
-    size=4,
+    spawn=4,
     worker=lambda *tags, credentials=None: LocalWorker(
         *tags, credentials=credentials, options=options,
     ),
@@ -245,7 +257,7 @@ creds = wool.WorkerCredentials.from_files(
     mutual=True,
 )
 
-async with wool.WorkerPool(size=4, credentials=creds):
+async with wool.WorkerPool(spawn=4, credentials=creds):
     result = await my_routine()
 ```
 
@@ -293,13 +305,13 @@ sequenceDiagram
 
     %% -- 1. Pool startup --
     rect rgb(0, 0, 0, 0)
-        Note over Client, Discovery: Worker pool startup
+        Note over Client, Worker: Worker pool startup
 
-        Client ->> Pool: create pool (size, discovery, loadbalancer)
+        Client ->> Pool: create pool (spawn, discovery, loadbalancer)
         activate Client
-        Pool ->> Pool: resolve mode from size and discovery
+        Pool ->> Pool: resolve mode from spawn and discovery
 
-        opt If size specified, spawn ephemeral workers
+        opt If spawn specified, spawn ephemeral workers
             loop Per worker
                 Pool ->> Worker: spawn worker
                 Worker ->> Worker: start process, bind gRPC server
@@ -384,7 +396,7 @@ sequenceDiagram
 
     %% -- 4. Teardown --
     rect rgb(0, 0, 0, 0)
-        Note over Client, Discovery: Worker pool teardown
+        Note over Client, Worker: Worker pool teardown
 
         Client ->> Pool: exit pool
         activate Client

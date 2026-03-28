@@ -174,6 +174,9 @@ class WorkerProxy:
         Load balancer instance, factory, or context manager.
     :param credentials:
         Optional channel credentials for TLS/mTLS connections to workers.
+    :param lease:
+        Maximum number of workers this proxy will admit from discovery.
+        Defaults to ``None`` (unbounded).
 
     .. caution::
 
@@ -204,6 +207,7 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        lease: int | None = None,
     ): ...
 
     @overload
@@ -215,6 +219,7 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        lease: int | None = None,
     ): ...
 
     @overload
@@ -226,6 +231,7 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        lease: int | None = None,
     ): ...
 
     def __init__(
@@ -240,6 +246,7 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        lease: int | None = None,
     ):
         if not (pool_uri or discovery or workers):
             raise ValueError(
@@ -247,9 +254,13 @@ class WorkerProxy:
                 "sequence of workers"
             )
 
+        if lease is not None and lease < 1:
+            raise ValueError("Lease must be a positive, non-zero integer")
+
         self._id: uuid.UUID = uuid.uuid4()
         self._started = False
         self._loadbalancer = loadbalancer
+        self._lease = lease
 
         if isinstance(loadbalancer, (ContextManager, AsyncContextManager)):
             warnings.warn(
@@ -352,17 +363,23 @@ class WorkerProxy:
                     f"{name}=my_cm())."
                 )
 
-        def _restore_proxy(discovery, loadbalancer, proxy_id):
+        def _restore_proxy(discovery, loadbalancer, proxy_id, lease):
             proxy = WorkerProxy(
                 discovery=discovery,
                 loadbalancer=loadbalancer,
+                lease=lease,
             )
             proxy._id = proxy_id
             return proxy
 
         return (
             _restore_proxy,
-            (self._discovery, self._loadbalancer, self._id),
+            (
+                self._discovery,
+                self._loadbalancer,
+                self._id,
+                self._lease,
+            ),
         )
 
     @property
@@ -546,6 +563,12 @@ class WorkerProxy:
         async for event in self._discovery_stream:
             match event.type:
                 case "worker-added" | "worker-updated":
+                    if (
+                        event.type == "worker-added"
+                        and self._lease is not None
+                        and len(self._loadbalancer_context.workers) >= self._lease
+                    ):
+                        continue
                     connection = WorkerConnection(
                         event.metadata.address,
                         credentials=client_credentials,
@@ -553,7 +576,7 @@ class WorkerProxy:
                     )
                     if event.type == "worker-added":
                         self._loadbalancer_context.add_worker(event.metadata, connection)
-                    else:
+                    elif event.metadata in self._loadbalancer_context.workers:
                         self._loadbalancer_context.update_worker(
                             event.metadata, connection
                         )

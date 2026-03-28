@@ -6,8 +6,8 @@ Workers are the execution layer where `@wool.routine` calls actually run. Each w
 
 `WorkerPool` supports four configurations depending on which arguments are provided:
 
-| Mode | `size` | `discovery` | Behavior |
-| ---- | ------ | ----------- | -------- |
+| Mode | `spawn` | `discovery` | Behavior |
+| ---- | ------- | ----------- | -------- |
 | Default | omitted | omitted | Spawns `cpu_count` local workers with internal `LocalDiscovery`. |
 | Ephemeral | set | omitted | Spawns N local workers with internal `LocalDiscovery`. |
 | Durable | omitted | set | No workers spawned; connects to existing workers via discovery. |
@@ -27,7 +27,7 @@ async with wool.WorkerPool():
 ```python
 import wool
 
-async with wool.WorkerPool("gpu-capable", size=4):
+async with wool.WorkerPool("gpu-capable", spawn=4):
     result = await gpu_task()
 ```
 
@@ -45,11 +45,23 @@ async with wool.WorkerPool(discovery=wool.LanDiscovery()):
 ```python
 import wool
 
-async with wool.WorkerPool(size=4, discovery=wool.LanDiscovery()):
+async with wool.WorkerPool(spawn=4, discovery=wool.LanDiscovery()):
     result = await my_routine()
 ```
 
-*Note: `size` controls how many workers are spawned by the pool — it does not cap the total number of workers available. In Hybrid mode, additional workers may join via discovery beyond the initial `size`.*
+> `spawn` controls how many workers are spawned by the pool — it does not cap the total number of workers available. In Hybrid mode, additional workers may join via discovery beyond the initial `spawn`. The `lease` parameter caps how many additional discovered workers the pool will accept. The total pool capacity is `spawn + lease` when both are set. The lease count is a cap on admission, not a reservation — discovered workers may serve multiple pools simultaneously, and there is no guarantee that a leased slot will remain filled for the life of the pool:
+>
+> ```python
+> import wool
+>
+> # Spawn 4 local workers, accept up to 4 more from discovery (8 total)
+> async with wool.WorkerPool(spawn=4, lease=4, discovery=wool.LanDiscovery()):
+>     result = await my_routine()
+>
+> # Durable pool capped at 10 discovered workers
+> async with wool.WorkerPool(discovery=wool.LanDiscovery(), lease=10):
+>     result = await my_routine()
+> ```
 
 ## Worker lifecycle
 
@@ -145,7 +157,7 @@ import wool
 from functools import partial
 
 async with wool.WorkerPool(
-    size=4,
+    spawn=4,
     worker=partial(ResilientWorker, check_interval=10.0),
 ):
     result = await my_routine()
@@ -227,7 +239,7 @@ options = WorkerOptions(
 )
 
 async with wool.WorkerPool(
-    size=4,
+    spawn=4,
     worker=lambda *tags, credentials=None: LocalWorker(
         *tags, credentials=credentials, options=options,
     ),
@@ -265,7 +277,7 @@ creds = wool.WorkerCredentials.from_files(
     mutual=True,
 )
 
-async with wool.WorkerPool(size=4, credentials=creds):
+async with wool.WorkerPool(spawn=4, credentials=creds):
     result = await my_routine()
 ```
 

@@ -46,11 +46,11 @@ class TestWorkerPool:
     # Constructor Tests
     # =========================================================================
 
-    def test___init___uses_cpu_count_as_default_size(self, mocker: MockerFixture):
+    def test___init___uses_cpu_count_as_default_spawn(self, mocker: MockerFixture):
         """Test successfully create a pool using CPU count.
 
         Given:
-            No size parameter is provided and CPU count is available
+            No spawn parameter is provided and CPU count is available
         When:
             WorkerPool is initialized
         Then:
@@ -72,7 +72,7 @@ class TestWorkerPool:
         """Test raise ValueError with appropriate message.
 
         Given:
-            Os.cpu_count() returns None and size is set to 0
+            Os.cpu_count() returns None and spawn is set to 0
         When:
             WorkerPool is initialized
         Then:
@@ -83,17 +83,17 @@ class TestWorkerPool:
 
         # Act & assert
         with pytest.raises(ValueError, match="Unable to determine CPU count"):
-            WorkerPool(size=0)
+            WorkerPool(spawn=0)
 
         mock_cpu_count.assert_called_once()
 
-    def test___init___raises_error_when_cpu_count_unavailable_default_size(
+    def test___init___raises_error_when_cpu_count_unavailable_default_spawn(
         self, mocker: MockerFixture
     ):
         """Test raise ValueError indicating CPU count cannot be determined.
 
         Given:
-            A system where os.cpu_count() returns None and no size is specified
+            A system where os.cpu_count() returns None and no spawn is specified
         When:
             WorkerPool constructor is called with default parameters
         Then:
@@ -106,50 +106,214 @@ class TestWorkerPool:
         with pytest.raises(ValueError, match="Unable to determine CPU count"):
             WorkerPool()
 
-    def test___init___raises_error_with_negative_size(self):
+    def test___init___raises_error_with_negative_spawn(self):
         """Test raise ValueError with appropriate message.
 
         Given:
-            A negative size parameter
+            A negative spawn parameter
         When:
             WorkerPool is initialized
         Then:
             Should raise ValueError with appropriate message
         """
         # Arrange
-        invalid_size = -1
+        invalid_spawn = -1
 
         # Act & assert
-        with pytest.raises(ValueError, match="Size must be non-negative"):
-            WorkerPool(size=invalid_size)
+        with pytest.raises(ValueError, match="Spawn must be non-negative"):
+            WorkerPool(spawn=invalid_spawn)
 
-    def test___init___with_zero_size_and_available_cpu_count(
-        self, mocker: MockerFixture
-    ):
-        """Test use CPU count as the pool size.
+    def test___init___size_emits_deprecation_warning(self):
+        """Test deprecated size parameter emits DeprecationWarning.
 
         Given:
-            Size parameter of 0 and available CPU count
+            The deprecated 'size' parameter is passed
         When:
             WorkerPool is initialized
         Then:
-            Should use CPU count as the pool size
+            It should emit a DeprecationWarning
+        """
+        # Act & assert
+        with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
+            WorkerPool(size=4)
+
+    def test___init___spawn_does_not_emit_deprecation_warning(self):
+        """Test spawn parameter does not emit DeprecationWarning.
+
+        Given:
+            The 'spawn' parameter is passed
+        When:
+            WorkerPool is initialized
+        Then:
+            It should not emit a DeprecationWarning
+        """
+        # Arrange
+        import warnings
+
+        # Act & assert
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            WorkerPool(spawn=4)
+
+    def test___init___size_and_spawn_raises_type_error(self):
+        """Test passing both size and spawn raises TypeError.
+
+        Given:
+            Both 'size' and 'spawn' parameters are provided
+        When:
+            WorkerPool is initialized
+        Then:
+            It should raise a TypeError
+        """
+        # Act & assert
+        with pytest.raises(TypeError, match="Cannot specify both"):
+            WorkerPool(size=4, spawn=4)
+
+    def test___init___size_value_forwarded_to_spawn(self):
+        """Test deprecated size value is forwarded to spawn.
+
+        Given:
+            The deprecated 'size' parameter with value 4
+        When:
+            WorkerPool is initialized
+        Then:
+            It should create a valid pool identical to spawn=4
+        """
+        # Arrange
+        import warnings
+
+        # Act
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            pool = WorkerPool(size=4)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___size_negative_emits_warning_and_raises(self):
+        """Test deprecated size with negative value emits warning and raises.
+
+        Given:
+            The deprecated 'size' parameter with value -1
+        When:
+            WorkerPool is initialized
+        Then:
+            It should emit a DeprecationWarning and raise ValueError
+        """
+        # Act & assert
+        with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
+            with pytest.raises(ValueError, match="Spawn must be non-negative"):
+                WorkerPool(size=-1)
+
+    def test___init___size_zero_resolves_cpu_count(self, mocker: MockerFixture):
+        """Test deprecated size=0 resolves to CPU count.
+
+        Given:
+            The deprecated 'size' parameter with value 0 and CPU count available
+        When:
+            WorkerPool is initialized
+        Then:
+            It should emit a DeprecationWarning and create a valid pool
+        """
+        # Arrange
+        mocker.patch("os.cpu_count", return_value=4)
+
+        # Act
+        with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
+            pool = WorkerPool(size=0)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___size_with_discovery_creates_hybrid(self, mocker: MockerFixture):
+        """Test deprecated size with discovery creates hybrid pool.
+
+        Given:
+            The deprecated 'size' parameter and a discovery service
+        When:
+            WorkerPool is initialized
+        Then:
+            It should emit a DeprecationWarning and create a valid pool
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act
+        with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
+            pool = WorkerPool(size=2, discovery=mock_discovery)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___size_with_lease(self):
+        """Test deprecated size combined with lease.
+
+        Given:
+            The deprecated 'size' parameter with value 4 and lease of 8
+        When:
+            WorkerPool is initialized
+        Then:
+            It should emit a DeprecationWarning and create a valid pool
+        """
+        # Act
+        with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
+            pool = WorkerPool(size=4, lease=8)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___size_warns_at_caller_frame(self):
+        """Test deprecation warning points to the caller's frame.
+
+        Given:
+            The deprecated 'size' parameter is passed
+        When:
+            WorkerPool is initialized
+        Then:
+            It should emit a warning whose filename is the test file
+        """
+        # Arrange
+        import warnings
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", DeprecationWarning)
+            WorkerPool(size=4)
+
+        # Assert
+        deprecation_warnings = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecation_warnings) == 1
+        assert "test_pool.py" in deprecation_warnings[0].filename
+
+    def test___init___with_zero_spawn_and_available_cpu_count(
+        self, mocker: MockerFixture
+    ):
+        """Test use CPU count as the pool spawn count.
+
+        Given:
+            Spawn parameter of 0 and available CPU count
+        When:
+            WorkerPool is initialized
+        Then:
+            Should use CPU count as the pool spawn count
         """
         # Arrange
         mock_cpu_count = mocker.patch("os.cpu_count", return_value=8)
 
         # Act
-        pool = WorkerPool(size=0)
+        pool = WorkerPool(spawn=0)
 
         # Assert
         assert isinstance(pool, WorkerPool)
         mock_cpu_count.assert_called_once()
 
-    def test___init___accepts_tags_and_size_parameters(self):
+    def test___init___accepts_tags_and_spawn_parameters(self):
         """Test successfully create a pool with the specified configuration.
 
         Given:
-            Custom tags and size parameter
+            Custom tags and spawn parameter
         When:
             WorkerPool is initialized
         Then:
@@ -157,10 +321,10 @@ class TestWorkerPool:
         """
         # Arrange
         expected_tags = ("gpu-capable", "ml-model")
-        expected_size = 2
+        expected_spawn = 2
 
         # Act
-        pool = WorkerPool(*expected_tags, size=expected_size)
+        pool = WorkerPool(*expected_tags, spawn=expected_spawn)
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -176,7 +340,7 @@ class TestWorkerPool:
             Should create pool successfully
         """
         # Act
-        pool = WorkerPool(size=1)
+        pool = WorkerPool(spawn=1)
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -195,7 +359,7 @@ class TestWorkerPool:
         tags = ("gpu", "ml", "high-memory", "production")
 
         # Act
-        pool = WorkerPool(*tags, size=2)
+        pool = WorkerPool(*tags, spawn=2)
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -204,7 +368,7 @@ class TestWorkerPool:
         """Test accept the factory for later worker creation.
 
         Given:
-            A custom worker factory function and size
+            A custom worker factory function and spawn
         When:
             WorkerPool is initialized
         Then:
@@ -212,10 +376,10 @@ class TestWorkerPool:
         """
         # Arrange
         mock_worker_factory = mocker.MagicMock()
-        expected_size = 2
+        expected_spawn = 2
 
         # Act
-        pool = WorkerPool(size=expected_size, worker=mock_worker_factory)
+        pool = WorkerPool(spawn=expected_spawn, worker=mock_worker_factory)
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -267,7 +431,7 @@ class TestWorkerPool:
 
         # Act
         async with WorkerPool(
-            size=1, worker=spy_factory, credentials=worker_credentials
+            spawn=1, worker=spy_factory, credentials=worker_credentials
         ):
             pass
 
@@ -296,7 +460,7 @@ class TestWorkerPool:
         spy_factory.return_value = mock_worker
 
         # Act
-        async with WorkerPool(size=1, worker=spy_factory, credentials=None):
+        async with WorkerPool(spawn=1, worker=spy_factory, credentials=None):
             pass
 
         # Assert
@@ -323,7 +487,7 @@ class TestWorkerPool:
             It should pass WorkerCredentials to LocalWorker.
         """
         # Act
-        async with WorkerPool(size=1, credentials=worker_credentials):
+        async with WorkerPool(spawn=1, credentials=worker_credentials):
             pass
 
         # Assert
@@ -352,7 +516,7 @@ class TestWorkerPool:
         pool_instance = None
 
         # Act
-        async with WorkerPool(worker=mock_worker_factory, size=2) as pool:
+        async with WorkerPool(worker=mock_worker_factory, spawn=2) as pool:
             pool_instance = pool
             # Pool is started and ready
             assert pool is not None
@@ -378,7 +542,7 @@ class TestWorkerPool:
 
         # Act & assert
         try:
-            async with WorkerPool(worker=mock_worker_factory, size=2):
+            async with WorkerPool(worker=mock_worker_factory, spawn=2):
                 pool_created = True
                 # Simulate error in user code
                 raise ValueError("Test error")
@@ -408,7 +572,7 @@ class TestWorkerPool:
             It should return the WorkerPool instance and manage lifecycle correctly
         """
         # Act
-        async with WorkerPool(size=1) as returned_pool:
+        async with WorkerPool(spawn=1) as returned_pool:
             # Assert: Context manager entry
             assert returned_pool is not None
             assert isinstance(returned_pool, WorkerPool)
@@ -436,7 +600,7 @@ class TestWorkerPool:
         """
         # Act & assert
         with pytest.raises(ValueError, match="User error"):
-            async with WorkerPool(size=2) as pool:
+            async with WorkerPool(spawn=2) as pool:
                 assert pool is not None
                 raise ValueError("User error")
 
@@ -467,7 +631,7 @@ class TestWorkerPool:
 
         # Act & assert
         with pytest.raises(ExceptionGroup) as exc_info:
-            async with WorkerPool(worker=failing_factory, size=1):
+            async with WorkerPool(worker=failing_factory, spawn=1):
                 pass
 
         assert len(exc_info.value.exceptions) == 1
@@ -494,7 +658,7 @@ class TestWorkerPool:
         mock_shared_memory.unlink.side_effect = OSError("Cleanup failed")
 
         # Act & assert - Should not raise exception from cleanup
-        async with WorkerPool(size=1) as pool:
+        async with WorkerPool(spawn=1) as pool:
             assert pool is not None
 
         # Assert: Pool was created and cleanup was attempted
@@ -518,7 +682,7 @@ class TestWorkerPool:
         mock_worker_proxy.__aexit__ = mock_proxy_exit
 
         # Act - Should not raise exceptions despite cleanup failures
-        pool = WorkerPool(size=1)
+        pool = WorkerPool(spawn=1)
         try:
             async with pool:
                 pass
@@ -537,7 +701,7 @@ class TestWorkerPool:
         """Test execute the create_proxy function covering lines 238-246.
 
         Given:
-            WorkerPool called with default parameters (no size, no discovery)
+            WorkerPool called with default parameters (no spawn, no discovery)
         When:
             Context manager is entered (which calls _proxy_factory)
         Then:
@@ -553,49 +717,49 @@ class TestWorkerPool:
     # =========================================================================
 
     @pytest.mark.asyncio
-    async def test_start_creates_workers_size_3(self, mock_worker_factory):
+    async def test_start_creates_workers_spawn_3(self, mock_worker_factory):
         """Test the pool successfully starts and stops.
 
         Given:
-            A WorkerPool configured with size=3
+            A WorkerPool configured with spawn=3
         When:
             The pool is started via context manager
         Then:
             The pool successfully starts and stops
         """
         # Arrange, act, & assert
-        async with WorkerPool(worker=mock_worker_factory, size=3) as pool:
+        async with WorkerPool(worker=mock_worker_factory, spawn=3) as pool:
             # Pool started successfully - this validates workers were created
             assert pool is not None
 
     @pytest.mark.asyncio
-    async def test_start_with_specific_size_1(self, mock_worker_factory):
+    async def test_start_with_specific_spawn_1(self, mock_worker_factory):
         """Test 1 worker is created.
 
         Given:
-            A WorkerPool configured with size=1
+            A WorkerPool configured with spawn=1
         When:
             The pool is started
         Then:
             1 worker is created
         """
         # Arrange, act, & assert
-        async with WorkerPool(worker=mock_worker_factory, size=1) as pool:
+        async with WorkerPool(worker=mock_worker_factory, spawn=1) as pool:
             assert pool is not None
 
     @pytest.mark.asyncio
-    async def test_start_with_specific_size_10(self, mock_worker_factory):
+    async def test_start_with_specific_spawn_10(self, mock_worker_factory):
         """Test 10 workers are created.
 
         Given:
-            A WorkerPool configured with size=10
+            A WorkerPool configured with spawn=10
         When:
             The pool is started
         Then:
             10 workers are created
         """
         # Arrange, act, & assert
-        async with WorkerPool(worker=mock_worker_factory, size=10) as pool:
+        async with WorkerPool(worker=mock_worker_factory, spawn=10) as pool:
             assert pool is not None
 
     @pytest.mark.asyncio
@@ -620,7 +784,7 @@ class TestWorkerPool:
             worker.metadata = mocker.MagicMock()
             return worker
 
-        pool = WorkerPool(worker=failing_factory, size=1)
+        pool = WorkerPool(worker=failing_factory, spawn=1)
 
         # Act & assert
         with pytest.raises(ExceptionGroup) as exc_info:
@@ -635,7 +799,7 @@ class TestWorkerPool:
         """Test multiple spawn failures raise ExceptionGroup.
 
         Given:
-            A WorkerPool with size=3 where all workers fail to start
+            A WorkerPool with spawn=3 where all workers fail to start
         When:
             The pool is used as async context manager
         Then:
@@ -652,7 +816,7 @@ class TestWorkerPool:
             worker.metadata = mocker.MagicMock()
             return worker
 
-        pool = WorkerPool(worker=failing_factory, size=3)
+        pool = WorkerPool(worker=failing_factory, spawn=3)
 
         # Act & assert
         with pytest.raises(ExceptionGroup) as exc_info:
@@ -666,7 +830,7 @@ class TestWorkerPool:
         """Test partial spawn failure raises ExceptionGroup with single error.
 
         Given:
-            A WorkerPool with size=3 where 1 of 3 workers fails to start
+            A WorkerPool with spawn=3 where 1 of 3 workers fails to start
         When:
             The pool is used as async context manager
         Then:
@@ -690,7 +854,7 @@ class TestWorkerPool:
             worker.metadata = _make_worker_metadata()
             return worker
 
-        pool = WorkerPool(worker=mixed_factory, size=3)
+        pool = WorkerPool(worker=mixed_factory, spawn=3)
 
         # Act & assert
         with pytest.raises(ExceptionGroup) as exc_info:
@@ -712,7 +876,7 @@ class TestWorkerPool:
             All workers are terminated
         """
         # Arrange & Act
-        async with WorkerPool(worker=mock_worker_factory, size=2) as pool:
+        async with WorkerPool(worker=mock_worker_factory, spawn=2) as pool:
             # Pool is running
             assert pool is not None
 
@@ -736,7 +900,7 @@ class TestWorkerPool:
             Should start and clean up successfully
         """
         # Act & assert - Context manager should complete without error
-        async with WorkerPool(size=3) as pool:
+        async with WorkerPool(spawn=3) as pool:
             assert pool is not None
             assert isinstance(pool, WorkerPool)
 
@@ -760,7 +924,7 @@ class TestWorkerPool:
             Pool context manager should complete successfully
         """
         # Act
-        async with WorkerPool(size=2) as pool:
+        async with WorkerPool(spawn=2) as pool:
             assert pool is not None
             # Pool successfully started and workers are initialized
             assert isinstance(pool, WorkerPool)
@@ -783,7 +947,7 @@ class TestWorkerPool:
             Pool context manager should complete successfully
         """
         # Act
-        async with WorkerPool(size=2) as pool:
+        async with WorkerPool(spawn=2) as pool:
             assert pool is not None
             # Pool successfully started - workers have been configured
             assert isinstance(pool, WorkerPool)
@@ -819,7 +983,7 @@ class TestWorkerPool:
             return cast(LocalWorker, custom_worker)
 
         # Act
-        async with WorkerPool(size=1, worker=custom_factory) as pool:
+        async with WorkerPool(spawn=1, worker=custom_factory) as pool:
             assert pool is not None
 
         # Assert: Custom worker was used
@@ -871,7 +1035,7 @@ class TestWorkerPool:
         custom_loadbalancer = mocker.MagicMock()
 
         # Act
-        async with WorkerPool(size=1, loadbalancer=custom_loadbalancer) as pool:
+        async with WorkerPool(spawn=1, loadbalancer=custom_loadbalancer) as pool:
             assert pool is not None
 
         # Assert: Pool was created successfully
@@ -893,7 +1057,7 @@ class TestWorkerPool:
             The pool handles concurrent operations correctly
         """
         # Arrange
-        pool = WorkerPool(worker=mock_worker_factory, size=2)
+        pool = WorkerPool(worker=mock_worker_factory, spawn=2)
 
         # Act - Start pool
         async with pool:
@@ -924,7 +1088,7 @@ class TestWorkerPool:
         mock_local_worker.start = mocker.AsyncMock()
 
         # Act
-        async with WorkerPool(size=3) as pool:
+        async with WorkerPool(spawn=3) as pool:
             assert pool is not None
             # Simulate concurrent operations
             tasks = [mock_local_worker.start() for _ in range(3)]
@@ -957,7 +1121,7 @@ class TestWorkerPool:
             worker.metadata = mocker.MagicMock()
             return worker
 
-        pool = WorkerPool(worker=slow_factory, size=1)
+        pool = WorkerPool(worker=slow_factory, spawn=1)
 
         # Act & assert - with a 1 second timeout
         with pytest.raises(asyncio.TimeoutError):
@@ -986,7 +1150,7 @@ class TestWorkerPool:
         start_time = time.time()
 
         # Act
-        async with WorkerPool(size=2) as pool:
+        async with WorkerPool(spawn=2) as pool:
             end_time = time.time()
             assert pool is not None
 
@@ -999,7 +1163,7 @@ class TestWorkerPool:
     # =========================================================================
 
     @pytest.mark.asyncio
-    async def test_hybrid_mode_size_and_discovery(
+    async def test_hybrid_mode_spawn_and_discovery(
         self,
         mock_shared_memory,
         mock_worker_proxy,
@@ -1009,17 +1173,17 @@ class TestWorkerPool:
         """Test spawn local workers and connect to discovery.
 
         Given:
-            A WorkerPool configured with both size and discovery (hybrid mode)
+            A WorkerPool configured with both spawn and discovery (hybrid mode)
         When:
             Pool is started
         Then:
             Should spawn local workers and connect to discovery
         """
-        # Arrange - This tests the (size, discovery) case at line 223
+        # Arrange - This tests the (spawn, discovery) case at line 223
         discovery_service = mock_discovery_service_for_pool
 
         # Act
-        async with WorkerPool(size=2, discovery=discovery_service) as pool:
+        async with WorkerPool(spawn=2, discovery=discovery_service) as pool:
             assert pool is not None
 
         # Assert: Pool created successfully with both local workers and discovery
@@ -1027,7 +1191,7 @@ class TestWorkerPool:
         mock_worker_proxy.__aexit__.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_hybrid_mode_size_zero_with_discovery(
+    async def test_hybrid_mode_spawn_zero_with_discovery(
         self,
         mocker: MockerFixture,
         mock_shared_memory,
@@ -1035,21 +1199,21 @@ class TestWorkerPool:
         mock_local_worker,
         mock_discovery_service_for_pool,
     ):
-        """Test use CPU count for worker size.
+        """Test use CPU count for worker spawn count.
 
         Given:
-            A WorkerPool configured with size=0 and discovery (hybrid mode)
+            A WorkerPool configured with spawn=0 and discovery (hybrid mode)
         When:
             Pool is started
         Then:
-            Should use CPU count for worker size
+            Should use CPU count for worker spawn count
         """
         # Arrange
         mocker.patch("os.cpu_count", return_value=4)
         discovery_service = mock_discovery_service_for_pool
 
         # Act
-        async with WorkerPool(size=0, discovery=discovery_service) as pool:
+        async with WorkerPool(spawn=0, discovery=discovery_service) as pool:
             assert pool is not None
 
         # Assert: Pool created with CPU count workers
@@ -1087,14 +1251,14 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
     ):
-        """Test use CPU count as default size.
+        """Test use CPU count as default spawn count.
 
         Given:
-            A WorkerPool with no size or discovery specified
+            A WorkerPool with no spawn or discovery specified
         When:
             Pool is started
         Then:
-            Should use CPU count as default size
+            Should use CPU count as default spawn count
         """
         # Arrange - This tests the (None, None) case at line 297
         mocker.patch("os.cpu_count", return_value=8)
@@ -1107,7 +1271,7 @@ class TestWorkerPool:
         mock_worker_proxy.__aenter__.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_ephemeral_mode_size_only(
+    async def test_ephemeral_mode_spawn_only(
         self,
         mock_shared_memory,
         mock_worker_proxy,
@@ -1116,44 +1280,44 @@ class TestWorkerPool:
         """Test spawn local workers with LocalDiscovery.
 
         Given:
-            A WorkerPool configured with size only (ephemeral mode)
+            A WorkerPool configured with spawn only (ephemeral mode)
         When:
             Pool is started
         Then:
             Should spawn local workers with LocalDiscovery
         """
-        # Arrange - This tests the (size, None) case at line 255
+        # Arrange - This tests the (spawn, None) case at line 255
         # This is the most common mode already tested extensively
 
         # Act
-        async with WorkerPool(size=3) as pool:
+        async with WorkerPool(spawn=3) as pool:
             assert pool is not None
 
         # Assert: Pool created successfully
         mock_worker_proxy.__aenter__.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_ephemeral_mode_size_zero_uses_cpu_count(
+    async def test_ephemeral_mode_spawn_zero_uses_cpu_count(
         self,
         mocker: MockerFixture,
         mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
-        """Test use CPU count for worker size.
+        """Test use CPU count for worker spawn count.
 
         Given:
-            A WorkerPool configured with size=0 (ephemeral mode)
+            A WorkerPool configured with spawn=0 (ephemeral mode)
         When:
             Pool is started
         Then:
-            Should use CPU count for worker size
+            Should use CPU count for worker spawn count
         """
-        # Arrange - Tests size=0 path at line 256
+        # Arrange - Tests spawn=0 path at line 256
         mocker.patch("os.cpu_count", return_value=6)
 
         # Act
-        async with WorkerPool(size=0) as pool:
+        async with WorkerPool(spawn=0) as pool:
             assert pool is not None
 
         # Assert: Pool created with CPU count workers
@@ -1170,7 +1334,7 @@ class TestWorkerPool:
         """Test pass tags to workers and discovery filtering.
 
         Given:
-            A WorkerPool with tags, size, and discovery
+            A WorkerPool with tags, spawn, and discovery
         When:
             Pool is started
         Then:
@@ -1181,7 +1345,7 @@ class TestWorkerPool:
         tags = ("gpu", "ml-model")
 
         # Act
-        async with WorkerPool(*tags, size=2, discovery=discovery_service) as pool:
+        async with WorkerPool(*tags, spawn=2, discovery=discovery_service) as pool:
             assert pool is not None
 
         # Assert: Pool created successfully with tags
@@ -1199,7 +1363,7 @@ class TestWorkerPool:
         """Test use custom loadbalancer.
 
         Given:
-            A WorkerPool with size, discovery, and custom loadbalancer
+            A WorkerPool with spawn, discovery, and custom loadbalancer
         When:
             Pool is started
         Then:
@@ -1211,7 +1375,7 @@ class TestWorkerPool:
 
         # Act
         async with WorkerPool(
-            size=2, discovery=discovery_service, loadbalancer=custom_lb
+            spawn=2, discovery=discovery_service, loadbalancer=custom_lb
         ) as pool:
             assert pool is not None
 
@@ -1257,7 +1421,7 @@ class TestWorkerPool:
         """Test raise TypeError.
 
         Given:
-            A WorkerPool with size and invalid discovery (not DiscoveryLike)
+            A WorkerPool with spawn and invalid discovery (not DiscoveryLike)
         When:
             Pool is started
         Then:
@@ -1279,17 +1443,17 @@ class TestWorkerPool:
 
         # Act & assert - This tests line 212 (TypeError)
         with pytest.raises(TypeError, match="Expected DiscoveryLike"):
-            async with WorkerPool(size=2, discovery=invalid_discovery):
+            async with WorkerPool(spawn=2, discovery=invalid_discovery):
                 pass
 
     @pytest.mark.asyncio
-    async def test_hybrid_mode_negative_size_raises_error(
+    async def test_hybrid_mode_negative_spawn_raises_error(
         self, mock_discovery_service_for_pool
     ):
         """Test raise ValueError.
 
         Given:
-            A WorkerPool with negative size and discovery (hybrid mode)
+            A WorkerPool with negative spawn and discovery (hybrid mode)
         When:
             Pool is created
         Then:
@@ -1299,16 +1463,16 @@ class TestWorkerPool:
         discovery_service = mock_discovery_service_for_pool
 
         # Act & assert - This tests line 230
-        with pytest.raises(ValueError, match="Size must be non-negative"):
-            WorkerPool(size=-1, discovery=discovery_service)
+        with pytest.raises(ValueError, match="Spawn must be non-negative"):
+            WorkerPool(spawn=-1, discovery=discovery_service)
 
-    def test_hybrid_mode_cpu_count_unavailable_with_size_zero(
+    def test_hybrid_mode_cpu_count_unavailable_with_spawn_zero(
         self, mocker: MockerFixture
     ):
         """Test raise ValueError.
 
         Given:
-            A WorkerPool with size=0 and discovery when CPU count unavailable
+            A WorkerPool with spawn=0 and discovery when CPU count unavailable
         When:
             Pool is created
         Then:
@@ -1320,68 +1484,68 @@ class TestWorkerPool:
 
         # Act & assert - This tests line 227
         with pytest.raises(ValueError, match="Unable to determine CPU count"):
-            WorkerPool(size=0, discovery=discovery_service)
+            WorkerPool(spawn=0, discovery=discovery_service)
 
     # =========================================================================
     # Property-Based Tests
     # =========================================================================
 
     @given(st.integers(min_value=1, max_value=10))
-    def test___init___accepts_valid_sizes(self, size):
+    def test___init___accepts_valid_spawns(self, spawn):
         """Test create pool successfully.
 
         Given:
-            Any valid size between 1 and 10
+            Any valid spawn between 1 and 10
         When:
-            WorkerPool is initialized with that size
+            WorkerPool is initialized with that spawn
         Then:
             Should create pool successfully
         """
         # Act
-        pool = WorkerPool(size=size)
+        pool = WorkerPool(spawn=spawn)
 
         # Assert
         assert isinstance(pool, WorkerPool)
 
     @given(st.integers(min_value=-100, max_value=-1))
-    def test___init___rejects_negative_sizes(self, negative_size):
+    def test___init___rejects_negative_spawns(self, negative_spawn):
         """Test raise ValueError.
 
         Given:
-            Any negative size
+            Any negative spawn
         When:
-            WorkerPool is initialized with that size
+            WorkerPool is initialized with that spawn
         Then:
             Should raise ValueError
         """
         # Act & assert
-        with pytest.raises(ValueError, match="Size must be non-negative"):
-            WorkerPool(size=negative_size)
+        with pytest.raises(ValueError, match="Spawn must be non-negative"):
+            WorkerPool(spawn=negative_spawn)
 
-    @given(size=st.integers(min_value=1, max_value=20))
+    @given(spawn=st.integers(min_value=1, max_value=20))
     @settings(
         max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
     )
     @pytest.mark.asyncio
-    async def test_property_worker_count_bounded(self, mock_worker_factory, size):
-        """Test the number of workers is exactly the configured size.
+    async def test_property_worker_count_bounded(self, mock_worker_factory, spawn):
+        """Test the number of workers is exactly the configured spawn count.
 
         Given:
-            A WorkerPool with any size from 1 to 20
+            A WorkerPool with any spawn from 1 to 20
         When:
             The pool is started
         Then:
-            The number of workers is exactly the configured size
+            The number of workers is exactly the configured spawn count
         """
         # Arrange
-        pool = WorkerPool(worker=mock_worker_factory, size=size)
+        pool = WorkerPool(worker=mock_worker_factory, spawn=spawn)
 
         # Act
         async with pool:
             # Pool is running with expected worker count
             pass
 
-        # Assert - invariant holds across all pool sizes
+        # Assert - invariant holds across all pool spawn counts
 
     @given(tags=st.lists(st.text(min_size=1, max_size=10), min_size=0, max_size=5))
     @settings(
@@ -1399,7 +1563,7 @@ class TestWorkerPool:
             The tags are preserved throughout the worker lifecycle
         """
         # Arrange
-        pool = WorkerPool(*tags, worker=mock_worker_factory, size=2)
+        pool = WorkerPool(*tags, worker=mock_worker_factory, spawn=2)
 
         # Act
         async with pool:
@@ -1408,23 +1572,23 @@ class TestWorkerPool:
 
         # Assert - tags immutability invariant holds
 
-    @given(size=st.integers(min_value=1, max_value=10))
+    @given(spawn=st.integers(min_value=1, max_value=10))
     @settings(
         max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
     )
     @pytest.mark.asyncio
-    async def test_property_cleanup_complete(self, mock_worker_factory, size):
+    async def test_property_cleanup_complete(self, mock_worker_factory, spawn):
         """Test all workers are stopped and resources cleaned up.
 
         Given:
-            A WorkerPool of any size
+            A WorkerPool of any spawn count
         When:
             The pool is stopped
         Then:
             All workers are stopped and resources cleaned up
         """
         # Arrange
-        pool = WorkerPool(worker=mock_worker_factory, size=size)
+        pool = WorkerPool(worker=mock_worker_factory, spawn=spawn)
         cleanup_completed = False
 
         # Act
@@ -1433,10 +1597,10 @@ class TestWorkerPool:
         cleanup_completed = True
 
         # Assert - cleanup completes without errors, confirming resource release
-        assert cleanup_completed, f"Cleanup should complete for pool of size {size}"
+        assert cleanup_completed, f"Cleanup should complete for pool of spawn {spawn}"
 
     @given(
-        size=st.integers(min_value=1, max_value=5),
+        spawn=st.integers(min_value=1, max_value=5),
         tags=st.lists(st.text(min_size=1, max_size=8), min_size=1, max_size=3),
     )
     @settings(
@@ -1444,19 +1608,19 @@ class TestWorkerPool:
     )
     @pytest.mark.asyncio
     async def test_property_context_manager_idempotency(
-        self, mock_worker_factory, size, tags
+        self, mock_worker_factory, spawn, tags
     ):
         """Test lifecycle completes successfully regardless of configuration.
 
         Given:
-            A WorkerPool with various size and tag configurations
+            A WorkerPool with various spawn and tag configurations
         When:
             The pool is used as a context manager
         Then:
             Lifecycle completes successfully regardless of configuration
         """
         # Arrange
-        pool = WorkerPool(*tags, worker=mock_worker_factory, size=size)
+        pool = WorkerPool(*tags, worker=mock_worker_factory, spawn=spawn)
         entered = False
         exited = False
 
@@ -1494,7 +1658,7 @@ class TestWorkerPool:
 
         # Act
         try:
-            async with WorkerPool(worker=mock_worker_factory, size=1):
+            async with WorkerPool(worker=mock_worker_factory, spawn=1):
                 raise exception_type(exception_message)
         except Exception as e:
             caught_exception = e
@@ -1695,7 +1859,7 @@ class TestWorkerPool:
         mock_proxy.__aexit__ = mocker.AsyncMock()
         mocker.patch("wool.runtime.worker.pool.WorkerProxy", return_value=mock_proxy)
 
-        pool = WorkerPool(size=1)
+        pool = WorkerPool(spawn=1)
 
         # Act & assert
         with pytest.raises(ValueError):
@@ -1725,7 +1889,7 @@ class TestWorkerPool:
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
         )
-        pool = WorkerPool(worker=mock_worker_factory, size=1)
+        pool = WorkerPool(worker=mock_worker_factory, spawn=1)
 
         # Act
         async with pool:
@@ -1735,3 +1899,296 @@ class TestWorkerPool:
         mock_proxy_cls.assert_called_once()
         _, proxy_kwargs = mock_proxy_cls.call_args
         assert "options" not in proxy_kwargs
+
+    def test___init___with_lease(self):
+        """Test instantiation with spawn and lease.
+
+        Given:
+            A spawn of 4 and lease of 8
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, lease=8)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_lease_and_no_spawn(self, mocker: MockerFixture):
+        """Test lease without spawn in durable mode.
+
+        Given:
+            A discovery service and lease of 8 with no spawn specified
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act
+        pool = WorkerPool(discovery=mock_discovery, lease=8)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_zero_lease_and_spawn(self):
+        """Test zero lease with spawn is accepted.
+
+        Given:
+            A spawn of 4 and lease of 0
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, lease=0)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_zero_lease_discovery_only(self, mocker: MockerFixture):
+        """Test zero lease with discovery-only pool is rejected.
+
+        Given:
+            A discovery service and lease of 0 with no spawn
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Lease must be positive for discovery-only pools",
+        ):
+            WorkerPool(discovery=mock_discovery, lease=0)
+
+    def test___init___with_negative_lease(self):
+        """Test negative lease is rejected.
+
+        Given:
+            A negative lease value
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Lease must be non-negative"):
+            WorkerPool(spawn=4, lease=-1)
+
+    @pytest.mark.asyncio
+    async def test___aenter___hybrid_mode_forwards_lease(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_discovery_service_for_pool,
+    ):
+        """Test hybrid mode forwards lease to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2, lease=4, and discovery
+        When:
+            The pool context is entered
+        Then:
+            It should pass lease=6 (spawn + lease) to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+        discovery_service = mock_discovery_service_for_pool
+
+        # Act
+        async with WorkerPool(spawn=2, lease=4, discovery=discovery_service):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["lease"] == 6  # spawn(2) + lease(4)
+
+    @pytest.mark.asyncio
+    async def test___aenter___ephemeral_mode_forwards_lease(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test ephemeral mode forwards lease to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and lease=4 without discovery
+        When:
+            The pool context is entered
+        Then:
+            It should pass lease=6 (spawn + lease) to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2, lease=4):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["lease"] == 6  # spawn(2) + lease(4)
+
+    @pytest.mark.asyncio
+    async def test___aenter___durable_mode_forwards_lease(
+        self,
+        mocker: MockerFixture,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test durable mode forwards lease to WorkerProxy.
+
+        Given:
+            A WorkerPool with discovery only and lease=6
+        When:
+            The pool context is entered
+        Then:
+            It should pass lease=6 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+        discovery_service = mock_discovery_service_for_pool
+
+        # Act
+        async with WorkerPool(discovery=discovery_service, lease=6):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["lease"] == 6
+
+    @pytest.mark.asyncio
+    async def test___aenter___no_lease_forwards_none(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test no lease forwards lease=None to WorkerProxy.
+
+        Given:
+            A WorkerPool with plain int spawn and no lease
+        When:
+            The pool context is entered
+        Then:
+            It should pass lease=None to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["lease"] is None
+
+    @pytest.mark.asyncio
+    async def test___aenter___default_mode_forwards_lease(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test default mode forwards spawn + lease to WorkerProxy.
+
+        Given:
+            A WorkerPool with no explicit spawn or discovery and lease=4
+        When:
+            The pool context is entered
+        Then:
+            It should pass lease=cpu_count + 4 to WorkerProxy
+        """
+        # Arrange
+        import os
+
+        import wool.runtime.worker.pool as wp
+
+        mocker.patch.object(os, "cpu_count", return_value=2)
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(lease=4):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["lease"] == 6  # cpu_count(2) + lease(4)
+
+    @given(
+        spawn=st.integers(min_value=1, max_value=20),
+        lease=st.integers(min_value=0, max_value=20),
+    )
+    def test___init___accepts_valid_spawn_and_lease(self, spawn, lease):
+        """Test valid spawn and lease combinations are accepted.
+
+        Given:
+            Any positive spawn and any non-negative lease
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=spawn, lease=lease)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    @given(lease=st.integers(min_value=-100, max_value=-1))
+    def test___init___rejects_negative_lease_pbt(self, lease):
+        """Test negative lease values are rejected.
+
+        Given:
+            Any negative lease value
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Lease must be non-negative",
+        ):
+            WorkerPool(spawn=1, lease=lease)

@@ -4,6 +4,7 @@ import asyncio
 import os
 import sys
 import uuid
+import warnings
 from contextlib import asynccontextmanager
 from typing import AsyncContextManager
 from typing import Awaitable
@@ -11,6 +12,8 @@ from typing import ContextManager
 from typing import Coroutine
 from typing import Final
 from typing import overload
+
+from typing_extensions import deprecated
 
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
@@ -59,7 +62,7 @@ class WorkerPool:
 
     .. code-block:: python
 
-        async with WorkerPool("gpu-capable", size=4):
+        async with WorkerPool("gpu-capable", spawn=4):
             result = await gpu_task()
 
     **Custom worker factory:**
@@ -70,7 +73,7 @@ class WorkerPool:
 
         worker_factory = partial(LocalWorker, host="0.0.0.0")
 
-        async with WorkerPool(size=8, worker=worker_factory):
+        async with WorkerPool(spawn=8, worker=worker_factory):
             result = await task()
 
     **Durable pool:**
@@ -95,7 +98,7 @@ class WorkerPool:
     .. code-block:: python
 
         # Spawn local workers AND discover remote workers
-        async with WorkerPool(size=4, discovery=LanDiscovery()):
+        async with WorkerPool(spawn=4, discovery=LanDiscovery()):
             result = await task()
 
     **Custom load balancer:**
@@ -135,8 +138,15 @@ class WorkerPool:
 
     :param tags:
         Capability tags for spawned workers.
-    :param size:
+    :param spawn:
         Number of workers to spawn (0 = CPU count).
+    :param size:
+        .. deprecated::
+            Use ``spawn`` instead. Will be removed in the next major release.
+    :param lease:
+        Maximum number of additionally discovered workers to admit to the pool.
+        The total pool capacity is ``spawn + lease`` when both are set, or just
+        ``lease`` for external pools. Defaults to ``None`` (unbounded).
     :param worker:
         Worker factory callable. Defaults to :class:`LocalWorker`.
     :param loadbalancer:
@@ -162,7 +172,8 @@ class WorkerPool:
     def __init__(
         self,
         *tags: str,
-        size: int = 0,
+        spawn: int = 0,
+        lease: int | None = None,
         worker: WorkerFactory = LocalWorker,
         discovery: None = None,
         loadbalancer: (
@@ -180,6 +191,7 @@ class WorkerPool:
     def __init__(
         self,
         *,
+        lease: int | None = None,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
@@ -196,7 +208,8 @@ class WorkerPool:
     def __init__(
         self,
         *tags: str,
-        size: int = 0,
+        spawn: int = 0,
+        lease: int | None = None,
         worker: WorkerFactory = LocalWorker,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
@@ -210,10 +223,42 @@ class WorkerPool:
         """
         ...
 
+    @overload
+    @deprecated("Use 'spawn' instead of 'size'.")
     def __init__(
         self,
         *tags: str,
+        size: int,
+        lease: int | None = None,
+        worker: WorkerFactory = LocalWorker,
+        discovery: None = None,
+        loadbalancer: (
+            LoadBalancerLike | Factory[LoadBalancerLike]
+        ) = RoundRobinLoadBalancer,
+        credentials: WorkerCredentials | None = None,
+    ): ...
+
+    @overload
+    @deprecated("Use 'spawn' instead of 'size'.")
+    def __init__(
+        self,
+        *tags: str,
+        size: int,
+        lease: int | None = None,
+        worker: WorkerFactory = LocalWorker,
+        discovery: DiscoveryLike | Factory[DiscoveryLike],
+        loadbalancer: (
+            LoadBalancerLike | Factory[LoadBalancerLike]
+        ) = RoundRobinLoadBalancer,
+        credentials: WorkerCredentials | None = None,
+    ): ...
+
+    def __init__(
+        self,
+        *tags: str,
+        spawn: int | None = None,
         size: int | None = None,
+        lease: int | None = None,
         worker: WorkerFactory | None = None,
         discovery: DiscoveryLike | Factory[DiscoveryLike] | None = None,
         loadbalancer: (
@@ -224,15 +269,26 @@ class WorkerPool:
         self._workers = {}
         self._credentials = credentials
 
-        match (size, discovery):
-            case (size, discovery) if size is not None and discovery is not None:
-                if size == 0:
-                    cpu_count = os.cpu_count()
-                    if cpu_count is None:
-                        raise ValueError("Unable to determine CPU count")
-                    size = cpu_count
-                elif size < 0:
-                    raise ValueError("Size must be non-negative")
+        if size is not None and spawn is not None:
+            raise TypeError(
+                "Cannot specify both 'spawn' and 'size'. "
+                "Use 'spawn' instead — 'size' is deprecated."
+            )
+        if size is not None:
+            warnings.warn(
+                "The 'size' parameter is deprecated. Use 'spawn' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            spawn = size
+
+        if lease is not None and lease < 0:
+            raise ValueError("Lease must be non-negative")
+
+        match (spawn, discovery):
+            case (spawn, discovery) if spawn is not None and discovery is not None:
+                spawn = _resolve_spawn(spawn)
+                max_workers = spawn + lease if lease is not None else None
 
                 @asynccontextmanager
                 async def create_proxy():
@@ -245,7 +301,7 @@ class WorkerPool:
                     try:
                         async with self._worker_context(
                             *tags,
-                            size=size,
+                            spawn=spawn,
                             factory=worker,
                             publisher=discovery_svc.publisher,
                         ):
@@ -253,19 +309,15 @@ class WorkerPool:
                                 discovery=discovery_svc.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
+                                lease=max_workers,
                             ):
                                 yield
                     finally:
                         await self._exit_context(discovery_ctx)
 
-            case (size, None) if size is not None:
-                if size == 0:
-                    cpu_count = os.cpu_count()
-                    if cpu_count is None:
-                        raise ValueError("Unable to determine CPU count")
-                    size = cpu_count
-                elif size < 0:
-                    raise ValueError("Size must be non-negative")
+            case (spawn, None) if spawn is not None:
+                spawn = _resolve_spawn(spawn)
+                max_workers = spawn + lease if lease is not None else None
 
                 namespace = f"pool-{uuid.uuid4().hex}"
 
@@ -274,7 +326,7 @@ class WorkerPool:
                     with LocalDiscovery(namespace) as discovery:
                         async with self._worker_context(
                             *tags,
-                            size=size,
+                            spawn=spawn,
                             factory=worker,
                             publisher=discovery.publisher,
                         ):
@@ -282,10 +334,13 @@ class WorkerPool:
                                 discovery=discovery.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
+                                lease=max_workers,
                             ):
                                 yield
 
             case (None, discovery) if discovery is not None:
+                if lease is not None and lease == 0:
+                    raise ValueError("Lease must be positive for discovery-only pools")
 
                 @asynccontextmanager
                 async def create_proxy():
@@ -297,16 +352,15 @@ class WorkerPool:
                             discovery=discovery_svc.subscriber,
                             loadbalancer=loadbalancer,
                             credentials=self._credentials,
+                            lease=lease,
                         ):
                             yield
                     finally:
                         await self._exit_context(discovery_ctx)
 
             case (None, None):
-                cpu_count = os.cpu_count()
-                if cpu_count is None:
-                    raise ValueError("Unable to determine CPU count")
-                size = cpu_count
+                spawn = _resolve_spawn(0)
+                max_workers = spawn + lease if lease is not None else None
 
                 namespace = f"pool-{uuid.uuid4().hex}"
 
@@ -315,7 +369,7 @@ class WorkerPool:
                     with LocalDiscovery(namespace) as discovery:
                         async with self._worker_context(
                             *tags,
-                            size=size,
+                            spawn=spawn,
                             factory=worker,
                             publisher=discovery.publisher,
                         ):
@@ -323,6 +377,7 @@ class WorkerPool:
                                 discovery=discovery.subscriber,
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
+                                lease=max_workers,
                             ):
                                 yield
 
@@ -352,7 +407,7 @@ class WorkerPool:
     async def _worker_context(
         self,
         *tags: str,
-        size: int,
+        spawn: int,
         factory: WorkerFactory | None,
         publisher: DiscoveryPublisherLike,
     ):
@@ -363,7 +418,7 @@ class WorkerPool:
             raise ValueError
 
         tasks = []
-        for _ in range(size):
+        for _ in range(spawn):
             worker = factory(*tags, credentials=self._credentials)
 
             async def start(worker):
@@ -415,6 +470,17 @@ class WorkerPool:
             await ctx.__aexit__(*sys.exc_info())
         elif isinstance(ctx, ContextManager):
             ctx.__exit__(*sys.exc_info())
+
+
+def _resolve_spawn(spawn: int) -> int:
+    if spawn == 0:
+        cpu_count = os.cpu_count()
+        if cpu_count is None:
+            raise ValueError("Unable to determine CPU count")
+        spawn = cpu_count
+    elif spawn < 0:
+        raise ValueError("Spawn must be non-negative")
+    return spawn
 
 
 def _predicate(tags):
