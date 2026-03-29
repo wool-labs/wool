@@ -12,6 +12,7 @@ import tempfile
 import uuid
 from contextlib import contextmanager
 from functools import partial
+from functools import wraps
 from multiprocessing.connection import Connection
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -390,17 +391,29 @@ def _sigint_handler(loop, service, signum, frame):
 async def _proxy_factory(proxy: WorkerProxy):
     """Factory function for WorkerProxy instances in ResourcePool.
 
-    Starts the proxy if not already started and returns it.
-    The proxy object itself is used as the cache key.
+    Wraps the proxy's dispatch method with a lazy-start closure so
+    that discovery subscription and sentinel setup are deferred until
+    a nested routine actually dispatches. The proxy object itself is
+    used as the cache key.
 
     :param proxy:
-        The WorkerProxy instance to start (passed as key from
+        The WorkerProxy instance to prepare (passed as key from
         ResourcePool).
     :returns:
-        The started WorkerProxy instance.
+        The WorkerProxy instance with lazy-start dispatch.
     """
-    if not proxy.started:
-        await proxy.start()
+    dispatch = proxy.dispatch
+    lock = asyncio.Lock()
+
+    @wraps(dispatch)
+    async def lazy_dispatch(*args, **kwargs):
+        if not proxy.started:
+            async with lock:
+                if not proxy.started:
+                    await proxy.start()
+        return await dispatch(*args, **kwargs)
+
+    proxy.dispatch = lazy_dispatch
     return proxy
 
 
@@ -408,12 +421,14 @@ async def _proxy_finalizer(proxy: WorkerProxy):
     """Finalizer function for WorkerProxy instances in ResourcePool.
 
     Stops the proxy when it's being cleaned up from the resource pool.
-    Based on the cleanup logic from WorkerProxyCache._delayed_cleanup.
+    Proxies that were never started (no nested dispatch occurred) are
+    skipped.
 
     :param proxy:
         The WorkerProxy instance to clean up.
     """
     try:
-        await proxy.stop()
+        if proxy.started:
+            await proxy.stop()
     except Exception:
         pass
