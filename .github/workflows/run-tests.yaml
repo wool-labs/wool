@@ -34,38 +34,35 @@ jobs:
           cd wool
           uv run pyright
 
-  run-tests:
-    name: Namespace ${{ matrix.namespace }} / Python ${{ matrix.python-version }}
+  unit-tests:
+    name: Unit / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        namespace:
-          - 'wool'
-        python-version:
-          - '3.11'
-          - '3.12'
-          - '3.13'
+        namespace: ['wool']
+        python-version: ['3.11', '3.12', '3.13']
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install uv and prepare python
-        uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-tests
         with:
           python-version: ${{ matrix.python-version }}
+          namespace: ${{ matrix.namespace }}
+          pytest-marker: not integration
+          cov-fail-under: '98'
 
-      - name: Install packages
-        env:
-          NAMESPACE: ${{ matrix.namespace }}
-        run: |
-          .github/scripts/install-python-packages.sh
-          uv pip install -e './${{ env.NAMESPACE }}[dev]'
-          uv pip freeze
-
-      - name: Run tests
-        env:
-          NAMESPACE: ${{ matrix.namespace }}
-        run: |
-          ulimit -n 65536
-          cd ${{ env.NAMESPACE }}
-          uv run pytest
+  integration-tests:
+    name: Integration / Python ${{ matrix.python-version }}
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        namespace: ['wool']
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-tests
+        with:
+          python-version: ${{ matrix.python-version }}
+          namespace: ${{ matrix.namespace }}
+          pytest-marker: integration
+          cov-fail-under: '70'

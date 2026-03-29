@@ -1,0 +1,37 @@
+name: Run tests
+description: Checkout, install dependencies, and run pytest for a given namespace.
+inputs:
+  python-version:
+    required: true
+    type: string
+  namespace:
+    required: true
+    type: string
+  pytest-marker:
+    required: true
+    type: string
+  cov-fail-under:
+    required: true
+    type: string
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv and prepare python
+      uses: astral-sh/setup-uv@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install packages
+      shell: bash
+      run: |
+        .github/scripts/install-python-packages.sh
+        uv pip install -e './${{ inputs.namespace }}[dev]'
+        uv pip freeze
+
+    - name: Run tests
+      shell: bash
+      run: |
+        ulimit -n 65536
+        cd ${{ inputs.namespace }}
+        uv run pytest -m "${{ inputs.pytest-marker }}" --cov-fail-under=${{ inputs.cov-fail-under }}
