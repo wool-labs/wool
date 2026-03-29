@@ -1,3 +1,4 @@
+import asyncio
 import signal
 import uuid
 from types import MappingProxyType
@@ -213,6 +214,193 @@ async def test__signal_handlers_restores_handlers_even_on_exception(mocker):
     assert len(signal_calls) == 4
     assert signal_calls[2] == (signal.SIGTERM, old_sigterm)
     assert signal_calls[3] == (signal.SIGINT, old_sigint)
+
+
+@pytest.mark.asyncio
+async def test__proxy_factory_with_unstarted_proxy(mocker):
+    """Test _proxy_factory does not start proxy eagerly.
+
+    Given:
+        A proxy with started=False.
+    When:
+        _proxy_factory() is called.
+    Then:
+        It should return the proxy without calling start().
+    """
+    # Arrange
+    mock_proxy = mocker.MagicMock()
+    mock_proxy.started = False
+    mock_proxy.start = mocker.AsyncMock()
+    mock_proxy.dispatch = mocker.AsyncMock()
+
+    # Act
+    result = await _proxy_factory(mock_proxy)
+
+    # Assert
+    mock_proxy.start.assert_not_called()
+    assert result is mock_proxy
+
+
+@pytest.mark.asyncio
+async def test__proxy_factory_on_first_dispatch(mocker):
+    """Test _proxy_factory lazy dispatch starts proxy on first call.
+
+    Given:
+        A proxy prepared by _proxy_factory with started=False.
+    When:
+        The wrapped dispatch method is called.
+    Then:
+        It should call start() then delegate to the original dispatch.
+    """
+    # Arrange
+    mock_proxy = mocker.MagicMock()
+    mock_proxy.started = False
+    mock_proxy.start = mocker.AsyncMock(
+        side_effect=lambda: setattr(mock_proxy, "started", True)
+    )
+    original_dispatch = mocker.AsyncMock(return_value="result")
+    mock_proxy.dispatch = original_dispatch
+    await _proxy_factory(mock_proxy)
+    task = mocker.MagicMock()
+
+    # Act
+    result = await mock_proxy.dispatch(task, timeout=5)
+
+    # Assert
+    mock_proxy.start.assert_called_once()
+    original_dispatch.assert_called_once_with(task, timeout=5)
+    assert result == "result"
+
+
+@pytest.mark.asyncio
+async def test__proxy_factory_on_dispatch_when_already_started(mocker):
+    """Test _proxy_factory lazy dispatch skips start when proxy is started.
+
+    Given:
+        A proxy prepared by _proxy_factory with started=True.
+    When:
+        The wrapped dispatch method is called.
+    Then:
+        It should delegate to the original dispatch without calling start().
+    """
+    # Arrange
+    mock_proxy = mocker.MagicMock()
+    mock_proxy.started = True
+    mock_proxy.start = mocker.AsyncMock()
+    original_dispatch = mocker.AsyncMock(return_value="result")
+    mock_proxy.dispatch = original_dispatch
+    await _proxy_factory(mock_proxy)
+    task = mocker.MagicMock()
+
+    # Act
+    result = await mock_proxy.dispatch(task, timeout=5)
+
+    # Assert
+    mock_proxy.start.assert_not_called()
+    original_dispatch.assert_called_once_with(task, timeout=5)
+    assert result == "result"
+
+
+@pytest.mark.asyncio
+async def test__proxy_factory_on_concurrent_dispatch(mocker):
+    """Test _proxy_factory starts proxy only once under concurrent dispatch.
+
+    Given:
+        A proxy prepared by _proxy_factory with started=False.
+    When:
+        Two dispatch calls are made concurrently.
+    Then:
+        It should call start() exactly once and both dispatches should succeed.
+    """
+    # Arrange
+    mock_proxy = mocker.MagicMock()
+    mock_proxy.started = False
+    mock_proxy.start = mocker.AsyncMock(
+        side_effect=lambda: setattr(mock_proxy, "started", True)
+    )
+    original_dispatch = mocker.AsyncMock(return_value="result")
+    mock_proxy.dispatch = original_dispatch
+    await _proxy_factory(mock_proxy)
+    task = mocker.MagicMock()
+
+    # Act
+    results = await asyncio.gather(
+        mock_proxy.dispatch(task),
+        mock_proxy.dispatch(task),
+    )
+
+    # Assert
+    mock_proxy.start.assert_called_once()
+    assert results == ["result", "result"]
+
+
+@pytest.mark.asyncio
+async def test__proxy_finalizer_with_started_proxy(mocker):
+    """Test _proxy_finalizer stops a started proxy.
+
+    Given:
+        A proxy with started=True that stops successfully.
+    When:
+        _proxy_finalizer() is called.
+    Then:
+        It should call proxy.stop().
+    """
+    # Arrange
+    mock_proxy = mocker.MagicMock()
+    mock_proxy.started = True
+    mock_proxy.stop = mocker.AsyncMock()
+
+    # Act
+    await _proxy_finalizer(mock_proxy)
+
+    # Assert
+    mock_proxy.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test__proxy_finalizer_with_unstarted_proxy(mocker):
+    """Test _proxy_finalizer skips stopping an un-started proxy.
+
+    Given:
+        A proxy with started=False.
+    When:
+        _proxy_finalizer() is called.
+    Then:
+        It should not call proxy.stop().
+    """
+    # Arrange
+    mock_proxy = mocker.MagicMock()
+    mock_proxy.started = False
+    mock_proxy.stop = mocker.AsyncMock()
+
+    # Act
+    await _proxy_finalizer(mock_proxy)
+
+    # Assert
+    mock_proxy.stop.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test__proxy_finalizer_with_stop_exception(mocker):
+    """Test _proxy_finalizer handles exception from proxy.stop() gracefully.
+
+    Given:
+        A started proxy that raises an exception on stop.
+    When:
+        _proxy_finalizer() is called.
+    Then:
+        It should catch the exception and complete without propagating it.
+    """
+    # Arrange
+    mock_proxy = mocker.MagicMock()
+    mock_proxy.started = True
+    mock_proxy.stop = mocker.AsyncMock(side_effect=Exception("Stop failed"))
+
+    # Act — should not raise exception
+    await _proxy_finalizer(mock_proxy)
+
+    # Assert
+    mock_proxy.stop.assert_called_once()
 
 
 class TestWorkerProcess:
@@ -745,96 +933,6 @@ class TestWorkerProcess:
         assert process.metadata.extra == MappingProxyType({"key": "value"})
         assert isinstance(process.metadata.extra, MappingProxyType)
         assert process.metadata.tags == frozenset({"gpu"})
-
-    @pytest.mark.asyncio
-    async def test__proxy_factory_starts_proxy_when_not_started(self, mocker):
-        """Test _proxy_factory starts proxy when not already started.
-
-        Given:
-            A WorkerProcess and a proxy with started=False
-        When:
-            _proxy_factory() is called
-        Then:
-            It should call proxy.start() and return the proxy
-        """
-        # Arrange
-        mock_proxy = mocker.MagicMock()
-        mock_proxy.started = False
-        mock_proxy.start = mocker.AsyncMock()
-
-        # Act
-        result = await _proxy_factory(mock_proxy)
-
-        # Assert
-        mock_proxy.start.assert_called_once()
-        assert result is mock_proxy
-
-    @pytest.mark.asyncio
-    async def test__proxy_factory_does_not_start_proxy_when_already_started(
-        self, mocker
-    ):
-        """Test _proxy_factory does not start proxy when already started.
-
-        Given:
-            A WorkerProcess and a proxy with started=True
-        When:
-            _proxy_factory() is called
-        Then:
-            It should not call proxy.start() but still return the proxy
-        """
-        # Arrange
-        mock_proxy = mocker.MagicMock()
-        mock_proxy.started = True
-        mock_proxy.start = mocker.AsyncMock()
-
-        # Act
-        result = await _proxy_factory(mock_proxy)
-
-        # Assert
-        mock_proxy.start.assert_not_called()
-        assert result is mock_proxy
-
-    @pytest.mark.asyncio
-    async def test__proxy_finalizer_successfully_stops_proxy(self, mocker):
-        """Test _proxy_finalizer successfully stops proxy.
-
-        Given:
-            A WorkerProcess and a proxy that stops successfully
-        When:
-            _proxy_finalizer() is called
-        Then:
-            It should call proxy.stop() and complete without error
-        """
-        # Arrange
-        mock_proxy = mocker.MagicMock()
-        mock_proxy.stop = mocker.AsyncMock()
-
-        # Act
-        await _proxy_finalizer(mock_proxy)
-
-        # Assert
-        mock_proxy.stop.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test__proxy_finalizer_handles_exception_gracefully(self, mocker):
-        """Test _proxy_finalizer handles exception from proxy.stop() gracefully.
-
-        Given:
-            A WorkerProcess and a proxy that raises exception on stop
-        When:
-            _proxy_finalizer() is called
-        Then:
-            It should catch the exception and complete without propagating it
-        """
-        # Arrange
-        mock_proxy = mocker.MagicMock()
-        mock_proxy.stop = mocker.AsyncMock(side_effect=Exception("Stop failed"))
-
-        # Act — should not raise exception
-        await _proxy_finalizer(mock_proxy)
-
-        # Assert
-        mock_proxy.stop.assert_called_once()
 
     def test_run_sets_up_proxy_pool_and_starts_server(self, mocker):
         """Test run method sets up proxy pool and starts gRPC server.
