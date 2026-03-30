@@ -11,6 +11,7 @@ from hypothesis import settings
 from .conftest import PAIRWISE_SCENARIOS
 from .conftest import CredentialType
 from .conftest import DiscoveryFactory
+from .conftest import LazyMode
 from .conftest import LbFactory
 from .conftest import PoolMode
 from .conftest import RoutineBinding
@@ -68,6 +69,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         WorkerOptionsKind.DEFAULT,
         TimeoutKind.NONE,
         RoutineBinding.MODULE_FUNCTION,
+        LazyMode.LAZY,
     )
 )
 @example(
@@ -80,6 +82,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         WorkerOptionsKind.DEFAULT,
         TimeoutKind.NONE,
         RoutineBinding.MODULE_FUNCTION,
+        LazyMode.LAZY,
     )
 )
 @example(
@@ -92,6 +95,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         WorkerOptionsKind.KEEPALIVE,
         TimeoutKind.NONE,
         RoutineBinding.MODULE_FUNCTION,
+        LazyMode.LAZY,
     )
 )
 @given(scenario=scenarios_strategy())

@@ -4,6 +4,7 @@ import pytest
 
 from .conftest import CredentialType
 from .conftest import DiscoveryFactory
+from .conftest import LazyMode
 from .conftest import LbFactory
 from .conftest import PoolMode
 from .conftest import RoutineBinding
@@ -39,6 +40,7 @@ class TestPoolComposition:
             options=WorkerOptionsKind.DEFAULT,
             timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.LAZY,
         )
 
         # Act
@@ -53,7 +55,8 @@ class TestPoolComposition:
         """Test building a pool with EPHEMERAL mode and size=2.
 
         Given:
-            A complete scenario using EPHEMERAL pool mode with 2 workers.
+            A complete scenario using EPHEMERAL pool mode with 2 workers
+            and eager proxy start.
         When:
             A pool is built and a coroutine routine is dispatched.
         Then:
@@ -69,6 +72,7 @@ class TestPoolComposition:
             options=WorkerOptionsKind.DEFAULT,
             timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.EAGER,
         )
 
         # Act
@@ -100,6 +104,7 @@ class TestPoolComposition:
             options=WorkerOptionsKind.DEFAULT,
             timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.LAZY,
         )
 
         # Act
@@ -131,6 +136,7 @@ class TestPoolComposition:
             options=WorkerOptionsKind.DEFAULT,
             timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.LAZY,
         )
 
         # Act
@@ -166,6 +172,7 @@ class TestPoolComposition:
             options=WorkerOptionsKind.DEFAULT,
             timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.LAZY,
         )
 
         # Act
@@ -197,6 +204,7 @@ class TestPoolComposition:
             options=WorkerOptionsKind.RESTRICTIVE,
             timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.LAZY,
         )
 
         # Act
@@ -229,6 +237,7 @@ class TestPoolComposition:
             options=WorkerOptionsKind.KEEPALIVE,
             timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.LAZY,
         )
 
         # Act
@@ -260,6 +269,7 @@ class TestPoolComposition:
             options=WorkerOptionsKind.DEFAULT,
             timeout=TimeoutKind.VIA_RUNTIME_CONTEXT,
             binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.LAZY,
         )
 
         # Act
@@ -294,6 +304,7 @@ class TestPoolComposition:
             options=WorkerOptionsKind.DEFAULT,
             timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.LAZY,
         )
 
         # Act
