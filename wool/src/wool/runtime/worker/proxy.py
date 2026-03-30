@@ -35,6 +35,8 @@ from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
 
 if TYPE_CHECKING:
+    from contextvars import Token
+
     from wool.runtime.routine.task import Task
 
 T = TypeVar("T")
@@ -208,6 +210,7 @@ class WorkerProxy:
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
         lease: int | None = None,
+        lazy: bool = True,
     ): ...
 
     @overload
@@ -220,6 +223,7 @@ class WorkerProxy:
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
         lease: int | None = None,
+        lazy: bool = True,
     ): ...
 
     @overload
@@ -232,6 +236,7 @@ class WorkerProxy:
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
         lease: int | None = None,
+        lazy: bool = True,
     ): ...
 
     def __init__(
@@ -247,6 +252,7 @@ class WorkerProxy:
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
         lease: int | None = None,
+        lazy: bool = True,
     ):
         if not (pool_uri or discovery or workers):
             raise ValueError(
@@ -259,8 +265,11 @@ class WorkerProxy:
 
         self._id: uuid.UUID = uuid.uuid4()
         self._started = False
+        self._lazy = lazy
+        self._start_lock = asyncio.Lock() if lazy else None
         self._loadbalancer = loadbalancer
         self._lease = lease
+        self._proxy_token: Token[WorkerProxy | None] | None = None
 
         if isinstance(loadbalancer, (ContextManager, AsyncContextManager)):
             warnings.warn(
@@ -363,11 +372,12 @@ class WorkerProxy:
                     f"{name}=my_cm())."
                 )
 
-        def _restore_proxy(discovery, loadbalancer, proxy_id, lease):
+        def _restore_proxy(discovery, loadbalancer, proxy_id, lease, lazy):
             proxy = WorkerProxy(
                 discovery=discovery,
                 loadbalancer=loadbalancer,
                 lease=lease,
+                lazy=lazy,
             )
             proxy._id = proxy_id
             return proxy
@@ -379,6 +389,7 @@ class WorkerProxy:
                 self._loadbalancer,
                 self._id,
                 self._lease,
+                self._lazy,
             ),
         )
 
@@ -391,6 +402,10 @@ class WorkerProxy:
         return self._started
 
     @property
+    def lazy(self) -> bool:
+        return self._lazy
+
+    @property
     def workers(self) -> list[WorkerMetadata]:
         """A list of the currently discovered worker gRPC stubs."""
         if self._loadbalancer_context:
@@ -401,9 +416,21 @@ class WorkerProxy:
     async def start(self) -> None:
         """Starts the proxy by initiating the worker discovery process.
 
+        Always sets this proxy as the active context variable.  When
+        ``lazy=True``, defers discovery and load-balancer startup
+        until :meth:`dispatch` is first called.  When ``lazy=False``,
+        starts eagerly.
+
         :raises RuntimeError:
-            If the proxy has already been started.
+            If the proxy has already been started and ``lazy`` is
+            ``False``.
         """
+        self._proxy_token = wool.__proxy__.set(self)
+        if self._lazy:
+            return
+        await self._start()
+
+    async def _start(self) -> None:
         if self._started:
             raise RuntimeError("Proxy already started")
 
@@ -421,7 +448,6 @@ class WorkerProxy:
         if not isinstance(self._discovery_stream, DiscoverySubscriberLike):
             raise ValueError
 
-        self._proxy_token = wool.__proxy__.set(self)
         self._loadbalancer_context = LoadBalancerContext()
         self._sentinel_task = asyncio.create_task(self._worker_sentinel())
         self._started = True
@@ -429,25 +455,34 @@ class WorkerProxy:
     async def stop(self, *args) -> None:
         """Stops the proxy, terminating discovery and clearing connections.
 
+        When ``lazy=True``, calling stop on an un-started proxy resets
+        only the context variable. When ``lazy=False``, raises
+        :class:`RuntimeError`.
+
         :raises RuntimeError:
-            If the proxy was not started first.
+            If the proxy was not started first and ``lazy`` is
+            ``False``.
         """
+        if self._proxy_token is not None:
+            wool.__proxy__.reset(self._proxy_token)
+            self._proxy_token = None
         if not self._started:
-            raise RuntimeError("Proxy not started - call start() first")
+            if not self._lazy:
+                raise RuntimeError("Proxy not started - call start() first")
+            return
+        else:
+            await self._exit_context(self._discovery_context_manager, *args)
+            await self._exit_context(self._loadbalancer_context_manager, *args)
 
-        await self._exit_context(self._discovery_context_manager, *args)
-        await self._exit_context(self._loadbalancer_context_manager, *args)
-
-        wool.__proxy__.reset(self._proxy_token)
-        if self._sentinel_task:
-            self._sentinel_task.cancel()
-            try:
-                await self._sentinel_task
-            except asyncio.CancelledError:
-                pass
-            self._sentinel_task = None
-        self._loadbalancer_context = None
-        self._started = False
+            if self._sentinel_task:
+                self._sentinel_task.cancel()
+                try:
+                    await self._sentinel_task
+                except asyncio.CancelledError:
+                    pass
+                self._sentinel_task = None
+            self._loadbalancer_context = None
+            self._started = False
 
     async def dispatch(
         self, task: Task, *, timeout: float | None = None
@@ -456,7 +491,8 @@ class WorkerProxy:
 
         This method selects a worker using a round-robin strategy. If no
         workers are available within the timeout period, it raises an
-        exception.
+        exception. When ``lazy=True``, the proxy is started automatically
+        on first dispatch.
 
         :param task:
             The :class:`Task` object to be dispatched.
@@ -465,12 +501,17 @@ class WorkerProxy:
         :returns:
             A protobuf result object from the worker.
         :raises RuntimeError:
-            If the proxy is not started.
+            If the proxy is not started and ``lazy`` is ``False``.
         :raises asyncio.TimeoutError:
             If no worker is available within the timeout period.
         """
         if not self._started:
-            raise RuntimeError("Proxy not started - call start() first")
+            if not self._lazy:
+                raise RuntimeError("Proxy not started - call start() first")
+            assert self._start_lock is not None
+            async with self._start_lock:
+                if not self._started:
+                    await self._start()
 
         await asyncio.wait_for(self._await_workers(), 60)
 
