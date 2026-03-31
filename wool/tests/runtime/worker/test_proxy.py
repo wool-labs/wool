@@ -756,13 +756,13 @@ class TestWorkerProxy:
         assert proxy.started
 
     @pytest.mark.asyncio
-    async def test_start_with_lazy_proxy(self, mock_discovery_service):
-        """Test start is a no-op for lazy proxies.
+    async def test_enter_with_lazy_proxy(self, mock_discovery_service):
+        """Test enter defers startup for lazy proxies.
 
         Given:
-            A lazy WorkerProxy that has not been started.
+            A lazy WorkerProxy that has not been entered.
         When:
-            start() is called.
+            enter() is called.
         Then:
             It should remain un-started.
         """
@@ -770,24 +770,46 @@ class TestWorkerProxy:
         proxy = WorkerProxy(discovery=mock_discovery_service)
 
         # Act
-        await proxy.start()
+        await proxy.enter()
 
         # Assert
         assert not proxy.started
+
+    @pytest.mark.asyncio
+    async def test_enter_with_non_lazy_proxy(
+        self, mock_discovery_service, mock_proxy_session
+    ):
+        """Test enter eagerly starts a non-lazy proxy.
+
+        Given:
+            A non-lazy WorkerProxy that has not been entered.
+        When:
+            enter() is called.
+        Then:
+            It should set started to True.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
+
+        # Act
+        await proxy.enter()
+
+        # Assert
+        assert proxy.started
 
     @pytest.mark.asyncio
     async def test_stop_clears_state(self, mock_discovery_service, mock_proxy_session):
         """Test clear workers and reset the started flag to False.
 
         Given:
-            A started WorkerProxy with registered workers
+            A started WorkerProxy with registered workers.
         When:
-            Stop is called
+            stop() is called.
         Then:
-            It should clear workers and reset the started flag to False
+            It should clear workers and reset the started flag to False.
         """
         # Arrange
-        proxy = WorkerProxy(discovery=mock_discovery_service)
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
         await proxy.start()
 
         # Act
@@ -819,31 +841,31 @@ class TestWorkerProxy:
             await proxy.start()
 
     @pytest.mark.asyncio
-    async def test_stop_not_started_raises_error(self, mock_discovery_service):
+    async def test_exit_not_started_raises_error(self, mock_discovery_service):
         """Test raise RuntimeError.
 
         Given:
-            A non-lazy WorkerProxy that is not started
+            A non-lazy WorkerProxy that is not started.
         When:
-            Stop is called
+            exit() is called.
         Then:
-            It should raise RuntimeError
+            It should raise RuntimeError.
         """
         # Arrange
         proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
 
         # Act & assert
         with pytest.raises(RuntimeError, match="Proxy not started"):
-            await proxy.stop()
+            await proxy.exit()
 
     @pytest.mark.asyncio
-    async def test_stop_with_unstarted_lazy_proxy(self, mock_discovery_service):
-        """Test stop is a no-op on an un-started lazy proxy.
+    async def test_exit_with_unstarted_lazy_proxy(self, mock_discovery_service):
+        """Test exit is a no-op on an un-started lazy proxy.
 
         Given:
             A lazy WorkerProxy that was never started.
         When:
-            stop() is called.
+            exit() is called.
         Then:
             It should return without raising.
         """
@@ -851,7 +873,32 @@ class TestWorkerProxy:
         proxy = WorkerProxy(discovery=mock_discovery_service)
 
         # Act & assert — should not raise
-        await proxy.stop()
+        await proxy.exit()
+
+    @pytest.mark.asyncio
+    async def test_exit_stops_started_lazy_proxy(
+        self, mock_discovery_service, mock_proxy_session
+    ):
+        """Test exit stops a lazy proxy that was started.
+
+        Given:
+            A lazy WorkerProxy that was entered and subsequently started.
+        When:
+            exit() is called.
+        Then:
+            It should stop the proxy and set started to False.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service)
+        await proxy.enter()
+        await proxy.start()
+        assert proxy.started
+
+        # Act
+        await proxy.exit()
+
+        # Assert
+        assert not proxy.started
 
     @pytest.mark.asyncio
     async def test___aenter___enter_starts_proxy(
@@ -1637,8 +1684,8 @@ class TestWorkerProxy:
         assert len(restored.workers) == 2
         await restored.stop()
 
-    def test_cloudpickle_serialization_preserves_lazy(self, mock_discovery_service):
-        """Test pickle round-trip preserves the lazy flag.
+    def test_cloudpickle_serialization_with_lazy_false(self, mock_discovery_service):
+        """Test pickle round-trip with explicit lazy=False.
 
         Given:
             A WorkerProxy with lazy=False.
@@ -1659,6 +1706,46 @@ class TestWorkerProxy:
 
         # Assert
         assert restored.lazy is False
+
+    def test_cloudpickle_serialization_with_default_lazy(self, mock_discovery_service):
+        """Test pickle round-trip with default lazy=True.
+
+        Given:
+            A WorkerProxy with default lazy=True.
+        When:
+            The proxy is pickled and unpickled.
+        Then:
+            It should preserve lazy as True on the restored proxy.
+        """
+        # Arrange
+        proxy = WorkerProxy(
+            discovery=mock_discovery_service,
+            loadbalancer=wp.RoundRobinLoadBalancer,
+        )
+
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(proxy))
+
+        # Assert
+        assert restored.lazy is True
+
+    @given(lazy=st.booleans())
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test___init___with_arbitrary_lazy_value(self, mock_discovery_service, lazy):
+        """Test instantiation with an arbitrary lazy value.
+
+        Given:
+            An arbitrary boolean value for lazy.
+        When:
+            WorkerProxy is instantiated with that value.
+        Then:
+            It should set the lazy property to the given value.
+        """
+        # Act
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=lazy)
+
+        # Assert
+        assert proxy.lazy is lazy
 
     @pytest.mark.asyncio
     async def test_dispatch_delegates_to_loadbalancer(

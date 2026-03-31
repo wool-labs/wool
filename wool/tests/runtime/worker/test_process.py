@@ -18,8 +18,6 @@ from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.process import WorkerProcess
-from wool.runtime.worker.process import _proxy_factory
-from wool.runtime.worker.process import _proxy_finalizer
 from wool.runtime.worker.process import _sigint_handler
 from wool.runtime.worker.process import _signal_handlers
 from wool.runtime.worker.process import _sigterm_handler
@@ -213,73 +211,6 @@ async def test__signal_handlers_restores_handlers_even_on_exception(mocker):
     assert len(signal_calls) == 4
     assert signal_calls[2] == (signal.SIGTERM, old_sigterm)
     assert signal_calls[3] == (signal.SIGINT, old_sigint)
-
-
-@pytest.mark.asyncio
-async def test__proxy_factory_with_proxy(mocker):
-    """Test _proxy_factory calls start and returns the proxy.
-
-    Given:
-        A WorkerProxy instance.
-    When:
-        _proxy_factory() is called.
-    Then:
-        It should call start() and return the proxy.
-    """
-    # Arrange
-    mock_proxy = mocker.MagicMock()
-    mock_proxy.start = mocker.AsyncMock()
-
-    # Act
-    result = await _proxy_factory(mock_proxy)
-
-    # Assert
-    mock_proxy.start.assert_called_once()
-    assert result is mock_proxy
-
-
-@pytest.mark.asyncio
-async def test__proxy_finalizer_with_proxy(mocker):
-    """Test _proxy_finalizer calls stop on the proxy.
-
-    Given:
-        A proxy that stops successfully.
-    When:
-        _proxy_finalizer() is called.
-    Then:
-        It should call proxy.stop().
-    """
-    # Arrange
-    mock_proxy = mocker.MagicMock()
-    mock_proxy.stop = mocker.AsyncMock()
-
-    # Act
-    await _proxy_finalizer(mock_proxy)
-
-    # Assert
-    mock_proxy.stop.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test__proxy_finalizer_with_stop_exception(mocker):
-    """Test _proxy_finalizer handles exception from proxy.stop() gracefully.
-
-    Given:
-        A proxy that raises an exception on stop.
-    When:
-        _proxy_finalizer() is called.
-    Then:
-        It should catch the exception and complete without propagating it.
-    """
-    # Arrange
-    mock_proxy = mocker.MagicMock()
-    mock_proxy.stop = mocker.AsyncMock(side_effect=Exception("Stop failed"))
-
-    # Act — should not raise exception
-    await _proxy_finalizer(mock_proxy)
-
-    # Assert
-    mock_proxy.stop.assert_called_once()
 
 
 class TestWorkerProcess:
