@@ -180,6 +180,7 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ):
         """
         Create an ephemeral pool of workers, spawning the specified
@@ -197,6 +198,7 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ):
         """
         Connect to an existing pool of workers discovered by the
@@ -216,6 +218,7 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ):
         """
         Create a hybrid pool that spawns local workers and discovers
@@ -236,6 +239,7 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ): ...
 
     @overload
@@ -251,6 +255,7 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ): ...
 
     def __init__(
@@ -265,9 +270,11 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ):
         self._workers = {}
         self._credentials = credentials
+        self._lazy = lazy
 
         if size is not None and spawn is not None:
             raise TypeError(
@@ -310,6 +317,7 @@ class WorkerPool:
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
                                 lease=max_workers,
+                                lazy=self._lazy,
                             ):
                                 yield
                     finally:
@@ -335,6 +343,7 @@ class WorkerPool:
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
                                 lease=max_workers,
+                                lazy=self._lazy,
                             ):
                                 yield
 
@@ -353,6 +362,7 @@ class WorkerPool:
                             loadbalancer=loadbalancer,
                             credentials=self._credentials,
                             lease=lease,
+                            lazy=self._lazy,
                         ):
                             yield
                     finally:
@@ -378,6 +388,7 @@ class WorkerPool:
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
                                 lease=max_workers,
+                                lazy=self._lazy,
                             ):
                                 yield
 
