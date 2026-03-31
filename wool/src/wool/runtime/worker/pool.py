@@ -26,6 +26,7 @@ from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.proxy import LoadBalancerLike
 from wool.runtime.worker.proxy import RoundRobinLoadBalancer
 from wool.runtime.worker.proxy import WorkerProxy
+from wool.utilities.noreentry import noreentry
 
 
 # public
@@ -397,6 +398,7 @@ class WorkerPool:
 
         self._proxy_factory = create_proxy
 
+    @noreentry
     async def __aenter__(self) -> WorkerPool:
         """Starts the worker pool and its services, returning a session.
 
@@ -405,6 +407,10 @@ class WorkerPool:
 
         :returns:
             The :class:`WorkerPool` instance itself for method chaining.
+        :raises RuntimeError:
+            If the pool has already been entered.  ``WorkerPool``
+            contexts are single-use — create a new instance instead
+            of re-entering.
         """
         self._proxy_context = self._proxy_factory()
         await self._proxy_context.__aenter__()
