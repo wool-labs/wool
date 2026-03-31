@@ -35,7 +35,7 @@ class NoReentryBoundMethod:
             if sys.version_info >= (3, 12):
                 inspect.markcoroutinefunction(self)
             else:
-                self._is_coroutine = asyncio.coroutines._is_coroutine
+                self._is_coroutine = asyncio.coroutines._is_coroutine  # type: ignore[attr-defined]
         self._fn = fn
         self._invocations = weakref.WeakSet()
 
