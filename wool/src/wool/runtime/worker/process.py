@@ -390,30 +390,30 @@ def _sigint_handler(loop, service, signum, frame):
 async def _proxy_factory(proxy: WorkerProxy):
     """Factory function for WorkerProxy instances in ResourcePool.
 
-    Calls ``start()`` on the proxy. Lazy proxies treat this as a
-    no-op and defer startup until first dispatch. Non-lazy proxies
-    start eagerly. The proxy object itself is used as the cache key.
+    Calls ``enter()`` on the proxy.  Lazy proxies defer actual
+    startup until first dispatch; non-lazy proxies start eagerly.
+    The proxy object itself is used as the cache key.
 
     :param proxy:
         The WorkerProxy instance (passed as key from ResourcePool).
     :returns:
-        The started (or lazy) WorkerProxy instance.
+        The entered WorkerProxy instance.
     """
-    await proxy.start()
+    await proxy.enter()
     return proxy
 
 
 async def _proxy_finalizer(proxy: WorkerProxy):
     """Finalizer function for WorkerProxy instances in ResourcePool.
 
-    Stops the proxy when it's being cleaned up from the resource pool.
-    Lazy proxies that were never started are handled gracefully by
-    the proxy's own stop method.
+    Exits the proxy context when it's being cleaned up from the
+    resource pool.  Lazy proxies that were never started are handled
+    gracefully by the proxy's own exit method.
 
     :param proxy:
         The WorkerProxy instance to clean up.
     """
     try:
-        await proxy.stop()
+        await proxy.exit()
     except Exception:
         pass

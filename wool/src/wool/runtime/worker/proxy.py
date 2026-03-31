@@ -331,13 +331,13 @@ class WorkerProxy:
         self._loadbalancer_context: LoadBalancerContext | None = None
 
     async def __aenter__(self):
-        """Starts the proxy and sets it as the active context."""
-        await self.start()
+        """Enters the proxy context and sets it as the active proxy."""
+        await self.enter()
         return self
 
     async def __aexit__(self, *args):
-        """Stops the proxy and resets the active context."""
-        await self.stop(*args)
+        """Exits the proxy context and resets the active proxy."""
+        await self.exit(*args)
 
     def __hash__(self) -> int:
         return hash(str(self.id))
@@ -413,13 +413,13 @@ class WorkerProxy:
         else:
             return []
 
-    async def start(self) -> None:
-        """Starts the proxy by initiating the worker discovery process.
+    async def enter(self) -> None:
+        """Enter the proxy context.
 
-        Always sets this proxy as the active context variable.  When
-        ``lazy=True``, defers discovery and load-balancer startup
-        until :meth:`dispatch` is first called.  When ``lazy=False``,
-        starts eagerly.
+        Sets this proxy as the active context variable.  When
+        ``lazy=True``, defers resource acquisition until
+        :meth:`dispatch` is first called.  When ``lazy=False``,
+        calls :meth:`start` eagerly.
 
         :raises RuntimeError:
             If the proxy has already been started and ``lazy`` is
@@ -428,9 +428,17 @@ class WorkerProxy:
         self._proxy_token = wool.__proxy__.set(self)
         if self._lazy:
             return
-        await self._start()
+        await self.start()
 
-    async def _start(self) -> None:
+    async def start(self) -> None:
+        """Start the proxy by initiating discovery and load balancing.
+
+        Subscribes to worker discovery, initializes the load-balancer
+        context, and launches the worker sentinel task.
+
+        :raises RuntimeError:
+            If the proxy has already been started.
+        """
         if self._started:
             raise RuntimeError("Proxy already started")
 
@@ -452,12 +460,12 @@ class WorkerProxy:
         self._sentinel_task = asyncio.create_task(self._worker_sentinel())
         self._started = True
 
-    async def stop(self, *args) -> None:
-        """Stops the proxy, terminating discovery and clearing connections.
+    async def exit(self, *args) -> None:
+        """Exit the proxy context.
 
-        When ``lazy=True``, calling stop on an un-started proxy resets
-        only the context variable. When ``lazy=False``, raises
-        :class:`RuntimeError`.
+        Resets the context variable.  If the proxy was started,
+        delegates to :meth:`stop` to release resources.  Calling
+        ``exit()`` on an un-started lazy proxy is a safe no-op.
 
         :raises RuntimeError:
             If the proxy was not started first and ``lazy`` is
@@ -470,19 +478,29 @@ class WorkerProxy:
             if not self._lazy:
                 raise RuntimeError("Proxy not started - call start() first")
             return
-        else:
-            await self._exit_context(self._discovery_context_manager, *args)
-            await self._exit_context(self._loadbalancer_context_manager, *args)
+        await self.stop(*args)
 
-            if self._sentinel_task:
-                self._sentinel_task.cancel()
-                try:
-                    await self._sentinel_task
-                except asyncio.CancelledError:
-                    pass
-                self._sentinel_task = None
-            self._loadbalancer_context = None
-            self._started = False
+    async def stop(self, *args) -> None:
+        """Stop the proxy, terminating discovery and clearing connections.
+
+        :raises RuntimeError:
+            If the proxy was not started first.
+        """
+        if not self._started:
+            raise RuntimeError("Proxy not started - call start() first")
+
+        await self._exit_context(self._discovery_context_manager, *args)
+        await self._exit_context(self._loadbalancer_context_manager, *args)
+
+        if self._sentinel_task:
+            self._sentinel_task.cancel()
+            try:
+                await self._sentinel_task
+            except asyncio.CancelledError:
+                pass
+            self._sentinel_task = None
+        self._loadbalancer_context = None
+        self._started = False
 
     async def dispatch(
         self, task: Task, *, timeout: float | None = None
@@ -511,7 +529,7 @@ class WorkerProxy:
             assert self._start_lock is not None
             async with self._start_lock:
                 if not self._started:
-                    await self._start()
+                    await self.start()
 
         await asyncio.wait_for(self._await_workers(), 60)
 

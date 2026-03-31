@@ -213,10 +213,10 @@ Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagat
 
 `WorkerProxy` accepts a `lazy` parameter (default `True`) that controls when the proxy actually starts — i.e., when it subscribes to discovery, launches the worker sentinel task, and initializes the load balancer context.
 
-| `lazy` | `start()` / `__aenter__` | `dispatch()` | `stop()` on un-started proxy |
-| ------ | ------------------------ | ------------- | ---------------------------- |
-| `True` | No-op | Starts the proxy on first call, then dispatches | No-op (safe to call) |
-| `False` | Starts eagerly | Raises `RuntimeError` if not started | Raises `RuntimeError` |
+| `lazy` | `enter()` / `__aenter__` | `dispatch()` | `exit()` on un-started proxy |
+| ------ | ------------------------ | ------------- | ----------------------------- |
+| `True` | Sets context var only | Calls `start()` on first call, then dispatches | No-op (safe to call) |
+| `False` | Sets context var, calls `start()` | Raises `RuntimeError` if not started | Raises `RuntimeError` |
 
 When `lazy=True`, concurrent `dispatch()` calls use a double-checked lock to ensure the proxy starts exactly once. The `lazy` flag is preserved through `cloudpickle` serialization, so proxies sent to worker subprocesses as part of a task retain their laziness setting.
 
