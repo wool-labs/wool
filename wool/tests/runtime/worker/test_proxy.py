@@ -798,6 +798,45 @@ class TestWorkerProxy:
         assert proxy.started
 
     @pytest.mark.asyncio
+    async def test_enter_already_entered_raises_error(self, mock_discovery_service):
+        """Test enter raises on reentrant call.
+
+        Given:
+            A lazy WorkerProxy that has already been entered.
+        When:
+            enter() is called a second time.
+        Then:
+            It should raise RuntimeError.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service)
+        await proxy.enter()
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="cannot be invoked more than once"):
+            await proxy.enter()
+
+    @pytest.mark.asyncio
+    async def test_enter_after_exit_raises_error(self, mock_discovery_service):
+        """Test enter raises after a full enter/exit cycle.
+
+        Given:
+            A lazy WorkerProxy that has been entered and exited.
+        When:
+            enter() is called again.
+        Then:
+            It should raise RuntimeError because the context is single-use.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service)
+        await proxy.enter()
+        await proxy.exit()
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="cannot be invoked more than once"):
+            await proxy.enter()
+
+    @pytest.mark.asyncio
     async def test_stop_clears_state(self, mock_discovery_service, mock_proxy_session):
         """Test clear workers and reset the started flag to False.
 
