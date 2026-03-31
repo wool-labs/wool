@@ -220,6 +220,20 @@ Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagat
 
 When `lazy=True`, concurrent `dispatch()` calls use a double-checked lock to ensure the proxy starts exactly once. The `lazy` flag is preserved through `cloudpickle` serialization, so proxies sent to worker subprocesses as part of a task retain their laziness setting.
 
+### Context lifecycle
+
+Both `WorkerPool` and `WorkerProxy` are **single-use** async context managers. Once entered and exited, the same instance cannot be entered again — create a new instance instead. Attempting to call `enter()` or `__aenter__()` a second time raises `RuntimeError`. This prevents silent state corruption from reentrant or repeated context usage (e.g., accidentally nesting `async with proxy:` blocks or calling `enter()` in a retry loop).
+
+```python
+# Correct — one instance per context
+async with wool.WorkerPool(spawn=4):
+    await my_routine()
+
+# Need another pool? Create a new instance.
+async with wool.WorkerPool(spawn=4):
+    await my_routine()
+```
+
 ### Self-describing connections
 
 Workers are self-describing: each worker advertises its gRPC transport configuration via `ChannelOptions` in its `WorkerMetadata`. When a client discovers a worker, it reads the advertised options and configures its channel to match — message sizes, keepalive intervals, concurrency limits, and compression are all set automatically. There is no separate client-side configuration step; the worker's metadata is the single source of truth for how to connect to it.
