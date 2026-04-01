@@ -136,6 +136,11 @@ class WorkerService(protocol.WorkerServicer):
     Handles graceful shutdown by rejecting new tasks while allowing
     in-flight tasks to complete. Exposes :attr:`stopping` and
     :attr:`stopped` events for lifecycle monitoring.
+
+    :param backpressure:
+        Optional admission control hook. See
+        :class:`BackpressureLike`. ``None`` (default) accepts all
+        tasks unconditionally.
     """
 
     _docket: set[_Task | _AsyncGen]
@@ -547,21 +552,9 @@ class WorkerService(protocol.WorkerServicer):
             await asyncio.sleep(0)
 
     async def _cancel(self):
-        """Cancel multiple tasks safely.
+        """Cancel all tracked tasks in the docket.
 
-        Cancels the provided tasks while performing safety checks to
-        avoid canceling the current task or already completed tasks.
-        Waits for all cancelled tasks to complete in parallel and handles
-        cancellation exceptions.
-
-        :param tasks:
-            The :class:`asyncio.Task` instances to cancel.
-
-        .. note::
-            This method performs the following safety checks:
-            - Avoids canceling the current task (would cause deadlock)
-            - Only cancels tasks that are not already done
-            - Properly handles :exc:`asyncio.CancelledError`
-              exceptions.
+        Cancels every entry in :attr:`_docket` and waits for them to
+        finish, handling cancellation exceptions gracefully.
         """
         await asyncio.gather(*(w.cancel() for w in self._docket), return_exceptions=True)

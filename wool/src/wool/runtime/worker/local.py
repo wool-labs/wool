@@ -64,6 +64,15 @@ class LocalWorker(Worker):
     :param options:
         gRPC message size options. Defaults to
         :class:`WorkerOptions` with 100 MB limits.
+    :param backpressure:
+        Optional admission control hook. A callable receiving a
+        :class:`~wool.runtime.worker.service.BackpressureContext`
+        and returning ``True`` to **reject** the task or ``False``
+        to **accept** it. Both sync and async callables are
+        supported. When a task is rejected the worker responds with
+        gRPC ``RESOURCE_EXHAUSTED``, causing the load balancer to
+        skip to the next worker. ``None`` (default) accepts all
+        tasks unconditionally.
     :param extra:
         Additional metadata as key-value pairs.
     """

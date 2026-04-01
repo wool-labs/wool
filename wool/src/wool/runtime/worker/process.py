@@ -66,6 +66,18 @@ class WorkerProcess(Process):
     :param options:
         gRPC message size options. Defaults to
         :class:`WorkerOptions` with 100 MB limits.
+    :param uid:
+        Unique identifier for this worker. Auto-generated if not
+        provided.
+    :param tags:
+        Capability tags for filtering and selection.
+    :param extra:
+        Additional metadata as key-value pairs.
+    :param backpressure:
+        Optional admission control hook. See
+        :class:`~wool.runtime.worker.service.BackpressureLike`.
+        Serialized with ``cloudpickle`` for transfer to the
+        subprocess.
     :param args:
         Additional args for :class:`multiprocessing.Process`.
     :param kwargs:
@@ -347,8 +359,10 @@ class WorkerProcess(Process):
                             os.unlink(uds_path)
 
     def _address(self, host, port) -> str:
-        """Format network address for the given port.
+        """Format network address for the given host and port.
 
+        :param host:
+            Host address to include in the address.
         :param port:
             Port number to include in the address.
         :returns:
