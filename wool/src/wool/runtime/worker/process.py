@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Final
 
+import cloudpickle
 import grpc.aio
 
 import wool
@@ -32,6 +33,7 @@ from wool.runtime.worker.service import WorkerService
 
 if TYPE_CHECKING:
     from wool.runtime.worker.proxy import WorkerProxy
+    from wool.runtime.worker.service import BackpressureLike
 
 _ctx = _mp.get_context("spawn")
 Pipe = _ctx.Pipe
@@ -91,6 +93,7 @@ class WorkerProcess(Process):
         options: WorkerOptions | None = None,
         tags: frozenset[str] = frozenset(),
         extra: dict[str, Any] | None = None,
+        backpressure: BackpressureLike | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -112,6 +115,9 @@ class WorkerProcess(Process):
         self._tags = tags
         self._extra = extra if extra is not None else {}
         self._metadata = None
+        self._backpressure = (
+            cloudpickle.dumps(backpressure) if backpressure is not None else None
+        )
         self._get_metadata, self._set_metadata = Pipe(duplex=False)
 
     @property
@@ -294,7 +300,12 @@ class WorkerProcess(Process):
                 server.add_insecure_port(uds_target)
                 uds_address = uds_target
 
-            service = WorkerService()
+            backpressure = (
+                cloudpickle.loads(self._backpressure)
+                if self._backpressure is not None
+                else None
+            )
+            service = WorkerService(backpressure=backpressure)
             protocol.add_to_server[protocol.WorkerServicer](service, server)
 
             with _signal_handlers(service):

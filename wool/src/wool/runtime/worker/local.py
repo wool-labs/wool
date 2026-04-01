@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 from typing import Any
 
 import grpc.aio
@@ -10,6 +11,9 @@ from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.process import WorkerProcess
+
+if TYPE_CHECKING:
+    from wool.runtime.worker.service import BackpressureLike
 
 
 # public
@@ -76,6 +80,7 @@ class LocalWorker(Worker):
         proxy_pool_ttl: float = 60.0,
         credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
+        backpressure: BackpressureLike | None = None,
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
@@ -90,6 +95,7 @@ class LocalWorker(Worker):
             options=options,
             tags=frozenset(self._tags),
             extra=self._extra,
+            backpressure=backpressure,
         )
 
     @property
