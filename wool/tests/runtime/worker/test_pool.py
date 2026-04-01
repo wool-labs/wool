@@ -555,6 +555,47 @@ class TestWorkerPool:
         assert exception_caught, "Exception should have been propagated"
 
     @pytest.mark.asyncio
+    async def test___aenter___already_entered_raises_error(self, mock_worker_factory):
+        """Test pool raises on reentrant entry.
+
+        Given:
+            A WorkerPool that is already entered via async with.
+        When:
+            The pool is entered a second time via async with.
+        Then:
+            It should raise RuntimeError.
+        """
+        # Arrange
+        pool = WorkerPool(worker=mock_worker_factory, spawn=2)
+
+        # Act & assert
+        async with pool:
+            with pytest.raises(RuntimeError, match="cannot be invoked more than once"):
+                async with pool:
+                    pass
+
+    @pytest.mark.asyncio
+    async def test___aenter___after_exit_raises_error(self, mock_worker_factory):
+        """Test pool raises when re-entered after exit.
+
+        Given:
+            A WorkerPool that has been entered and exited.
+        When:
+            The pool is entered again via async with.
+        Then:
+            It should raise RuntimeError because the context is single-use.
+        """
+        # Arrange
+        pool = WorkerPool(worker=mock_worker_factory, spawn=2)
+        async with pool:
+            pass
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="cannot be invoked more than once"):
+            async with pool:
+                pass
+
+    @pytest.mark.asyncio
     async def test___aenter___lifecycle_returns_pool_instance(
         self,
         mock_shared_memory,

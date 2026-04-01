@@ -108,9 +108,14 @@ class SubscriberMeta(type):
     :class:`~wool.runtime.resourcepool.Resource` is entered lazily
     on first iteration.
 
-    Subscriber classes using this metaclass must define a
-    ``_cache_key`` classmethod that returns a hashable key from the
-    constructor arguments.
+    Subscriber classes pass a ``key`` keyword argument at class
+    definition time.  The callable receives ``(cls, *args, **kwargs)``
+    and must return a hashable cache key.
+
+    Example::
+
+        class Sub(metaclass=SubscriberMeta, key=lambda cls, ns: (cls, ns)):
+            def __init__(self, ns: str) -> None: ...
     """
 
     def __new__(
@@ -118,12 +123,16 @@ class SubscriberMeta(type):
         name: str,
         bases: tuple[type, ...],
         namespace: dict[str, Any],
+        **kwargs: Any,
     ) -> SubscriberMeta:
-        cls = super().__new__(mcs, name, bases, namespace)
+        key_fn: Callable[..., Any] | None = kwargs.pop("key", None)
+        cls = super().__new__(mcs, name, bases, namespace, **kwargs)
+        if key_fn is not None:
+            cls._cache_key_fn = key_fn  # type: ignore[attr-defined]
         original_init = cls.__init__  # type: ignore[misc]
 
         def _subscriber_new(cls_arg: type, *args: Any, **kwargs: Any) -> Any:
-            key = cls_arg._cache_key(*args, **kwargs)  # type: ignore[attr-defined]
+            key = cls_arg._cache_key_fn(cls_arg, *args, **kwargs)  # type: ignore[attr-defined]
             pool = __subscriber_pool__.get()
             if pool is None:
                 pool = ResourcePool(

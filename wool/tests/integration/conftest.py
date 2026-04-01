@@ -105,6 +105,11 @@ class RoutineBinding(Enum):
     STATICMETHOD = auto()
 
 
+class LazyMode(Enum):
+    LAZY = auto()
+    EAGER = auto()
+
+
 @dataclass(frozen=True)
 class Scenario:
     """Composable scenario describing one integration test configuration.
@@ -121,6 +126,7 @@ class Scenario:
     options: WorkerOptionsKind | None = None
     timeout: TimeoutKind | None = None
     binding: RoutineBinding | None = None
+    lazy: LazyMode | None = None
 
     def __or__(self, other: Scenario) -> Scenario:
         """Merge two partial scenarios. Right side wins on ``None`` fields.
@@ -141,7 +147,7 @@ class Scenario:
 
     @property
     def is_complete(self) -> bool:
-        """True when all 8 dimensions are set."""
+        """True when all 9 dimensions are set."""
         return all(getattr(self, f.name) is not None for f in fields(self))
 
     def __str__(self) -> str:
@@ -277,20 +283,24 @@ async def build_pool_from_scenario(scenario, credentials_map):
     if scenario.timeout is TimeoutKind.VIA_RUNTIME_CONTEXT:
         runtime_ctx = RuntimeContext(dispatch_timeout=30.0)
 
+    lazy = scenario.lazy is LazyMode.LAZY
+
     try:
         if runtime_ctx is not None:
             runtime_ctx.__enter__()
 
         try:
             if scenario.pool_mode is PoolMode.DURABLE:
-                async with _durable_pool_context(lb, creds, options) as pool:
+                async with _durable_pool_context(lb, creds, options, lazy) as pool:
                     yield pool
             elif scenario.pool_mode is PoolMode.DURABLE_SHARED:
-                async with _durable_shared_pool_context(lb, creds, options) as pool:
+                async with _durable_shared_pool_context(
+                    lb, creds, options, lazy
+                ) as pool:
                     yield pool
             elif scenario.pool_mode is PoolMode.DURABLE_JOINED:
                 async with _durable_joined_pool_context(
-                    scenario.discovery, lb, creds, options
+                    scenario.discovery, lb, creds, options, lazy
                 ) as pool:
                     yield pool
             else:
@@ -298,6 +308,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
                     "loadbalancer": lb,
                     "credentials": creds,
                     "worker": partial(LocalWorker, options=options),
+                    "lazy": lazy,
                 }
                 match scenario.pool_mode:
                     case PoolMode.DEFAULT:
@@ -345,7 +356,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
 
 
 @asynccontextmanager
-async def _durable_pool_context(lb, creds, options):
+async def _durable_pool_context(lb, creds, options, lazy):
     """Manually start a worker, register it, then create a DURABLE pool.
 
     DURABLE pools don't spawn workers — they only discover external
@@ -368,6 +379,7 @@ async def _durable_pool_context(lb, creds, options):
                         discovery=_DirectDiscovery(discovery),
                         loadbalancer=lb,
                         credentials=creds,
+                        lazy=lazy,
                     )
                     async with pool:
                         yield pool
@@ -378,7 +390,7 @@ async def _durable_pool_context(lb, creds, options):
 
 
 @asynccontextmanager
-async def _durable_shared_pool_context(lb, creds, options):
+async def _durable_shared_pool_context(lb, creds, options, lazy):
     """Create two pools sharing the same LocalDiscovery subscriber.
 
     Exercises ``SubscriberMeta`` singleton caching and
@@ -401,11 +413,13 @@ async def _durable_shared_pool_context(lb, creds, options):
                         discovery=shared,
                         loadbalancer=lb,
                         credentials=creds,
+                        lazy=lazy,
                     )
                     pool_b = WorkerPool(
                         discovery=shared,
                         loadbalancer=lb,
                         credentials=creds,
+                        lazy=lazy,
                     )
                     async with pool_a:
                         async with pool_b:
@@ -455,7 +469,7 @@ def _resolve_joiner(namespace, factory):
 
 
 @asynccontextmanager
-async def _durable_joined_pool_context(discovery_factory, lb, creds, options):
+async def _durable_joined_pool_context(discovery_factory, lb, creds, options, lazy):
     """Create a DURABLE pool that joins an externally owned namespace.
 
     Sets up an owner ``LocalDiscovery`` that creates workers and publishes
@@ -480,6 +494,7 @@ async def _durable_joined_pool_context(discovery_factory, lb, creds, options):
                         discovery=joiner,
                         loadbalancer=lb,
                         credentials=creds,
+                        lazy=lazy,
                     )
                     async with pool:
                         yield pool
@@ -704,6 +719,7 @@ PAIRWISE_SCENARIOS = [
         options=row[5],
         timeout=row[6],
         binding=row[7],
+        lazy=row[8],
     )
     for row in AllPairs(
         [
@@ -715,6 +731,7 @@ PAIRWISE_SCENARIOS = [
             list(WorkerOptionsKind),
             list(TimeoutKind),
             list(RoutineBinding),
+            list(LazyMode),
         ],
         filter_func=_pairwise_filter,
     )
@@ -774,6 +791,8 @@ def scenarios_strategy(draw):
     else:
         binding = draw(st.sampled_from(RoutineBinding))
 
+    lazy = draw(st.sampled_from(LazyMode))
+
     return Scenario(
         shape=shape,
         pool_mode=pool_mode,
@@ -783,6 +802,7 @@ def scenarios_strategy(draw):
         options=options,
         timeout=timeout,
         binding=binding,
+        lazy=lazy,
     )
 
 

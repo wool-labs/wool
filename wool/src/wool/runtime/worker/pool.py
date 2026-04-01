@@ -26,6 +26,7 @@ from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.proxy import LoadBalancerLike
 from wool.runtime.worker.proxy import RoundRobinLoadBalancer
 from wool.runtime.worker.proxy import WorkerProxy
+from wool.utilities.noreentry import noreentry
 
 
 # public
@@ -180,6 +181,7 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ):
         """
         Create an ephemeral pool of workers, spawning the specified
@@ -197,6 +199,7 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ):
         """
         Connect to an existing pool of workers discovered by the
@@ -216,6 +219,7 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ):
         """
         Create a hybrid pool that spawns local workers and discovers
@@ -236,6 +240,7 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ): ...
 
     @overload
@@ -251,6 +256,7 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ): ...
 
     def __init__(
@@ -265,9 +271,11 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
+        lazy: bool = True,
     ):
         self._workers = {}
         self._credentials = credentials
+        self._lazy = lazy
 
         if size is not None and spawn is not None:
             raise TypeError(
@@ -310,6 +318,7 @@ class WorkerPool:
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
                                 lease=max_workers,
+                                lazy=self._lazy,
                             ):
                                 yield
                     finally:
@@ -335,6 +344,7 @@ class WorkerPool:
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
                                 lease=max_workers,
+                                lazy=self._lazy,
                             ):
                                 yield
 
@@ -353,6 +363,7 @@ class WorkerPool:
                             loadbalancer=loadbalancer,
                             credentials=self._credentials,
                             lease=lease,
+                            lazy=self._lazy,
                         ):
                             yield
                     finally:
@@ -378,6 +389,7 @@ class WorkerPool:
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
                                 lease=max_workers,
+                                lazy=self._lazy,
                             ):
                                 yield
 
@@ -386,6 +398,7 @@ class WorkerPool:
 
         self._proxy_factory = create_proxy
 
+    @noreentry
     async def __aenter__(self) -> WorkerPool:
         """Starts the worker pool and its services, returning a session.
 
@@ -394,6 +407,10 @@ class WorkerPool:
 
         :returns:
             The :class:`WorkerPool` instance itself for method chaining.
+        :raises RuntimeError:
+            If the pool has already been entered.  ``WorkerPool``
+            contexts are single-use — create a new instance instead
+            of re-entering.
         """
         self._proxy_context = self._proxy_factory()
         await self._proxy_context.__aenter__()

@@ -560,7 +560,14 @@ class LocalDiscovery(Discovery):
                 pass  # pragma: no cover
             atexit.unregister(self._cleanups.pop(shared_memory.name))
 
-    class Subscriber(metaclass=SubscriberMeta):
+    class Subscriber(
+        metaclass=SubscriberMeta,
+        key=lambda cls, namespace, *, poll_interval=None: (
+            cls,
+            namespace,
+            poll_interval,
+        ),
+    ):
         """Subscriber for receiving worker discovery events.
 
         Subscribes to worker :class:`discovery events <~wool.DiscoveryEvent>`
@@ -599,10 +606,6 @@ class LocalDiscovery(Discovery):
             if poll_interval is not None and poll_interval < 0:
                 raise ValueError(f"Expected positive poll interval, got {poll_interval}")
             self._poll_interval = poll_interval
-
-        @classmethod
-        def _cache_key(cls, namespace: str, *, poll_interval: float | None = None):
-            return (cls, namespace, poll_interval)
 
         async def _shutdown(self) -> None:
             """Clean up shared subscription state for this subscriber."""

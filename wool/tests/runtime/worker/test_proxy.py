@@ -647,19 +647,51 @@ class TestWorkerProxy:
         user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
         assert user_warnings == []
 
+    def test___init___with_default_lazy(self, mock_discovery_service):
+        """Test WorkerProxy defaults to lazy initialization.
+
+        Given:
+            A discovery service.
+        When:
+            WorkerProxy is instantiated with default parameters.
+        Then:
+            It should have lazy set to True.
+        """
+        # Act
+        proxy = WorkerProxy(discovery=mock_discovery_service)
+
+        # Assert
+        assert proxy.lazy is True
+
+    def test___init___with_lazy_false(self, mock_discovery_service):
+        """Test WorkerProxy accepts explicit lazy=False.
+
+        Given:
+            A discovery service and lazy=False.
+        When:
+            WorkerProxy is instantiated.
+        Then:
+            It should have lazy set to False.
+        """
+        # Act
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
+
+        # Assert
+        assert proxy.lazy is False
+
     @pytest.mark.asyncio
     async def test___aenter___lifecycle(self, mock_discovery_service):
         """Test it starts and stops correctly.
 
         Given:
-            A WorkerProxy configured with discovery service
+            A non-lazy WorkerProxy configured with discovery service
         When:
             The proxy is used as a context manager
         Then:
             It starts and stops correctly
         """
         # Arrange
-        proxy = WorkerProxy(discovery=mock_discovery_service)
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
         entered = False
         exited = False
 
@@ -708,14 +740,14 @@ class TestWorkerProxy:
         """Test set the started flag to True.
 
         Given:
-            An unstarted WorkerProxy instance
+            A non-lazy unstarted WorkerProxy instance
         When:
             Start is called
         Then:
             It should set the started flag to True
         """
         # Arrange
-        proxy = WorkerProxy(discovery=mock_discovery_service)
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
 
         # Act
         await proxy.start()
@@ -724,18 +756,99 @@ class TestWorkerProxy:
         assert proxy.started
 
     @pytest.mark.asyncio
+    async def test_enter_with_lazy_proxy(self, mock_discovery_service):
+        """Test enter defers startup for lazy proxies.
+
+        Given:
+            A lazy WorkerProxy that has not been entered.
+        When:
+            enter() is called.
+        Then:
+            It should remain un-started.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service)
+
+        # Act
+        await proxy.enter()
+
+        # Assert
+        assert not proxy.started
+
+    @pytest.mark.asyncio
+    async def test_enter_with_non_lazy_proxy(
+        self, mock_discovery_service, mock_proxy_session
+    ):
+        """Test enter eagerly starts a non-lazy proxy.
+
+        Given:
+            A non-lazy WorkerProxy that has not been entered.
+        When:
+            enter() is called.
+        Then:
+            It should set started to True.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
+
+        # Act
+        await proxy.enter()
+
+        # Assert
+        assert proxy.started
+
+    @pytest.mark.asyncio
+    async def test_enter_already_entered_raises_error(self, mock_discovery_service):
+        """Test enter raises on reentrant call.
+
+        Given:
+            A lazy WorkerProxy that has already been entered.
+        When:
+            enter() is called a second time.
+        Then:
+            It should raise RuntimeError.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service)
+        await proxy.enter()
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="cannot be invoked more than once"):
+            await proxy.enter()
+
+    @pytest.mark.asyncio
+    async def test_enter_after_exit_raises_error(self, mock_discovery_service):
+        """Test enter raises after a full enter/exit cycle.
+
+        Given:
+            A lazy WorkerProxy that has been entered and exited.
+        When:
+            enter() is called again.
+        Then:
+            It should raise RuntimeError because the context is single-use.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service)
+        await proxy.enter()
+        await proxy.exit()
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="cannot be invoked more than once"):
+            await proxy.enter()
+
+    @pytest.mark.asyncio
     async def test_stop_clears_state(self, mock_discovery_service, mock_proxy_session):
         """Test clear workers and reset the started flag to False.
 
         Given:
-            A started WorkerProxy with registered workers
+            A started WorkerProxy with registered workers.
         When:
-            Stop is called
+            stop() is called.
         Then:
-            It should clear workers and reset the started flag to False
+            It should clear workers and reset the started flag to False.
         """
         # Arrange
-        proxy = WorkerProxy(discovery=mock_discovery_service)
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
         await proxy.start()
 
         # Act
@@ -752,14 +865,14 @@ class TestWorkerProxy:
         """Test raise RuntimeError.
 
         Given:
-            A WorkerProxy that is already started
+            A non-lazy WorkerProxy that is already started
         When:
             Start is called again
         Then:
             It should raise RuntimeError
         """
         # Arrange
-        proxy = WorkerProxy(discovery=mock_discovery_service)
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
         await proxy.start()
 
         # Act & assert
@@ -767,22 +880,64 @@ class TestWorkerProxy:
             await proxy.start()
 
     @pytest.mark.asyncio
-    async def test_stop_not_started_raises_error(self, mock_discovery_service):
+    async def test_exit_not_started_raises_error(self, mock_discovery_service):
         """Test raise RuntimeError.
 
         Given:
-            A WorkerProxy that is not started
+            A non-lazy WorkerProxy that is not started.
         When:
-            Stop is called
+            exit() is called.
         Then:
-            It should raise RuntimeError
+            It should raise RuntimeError.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="Proxy not started"):
+            await proxy.exit()
+
+    @pytest.mark.asyncio
+    async def test_exit_with_unstarted_lazy_proxy(self, mock_discovery_service):
+        """Test exit is a no-op on an un-started lazy proxy.
+
+        Given:
+            A lazy WorkerProxy that was never started.
+        When:
+            exit() is called.
+        Then:
+            It should return without raising.
         """
         # Arrange
         proxy = WorkerProxy(discovery=mock_discovery_service)
 
-        # Act & assert
-        with pytest.raises(RuntimeError, match="Proxy not started"):
-            await proxy.stop()
+        # Act & assert — should not raise
+        await proxy.exit()
+
+    @pytest.mark.asyncio
+    async def test_exit_stops_started_lazy_proxy(
+        self, mock_discovery_service, mock_proxy_session
+    ):
+        """Test exit stops a lazy proxy that was started.
+
+        Given:
+            A lazy WorkerProxy that was entered and subsequently started.
+        When:
+            exit() is called.
+        Then:
+            It should stop the proxy and set started to False.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service)
+        await proxy.enter()
+        await proxy.start()
+        assert proxy.started
+
+        # Act
+        await proxy.exit()
+
+        # Assert
+        assert not proxy.started
 
     @pytest.mark.asyncio
     async def test___aenter___enter_starts_proxy(
@@ -791,14 +946,14 @@ class TestWorkerProxy:
         """Test automatically start the proxy.
 
         Given:
-            An unstarted WorkerProxy
+            A non-lazy unstarted WorkerProxy
         When:
             The async context manager is entered
         Then:
             It should automatically start the proxy
         """
         # Arrange
-        proxy = WorkerProxy(discovery=mock_discovery_service)
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
 
         # Act & assert
         async with proxy as p:
@@ -811,14 +966,14 @@ class TestWorkerProxy:
         """Test automatically stop the proxy.
 
         Given:
-            A WorkerProxy within async context
+            A non-lazy WorkerProxy within async context
         When:
             The async context manager exits
         Then:
             It should automatically stop the proxy
         """
         # Arrange
-        proxy = WorkerProxy(discovery=mock_discovery_service)
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
 
         # Act
         async with proxy:
@@ -834,8 +989,8 @@ class TestWorkerProxy:
         """Test start/stop with sync context manager load balancer.
 
         Given:
-            A WorkerProxy with a load balancer provided as a sync
-            context manager.
+            A non-lazy WorkerProxy with a load balancer provided as a
+            sync context manager.
         When:
             start() then stop() are called.
         Then:
@@ -859,7 +1014,9 @@ class TestWorkerProxy:
                 self.exited = True
 
         cm = SyncCM()
-        proxy = WorkerProxy(discovery=mock_discovery_service, loadbalancer=cm)
+        proxy = WorkerProxy(
+            discovery=mock_discovery_service, loadbalancer=cm, lazy=False
+        )
 
         # Act
         await proxy.start()
@@ -879,8 +1036,8 @@ class TestWorkerProxy:
         """Test start/stop with async context manager load balancer.
 
         Given:
-            A WorkerProxy with a load balancer provided as an async
-            context manager.
+            A non-lazy WorkerProxy with a load balancer provided as an
+            async context manager.
         When:
             start() then stop() are called.
         Then:
@@ -904,7 +1061,9 @@ class TestWorkerProxy:
                 self.exited = True
 
         cm = AsyncCM()
-        proxy = WorkerProxy(discovery=mock_discovery_service, loadbalancer=cm)
+        proxy = WorkerProxy(
+            discovery=mock_discovery_service, loadbalancer=cm, lazy=False
+        )
 
         # Act
         await proxy.start()
@@ -924,8 +1083,8 @@ class TestWorkerProxy:
         """Test start with an awaitable load balancer.
 
         Given:
-            A WorkerProxy with a load balancer provided as a bare
-            awaitable (coroutine object).
+            A non-lazy WorkerProxy with a load balancer provided as a
+            bare awaitable (coroutine object).
         When:
             start() is called.
         Then:
@@ -939,7 +1098,9 @@ class TestWorkerProxy:
         async def make_lb():
             return mock_lb
 
-        proxy = WorkerProxy(discovery=mock_discovery_service, loadbalancer=make_lb())
+        proxy = WorkerProxy(
+            discovery=mock_discovery_service, loadbalancer=make_lb(), lazy=False
+        )
 
         # Act
         await proxy.start()
@@ -1055,7 +1216,7 @@ class TestWorkerProxy:
         """Test the proxy handles worker-updated events.
 
         Given:
-            A started WorkerProxy with a discovered worker.
+            A non-lazy, started WorkerProxy with a discovered worker.
         When:
             A "worker-updated" event is received for that worker.
         Then:
@@ -1074,7 +1235,7 @@ class TestWorkerProxy:
             DiscoveryEvent("worker-updated", metadata=metadata),
         ]
         discovery = wp.ReducibleAsyncIterator(events)
-        proxy = WorkerProxy(discovery=discovery)
+        proxy = WorkerProxy(discovery=discovery, lazy=False)
 
         # Act
         await proxy.start()
@@ -1093,8 +1254,9 @@ class TestWorkerProxy:
         """Test sentinel creates WorkerConnection with metadata options.
 
         Given:
-            A WorkerProxy with a discovery stream yielding a worker-added
-            event whose metadata has options=ChannelOptions(keepalive_time_ms=60000)
+            A non-lazy WorkerProxy with a discovery stream yielding a
+            worker-added event whose metadata has
+            options=ChannelOptions(keepalive_time_ms=60000)
         When:
             The sentinel processes the event
         Then:
@@ -1117,7 +1279,7 @@ class TestWorkerProxy:
         )
         events = [DiscoveryEvent("worker-added", metadata=metadata)]
         discovery = wp.ReducibleAsyncIterator(events)
-        proxy = WorkerProxy(discovery=discovery)
+        proxy = WorkerProxy(discovery=discovery, lazy=False)
 
         # Act
         await proxy.start()
@@ -1140,8 +1302,8 @@ class TestWorkerProxy:
         """Test sentinel creates WorkerConnection with options=None for legacy workers.
 
         Given:
-            A WorkerProxy with a discovery stream yielding a worker-added
-            event whose metadata has options=None
+            A non-lazy WorkerProxy with a discovery stream yielding a
+            worker-added event whose metadata has options=None
         When:
             The sentinel processes the event
         Then:
@@ -1161,7 +1323,7 @@ class TestWorkerProxy:
         )
         events = [DiscoveryEvent("worker-added", metadata=metadata)]
         discovery = wp.ReducibleAsyncIterator(events)
-        proxy = WorkerProxy(discovery=discovery)
+        proxy = WorkerProxy(discovery=discovery, lazy=False)
 
         # Act
         await proxy.start()
@@ -1184,9 +1346,9 @@ class TestWorkerProxy:
         """Test sentinel creates WorkerConnection with updated metadata options.
 
         Given:
-            A WorkerProxy with a discovery stream yielding a worker-added
-            event followed by a worker-updated event whose metadata has
-            options=ChannelOptions(keepalive_time_ms=90000)
+            A non-lazy WorkerProxy with a discovery stream yielding a
+            worker-added event followed by a worker-updated event whose
+            metadata has options=ChannelOptions(keepalive_time_ms=90000)
         When:
             The sentinel processes the events
         Then:
@@ -1221,7 +1383,7 @@ class TestWorkerProxy:
             DiscoveryEvent("worker-updated", metadata=updated_metadata),
         ]
         discovery = wp.ReducibleAsyncIterator(events)
-        proxy = WorkerProxy(discovery=discovery)
+        proxy = WorkerProxy(discovery=discovery, lazy=False)
 
         # Act
         await proxy.start()
@@ -1292,8 +1454,8 @@ class TestWorkerProxy:
         """Test sentinel respects lease cap on worker-added events.
 
         Given:
-            A WorkerProxy with lease=2 and a discovery stream with
-            3 worker-added events
+            A non-lazy WorkerProxy with lease=2 and a discovery stream
+            with 3 worker-added events
         When:
             The sentinel processes all events
         Then:
@@ -1312,7 +1474,7 @@ class TestWorkerProxy:
         ]
         events = [DiscoveryEvent("worker-added", metadata=w) for w in workers]
         discovery = wp.ReducibleAsyncIterator(events)
-        proxy = WorkerProxy(discovery=discovery, lease=2)
+        proxy = WorkerProxy(discovery=discovery, lease=2, lazy=False)
 
         # Act
         await proxy.start()
@@ -1331,8 +1493,8 @@ class TestWorkerProxy:
         """Test sentinel accepts all workers when lease is None.
 
         Given:
-            A WorkerProxy with lease=None and a discovery stream
-            with 3 worker-added events
+            A non-lazy WorkerProxy with lease=None and a discovery
+            stream with 3 worker-added events
         When:
             The sentinel processes all events
         Then:
@@ -1351,7 +1513,7 @@ class TestWorkerProxy:
         ]
         events = [DiscoveryEvent("worker-added", metadata=w) for w in workers]
         discovery = wp.ReducibleAsyncIterator(events)
-        proxy = WorkerProxy(discovery=discovery, lease=None)
+        proxy = WorkerProxy(discovery=discovery, lease=None, lazy=False)
 
         # Act
         await proxy.start()
@@ -1370,7 +1532,7 @@ class TestWorkerProxy:
         """Test sentinel processes worker-updated events even at capacity.
 
         Given:
-            A WorkerProxy with lease=2, already at capacity,
+            A non-lazy WorkerProxy with lease=2, already at capacity,
             receiving a worker-updated event
         When:
             The sentinel processes the update event
@@ -1397,7 +1559,7 @@ class TestWorkerProxy:
             DiscoveryEvent("worker-updated", metadata=worker1),
         ]
         discovery = wp.ReducibleAsyncIterator(events)
-        proxy = WorkerProxy(discovery=discovery, lease=2)
+        proxy = WorkerProxy(discovery=discovery, lease=2, lazy=False)
 
         # Act
         await proxy.start()
@@ -1417,8 +1579,9 @@ class TestWorkerProxy:
         """Test drop restores capacity for a subsequent worker-added event.
 
         Given:
-            A WorkerProxy with lease=2, at capacity with 2 workers,
-            then one worker is dropped followed by a new worker-added
+            A non-lazy WorkerProxy with lease=2, at capacity with 2
+            workers, then one worker is dropped followed by a new
+            worker-added
         When:
             The proxy processes all events
         Then:
@@ -1451,7 +1614,7 @@ class TestWorkerProxy:
             DiscoveryEvent("worker-added", metadata=worker3),
         ]
         discovery = wp.ReducibleAsyncIterator(events)
-        proxy = WorkerProxy(discovery=discovery, lease=2)
+        proxy = WorkerProxy(discovery=discovery, lease=2, lazy=False)
 
         # Act
         await proxy.start()
@@ -1472,8 +1635,8 @@ class TestWorkerProxy:
         """Test worker-updated for a cap-rejected worker is silently dropped.
 
         Given:
-            A WorkerProxy with lease=1 and a discovery stream where
-            worker2 is rejected by the cap, then a worker-updated
+            A non-lazy WorkerProxy with lease=1 and a discovery stream
+            where worker2 is rejected by the cap, then a worker-updated
             event arrives for worker2
         When:
             The proxy processes all events
@@ -1500,7 +1663,7 @@ class TestWorkerProxy:
             DiscoveryEvent("worker-updated", metadata=worker2),  # dropped
         ]
         discovery = wp.ReducibleAsyncIterator(events)
-        proxy = WorkerProxy(discovery=discovery, lease=1)
+        proxy = WorkerProxy(discovery=discovery, lease=1, lazy=False)
 
         # Act
         await proxy.start()
@@ -1521,7 +1684,7 @@ class TestWorkerProxy:
         """Test pickle round-trip preserves lease cap behavior.
 
         Given:
-            A WorkerProxy with lease=2 and a discovery stream
+            A non-lazy WorkerProxy with lease=2 and a discovery stream
             with 3 worker-added events
         When:
             The proxy is pickled, unpickled, started, and processes
@@ -1547,6 +1710,7 @@ class TestWorkerProxy:
             discovery=discovery,
             loadbalancer=wp.RoundRobinLoadBalancer,
             lease=2,
+            lazy=False,
         )
 
         # Act — pickle round-trip, then start the restored proxy
@@ -1558,6 +1722,69 @@ class TestWorkerProxy:
         # Assert — restored proxy enforces the cap
         assert len(restored.workers) == 2
         await restored.stop()
+
+    def test_cloudpickle_serialization_with_lazy_false(self, mock_discovery_service):
+        """Test pickle round-trip with explicit lazy=False.
+
+        Given:
+            A WorkerProxy with lazy=False.
+        When:
+            The proxy is pickled and unpickled.
+        Then:
+            It should preserve lazy as False on the restored proxy.
+        """
+        # Arrange
+        proxy = WorkerProxy(
+            discovery=mock_discovery_service,
+            loadbalancer=wp.RoundRobinLoadBalancer,
+            lazy=False,
+        )
+
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(proxy))
+
+        # Assert
+        assert restored.lazy is False
+
+    def test_cloudpickle_serialization_with_default_lazy(self, mock_discovery_service):
+        """Test pickle round-trip with default lazy=True.
+
+        Given:
+            A WorkerProxy with default lazy=True.
+        When:
+            The proxy is pickled and unpickled.
+        Then:
+            It should preserve lazy as True on the restored proxy.
+        """
+        # Arrange
+        proxy = WorkerProxy(
+            discovery=mock_discovery_service,
+            loadbalancer=wp.RoundRobinLoadBalancer,
+        )
+
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(proxy))
+
+        # Assert
+        assert restored.lazy is True
+
+    @given(lazy=st.booleans())
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test___init___with_arbitrary_lazy_value(self, mock_discovery_service, lazy):
+        """Test instantiation with an arbitrary lazy value.
+
+        Given:
+            An arbitrary boolean value for lazy.
+        When:
+            WorkerProxy is instantiated with that value.
+        Then:
+            It should set the lazy property to the given value.
+        """
+        # Act
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=lazy)
+
+        # Assert
+        assert proxy.lazy is lazy
 
     @pytest.mark.asyncio
     async def test_dispatch_delegates_to_loadbalancer(
@@ -1610,19 +1837,110 @@ class TestWorkerProxy:
         """Test raise RuntimeError.
 
         Given:
-            A WorkerProxy that is not started
+            A non-lazy WorkerProxy that is not started
         When:
             Dispatch is called
         Then:
             It should raise RuntimeError
         """
         # Arrange
-        proxy = WorkerProxy(discovery=mock_discovery_service)
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
 
         # Act & assert
         with pytest.raises(RuntimeError, match="Proxy not started"):
             async for _ in await proxy.dispatch(mock_wool_task):
                 pass
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_lazy_auto_start(
+        self,
+        spy_loadbalancer_with_workers,
+        spy_discovery_with_events,
+        mock_worker_connection,
+        mock_wool_task,
+        mock_proxy_session,
+        mocker,
+    ):
+        """Test dispatch auto-starts a lazy proxy on first call.
+
+        Given:
+            A lazy WorkerProxy that has not been started.
+        When:
+            dispatch() is called.
+        Then:
+            It should auto-start the proxy and dispatch the task.
+        """
+        # Arrange
+        discovery, metadata = spy_discovery_with_events
+
+        proxy = WorkerProxy(
+            discovery=discovery,
+            loadbalancer=spy_loadbalancer_with_workers,
+        )
+
+        spy_loadbalancer_with_workers.worker_added_callback(
+            mock_worker_connection, metadata
+        )
+
+        assert not proxy.started
+
+        # Act
+        result_iterator = await proxy.dispatch(mock_wool_task)
+        results = [result async for result in result_iterator]
+
+        # Assert
+        assert proxy.started
+        assert results == ["test_result"]
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_lazy_concurrent_start(
+        self,
+        spy_loadbalancer_with_workers,
+        spy_discovery_with_events,
+        mock_worker_connection,
+        mock_proxy_session,
+        mocker,
+    ):
+        """Test concurrent dispatch calls start the proxy only once.
+
+        Given:
+            A lazy WorkerProxy that has not been started.
+        When:
+            Two dispatch() calls are made concurrently.
+        Then:
+            It should start the proxy and both dispatches should succeed.
+        """
+        # Arrange
+        discovery, metadata = spy_discovery_with_events
+
+        proxy = WorkerProxy(
+            discovery=discovery,
+            loadbalancer=spy_loadbalancer_with_workers,
+        )
+
+        spy_loadbalancer_with_workers.worker_added_callback(
+            mock_worker_connection, metadata
+        )
+
+        task = mocker.MagicMock(spec=Task)
+        spy_loadbalancer_with_workers.dispatch = mocker.AsyncMock(
+            return_value=mocker.AsyncMock(
+                __aiter__=mocker.Mock(return_value=mocker.AsyncMock()),
+                __anext__=mocker.AsyncMock(side_effect=StopAsyncIteration),
+            )
+        )
+
+        # Act
+        await asyncio.gather(
+            proxy.dispatch(task),
+            proxy.dispatch(task),
+        )
+
+        # Assert
+        assert proxy.started
+        assert spy_loadbalancer_with_workers.dispatch.call_count == 2
+        await proxy.stop()
 
     @pytest.mark.asyncio
     async def test_dispatch_propagates_loadbalancer_errors(
@@ -1845,7 +2163,7 @@ class TestWorkerProxy:
             ),
         ]
 
-        proxy = WorkerProxy(workers=workers)
+        proxy = WorkerProxy(workers=workers, lazy=False)
 
         # Act & assert
         async with proxy as p:
@@ -1860,14 +2178,14 @@ class TestWorkerProxy:
         """Test it starts and stops correctly.
 
         Given:
-            A WorkerProxy configured with a pool URI
+            A non-lazy WorkerProxy configured with a pool URI
         When:
             The proxy is used as a context manager
         Then:
             It starts and stops correctly
         """
         # Arrange
-        proxy = WorkerProxy("test://pool")
+        proxy = WorkerProxy("test://pool", lazy=False)
 
         # Act & assert
         async with proxy as p:
@@ -1902,7 +2220,7 @@ class TestWorkerProxy:
         await mock_discovery_service.start()
         mock_discovery_service.inject_worker_added(metadata)
 
-        proxy = WorkerProxy(discovery=mock_discovery_service)
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False)
 
         # Act
         async with proxy:
@@ -1996,7 +2314,9 @@ class TestWorkerProxy:
         # Arrange - Use real objects instead of mocks for cloudpickle test
         discovery_service = LocalDiscovery("test-pool").subscriber
         proxy = WorkerProxy(
-            discovery=discovery_service, loadbalancer=wp.RoundRobinLoadBalancer
+            discovery=discovery_service,
+            loadbalancer=wp.RoundRobinLoadBalancer,
+            lazy=False,
         )
 
         # Act & assert
@@ -2018,7 +2338,7 @@ class TestWorkerProxy:
         in an unstarted state.
 
         Given:
-            A started WorkerProxy with only discovery service
+            A non-lazy started WorkerProxy with only discovery service
         When:
             Cloudpickle serialization and deserialization are performed within
             context
@@ -2028,7 +2348,7 @@ class TestWorkerProxy:
         """
         # Arrange - Use real objects instead of mocks for cloudpickle test
         discovery_service = LocalDiscovery("test-pool").subscriber
-        proxy = WorkerProxy(discovery=discovery_service)
+        proxy = WorkerProxy(discovery=discovery_service, lazy=False)
 
         # Act & assert
         async with proxy:
@@ -2049,7 +2369,7 @@ class TestWorkerProxy:
         in an unstarted state and preserved ID.
 
         Given:
-            A started WorkerProxy created with only a URI
+            A non-lazy started WorkerProxy created with only a URI
         When:
             Cloudpickle serialization and deserialization are performed within
             context
@@ -2058,7 +2378,7 @@ class TestWorkerProxy:
             proxy in an unstarted state and preserved ID
         """
         # Arrange - Use real objects - this creates a LocalDiscovery internally
-        proxy = WorkerProxy("pool-1")
+        proxy = WorkerProxy("pool-1", lazy=False)
 
         # Act & assert
         async with proxy:
@@ -2189,6 +2509,7 @@ class TestWorkerProxy:
             # static workers — default credentials resolve from ContextVar.
             restored_proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
+                lazy=False,
             )
 
         # Assert — resolved credentials from ContextVar: only secure workers
@@ -2324,7 +2645,8 @@ class TestWorkerProxy:
 
         Given:
             A WorkerCredentials context is active with mTLS credentials
-            and a mix of secure and insecure static workers.
+            and a non-lazy WorkerProxy with a mix of secure and insecure
+            static workers.
         When:
             WorkerProxy is created with explicit None credentials.
         Then:
@@ -2353,6 +2675,7 @@ class TestWorkerProxy:
             proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
                 credentials=None,
+                lazy=False,
             )
 
         await proxy.start()
@@ -2370,8 +2693,9 @@ class TestWorkerProxy:
         """Test default credentials resolves from ContextVar.
 
         Given:
-            A WorkerCredentials context is active and a mix of secure
-            and insecure static workers.
+            A WorkerCredentials context is active and a non-lazy
+            WorkerProxy with a mix of secure and insecure static
+            workers.
         When:
             WorkerProxy is created without explicit credentials.
         Then:
@@ -2399,6 +2723,7 @@ class TestWorkerProxy:
         with CredentialContext(worker_credentials):
             proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
+                lazy=False,
             )
 
         await proxy.start()
@@ -2416,8 +2741,9 @@ class TestWorkerProxy:
         """Test credentials resolve to None when no context is set.
 
         Given:
-            No WorkerCredentials context is active and a mix of secure
-            and insecure static workers.
+            No WorkerCredentials context is active and a non-lazy
+            WorkerProxy with a mix of secure and insecure static
+            workers.
         When:
             WorkerProxy is created without explicit credentials.
         Then:
@@ -2444,6 +2770,7 @@ class TestWorkerProxy:
         # Act
         proxy = WorkerProxy(
             workers=[secure_worker, insecure_worker],
+            lazy=False,
         )
 
         await proxy.start()
@@ -2461,7 +2788,8 @@ class TestWorkerProxy:
         """Test raise ValueError.
 
         Given:
-            A WorkerProxy with a loadbalancer that doesn't implement LoadBalancerLike
+            A non-lazy WorkerProxy with a loadbalancer that doesn't
+            implement LoadBalancerLike
         When:
             Start() is called
         Then:
@@ -2475,7 +2803,9 @@ class TestWorkerProxy:
         invalid_loadbalancer = NotALoadBalancer()
 
         proxy = WorkerProxy(
-            pool_uri="test-pool", loadbalancer=lambda: invalid_loadbalancer
+            pool_uri="test-pool",
+            loadbalancer=lambda: invalid_loadbalancer,
+            lazy=False,
         )
 
         # Act & assert
@@ -2489,7 +2819,8 @@ class TestWorkerProxy:
         """Test raise ValueError.
 
         Given:
-            A WorkerProxy with a discovery that doesn't implement AsyncIterator
+            A non-lazy WorkerProxy with a discovery that doesn't
+            implement AsyncIterator
         When:
             Start() is called
         Then:
@@ -2498,7 +2829,7 @@ class TestWorkerProxy:
         # Arrange - use a simple string which is definitely not an AsyncIterator
         invalid_discovery = "not_an_async_iterator"
 
-        proxy = WorkerProxy(discovery=lambda: invalid_discovery)
+        proxy = WorkerProxy(discovery=lambda: invalid_discovery, lazy=False)
 
         # Act & assert
         with pytest.raises(ValueError):
@@ -2511,8 +2842,8 @@ class TestWorkerProxy:
         """Test only secure workers are discovered with credentials.
 
         Given:
-            A WorkerProxy instantiated with credentials and a mix
-            of secure and insecure static workers.
+            A non-lazy WorkerProxy instantiated with credentials and a
+            mix of secure and insecure static workers.
         When:
             The proxy is started and discovery events are processed.
         Then:
@@ -2538,6 +2869,7 @@ class TestWorkerProxy:
         proxy = WorkerProxy(
             workers=[secure_worker, insecure_worker],
             credentials=worker_credentials,
+            lazy=False,
         )
 
         # Act

@@ -4,6 +4,7 @@ import pytest
 
 from .conftest import CredentialType
 from .conftest import DiscoveryFactory
+from .conftest import LazyMode
 from .conftest import LbFactory
 from .conftest import PoolMode
 from .conftest import RoutineBinding
@@ -102,7 +103,7 @@ class TestScenario:
         """Test that a fully populated scenario reports complete.
 
         Given:
-            A scenario with all 8 dimensions set.
+            A scenario with all 9 dimensions set.
         When:
             ``is_complete`` is checked.
         Then:
@@ -118,6 +119,7 @@ class TestScenario:
             options=WorkerOptionsKind.DEFAULT,
             timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.LAZY,
         )
 
         # Act & assert
@@ -163,4 +165,4 @@ class TestScenario:
         result = str(scenario)
 
         # Assert
-        assert result == "COROUTINE-DEFAULT-_-_-_-_-_-_"
+        assert result == "COROUTINE-DEFAULT-_-_-_-_-_-_-_"
