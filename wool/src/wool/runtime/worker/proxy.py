@@ -33,6 +33,7 @@ from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
+from wool.utilities.noreentry import noreentry
 
 if TYPE_CHECKING:
     from contextvars import Token
@@ -413,6 +414,7 @@ class WorkerProxy:
         else:
             return []
 
+    @noreentry
     async def enter(self) -> None:
         """Enter the proxy context.
 
@@ -421,6 +423,10 @@ class WorkerProxy:
         :meth:`dispatch` is first called.  When ``lazy=False``,
         calls :meth:`start` eagerly.
 
+        :raises RuntimeError:
+            If the proxy has already been entered.  ``WorkerProxy``
+            contexts are single-use — create a new instance instead
+            of re-entering.
         :raises RuntimeError:
             If the proxy has already been started and ``lazy`` is
             ``False``.
