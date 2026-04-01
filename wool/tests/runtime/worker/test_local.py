@@ -704,3 +704,26 @@ class TestLocalWorker:
 
         # Assert
         assert worker.metadata is not None
+
+    def test___init___with_backpressure(self, mocker):
+        """Test LocalWorker initialization with backpressure hook.
+
+        Given:
+            A callable backpressure hook
+        When:
+            LocalWorker is instantiated with backpressure=hook
+        Then:
+            It should forward the hook to WorkerProcess
+        """
+        # Arrange
+        MockWorkerProcess = mocker.patch.object(local_module, "WorkerProcess")
+
+        def hook(ctx):
+            return ctx.active_task_count >= 4
+
+        # Act
+        LocalWorker(backpressure=hook)
+
+        # Assert
+        MockWorkerProcess.assert_called_once()
+        assert MockWorkerProcess.call_args.kwargs["backpressure"] is hook
