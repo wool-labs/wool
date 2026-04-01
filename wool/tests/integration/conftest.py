@@ -105,9 +105,25 @@ class RoutineBinding(Enum):
     STATICMETHOD = auto()
 
 
+class BackpressureMode(Enum):
+    NONE = auto()
+    SYNC = auto()
+    ASYNC = auto()
+
+
 class LazyMode(Enum):
     LAZY = auto()
     EAGER = auto()
+
+
+def _sync_accept_hook(ctx):
+    """Sync backpressure hook that accepts all tasks."""
+    return False
+
+
+async def _async_accept_hook(ctx):
+    """Async backpressure hook that accepts all tasks."""
+    return False
 
 
 @dataclass(frozen=True)
@@ -127,6 +143,7 @@ class Scenario:
     timeout: TimeoutKind | None = None
     binding: RoutineBinding | None = None
     lazy: LazyMode | None = None
+    backpressure: BackpressureMode | None = None
 
     def __or__(self, other: Scenario) -> Scenario:
         """Merge two partial scenarios. Right side wins on ``None`` fields.
@@ -147,7 +164,7 @@ class Scenario:
 
     @property
     def is_complete(self) -> bool:
-        """True when all 9 dimensions are set."""
+        """True when all 10 dimensions are set."""
         return all(getattr(self, f.name) is not None for f in fields(self))
 
     def __str__(self) -> str:
@@ -285,29 +302,46 @@ async def build_pool_from_scenario(scenario, credentials_map):
 
     lazy = scenario.lazy is LazyMode.LAZY
 
+    match scenario.backpressure:
+        case BackpressureMode.SYNC:
+            bp_hook = _sync_accept_hook
+        case BackpressureMode.ASYNC:
+            bp_hook = _async_accept_hook
+        case _:
+            bp_hook = None
+
     try:
         if runtime_ctx is not None:
             runtime_ctx.__enter__()
 
         try:
             if scenario.pool_mode is PoolMode.DURABLE:
-                async with _durable_pool_context(lb, creds, options, lazy) as pool:
+                async with _durable_pool_context(
+                    lb, creds, options, lazy, backpressure=bp_hook
+                ) as pool:
                     yield pool
             elif scenario.pool_mode is PoolMode.DURABLE_SHARED:
                 async with _durable_shared_pool_context(
-                    lb, creds, options, lazy
+                    lb, creds, options, lazy, backpressure=bp_hook
                 ) as pool:
                     yield pool
             elif scenario.pool_mode is PoolMode.DURABLE_JOINED:
                 async with _durable_joined_pool_context(
-                    scenario.discovery, lb, creds, options, lazy
+                    scenario.discovery,
+                    lb,
+                    creds,
+                    options,
+                    lazy,
+                    backpressure=bp_hook,
                 ) as pool:
                     yield pool
             else:
                 pool_kwargs = {
                     "loadbalancer": lb,
                     "credentials": creds,
-                    "worker": partial(LocalWorker, options=options),
+                    "worker": partial(
+                        LocalWorker, options=options, backpressure=bp_hook
+                    ),
                     "lazy": lazy,
                 }
                 match scenario.pool_mode:
@@ -356,7 +390,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
 
 
 @asynccontextmanager
-async def _durable_pool_context(lb, creds, options, lazy):
+async def _durable_pool_context(lb, creds, options, lazy, *, backpressure=None):
     """Manually start a worker, register it, then create a DURABLE pool.
 
     DURABLE pools don't spawn workers — they only discover external
@@ -368,7 +402,9 @@ async def _durable_pool_context(lb, creds, options, lazy):
     """
     namespace = f"durable-{uuid.uuid4().hex[:12]}"
     with LocalDiscovery(namespace) as discovery:
-        worker = LocalWorker(credentials=creds, options=options)
+        worker = LocalWorker(
+            credentials=creds, options=options, backpressure=backpressure
+        )
         await worker.start()
         try:
             publisher = discovery.publisher
@@ -390,7 +426,7 @@ async def _durable_pool_context(lb, creds, options, lazy):
 
 
 @asynccontextmanager
-async def _durable_shared_pool_context(lb, creds, options, lazy):
+async def _durable_shared_pool_context(lb, creds, options, lazy, *, backpressure=None):
     """Create two pools sharing the same LocalDiscovery subscriber.
 
     Exercises ``SubscriberMeta`` singleton caching and
@@ -401,7 +437,9 @@ async def _durable_shared_pool_context(lb, creds, options, lazy):
     """
     namespace = f"shared-{uuid.uuid4().hex[:12]}"
     with LocalDiscovery(namespace) as discovery:
-        worker = LocalWorker(credentials=creds, options=options)
+        worker = LocalWorker(
+            credentials=creds, options=options, backpressure=backpressure
+        )
         await worker.start()
         try:
             publisher = discovery.publisher
@@ -469,7 +507,9 @@ def _resolve_joiner(namespace, factory):
 
 
 @asynccontextmanager
-async def _durable_joined_pool_context(discovery_factory, lb, creds, options, lazy):
+async def _durable_joined_pool_context(
+    discovery_factory, lb, creds, options, lazy, *, backpressure=None
+):
     """Create a DURABLE pool that joins an externally owned namespace.
 
     Sets up an owner ``LocalDiscovery`` that creates workers and publishes
@@ -479,7 +519,7 @@ async def _durable_joined_pool_context(discovery_factory, lb, creds, options, la
     """
     namespace = f"joined-{uuid.uuid4().hex[:12]}"
 
-    worker = LocalWorker(credentials=creds, options=options)
+    worker = LocalWorker(credentials=creds, options=options, backpressure=backpressure)
     await worker.start()
     try:
         owner = LocalDiscovery(namespace)
@@ -720,6 +760,7 @@ PAIRWISE_SCENARIOS = [
         timeout=row[6],
         binding=row[7],
         lazy=row[8],
+        backpressure=row[9],
     )
     for row in AllPairs(
         [
@@ -732,6 +773,7 @@ PAIRWISE_SCENARIOS = [
             list(TimeoutKind),
             list(RoutineBinding),
             list(LazyMode),
+            list(BackpressureMode),
         ],
         filter_func=_pairwise_filter,
     )
@@ -792,6 +834,7 @@ def scenarios_strategy(draw):
         binding = draw(st.sampled_from(RoutineBinding))
 
     lazy = draw(st.sampled_from(LazyMode))
+    backpressure = draw(st.sampled_from(BackpressureMode))
 
     return Scenario(
         shape=shape,
@@ -803,6 +846,7 @@ def scenarios_strategy(draw):
         timeout=timeout,
         binding=binding,
         lazy=lazy,
+        backpressure=backpressure,
     )
 
 
