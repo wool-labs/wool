@@ -32,7 +32,9 @@ from wool.runtime.discovery.lan import AdvertiseHostError
 from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.lan import LoopbackAdvertisementWarning
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.loadbalancer.base import DispatchingLoadBalancerLike
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
+from wool.runtime.loadbalancer.base import LoadBalancerContextView
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
@@ -112,11 +114,13 @@ __all__ = [
     "DiscoveryLike",
     "DiscoveryPublisherLike",
     "DiscoverySubscriberLike",
+    "DispatchingLoadBalancerLike",
     "Factory",
     "IneffectiveLeaseWarning",
     "IneffectiveQuorumTimeoutWarning",
     "LanDiscovery",
     "LoadBalancerContextLike",
+    "LoadBalancerContextView",
     "LoadBalancerLike",
     "LocalDiscovery",
     "LocalWorker",
