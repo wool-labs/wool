@@ -16,13 +16,23 @@ Every skill in this pipeline is collaborative, not autonomous. The LLM agent pro
 ```
 llms/
 ├── README.md            ← you are here
-├── skills/
+├── skills/              ← LLM-agnostic skill definitions (portable)
 │   ├── issue.md         ← /issue — draft and push a GitHub issue
 │   ├── pr.md            ← /pr — create a branch and draft PR from an issue
 │   ├── implement.md     ← /implement — implement a planned PR or issue
 │   ├── test.md          ← /test — generate test specifications
 │   ├── commit.md        ← /commit — stage and commit changes atomically
+│   ├── review.md        ← /review — review a PR for compliance and quality
 │   └── audit.md         ← /audit — post-skill compliance checker
+├── dispatchers/         ← harness-specific subagent dispatch wrappers
+│   └── claude/          ← Claude Code dispatchers
+│       ├── issue.md
+│       ├── implement.md
+│       ├── test.md
+│       ├── commit.md
+│       ├── pr.md
+│       ├── review.md
+│       └── audit.md
 ├── test-guides/
 │   └── python.md        ← Python testing conventions
 └── style-guides/
@@ -136,13 +146,19 @@ sequenceDiagram
 
 The `style-guides/` directory contains format-specific authoring conventions (e.g., Markdown, YAML). These are **always-on context** — agents MUST read every file in `llms/style-guides/` at the start of a session and treat their rules as active constraints. The directory may be empty; if so, agents SHOULD default to following established convention already present in the codebase.
 
+## Dispatchers
+
+The `dispatchers/` directory contains harness-specific wrappers that execute each skill inside a subagent. Dispatchers are organized by harness — e.g., `dispatchers/claude/` for Claude Code. Each dispatcher spawns a dedicated subagent, passes it the corresponding skill definition from `skills/`, and relays the summary back to the parent context. This keeps the parent conversation clean — only the final summary and next-step prompt appear, while all intermediate tool calls (file reads, diffs, git operations) stay isolated in the subagent.
+
+The skill definitions in `skills/` remain LLM-agnostic and portable. The dispatchers are the harness layer — they contain orchestration instructions specific to the coding assistant's subagent mechanism. Adding support for a new harness means creating a new subdirectory under `dispatchers/` with harness-specific wrappers that delegate to the same skill definitions.
+
 ## Registration mechanism
 
-Each agentic coding assistant has its own convention for discovering skills and instructions. The registration mechanism bridges the canonical `llms/` content into whatever directory structure a given tool expects, typically via symlinks or config files. For example, an assistant that discovers skills in `.assistant/skills/` would have symlinks like:
+Each agentic coding assistant has its own convention for discovering skills and instructions. The registration mechanism bridges the canonical `llms/` content into whatever directory structure a given tool expects, typically via symlinks or config files. Symlinks point to dispatchers (not directly to skills) so that every invocation runs in a subagent. For example, an assistant that discovers skills in `.assistant/skills/` would have symlinks like:
 
 ```
-.assistant/skills/commit/SKILL.md    → ../../../llms/skills/commit.md
-.assistant/skills/implement/SKILL.md → ../../../llms/skills/implement.md
+.assistant/skills/commit.md    → ../../llms/dispatchers/<harness>/commit.md
+.assistant/skills/implement.md → ../../llms/dispatchers/<harness>/implement.md
 ```
 
 Guides are similarly symlinked where needed (e.g., `.assistant/skills/implement/TESTGUIDE.md → ../../../llms/test-guides/python.md`). This keeps the canonical content in `llms/` while letting each tool's skill discovery find it automatically.
