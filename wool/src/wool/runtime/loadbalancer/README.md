@@ -79,8 +79,10 @@ class LeastLoadedBalancer:
             )
             try:
                 sent = yield metadata, connection
-            except BaseException:
+            except Exception:
                 # Dispatch failed. Decrement and try the next candidate.
+                # Use except Exception (not BaseException) so that
+                # GeneratorExit and CancelledError propagate correctly.
                 self._in_flight[metadata.uid] -= 1
                 continue
 

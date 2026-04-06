@@ -276,10 +276,10 @@ async with wool.WorkerPool(
 
 ### Error classification
 
-| Error | gRPC codes | Load balancer behavior |
-| ----- | ---------- | ---------------------- |
-| `TransientRpcError` | `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED` | Retry on next worker. |
-| `RpcError` | All others | Remove worker from context, retry next. |
+| Error | gRPC codes | Dispatch behavior |
+| ----- | ---------- | ----------------- |
+| `TransientRpcError` | `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED` | Skip worker, retry next candidate. |
+| `RpcError` | All others | Evict worker from context, retry next candidate. |
 
 ### Security filter
 
