@@ -52,31 +52,41 @@ class TestRoundRobinLoadBalancer:
         # Act & assert
         assert isinstance(RoundRobinLoadBalancer(), DelegatingLoadBalancerLike)
 
-    def test___reduce___with_populated_index(self):
-        """Test pickle roundtrip excludes runtime state.
+    @pytest.mark.asyncio
+    async def test___reduce___excludes_runtime_state(self):
+        """Test pickle roundtrip resets runtime balancing state.
 
         Given:
-            A RoundRobinLoadBalancer with a populated _index
+            A RoundRobinLoadBalancer that has been driven through one
+            successful delegate cycle on a context
         When:
             Pickled and unpickled
         Then:
-            It should restore with an empty _index and a fresh _lock
+            The restored instance starts cycling from position zero on
+            the same context — equivalent to a freshly constructed
+            instance, proving the runtime state is not carried over
         """
         # Arrange
         import pickle
-        from asyncio import Lock
 
         lb = RoundRobinLoadBalancer()
-        context = LoadBalancerContext()
-        lb._index[context] = 3
+        ctx, workers = _make_context(3)
+
+        gen = lb.delegate(context=ctx)
+        first_used, _ = await gen.__anext__()
+        with pytest.raises(StopAsyncIteration):
+            await gen.asend(first_used)
+        # Original has now advanced past workers[0] on ctx.
 
         # Act
         restored = pickle.loads(pickle.dumps(lb))
 
         # Assert
         assert isinstance(restored, RoundRobinLoadBalancer)
-        assert restored._index == {}
-        assert isinstance(restored._lock, Lock)
+        gen_restored = restored.delegate(context=ctx)
+        first_after_restore, _ = await gen_restored.__anext__()
+        await gen_restored.aclose()
+        assert first_after_restore == workers[0]
 
     @pytest.mark.asyncio
     async def test_delegate_with_empty_context(self):
