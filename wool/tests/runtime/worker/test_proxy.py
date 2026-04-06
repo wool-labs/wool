@@ -8,6 +8,7 @@ to avoid network overhead and ensure deterministic behavior.
 import asyncio
 import contextvars
 import copy
+import inspect
 import pickle
 import uuid
 import warnings
@@ -28,13 +29,13 @@ from tests.helpers import _unique
 from wool import protocol
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.local import LocalDiscovery
-from wool.runtime.loadbalancer.base import DelegatingLoadBalancerLike
-from wool.runtime.loadbalancer.base import LoadBalancerContext
+from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
-from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.connection import RpcError
+from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.proxy import WorkerProxy
@@ -55,6 +56,118 @@ async def _drain_discovery(proxy, *, expect, timeout=2.0):
         await asyncio.sleep(0)
 
 
+async def _run_hook(hook, *arguments):
+    """Invoke an optional balancer hook, awaiting an awaitable result.
+
+    A hook may be ``None`` (a no-op), a plain callable, or a callable
+    returning an awaitable — the awaitable form lets a hook suspend the
+    generator (e.g. to simulate slow success bookkeeping under
+    cancellation).
+    """
+    if hook is None:
+        return
+    result = hook(*arguments)
+    if inspect.isawaitable(result):
+        await result
+
+
+def make_delegating_balancer(
+    *, on_task=None, on_yield=None, on_throw=None, on_success=None
+):
+    """Build a delegating balancer that yields workers in context order.
+
+    The returned balancer's ``delegate`` walks ``context.workers`` in
+    insertion order, yielding each ``(metadata, connection)`` pair for the
+    proxy to dispatch to. Four optional hooks observe the handshake
+    without altering control flow: ``on_task(task)`` fires once with the
+    routed task before any candidate is offered, ``on_yield(metadata)``
+    fires before each candidate is offered, ``on_throw(exception,
+    context)`` fires when the proxy reports a dispatch failure via
+    ``athrow``, and ``on_success(metadata)`` fires when the proxy
+    acknowledges a successful dispatch via ``asend``. Any hook may return
+    an awaitable, which is awaited before the generator continues.
+    """
+
+    class DelegatingBalancer:
+        async def delegate(self, task, *, context):
+            await _run_hook(on_task, task)
+            for metadata, connection in list(context.workers.items()):
+                await _run_hook(on_yield, metadata)
+                try:
+                    sent = yield metadata, connection
+                except Exception as exception:
+                    await _run_hook(on_throw, exception, context)
+                    continue
+                if sent is not None:
+                    await _run_hook(on_success, sent)
+                    return
+
+    return DelegatingBalancer()
+
+
+def make_dispatching_balancer(*, marker="ok", on_dispatch=None):
+    """Build a legacy dispatching balancer that yields a single marker.
+
+    The returned balancer implements only the deprecated ``dispatch``
+    method — the `DispatchingLoadBalancerLike` protocol — yielding
+    ``marker`` once as its streamed result. The optional
+    ``on_dispatch(task)`` hook fires before the result stream is produced
+    so a test can record the dispatched task; it may return an awaitable,
+    which is awaited before the stream is returned.
+    """
+
+    class DispatchingBalancer:
+        async def dispatch(self, task, *, context, timeout=None):
+            await _run_hook(on_dispatch, task)
+
+            async def _stream():
+                yield marker
+
+            return _stream()
+
+    return DispatchingBalancer()
+
+
+def _dispatch_deprecations(caught):
+    """Return the recorded `DispatchingLoadBalancerLike` deprecation warnings.
+
+    Filters a ``warnings.catch_warnings(record=True)`` list down to the
+    proxy's dispatch-protocol ``DeprecationWarning``, so an assertion on the
+    fire-once guarantee is not perturbed by unrelated deprecation warnings.
+    """
+    return [
+        warning
+        for warning in caught
+        if issubclass(warning.category, DeprecationWarning)
+        and "DispatchingLoadBalancerLike" in str(warning.message)
+    ]
+
+
+class SpyStream:
+    """Async result-stream double that records ``aclose`` invocations.
+
+    Yields the supplied items, then reports each ``aclose`` call to the
+    ``on_close`` callback so a test can assert the proxy released an
+    orphaned stream.
+    """
+
+    def __init__(self, items=(), *, on_close):
+        self._items = iter(items)
+        self._on_close = on_close
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._items)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    async def aclose(self):
+        self._on_close()
+
+
 # ============================================================================
 # Test Fixtures
 # ============================================================================
@@ -69,9 +182,9 @@ def mock_load_balancer_factory(mocker: MockerFixture):
     — tests that actually exercise dispatch should override it.
     """
     mock_load_balancer_factory = mocker.MagicMock()
-    mock_load_balancer = mocker.MagicMock(spec=DelegatingLoadBalancerLike)
+    mock_load_balancer = mocker.MagicMock(spec=LoadBalancerLike)
 
-    async def _empty_delegate(*, context):
+    async def _empty_delegate(task, *, context):
         if False:
             yield  # pragma: no cover
 
@@ -108,25 +221,11 @@ def mock_wool_task(mocker: MockerFixture):
 def spy_loadbalancer_with_workers(mocker: MockerFixture):
     """Create a spy-wrapped delegating load balancer.
 
-    Provides a :py:class:`DelegatingLoadBalancerLike` implementation
-    that yields workers straight from the context in iteration order,
-    wrapped with a spy so tests can assert that ``delegate`` was called.
+    Provides a `LoadBalancerLike` implementation that yields workers
+    straight from the context in iteration order, wrapped with a spy so
+    tests can assert that ``delegate`` was called.
     """
-
-    class SpyableLoadBalancer:
-        """Delegating load balancer wrapping context iteration."""
-
-        async def delegate(self, *, context):
-            """Yield workers from the context in insertion order."""
-            for metadata, connection in list(context.workers.items()):
-                try:
-                    sent = yield metadata, connection
-                except Exception:
-                    continue
-                if sent is not None:
-                    return
-
-    loadbalancer = SpyableLoadBalancer()
+    loadbalancer = make_delegating_balancer()
     loadbalancer.delegate = mocker.spy(loadbalancer, "delegate")
     return loadbalancer
 
@@ -2959,7 +3058,7 @@ class TestWorkerProxy:
 
         # Create a delegating loadbalancer whose generator raises immediately
         class FailingLoadBalancer:
-            async def delegate(self, *, context):
+            async def delegate(self, task, *, context):
                 raise Exception("Load balancer error")
                 if False:
                     yield  # pragma: no cover
@@ -3004,19 +3103,7 @@ class TestWorkerProxy:
         mocker.patch.object(wp, "WorkerConnection", return_value=mock_worker_connection)
 
         # Delegating loadbalancer that yields straight from the context
-        class WaitingLoadBalancer:
-            async def delegate(self, *, context):
-                if not context.workers:
-                    raise NoWorkersAvailable("No workers available")
-                for metadata_, connection in list(context.workers.items()):
-                    try:
-                        sent = yield metadata_, connection
-                    except Exception:
-                        continue
-                    if sent is not None:
-                        return
-
-        waiting_loadbalancer = WaitingLoadBalancer()
+        waiting_loadbalancer = make_delegating_balancer()
 
         proxy = WorkerProxy(
             discovery=discovery,
@@ -3073,21 +3160,10 @@ class TestWorkerProxy:
                 gate.clear()
                 return DiscoveryEvent("worker-added", metadata=metadata)
 
-        class StubLoadBalancer:
-            def __init__(self):
-                self.delegated = False
-
-            async def delegate(self, *, context):
-                self.delegated = True
-                for metadata_, connection in list(context.workers.items()):
-                    try:
-                        sent = yield metadata_, connection
-                    except Exception:
-                        continue
-                    if sent is not None:
-                        return
-
-        stub_lb = StubLoadBalancer()
+        delegated: list[bool] = []
+        stub_lb = make_delegating_balancer(
+            on_yield=lambda metadata: delegated.append(True)
+        )
         mock_connection = mocker.MagicMock(spec=WorkerConnection)
 
         async def fake_dispatch(task, *, timeout=None):
@@ -3113,7 +3189,7 @@ class TestWorkerProxy:
 
         # Assert
         assert metadata in proxy.workers
-        assert stub_lb.delegated
+        assert delegated
 
         # Cleanup
         await proxy.stop()
@@ -4184,78 +4260,143 @@ class TestReducibleAsyncIterator:
         assert results == items
 
 
-class TestWorkerProxyDelegateDispatch:
+_DISPATCH_OUTCOMES = ("success", "transient", "non_transient")
+
+
+async def _make_proxy_with_workers(
+    *,
+    connections: list,
+    loadbalancer,
+    mocker: MockerFixture,
+) -> tuple[WorkerProxy, list[WorkerMetadata]]:
+    """Build and start a WorkerProxy seeded via the public discovery flow.
+
+    Patches `WorkerConnection` so the sentinel creates the given mock
+    connections, constructs a proxy with a `ReducibleAsyncIterator`
+    discovery stream, starts it, and waits until all workers are visible
+    on ``proxy.workers``.
+
+    :returns:
+        ``(proxy, metadata_list)`` where the metadata matches the
+        connections in order.
+    """
+    metadata_list = [
+        WorkerMetadata(
+            uid=uuid.uuid4(),
+            address=f"127.0.0.1:{50100 + i}",
+            pid=9000 + i,
+            version="1.0.0",
+        )
+        for i in range(len(connections))
+    ]
+    mocker.patch.object(wp, "WorkerConnection", side_effect=connections)
+    discovery = wp.ReducibleAsyncIterator(
+        [DiscoveryEvent("worker-added", metadata=m) for m in metadata_list]
+    )
+    proxy = WorkerProxy(
+        discovery=discovery,
+        loadbalancer=loadbalancer,
+        lazy=False,
+    )
+    await proxy.start()
+    await _drain_discovery(proxy, expect=len(connections))
+    return proxy, metadata_list
+
+
+def _make_success_connection(mocker: MockerFixture, spy_stream: list):
+    """Build a mock connection whose dispatch yields a tracked stream."""
+    connection = mocker.MagicMock(spec=WorkerConnection)
+
+    async def _fake_dispatch(task, *, timeout=None):
+        async def _gen():
+            yield "ok"
+
+        gen = _gen()
+        spy_stream.append(gen)
+        return gen
+
+    connection.dispatch = _fake_dispatch
+    return connection
+
+
+def _make_outcome_connection(outcome, marker, mocker: MockerFixture):
+    """Build a mock connection whose dispatch resolves to a drawn outcome.
+
+    A ``"success"`` connection returns a stream yielding ``marker``; a
+    ``"transient"`` connection raises `TransientRpcError`; any other
+    outcome raises a non-transient `RpcError`.
+    """
+    connection = mocker.MagicMock(spec=WorkerConnection)
+    if outcome == "success":
+
+        async def _dispatch(task, *, timeout=None, _marker=marker):
+            async def _stream():
+                yield _marker
+
+            return _stream()
+
+        connection.dispatch = _dispatch
+    elif outcome == "transient":
+        connection.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
+    else:
+        connection.dispatch = mocker.AsyncMock(side_effect=RpcError())
+    return connection
+
+
+class TestWorkerProxyDispatchRetryEviction:
     """Tests for the proxy-owned dispatch-retry-evict loop.
 
-    These tests exercise ``WorkerProxy._delegate_dispatch`` directly by
-    constructing a proxy, seeding its internal ``LoadBalancerContext``
-    with mock connections, and driving a custom delegating balancer.
-    The proxy owns the retry/evict/cancellation semantics — the tests
-    verify each branch of that loop.
+    Each test drives the public `dispatch()` API against a delegating
+    balancer, seeding the worker pool through the public discovery flow.
+    The proxy owns the dispatch loop — it calls `WorkerConnection.dispatch`
+    on each candidate, evicts workers on non-transient errors, reports
+    outcomes back to the balancer, and surfaces `NoWorkersAvailable` when
+    candidates are exhausted. The tests verify each branch of that loop.
     """
 
-    @staticmethod
-    async def _start_proxy_with_workers(
-        proxy: WorkerProxy,
+    @pytest.mark.asyncio
+    async def test_dispatch_forwards_task_to_delegate(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
         mocker: MockerFixture,
-        *,
-        connections: list,
-    ) -> list[WorkerMetadata]:
-        """Start the proxy and seed its context with mock connections.
+    ):
+        """Test the proxy forwards the routed task to the balancer.
 
-        Returns the list of :class:`WorkerMetadata` in the same order
-        as ``connections``.
+        Given:
+            A delegating balancer with one worker that records the task
+            its ``delegate`` receives
+        When:
+            dispatch() is called with a task
+        Then:
+            The balancer's ``delegate`` should receive the same task
+            object the caller passed to dispatch()
         """
-        assert not proxy.started
-        await proxy.start()
-        assert proxy._loadbalancer_context is not None
-        metadata_list: list[WorkerMetadata] = []
-        for i, connection in enumerate(connections):
-            metadata = WorkerMetadata(
-                uid=uuid.uuid4(),
-                address=f"127.0.0.1:{50100 + i}",
-                pid=9000 + i,
-                version="1.0.0",
-            )
-            proxy._loadbalancer_context.add_worker(metadata, connection)
-            metadata_list.append(metadata)
-        return metadata_list
+        # Arrange
+        routed_tasks: list = []
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
 
-    @staticmethod
-    def _make_success_connection(mocker: MockerFixture, spy_stream: list):
-        """Build a mock connection whose dispatch yields a tracked stream."""
-        connection = mocker.MagicMock(spec=WorkerConnection)
-
-        async def _fake_dispatch(task, *, timeout=None):
-            async def _gen():
-                yield "ok"
-
-            gen = _gen()
-            spy_stream.append(gen)
-            return gen
-
-        connection.dispatch = _fake_dispatch
-        return connection
-
-    @pytest.fixture
-    def mock_proxy(self, mock_discovery_service, mock_proxy_session):
-        """Construct a WorkerProxy with an empty delegating balancer."""
-
-        class _NoopBalancer:
-            async def delegate(self, *, context):
-                if False:
-                    yield  # pragma: no cover
-
-        return WorkerProxy(
-            discovery=mock_discovery_service,
-            loadbalancer=_NoopBalancer(),
-            lazy=False,
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[success_connection],
+            loadbalancer=make_delegating_balancer(
+                on_task=lambda task: routed_tasks.append(task)
+            ),
+            mocker=mocker,
         )
 
+        # Act
+        result_stream = await proxy.dispatch(mock_wool_task)
+        results = [r async for r in result_stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert routed_tasks == [mock_wool_task]
+        await proxy.stop()
+
     @pytest.mark.asyncio
-    async def test_dispatch_with_transient_error_skips_worker(
+    async def test_dispatch_with_transient_error(
         self,
-        mock_discovery_service,
         mock_proxy_session,
         mock_wool_task,
         mocker: MockerFixture,
@@ -4273,31 +4414,16 @@ class TestWorkerProxyDelegateDispatch:
             successfully, and the first worker is NOT evicted from the
             context.
         """
-
         # Arrange
-        class TwoWorkerBalancer:
-            async def delegate(self, *, context):
-                items = list(context.workers.items())
-                for metadata, connection in items:
-                    try:
-                        sent = yield metadata, connection
-                    except Exception:
-                        continue
-                    if sent is not None:
-                        return
-
-        failing_conn = mocker.MagicMock(spec=WorkerConnection)
-        failing_conn.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
         success_streams: list = []
-        success_conn = self._make_success_connection(mocker, success_streams)
+        success_connection = _make_success_connection(mocker, success_streams)
 
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
-            loadbalancer=TwoWorkerBalancer(),
-            lazy=False,
-        )
-        metadata_list = await self._start_proxy_with_workers(
-            proxy, mocker, connections=[failing_conn, success_conn]
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=[failing_connection, success_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
         )
 
         # Act
@@ -4314,9 +4440,8 @@ class TestWorkerProxyDelegateDispatch:
         await proxy.stop()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_non_transient_error_evicts_worker(
+    async def test_dispatch_with_non_transient_error(
         self,
-        mock_discovery_service,
         mock_proxy_session,
         mock_wool_task,
         mocker: MockerFixture,
@@ -4325,7 +4450,7 @@ class TestWorkerProxyDelegateDispatch:
 
         Given:
             A delegating balancer with two workers; the first worker's
-            connection raises a generic ``Exception``, the second
+            connection raises a non-transient ``RpcError``, the second
             succeeds
         When:
             dispatch() is called
@@ -4334,36 +4459,21 @@ class TestWorkerProxyDelegateDispatch:
             the balancer is notified via athrow, and the proxy
             eventually dispatches to the second worker.
         """
-
         # Arrange
         observed_workers_during_athrow: list[list[WorkerMetadata]] = []
-
-        class ObservingBalancer:
-            async def delegate(self_, *, context):
-                items = list(context.workers.items())
-                for metadata, connection in items:
-                    try:
-                        sent = yield metadata, connection
-                    except Exception:
-                        observed_workers_during_athrow.append(
-                            list(context.workers.keys())
-                        )
-                        continue
-                    if sent is not None:
-                        return
-
-        failing_conn = mocker.MagicMock(spec=WorkerConnection)
-        failing_conn.dispatch = mocker.AsyncMock(side_effect=Exception("fatal"))
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(side_effect=RpcError())
         success_streams: list = []
-        success_conn = self._make_success_connection(mocker, success_streams)
+        success_connection = _make_success_connection(mocker, success_streams)
 
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
-            loadbalancer=ObservingBalancer(),
-            lazy=False,
-        )
-        metadata_list = await self._start_proxy_with_workers(
-            proxy, mocker, connections=[failing_conn, success_conn]
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=[failing_connection, success_connection],
+            loadbalancer=make_delegating_balancer(
+                on_throw=lambda exception, context: (
+                    observed_workers_during_athrow.append(list(context.workers.keys()))
+                )
+            ),
+            mocker=mocker,
         )
 
         # Act
@@ -4382,9 +4492,45 @@ class TestWorkerProxyDelegateDispatch:
         await proxy.stop()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_empty_delegate_raises_no_workers_available(
+    async def test_dispatch_with_non_rpc_error(
         self,
-        mock_discovery_service,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test non-RpcError faults propagate without evicting the worker.
+
+        Given:
+            A delegating balancer with one worker whose connection
+            raises a non-``RpcError`` exception — a fault unrelated to
+            worker health, such as a caller-side ``ValueError``
+        When:
+            dispatch() is called
+        Then:
+            The exception propagates to the caller unwrapped and the
+            worker is left in ``proxy.workers``; only ``RpcError`` is
+            treated as a worker-health signal warranting eviction.
+        """
+        # Arrange
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(side_effect=ValueError("boom"))
+
+        proxy, [metadata] = await _make_proxy_with_workers(
+            connections=[failing_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act & assert
+        with pytest.raises(ValueError, match="boom"):
+            await proxy.dispatch(mock_wool_task)
+        # Not a worker-health signal: the worker was NOT evicted.
+        assert metadata in proxy.workers
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_empty_delegate(
+        self,
         mock_proxy_session,
         mock_wool_task,
         mocker: MockerFixture,
@@ -4402,18 +4548,15 @@ class TestWorkerProxyDelegateDispatch:
 
         # Arrange
         class EmptyBalancer:
-            async def delegate(self, *, context):
+            async def delegate(self, task, *, context):
                 if False:
                     yield  # pragma: no cover
 
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
+        dummy_connection = mocker.MagicMock(spec=WorkerConnection)
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[dummy_connection],
             loadbalancer=EmptyBalancer(),
-            lazy=False,
-        )
-        dummy_conn = mocker.MagicMock(spec=WorkerConnection)
-        await self._start_proxy_with_workers(
-            proxy, mocker, connections=[dummy_conn]
+            mocker=mocker,
         )
 
         # Act & assert
@@ -4422,9 +4565,8 @@ class TestWorkerProxyDelegateDispatch:
         await proxy.stop()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_non_transient_exhaustion_raises_no_workers_available(
+    async def test_dispatch_with_non_transient_exhaustion(
         self,
-        mock_discovery_service,
         mock_proxy_session,
         mock_wool_task,
         mocker: MockerFixture,
@@ -4442,30 +4584,14 @@ class TestWorkerProxyDelegateDispatch:
             branch, and the failing worker was evicted before the
             athrow (covering the eviction-then-exhaustion path).
         """
-
         # Arrange
-        class SingleCandidateBalancer:
-            async def delegate(self, *, context):
-                items = list(context.workers.items())
-                if items:
-                    metadata, connection = items[0]
-                    try:
-                        sent = yield metadata, connection
-                    except Exception:
-                        return
-                    if sent is not None:
-                        return
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(side_effect=RpcError())
 
-        failing_conn = mocker.MagicMock(spec=WorkerConnection)
-        failing_conn.dispatch = mocker.AsyncMock(side_effect=Exception("fatal"))
-
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
-            loadbalancer=SingleCandidateBalancer(),
-            lazy=False,
-        )
-        [metadata] = await self._start_proxy_with_workers(
-            proxy, mocker, connections=[failing_conn]
+        proxy, [metadata] = await _make_proxy_with_workers(
+            connections=[failing_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
         )
 
         # Act & assert
@@ -4476,9 +4602,8 @@ class TestWorkerProxyDelegateDispatch:
         await proxy.stop()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_exhausted_candidates_raises_no_workers_available(
+    async def test_dispatch_with_exhausted_candidates(
         self,
-        mock_discovery_service,
         mock_proxy_session,
         mock_wool_task,
         mocker: MockerFixture,
@@ -4493,28 +4618,14 @@ class TestWorkerProxyDelegateDispatch:
         Then:
             NoWorkersAvailable is raised.
         """
-
         # Arrange
-        class ExhaustedBalancer:
-            async def delegate(self, *, context):
-                for metadata, connection in list(context.workers.items()):
-                    try:
-                        sent = yield metadata, connection
-                    except Exception:
-                        continue
-                    if sent is not None:
-                        return
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
 
-        failing_conn = mocker.MagicMock(spec=WorkerConnection)
-        failing_conn.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
-
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
-            loadbalancer=ExhaustedBalancer(),
-            lazy=False,
-        )
-        await self._start_proxy_with_workers(
-            proxy, mocker, connections=[failing_conn]
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[failing_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
         )
 
         # Act & assert
@@ -4523,9 +4634,63 @@ class TestWorkerProxyDelegateDispatch:
         await proxy.stop()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_success_asends_metadata(
+    async def test_dispatch_with_evicted_checkpoint_and_transient_survivors(
         self,
-        mock_discovery_service,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test dispatch ends when the checkpoint worker is evicted.
+
+        Given:
+            A real RoundRobinLoadBalancer over three workers where the
+            first-tried (checkpoint) worker fails non-transiently and is
+            evicted, while both survivors fail transiently on every
+            attempt
+        When:
+            dispatch() is awaited under a short timeout
+        Then:
+            It should raise NoWorkersAvailable rather than spin forever,
+            because the balancer reseeds its cycle boundary when the
+            checkpoint worker leaves the pool.
+        """
+
+        # Arrange
+        def _slow_transient_connection():
+            connection = mocker.MagicMock(spec=WorkerConnection)
+
+            async def _dispatch(task, *, timeout=None):
+                # Yield to the loop so wait_for can fire — a regression
+                # surfaces as TimeoutError, never a suite hang.
+                await asyncio.sleep(0)
+                raise TransientRpcError()
+
+            connection.dispatch = _dispatch
+            return connection
+
+        checkpoint_connection = mocker.MagicMock(spec=WorkerConnection)
+        checkpoint_connection.dispatch = mocker.AsyncMock(side_effect=RpcError())
+        proxy, [checkpoint, _, _] = await _make_proxy_with_workers(
+            connections=[
+                checkpoint_connection,
+                _slow_transient_connection(),
+                _slow_transient_connection(),
+            ],
+            loadbalancer=wp.RoundRobinLoadBalancer,
+            mocker=mocker,
+        )
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable):
+            await asyncio.wait_for(proxy.dispatch(mock_wool_task), timeout=2)
+        assert checkpoint not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_success(
+        self,
         mock_proxy_session,
         mock_wool_task,
         mocker: MockerFixture,
@@ -4542,28 +4707,15 @@ class TestWorkerProxyDelegateDispatch:
         """
         # Arrange
         sent_values: list = []
-
-        class RecordingBalancer:
-            async def delegate(self, *, context):
-                for metadata, connection in list(context.workers.items()):
-                    try:
-                        sent = yield metadata, connection
-                    except Exception:
-                        continue
-                    sent_values.append(sent)
-                    if sent is not None:
-                        return
-
         success_streams: list = []
-        conn = self._make_success_connection(mocker, success_streams)
+        conn = _make_success_connection(mocker, success_streams)
 
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
-            loadbalancer=RecordingBalancer(),
-            lazy=False,
-        )
-        [metadata] = await self._start_proxy_with_workers(
-            proxy, mocker, connections=[conn]
+        proxy, [metadata] = await _make_proxy_with_workers(
+            connections=[conn],
+            loadbalancer=make_delegating_balancer(
+                on_success=lambda sent: sent_values.append(sent)
+            ),
+            mocker=mocker,
         )
 
         # Act
@@ -4575,9 +4727,8 @@ class TestWorkerProxyDelegateDispatch:
         await proxy.stop()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_post_success_yield_raises_runtime_error(
+    async def test_dispatch_with_post_success_yield(
         self,
-        mock_discovery_service,
         mock_proxy_session,
         mock_wool_task,
         mocker: MockerFixture,
@@ -4603,7 +4754,7 @@ class TestWorkerProxyDelegateDispatch:
         )
 
         class MalformedBalancer:
-            async def delegate(self, *, context):
+            async def delegate(self, task, *, context):
                 items = list(context.workers.items())
                 if not items:
                     return
@@ -4613,24 +4764,7 @@ class TestWorkerProxyDelegateDispatch:
                 yield sentinel_metadata, connection
 
         stream_close_calls: list[bool] = []
-
-        class SpyStream:
-            def __init__(self):
-                self._items = iter(["ok"])
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                try:
-                    return next(self._items)
-                except StopIteration:
-                    raise StopAsyncIteration
-
-            async def aclose(self):
-                stream_close_calls.append(True)
-
-        spy_stream = SpyStream()
+        spy_stream = SpyStream(["ok"], on_close=lambda: stream_close_calls.append(True))
         conn = mocker.MagicMock(spec=WorkerConnection)
 
         async def _dispatch(task, *, timeout=None):
@@ -4638,12 +4772,11 @@ class TestWorkerProxyDelegateDispatch:
 
         conn.dispatch = _dispatch
 
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[conn],
             loadbalancer=MalformedBalancer(),
-            lazy=False,
+            mocker=mocker,
         )
-        await self._start_proxy_with_workers(proxy, mocker, connections=[conn])
 
         # Act & assert
         with pytest.raises(RuntimeError, match="after receiving a success signal"):
@@ -4654,7 +4787,6 @@ class TestWorkerProxyDelegateDispatch:
     @pytest.mark.asyncio
     async def test_dispatch_with_cancellation_during_connection_dispatch(
         self,
-        mock_discovery_service,
         mock_proxy_session,
         mock_wool_task,
         mocker: MockerFixture,
@@ -4668,23 +4800,11 @@ class TestWorkerProxyDelegateDispatch:
             The outer dispatch task is cancelled mid-dispatch
         Then:
             CancelledError propagates to the caller, the worker is
-            NOT evicted, and the balancer's delegate was called only
-            once (no retry against another candidate).
+            NOT evicted, and the balancer yielded only one candidate
+            (no retry against another candidate).
         """
         # Arrange
-        delegate_calls = []
-
-        class SingleWorkerBalancer:
-            async def delegate(self_, *, context):
-                delegate_calls.append(1)
-                for metadata, connection in list(context.workers.items()):
-                    try:
-                        sent = yield metadata, connection
-                    except Exception:
-                        continue
-                    if sent is not None:
-                        return
-
+        yielded_candidates: list = []
         conn = mocker.MagicMock(spec=WorkerConnection)
 
         async def _hang(task, *, timeout=None):
@@ -4692,13 +4812,12 @@ class TestWorkerProxyDelegateDispatch:
 
         conn.dispatch = _hang
 
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
-            loadbalancer=SingleWorkerBalancer(),
-            lazy=False,
-        )
-        [metadata] = await self._start_proxy_with_workers(
-            proxy, mocker, connections=[conn]
+        proxy, [metadata] = await _make_proxy_with_workers(
+            connections=[conn],
+            loadbalancer=make_delegating_balancer(
+                on_yield=lambda metadata: yielded_candidates.append(metadata)
+            ),
+            mocker=mocker,
         )
 
         # Act
@@ -4711,14 +4830,13 @@ class TestWorkerProxyDelegateDispatch:
             await dispatch_task
         # Worker was not evicted.
         assert metadata in proxy.workers
-        # delegate was entered exactly once — no retry on cancellation.
-        assert len(delegate_calls) == 1
+        # Exactly one candidate was yielded — no retry on cancellation.
+        assert len(yielded_candidates) == 1
         await proxy.stop()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_cancellation_during_asend_closes_stream(
+    async def test_dispatch_with_cancellation_during_asend(
         self,
-        mock_discovery_service,
         mock_proxy_session,
         mock_wool_task,
         mocker: MockerFixture,
@@ -4736,34 +4854,10 @@ class TestWorkerProxyDelegateDispatch:
             The spy stream's aclose was invoked so the underlying gRPC
             call is released, and CancelledError propagates.
         """
-        # Arrange
+        # Arrange — the success hook blocks, simulating slow bookkeeping.
         hang = asyncio.Event()
-
-        class HangingOnSuccessBalancer:
-            async def delegate(self, *, context):
-                for metadata, connection in list(context.workers.items()):
-                    try:
-                        sent = yield metadata, connection
-                    except Exception:
-                        continue
-                    if sent is not None:
-                        # Simulate slow bookkeeping on success.
-                        await hang.wait()
-                        return
-
         stream_close_calls: list[bool] = []
-
-        class SpyStream:
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                raise StopAsyncIteration
-
-            async def aclose(self):
-                stream_close_calls.append(True)
-
-        spy_stream = SpyStream()
+        spy_stream = SpyStream(on_close=lambda: stream_close_calls.append(True))
         conn = mocker.MagicMock(spec=WorkerConnection)
 
         async def _dispatch(task, *, timeout=None):
@@ -4771,12 +4865,11 @@ class TestWorkerProxyDelegateDispatch:
 
         conn.dispatch = _dispatch
 
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
-            loadbalancer=HangingOnSuccessBalancer(),
-            lazy=False,
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[conn],
+            loadbalancer=make_delegating_balancer(on_success=lambda sent: hang.wait()),
+            mocker=mocker,
         )
-        await self._start_proxy_with_workers(proxy, mocker, connections=[conn])
 
         # Act
         dispatch_task = asyncio.create_task(proxy.dispatch(mock_wool_task))
@@ -4789,54 +4882,192 @@ class TestWorkerProxyDelegateDispatch:
         assert stream_close_calls == [True]
         await proxy.stop()
 
-    @pytest.mark.asyncio
-    async def test_start_with_legacy_dispatching_balancer_emits_warning(
-        self,
-        mock_discovery_service,
-        mock_proxy_session,
-        mocker: MockerFixture,
+    @settings(
+        max_examples=30,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        outcomes=st.lists(st.sampled_from(_DISPATCH_OUTCOMES), min_size=1, max_size=5)
+    )
+    def test_dispatch_with_arbitrary_outcome_sequence(
+        self, outcomes, mock_proxy_session, mock_wool_task, mocker: MockerFixture
     ):
-        """Test legacy DispatchingLoadBalancerLike path emits deprecation warning.
+        """Test the retry/evict loop over an arbitrary per-worker outcome run.
 
         Given:
-            A load balancer that implements only the legacy ``dispatch``
-            method (DispatchingLoadBalancerLike)
+            A delegating balancer over N workers whose connections each
+            resolve to a drawn outcome — a success, a transient
+            ``TransientRpcError``, or a non-transient ``RpcError``.
         When:
-            The proxy is started
+            dispatch() drives the candidates in order.
         Then:
-            A DeprecationWarning is emitted referencing the new protocol.
+            It should return the first success (else raise
+            NoWorkersAvailable), evict exactly the non-transient failures
+            it attempted, and leave every transient-failing worker in
+            place.
         """
 
+        async def _scenario() -> None:
+            # Arrange
+            connections = [
+                _make_outcome_connection(outcome, index, mocker)
+                for index, outcome in enumerate(outcomes)
+            ]
+            proxy, metadata_list = await _make_proxy_with_workers(
+                connections=connections,
+                loadbalancer=make_delegating_balancer(),
+                mocker=mocker,
+            )
+            first_success = next(
+                (i for i, o in enumerate(outcomes) if o == "success"), None
+            )
+            attempted = (
+                range(len(outcomes))
+                if first_success is None
+                else range(first_success + 1)
+            )
+            evicted = {
+                metadata_list[i] for i in attempted if outcomes[i] == "non_transient"
+            }
+            surviving = set(metadata_list) - evicted
+
+            # Act & assert
+            try:
+                if first_success is None:
+                    with pytest.raises(NoWorkersAvailable):
+                        await proxy.dispatch(mock_wool_task)
+                else:
+                    stream = await proxy.dispatch(mock_wool_task)
+                    results = [item async for item in stream]
+                    assert results == [first_success]
+                assert set(proxy.workers) == surviving
+                for index, outcome in enumerate(outcomes):
+                    if outcome == "transient":
+                        assert metadata_list[index] in proxy.workers
+            finally:
+                await proxy.stop()
+
+        asyncio.run(_scenario())
+
+    @pytest.mark.asyncio
+    async def test_start_with_delegating_balancer(
+        self, mock_discovery_service, mock_proxy_session
+    ):
+        """Test starting a delegating balancer emits no deprecation warning.
+
+        Given:
+            A proxy configured with a delegating balancer that implements
+            the ``delegate`` protocol.
+        When:
+            The proxy is started.
+        Then:
+            It should emit no DeprecationWarning — the delegating protocol
+            is the supported, non-deprecated path.
+        """
         # Arrange
-        class LegacyBalancer:
-            async def dispatch(self, task, *, context, timeout=None):
-                async def _gen():
-                    yield "ok"
-
-                return _gen()
-
         proxy = WorkerProxy(
             discovery=mock_discovery_service,
-            loadbalancer=LegacyBalancer(),
+            loadbalancer=make_delegating_balancer(),
             lazy=False,
+            quorum=0,
         )
 
-        # Act & assert
+        # Act
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             await proxy.start()
-            deprecations = [
-                w for w in caught if issubclass(w.category, DeprecationWarning)
-            ]
-            assert any(
-                "DispatchingLoadBalancerLike" in str(w.message) for w in deprecations
-            ), f"expected deprecation warning, got: {[str(w.message) for w in caught]}"
+
+        # Assert
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert deprecations == []
+        await proxy.stop()
+
+
+class TestWorkerProxyDispatchingBalancerBackcompat:
+    """Tests for the deprecated `DispatchingLoadBalancerLike` dispatch path.
+
+    A balancer that implements only the legacy ``dispatch`` method keeps
+    working: the proxy delegates dispatch to it and warns once that the
+    protocol is deprecated.
+    """
+
+    @pytest.mark.asyncio
+    async def test_init_with_dispatching_balancer_instance(
+        self, mock_discovery_service, mock_proxy_session
+    ):
+        """Test constructing with a legacy balancer instance warns once.
+
+        Given:
+            A load balancer instance implementing only the legacy
+            ``dispatch`` method (a `DispatchingLoadBalancerLike`)
+        When:
+            The proxy is constructed and then started
+        Then:
+            It should emit exactly one deprecation warning, at
+            construction, and starting should not warn a second time
+        """
+        # Arrange
+        loadbalancer = make_dispatching_balancer()
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            proxy = WorkerProxy(
+                discovery=mock_discovery_service,
+                loadbalancer=loadbalancer,
+                lazy=False,
+                quorum=0,
+            )
+            warned_at_construction = _dispatch_deprecations(caught)
+            await proxy.start()
+
+        # Assert
+        assert len(warned_at_construction) == 1
+        assert len(_dispatch_deprecations(caught)) == 1
         await proxy.stop()
 
     @pytest.mark.asyncio
-    async def test_dispatch_via_legacy_dispatching_balancer_still_works(
+    async def test_start_with_dispatching_balancer_factory(
+        self, mock_discovery_service, mock_proxy_session
+    ):
+        """Test a legacy balancer factory warns at start().
+
+        Given:
+            A factory returning a load balancer that implements only the
+            legacy ``dispatch`` method (a `DispatchingLoadBalancerLike`)
+        When:
+            The proxy is constructed and then started
+        Then:
+            It should not warn at construction — the factory is opaque —
+            and emit exactly one deprecation warning when start() resolves
+            it to the legacy instance
+        """
+
+        # Arrange
+        def factory():
+            return make_dispatching_balancer()
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            proxy = WorkerProxy(
+                discovery=mock_discovery_service,
+                loadbalancer=factory,
+                lazy=False,
+                quorum=0,
+            )
+            warned_at_construction = _dispatch_deprecations(caught)
+            await proxy.start()
+
+        # Assert
+        assert warned_at_construction == []
+        assert len(_dispatch_deprecations(caught)) == 1
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_dispatching_balancer(
         self,
-        mock_discovery_service,
         mock_proxy_session,
         mock_wool_task,
         mocker: MockerFixture,
@@ -4844,7 +5075,7 @@ class TestWorkerProxyDelegateDispatch:
         """Test the legacy dispatch path is still functional.
 
         Given:
-            A started proxy with a legacy DispatchingLoadBalancerLike
+            A started proxy with a legacy `DispatchingLoadBalancerLike`
         When:
             dispatch() is called
         Then:
@@ -4853,36 +5084,19 @@ class TestWorkerProxyDelegateDispatch:
         """
         # Arrange
         dispatched_tasks: list = []
-
-        class LegacyBalancer:
-            async def dispatch(self, task, *, context, timeout=None):
-                dispatched_tasks.append(task)
-
-                async def _gen():
-                    yield "legacy-ok"
-
-                return _gen()
-
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
-            loadbalancer=LegacyBalancer(),
-            lazy=False,
+        loadbalancer = make_dispatching_balancer(
+            marker="legacy-ok",
+            on_dispatch=lambda task: dispatched_tasks.append(task),
         )
 
-        # Seed context with a dummy worker so _await_workers resolves.
+        dummy_connection = mocker.MagicMock(spec=WorkerConnection)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            await proxy.start()
-        assert proxy._loadbalancer_context is not None
-        proxy._loadbalancer_context.add_worker(
-            WorkerMetadata(
-                uid=uuid.uuid4(),
-                address="127.0.0.1:55555",
-                pid=1234,
-                version="1.0.0",
-            ),
-            mocker.MagicMock(spec=WorkerConnection),
-        )
+            proxy, _ = await _make_proxy_with_workers(
+                connections=[dummy_connection],
+                loadbalancer=loadbalancer,
+                mocker=mocker,
+            )
 
         # Act
         stream = await proxy.dispatch(mock_wool_task)
@@ -4891,4 +5105,57 @@ class TestWorkerProxyDelegateDispatch:
         # Assert
         assert results == ["legacy-ok"]
         assert len(dispatched_tasks) == 1
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_dual_protocol_balancer(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test a balancer implementing both protocols uses delegate.
+
+        Given:
+            A balancer implementing both the ``delegate`` and the legacy
+            ``dispatch`` methods, seeded with one worker
+        When:
+            The proxy is constructed, started, and dispatch() is called
+        Then:
+            It should route through ``delegate`` — surfacing the delegate
+            path's result, not the ``dispatch`` result — and emit no
+            deprecation warning, because the non-deprecated path is used
+        """
+
+        # Arrange
+        class DualBalancer:
+            async def delegate(self, task, *, context):
+                for metadata, connection in list(context.workers.items()):
+                    sent = yield metadata, connection
+                    if sent is not None:
+                        return
+
+            async def dispatch(self, task, *, context, timeout=None):
+                async def _stream():
+                    yield "legacy-ok"
+
+                return _stream()
+
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            proxy, _ = await _make_proxy_with_workers(
+                connections=[success_connection],
+                loadbalancer=DualBalancer(),
+                mocker=mocker,
+            )
+            result_stream = await proxy.dispatch(mock_wool_task)
+            results = [r async for r in result_stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert _dispatch_deprecations(caught) == []
         await proxy.stop()

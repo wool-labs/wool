@@ -1,19 +1,25 @@
 import asyncio
+import gc
+import pickle
+import weakref
 from uuid import uuid4
 
 import pytest
-from hypothesis import HealthCheck
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
-from wool.runtime.loadbalancer.base import DelegatingLoadBalancerLike
 from wool.runtime.loadbalancer.base import LoadBalancerContext
+from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
+
+# ``delegate`` takes the routed task as its first positional argument.
+# ``RoundRobinLoadBalancer`` ignores it, so a single opaque sentinel
+# stands in for the task across every dispatch in this module.
+_TASK = object()
 
 
 def _make_context(worker_count: int) -> tuple[LoadBalancerContext, list[WorkerMetadata]]:
@@ -38,45 +44,85 @@ def _make_context(worker_count: int) -> tuple[LoadBalancerContext, list[WorkerMe
     return ctx, ordered
 
 
+class _ItemsCountingContext:
+    """LoadBalancerContextView that counts workers.items() materializations.
+
+    Wraps a real `LoadBalancerContext` and records how many times
+    the ordered worker mapping is materialized via ``items()``, so a test
+    can prove the balancer snapshots once per wrap rather than rescanning
+    the mapping per candidate.
+    """
+
+    def __init__(self, context: LoadBalancerContext):
+        self._context = context
+        self.items_calls = 0
+
+    @property
+    def workers(self):
+        real = self._context.workers
+        outer = self
+
+        class _CountingMapping:
+            def __len__(self):
+                return len(real)
+
+            def __contains__(self, key):
+                return key in real
+
+            def items(self):
+                outer.items_calls += 1
+                return real.items()
+
+        return _CountingMapping()
+
+
 class TestRoundRobinLoadBalancer:
     def test_isinstance_satisfies_protocol(self):
-        """Test RoundRobinLoadBalancer satisfies DelegatingLoadBalancerLike.
+        """Test RoundRobinLoadBalancer satisfies LoadBalancerLike.
 
         Given:
             A concrete RoundRobinLoadBalancer instance
         When:
-            Checked against the DelegatingLoadBalancerLike protocol
+            Checked against the LoadBalancerLike protocol
         Then:
             It should satisfy the protocol
         """
         # Act & assert
-        assert isinstance(RoundRobinLoadBalancer(), DelegatingLoadBalancerLike)
+        assert isinstance(RoundRobinLoadBalancer(), LoadBalancerLike)
 
-    def test___reduce___with_populated_index(self):
-        """Test pickle roundtrip excludes runtime state.
+    @pytest.mark.asyncio
+    async def test___reduce___excludes_runtime_state(self):
+        """Test pickle roundtrip resets runtime balancing state.
 
         Given:
-            A RoundRobinLoadBalancer with a populated _index
+            A RoundRobinLoadBalancer that has been driven through one
+            successful delegate cycle on a context
         When:
             Pickled and unpickled
         Then:
-            It should restore with an empty _index and a fresh _lock
+            The restored instance starts cycling from position zero on
+            the same context — equivalent to a freshly constructed
+            instance, proving the runtime state is not carried over
         """
         # Arrange
-        import pickle
-        from asyncio import Lock
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
 
-        lb = RoundRobinLoadBalancer()
-        context = LoadBalancerContext()
-        lb._index[context] = 3
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first_used, _ = await anext(generator)
+        with pytest.raises(StopAsyncIteration):
+            await generator.asend(first_used)
+        # Original has now advanced past workers[0] on ctx.
 
         # Act
-        restored = pickle.loads(pickle.dumps(lb))
+        restored = pickle.loads(pickle.dumps(loadbalancer))
 
         # Assert
         assert isinstance(restored, RoundRobinLoadBalancer)
-        assert restored._index == {}
-        assert isinstance(restored._lock, Lock)
+        restored_generator = restored.delegate(_TASK, context=ctx)
+        first_after_restore, _ = await anext(restored_generator)
+        await restored_generator.aclose()
+        assert first_after_restore == workers[0]
 
     @pytest.mark.asyncio
     async def test_delegate_with_empty_context(self):
@@ -91,17 +137,17 @@ class TestRoundRobinLoadBalancer:
             exhaustion so the proxy can raise NoWorkersAvailable.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
+        loadbalancer = RoundRobinLoadBalancer()
         ctx = LoadBalancerContext()
 
         # Act & assert
-        gen = lb.delegate(context=ctx)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
         with pytest.raises(StopAsyncIteration):
-            await gen.__anext__()
-        await gen.aclose()
+            await anext(generator)
+        await generator.aclose()
 
     @pytest.mark.asyncio
-    async def test_delegate_yields_first_worker_on_anext(self):
+    async def test_delegate_with_single_worker(self):
         """Test delegate yields the first worker on initial anext.
 
         Given:
@@ -112,20 +158,20 @@ class TestRoundRobinLoadBalancer:
             The first yielded candidate is the worker in the context.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
+        loadbalancer = RoundRobinLoadBalancer()
         ctx, [worker] = _make_context(1)
 
         # Act
-        gen = lb.delegate(context=ctx)
-        metadata, connection = await gen.__anext__()
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        metadata, connection = await anext(generator)
 
         # Assert
         assert metadata == worker
         assert connection is ctx.workers[worker]
-        await gen.aclose()
+        await generator.aclose()
 
     @pytest.mark.asyncio
-    async def test_delegate_advances_index_after_success(self):
+    async def test_delegate_after_prior_success(self):
         """Test delegate advances the round-robin index after asend.
 
         Given:
@@ -138,25 +184,25 @@ class TestRoundRobinLoadBalancer:
             advanced past the previously-successful worker.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
+        loadbalancer = RoundRobinLoadBalancer()
         ctx, workers = _make_context(3)
 
         # Act
-        gen = lb.delegate(context=ctx)
-        first_metadata, _ = await gen.__anext__()
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first_metadata, _ = await anext(generator)
         with pytest.raises(StopAsyncIteration):
-            await gen.asend(first_metadata)
+            await generator.asend(first_metadata)
 
-        gen2 = lb.delegate(context=ctx)
-        second_metadata, _ = await gen2.__anext__()
+        second_generator = loadbalancer.delegate(_TASK, context=ctx)
+        second_metadata, _ = await anext(second_generator)
 
         # Assert
         assert first_metadata == workers[0]
         assert second_metadata == workers[1]
-        await gen2.aclose()
+        await second_generator.aclose()
 
     @pytest.mark.asyncio
-    async def test_delegate_advances_index_after_athrow(self):
+    async def test_delegate_after_athrow(self):
         """Test delegate advances the index on athrow (failure).
 
         Given:
@@ -168,21 +214,21 @@ class TestRoundRobinLoadBalancer:
             The next yielded candidate is the subsequent worker.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
+        loadbalancer = RoundRobinLoadBalancer()
         ctx, workers = _make_context(3)
 
         # Act
-        gen = lb.delegate(context=ctx)
-        first_metadata, _ = await gen.__anext__()
-        second_metadata, _ = await gen.athrow(TransientRpcError())
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first_metadata, _ = await anext(generator)
+        second_metadata, _ = await generator.athrow(TransientRpcError())
 
         # Assert
         assert first_metadata == workers[0]
         assert second_metadata == workers[1]
-        await gen.aclose()
+        await generator.aclose()
 
     @pytest.mark.asyncio
-    async def test_delegate_exhausts_after_full_cycle(self):
+    async def test_delegate_with_all_workers_failing(self):
         """Test delegate ends after a full cycle of failures.
 
         Given:
@@ -194,17 +240,17 @@ class TestRoundRobinLoadBalancer:
             — the checkpoint-by-UID logic terminates the cycle.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
+        loadbalancer = RoundRobinLoadBalancer()
         ctx, workers = _make_context(5)
 
         # Act
         yielded: list[WorkerMetadata] = []
-        gen = lb.delegate(context=ctx)
-        metadata, _ = await gen.__anext__()
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        metadata, _ = await anext(generator)
         yielded.append(metadata)
         while True:
             try:
-                metadata, _ = await gen.athrow(TransientRpcError())
+                metadata, _ = await generator.athrow(TransientRpcError())
             except StopAsyncIteration:
                 break
             yielded.append(metadata)
@@ -214,7 +260,7 @@ class TestRoundRobinLoadBalancer:
         assert set(yielded) == set(workers)
 
     @pytest.mark.asyncio
-    async def test_delegate_reacts_to_context_eviction(self):
+    async def test_delegate_with_context_eviction(self):
         """Test delegate observes pool mutations between yields.
 
         Given:
@@ -228,24 +274,24 @@ class TestRoundRobinLoadBalancer:
             (smaller) context and is not the evicted worker.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
+        loadbalancer = RoundRobinLoadBalancer()
         ctx, workers = _make_context(3)
 
         # Act
-        gen = lb.delegate(context=ctx)
-        first_metadata, _ = await gen.__anext__()
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first_metadata, _ = await anext(generator)
         ctx.remove_worker(first_metadata)  # simulate proxy eviction
-        second_metadata, _ = await gen.athrow(Exception("fatal"))
+        second_metadata, _ = await generator.athrow(Exception("fatal"))
 
         # Assert
         assert first_metadata == workers[0]
         assert second_metadata != first_metadata
         assert second_metadata in workers
         assert first_metadata not in ctx.workers
-        await gen.aclose()
+        await generator.aclose()
 
     @pytest.mark.asyncio
-    async def test_delegate_terminates_on_asend_success(self):
+    async def test_delegate_with_asend_success(self):
         """Test delegate terminates after asend signals success.
 
         Given:
@@ -258,27 +304,24 @@ class TestRoundRobinLoadBalancer:
             contract that asend is terminal.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
+        loadbalancer = RoundRobinLoadBalancer()
         ctx, _ = _make_context(3)
 
         # Act
-        gen = lb.delegate(context=ctx)
-        metadata, _ = await gen.__anext__()
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        metadata, _ = await anext(generator)
 
         # Assert
         with pytest.raises(StopAsyncIteration):
-            await gen.asend(metadata)
+            await generator.asend(metadata)
 
     @pytest.mark.asyncio
-    @settings(
-        max_examples=32,
-        suppress_health_check=[HealthCheck.function_scoped_fixture],
-    )
+    @settings(max_examples=32)
     @given(
         worker_count=st.integers(min_value=2, max_value=8),
         failure_count=st.integers(min_value=0, max_value=7),
     )
-    async def test_delegate_yields_expected_round_robin_sequence(
+    async def test_delegate_with_failures_then_success(
         self, worker_count: int, failure_count: int
     ):
         """Test delegate respects round-robin fairness across failures.
@@ -294,25 +337,63 @@ class TestRoundRobinLoadBalancer:
         """
         # Arrange
         failure_count = min(failure_count, worker_count - 1)
-        lb = RoundRobinLoadBalancer()
+        loadbalancer = RoundRobinLoadBalancer()
         ctx, workers = _make_context(worker_count)
 
         # Act
-        gen = lb.delegate(context=ctx)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
         yielded: list[WorkerMetadata] = []
-        metadata, _ = await gen.__anext__()
+        metadata, _ = await anext(generator)
         yielded.append(metadata)
         for _ in range(failure_count):
-            metadata, _ = await gen.athrow(TransientRpcError())
+            metadata, _ = await generator.athrow(TransientRpcError())
             yielded.append(metadata)
         with pytest.raises(StopAsyncIteration):
-            await gen.asend(yielded[-1])
+            await generator.asend(yielded[-1])
 
         # Assert
         assert yielded == workers[: failure_count + 1]
 
     @pytest.mark.asyncio
-    async def test_delegate_with_concurrent_tasks_distributes_across_workers(self):
+    @settings(max_examples=32)
+    @given(
+        worker_count=st.integers(min_value=1, max_value=8),
+        dispatch_count=st.integers(min_value=1, max_value=24),
+    )
+    async def test_delegate_with_successive_calls(
+        self, worker_count: int, dispatch_count: int
+    ):
+        """Test delegate rotates the starting worker across calls.
+
+        Given:
+            A load balancer with N workers driven through K successive
+            delegate() calls, each completing with asend
+        When:
+            Each call is driven to its first candidate and then to
+            success
+        Then:
+            Dispatch k starts at workers[k modulo N], wrapping around
+            past the end of the worker list.
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(worker_count)
+
+        # Act
+        starts: list[WorkerMetadata] = []
+        for _ in range(dispatch_count):
+            generator = loadbalancer.delegate(_TASK, context=ctx)
+            metadata, _ = await anext(generator)
+            starts.append(metadata)
+            with pytest.raises(StopAsyncIteration):
+                await generator.asend(metadata)
+
+        # Assert
+        expected = [workers[k % worker_count] for k in range(dispatch_count)]
+        assert starts == expected
+
+    @pytest.mark.asyncio
+    async def test_delegate_with_concurrent_drivers(self):
         """Test concurrent delegate drivers land on distinct workers.
 
         Given:
@@ -324,17 +405,17 @@ class TestRoundRobinLoadBalancer:
             Each dispatch lands on a distinct worker (fairness).
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
+        loadbalancer = RoundRobinLoadBalancer()
         ctx, workers = _make_context(4)
 
         async def drive_one() -> WorkerMetadata:
-            gen = lb.delegate(context=ctx)
-            metadata, _ = await gen.__anext__()
+            generator = loadbalancer.delegate(_TASK, context=ctx)
+            metadata, _ = await anext(generator)
             try:
                 with pytest.raises(StopAsyncIteration):
-                    await gen.asend(metadata)
+                    await generator.asend(metadata)
             finally:
-                await gen.aclose()
+                await generator.aclose()
             return metadata
 
         # Act
@@ -344,31 +425,140 @@ class TestRoundRobinLoadBalancer:
         assert set(results) == set(workers)
 
     @pytest.mark.asyncio
-    async def test_delegate_with_non_transient_error_via_athrow(self):
-        """Test delegate treats non-transient errors the same as transient.
+    async def test_delegate_terminates_when_checkpoint_evicted(self):
+        """Test delegate ends when the checkpoint worker is evicted.
 
         Given:
-            A load balancer with multiple workers (the proxy is
-            expected to have already evicted the failed worker)
+            A balancer whose first-yielded (checkpoint) candidate is
+            evicted from the context, while every surviving worker keeps
+            failing transiently forever
         When:
-            The proxy reports a non-transient error via athrow
+            The proxy drives the generator with repeated athrow
         Then:
-            The next candidate is yielded — the balancer itself does
-            not classify errors or perform eviction; that's the
-            proxy's job.
+            It should raise StopAsyncIteration rather than spin forever —
+            the cycle boundary is reseeded once the checkpoint worker
+            leaves the pool.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
-        ctx, _ = _make_context(3)
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first, _ = await anext(generator)
+        ctx.remove_worker(first)  # proxy evicts the checkpoint (non-transient)
 
         # Act
-        gen = lb.delegate(context=ctx)
-        first_metadata, _ = await gen.__anext__()
-        # Simulate proxy-driven eviction
-        ctx.remove_worker(first_metadata)
-        second_metadata, _ = await gen.athrow(RpcError())
+        yielded: list[WorkerMetadata] = [first]
+        terminated = False
+        for _ in range(100):
+            try:
+                metadata, _ = await generator.athrow(TransientRpcError())
+            except StopAsyncIteration:
+                terminated = True
+                break
+            yielded.append(metadata)
 
         # Assert
-        assert first_metadata != second_metadata
-        assert second_metadata in ctx.workers
-        await gen.aclose()
+        assert terminated, "delegate did not terminate after checkpoint eviction"
+        assert first not in ctx.workers
+        assert first not in yielded[1:]
+
+    @pytest.mark.asyncio
+    async def test_delegate_skips_worker_evicted_after_snapshot(self):
+        """Test delegate skips a candidate evicted after the snapshot.
+
+        Given:
+            A balancer that has snapshotted three workers and then has an
+            ahead-of-cursor worker evicted before the cursor reaches it
+        When:
+            The proxy drives the generator to exhaustion via athrow
+        Then:
+            The evicted worker is never yielded — it is skipped against
+            the live pool — and the generator still terminates.
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first, _ = await anext(generator)
+        ctx.remove_worker(workers[2])  # evict a not-yet-reached worker
+
+        # Act
+        yielded: list[WorkerMetadata] = [first]
+        terminated = False
+        for _ in range(100):
+            try:
+                metadata, _ = await generator.athrow(TransientRpcError())
+            except StopAsyncIteration:
+                terminated = True
+                break
+            yielded.append(metadata)
+
+        # Assert
+        assert terminated, "delegate did not terminate after mid-cycle eviction"
+        assert workers[2] not in ctx.workers
+        assert workers[2] not in yielded
+
+    @pytest.mark.asyncio
+    async def test_delegate_snapshots_once_per_wrap(self):
+        """Test delegate materializes the worker order once per wrap.
+
+        Given:
+            A balancer cycling a 16-worker pool through one full cycle of
+            transient failures, observed through a context view that
+            counts ``workers.items()`` materializations
+        When:
+            The generator is driven to exhaustion via athrow
+        Then:
+            The ordered snapshot is materialized a small constant number
+            of times (once per wrap), not once per candidate — proving the
+            O(1) cursor replaced the former O(index) per-candidate scan.
+        """
+        # Arrange
+        ctx, workers = _make_context(16)
+        counting = _ItemsCountingContext(ctx)
+        loadbalancer = RoundRobinLoadBalancer()
+
+        # Act
+        generator = loadbalancer.delegate(_TASK, context=counting)
+        yielded: list[WorkerMetadata] = []
+        metadata, _ = await anext(generator)
+        yielded.append(metadata)
+        while True:
+            try:
+                metadata, _ = await generator.athrow(TransientRpcError())
+            except StopAsyncIteration:
+                break
+            yielded.append(metadata)
+
+        # Assert
+        assert len(yielded) == len(workers)
+        assert counting.items_calls <= 2
+
+    @pytest.mark.asyncio
+    async def test_delegate_does_not_pin_retired_contexts(self):
+        """Test the balancer does not pin retired contexts against GC.
+
+        Given:
+            A shared RoundRobinLoadBalancer that has served a context the
+            caller then drops every strong reference to
+        When:
+            A garbage collection is forced
+        Then:
+            The context is reclaimed — the balancer holds it only weakly,
+            so a weakref to it resolves to None (no per-context leak of
+            the context or the connections it references).
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, _ = _make_context(2)
+        ref = weakref.ref(ctx)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        await anext(generator)  # registers ctx in the balancer's rotation state
+        await generator.aclose()
+
+        # Act
+        del ctx, generator
+        gc.collect()
+
+        # Assert
+        assert ref() is None
