@@ -28,10 +28,11 @@ This skill is part of the development workflow pipeline: `/issue` → `/implemen
 1. Verify git state
 2. Create a staging branch
 3. Analyze the full diff
-4. Plan the commits
-5. Stage and commit sequentially
-6. Review and present
-7. Prompt the user to move onto the PR step
+4. Gather knowledge graph context
+5. Plan the commits
+6. Stage and commit sequentially
+7. Review and present
+8. Prompt the user to move onto the PR step
 
 ### 1. Verify git state
 
@@ -74,7 +75,17 @@ The diff MUST be read carefully. For each changed file, note:
 
 A commit plan MUST be built before touching anything. The goal is a sequence of commits where each one represents exactly one logical change.
 
-### 4. Plan the commits
+### 4. Gather knowledge graph context
+
+Check whether a knowledge graph exists:
+
+```bash
+test -f .understand-anything/knowledge-graph.json && echo "exists" || echo "missing"
+```
+
+If the graph exists, invoke `/understand-chat` with a query listing the changed file paths from the diff to gather architectural context — component summaries, relationships, and layer assignments — that reveals component boundaries for logical commit grouping. If the graph does not exist, skip this step and continue.
+
+### 5. Plan the commits
 
 Group files and hunks into commits. The categories to use as a guide:
 
@@ -93,7 +104,7 @@ Mixed changes in a single file are common and MUST be handled with partial stagi
 
 Logical ordering MUST be considered: if commit B depends on commit A, A comes first. Generally: refactoring before feature work, build changes before code that uses them, tests after (or alongside) the code they test.
 
-### 5. Stage and commit sequentially
+### 6. Stage and commit sequentially
 
 For each planned commit, stage exactly the right changes and commit.
 
@@ -139,7 +150,7 @@ git commit -F /tmp/commit_msg.txt
 
 Repeat for each planned commit.
 
-### 6. Review and present
+### 7. Review and present
 
 After all commits:
 
@@ -161,7 +172,7 @@ Or if they prefer to review as a PR first, they can push the staging branch and 
 
 ---
 
-### 7. Prompt the user to move onto the PR step
+### 8. Prompt the user to move onto the PR step
 
 The user MUST be prompted with the next pipeline step: "Ready to create the PR? Run `/pr <number>` to review the changes and open a draft pull request." DO NOT proceed on your own.
 

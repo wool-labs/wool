@@ -28,10 +28,11 @@ An issue number MUST be provided as the sole argument (e.g., `/pr 103`). The iss
 1. Resolve target repository
 2. Identify the issue and branch
 3. Review the branch diff
-4. Draft the PR description
-5. Show draft for approval
-6. Push and create the draft PR
-7. Return the PR URL
+4. Gather knowledge graph context
+5. Draft the PR description
+6. Show draft for approval
+7. Push and create the draft PR
+8. Return the PR URL
 
 ### 1. Resolve target repository
 
@@ -85,7 +86,17 @@ git diff <merge-base>..HEAD --stat
 
 Analyze all committed source and test changes. Understand what was implemented, what was refactored, what tests were added or modified.
 
-### 4. Draft the PR description
+### 4. Gather knowledge graph context
+
+Check whether a knowledge graph exists:
+
+```bash
+test -f .understand-anything/knowledge-graph.json && echo "exists" || echo "missing"
+```
+
+If the graph exists, invoke `/understand-chat` with a query listing the changed files and branch diff summary to gather architectural context — component summaries, relationships, and layer assignments — that provides architectural context for writing the PR description. If the graph does not exist, skip this step and continue.
+
+### 5. Draft the PR description
 
 #### 4a. Detect a PR template
 
@@ -126,11 +137,11 @@ When no PR template file is detected, the PR description MUST contain a **Summar
 
 The first word of every plain-language table entry MUST be capitalized. Table entries MUST NOT end with punctuation (no trailing periods, commas, etc.). Code spans in entries (e.g., `` `foo.bar()` is called ``) are exempt from the capitalization rule.
 
-### 5. Show draft for approval
+### 6. Show draft for approval
 
 The full PR (title, body, branch name) MUST be presented to the user. The PR MUST NOT be created until the user explicitly approves.
 
-### 6. Push and create the draft PR
+### 7. Push and create the draft PR
 
 Push the branch if not already pushed:
 
@@ -174,7 +185,7 @@ EOF
 
 The `--repo <target>` flag MUST be included when the target repo differs from the current repo.
 
-### 7. Return the PR URL
+### 8. Return the PR URL
 
 The PR URL MUST be printed so the user can access it directly.
 
