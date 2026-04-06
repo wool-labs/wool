@@ -77,7 +77,7 @@ Check whether a knowledge graph exists:
 test -f .understand-anything/knowledge-graph.json && echo "exists" || echo "missing"
 ```
 
-If the graph exists, invoke `/understand-chat` with a query listing the changed file paths to gather architectural context — component summaries, relationships, and layer assignments — that reveals which components interact with the changed code and informs test coverage planning. If the graph does not exist, skip this step and continue.
+If the graph exists, read and follow `llms/skills/understand-chat.md` with a query listing the changed file paths to gather architectural context — component summaries, relationships, and layer assignments — that reveals which components interact with the changed code and informs test coverage planning. If the graph does not exist, skip this step and continue.
 
 ### 3. Analyze code changes
 

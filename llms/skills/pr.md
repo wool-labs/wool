@@ -94,7 +94,7 @@ Check whether a knowledge graph exists:
 test -f .understand-anything/knowledge-graph.json && echo "exists" || echo "missing"
 ```
 
-If the graph exists, invoke `/understand-chat` with a query listing the changed files and branch diff summary to gather architectural context — component summaries, relationships, and layer assignments — that provides architectural context for writing the PR description. If the graph does not exist, skip this step and continue.
+If the graph exists, read and follow `llms/skills/understand-chat.md` with a query listing the changed files and branch diff summary to gather architectural context — component summaries, relationships, and layer assignments — that provides architectural context for writing the PR description. If the graph does not exist, skip this step and continue.
 
 ### 5. Draft the PR description
 

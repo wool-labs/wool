@@ -63,7 +63,7 @@ Check whether a knowledge graph exists:
 test -f .understand-anything/knowledge-graph.json && echo "exists" || echo "missing"
 ```
 
-If the graph exists, invoke `/understand-chat` with a query synthesized from the conversation context (the user's description of the problem or feature) to gather architectural context — component summaries, relationships, and layer assignments — that helps scope the issue by revealing which components and layers are relevant. If the graph does not exist, skip this step and continue.
+If the graph exists, read and follow `llms/skills/understand-chat.md` with a query synthesized from the conversation context (the user's description of the problem or feature) to gather architectural context — component summaries, relationships, and layer assignments — that helps scope the issue by revealing which components and layers are relevant. If the graph does not exist, skip this step and continue.
 
 ### 4. Draft interactively
 
