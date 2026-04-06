@@ -122,7 +122,7 @@ The `--repo <target>` flag MUST be included when the target repo differs from th
 
 Before entering plan mode, read enough of the codebase to plan confidently:
 
-- Check whether `.understand-anything/knowledge-graph.json` exists. If it does, invoke `/understand-chat` with a query synthesized from the issue title and body to gather architectural context — component summaries, relationships, and layer assignments — that informs the planning phase by revealing which files, components, and layers are relevant to the issue. If the graph does not exist, skip this bullet and continue.
+- Check whether `.understand-anything/knowledge-graph.json` exists. If it does, read and follow `llms/skills/understand-chat.md` with a query synthesized from the issue title and body to gather architectural context — component summaries, relationships, and layer assignments — that informs the planning phase by revealing which files, components, and layers are relevant to the issue. If the graph does not exist, skip this bullet and continue.
 - Read source files referenced in the issue's description.
 - Read existing tests for the affected modules.
 - Read the project test guide (`@llm/guides/testguide-python.md`) to internalize testing conventions.
