@@ -4,9 +4,9 @@ The load balancer is the selection layer between Wool routines and workers. When
 
 ## Context-based selection
 
-Every `delegate` call receives a `LoadBalancerContextView` — an immutable view of the workers and their connections for a specific pool. Each `WorkerPool` maintains its own underlying context (via its `WorkerProxy`), so a single load balancer instance can be reused across multiple pools while keeping selection scoped to the correct one. Routines are always routed to the workers belonging to the pool they were called through, regardless of how many share the same load balancer. Discovery events populate the context automatically; the load balancer never needs to know how workers are found, only that they exist.
+Every `delegate` call receives a `LoadBalancerContextView` — a read-only view of the workers and their connections for a specific pool. Each `WorkerPool` maintains its own underlying context (via its `WorkerProxy`), so a single load balancer instance can be reused across multiple pools while keeping selection scoped to the correct one. Routines are always routed to the workers belonging to the pool they were called through, regardless of how many share the same load balancer. Discovery events populate the context automatically; the load balancer never needs to know how workers are found, only that they exist.
 
-The read-only `LoadBalancerContextView` exposes just a `workers` property. Load balancers observe pool membership but cannot mutate it — eviction on failure is the `WorkerProxy`'s job. This split is enforced at the protocol level.
+The `LoadBalancerContextView` exposes just a `workers` property — a `MappingProxyType` over the pool's current membership. Delegating balancers are typed against this read-only view, so selection is written against pool membership alone; eviction on failure is the `WorkerProxy`'s responsibility.
 
 ## Built-in load balancer
 
@@ -18,16 +18,17 @@ Wool ships with `RoundRobinLoadBalancer`, the default when no load balancer is e
 
 Wool supports custom load balancers via structural subtyping.
 
-`WorkerPool` and `WorkerProxy` accept any `DelegatingLoadBalancerLike` (or `Factory[DelegatingLoadBalancerLike]`). The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables. You can pass a load balancer instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` manages it appropriately.
+`WorkerPool` and `WorkerProxy` accept any `LoadBalancerLike` (or `Factory[LoadBalancerLike]`). The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables. You can pass a load balancer instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` manages it appropriately.
 
-### `DelegatingLoadBalancerLike` protocol
+### `LoadBalancerLike` protocol
 
 Custom load balancers implement a single method:
 
 ```python
-class DelegatingLoadBalancerLike(Protocol):
+class LoadBalancerLike(Protocol):
     def delegate(
         self,
+        task: Task,
         *,
         context: LoadBalancerContextView,
     ) -> AsyncGenerator[
@@ -36,34 +37,72 @@ class DelegatingLoadBalancerLike(Protocol):
     ]: ...
 ```
 
+`task` is the `Task` being routed, passed read-only as the first positional argument. A balancer MAY key its routing on it — hashing `task.tag` for sticky routing, or dispatching by `task.callable` for task-type specialization — or ignore it entirely, as `RoundRobinLoadBalancer` does.
+
 ### Contract
 
-The proxy drives the `delegate` generator through three signals:
-
-- `anext()` — request the next worker candidate.
-- `athrow(exc)` — report that the previous candidate's dispatch failed. On transient errors (`TransientRpcError`) the proxy leaves the worker in the pool; on non-transient errors the proxy evicts the worker from the context **before** throwing into the generator, so the balancer observes the capacity change before choosing the next candidate.
-- `asend(metadata)` — report that the previous candidate's dispatch succeeded, enabling per-dispatch bookkeeping (sticky routing, in-flight counts, affinity).
-
-**`asend` is terminal.** The generator MUST `return` (or let control fall off the end) after recording a success. Yielding another candidate after `asend` is a protocol violation — the proxy raises `RuntimeError` at the call site with the offending value in the message.
-
-When the generator ends without producing a successful candidate (e.g., all candidates fail), the proxy raises `NoWorkersAvailable`.
+The proxy drives the `delegate` generator: the balancer selects and orders worker candidates, and the proxy dispatches to each, retries on failure, and evicts unhealthy workers. Selection lives in the balancer; dispatch, retry, and eviction live in the proxy. The proxy reports each candidate's outcome back through the generator's `anext`, `athrow`, and `asend` signals — the `LoadBalancerLike` docstring documents them signal by signal and is the single source of truth for the handshake.
 
 ### Implementing a custom load balancer
 
-A sketch of a least-loaded balancer that tracks in-flight counts across dispatches:
+A task-aware balancer that routes by a stable hash of the task's tag, so tasks sharing a tag stick to the same worker (consistent-hashing / affinity routing):
+
+```python
+import wool
+
+
+class StickyTagBalancer:
+    """Route each task to a worker chosen by hashing its tag."""
+
+    async def delegate(
+        self,
+        task: wool.Task,
+        *,
+        context: wool.LoadBalancerContextView,
+    ):
+        workers = list(context.workers.items())
+        if not workers:
+            return
+
+        # Consistent-hashing key: prefer the caller-supplied tag so
+        # tasks sharing a tag route together, falling back to the task
+        # id so untagged tasks still route deterministically.
+        key = task.tag or str(task.id)
+        start = hash(key) % len(workers)
+
+        # Probe the hashed worker first, then walk the ring so a single
+        # unhealthy worker does not strand the task.
+        for offset in range(len(workers)):
+            metadata, connection = workers[(start + offset) % len(workers)]
+            try:
+                yield metadata, connection
+            except Exception:
+                # Dispatch failed (reported via athrow). Advance to the
+                # next worker on the ring. Catch Exception (not
+                # BaseException) so GeneratorExit and CancelledError
+                # propagate correctly.
+                continue
+            # Control returns here only when the proxy signals success
+            # via asend; the contract requires the generator to
+            # terminate after a success.
+            return
+```
+
+A worker-keyed balancer ignores `task` and ranks by worker state instead — here, by in-flight task count, yielding the least-loaded worker first:
 
 ```python
 import wool
 
 
 class LeastLoadedBalancer:
-    """Yields workers in ascending order of in-flight task count."""
+    """Yield workers in ascending order of in-flight task count."""
 
     def __init__(self):
         self._in_flight: dict[str, int] = {}
 
     async def delegate(
         self,
+        task: wool.Task,
         *,
         context: wool.LoadBalancerContextView,
     ):
@@ -78,23 +117,20 @@ class LeastLoadedBalancer:
                 self._in_flight.get(metadata.uid, 0) + 1
             )
             try:
-                sent = yield metadata, connection
-            except BaseException:
+                yield metadata, connection
+            except Exception:
                 # Dispatch failed. Decrement and try the next candidate.
+                # Catch Exception (not BaseException) so GeneratorExit
+                # and CancelledError propagate correctly.
                 self._in_flight[metadata.uid] -= 1
                 continue
-
-            if sent is not None:
-                # Success recorded via asend(metadata). Contract: the
-                # generator must terminate after a success signal.
-                # The in-flight count stays incremented for the life
-                # of this dispatch; decrement happens out-of-band when
-                # the stream drains (not shown — requires a lifecycle
-                # hook beyond this protocol's scope).
-                return
+            # Success signaled via asend; the contract requires the
+            # generator to terminate here. The in-flight count stays
+            # incremented for the life of this dispatch; the matching
+            # decrement happens out-of-band when the stream drains (not
+            # shown — requires a lifecycle hook beyond this protocol).
+            return
 ```
-
-Compared to implementing the deprecated `DispatchingLoadBalancerLike`, the delegate form has no stream-forwarding code, no error classification, and no eviction calls — the proxy does all of that.
 
 ## Usage examples
 
@@ -111,7 +147,7 @@ async with wool.WorkerPool(spawn=4):
 
 ### Custom load balancer
 
-Pass any `DelegatingLoadBalancerLike` instance (or factory) to `WorkerPool`:
+Pass any `LoadBalancerLike` instance (or factory) to `WorkerPool`:
 
 ```python
 import wool
@@ -124,6 +160,4 @@ async with wool.WorkerPool(spawn=4, loadbalancer=balancer):
 
 ## Deprecated: `DispatchingLoadBalancerLike`
 
-The previous `LoadBalancerLike` protocol — which required implementations to own the full dispatch-retry-evict loop — has been renamed to `DispatchingLoadBalancerLike` and is deprecated. Passing a `DispatchingLoadBalancerLike` to `WorkerProxy` or `WorkerPool` still works during the transition but emits a `DeprecationWarning` at startup. Support for the dispatch-based protocol will be removed in the next major release. Migrate custom implementations to `DelegatingLoadBalancerLike` by extracting the selection logic and dropping the retry/eviction boilerplate — the proxy now owns it.
-
-During the transition, the `LoadBalancerLike` alias resolves to a union of both protocols so existing code keeps type-checking. In the next major release, `LoadBalancerLike` will narrow to `DelegatingLoadBalancerLike` alone.
+`DispatchingLoadBalancerLike` is the deprecated dispatch-owning protocol; `LoadBalancerLike` is its replacement. A `DispatchingLoadBalancerLike` implementation owns the full dispatch-retry-evict loop itself, whereas a `LoadBalancerLike` implementation only selects candidates and lets the proxy own dispatch, retry, and eviction. Passing a `DispatchingLoadBalancerLike` to `WorkerProxy` or `WorkerPool` still works during the transition but emits a `DeprecationWarning`; support for the dispatch-based protocol will be removed in the next major release. Migrate custom implementations to `LoadBalancerLike` by extracting the selection logic and dropping the retry and eviction boilerplate — the proxy now owns it.
