@@ -12,8 +12,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  detect-changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    outputs:
+      has_code_changes: ${{ steps.get-touched-files.outputs.touched && 'true' || 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get touched files
+        id: get-touched-files
+        uses: ./.github/actions/get-touched-files
+        with:
+          pathspec: 'wool/src/ wool/tests/ wool/pyproject.toml proto/ .github/'
+
   lint:
     name: Lint / pyright
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_code_changes == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -36,6 +53,8 @@ jobs:
 
   unit-tests:
     name: Unit / Python ${{ matrix.python-version }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_code_changes == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -52,7 +71,8 @@ jobs:
 
   integration-tests:
     name: Integration / Python ${{ matrix.python-version }}
-    needs: unit-tests
+    needs: [detect-changes, unit-tests]
+    if: needs.detect-changes.outputs.has_code_changes == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
