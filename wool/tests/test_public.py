@@ -45,6 +45,8 @@ def test_public_api_completeness():
         "TaskException",
         "current_task",
         "routine",
+        "BackpressureContext",
+        "BackpressureLike",
         "LocalWorker",
         "Worker",
         "WorkerCredentials",

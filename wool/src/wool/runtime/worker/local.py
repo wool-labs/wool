@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 from typing import Any
 
 import grpc.aio
@@ -10,6 +11,9 @@ from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.process import WorkerProcess
+
+if TYPE_CHECKING:
+    from wool.runtime.worker.service import BackpressureLike
 
 
 # public
@@ -60,6 +64,15 @@ class LocalWorker(Worker):
     :param options:
         gRPC message size options. Defaults to
         :class:`WorkerOptions` with 100 MB limits.
+    :param backpressure:
+        Optional admission control hook. A callable receiving a
+        :class:`~wool.runtime.worker.service.BackpressureContext`
+        and returning ``True`` to **reject** the task or ``False``
+        to **accept** it. Both sync and async callables are
+        supported. When a task is rejected the worker responds with
+        gRPC ``RESOURCE_EXHAUSTED``, causing the load balancer to
+        skip to the next worker. ``None`` (default) accepts all
+        tasks unconditionally.
     :param extra:
         Additional metadata as key-value pairs.
     """
@@ -76,6 +89,7 @@ class LocalWorker(Worker):
         proxy_pool_ttl: float = 60.0,
         credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
+        backpressure: BackpressureLike | None = None,
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
@@ -90,6 +104,7 @@ class LocalWorker(Worker):
             options=options,
             tags=frozenset(self._tags),
             extra=self._extra,
+            backpressure=backpressure,
         )
 
     @property

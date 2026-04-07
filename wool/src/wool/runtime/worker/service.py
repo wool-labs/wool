@@ -5,11 +5,16 @@ import concurrent.futures
 import contextvars
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from inspect import isasyncgen
 from inspect import isasyncgenfunction
+from inspect import isawaitable
 from inspect import iscoroutinefunction
 from typing import AsyncGenerator
 from typing import AsyncIterator
+from typing import Awaitable
+from typing import Protocol
+from typing import runtime_checkable
 
 import cloudpickle
 from grpc import StatusCode
@@ -23,6 +28,59 @@ from wool.runtime.routine.task import do_dispatch
 
 # Sentinel to mark end of async generator stream
 _SENTINEL = object()
+
+
+# public
+@dataclass(frozen=True)
+class BackpressureContext:
+    """Snapshot of worker state provided to backpressure hooks.
+
+    :param active_task_count:
+        Number of tasks currently executing on this worker.
+    :param task:
+        The incoming :class:`~wool.runtime.routine.task.Task` being
+        evaluated for admission.
+    """
+
+    active_task_count: int
+    task: Task
+
+
+# public
+@runtime_checkable
+class BackpressureLike(Protocol):
+    """Protocol for backpressure hooks.
+
+    A backpressure hook determines whether an incoming task should be
+    rejected. Return ``True`` to **reject** the task (apply
+    backpressure) or ``False`` to **accept** it.
+
+    When a task is rejected the worker responds with gRPC
+    ``RESOURCE_EXHAUSTED``, which the load balancer treats as
+    transient and skips to the next worker.
+
+    Pass ``None`` (the default) to accept all tasks unconditionally.
+
+    Both sync and async implementations are supported::
+
+        def sync_hook(ctx: BackpressureContext) -> bool:
+            return ctx.active_task_count >= 4
+
+
+        async def async_hook(ctx: BackpressureContext) -> bool:
+            return ctx.active_task_count >= 4
+    """
+
+    def __call__(self, ctx: BackpressureContext) -> bool | Awaitable[bool]:
+        """Evaluate whether to reject the incoming task.
+
+        :param ctx:
+            Snapshot of the worker's current state and the incoming
+            task.
+        :returns:
+            ``True`` to reject the task, ``False`` to accept it.
+        """
+        ...
 
 
 class _Task:
@@ -78,6 +136,11 @@ class WorkerService(protocol.WorkerServicer):
     Handles graceful shutdown by rejecting new tasks while allowing
     in-flight tasks to complete. Exposes :attr:`stopping` and
     :attr:`stopped` events for lifecycle monitoring.
+
+    :param backpressure:
+        Optional admission control hook. See
+        :class:`BackpressureLike`. ``None`` (default) accepts all
+        tasks unconditionally.
     """
 
     _docket: set[_Task | _AsyncGen]
@@ -86,11 +149,12 @@ class WorkerService(protocol.WorkerServicer):
     _task_completed: asyncio.Event
     _loop_pool: ResourcePool[tuple[asyncio.AbstractEventLoop, threading.Thread]]
 
-    def __init__(self):
+    def __init__(self, *, backpressure: BackpressureLike | None = None):
         self._stopped = asyncio.Event()
         self._stopping = asyncio.Event()
         self._task_completed = asyncio.Event()
         self._docket = set()
+        self._backpressure = backpressure
         self._loop_pool = ResourcePool(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
@@ -143,7 +207,24 @@ class WorkerService(protocol.WorkerServicer):
             )
 
         response = await anext(aiter(request_iterator))
-        with self._tracker(Task.from_protobuf(response.task), request_iterator) as task:
+        work_task = Task.from_protobuf(response.task)
+
+        if self._backpressure is not None:
+            decision = self._backpressure(
+                BackpressureContext(
+                    active_task_count=len(self._docket),
+                    task=work_task,
+                )
+            )
+            if isawaitable(decision):
+                decision = await decision
+            if decision:
+                await context.abort(
+                    StatusCode.RESOURCE_EXHAUSTED,
+                    "Task rejected by backpressure hook",
+                )
+
+        with self._tracker(work_task, request_iterator) as task:
             ack = protocol.Ack(version=protocol.__version__)
             yield protocol.Response(ack=ack)
             try:
@@ -471,21 +552,9 @@ class WorkerService(protocol.WorkerServicer):
             await asyncio.sleep(0)
 
     async def _cancel(self):
-        """Cancel multiple tasks safely.
+        """Cancel all tracked tasks in the docket.
 
-        Cancels the provided tasks while performing safety checks to
-        avoid canceling the current task or already completed tasks.
-        Waits for all cancelled tasks to complete in parallel and handles
-        cancellation exceptions.
-
-        :param tasks:
-            The :class:`asyncio.Task` instances to cancel.
-
-        .. note::
-            This method performs the following safety checks:
-            - Avoids canceling the current task (would cause deadlock)
-            - Only cancels tasks that are not already done
-            - Properly handles :exc:`asyncio.CancelledError`
-              exceptions.
+        Cancels every entry in :attr:`_docket` and waits for them to
+        finish, handling cancellation exceptions gracefully.
         """
         await asyncio.gather(*(w.cancel() for w in self._docket), return_exceptions=True)

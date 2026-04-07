@@ -9,6 +9,7 @@ from hypothesis import given
 from hypothesis import settings
 
 from .conftest import PAIRWISE_SCENARIOS
+from .conftest import BackpressureMode
 from .conftest import CredentialType
 from .conftest import DiscoveryFactory
 from .conftest import LazyMode
@@ -70,6 +71,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         TimeoutKind.NONE,
         RoutineBinding.MODULE_FUNCTION,
         LazyMode.LAZY,
+        BackpressureMode.NONE,
     )
 )
 @example(
@@ -83,6 +85,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         TimeoutKind.NONE,
         RoutineBinding.MODULE_FUNCTION,
         LazyMode.LAZY,
+        BackpressureMode.SYNC,
     )
 )
 @example(
@@ -96,6 +99,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         TimeoutKind.NONE,
         RoutineBinding.MODULE_FUNCTION,
         LazyMode.LAZY,
+        BackpressureMode.ASYNC,
     )
 )
 @given(scenario=scenarios_strategy())

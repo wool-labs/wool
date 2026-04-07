@@ -23,13 +23,14 @@ This skill is part of the development workflow pipeline: `/issue` → `/implemen
 
 1. Determine the source
 2. Resolve target repository
-3. Draft interactively
-4. Suggest labels
-5. Show draft for approval
-6. Push the issue
-7. Clean up `.issue.md` (if applicable)
-8. Return the issue URL
-9. Prompt the user to move onto the implement step
+3. Gather knowledge graph context
+4. Draft interactively
+5. Suggest labels
+6. Show draft for approval
+7. Push the issue
+8. Clean up `.issue.md` (if applicable)
+9. Return the issue URL
+10. Prompt the user to move onto the implement step
 
 ### 1. Determine the source
 
@@ -54,7 +55,17 @@ If `isFork` is `true`, extract `parent.owner.login` and `parent.name` to form th
 
 All `gh` commands in subsequent steps that reference issues or PRs MUST include `--repo <target>` when the target repo differs from the current repo.
 
-### 3. Draft interactively
+### 3. Gather knowledge graph context
+
+Check whether a knowledge graph exists:
+
+```bash
+test -f .understand-anything/knowledge-graph.json && echo "exists" || echo "missing"
+```
+
+If the graph exists, read and follow `llms/skills/understand-chat.md` with a query synthesized from the conversation context (the user's description of the problem or feature) to gather architectural context — component summaries, relationships, and layer assignments — that helps scope the issue by revealing which components and layers are relevant. If the graph does not exist, skip this step and continue.
+
+### 4. Draft interactively
 
 Based on conversation context, determine the issue type and draft using the matching template. All templates share the same structure — only the field names and auto-label differ.
 
@@ -176,7 +187,7 @@ When the project defines a GitHub issue form template in `.github/ISSUE_TEMPLATE
 
 The draft MUST be shown to the user and iterated until they approve.
 
-### 4. Suggest labels
+### 5. Suggest labels
 
 The issue content MUST be analyzed and one or more labels suggested from the repository's label set:
 
@@ -193,11 +204,11 @@ Each label SHOULD only be applied when the issue's **primary focus** matches tha
 
 The suggested labels MUST be shown alongside the draft for user approval.
 
-### 5. Show draft for approval
+### 6. Show draft for approval
 
 The full issue (title, body, labels) MUST be presented to the user. The issue MUST NOT be pushed until the user explicitly approves.
 
-### 6. Push the issue
+### 7. Push the issue
 
 A heredoc MUST be used for the body to avoid shell escaping issues:
 
@@ -210,7 +221,7 @@ EOF
 
 The `--repo <target>` flag MUST be included when the target repo differs from the current repo (as resolved in step 2). The `--assignee` flag MUST NOT be used — issues are not auto-assigned.
 
-### 7. Clean up `.issue.md`
+### 8. Clean up `.issue.md`
 
 If the issue was created from `.issue.md`, the user MUST be asked whether to delete the file now that the issue has been pushed. If they agree:
 
@@ -218,12 +229,12 @@ If the issue was created from `.issue.md`, the user MUST be asked whether to del
 rm .issue.md
 ```
 
-### 8. Return the issue URL
+### 9. Return the issue URL
 
 The issue URL returned by `gh issue create` MUST be printed so the user can access it directly.
 
 The user SHOULD be prompted with the next pipeline step: "Ready to implement? Run `/implement <number>` to create a branch and start planning."
 
-### 9. Prompt the user to move onto the implement step
+### 10. Prompt the user to move onto the implement step
 
 The user MUST be prompted with the next pipeline step: "Ready to implement? Run `/implement <number>` to create a branch and start planning." When working from a fork, note that `<number>` refers to the issue on the upstream repo. DO NOT proceed on your own.

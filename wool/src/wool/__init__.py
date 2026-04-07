@@ -38,6 +38,8 @@ from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.proxy import WorkerProxy
+from wool.runtime.worker.service import BackpressureContext
+from wool.runtime.worker.service import BackpressureLike
 from wool.runtime.worker.service import WorkerService
 
 pickling_support.install()
@@ -80,6 +82,9 @@ __all__ = [
     "TaskException",
     "current_task",
     "routine",
+    # Backpressure
+    "BackpressureContext",
+    "BackpressureLike",
     # Workers
     "LocalWorker",
     "Worker",

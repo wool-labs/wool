@@ -1430,6 +1430,27 @@ class TestWorkerProcess:
         # Assert
         assert process.host == "127.0.0.1"
 
+    def test___init___with_backpressure_hook(self):
+        """Test WorkerProcess construction with a backpressure hook.
+
+        Given:
+            A callable backpressure hook
+        When:
+            WorkerProcess is instantiated with backpressure=hook
+        Then:
+            It should construct successfully
+        """
+
+        # Arrange
+        def hook(ctx):
+            return ctx.active_task_count >= 4
+
+        # Act
+        process = WorkerProcess(backpressure=hook)
+
+        # Assert
+        assert process.host == "127.0.0.1"
+
     def test_run_with_default_options_passes_grpc_options(self, mocker):
         """Test run passes default WorkerOptions to gRPC server.
 

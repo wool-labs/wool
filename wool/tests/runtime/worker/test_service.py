@@ -2172,3 +2172,374 @@ class TestWorkerService:
         # Assert
         assert result["do_dispatch"] is False
         assert result["has_proxy"] is True
+
+    def test___init___with_backpressure_hook(self):
+        """Test WorkerService initialization with a backpressure hook.
+
+        Given:
+            A callable backpressure hook
+        When:
+            WorkerService is instantiated with backpressure=hook
+        Then:
+            It should initialize successfully with stopping and stopped events unset
+        """
+
+        # Arrange
+        def hook(ctx):
+            return False
+
+        # Act
+        service = WorkerService(backpressure=hook)
+
+        # Assert
+        assert not service.stopping.is_set()
+        assert not service.stopped.is_set()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_sync_backpressure_accepting(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test dispatch succeeds when sync backpressure hook returns False.
+
+        Given:
+            A :class:`WorkerService` with a sync backpressure hook that returns False
+        When:
+            Dispatch RPC is called
+        Then:
+            It should accept the task and return the result normally
+        """
+
+        # Arrange
+        async def sample_task():
+            return "accepted"
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        request = protocol.Request(task=wool_task.to_protobuf())
+
+        def hook(ctx):
+            return False
+
+        service = WorkerService(backpressure=hook)
+
+        # Act
+        async with grpc_aio_stub(servicer=service) as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            responses = [r async for r in stream]
+
+        # Assert
+        ack, response = responses
+        assert ack.HasField("ack")
+        assert response.HasField("result")
+        assert cloudpickle.loads(response.result.dump) == "accepted"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_sync_backpressure_rejecting(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test dispatch aborts when sync backpressure hook returns True.
+
+        Given:
+            A :class:`WorkerService` with a sync backpressure hook that returns True
+        When:
+            Dispatch RPC is called
+        Then:
+            It should reject the task with RESOURCE_EXHAUSTED status
+        """
+
+        # Arrange
+        async def sample_task():
+            return "should_not_reach"
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        request = protocol.Request(task=wool_task.to_protobuf())
+
+        def hook(ctx):
+            return True
+
+        service = WorkerService(backpressure=hook)
+
+        # Act & assert
+        async with grpc_aio_stub(servicer=service) as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            with pytest.raises(grpc.RpcError) as exc_info:
+                async for _ in stream:
+                    pass
+            assert exc_info.value.code() == StatusCode.RESOURCE_EXHAUSTED
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_async_backpressure_rejecting(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test dispatch aborts when async backpressure hook returns True.
+
+        Given:
+            A :class:`WorkerService` with an async backpressure hook that returns True
+        When:
+            Dispatch RPC is called
+        Then:
+            It should reject the task with RESOURCE_EXHAUSTED status
+        """
+
+        # Arrange
+        async def sample_task():
+            return "should_not_reach"
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        request = protocol.Request(task=wool_task.to_protobuf())
+
+        async def async_hook(ctx):
+            return True
+
+        service = WorkerService(backpressure=async_hook)
+
+        # Act & assert
+        async with grpc_aio_stub(servicer=service) as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            with pytest.raises(grpc.RpcError) as exc_info:
+                async for _ in stream:
+                    pass
+            assert exc_info.value.code() == StatusCode.RESOURCE_EXHAUSTED
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_async_backpressure_accepting(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test dispatch succeeds when async backpressure hook returns False.
+
+        Given:
+            A :class:`WorkerService` with an async backpressure hook that returns False
+        When:
+            Dispatch RPC is called
+        Then:
+            It should accept the task and return the result normally
+        """
+
+        # Arrange
+        async def sample_task():
+            return "async_accepted"
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        request = protocol.Request(task=wool_task.to_protobuf())
+
+        async def async_hook(ctx):
+            return False
+
+        service = WorkerService(backpressure=async_hook)
+
+        # Act
+        async with grpc_aio_stub(servicer=service) as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            responses = [r async for r in stream]
+
+        # Assert
+        ack, response = responses
+        assert ack.HasField("ack")
+        assert response.HasField("result")
+        assert cloudpickle.loads(response.result.dump) == "async_accepted"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_backpressure_receiving_context(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test backpressure hook receives correct context.
+
+        Given:
+            A :class:`WorkerService` with a backpressure hook that captures its argument
+        When:
+            Dispatch RPC is called
+        Then:
+            It should pass a BackpressureContext with active_task_count and task fields
+        """
+        # Arrange
+        from wool.runtime.worker.service import BackpressureContext
+
+        async def sample_task():
+            return "result"
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        request = protocol.Request(task=wool_task.to_protobuf())
+
+        captured = []
+
+        def hook(ctx):
+            captured.append(ctx)
+            return False
+
+        service = WorkerService(backpressure=hook)
+
+        # Act
+        async with grpc_aio_stub(servicer=service) as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            [r async for r in stream]
+
+        # Assert
+        assert len(captured) == 1
+        ctx = captured[0]
+        assert isinstance(ctx, BackpressureContext)
+        assert ctx.active_task_count == 0
+        assert ctx.task.id == wool_task.id
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_backpressure_and_active_tasks(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test backpressure hook sees correct active task count.
+
+        Given:
+            A :class:`WorkerService` with one active task already dispatched
+        When:
+            A second dispatch RPC is called with a backpressure hook
+        Then:
+            It should see active_task_count == 1
+        """
+        # Arrange
+        global _control_event
+        _control_event = threading.Event()
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+
+        first_task = Task(
+            id=uuid4(),
+            callable=_controllable_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        first_request = protocol.Request(task=first_task.to_protobuf())
+
+        async def second_fn():
+            return "second"
+
+        second_task = Task(
+            id=uuid4(),
+            callable=second_fn,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        second_request = protocol.Request(task=second_task.to_protobuf())
+
+        captured_count = []
+
+        def hook(ctx):
+            captured_count.append(ctx.active_task_count)
+            return False
+
+        service = WorkerService(backpressure=hook)
+
+        # Act
+        try:
+            async with grpc_aio_stub(servicer=service) as stub:
+                # Dispatch first task (blocks on control event)
+                stream1 = stub.dispatch()
+                await stream1.write(first_request)
+                await stream1.done_writing()
+                # Wait for ack to confirm first task is tracked
+                async for response in stream1:
+                    assert response.HasField("ack")
+                    break
+
+                # Dispatch second task — hook should see 1 active task
+                stream2 = stub.dispatch()
+                await stream2.write(second_request)
+                await stream2.done_writing()
+                [r async for r in stream2]
+
+                # Release first task
+                _control_event.set()
+                [r async for r in stream1]
+        finally:
+            if _control_event and not _control_event.is_set():
+                _control_event.set()
+            _control_event = None
+
+        # Assert — first dispatch sees 0 active, second sees 1
+        assert captured_count == [0, 1]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_backpressure_hook_raising_exception(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test dispatch surfaces error when backpressure hook raises.
+
+        Given:
+            A :class:`WorkerService` with a backpressure hook that
+            raises RuntimeError
+        When:
+            Dispatch RPC is called
+        Then:
+            It should propagate the error as a gRPC failure
+        """
+
+        # Arrange
+        async def sample_task():
+            return "should_not_reach"
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        request = protocol.Request(task=wool_task.to_protobuf())
+
+        def hook(ctx):
+            raise RuntimeError("hook exploded")
+
+        service = WorkerService(backpressure=hook)
+
+        # Act & assert
+        async with grpc_aio_stub(servicer=service) as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            with pytest.raises(grpc.RpcError):
+                async for _ in stream:
+                    pass

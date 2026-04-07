@@ -35,12 +35,13 @@ An issue number MUST be provided as the sole argument (e.g., `/test 103`).
 ### TL;DR
 
 1. Resolve issue, PR, and branch
-2. Analyze code changes
-3. Evaluate existing tests
-4. Generate test plan
-5. Enter plan mode
-6. Implement tests after approval
-7. Prompt the user to move onto the commit step
+2. Gather knowledge graph context
+3. Analyze code changes
+4. Evaluate existing tests
+5. Generate test plan
+6. Enter plan mode
+7. Implement tests after approval
+8. Prompt the user to move onto the commit step
 
 ### 1. Resolve issue, PR, and branch
 
@@ -68,7 +69,17 @@ git checkout <branch>
 
 If the branch does not exist, inform the user that the implement skill must be run first and stop. The test skill MUST NOT create branches.
 
-### 2. Analyze code changes
+### 2. Gather knowledge graph context
+
+Check whether a knowledge graph exists:
+
+```bash
+test -f .understand-anything/knowledge-graph.json && echo "exists" || echo "missing"
+```
+
+If the graph exists, read and follow `llms/skills/understand-chat.md` with a query listing the changed file paths to gather architectural context — component summaries, relationships, and layer assignments — that reveals which components interact with the changed code and informs test coverage planning. If the graph does not exist, skip this step and continue.
+
+### 3. Analyze code changes
 
 Determine the base branch and diff against it:
 
@@ -80,7 +91,7 @@ git diff <merge-base>..HEAD
 
 Read every changed source file to understand what was implemented. Note which modules have new or modified public APIs.
 
-### 3. Evaluate existing tests
+### 4. Evaluate existing tests
 
 Read the current test files for all affected modules. For each existing test:
 
@@ -89,7 +100,7 @@ Read the current test files for all affected modules. For each existing test:
 - Identify tests that **no longer apply** due to removed or significantly changed functionality — flag these for removal or rewriting.
 - Note gaps that require **new** test cases.
 
-### 4. Generate test plan
+### 5. Generate test plan
 
 Generate a Given-When-Then test plan internally. This plan is an agent planning artifact — do NOT write spec files to disk. The plan MUST:
 
@@ -98,7 +109,7 @@ Generate a Given-When-Then test plan internally. This plan is an agent planning 
 - Follow the structure in [Table Format](#table-format) below.
 - Follow the project test guide conventions.
 
-### 5. Enter plan mode
+### 6. Enter plan mode
 
 Call `EnterPlanMode` to present the test plan to the user for approval. The plan MUST clearly distinguish between:
 
@@ -107,7 +118,7 @@ Call `EnterPlanMode` to present the test plan to the user for approval. The plan
 - **Existing tests to remove** — no longer apply due to removed or changed functionality
 - **New tests to add** — cover genuinely uncovered behavior
 
-### 6. Implement tests after approval
+### 7. Implement tests after approval
 
 Once the user approves the plan, implement the test files:
 
@@ -115,7 +126,7 @@ Once the user approves the plan, implement the test files:
 - Add new test cases where the plan identifies coverage gaps.
 - Follow the project test guide for file naming, class organization, and test conventions.
 
-### 7. Prompt the user to move onto the commit step
+### 8. Prompt the user to move onto the commit step
 
 The user MUST be prompted with the next pipeline step: "Ready to commit? Run `/commit` to stage and commit the changes." DO NOT proceed on your own.
 

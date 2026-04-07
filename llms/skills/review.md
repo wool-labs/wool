@@ -31,11 +31,12 @@ A PR number MUST be provided as the sole argument (e.g., `/review 146`).
 2. Fetch the PR metadata and diff
 3. Read project guides and styles
 4. Read source files under review
-5. Analyze the diff
-6. Categorize findings
-7. Present findings for approval
-8. Post the review
-9. Prompt the user with next steps
+5. Gather knowledge graph context
+6. Analyze the diff
+7. Categorize findings
+8. Present findings for approval
+9. Post the review
+10. Prompt the user with next steps
 
 ### 1. Resolve target repository
 
@@ -75,7 +76,17 @@ For each changed file in the PR:
 - Read the full file at its current HEAD revision so that surrounding context is available.
 - If the changed file is a test file, also read the corresponding source module it tests (and vice versa).
 
-### 5. Analyze the diff
+### 5. Gather knowledge graph context
+
+Check whether a knowledge graph exists:
+
+```bash
+test -f .understand-anything/knowledge-graph.json && echo "exists" || echo "missing"
+```
+
+If the graph exists, read and follow `llms/skills/understand-chat.md` with a query listing the changed file paths from the PR diff to gather architectural context — component summaries, relationships, and layer assignments — that reveals how changed components fit into the broader architecture and informs review quality. If the graph does not exist, skip this step and continue.
+
+### 6. Analyze the diff
 
 Review every hunk in the diff against the guides read in step 3 and the source context read in step 4. Check for:
 
@@ -87,7 +98,7 @@ Review every hunk in the diff against the guides read in step 3 and the source c
 
 Each finding MUST reference the specific file and line range in the diff where the issue occurs.
 
-### 6. Categorize findings
+### 7. Categorize findings
 
 Every finding MUST be assigned exactly one severity:
 
@@ -96,7 +107,7 @@ Every finding MUST be assigned exactly one severity:
 
 Present findings grouped by severity, with blocking findings first.
 
-### 7. Present findings for approval
+### 8. Present findings for approval
 
 The complete list of findings MUST be presented to the user before posting. For each finding, show:
 
@@ -114,7 +125,7 @@ The user MUST be given the opportunity to:
 
 The review MUST NOT be posted until the user explicitly approves the final set of findings.
 
-### 8. Post the review
+### 9. Post the review
 
 Construct a review payload and post it via the GitHub API. The payload MUST be written to a temporary file to avoid shell escaping issues:
 
@@ -159,7 +170,7 @@ gh api repos/<owner>/<repo>/pulls/<number>/reviews \
 
 The `<owner>` and `<repo>` values MUST be resolved from step 1. When working from a fork, these refer to the upstream repo's owner and name (unless the user explicitly targeted the fork).
 
-### 9. Prompt the user with next steps
+### 10. Prompt the user with next steps
 
 After the review is posted, prompt the user with the appropriate next step:
 

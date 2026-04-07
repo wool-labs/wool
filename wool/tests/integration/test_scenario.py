@@ -2,6 +2,7 @@
 
 import pytest
 
+from .conftest import BackpressureMode
 from .conftest import CredentialType
 from .conftest import DiscoveryFactory
 from .conftest import LazyMode
@@ -103,7 +104,7 @@ class TestScenario:
         """Test that a fully populated scenario reports complete.
 
         Given:
-            A scenario with all 9 dimensions set.
+            A scenario with all 10 dimensions set.
         When:
             ``is_complete`` is checked.
         Then:
@@ -120,6 +121,7 @@ class TestScenario:
             timeout=TimeoutKind.NONE,
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
+            backpressure=BackpressureMode.NONE,
         )
 
         # Act & assert
@@ -165,4 +167,4 @@ class TestScenario:
         result = str(scenario)
 
         # Assert
-        assert result == "COROUTINE-DEFAULT-_-_-_-_-_-_-_"
+        assert result == "COROUTINE-DEFAULT-_-_-_-_-_-_-_-_"
