@@ -22,7 +22,7 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
-from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.cache import ReferenceCountedCache
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import do_dispatch
 
@@ -147,7 +147,7 @@ class WorkerService(protocol.WorkerServicer):
     _stopped: asyncio.Event
     _stopping: asyncio.Event
     _task_completed: asyncio.Event
-    _loop_pool: ResourcePool[tuple[asyncio.AbstractEventLoop, threading.Thread]]
+    _loop_pool: ReferenceCountedCache[tuple[asyncio.AbstractEventLoop, threading.Thread]]
 
     def __init__(self, *, backpressure: BackpressureLike | None = None):
         self._stopped = asyncio.Event()
@@ -155,7 +155,7 @@ class WorkerService(protocol.WorkerServicer):
         self._task_completed = asyncio.Event()
         self._docket = set()
         self._backpressure = backpressure
-        self._loop_pool = ResourcePool(
+        self._loop_pool = ReferenceCountedCache(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
             ttl=0,
@@ -267,7 +267,7 @@ class WorkerService(protocol.WorkerServicer):
         """Create a new event loop running on a dedicated daemon thread.
 
         :param key:
-            The :class:`ResourcePool` cache key (unused).
+            The :class:`ReferenceCountedCache` cache key (unused).
         :returns:
             A tuple of the event loop and the thread running it.
         """

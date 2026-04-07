@@ -6,9 +6,9 @@ from typing import AsyncIterator
 from typing import Callable
 from typing import ClassVar
 
+from wool.runtime.cache import ReferenceCountedCache
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.discovery.base import DiscoveryEvent
-from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.fanout import Fanout
 
@@ -30,7 +30,7 @@ class _SharedSubscription:
     """Adapter bridging a discovery subscriber and a :class:`Fanout`.
 
     Each ``__aiter__`` call returns an independent async generator
-    that enters a :class:`~wool.runtime.resourcepool.Resource` from
+    that enters a :class:`~wool.runtime.cache.Reference` from
     the pool, wraps the raw subscriber in a shared
     :class:`~wool.utilities.fanout.Fanout`, and iterates a
     :class:`~wool.utilities.fanout.FanoutConsumer`.  The ``async
@@ -42,7 +42,7 @@ class _SharedSubscription:
     so they start with a consistent view of the current state.
 
     :param key:
-        Cache key for the :class:`ResourcePool`.
+        Cache key for the :class:`ReferenceCountedCache`.
     :param reduce_info:
         ``(cls, args, kwargs)`` tuple used by :meth:`__reduce__` for
         pickle support.
@@ -105,7 +105,7 @@ class SubscriberMeta(type):
     ``__new__`` onto the subscriber class.  The injected method
     registers a factory that creates raw subscribers, then returns a
     :class:`_SharedSubscription` whose pool
-    :class:`~wool.runtime.resourcepool.Resource` is entered lazily
+    :class:`~wool.runtime.cache.Reference` is entered lazily
     on first iteration.
 
     Subscriber classes pass a ``key`` keyword argument at class
@@ -135,7 +135,7 @@ class SubscriberMeta(type):
             key = cls_arg._cache_key_fn(cls_arg, *args, **kwargs)  # type: ignore[attr-defined]
             pool = __subscriber_pool__.get()
             if pool is None:
-                pool = ResourcePool(
+                pool = ReferenceCountedCache(
                     factory=_pool_factory,
                     finalizer=_pool_finalizer,
                     ttl=0,
@@ -158,7 +158,7 @@ class SubscriberMeta(type):
 
 
 async def _pool_finalizer(subscriber: Any) -> None:
-    """Resource pool finalizer — clean up fanout and subscriber."""
+    """Cache finalizer — clean up fanout and subscriber."""
     fanout = _SharedSubscription._fanouts.pop(subscriber, None)
     if fanout is not None:
         await fanout.cleanup()

@@ -5,13 +5,13 @@ import uuid
 import cloudpickle
 import pytest
 
+from wool.runtime.cache import ReferenceCountedCache
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.pool import SubscriberMeta
 from wool.runtime.discovery.pool import _pool_factory
 from wool.runtime.discovery.pool import _SharedSubscription
 from wool.runtime.discovery.pool import _subscriber_factories
-from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.metadata import WorkerMetadata
 
 
@@ -53,7 +53,7 @@ def _setup_pool():
     """Ensure the subscriber pool exists for direct-construction tests."""
     pool = __subscriber_pool__.get()
     if pool is None:
-        pool = ResourcePool(factory=_pool_factory, ttl=0)
+        pool = ReferenceCountedCache(factory=_pool_factory, ttl=0)
         __subscriber_pool__.set(pool)
     return pool
 
@@ -192,7 +192,7 @@ class TestSubscriberMeta:
         When:
             A subscriber is constructed via SubscriberMeta.
         Then:
-            The ContextVar should be set to a ResourcePool.
+            The ContextVar should be set to a ReferenceCountedCache.
         """
         # Arrange
         __subscriber_pool__.set(None)
