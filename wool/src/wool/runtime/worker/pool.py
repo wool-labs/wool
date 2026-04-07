@@ -154,6 +154,10 @@ class WorkerPool:
         Load balancer instance, factory, or context manager.
     :param discovery:
         Discovery service instance, factory, or context manager.
+    :param quorum:
+        Minimum number of workers that must be discovered before the proxy
+        considers itself ready.  Defaults to ``1``.  Set to ``0`` to skip
+        waiting for workers entirely.
     :param credentials:
         Optional channel credentials for TLS/mTLS connections to workers.
     :raises ValueError:
@@ -175,6 +179,7 @@ class WorkerPool:
         *tags: str,
         spawn: int = 0,
         lease: int | None = None,
+        quorum: int = 1,
         worker: WorkerFactory = LocalWorker,
         discovery: None = None,
         loadbalancer: (
@@ -194,6 +199,7 @@ class WorkerPool:
         self,
         *,
         lease: int | None = None,
+        quorum: int = 1,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
@@ -213,6 +219,7 @@ class WorkerPool:
         *tags: str,
         spawn: int = 0,
         lease: int | None = None,
+        quorum: int = 1,
         worker: WorkerFactory = LocalWorker,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
@@ -234,6 +241,7 @@ class WorkerPool:
         *tags: str,
         size: int,
         lease: int | None = None,
+        quorum: int = 1,
         worker: WorkerFactory = LocalWorker,
         discovery: None = None,
         loadbalancer: (
@@ -250,6 +258,7 @@ class WorkerPool:
         *tags: str,
         size: int,
         lease: int | None = None,
+        quorum: int = 1,
         worker: WorkerFactory = LocalWorker,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
@@ -265,6 +274,7 @@ class WorkerPool:
         spawn: int | None = None,
         size: int | None = None,
         lease: int | None = None,
+        quorum: int = 1,
         worker: WorkerFactory | None = None,
         discovery: DiscoveryLike | Factory[DiscoveryLike] | None = None,
         loadbalancer: (
@@ -293,6 +303,14 @@ class WorkerPool:
         if lease is not None and lease < 0:
             raise ValueError("Lease must be non-negative")
 
+        if quorum < 0:
+            raise ValueError("Quorum must be a non-negative integer")
+
+        if lease is not None and quorum > lease:
+            raise ValueError(
+                "Quorum cannot exceed lease — the quorum would never be satisfied"
+            )
+
         match (spawn, discovery):
             case (spawn, discovery) if spawn is not None and discovery is not None:
                 spawn = _resolve_spawn(spawn)
@@ -318,6 +336,7 @@ class WorkerPool:
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
                                 lease=max_workers,
+                                quorum=quorum,
                                 lazy=self._lazy,
                             ):
                                 yield
@@ -344,6 +363,7 @@ class WorkerPool:
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
                                 lease=max_workers,
+                                quorum=quorum,
                                 lazy=self._lazy,
                             ):
                                 yield
@@ -363,6 +383,7 @@ class WorkerPool:
                             loadbalancer=loadbalancer,
                             credentials=self._credentials,
                             lease=lease,
+                            quorum=quorum,
                             lazy=self._lazy,
                         ):
                             yield
@@ -389,6 +410,7 @@ class WorkerPool:
                                 loadbalancer=loadbalancer,
                                 credentials=self._credentials,
                                 lease=max_workers,
+                                quorum=quorum,
                                 lazy=self._lazy,
                             ):
                                 yield

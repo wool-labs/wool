@@ -1723,6 +1723,285 @@ class TestWorkerProxy:
         assert len(restored.workers) == 2
         await restored.stop()
 
+    # ------------------------------------------------------------------
+    # Quorum tests
+    # ------------------------------------------------------------------
+
+    def test___init___with_negative_quorum_raises(self, mock_discovery_service):
+        """Test negative quorum is rejected.
+
+        Given:
+            A discovery service and quorum of -1
+        When:
+            WorkerProxy is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Quorum must be a non-negative integer",
+        ):
+            WorkerProxy(discovery=mock_discovery_service, quorum=-1)
+
+    def test___init___with_zero_quorum_accepted(self, mock_discovery_service):
+        """Test zero quorum is accepted.
+
+        Given:
+            A discovery service and quorum of 0
+        When:
+            WorkerProxy is instantiated
+        Then:
+            It should create the proxy successfully
+        """
+        # Act
+        proxy = WorkerProxy(discovery=mock_discovery_service, quorum=0)
+
+        # Assert
+        assert isinstance(proxy, WorkerProxy)
+
+    def test___init___with_positive_quorum_accepted(self, mock_discovery_service):
+        """Test positive quorum is accepted.
+
+        Given:
+            A discovery service and quorum of 3
+        When:
+            WorkerProxy is instantiated
+        Then:
+            It should create the proxy successfully
+        """
+        # Act
+        proxy = WorkerProxy(discovery=mock_discovery_service, quorum=3)
+
+        # Assert
+        assert isinstance(proxy, WorkerProxy)
+
+    def test___init___with_quorum_exceeding_lease_raises(self, mock_discovery_service):
+        """Test quorum exceeding lease is rejected.
+
+        Given:
+            A discovery service with lease=2 and quorum=3
+        When:
+            WorkerProxy is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Quorum cannot exceed lease",
+        ):
+            WorkerProxy(discovery=mock_discovery_service, lease=2, quorum=3)
+
+    def test___init___with_quorum_equal_to_lease_accepted(self, mock_discovery_service):
+        """Test quorum equal to lease is accepted.
+
+        Given:
+            A discovery service with lease=3 and quorum=3
+        When:
+            WorkerProxy is instantiated
+        Then:
+            It should create the proxy successfully
+        """
+        # Act
+        proxy = WorkerProxy(discovery=mock_discovery_service, lease=3, quorum=3)
+
+        # Assert
+        assert isinstance(proxy, WorkerProxy)
+
+    def test___init___with_quorum_and_no_lease_accepted(self, mock_discovery_service):
+        """Test quorum without lease is accepted.
+
+        Given:
+            A discovery service and quorum of 5 with no lease
+        When:
+            WorkerProxy is instantiated
+        Then:
+            It should create the proxy successfully
+        """
+        # Act
+        proxy = WorkerProxy(discovery=mock_discovery_service, quorum=5)
+
+        # Assert
+        assert isinstance(proxy, WorkerProxy)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_zero_quorum_skips_worker_wait(
+        self,
+        mocker: MockerFixture,
+        mock_proxy_session,
+    ):
+        """Test dispatch does not wait for workers when quorum is 0.
+
+        Given:
+            A started WorkerProxy with quorum=0 and no workers
+        When:
+            dispatch is called
+        Then:
+            It should proceed without waiting for workers
+        """
+
+        # Arrange
+        class EmptyDiscovery:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                # Block forever — no workers will appear
+                await asyncio.Event().wait()
+                raise StopAsyncIteration
+
+        class StubLoadBalancer:
+            def __init__(self):
+                self.dispatched = False
+
+            async def dispatch(self, task, *, context, timeout=None):
+                self.dispatched = True
+
+        stub_lb = StubLoadBalancer()
+        proxy = WorkerProxy(
+            discovery=EmptyDiscovery(),
+            loadbalancer=stub_lb,
+            quorum=0,
+        )
+        await proxy.start()
+
+        mock_task = mocker.MagicMock(spec=Task)
+
+        # Act — should not block waiting for workers
+        await asyncio.wait_for(proxy.dispatch(mock_task), timeout=2.0)
+
+        # Assert
+        assert stub_lb.dispatched
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_waits_for_quorum_workers(
+        self,
+        mocker: MockerFixture,
+        mock_proxy_session,
+    ):
+        """Test dispatch blocks until quorum workers are discovered.
+
+        Given:
+            A started WorkerProxy with quorum=2 and a gated
+            discovery stream
+        When:
+            dispatch is called and workers are added one at a time
+        Then:
+            It should block until 2 workers are discovered
+        """
+        # Arrange
+        gate = asyncio.Event()
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+            )
+            for i in range(2)
+        ]
+        call_count = 0
+
+        class GatedDiscovery:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                nonlocal call_count
+                await gate.wait()
+                gate.clear()
+                if call_count < len(workers):
+                    event = DiscoveryEvent("worker-added", metadata=workers[call_count])
+                    call_count += 1
+                    return event
+                await asyncio.Event().wait()
+                raise StopAsyncIteration
+
+        class StubLoadBalancer:
+            def __init__(self):
+                self.dispatched = False
+
+            async def dispatch(self, task, *, context, timeout=None):
+                self.dispatched = True
+
+        stub_lb = StubLoadBalancer()
+        proxy = WorkerProxy(
+            discovery=GatedDiscovery(),
+            loadbalancer=stub_lb,
+            quorum=2,
+        )
+        await proxy.start()
+        mock_task = mocker.MagicMock(spec=Task)
+
+        # Act — launch dispatch; it will block on quorum
+        dispatch_task = asyncio.create_task(proxy.dispatch(mock_task))
+        await asyncio.sleep(0)
+
+        # Release first worker — still below quorum
+        gate.set()
+        await asyncio.sleep(0.05)
+        assert not dispatch_task.done()
+
+        # Release second worker — quorum met
+        gate.set()
+        await asyncio.wait_for(dispatch_task, timeout=2.0)
+
+        # Assert
+        assert stub_lb.dispatched
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_cloudpickle_serialization_preserves_quorum(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test pickle round-trip preserves quorum behavior.
+
+        Given:
+            A non-lazy WorkerProxy with quorum=2 and a discovery
+            stream with 3 worker-added events
+        When:
+            The proxy is pickled, unpickled, started, and processes
+            the discovery events
+        Then:
+            It should require 2 workers before dispatch unblocks,
+            proving the quorum survived the round-trip
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+            )
+            for i in range(3)
+        ]
+        events = [DiscoveryEvent("worker-added", metadata=w) for w in workers]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(
+            discovery=discovery,
+            loadbalancer=wp.RoundRobinLoadBalancer,
+            quorum=2,
+            lazy=False,
+        )
+
+        # Act — pickle round-trip, then start the restored proxy
+        pickled_data = cloudpickle.dumps(proxy)
+        restored = cloudpickle.loads(pickled_data)
+        await restored.start()
+        await _drain_discovery(restored, expect=3)
+
+        # Assert — quorum survived the round-trip
+        assert len(restored.workers) >= 2
+        await restored.stop()
+
     def test_cloudpickle_serialization_with_lazy_false(self, mock_discovery_service):
         """Test pickle round-trip with explicit lazy=False.
 

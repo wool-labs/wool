@@ -1977,17 +1977,17 @@ class TestWorkerPool:
         assert isinstance(pool, WorkerPool)
 
     def test___init___with_zero_lease_and_spawn(self):
-        """Test zero lease with spawn is accepted.
+        """Test zero lease with spawn is accepted when quorum is also zero.
 
         Given:
-            A spawn of 4 and lease of 0
+            A spawn of 4, lease of 0, and quorum of 0
         When:
             WorkerPool is instantiated
         Then:
             It should create the pool successfully
         """
         # Act
-        pool = WorkerPool(spawn=4, lease=0)
+        pool = WorkerPool(spawn=4, lease=0, quorum=0)
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -1996,7 +1996,7 @@ class TestWorkerPool:
         """Test zero lease with discovery-only pool is rejected.
 
         Given:
-            A discovery service and lease of 0 with no spawn
+            A discovery service, lease of 0, and quorum of 0
         When:
             WorkerPool is instantiated
         Then:
@@ -2010,7 +2010,7 @@ class TestWorkerPool:
             ValueError,
             match="Lease must be positive for discovery-only pools",
         ):
-            WorkerPool(discovery=mock_discovery, lease=0)
+            WorkerPool(discovery=mock_discovery, lease=0, quorum=0)
 
     def test___init___with_negative_lease(self):
         """Test negative lease is rejected.
@@ -2198,13 +2198,13 @@ class TestWorkerPool:
 
     @given(
         spawn=st.integers(min_value=1, max_value=20),
-        lease=st.integers(min_value=0, max_value=20),
+        lease=st.integers(min_value=1, max_value=20),
     )
     def test___init___accepts_valid_spawn_and_lease(self, spawn, lease):
         """Test valid spawn and lease combinations are accepted.
 
         Given:
-            Any positive spawn and any non-negative lease
+            Any positive spawn and any positive lease
         When:
             WorkerPool is instantiated
         Then:
@@ -2233,3 +2233,235 @@ class TestWorkerPool:
             match="Lease must be non-negative",
         ):
             WorkerPool(spawn=1, lease=lease)
+
+    # ------------------------------------------------------------------
+    # Quorum tests
+    # ------------------------------------------------------------------
+
+    def test___init___with_quorum(self):
+        """Test instantiation with spawn and quorum.
+
+        Given:
+            A spawn of 4 and quorum of 2
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, quorum=2)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_zero_quorum(self):
+        """Test zero quorum is accepted.
+
+        Given:
+            A spawn of 4 and quorum of 0
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, quorum=0)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_negative_quorum(self):
+        """Test negative quorum is rejected.
+
+        Given:
+            A spawn of 4 and quorum of -1
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Quorum must be a non-negative integer"):
+            WorkerPool(spawn=4, quorum=-1)
+
+    def test___init___with_quorum_exceeding_lease(self):
+        """Test quorum exceeding lease is rejected.
+
+        Given:
+            A spawn of 4, lease of 2, and quorum of 3
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Quorum cannot exceed lease"):
+            WorkerPool(spawn=4, lease=2, quorum=3)
+
+    def test___init___with_quorum_equal_to_lease(self):
+        """Test quorum equal to lease is accepted.
+
+        Given:
+            A spawn of 4, lease of 3, and quorum of 3
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, lease=3, quorum=3)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    @pytest.mark.asyncio
+    async def test___aenter___forwards_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test quorum is forwarded to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and quorum=2
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=2 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2, quorum=2):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 2
+
+    @pytest.mark.asyncio
+    async def test___aenter___forwards_default_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test default quorum is forwarded to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and no explicit quorum
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=1 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 1
+
+    @pytest.mark.asyncio
+    async def test___aenter___durable_mode_forwards_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test durable mode forwards quorum to WorkerProxy.
+
+        Given:
+            A WorkerPool with discovery and quorum=3
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=3 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+        discovery_service = mock_discovery_service_for_pool
+
+        # Act
+        async with WorkerPool(discovery=discovery_service, quorum=3):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 3
+
+    @pytest.mark.asyncio
+    async def test___aenter___hybrid_mode_forwards_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_discovery_service_for_pool,
+    ):
+        """Test hybrid mode forwards quorum to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2, discovery, and quorum=3
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=3 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+        discovery_service = mock_discovery_service_for_pool
+
+        # Act
+        async with WorkerPool(spawn=2, discovery=discovery_service, quorum=3):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 3
+
+    @given(quorum=st.integers(min_value=-100, max_value=-1))
+    def test___init___rejects_negative_quorum_pbt(self, quorum):
+        """Test negative quorum values are rejected.
+
+        Given:
+            Any negative quorum value
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Quorum must be a non-negative integer",
+        ):
+            WorkerPool(spawn=1, quorum=quorum)
