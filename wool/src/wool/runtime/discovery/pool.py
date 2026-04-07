@@ -30,7 +30,7 @@ class _SharedSubscription:
     """Adapter bridging a discovery subscriber and a :class:`Fanout`.
 
     Each ``__aiter__`` call returns an independent async generator
-    that enters a :class:`~wool.runtime.cache.Resource` from
+    that enters a :class:`~wool.runtime.cache.Reference` from
     the pool, wraps the raw subscriber in a shared
     :class:`~wool.utilities.fanout.Fanout`, and iterates a
     :class:`~wool.utilities.fanout.FanoutConsumer`.  The ``async
@@ -105,7 +105,7 @@ class SubscriberMeta(type):
     ``__new__`` onto the subscriber class.  The injected method
     registers a factory that creates raw subscribers, then returns a
     :class:`_SharedSubscription` whose pool
-    :class:`~wool.runtime.cache.Resource` is entered lazily
+    :class:`~wool.runtime.cache.Reference` is entered lazily
     on first iteration.
 
     Subscriber classes pass a ``key`` keyword argument at class

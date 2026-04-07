@@ -15,18 +15,18 @@ from wool.runtime.typing import UndefinedType
 T = TypeVar("T")
 
 
-class Resource(Generic[T]):
+class Reference(Generic[T]):
     """
-    A single-use async context manager for resource acquisition.
+    A single-use async context manager for reference acquisition.
 
     This class can only be used once as an async context manager. After
     acquisition, it cannot be reacquired, and after release, it cannot be
     released again.
 
     :param pool:
-        The :class:`ReferenceCountedCache` this resource belongs to.
+        The :class:`ReferenceCountedCache` this reference belongs to.
     :param key:
-        The cache key for this resource.
+        The cache key for this reference.
     """
 
     def __init__(self, pool: ReferenceCountedCache[T], key):
@@ -210,17 +210,17 @@ class ReferenceCountedCache(Generic[T]):
             if v.cleanup is not None and not v.cleanup.done()
         }
 
-    def get(self, key: Any) -> Resource[T]:
+    def get(self, key: Any) -> Reference[T]:
         """
-        Get a resource acquisition that can be awaited or used as context
+        Get a reference acquisition that can be awaited or used as context
         manager.
 
         :param key:
             The cache key.
         :returns:
-            :class:`Resource` that can be awaited or used with 'async with'.
+            :class:`Reference` that can be awaited or used with 'async with'.
         """
-        return Resource(self, key)
+        return Reference(self, key)
 
     async def acquire(self, key: Any) -> T:
         """
