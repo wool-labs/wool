@@ -17,13 +17,23 @@ Review committed source and test changes on a branch and create a draft pull req
 
 This skill is part of the development workflow pipeline: `/issue` → `/implement` → `/test` → `/commit` → `/pr`. This skill is the **fifth** (final) stage. After review feedback is received, the user re-enters the loop at the implement skill to address comments, then optionally re-runs the test and commit skills before re-running the PR skill to update the description.
 
+## Invariants
+
+- MUST always create the PR as a draft -- never mark it ready for review automatically.
+- MUST NOT create the PR until the user explicitly approves the description.
+- MUST match the PR title exactly to the issue title with ` — Closes #<number>` appended.
+- MUST use a heredoc for the `gh pr create` body to avoid shell escaping issues.
+- MUST structure the PR description according to the project's PR template if one exists, otherwise the built-in format defined in this document.
+- MUST assign the PR to the current user upon creation via `gh pr edit <number> --add-assignee @me`.
+- MUST use the knowledge graph (`llms/skills/understand-chat.md`) for context gathering when `.understand-anything/knowledge-graph.json` exists.
+
 ## Arguments
 
 An issue number MUST be provided as the sole argument (e.g., `/pr 103`). The issue number is used to identify the branch (`<number>-<kebab-case-summary>`) and to link the PR via `Closes #<number>`.
 
 ## Workflow
 
-### TL;DR
+### Checklist
 
 1. Resolve target repository
 2. Identify the issue and branch
@@ -181,6 +191,14 @@ gh pr edit <pr-number> --repo <target> --body "$(cat <<'EOF'
 <updated body>
 EOF
 )"
+```
+
+The `--repo <target>` flag MUST be included when the target repo differs from the current repo.
+
+After the PR is created (or updated), assign it to the current user:
+
+```bash
+gh pr edit <number> --repo <target> --add-assignee @me
 ```
 
 The `--repo <target>` flag MUST be included when the target repo differs from the current repo.

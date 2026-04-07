@@ -19,13 +19,21 @@ Fetch a pull request, analyze its diff against project guides and source context
 
 This skill is part of the development workflow pipeline: `/issue` → `/implement` → `/test` → `/commit` → `/pr` → `/review`. This skill is the **sixth** stage, invoked after the PR has been created and is ready for review.
 
+## Invariants
+
+- MUST NOT post the review until the user explicitly approves the final set of findings.
+- MUST use `REQUEST_CHANGES` as the review event when any blocking findings remain after approval.
+- MUST present every finding to the user with severity, file, line range, and comment text before posting.
+- MUST NOT fabricate guide requirements that do not exist in the project's actual guides.
+- MUST use the knowledge graph (`llms/skills/understand-chat.md`) for context gathering when `.understand-anything/knowledge-graph.json` exists.
+
 ## Arguments
 
 A PR number MUST be provided as the sole argument (e.g., `/review 146`).
 
 ## Workflow
 
-### TL;DR
+### Checklist
 
 1. Resolve target repository
 2. Fetch the PR metadata and diff
