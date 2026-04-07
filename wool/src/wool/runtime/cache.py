@@ -24,12 +24,12 @@ class Resource(Generic[T]):
     released again.
 
     :param pool:
-        The :class:`ResourcePool` this resource belongs to.
+        The :class:`ReferenceCountedCache` this resource belongs to.
     :param key:
         The cache key for this resource.
     """
 
-    def __init__(self, pool: ResourcePool[T], key):
+    def __init__(self, pool: ReferenceCountedCache[T], key):
         self._pool = pool
         self._key = key
         self._resource = None
@@ -91,7 +91,7 @@ class Resource(Generic[T]):
             await self._pool.release(self._key)
 
 
-class ResourcePool(Generic[T]):
+class ReferenceCountedCache(Generic[T]):
     """
     An asynchronous reference-counted cache with TTL-based cleanup.
 
@@ -127,7 +127,7 @@ class ResourcePool(Generic[T]):
     @dataclass
     class Stats:
         """
-        Statistics about the current state of the resource pool.
+        Statistics about the current state of the cache.
 
         :param total_entries:
             Total number of cached entries.
@@ -151,14 +151,14 @@ class ResourcePool(Generic[T]):
         self._factory = factory
         self._finalizer = finalizer
         self._ttl = ttl
-        self._cache: dict[Any, ResourcePool.CacheEntry] = {}
+        self._cache: dict[Any, ReferenceCountedCache.CacheEntry] = {}
         self._lock = asyncio.Lock()
 
     async def __aenter__(self):
         """Async context manager entry.
 
         :returns:
-            The ResourcePool instance itself.
+            The ReferenceCountedCache instance itself.
         """
         return self
 
@@ -184,7 +184,7 @@ class ResourcePool(Generic[T]):
             when not concurrently modifying the cache.
 
         :returns:
-            :class:`ResourcePool.Stats` containing current statistics.
+            :class:`ReferenceCountedCache.Stats` containing current statistics.
         """
         pending_cleanup = sum(
             1 for c in self.pending_cleanup.values() if c is not None and not c.done()

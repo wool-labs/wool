@@ -193,7 +193,7 @@ Signal handlers map `SIGTERM` to timeout 0 (cancel immediately) and `SIGINT` to 
 
 ### Nested routines
 
-Worker subprocesses can dispatch tasks to other workers. Each subprocess is configured with a `ResourcePool` of `WorkerProxy` instances (via `wool.__proxy_pool__`), so `@wool.routine` calls within a task transparently route to the target pool. Spinning up a `WorkerProxy` is not free — it involves establishing a discovery subscription, starting a sentinel task, and opening gRPC connections — so the resource pool caches proxies with a configurable TTL (default 60 seconds, set via `proxy_pool_ttl` on `LocalWorker`). If the interval between dispatches for a given pool on a given worker is shorter than the TTL, the cached proxy is reused. If it exceeds the TTL, the proxy is finalized and must be recreated on the next dispatch. Tuning `proxy_pool_ttl` above the expected dispatch interval keeps proxies warm and avoids this cold-start overhead.
+Worker subprocesses can dispatch tasks to other workers. Each subprocess is configured with a `ReferenceCountedCache` of `WorkerProxy` instances (via `wool.__proxy_pool__`), so `@wool.routine` calls within a task transparently route to the target pool. Spinning up a `WorkerProxy` is not free — it involves establishing a discovery subscription, starting a sentinel task, and opening gRPC connections — so the cache stores proxies with a configurable TTL (default 60 seconds, set via `proxy_pool_ttl` on `LocalWorker`). If the interval between dispatches for a given pool on a given worker is shorter than the TTL, the cached proxy is reused. If it exceeds the TTL, the proxy is finalized and must be recreated on the next dispatch. Tuning `proxy_pool_ttl` above the expected dispatch interval keeps proxies warm and avoids this cold-start overhead.
 
 Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagates its `lazy` flag to every `WorkerProxy` it constructs, and each task serializes the proxy (including the flag) so that workers receiving the task inherit the same laziness setting. A lazy proxy defers discovery subscription and sentinel setup until its first `dispatch()` call, so workers that never invoke nested routines pay no startup cost.
 
@@ -240,7 +240,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 ### Connection pooling
 
-`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`.
+`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ReferenceCountedCache` keyed by `(target, credentials, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`.
 
 ### Transport configuration
 

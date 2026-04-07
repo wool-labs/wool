@@ -14,7 +14,7 @@ import grpc.aio
 
 import wool
 from wool import protocol
-from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.cache import ReferenceCountedCache
 from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.base import ChannelOptions
@@ -80,7 +80,7 @@ async def _channel_finalizer(channel: _Channel):
     await channel.close()
 
 
-_channel_pool: ResourcePool[_Channel] = ResourcePool(
+_channel_pool: ReferenceCountedCache[_Channel] = ReferenceCountedCache(
     factory=_channel_factory, finalizer=_channel_finalizer, ttl=60
 )
 
