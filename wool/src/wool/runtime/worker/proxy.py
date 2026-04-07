@@ -180,6 +180,10 @@ class WorkerProxy:
     :param lease:
         Maximum number of workers this proxy will admit from discovery.
         Defaults to ``None`` (unbounded).
+    :param quorum:
+        Minimum number of workers that must be discovered before the proxy
+        considers itself ready.  Defaults to ``1``.  Set to ``0`` to skip
+        waiting for workers entirely.
 
     .. caution::
 
@@ -211,6 +215,7 @@ class WorkerProxy:
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
         lease: int | None = None,
+        quorum: int = 1,
         lazy: bool = True,
     ): ...
 
@@ -224,6 +229,7 @@ class WorkerProxy:
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
         lease: int | None = None,
+        quorum: int = 1,
         lazy: bool = True,
     ): ...
 
@@ -237,6 +243,7 @@ class WorkerProxy:
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
         lease: int | None = None,
+        quorum: int = 1,
         lazy: bool = True,
     ): ...
 
@@ -253,6 +260,7 @@ class WorkerProxy:
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None | UndefinedType = Undefined,
         lease: int | None = None,
+        quorum: int = 1,
         lazy: bool = True,
     ):
         if not (pool_uri or discovery or workers):
@@ -264,12 +272,21 @@ class WorkerProxy:
         if lease is not None and lease < 1:
             raise ValueError("Lease must be a positive, non-zero integer")
 
+        if quorum < 0:
+            raise ValueError("Quorum must be a non-negative integer")
+
+        if lease is not None and quorum > lease:
+            raise ValueError(
+                "Quorum cannot exceed lease — the quorum would never be satisfied"
+            )
+
         self._id: uuid.UUID = uuid.uuid4()
         self._started = False
         self._lazy = lazy
         self._start_lock = asyncio.Lock() if lazy else None
         self._loadbalancer = loadbalancer
         self._lease = lease
+        self._quorum = quorum
         self._proxy_token: Token[WorkerProxy | None] | None = None
 
         if isinstance(loadbalancer, (ContextManager, AsyncContextManager)):
@@ -373,11 +390,12 @@ class WorkerProxy:
                     f"{name}=my_cm())."
                 )
 
-        def _restore_proxy(discovery, loadbalancer, proxy_id, lease, lazy):
+        def _restore_proxy(discovery, loadbalancer, proxy_id, lease, quorum, lazy):
             proxy = WorkerProxy(
                 discovery=discovery,
                 loadbalancer=loadbalancer,
                 lease=lease,
+                quorum=quorum,
                 lazy=lazy,
             )
             proxy._id = proxy_id
@@ -390,6 +408,7 @@ class WorkerProxy:
                 self._loadbalancer,
                 self._id,
                 self._lease,
+                self._quorum,
                 self._lazy,
             ),
         )
@@ -615,7 +634,12 @@ class WorkerProxy:
         return version_filter
 
     async def _await_workers(self):
-        while not self._loadbalancer_context or not self._loadbalancer_context.workers:
+        if self._quorum == 0:
+            return
+        while (
+            not self._loadbalancer_context
+            or len(self._loadbalancer_context.workers) < self._quorum
+        ):
             await asyncio.sleep(0)
 
     async def _worker_sentinel(self):
