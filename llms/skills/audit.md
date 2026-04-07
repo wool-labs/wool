@@ -18,6 +18,12 @@ Spawn a fresh subagent to evaluate whether a skill's requirements were met durin
 
 This skill is a **cross-cutting quality gate** invoked at the end of every SDLC pipeline stage: `/issue` → audit → `/implement` → audit → `/test` → audit → `/commit` → audit → `/pr` → audit → `/review` → audit.
 
+## Invariants
+
+- MUST extract checklist items from every normative requirement (MUST, SHALL, REQUIRED, RECOMMENDED) in the skill definition -- not a subset.
+- MUST NOT report a COMPLIANT verdict when any requirement has a FAIL verdict.
+- MUST present remediation descriptions for every FAIL item before proceeding.
+
 ## Arguments
 
 ```
@@ -29,7 +35,7 @@ This skill is a **cross-cutting quality gate** invoked at the end of every SDLC 
 
 ## Workflow
 
-### TL;DR
+### Checklist
 
 1. Resolve the skill definition
 2. Compile the action summary

@@ -19,13 +19,21 @@ Fetch a GitHub issue, create a branch, gather codebase context, and enter plan m
 
 This skill is part of the development workflow pipeline: `/issue` → `/implement` → `/test` → `/commit` → `/pr`. This skill is the **second** stage. The implement, test, and commit steps are iterative — they can be invoked multiple times for a given issue to address PR feedback or refine the implementation.
 
+## Invariants
+
+- MUST enter plan mode and receive user approval before writing any code.
+- MUST NOT create or modify files outside the scope of the approved plan.
+- MUST check for an existing PR and address unresolved review comments on re-invocation before planning new work.
+- MUST NOT proceed to the next pipeline step autonomously -- always prompt the user.
+- MUST use the knowledge graph (`llms/skills/understand-chat.md`) for context gathering when `.understand-anything/knowledge-graph.json` exists.
+
 ## Arguments
 
 An issue number MUST be provided as the sole argument (e.g., `/implement 103`).
 
 ## Workflow
 
-### TL;DR
+### Checklist
 
 1. Resolve target repository
 2. Fetch the issue
