@@ -5,6 +5,7 @@ import concurrent.futures
 import contextvars
 import threading
 from contextlib import contextmanager
+from contextlib import nullcontext
 from dataclasses import dataclass
 from inspect import isasyncgen
 from inspect import isasyncgenfunction
@@ -382,43 +383,54 @@ class WorkerService(protocol.WorkerServicer):
                 proxy = await proxy_ctx.__aenter__() if proxy_ctx else None
                 token = wool.__proxy__.set(proxy) if proxy else None
                 try:
-                    gen = work_task.callable(*work_task.args, **work_task.kwargs)
-                    try:
-                        while True:
-                            cmd = await request_queue.get()
-                            if cmd is _SENTINEL:
-                                break
-                            action, payload = cmd
+                    # Enter the task's RuntimeContext so dispatch_timeout
+                    # and any propagated wool.ContextVar values are
+                    # restored before the async generator captures the
+                    # current context on first suspension.
+                    runtime_ctx = (
+                        work_task.context
+                        if work_task.context is not None
+                        else nullcontext()
+                    )
+                    with runtime_ctx:
+                        with work_task:  # sets _current_task for nested dispatch
+                            gen = work_task.callable(*work_task.args, **work_task.kwargs)
                             try:
-                                with do_dispatch(False):
-                                    match action:
-                                        case "next":
-                                            value = await gen.asend(None)
-                                        case "send":
-                                            value = await gen.asend(payload)
-                                        case "throw":
-                                            value = await gen.athrow(
-                                                type(payload), payload
-                                            )
-                                        case _:
-                                            continue
-                            except StopAsyncIteration:
-                                main_loop.call_soon_threadsafe(
-                                    result_queue.put_nowait, _SENTINEL
-                                )
-                                return
-                            except BaseException as e:
-                                main_loop.call_soon_threadsafe(
-                                    result_queue.put_nowait, ("error", e)
-                                )
-                                return
-                            else:
-                                main_loop.call_soon_threadsafe(
-                                    result_queue.put_nowait,
-                                    ("value", value),
-                                )
-                    finally:
-                        await gen.aclose()
+                                while True:
+                                    cmd = await request_queue.get()
+                                    if cmd is _SENTINEL:
+                                        break
+                                    action, payload = cmd
+                                    try:
+                                        with do_dispatch(False):
+                                            match action:
+                                                case "next":
+                                                    value = await gen.asend(None)
+                                                case "send":
+                                                    value = await gen.asend(payload)
+                                                case "throw":
+                                                    value = await gen.athrow(
+                                                        type(payload), payload
+                                                    )
+                                                case _:
+                                                    continue
+                                    except StopAsyncIteration:
+                                        main_loop.call_soon_threadsafe(
+                                            result_queue.put_nowait, _SENTINEL
+                                        )
+                                        return
+                                    except BaseException as e:
+                                        main_loop.call_soon_threadsafe(
+                                            result_queue.put_nowait, ("error", e)
+                                        )
+                                        return
+                                    else:
+                                        main_loop.call_soon_threadsafe(
+                                            result_queue.put_nowait,
+                                            ("value", value),
+                                        )
+                            finally:
+                                await gen.aclose()
                 finally:
                     if token is not None:
                         wool.__proxy__.reset(token)
