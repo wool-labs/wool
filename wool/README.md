@@ -103,6 +103,44 @@ Task serialization has two layers. [cloudpickle](https://github.com/cloudpipe/cl
 
 [Protocol Buffers](https://protobuf.dev/) provides the wire format. Scalar task metadata (id, caller, tag, timeout) maps directly to protobuf fields, while Python-specific objects are nested as cloudpickle byte blobs. The protobuf definitions in the `proto/` directory define the gRPC wire protocol for task dispatch, acknowledgment, and result streaming between workers.
 
+## Context propagation
+
+Python's `contextvars.ContextVar` cannot be pickled — it's a C extension type that explicitly blocks serialization — so ambient state like trace IDs, tenant identifiers, and feature flags has no built-in way to cross process boundaries. `wool.ContextVar` solves this by mirroring the stdlib API (`get`, `set`, `reset`) and adding automatic propagation across the dispatch chain.
+
+```python
+import wool
+
+tenant_id: wool.ContextVar[str] = wool.ContextVar("tenant_id", default="unknown")
+
+@wool.routine
+async def handle_request() -> str:
+    return tenant_id.get()
+
+async def main():
+    async with wool.WorkerPool(spawn=2):
+        tenant_id.set("acme-corp")
+        result = await handle_request()
+        print(result)  # "acme-corp" — propagated to the worker
+```
+
+Two construction modes are supported:
+
+- `wool.ContextVar("name")` — no default; `get()` raises `LookupError` until a value is set.
+- `wool.ContextVar("name", default=...)` — `get()` returns the default when the variable has no value in the current context.
+
+### How propagation works
+
+At dispatch time, `RuntimeContext` iterates the `wool.ContextVar` registry and snapshots any variable that has been explicitly `set()` in the current context — default-only values are not shipped. The snapshot is serialized into the task's protobuf payload alongside `dispatch_timeout`. On the worker, each task restores the propagated values before the routine executes. When the worker returns (or yields), the current context var state is attached to the gRPC response and applied on the caller side, so worker-side mutations flow back automatically. For async generators, the caller also attaches its current context to each iteration request, enabling bidirectional state exchange between caller and worker at every yield/next boundary.
+
+### Isolation
+
+Each dispatched task runs inside its own `contextvars.Context` copy. Concurrent tasks on the same worker with different values for the same variable never interfere — each sees only its own propagated value. Worker-side mutations (via `set()`) are back-propagated to the caller when the task returns or yields, but they do not leak to other concurrent tasks — the context is exclusively owned by one side at a time.
+
+### Limitations
+
+- **Values must be picklable.** A `TypeError` naming the offending variable is raised at dispatch time if serialization fails.
+- **Only explicitly set values propagate.** A variable that has never been `set()` (only has a class-level default) is not included in the snapshot — the worker falls through to its own default.
+
 ## Worker pools
 
 `WorkerPool` is the main entry point for running routines. It orchestrates worker subprocess lifecycles, discovery, and load-balanced dispatch. The pool supports four configurations depending on which arguments are provided:
