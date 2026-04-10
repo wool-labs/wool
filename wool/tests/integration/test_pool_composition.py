@@ -13,6 +13,7 @@ from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
 from .conftest import BackpressureMode
+from .conftest import ContextVarPattern
 from .conftest import CredentialType
 from .conftest import DiscoveryFactory
 from .conftest import LazyMode
@@ -54,6 +55,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act
@@ -87,6 +91,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.EAGER,
             backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act
@@ -120,6 +127,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act
@@ -153,6 +163,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act
@@ -190,6 +203,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act
@@ -223,6 +239,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act
@@ -257,6 +276,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act
@@ -290,6 +312,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act
@@ -326,6 +351,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act
@@ -362,6 +390,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.SYNC,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act
@@ -398,6 +429,9 @@ class TestPoolComposition:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.ASYNC,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act

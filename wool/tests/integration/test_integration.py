@@ -10,6 +10,7 @@ from hypothesis import settings
 
 from .conftest import PAIRWISE_SCENARIOS
 from .conftest import BackpressureMode
+from .conftest import ContextVarPattern
 from .conftest import CredentialType
 from .conftest import DiscoveryFactory
 from .conftest import LazyMode
@@ -72,6 +73,9 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         RoutineBinding.MODULE_FUNCTION,
         LazyMode.LAZY,
         BackpressureMode.NONE,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
     )
 )
 @example(
@@ -86,6 +90,9 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         RoutineBinding.MODULE_FUNCTION,
         LazyMode.LAZY,
         BackpressureMode.SYNC,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
     )
 )
 @example(
@@ -100,6 +107,9 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         RoutineBinding.MODULE_FUNCTION,
         LazyMode.LAZY,
         BackpressureMode.ASYNC,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
     )
 )
 @given(scenario=scenarios_strategy())
