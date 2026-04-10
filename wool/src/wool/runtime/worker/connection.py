@@ -14,6 +14,7 @@ import grpc.aio
 
 import wool
 from wool import protocol
+from wool.runtime.context import _Context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
@@ -126,7 +127,8 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            request = protocol.Request(next=protocol.Void())
+            ctx = _Context.snapshot()
+            request = protocol.Request(next=protocol.Void(), context=ctx)
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
@@ -140,11 +142,17 @@ class _DispatchStream(Generic[_T]):
         Used by :meth:`asend` and :meth:`athrow` which have already
         written their own request to the stream.
 
+        If the response carries a non-empty ``context`` map, the
+        back-propagated var mutations are applied to the current
+        context before the result is returned.
+
         :returns:
             The next task result from the worker.
         """
         try:
             response = await anext(self._iter)
+            if response.context:
+                _Context.apply(dict(response.context))
             if response.HasField("result"):
                 return cloudpickle.loads(response.result.dump)
             elif response.HasField("exception"):
@@ -204,7 +212,8 @@ class _DispatchStream(Generic[_T]):
         self._running = True
         try:
             dump = cloudpickle.dumps(value)
-            request = protocol.Request(send=protocol.Message(dump=dump))
+            ctx = _Context.snapshot()
+            request = protocol.Request(send=protocol.Message(dump=dump), context=ctx)
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
@@ -247,7 +256,8 @@ class _DispatchStream(Generic[_T]):
                 exc = typ()
 
             dump = cloudpickle.dumps(exc)
-            request = protocol.Request(throw=protocol.Message(dump=dump))
+            ctx = _Context.snapshot()
+            request = protocol.Request(throw=protocol.Message(dump=dump), context=ctx)
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1

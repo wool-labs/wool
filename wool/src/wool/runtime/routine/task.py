@@ -308,11 +308,6 @@ class Task(Generic[W]):
         :returns:
             A :class:`Task` instance with all fields restored.
         """
-        context = (
-            RuntimeContext.from_protobuf(task.context)
-            if task.HasField("context")
-            else None
-        )
         if task.HasField("serializer"):
             s = _unpickle_serializer(task.serializer)
             loads = s.loads
@@ -323,6 +318,11 @@ class Task(Generic[W]):
         else:
             loads = cloudpickle.loads
             proxy_loads = cloudpickle.loads
+        context = (
+            RuntimeContext.from_protobuf(task.context, loads=loads)
+            if task.HasField("context")
+            else None
+        )
         return cls(
             id=UUID(task.id),
             callable=loads(task.callable),
@@ -370,7 +370,7 @@ class Task(Generic[W]):
             proxy_id=str(self.proxy.id),
             timeout=int(self.timeout) if self.timeout else 0,
             tag=self.tag if self.tag else "",
-            context=self.context.to_protobuf() if self.context else None,
+            context=self.context.to_protobuf(dumps=dumps) if self.context else None,
         )
         if serializer is not None:
             task_msg.serializer = _pickle_serializer(serializer)

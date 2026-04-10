@@ -14,6 +14,7 @@ from inspect import iscoroutinefunction
 from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Awaitable
+from typing import Final
 from typing import Protocol
 from typing import runtime_checkable
 
@@ -23,12 +24,13 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
+from wool.runtime.context import _Context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import do_dispatch
 
 # Sentinel to mark end of async generator stream
-_SENTINEL = object()
+_SENTINEL: Final = object()
 
 
 # public
@@ -230,15 +232,17 @@ class WorkerService(protocol.WorkerServicer):
             yield protocol.Response(ack=ack)
             try:
                 if isasyncgen(task):
-                    async for result in task:
-                        result = protocol.Message(dump=cloudpickle.dumps(result))
-                        yield protocol.Response(result=result)
+                    async for value, ctx_snapshot in task:
+                        result = protocol.Message(dump=cloudpickle.dumps(value))
+                        yield protocol.Response(result=result, context=ctx_snapshot)
                 elif isinstance(task, asyncio.Task):
-                    result = protocol.Message(dump=cloudpickle.dumps(await task))
-                    yield protocol.Response(result=result)
+                    value, ctx_snapshot = await task
+                    result = protocol.Message(dump=cloudpickle.dumps(value))
+                    yield protocol.Response(result=result, context=ctx_snapshot)
             except (Exception, asyncio.CancelledError) as e:
                 exception = protocol.Message(dump=cloudpickle.dumps(e))
-                yield protocol.Response(exception=exception)
+                ctx_snapshot = _Context.snapshot()
+                yield protocol.Response(exception=exception, context=ctx_snapshot)
 
     async def stop(
         self, request: protocol.StopRequest, context: ServicerContext | None
@@ -310,10 +314,15 @@ class WorkerService(protocol.WorkerServicer):
         prevent blocking the main gRPC event loop. Context variables
         are propagated from the calling context to the worker loop.
 
+        The return value is always a ``(result, context_snapshot)``
+        tuple so that the caller can attach the snapshot to the gRPC
+        response.
+
         :param work_task:
             The :class:`Task` instance to execute.
         :returns:
-            The result of the task execution.
+            A ``(result, dict)`` tuple containing the task result and
+            a context snapshot of mutated wool.ContextVar values.
         """
         ctx = contextvars.copy_context()
         future: concurrent.futures.Future = concurrent.futures.Future()
@@ -334,7 +343,9 @@ class WorkerService(protocol.WorkerServicer):
                     elif t.exception() is not None:
                         future.set_exception(t.exception())
                     else:
-                        future.set_result(t.result())
+                        result = t.result()
+                        snapshot = _Context.snapshot_from(ctx)
+                        future.set_result((result, snapshot))
 
                 task.add_done_callback(_done)
 
@@ -400,7 +411,9 @@ class WorkerService(protocol.WorkerServicer):
                                     cmd = await request_queue.get()
                                     if cmd is _SENTINEL:
                                         break
-                                    action, payload = cmd
+                                    action, payload, caller_ctx = cmd
+                                    if caller_ctx:
+                                        _Context.apply(caller_ctx)
                                     try:
                                         with do_dispatch(False):
                                             match action:
@@ -420,14 +433,17 @@ class WorkerService(protocol.WorkerServicer):
                                         )
                                         return
                                     except BaseException as e:
+                                        ctx_snapshot = _Context.snapshot()
                                         main_loop.call_soon_threadsafe(
-                                            result_queue.put_nowait, ("error", e)
+                                            result_queue.put_nowait,
+                                            ("error", e, ctx_snapshot),
                                         )
                                         return
                                     else:
+                                        ctx_snapshot = _Context.snapshot()
                                         main_loop.call_soon_threadsafe(
                                             result_queue.put_nowait,
-                                            ("value", value),
+                                            ("value", value, ctx_snapshot),
                                         )
                             finally:
                                 await gen.aclose()
@@ -443,23 +459,24 @@ class WorkerService(protocol.WorkerServicer):
 
             try:
                 async for request in request_iterator:
+                    caller_ctx = dict(request.context) if request.context else {}
                     match request.WhichOneof("payload"):
                         case "next":
                             worker_loop.call_soon_threadsafe(
                                 request_queue.put_nowait,
-                                ("next", None),
+                                ("next", None, caller_ctx),
                             )
                         case "send":
                             value = cloudpickle.loads(request.send.dump)
                             worker_loop.call_soon_threadsafe(
                                 request_queue.put_nowait,
-                                ("send", value),
+                                ("send", value, caller_ctx),
                             )
                         case "throw":
                             exc = cloudpickle.loads(request.throw.dump)
                             worker_loop.call_soon_threadsafe(
                                 request_queue.put_nowait,
-                                ("throw", exc),
+                                ("throw", exc, caller_ctx),
                             )
                         case _:
                             continue
@@ -468,10 +485,10 @@ class WorkerService(protocol.WorkerServicer):
 
                     if result is _SENTINEL:
                         break
-                    tag, payload = result
+                    tag, payload, ctx_snapshot = result
                     if tag == "error":
                         raise payload
-                    yield payload
+                    yield (payload, ctx_snapshot)
             finally:
                 worker_loop.call_soon_threadsafe(request_queue.put_nowait, _SENTINEL)
 
