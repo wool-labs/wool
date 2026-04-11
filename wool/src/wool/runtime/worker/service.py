@@ -234,15 +234,15 @@ class WorkerService(protocol.WorkerServicer):
                 if isasyncgen(task):
                     async for value, ctx_snapshot in task:
                         result = protocol.Message(dump=cloudpickle.dumps(value))
-                        yield protocol.Response(result=result, context=ctx_snapshot)
+                        yield protocol.Response(result=result, vars=ctx_snapshot)
                 elif isinstance(task, asyncio.Task):
                     value, ctx_snapshot = await task
                     result = protocol.Message(dump=cloudpickle.dumps(value))
-                    yield protocol.Response(result=result, context=ctx_snapshot)
+                    yield protocol.Response(result=result, vars=ctx_snapshot)
             except (Exception, asyncio.CancelledError) as e:
                 exception = protocol.Message(dump=cloudpickle.dumps(e))
                 ctx_snapshot = _Context.snapshot()
-                yield protocol.Response(exception=exception, context=ctx_snapshot)
+                yield protocol.Response(exception=exception, vars=ctx_snapshot)
 
     async def stop(
         self, request: protocol.StopRequest, context: ServicerContext | None
@@ -459,7 +459,7 @@ class WorkerService(protocol.WorkerServicer):
 
             try:
                 async for request in request_iterator:
-                    caller_ctx = dict(request.context) if request.context else {}
+                    caller_ctx = dict(request.vars) if request.vars else {}
                     match request.WhichOneof("payload"):
                         case "next":
                             worker_loop.call_soon_threadsafe(

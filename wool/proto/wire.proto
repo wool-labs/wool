@@ -58,7 +58,7 @@ message Request {
         Message send = 3;
         Message throw = 4;
     }
-    map<string, bytes> context = 5;
+    map<string, bytes> vars = 5;
 }
 
 message Response {
@@ -68,7 +68,7 @@ message Response {
         Message result = 3;
         Message exception = 4;
     }
-    map<string, bytes> context = 5;
+    map<string, bytes> vars = 5;
 }
 
 message StopRequest {

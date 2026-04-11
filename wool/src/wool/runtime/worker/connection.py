@@ -128,7 +128,7 @@ class _DispatchStream(Generic[_T]):
         self._running = True
         try:
             ctx = _Context.snapshot()
-            request = protocol.Request(next=protocol.Void(), context=ctx)
+            request = protocol.Request(next=protocol.Void(), vars=ctx)
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
@@ -142,7 +142,7 @@ class _DispatchStream(Generic[_T]):
         Used by :meth:`asend` and :meth:`athrow` which have already
         written their own request to the stream.
 
-        If the response carries a non-empty ``context`` map, the
+        If the response carries a non-empty ``vars`` map, the
         back-propagated var mutations are applied to the current
         context before the result is returned.
 
@@ -151,8 +151,8 @@ class _DispatchStream(Generic[_T]):
         """
         try:
             response = await anext(self._iter)
-            if response.context:
-                _Context.apply(dict(response.context))
+            if response.vars:
+                _Context.apply(dict(response.vars))
             if response.HasField("result"):
                 return cloudpickle.loads(response.result.dump)
             elif response.HasField("exception"):
@@ -213,7 +213,7 @@ class _DispatchStream(Generic[_T]):
         try:
             dump = cloudpickle.dumps(value)
             ctx = _Context.snapshot()
-            request = protocol.Request(send=protocol.Message(dump=dump), context=ctx)
+            request = protocol.Request(send=protocol.Message(dump=dump), vars=ctx)
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
@@ -257,7 +257,7 @@ class _DispatchStream(Generic[_T]):
 
             dump = cloudpickle.dumps(exc)
             ctx = _Context.snapshot()
-            request = protocol.Request(throw=protocol.Message(dump=dump), context=ctx)
+            request = protocol.Request(throw=protocol.Message(dump=dump), vars=ctx)
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
