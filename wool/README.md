@@ -105,7 +105,7 @@ Task serialization has two layers. [cloudpickle](https://github.com/cloudpipe/cl
 
 ## Context propagation
 
-Python's `contextvars.ContextVar` cannot be pickled — it's a C extension type that explicitly blocks serialization — so ambient state like trace IDs, tenant identifiers, and feature flags has no built-in way to cross process boundaries. `wool.ContextVar` solves this by mirroring the stdlib API (`get`, `set`, `reset`) and adding automatic propagation across the dispatch chain.
+Python's `contextvars.ContextVar` cannot be pickled — it's a C extension type that explicitly blocks serialization — so ambient state has no built-in way to cross process boundaries. `wool.ContextVar` solves this by mirroring the stdlib API (`get`, `set`, `reset`) and adding automatic propagation across the dispatch chain.
 
 ```python
 import wool
@@ -138,7 +138,7 @@ Each dispatched task runs inside its own `contextvars.Context` copy. Concurrent 
 
 ### Limitations
 
-- **Values must be picklable.** A `TypeError` naming the offending variable is raised at dispatch time if serialization fails.
+- **Values must be _cloudpicklable_.** A `TypeError` naming the offending variable is raised at dispatch time if serialization fails.
 - **Only explicitly set values propagate.** A variable that has never been `set()` (only has a class-level default) is not included in the snapshot — the worker falls through to its own default.
 
 ## Worker pools
