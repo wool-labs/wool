@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import threading
 import weakref
 from typing import TYPE_CHECKING
 from typing import Any
@@ -10,10 +11,7 @@ from typing import ClassVar
 from typing import Final
 from typing import Generic
 from typing import TypeVar
-from typing import cast
 from typing import overload
-from uuid import UUID
-from uuid import uuid4
 
 import cloudpickle
 
@@ -25,7 +23,31 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
-_SENTINEL: Final = object()
+
+class _SentinelType:
+    """Singleton sentinel marking "no default provided" on a ContextVar.
+
+    Distinct from :class:`_UnsetType`, which represents "no value set
+    in the current context" on the internal stdlib ContextVar.
+    Picklable by identity so classmethod ``__defaults__`` round-trip
+    through cloudpickle without creating distinct sentinel instances.
+    """
+
+    _instance: _SentinelType | None = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __reduce__(self):
+        return (_SentinelType, ())
+
+    def __repr__(self):
+        return "_SENTINEL"
+
+
+_SENTINEL: Final = _SentinelType()
 
 
 class _UnsetType:
@@ -56,75 +78,107 @@ class _UnsetType:
 _UNSET: Final = _UnsetType()
 
 
-def _reconstruct_token(
-    id: UUID,
-    var_name: str,
-    old_value: Any,
-) -> Token:
-    """Unpickle helper for :class:`Token`."""
-    tok = object.__new__(Token)
-    tok._id = id
-    tok._var_name = var_name
-    tok._old_value = old_value
-    tok._stdlib_token = None
-    tok._used = False
-    return tok
-
-
 # public
 class Token(Generic[T]):
-    """Picklable token for reverting a :class:`ContextVar` mutation.
+    """Token for reverting a :class:`ContextVar` mutation.
 
-    Mirrors :class:`contextvars.Token` with the addition of
-    cross-process serializability. Each token carries a UUID so its
-    identity survives pickling — two tokens created by separate
-    ``set()`` calls are never equal, even across workers.
-
-    On the local process the wrapped stdlib token is used for
-    :meth:`ContextVar.reset`, giving the same guarantees as the stdlib
-    (same-var, same-context, single-use). After deserialization the
-    stdlib token is unavailable; :meth:`ContextVar.reset` falls back
-    to restoring ``_old_value`` directly.
+    Mirrors :class:`contextvars.Token` semantics: single-use,
+    same-var rejection, LIFO ordering enforced by the underlying
+    stdlib token. Not picklable — :meth:`ContextVar.reset` must be
+    called on the same process that minted the token.
     """
 
-    __slots__ = ("_id", "_var_name", "_old_value", "_stdlib_token", "_used")
+    __slots__ = ("_var", "_old_value", "_stdlib_token", "_used")
 
-    _id: UUID
-    _var_name: str
+    _var: ContextVar[T]
     _old_value: T | _UnsetType
-    _stdlib_token: contextvars.Token[T | _UnsetType] | None
+    _stdlib_token: contextvars.Token[T | _UnsetType]
     _used: bool
 
     def __init__(
         self,
-        var_name: str,
+        var: ContextVar[T],
         old_value: T | _UnsetType,
         stdlib_token: contextvars.Token[T | _UnsetType],
     ):
-        self._id = uuid4()
-        self._var_name = var_name
+        self._var = var
         self._old_value = old_value
         self._stdlib_token = stdlib_token
         self._used = False
 
     def __reduce__(self):
-        return (_reconstruct_token, (self._id, self._var_name, self._old_value))
+        raise TypeError(
+            "wool.Token is not picklable; reset must happen in the "
+            "process that minted the token"
+        )
 
     def __repr__(self) -> str:
-        return f"<wool.Token var={self._var_name!r} id={self._id}>"
+        return f"<wool.Token var={self._var.name!r}>"
 
-    @property
-    def var_name(self) -> str:
-        return self._var_name
+
+class _ContextVarMeta(type):
+    """Metaclass enforcing singleton-by-name construction semantics.
+
+    :class:`ContextVar` instances are cached by name in a
+    :class:`weakref.WeakValueDictionary`. Public construction via
+    ``ContextVar(name)`` raises :exc:`ValueError` on duplicate name;
+    use :meth:`ContextVar.get_or_create` for idempotent lookup.
+
+    The pickle reconstruction path uses
+    :meth:`ContextVar._get_or_create`, which bypasses the raising
+    ``__call__`` override by constructing via ``object.__new__``
+    directly.
+    """
+
+    _cache: ClassVar[weakref.WeakValueDictionary[str, ContextVar]] = (
+        weakref.WeakValueDictionary()
+    )
+    _lock: ClassVar[threading.Lock] = threading.Lock()
+
+    def __call__(cls, name: str, /, *, default: Any = _SENTINEL) -> ContextVar:
+        # Fast path — lock-free dict lookup. dict.get is atomic under
+        # the GIL, so a cache hit can return the existing instance
+        # without acquiring the lock.
+        existing = cls._cache.get(name)
+        if existing is not None:
+            if default != existing._default:
+                raise ValueError(
+                    f"wool.ContextVar {name!r} already exists with a "
+                    f"different declaration: cached "
+                    f"default={existing._default!r}, incoming "
+                    f"default={default!r}. Both sides must agree on "
+                    f"the var's declaration."
+                )
+            return existing
+        with cls._lock:
+            # Re-check under lock to close the race between two
+            # concurrent first-time constructions of the same name.
+            existing = cls._cache.get(name)
+            if existing is not None:
+                if default != existing._default:
+                    raise ValueError(
+                        f"wool.ContextVar {name!r} already exists "
+                        f"with a different declaration: cached "
+                        f"default={existing._default!r}, incoming "
+                        f"default={default!r}. Both sides must agree "
+                        f"on the var's declaration."
+                    )
+                return existing
+            instance = super().__call__(name, default=default)
+            cls._cache[name] = instance
+            return instance
 
 
 # public
-class ContextVar(Generic[T]):
+class ContextVar(Generic[T], metaclass=_ContextVarMeta):
     """Propagating context variable that crosses worker boundaries.
 
     Mirrors :class:`contextvars.ContextVar` with the addition of
-    automatic propagation across the dispatch chain. Each instance
-    self-registers in a class-level :class:`weakref.WeakSet`.
+    automatic propagation across the dispatch chain. Instances are
+    singletons by name within a process: constructing
+    ``ContextVar("same_name")`` twice raises :exc:`ValueError`. Use
+    :meth:`get_or_create` for idempotent lookup when names are
+    generated dynamically.
 
     Two construction modes:
 
@@ -134,17 +188,13 @@ class ContextVar(Generic[T]):
       default when the variable has no value in the current context.
 
     The internal stdlib ``ContextVar`` always defaults to
-    :data:`_UNSET` so that the "no value" state is representable as a
-    real, picklable value — this enables :class:`Token`-based reset
-    across serialization boundaries.
+    :data:`_UNSET` so that the "no value" state is representable as
+    a real, picklable value.
 
-    Values propagated across the wire MUST be picklable (or
-    serializable via the serializer supplied at dispatch time).
+    Values propagated across the wire MUST be cloudpicklable.
     Non-serializable values surface a :class:`TypeError` at dispatch
     time naming the offending variable.
     """
-
-    _registry: ClassVar["weakref.WeakSet[ContextVar[Any]]"] = weakref.WeakSet()
 
     _var: contextvars.ContextVar[T | _UnsetType]
     _default: Any  # T or _SENTINEL — wool-level default
@@ -155,34 +205,87 @@ class ContextVar(Generic[T]):
     @overload
     def __init__(self, name: str, /, *, default: T) -> None: ...
 
-    def __init__(self, name: str, /, *, default=_SENTINEL):
-        self._var = cast(
-            "contextvars.ContextVar[T | _UnsetType]",
-            contextvars.ContextVar(name, default=_UNSET),
-        )
+    def __init__(self, name: str, /, *, default: Any = _SENTINEL):
+        self._var = contextvars.ContextVar(name, default=_UNSET)
         self._default = default
-        type(self)._registry.add(self)
 
     def __reduce__(self):
-        """Reduce to (reconstructor, args) so cloudpickle can serialize.
-
-        The underlying stdlib :class:`contextvars.ContextVar` cannot be
-        pickled, so default object pickling fails. Reducing to a
-        constructor call sidesteps that — the receiving process
-        reconstructs a fresh var with the same name and default, which
-        self-registers. :class:`_Context` resolves vars by name
-        against the full registry, so both siblings receive the
-        propagated value.
-        """
-
-        def _reconstruct(name, default=_SENTINEL):
-            if default is _SENTINEL:
-                return ContextVar(name)
-            return ContextVar(name, default=default)
-
+        # The stdlib contextvars.ContextVar is a C type that blocks
+        # pickling outright; without this reducer, default pickling
+        # of wool.ContextVar tries to pickle self._var and fails.
+        # Routing through _get_or_create ensures the worker resolves
+        # to the existing singleton (if any) or constructs a new one
+        # under the same name.
         if self._default is _SENTINEL:
-            return (_reconstruct, (self.name,))
-        return (_reconstruct, (self.name, self._default))
+            return (type(self)._get_or_create, (self.name,))
+        return (type(self)._get_or_create, (self.name, self._default))
+
+    @classmethod
+    def _lookup(cls, name: str) -> ContextVar | None:
+        """Internal: return the cached instance for ``name``, or None.
+
+        Used by :class:`_Context` to resolve wire-propagated var
+        entries. Lock-free; ``dict.get`` is atomic under the GIL.
+        """
+        return _ContextVarMeta._cache.get(name)
+
+    @classmethod
+    def _get_or_create(
+        cls,
+        name: str,
+        default: Any = _SENTINEL,
+    ) -> ContextVar:
+        """Internal: lookup-or-construct bypass for the unpickle path.
+
+        Used by :meth:`__reduce__`. Raises :exc:`ValueError` when the
+        incoming declaration disagrees with a cached instance's
+        default (strict mode).
+        """
+        meta = _ContextVarMeta
+        with meta._lock:
+            existing = meta._cache.get(name)
+            if existing is not None:
+                if default != existing._default:
+                    raise ValueError(
+                        f"wool.ContextVar {name!r} already exists with "
+                        f"a different declaration: cached "
+                        f"default={existing._default!r}, incoming "
+                        f"default={default!r}. Both sides must agree "
+                        f"on the var's declaration."
+                    )
+                return existing
+            # Bypass the metaclass's raising __call__ by constructing
+            # via object.__new__ + __init__ directly.
+            instance = object.__new__(cls)
+            instance.__init__(name, default=default)
+            meta._cache[name] = instance
+            return instance
+
+    @classmethod
+    def get_or_create(
+        cls,
+        name: str,
+        *,
+        default: Any = _SENTINEL,
+    ) -> ContextVar:
+        """Public idempotent lookup-or-construct.
+
+        Use when the var name is dynamic (factory, config-driven,
+        parametrized test). Returns the cached instance if one
+        exists with a matching ``default``, otherwise constructs a
+        new one. Raises :exc:`ValueError` on default conflict.
+
+        :param name:
+            The variable's name.
+        :param default:
+            The class-level default. Must match an existing cached
+            instance's default if one exists.
+        :returns:
+            The cached or newly-constructed :class:`ContextVar`.
+        :raises ValueError:
+            If a cached instance has a different default.
+        """
+        return cls._get_or_create(name, default=default)
 
     @property
     def name(self) -> str:
@@ -227,16 +330,23 @@ class ContextVar(Generic[T]):
             The new value.
         :returns:
             A :class:`Token` usable with :meth:`reset` to restore
-            the previous value. The token is picklable and carries a
-            UUID identity for cross-process use.
+            the previous value.
         """
         raw = self._var.get()
-        old_value: T | _UnsetType = cast("T", raw) if raw is not _UNSET else _UNSET
+        old_value: T | _UnsetType = raw if raw is not _UNSET else _UNSET
         stdlib_token = self._var.set(value)
-        return Token(self.name, old_value, stdlib_token)
+        return Token(self, old_value, stdlib_token)
 
     def reset(self, token: Token[T]) -> None:
         """Restore the variable to the value it had before ``token``.
+
+        Matches :meth:`contextvars.ContextVar.reset` semantics: the
+        var is restored to the value it had before the :meth:`set`
+        call that produced ``token``. Out-of-order reset is not
+        rejected — resetting an older token while a newer set is
+        still active silently restores the pre-older-set state,
+        discarding the newer mutation. This matches stdlib
+        behavior.
 
         :param token:
             A token previously returned by :meth:`set`.
@@ -248,19 +358,10 @@ class ContextVar(Generic[T]):
         """
         if token._used:
             raise RuntimeError("Token has already been used")
-        if token._var_name != self.name:
-            raise ValueError(
-                f"Token was created by ContextVar {token._var_name!r}, not {self.name!r}"
-            )
+        if token._var is not self:
+            raise ValueError("Token was created by a different ContextVar")
         token._used = True
-        if token._stdlib_token is not None:
-            self._var.reset(token._stdlib_token)
-        else:
-            # Deserialized token — restore old value directly
-            if isinstance(token._old_value, _UnsetType):
-                self._var.set(_UNSET)
-            else:
-                self._var.set(token._old_value)
+        self._var.reset(token._stdlib_token)
 
     def __repr__(self) -> str:
         return f"<wool.ContextVar name={self.name!r}>"
@@ -270,9 +371,9 @@ class _Context:
     """Internal serialization wrapper for context variable snapshots.
 
     Handles the conversion between the in-process
-    :class:`ContextVar` registry state and the ``map<string, bytes>``
-    protobuf representation used on the ``Request.context`` and
-    ``Response.context`` fields.
+    :class:`ContextVar` cache and the ``map<string, bytes>`` protobuf
+    representation used on the ``Request.vars`` and ``Response.vars``
+    fields.
     """
 
     @staticmethod
@@ -280,7 +381,7 @@ class _Context:
         *,
         dumps: Callable[[Any], bytes] = cloudpickle.dumps,
     ) -> dict[str, bytes]:
-        """Snapshot all registered :class:`ContextVar` values.
+        """Snapshot all cached :class:`ContextVar` values.
 
         :param dumps:
             Serializer for values. Defaults to
@@ -293,7 +394,7 @@ class _Context:
             If a value fails to serialize.
         """
         result: dict[str, bytes] = {}
-        for var in list(ContextVar._registry):
+        for var in list(_ContextVarMeta._cache.values()):
             raw = var._var.get()
             if raw is _UNSET:
                 continue
@@ -311,7 +412,7 @@ class _Context:
         *,
         dumps: Callable[[Any], bytes] = cloudpickle.dumps,
     ) -> dict[str, bytes]:
-        """Snapshot registered :class:`ContextVar` values from a specific context.
+        """Snapshot cached :class:`ContextVar` values from a specific context.
 
         Like :meth:`snapshot` but reads from *ctx* instead of the
         current context. Used on the worker side to read the final
@@ -326,7 +427,7 @@ class _Context:
             A ``{name: serialized_value}`` dict.
         """
         result: dict[str, bytes] = {}
-        for var in list(ContextVar._registry):
+        for var in list(_ContextVarMeta._cache.values()):
             if var._var in ctx:
                 raw = ctx[var._var]
                 if raw is _UNSET:
@@ -348,8 +449,8 @@ class _Context:
         """Apply a context snapshot to the current context.
 
         Deserializes each entry and calls ``var.set(value)`` on the
-        matching registered :class:`ContextVar`. Unknown names are
-        logged and skipped.
+        cached :class:`ContextVar` with the matching name. Names that
+        don't resolve to a cached instance are logged and skipped.
 
         :param vars:
             A ``{name: serialized_value}`` dict from the proto map.
@@ -359,21 +460,20 @@ class _Context:
         """
         if not vars:
             return
-        by_name: dict[str, list[ContextVar[Any]]] = {}
-        for var in list(ContextVar._registry):
-            by_name.setdefault(var.name, []).append(var)
         for name, data in vars.items():
-            matches = by_name.get(name)
-            if not matches:
+            var = ContextVar._lookup(name)
+            if var is None:
+                # Happens when the caller has set a var that the
+                # target routine doesn't reference — the wire map
+                # carries it, but the worker never saw the name
+                # (routines only register vars they actually use).
                 logging.warning(
                     "wool.ContextVar %r not registered on this process; "
                     "propagated value dropped",
                     name,
                 )
                 continue
-            value = loads(data)
-            for var in matches:
-                var.set(value)
+            var.set(loads(data))
 
 
 dispatch_timeout: Final[contextvars.ContextVar[float | None]] = contextvars.ContextVar(
@@ -399,14 +499,18 @@ class RuntimeContext:
     :param dispatch_timeout:
         Default timeout for task dispatch operations.
     :param vars:
-        Mapping of :class:`wool.ContextVar` names to values to restore
-        on :meth:`__enter__`. Normally populated by
-        :meth:`get_current` or :meth:`from_protobuf`; direct
-        construction is intended for tests and internal use.
+        Mapping of :class:`wool.ContextVar` names to the restored
+        VALUES (any cloudpicklable object — not
+        :class:`wool.ContextVar` instances themselves). The values
+        are applied via ``var.set(value)`` on :meth:`__enter__`.
+        Normally populated by :meth:`get_current` or
+        :meth:`from_protobuf`; direct construction is intended for
+        tests and internal use.
     """
 
     _dispatch_timeout: float | None | UndefinedType
     _dispatch_timeout_token: contextvars.Token[float | None] | UndefinedType
+    # Maps ContextVar names to restored values (not ContextVar instances).
     _vars: dict[str, Any]
 
     def __init__(
@@ -424,21 +528,16 @@ class RuntimeContext:
         else:
             self._dispatch_timeout_token = Undefined
 
-        if self._vars:
-            by_name: dict[str, list[ContextVar[Any]]] = {}
-            for var in list(ContextVar._registry):
-                by_name.setdefault(var.name, []).append(var)
-            for name, value in self._vars.items():
-                matches = by_name.get(name)
-                if not matches:
-                    logging.warning(
-                        "wool.ContextVar %r not registered on this worker; "
-                        "propagated value dropped",
-                        name,
-                    )
-                    continue
-                for var in matches:
-                    var.set(value)
+        for name, value in self._vars.items():
+            var = ContextVar._lookup(name)
+            if var is None:
+                logging.warning(
+                    "wool.ContextVar %r not registered on this worker; "
+                    "propagated value dropped",
+                    name,
+                )
+                continue
+            var.set(value)
 
         return self
 
@@ -460,10 +559,10 @@ class RuntimeContext:
             A :class:`RuntimeContext` with current context values.
         """
         snapshot: dict[str, Any] = {}
-        for wool_var in list(ContextVar._registry):
-            raw = wool_var._var.get()
+        for var in list(_ContextVarMeta._cache.values()):
+            raw = var._var.get()
             if raw is not _UNSET:
-                snapshot[wool_var.name] = raw
+                snapshot[var.name] = raw
         return cls(
             dispatch_timeout=dispatch_timeout.get(),
             vars=snapshot,

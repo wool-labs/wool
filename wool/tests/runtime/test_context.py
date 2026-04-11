@@ -12,7 +12,6 @@ from wool import protocol
 from wool.runtime.context import _UNSET
 from wool.runtime.context import ContextVar
 from wool.runtime.context import RuntimeContext
-from wool.runtime.context import Token
 from wool.runtime.context import _Context
 from wool.runtime.context import _UnsetType
 from wool.runtime.context import dispatch_timeout
@@ -906,53 +905,32 @@ class TestContextVar:
         with pytest.raises(RuntimeError, match="Token has already been used"):
             var.reset(token)
 
-    def test_reset_with_deserialized_token_restores_old_value(self):
-        """Test reset with a deserialized token restores the old value.
+    def test_reset_with_out_of_order_token_restores_prior_value(self):
+        """Test out-of-order reset restores to the pre-set value.
 
         Given:
-            A ContextVar with an old value set, a token created from
-            a subsequent set(), and that token round-tripped through
-            cloudpickle so its stdlib token is gone
+            A ContextVar with two tokens minted from sequential set
+            calls — t1 from the first set, t2 from the second
         When:
-            reset is called with the deserialized token
+            reset is called with t1 (the older token) while t2's
+            mutation is still active
         Then:
-            The var should be restored to the old value the token
-            captured
+            The var should be restored to the value it had before
+            t1's set was called, matching stdlib semantics. The
+            stdlib contextvars.ContextVar.reset documentation states
+            that reset returns the var to "the value it had before
+            the ContextVar.set() that created the token was used" —
+            it does not enforce LIFO ordering
         """
         # Arrange
-        var: ContextVar[str] = ContextVar("cv_deserialized_reset")
-        var.set("old_value")
-        token = var.set("new_value")
-        deserialized_token = cloudpickle.loads(cloudpickle.dumps(token))
+        var: ContextVar[int] = ContextVar("cv_reset_restores_prior")
 
         # Act
-        var.reset(deserialized_token)
+        t1 = var.set(1)
+        var.set(2)
+        var.reset(t1)
 
-        # Assert
-        assert var.get() == "old_value"
-
-    def test_reset_with_deserialized_token_restores_unset_sentinel(self):
-        """Test reset with deserialized token whose old value was unset.
-
-        Given:
-            A fresh ContextVar with no prior value, a token from the
-            first set() call, and that token round-tripped through
-            cloudpickle
-        When:
-            reset is called with the deserialized token
-        Then:
-            The var should be restored to the unset state so get()
-            raises LookupError
-        """
-        # Arrange
-        var: ContextVar[str] = ContextVar("cv_deserialized_reset_unset")
-        token = var.set("first_value")
-        deserialized_token = cloudpickle.loads(cloudpickle.dumps(token))
-
-        # Act
-        var.reset(deserialized_token)
-
-        # Assert
+        # Assert — restored to pre-t1 state (unset, so LookupError)
         with pytest.raises(LookupError):
             var.get()
 
@@ -1021,16 +999,16 @@ class TestContextVar:
         with pytest.raises(LookupError):
             restored.get()
 
-    def test_token___repr___includes_var_name_and_uuid(self):
-        """Test Token repr includes the variable name and UUID.
+    def test_token___repr___includes_var_name(self):
+        """Test Token repr includes the variable name.
 
         Given:
             A Token returned by ContextVar.set
         When:
             repr() is called on it
         Then:
-            The result should include the wool.Token tag, the var
-            name, and the token's UUID
+            The result should include the wool.Token tag and the
+            var name
         """
         # Arrange
         var: ContextVar[str] = ContextVar("cv_token_repr")
@@ -1042,51 +1020,129 @@ class TestContextVar:
         # Assert
         assert "wool.Token" in result
         assert "cv_token_repr" in result
-        assert str(token.var_name) == "cv_token_repr"
 
-    def test_token_var_name_property_returns_stored_name(self):
-        """Test Token.var_name returns the stored var name.
+    def test_token___reduce___raises_type_error(self):
+        """Test Token is not picklable.
 
         Given:
-            A Token returned by ContextVar.set on a named var
+            A Token returned by ContextVar.set
         When:
-            The var_name property is accessed
+            cloudpickle.dumps is called on it
         Then:
-            It should return the var's name
+            A TypeError should be raised explaining that tokens
+            must be reset on the process that minted them
         """
         # Arrange
-        var: ContextVar[int] = ContextVar("cv_token_var_name")
-        token = var.set(42)
+        var: ContextVar[str] = ContextVar("cv_token_not_picklable")
+        token = var.set("value")
 
         # Act & assert
-        assert token.var_name == "cv_token_var_name"
+        with pytest.raises(TypeError, match="not picklable"):
+            cloudpickle.dumps(token)
 
-    def test_token___reduce___roundtrip_preserves_var_name(self):
-        """Test pickled Token survives round-trip by var name.
+    def test___init___with_duplicate_name_returns_cached_instance(self):
+        """Test duplicate-name construction returns the cached instance.
 
         Given:
-            A Token returned by ContextVar.set with a known old value
+            A wool.ContextVar already constructed with a given name
+            and default, held by a strong reference so it stays in
+            the cache
         When:
-            The token is serialized via cloudpickle.dumps and
-            deserialized via cloudpickle.loads
+            Another ContextVar is constructed with the same name
+            and the same default
         Then:
-            The restored token should expose the same var_name and
-            be a Token instance usable to reset the var to its old
-            value
+            The same Python object should be returned (singleton by
+            name). Construction is idempotent when declarations
+            agree; it only raises on default conflict.
         """
         # Arrange
-        var: ContextVar[str] = ContextVar("cv_token_reduce")
-        var.set("before")
-        token = var.set("after")
+        first = ContextVar("cv_duplicate_name", default="d")
 
         # Act
-        restored = cloudpickle.loads(cloudpickle.dumps(token))
+        second = ContextVar("cv_duplicate_name", default="d")
 
         # Assert
-        assert isinstance(restored, Token)
-        assert restored.var_name == "cv_token_reduce"
-        var.reset(restored)
-        assert var.get() == "before"
+        assert second is first
+
+    def test___init___with_conflicting_default_raises_value_error(self):
+        """Test duplicate-name construction with a different default raises.
+
+        Given:
+            A wool.ContextVar cached with one default
+        When:
+            Another ContextVar is constructed with the same name
+            but a different default
+        Then:
+            A ValueError should be raised naming both defaults
+        """
+        # Arrange
+        _first = ContextVar("cv_duplicate_conflict", default="A")
+
+        # Act & assert
+        with pytest.raises(ValueError, match="different declaration"):
+            ContextVar("cv_duplicate_conflict", default="B")
+
+        assert _first.get() == "A"
+
+    def test_get_or_create_with_cached_returns_existing(self):
+        """Test get_or_create returns the cached instance for a known name.
+
+        Given:
+            A wool.ContextVar already constructed with a default
+        When:
+            get_or_create is called with the same name and default
+        Then:
+            The same Python object should be returned
+        """
+        # Arrange
+        original = ContextVar("cv_get_or_create_cached", default="x")
+
+        # Act
+        fetched = ContextVar.get_or_create("cv_get_or_create_cached", default="x")
+
+        # Assert
+        assert fetched is original
+
+    def test_get_or_create_with_conflicting_default_raises_value_error(self):
+        """Test get_or_create raises on default conflict.
+
+        Given:
+            A wool.ContextVar cached with one default and held by
+            a strong reference
+        When:
+            get_or_create is called with the same name but a
+            different default
+        Then:
+            A ValueError should be raised naming both defaults
+        """
+        # Arrange — strong reference keeps the cache entry alive.
+        _first = ContextVar("cv_get_or_create_conflict", default="A")
+
+        # Act & assert
+        with pytest.raises(ValueError, match="different declaration"):
+            ContextVar.get_or_create("cv_get_or_create_conflict", default="B")
+
+        assert _first.get() == "A"
+
+    def test_get_or_create_without_cached_constructs_new(self):
+        """Test get_or_create constructs a new instance for an unknown name.
+
+        Given:
+            No cached wool.ContextVar with the given name
+        When:
+            get_or_create is called with that name and a default
+        Then:
+            A new ContextVar with the given name and default should
+            be returned and subsequently cached
+        """
+        # Act
+        created = ContextVar.get_or_create("cv_get_or_create_fresh", default=42)
+
+        # Assert
+        assert created.name == "cv_get_or_create_fresh"
+        assert created.get() == 42
+        # Second call must return the same cached instance
+        assert ContextVar.get_or_create("cv_get_or_create_fresh", default=42) is created
 
     def test_propagation_round_trip_preserves_set_value(self):
         """Test end-to-end propagation of an explicitly set value.
@@ -1273,18 +1329,21 @@ class TestContextVar:
         with pytest.raises(TypeError, match="cv_bad"):
             context.to_protobuf()
 
-    def test_garbage_collected_var_drops_from_registry(self):
-        """Test function-scoped vars drop from the WeakSet on GC.
+    def test_garbage_collected_var_drops_from_cache(self):
+        """Test function-scoped vars drop from the metaclass cache on GC.
 
         Given:
             A wool.ContextVar constructed, set, and reset inside a
-            helper scope that then returns
+            helper scope that then returns, so no strong references
+            remain
         When:
             gc.collect() runs and RuntimeContext.get_current() is
             called afterward
         Then:
             The protobuf serialization should not include the
-            collected var's name
+            collected var's name — the WeakValueDictionary cache in
+            the metaclass drops entries whose strong references have
+            been released
         """
 
         # Arrange
@@ -1520,41 +1579,6 @@ class TestContext:
         # Assert
         assert "cv_ctx_snapshot_from" in result
         assert cloudpickle.loads(result["cv_ctx_snapshot_from"]) == "inside_ctx"
-
-    def test_snapshot_from_skips_unset_sentinel_present_in_context(self):
-        """Test snapshot_from omits vars whose ctx value is the unset sentinel.
-
-        Given:
-            A wool.ContextVar and a deserialized token whose old
-            value was the unset sentinel, applied inside a fresh
-            contextvars.Context so the backing var is present with
-            the unset sentinel as its value
-        When:
-            _Context.snapshot_from is called with that context
-        Then:
-            The returned dict should not include the var's name
-        """
-        # Arrange
-        var: ContextVar[str] = ContextVar("cv_ctx_snapshot_from_unset")
-        ctx = contextvars.copy_context()
-
-        # A token whose old_value is _UNSET — created by the first
-        # set() on a fresh var — serialized so the stdlib token is
-        # dropped; reset with this token performs var._var.set(_UNSET)
-        # inside the ctx, leaving the sentinel as the value.
-        first_token = var.set("temporary")
-        deserialized = cloudpickle.loads(cloudpickle.dumps(first_token))
-
-        def reset_to_unset():
-            var.reset(deserialized)
-
-        ctx.run(reset_to_unset)
-
-        # Act
-        result = _Context.snapshot_from(ctx)
-
-        # Assert
-        assert "cv_ctx_snapshot_from_unset" not in result
 
     def test_snapshot_from_excludes_vars_not_in_context(self):
         """Test snapshot_from skips vars not present in the given context.
