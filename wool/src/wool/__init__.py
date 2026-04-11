@@ -1,4 +1,4 @@
-from contextvars import ContextVar as _StdlibContextVar
+import contextvars
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
 from typing import Final
@@ -51,20 +51,20 @@ try:
 except PackageNotFoundError:
     __version__ = "unknown"
 
-__proxy__: Final[_StdlibContextVar[WorkerProxy | None]] = _StdlibContextVar(
+__proxy__: Final[contextvars.ContextVar[WorkerProxy | None]] = contextvars.ContextVar(
     "__proxy__", default=None
 )
 
-__proxy_pool__: Final[_StdlibContextVar[ResourcePool[WorkerProxy] | None]] = (
-    _StdlibContextVar("__proxy_pool__", default=None)
+__proxy_pool__: Final[contextvars.ContextVar[ResourcePool[WorkerProxy] | None]] = (
+    contextvars.ContextVar("__proxy_pool__", default=None)
 )
 
 __worker_metadata__: WorkerMetadata | None = None
 
 __worker_uds_address__: str | None = None
 
-__worker_service__: Final[_StdlibContextVar[WorkerService | None]] = _StdlibContextVar(
-    "__worker_service__", default=None
+__worker_service__: Final[contextvars.ContextVar[WorkerService | None]] = (
+    contextvars.ContextVar("__worker_service__", default=None)
 )
 
 __all__ = [
