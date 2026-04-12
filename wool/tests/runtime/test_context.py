@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import gc
 import logging
+import sys
 
 import cloudpickle
 import pytest
@@ -1021,39 +1022,42 @@ class TestContextVar:
         assert "wool.Token" in result
         assert "cv_token_repr" in result
 
-    def test_token___reduce___raises_type_error(self):
-        """Test Token is not picklable.
+    def test_token___reduce___roundtrip_preserves_var_reference(self):
+        """Test Token pickle round-trip preserves the var reference.
 
         Given:
             A Token returned by ContextVar.set
         When:
-            cloudpickle.dumps is called on it
+            The token is pickled and unpickled via cloudpickle
         Then:
-            A TypeError should be raised explaining that tokens
-            must be reset on the process that minted them
+            The restored token's _var should resolve to the same
+            ContextVar instance via sys.modules unification, and
+            reset should succeed
         """
         # Arrange
-        var: ContextVar[str] = ContextVar("cv_token_not_picklable")
-        token = var.set("value")
+        var: ContextVar[str] = ContextVar("cv_token_pickle_roundtrip")
+        var.set("before")
+        token = var.set("after")
 
-        # Act & assert
-        with pytest.raises(TypeError, match="not picklable"):
-            cloudpickle.dumps(token)
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(token))
 
-    def test___init___with_duplicate_name_returns_cached_instance(self):
-        """Test duplicate-name construction returns the cached instance.
+        # Assert — the restored token's _var unifies with the
+        # original via sys.modules
+        assert restored._var is var
+        var.reset(restored)
+        assert var.get() == "before"
+
+    def test___init___with_duplicate_name_returns_same_instance(self):
+        """Test duplicate-name construction returns the same instance.
 
         Given:
             A wool.ContextVar already constructed with a given name
-            and default, held by a strong reference so it stays in
-            the cache
         When:
             Another ContextVar is constructed with the same name
-            and the same default
         Then:
-            The same Python object should be returned (singleton by
-            name). Construction is idempotent when declarations
-            agree; it only raises on default conflict.
+            The same Python object should be returned via sys.modules
+            unification (__new__ returns the existing instance)
         """
         # Arrange
         first = ContextVar("cv_duplicate_name", default="d")
@@ -1064,85 +1068,23 @@ class TestContextVar:
         # Assert
         assert second is first
 
-    def test___init___with_conflicting_default_raises_value_error(self):
-        """Test duplicate-name construction with a different default raises.
+    def test___init___registers_in_sys_modules(self):
+        """Test construction registers the instance in sys.modules.
 
         Given:
-            A wool.ContextVar cached with one default
+            A fresh wool.ContextVar name
         When:
-            Another ContextVar is constructed with the same name
-            but a different default
+            A ContextVar is constructed with that name
         Then:
-            A ValueError should be raised naming both defaults
-        """
-        # Arrange
-        _first = ContextVar("cv_duplicate_conflict", default="A")
-
-        # Act & assert
-        with pytest.raises(ValueError, match="different declaration"):
-            ContextVar("cv_duplicate_conflict", default="B")
-
-        assert _first.get() == "A"
-
-    def test_get_or_create_with_cached_returns_existing(self):
-        """Test get_or_create returns the cached instance for a known name.
-
-        Given:
-            A wool.ContextVar already constructed with a default
-        When:
-            get_or_create is called with the same name and default
-        Then:
-            The same Python object should be returned
-        """
-        # Arrange
-        original = ContextVar("cv_get_or_create_cached", default="x")
-
-        # Act
-        fetched = ContextVar.get_or_create("cv_get_or_create_cached", default="x")
-
-        # Assert
-        assert fetched is original
-
-    def test_get_or_create_with_conflicting_default_raises_value_error(self):
-        """Test get_or_create raises on default conflict.
-
-        Given:
-            A wool.ContextVar cached with one default and held by
-            a strong reference
-        When:
-            get_or_create is called with the same name but a
-            different default
-        Then:
-            A ValueError should be raised naming both defaults
-        """
-        # Arrange — strong reference keeps the cache entry alive.
-        _first = ContextVar("cv_get_or_create_conflict", default="A")
-
-        # Act & assert
-        with pytest.raises(ValueError, match="different declaration"):
-            ContextVar.get_or_create("cv_get_or_create_conflict", default="B")
-
-        assert _first.get() == "A"
-
-    def test_get_or_create_without_cached_constructs_new(self):
-        """Test get_or_create constructs a new instance for an unknown name.
-
-        Given:
-            No cached wool.ContextVar with the given name
-        When:
-            get_or_create is called with that name and a default
-        Then:
-            A new ContextVar with the given name and default should
-            be returned and subsequently cached
+            It should be registered in sys.modules under the
+            synthetic key wool._vars.<name>
         """
         # Act
-        created = ContextVar.get_or_create("cv_get_or_create_fresh", default=42)
+        var = ContextVar("cv_sys_modules_check")
 
         # Assert
-        assert created.name == "cv_get_or_create_fresh"
-        assert created.get() == 42
-        # Second call must return the same cached instance
-        assert ContextVar.get_or_create("cv_get_or_create_fresh", default=42) is created
+        synthetic = "wool._vars.cv_sys_modules_check"
+        assert sys.modules.get(synthetic) is var
 
     def test_propagation_round_trip_preserves_set_value(self):
         """Test end-to-end propagation of an explicitly set value.
@@ -1501,8 +1443,8 @@ class TestContext:
         result = _Context.snapshot()
 
         # Assert
-        assert "cv_ctx_snapshot_set" in result
-        assert cloudpickle.loads(result["cv_ctx_snapshot_set"]) == "live"
+        assert "wool._vars.cv_ctx_snapshot_set" in result
+        assert cloudpickle.loads(result["wool._vars.cv_ctx_snapshot_set"]) == "live"
 
     def test_snapshot_skips_vars_without_any_set_value(self):
         """Test snapshot omits vars that have never been set.
@@ -1522,7 +1464,7 @@ class TestContext:
         result = _Context.snapshot()
 
         # Assert
-        assert "cv_ctx_snapshot_never_set" not in result
+        assert "wool._vars.cv_ctx_snapshot_never_set" not in result
         # Keep the var alive until after snapshot() runs
         assert var.name == "cv_ctx_snapshot_never_set"
 
@@ -1577,8 +1519,10 @@ class TestContext:
         result = _Context.snapshot_from(ctx)
 
         # Assert
-        assert "cv_ctx_snapshot_from" in result
-        assert cloudpickle.loads(result["cv_ctx_snapshot_from"]) == "inside_ctx"
+        assert "wool._vars.cv_ctx_snapshot_from" in result
+        assert (
+            cloudpickle.loads(result["wool._vars.cv_ctx_snapshot_from"]) == "inside_ctx"
+        )
 
     def test_snapshot_from_excludes_vars_not_in_context(self):
         """Test snapshot_from skips vars not present in the given context.
@@ -1601,7 +1545,7 @@ class TestContext:
         result = _Context.snapshot_from(ctx)
 
         # Assert
-        assert "cv_ctx_snapshot_from_absent" not in result
+        assert "wool._vars.cv_ctx_snapshot_from_absent" not in result
 
     def test_snapshot_from_raises_typeerror_for_non_picklable_value(self):
         """Test snapshot_from errors name the offending variable.
@@ -1667,7 +1611,7 @@ class TestContext:
         """
         # Arrange
         var: ContextVar[str] = ContextVar("cv_ctx_apply_valid")
-        payload = {"cv_ctx_apply_valid": cloudpickle.dumps("propagated")}
+        payload = {"wool._vars.cv_ctx_apply_valid": cloudpickle.dumps("propagated")}
 
         # Act
         _Context.apply(payload)
