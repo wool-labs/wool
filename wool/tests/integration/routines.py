@@ -34,6 +34,21 @@ TEST_PATTERNS: wool.ContextVar[dict] = wool.ContextVar("_test_patterns", default
 # setting vars; the inner decorator reads them and calls reset().
 _RESET_TOKENS: wool.ContextVar[dict] = wool.ContextVar("_reset_tokens", default={})
 
+
+def _var(name: str) -> "wool.ContextVar":
+    """Look up a wool.ContextVar by logical name at call time.
+
+    Resolves against the module's live globals so that attribute
+    substitutions performed by wool's manifest machinery on the
+    worker (``sys.modules['integration.routines'].TENANT_ID = ...``)
+    are visible to every caller. A module-level ``dict`` built at
+    import time would retain stale references to the pre-substitution
+    instances; ``globals()[name.upper()]`` re-resolves each call.
+    """
+    return globals()[name.upper()]
+
+
+# Deprecated legacy alias. Existing call sites use ``_var(name)``.
 VARS = {"tenant_id": TENANT_ID, "region": REGION, "trace_id": TRACE_ID}
 
 
@@ -45,7 +60,7 @@ def _execute_patterns(patterns, *, step=None):
     to apply.
     """
     for var_name, pattern in patterns.items():
-        var = VARS[var_name]
+        var = _var(var_name)
         match pattern:
             case "ROUND_TRIP":
                 var.set(f"worker-mutated-{var_name}")
@@ -82,7 +97,7 @@ def _pre_nested_setup(patterns):
     """
     tokens_for_inner = {}
     for var_name, pattern in patterns.items():
-        var = VARS[var_name]
+        var = _var(var_name)
         match pattern:
             case "DOWNSTREAM_OVERWRITE":
                 var.set(f"outer-set-{var_name}")
@@ -102,7 +117,7 @@ def _post_nested_teardown(patterns):
     worker set, using a token captured before the nested call.
     """
     for var_name, pattern in patterns.items():
-        var = VARS[var_name]
+        var = _var(var_name)
         if pattern == "UPSTREAM_RESET":
             # The inner worker set this var; the outer worker now
             # resets it back to whatever it was before.

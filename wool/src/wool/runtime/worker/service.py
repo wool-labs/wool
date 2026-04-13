@@ -227,6 +227,15 @@ class WorkerService(protocol.WorkerServicer):
         ]
         manifest = Manifest.from_wire(manifest_entries)
 
+        # Unpickle the Task BEFORE activating the namespace so that
+        # cloudpickle's by-reference imports populate sys.modules
+        # with the library modules the manifest will target. If we
+        # activated first, the manifest's "substitute sys.modules[mod]"
+        # pass would be a no-op on modules that haven't been imported
+        # yet, and the library's fresh ContextVar would remain as the
+        # routine's LOAD_GLOBAL target.
+        work_task = Task.from_protobuf(response.task)
+
         with _namespace.activate(lineage_id, manifest):
             # Apply wire-shipped var values to the current (task)
             # context. This must run after activate() so that the
@@ -235,7 +244,6 @@ class WorkerService(protocol.WorkerServicer):
             # up by their UUID-keyed synthetic name.
             if response.vars:
                 _Context.apply(dict(response.vars))
-            work_task = Task.from_protobuf(response.task)
 
             if self._backpressure is not None:
                 decision = self._backpressure(
