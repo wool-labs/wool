@@ -43,7 +43,6 @@ import logging
 import sys
 import types
 import uuid
-import weakref
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 from typing import Any
@@ -156,33 +155,50 @@ def clone_module(original: types.ModuleType) -> types.ModuleType:
 # ----------------------------------------------------------------------
 
 
+if sys.version_info >= (3, 12):
+
+    def _task_context_id(task: asyncio.Task[Any]) -> int:
+        """Return ``id(ctx)`` for the task's bound :class:`contextvars.Context`.
+
+        Uses the public :meth:`asyncio.Task.get_context` introduced
+        in Python 3.12.
+        """
+        return id(task.get_context())
+
+else:
+
+    def _task_context_id(task: asyncio.Task[Any]) -> int:
+        """Return ``id(ctx)`` for the task's bound :class:`contextvars.Context`.
+
+        Falls back to the non-public ``_context`` attribute on
+        Python 3.11 where :meth:`asyncio.Task.get_context` is not
+        yet available. Documented in CPython's asyncio internals and
+        stable across 3.11 patch releases.
+        """
+        return id(task._context)  # type: ignore[attr-defined]
+
+
 class _LineageSentinel:
-    """Marker that binds a lineage UUID to the asyncio Task it was
+    """Marker that binds a lineage UUID to the stdlib Context it was
     established in.
 
     Stored in the :data:`_wool_sentinel` stdlib contextvar so lineage
     is recoverable from the current context. When stdlib copies the
     contextvar across an ``asyncio.create_task`` boundary, the
-    sentinel's value propagates verbatim — but its ``task_ref`` still
-    points at the PARENT task. :func:`current_lineage` uses this to
-    detect implicit forks: a mismatch between ``sentinel.task_ref()``
-    and :func:`asyncio.current_task` means we're inside a
-    copied-context task, which mints a fresh lineage.
+    sentinel's value propagates verbatim — but ``ctx_id`` still
+    identifies the PARENT task's :class:`contextvars.Context` via
+    :func:`_task_context_id`. :func:`current_lineage` uses this to
+    detect implicit forks: a mismatch between the sentinel's stored
+    ``ctx_id`` and the current task's context id means we're inside
+    a forked context (``asyncio.create_task`` or equivalent), which
+    mints a fresh lineage.
     """
 
-    __slots__ = ("lineage_id", "_task_ref")
+    __slots__ = ("lineage_id", "ctx_id")
 
-    def __init__(self, lineage_id: uuid.UUID, task: asyncio.Task | None):
+    def __init__(self, lineage_id: uuid.UUID, ctx_id: int):
         self.lineage_id = lineage_id
-        self._task_ref: weakref.ref[asyncio.Task] | None = (
-            weakref.ref(task) if task is not None else None
-        )
-
-    @property
-    def task(self) -> asyncio.Task | None:
-        if self._task_ref is None:
-            return None
-        return self._task_ref()
+        self.ctx_id = ctx_id
 
 
 # Sentinel holding the active lineage UUID and the task it was
@@ -220,16 +236,15 @@ def current_lineage() -> uuid.UUID:
     Resolution order:
 
     1. If we're in an asyncio task and the current stdlib ``Context``
-       has a :class:`_LineageSentinel` whose ``task`` matches
-       :func:`asyncio.current_task`, return its lineage
-       (continuation).
+       has a :class:`_LineageSentinel` whose ``ctx_id`` matches the
+       current task's context id, return its lineage (continuation).
     2. Else if :data:`_intended_lineage` is set (typically by
        :func:`activate` on the worker), consume it by writing
        ``None`` to our own context so descendants don't re-adopt,
-       bind the sentinel to the current task (if any), and return
-       the adopted UUID.
+       bind the sentinel to the current context, and return the
+       adopted UUID.
     3. Else in an asyncio task, mint a fresh lineage, bind the
-       sentinel to the current task, and return it (implicit fork
+       sentinel to the current context, and return it (implicit fork
        across an ``asyncio.create_task`` boundary).
     4. Outside any asyncio task and with no intended lineage, return
        the process-wide default lineage.
@@ -239,23 +254,25 @@ def current_lineage() -> uuid.UUID:
     except RuntimeError:
         task = None
 
-    if task is not None:
+    ctx_id = _task_context_id(task) if task is not None else None
+
+    if ctx_id is not None:
         sentinel = _wool_sentinel.get(None)
-        if sentinel is not None and sentinel.task is task:
+        if sentinel is not None and sentinel.ctx_id == ctx_id:
             return sentinel.lineage_id
 
     intended = _intended_lineage.get(None)
     if intended is not None:
         _intended_lineage.set(None)
-        if task is not None:
-            _wool_sentinel.set(_LineageSentinel(intended, task))
+        if ctx_id is not None:
+            _wool_sentinel.set(_LineageSentinel(intended, ctx_id))
         return intended
 
-    if task is None:
+    if ctx_id is None:
         return _process_default_lineage
 
     lineage = uuid.uuid4()
-    _wool_sentinel.set(_LineageSentinel(lineage, task))
+    _wool_sentinel.set(_LineageSentinel(lineage, ctx_id))
     return lineage
 
 
@@ -270,7 +287,9 @@ def adopt_lineage(lineage_id: uuid.UUID) -> None:
         task = asyncio.current_task()
     except RuntimeError:
         task = None
-    _wool_sentinel.set(_LineageSentinel(lineage_id, task))
+    if task is None:
+        return
+    _wool_sentinel.set(_LineageSentinel(lineage_id, _task_context_id(task)))
 
 
 # Legacy alias — deprecated compatibility for callers that still
@@ -295,7 +314,7 @@ class _ActiveLineageShim:
         if task is None:
             return default
         sentinel = _wool_sentinel.get(None)
-        if sentinel is not None and sentinel.task is task:
+        if sentinel is not None and sentinel.ctx_id == _task_context_id(task):
             return sentinel.lineage_id
         return default
 
