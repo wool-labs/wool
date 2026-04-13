@@ -34,6 +34,7 @@ the hash table, ``__missing__`` is called. This is why
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import importlib.abc
 import importlib.machinery
@@ -42,6 +43,7 @@ import logging
 import sys
 import types
 import uuid
+import weakref
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 from typing import Any
@@ -154,11 +156,154 @@ def clone_module(original: types.ModuleType) -> types.ModuleType:
 # ----------------------------------------------------------------------
 
 
-# contextvar holding the current lineage ID for a task. None outside
-# of any active dispatch.
-_active_lineage: contextvars.ContextVar[uuid.UUID | None] = contextvars.ContextVar(
-    "wool.namespace.active_lineage", default=None
+class _LineageSentinel:
+    """Marker that binds a lineage UUID to the asyncio Task it was
+    established in.
+
+    Stored in the :data:`_wool_sentinel` stdlib contextvar so lineage
+    is recoverable from the current context. When stdlib copies the
+    contextvar across an ``asyncio.create_task`` boundary, the
+    sentinel's value propagates verbatim — but its ``task_ref`` still
+    points at the PARENT task. :func:`current_lineage` uses this to
+    detect implicit forks: a mismatch between ``sentinel.task_ref()``
+    and :func:`asyncio.current_task` means we're inside a
+    copied-context task, which mints a fresh lineage.
+    """
+
+    __slots__ = ("lineage_id", "_task_ref")
+
+    def __init__(self, lineage_id: uuid.UUID, task: asyncio.Task | None):
+        self.lineage_id = lineage_id
+        self._task_ref: weakref.ref[asyncio.Task] | None = (
+            weakref.ref(task) if task is not None else None
+        )
+
+    @property
+    def task(self) -> asyncio.Task | None:
+        if self._task_ref is None:
+            return None
+        return self._task_ref()
+
+
+# Sentinel holding the active lineage UUID and the task it was
+# bound to. Inside the same asyncio Task, lineage is constant and
+# continues across sequential awaits. Crossing an asyncio.create_task
+# boundary flips the current task, :func:`current_lineage` detects
+# the mismatch, and mints a fresh lineage — stdlib parity with
+# ``contextvars.Context`` fork semantics.
+_wool_sentinel: contextvars.ContextVar[_LineageSentinel | None] = contextvars.ContextVar(
+    "wool.namespace.wool_sentinel", default=None
 )
+
+
+# Worker-side adoption mechanism. When a dispatch handler enters
+# :func:`activate`, it sets this contextvar to the caller's wire
+# lineage. The first asyncio task descendant that calls
+# :func:`current_lineage` consumes the intended value (by writing
+# ``None`` to its own local context) and binds the sentinel to
+# itself. Descendants of that task (via the user's own
+# ``asyncio.create_task``) see ``None`` and mint fresh lineages —
+# stdlib fork semantics.
+_intended_lineage: contextvars.ContextVar[uuid.UUID | None] = contextvars.ContextVar(
+    "wool.namespace.intended_lineage", default=None
+)
+
+
+# Fallback lineage for code that dispatches outside any asyncio task
+# (e.g., synchronous tests building payloads manually). One per process.
+_process_default_lineage: uuid.UUID = uuid.uuid4()
+
+
+def current_lineage() -> uuid.UUID:
+    """Return the lineage UUID for the current execution context.
+
+    Resolution order:
+
+    1. If we're in an asyncio task and the current stdlib ``Context``
+       has a :class:`_LineageSentinel` whose ``task`` matches
+       :func:`asyncio.current_task`, return its lineage
+       (continuation).
+    2. Else if :data:`_intended_lineage` is set (typically by
+       :func:`activate` on the worker), consume it by writing
+       ``None`` to our own context so descendants don't re-adopt,
+       bind the sentinel to the current task (if any), and return
+       the adopted UUID.
+    3. Else in an asyncio task, mint a fresh lineage, bind the
+       sentinel to the current task, and return it (implicit fork
+       across an ``asyncio.create_task`` boundary).
+    4. Outside any asyncio task and with no intended lineage, return
+       the process-wide default lineage.
+    """
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+
+    if task is not None:
+        sentinel = _wool_sentinel.get(None)
+        if sentinel is not None and sentinel.task is task:
+            return sentinel.lineage_id
+
+    intended = _intended_lineage.get(None)
+    if intended is not None:
+        _intended_lineage.set(None)
+        if task is not None:
+            _wool_sentinel.set(_LineageSentinel(intended, task))
+        return intended
+
+    if task is None:
+        return _process_default_lineage
+
+    lineage = uuid.uuid4()
+    _wool_sentinel.set(_LineageSentinel(lineage, task))
+    return lineage
+
+
+def adopt_lineage(lineage_id: uuid.UUID) -> None:
+    """Bind *lineage_id* to the current asyncio task.
+
+    Used on the worker side when a dispatched task adopts the
+    caller's lineage instead of minting a fresh one. Must be called
+    from within the asyncio task that will run user code.
+    """
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    _wool_sentinel.set(_LineageSentinel(lineage_id, task))
+
+
+# Legacy alias — deprecated compatibility for callers that still
+# import :data:`_active_lineage`. New code should call
+# :func:`current_lineage` or :func:`adopt_lineage`.
+class _ActiveLineageShim:
+    """Backport shim for the retired ``_active_lineage`` contextvar.
+
+    Provides ``.get(default=None)`` returning the current lineage
+    (or None when outside an asyncio task / before adopt), and
+    ``.set(value)`` that delegates to :func:`adopt_lineage` when a
+    UUID is provided. Full contextvar semantics are not preserved;
+    callers that need reset-token behavior should migrate to
+    :func:`adopt_lineage` directly.
+    """
+
+    def get(self, default: Any = None) -> uuid.UUID | None:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            return default
+        if task is None:
+            return default
+        sentinel = _wool_sentinel.get(None)
+        if sentinel is not None and sentinel.task is task:
+            return sentinel.lineage_id
+        return default
+
+    def set(self, value: uuid.UUID) -> None:
+        adopt_lineage(value)
+
+
+_active_lineage = _ActiveLineageShim()
 
 
 # In-process cache: lineage_id → {module_name → cloned_module}.
@@ -356,7 +501,14 @@ def activate(
         will not be reused, or for tests.
     """
     entry = _get_lineage_entry(lineage_id)
-    token = _active_lineage.set(lineage_id)
+    # Set the intended lineage so the next asyncio task descendant
+    # (typically the worker-side task created by the dispatch
+    # handler to run user code) adopts it instead of minting a fresh
+    # one. Direct sentinel adoption here would bind to the handler's
+    # task — sub-tasks created under it would see the mismatch and
+    # fork, which is the opposite of what we want for worker
+    # adoption.
+    intended_token = _intended_lineage.set(lineage_id)
 
     try:
         # Substitute manifest entries directly into the live
@@ -388,6 +540,6 @@ def activate(
 
         yield entry
     finally:
-        _active_lineage.reset(token)
+        _intended_lineage.reset(intended_token)
         if drop_on_exit:
             _discard_lineage(lineage_id)

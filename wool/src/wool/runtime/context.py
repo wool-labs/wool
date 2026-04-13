@@ -650,14 +650,14 @@ class Context:
             If the current event loop is running and *fn* returns an
             awaitable. Use :meth:`run_async` for coroutines.
         """
-        from wool.runtime.worker.namespace import _active_lineage
+        from wool.runtime.worker.namespace import adopt_lineage
 
         seeded = contextvars.copy_context()
 
         def _seed_and_call() -> T:
             for var, value in self._vars.items():
                 var.set(value)
-            _active_lineage.set(self._lineage_id)
+            adopt_lineage(self._lineage_id)
             return fn(*args, **kwargs)
 
         return seeded.run(_seed_and_call)
@@ -671,14 +671,17 @@ class Context:
         The caller's own context is unaffected by any mutations made
         inside *coro*.
         """
-        from wool.runtime.worker.namespace import _active_lineage
+        from wool.runtime.worker.namespace import _intended_lineage
 
         seeded = contextvars.copy_context()
 
         def _seed() -> None:
             for var, value in self._vars.items():
                 var.set(value)
-            _active_lineage.set(self._lineage_id)
+            # Plant intended so the new task adopts our lineage on
+            # first current_lineage() call — parity with the worker
+            # dispatch adoption path.
+            _intended_lineage.set(self._lineage_id)
 
         seeded.run(_seed)
         return await asyncio.create_task(coro, context=seeded)
@@ -731,7 +734,7 @@ def copy_context() -> Context:
     scoping a call via :meth:`Context.run` does not leak mutations
     back to the current context.
     """
-    from wool.runtime.worker.namespace import _active_lineage
+    from wool.runtime.worker.namespace import current_lineage
 
     vars_dict: dict[ContextVar[Any], Any] = {}
     for var in list(ContextVar._registry):
@@ -740,10 +743,7 @@ def copy_context() -> Context:
             continue
         vars_dict[var] = raw
 
-    lineage = _active_lineage.get()
-    if lineage is None:
-        lineage = uuid4()
-    return Context._create(lineage, vars_dict)
+    return Context._create(current_lineage(), vars_dict)
 
 
 def build_task_frame_payload() -> tuple[
@@ -764,13 +764,12 @@ def build_task_frame_payload() -> tuple[
     empty when no lineage is active (root dispatch — the worker
     assigns one).
     """
-    from wool.runtime.worker.namespace import _active_lineage
+    from wool.runtime.worker.namespace import current_lineage
 
     vars_dict = _Context.snapshot()
     manifest = Manifest.build()
     manifest_entries = Manifest.to_wire(manifest)
-    lineage = _active_lineage.get()
-    lineage_hex = lineage.hex if lineage is not None else ""
+    lineage_hex = current_lineage().hex
     return vars_dict, manifest_entries, lineage_hex
 
 
@@ -783,11 +782,10 @@ def build_stream_frame_payload() -> tuple[dict[str, bytes], str]:
     ID are propagated so back-propagated values reach the caller and
     the worker confirms the lineage.
     """
-    from wool.runtime.worker.namespace import _active_lineage
+    from wool.runtime.worker.namespace import current_lineage
 
     vars_dict = _Context.snapshot()
-    lineage = _active_lineage.get()
-    lineage_hex = lineage.hex if lineage is not None else ""
+    lineage_hex = current_lineage().hex
     return vars_dict, lineage_hex
 
 

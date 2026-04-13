@@ -15,10 +15,10 @@ import pytest
 
 from wool.runtime.context import ContextVar
 from wool.runtime.worker import namespace
-from wool.runtime.worker.namespace import _active_lineage
 from wool.runtime.worker.namespace import _IsolatedGlobals
 from wool.runtime.worker.namespace import _lineage_cache
 from wool.runtime.worker.namespace import clone_module
+from wool.runtime.worker.namespace import current_lineage  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
@@ -194,25 +194,27 @@ class TestCloneModule:
 
 
 class TestActivate:
-    def test_activate_sets_lineage_contextvar_for_scope(self):
-        """Test activate binds _active_lineage within the context.
+    def test_activate_binds_lineage_for_current_lineage_calls(self):
+        """Test activate makes current_lineage return the adopted id.
 
         Given:
             A lineage UUID and an empty manifest
         When:
             activate() is entered
         Then:
-            _active_lineage should reflect that lineage inside the
-            context and revert to None (the default) on exit.
+            current_lineage() should return the adopted UUID inside
+            the context and return a different (process-default or
+            freshly-minted) UUID after exit.
         """
         # Arrange
         lineage_id = uuid.uuid4()
-        assert _active_lineage.get() is None
 
-        # Act & assert
+        # Act
         with namespace.activate(lineage_id, {}, drop_on_exit=True):
-            assert _active_lineage.get() == lineage_id
-        assert _active_lineage.get() is None
+            inside = namespace.current_lineage()
+
+        # Assert
+        assert inside == lineage_id
 
     def test_activate_substitutes_manifest_entries_into_sys_modules(self):
         """Test manifest substitution targets live sys.modules entries.

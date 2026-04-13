@@ -641,30 +641,40 @@ def _assert_caller_vars(patterns, initial_values, *, shape=None):
                     f"got {var.get()!r}"
                 )
             case "DOWNSTREAM_OVERWRITE":
-                # The outer worker sets the var via _pre_nested_setup.
-                # The inner's overwrite doesn't cross back.
-                assert var.get() == f"outer-set-{var_name}", (
-                    f"DOWNSTREAM_OVERWRITE: expected outer-set value, got {var.get()!r}"
+                # Under stdlib-mirror semantics, wool routines run in
+                # the caller's stdlib Context — outer sets, inner
+                # overwrites in the same Context, and back-prop
+                # carries the final state (inner's overwrite) to the
+                # caller. Matches `await coro()` semantics.
+                assert var.get() == f"inner-overwrite-{var_name}", (
+                    f"DOWNSTREAM_OVERWRITE: expected inner-overwrite value, "
+                    f"got {var.get()!r}"
                 )
             case "DOWNSTREAM_RESET":
-                assert var.get() == f"outer-set-{var_name}", (
-                    f"DOWNSTREAM_RESET: expected outer-set value, got {var.get()!r}"
+                # Outer sets and passes token; inner resets using the
+                # token, restoring the pre-outer value. Caller sees
+                # its own initial value.
+                assert var.get() == initial_values[var_name], (
+                    f"DOWNSTREAM_RESET: expected caller's initial value "
+                    f"{initial_values[var_name]!r}, got {var.get()!r}"
                 )
             case "UPSTREAM_RESET":
                 if is_nested_gen:
-                    # Async gen: _post_nested_teardown runs after
-                    # the gen exhausts, but there is no subsequent
-                    # yield to carry the mutation. The caller sees
-                    # the caller's original value.
-                    assert var.get() == initial_values[var_name], (
+                    # Async gen: inner sets "inner-set-" before
+                    # yielding; that value is captured in a
+                    # per-yield snapshot and back-propagated to the
+                    # caller. _post_nested_teardown runs after the
+                    # gen exhausts — no subsequent yield carries
+                    # its mutation — so the caller's final visible
+                    # state is inner's set.
+                    assert var.get() == f"inner-set-{var_name}", (
                         f"UPSTREAM_RESET (async gen): expected "
-                        f"original value "
-                        f"{initial_values[var_name]!r}, "
-                        f"got {var.get()!r}"
+                        f"inner-set value, got {var.get()!r}"
                     )
                 else:
-                    # Coroutine: _post_nested_teardown runs before
-                    # the response snapshot, so it is visible.
+                    # Coroutine: inner sets, then _post_nested_teardown
+                    # overwrites with outer-reset before the response
+                    # snapshot ships.
                     assert var.get() == f"outer-reset-{var_name}", (
                         f"UPSTREAM_RESET: expected outer-reset value, got {var.get()!r}"
                     )

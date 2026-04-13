@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import contextvars
 from collections.abc import Callable
 from functools import wraps
 from inspect import getsourcelines
@@ -257,34 +255,21 @@ def _dispatch(
 
 
 async def _stream(fn, *args, **kwargs):
-    """Iterate a local async generator with copy-on-inherit context.
+    """Iterate a local async generator in the caller's context.
 
-    Nested async generator routines run here when ``do_dispatch()``
-    is ``False`` (we're inside a running task). Each step of the
-    generator — ``__anext__``, ``asend``, ``athrow`` — runs as a
-    task spawned in a shared child context copy so the generator's
-    wool.ContextVar mutations stay isolated from the caller's
-    context, matching the coroutine isolation in :func:`_execute`
-    and the integration-test expectations for nested patterns.
+    Nested async-generator routines run here when ``do_dispatch()``
+    is ``False`` (we're inside a running task). The generator
+    executes sequentially in the caller's stdlib ``Context`` — same
+    as a plain ``async for`` on a local async generator. Mutations
+    the generator makes are visible to the caller after each yield.
+    A caller that wants value isolation uses ``asyncio.create_task``
+    explicitly (stdlib parity).
     """
-    child_ctx = contextvars.copy_context()
-
-    async def _step_anext():
-        with do_dispatch(True):
-            return await gen.__anext__()
-
-    async def _step_asend(value):
-        with do_dispatch(True):
-            return await gen.asend(value)
-
-    async def _step_athrow(exc):
-        with do_dispatch(True):
-            return await gen.athrow(exc)
-
     gen = fn(*args, **kwargs)
     try:
         sent = None
-        result = await asyncio.create_task(_step_anext(), context=child_ctx)
+        with do_dispatch(True):
+            result = await gen.__anext__()
         while True:
             try:
                 sent = yield result
@@ -292,14 +277,14 @@ async def _stream(fn, *args, **kwargs):
                 await gen.aclose()
                 return
             except BaseException as exc:
-                result = await asyncio.create_task(_step_athrow(exc), context=child_ctx)
+                with do_dispatch(True):
+                    result = await gen.athrow(exc)
             else:
-                if sent is None:
-                    result = await asyncio.create_task(_step_anext(), context=child_ctx)
-                else:
-                    result = await asyncio.create_task(
-                        _step_asend(sent), context=child_ctx
-                    )
+                with do_dispatch(True):
+                    if sent is None:
+                        result = await gen.__anext__()
+                    else:
+                        result = await gen.asend(sent)
     except StopAsyncIteration:
         return
     finally:
@@ -307,26 +292,17 @@ async def _stream(fn, *args, **kwargs):
 
 
 async def _execute(fn, *args, **kwargs):
-    """Run *fn* locally in a copy-on-inherit context.
+    """Run *fn* locally in the caller's context.
 
     Nested routine calls dispatched on the same worker land here when
-    ``do_dispatch()`` is ``False`` (i.e., we're already inside a
-    running task). Running in a copy of the current context gives
-    nested calls the same semantic as :func:`asyncio.create_task`:
-    the callee's wool.ContextVar mutations are scoped to its own
-    context and do not contaminate the caller's. This matches the
-    integration test expectations for nested patterns
-    (DOWNSTREAM_OVERWRITE, DOWNSTREAM_RESET, UPSTREAM_RESET) where
-    the outer routine's context must be untouched by the inner's
-    mutations.
+    ``do_dispatch()`` is ``False``. The routine executes in the
+    caller's stdlib ``Context`` — same as a plain ``await fn()`` on a
+    local async function. Mutations are visible to the caller after
+    the routine returns. A caller that wants value isolation uses
+    ``asyncio.create_task(fn())`` explicitly (stdlib parity).
     """
-    child_ctx = contextvars.copy_context()
-
-    async def _run_in_copy():
-        with do_dispatch(True):
-            return await fn(*args, **kwargs)
-
-    return await asyncio.create_task(_run_in_copy(), context=child_ctx)
+    with do_dispatch(True):
+        return await fn(*args, **kwargs)
 
 
 async def _stream_to_coroutine(stream):

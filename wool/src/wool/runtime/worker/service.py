@@ -373,11 +373,22 @@ class WorkerService(protocol.WorkerServicer):
         future: concurrent.futures.Future = concurrent.futures.Future()
         worker_task = None
 
+        async def _run_with_lineage_adoption():
+            # Consume the _intended_lineage that the dispatch handler's
+            # activate() set, binding the sentinel to THIS task (the
+            # one the worker loop actually runs user code in). Any
+            # asyncio.create_task spawned by user code below will
+            # observe the sentinel bound to this task, see the
+            # mismatch on their own entry to current_lineage(), and
+            # mint a fresh lineage — stdlib fork semantics.
+            _namespace.current_lineage()
+            return await work_task._run()
+
         async with self._loop_pool.get("worker") as (worker_loop, _):
 
             def _schedule():
                 nonlocal worker_task
-                task = worker_loop.create_task(work_task._run(), context=ctx)
+                task = worker_loop.create_task(_run_with_lineage_adoption(), context=ctx)
                 worker_task = task
 
                 def _done(t: asyncio.Task):
