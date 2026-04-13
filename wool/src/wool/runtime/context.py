@@ -120,15 +120,19 @@ def _reconstruct_context_var(
     """Unpickle helper for :class:`ContextVar`.
 
     Checks ``sys.modules`` first for an existing instance under the
-    synthetic name. If found, returns it — this is the unification
-    path that makes pickle-reconstructed instances and library-
-    import-constructed instances converge to the same Python object.
-    If not found, constructs a fresh instance and registers it.
+    UUID-keyed synthetic name. If found, returns it — this path is
+    purely multi-unpickle dedup within one process. A single
+    pickle-reconstructed instance resolves to the same Python object
+    on every subsequent unpickle of the same UUID.
+
+    Construction-by-name on the worker never collides with a
+    reconstructed instance, because each user construction mints a
+    fresh UUID.
     """
     existing = sys.modules.get(synthetic_name)
     if existing is not None and isinstance(existing, ContextVar):
         return existing
-    mod = ContextVar.__new__(ContextVar, state["_wool_name"])
+    mod = types.ModuleType.__new__(ContextVar, synthetic_name)  # type: ignore[call-arg]
     types.ModuleType.__init__(mod, synthetic_name)
     mod._wool_name = state["_wool_name"]
     mod._uuid = state["_uuid"]
@@ -136,6 +140,7 @@ def _reconstruct_context_var(
     mod._var = contextvars.ContextVar(state["_wool_name"], default=_UNSET)
     sys.modules[synthetic_name] = mod
     ContextVar._registry.add(mod)
+    ContextVar._construction_count += 1
     return mod
 
 
@@ -143,17 +148,22 @@ def _reconstruct_context_var(
 class ContextVar(types.ModuleType, Generic[T]):
     """Propagating context variable that crosses worker boundaries.
 
-    A :class:`types.ModuleType` subclass whose instances live in
-    ``sys.modules`` under a deterministic key
-    (``wool._vars.<name>``). This enables cross-process identity via
-    ``sys.modules`` unification: both the pickle reconstructor and
-    the library's import-time constructor produce the same key, so
-    they converge on a single Python object.
+    A :class:`types.ModuleType` subclass. Each construction mints a
+    fresh UUID and registers the instance in ``sys.modules`` under a
+    UUID-keyed synthetic name (``wool._vars.<uuid>``).
 
-    Mirrors :class:`contextvars.ContextVar` API: ``get``, ``set``,
-    ``reset``, ``name``. Name is cosmetic — used for the stdlib
-    backing var and for repr, matching the stdlib API. Identity is
-    the ``sys.modules`` key.
+    Identity semantics mirror the stdlib :class:`contextvars.ContextVar`:
+    each ``wool.ContextVar(name, ...)`` call produces a distinct
+    instance, regardless of name. Two calls with the same name return
+    two independent vars. Name is cosmetic — used for the stdlib
+    backing var and for repr.
+
+    Cross-process propagation rides the manifest machinery
+    (:class:`Manifest`), not name-based unification. At dispatch time
+    a manifest is built by walking ``sys.modules`` to discover
+    ``(module, attr) → ContextVar`` bindings; on the worker, task-
+    local module clones get those bindings substituted via
+    :meth:`Manifest.apply`.
 
     Two construction modes:
 
@@ -169,17 +179,26 @@ class ContextVar(types.ModuleType, Generic[T]):
 
     _registry: ClassVar[weakref.WeakSet[ContextVar[Any]]] = weakref.WeakSet()
 
+    # Counter of live constructions. Incremented in __init__ and in
+    # _reconstruct_context_var; used by Manifest.build() as an
+    # early-exit upper bound.
+    _construction_count: ClassVar[int] = 0
+
     _wool_name: str
     _uuid: UUID
     _default: Any
     _var: contextvars.ContextVar[T | _UnsetType]
 
     def __new__(cls, name: str, /, *, default: Any = _SENTINEL):
-        synthetic = f"wool._vars.{name}"
-        existing = sys.modules.get(synthetic)
-        if existing is not None and isinstance(existing, cls):
-            return existing
-        return super().__new__(cls, synthetic)
+        # Mint a fresh UUID-keyed synthetic name. No name-based
+        # sys.modules lookup — each construction is a distinct var.
+        uid = uuid4()
+        synthetic = f"wool._vars.{uid}"
+        instance = super().__new__(cls, synthetic)  # type: ignore[call-arg]
+        # Stash the pre-minted UUID so __init__ can reuse it without
+        # generating a second one.
+        instance._pending_uuid = uid  # type: ignore[attr-defined]
+        return instance
 
     @overload
     def __init__(self, name: str, /) -> None: ...
@@ -188,16 +207,16 @@ class ContextVar(types.ModuleType, Generic[T]):
     def __init__(self, name: str, /, *, default: T) -> None: ...
 
     def __init__(self, name: str, /, *, default: Any = _SENTINEL):
-        if hasattr(self, "_uuid"):
-            return  # already initialized (from __new__ unification)
-        synthetic = f"wool._vars.{name}"
+        uid = self.__dict__.pop("_pending_uuid", None) or uuid4()
+        synthetic = f"wool._vars.{uid}"
         super().__init__(synthetic)
         self._wool_name = name
-        self._uuid = uuid4()
+        self._uuid = uid
         self._default = default
         self._var = contextvars.ContextVar(name, default=_UNSET)
         sys.modules[synthetic] = self
         type(self)._registry.add(self)
+        type(self)._construction_count += 1
 
     def __reduce__(self):
         # The stdlib contextvars.ContextVar is a C type that blocks
@@ -301,14 +320,19 @@ class ContextVar(types.ModuleType, Generic[T]):
 
 
 class _Context:
-    """Internal serialization wrapper for context variable snapshots.
+    """Internal serialization wrapper for context variable *values*.
 
     Handles the conversion between the in-process
     :class:`ContextVar` registry and the ``map<string, bytes>``
     protobuf representation used on the ``Request.vars`` and
-    ``Response.vars`` fields. The map key is the synthetic
-    ``sys.modules`` name (``wool._vars.<name>``), which enables
-    cross-process identity via ``sys.modules`` unification.
+    ``Response.vars`` fields. The map key is the UUID-keyed synthetic
+    ``sys.modules`` name (``wool._vars.<uuid>``).
+
+    This class handles VALUES only. Instance identity and the
+    ``(module, attr) → ContextVar`` binding map is the concern of
+    :class:`Manifest`. Values apply successfully only after the
+    corresponding manifest entries have been applied (so that
+    ``sys.modules[synthetic_name]`` resolves on the worker).
     """
 
     @staticmethod
@@ -406,6 +430,138 @@ class _Context:
                 )
                 continue
             var.set(loads(data))
+
+
+class Manifest:
+    """Instance-binding manifest for cross-process ContextVar propagation.
+
+    A manifest records which module-level ``(module_name, attr_name)``
+    bindings in a process refer to which :class:`ContextVar`
+    instances. On dispatch the caller builds a manifest by walking
+    :data:`sys.modules` for bindings to live ContextVars in the
+    :attr:`ContextVar._registry`. The manifest ships alongside the
+    task payload (via the proto ``manifest`` field) and is applied on
+    the worker by substituting the reconstructed ContextVar instances
+    into the corresponding task-local module clones.
+
+    Manifest entries are distinct from value snapshots
+    (:class:`_Context`). The manifest conveys *which instance lives at
+    which module attribute*; the value snapshot conveys *what value
+    each instance currently holds*. Values apply after manifests
+    because value lookups resolve through the instance registered in
+    :data:`sys.modules`, which the manifest establishes.
+    """
+
+    @staticmethod
+    def build() -> dict[tuple[str, str], ContextVar]:
+        """Discover ``(module, attr) → ContextVar`` bindings.
+
+        Walks :data:`sys.modules`, inspecting each module's
+        ``__dict__`` for attributes that are live
+        :class:`ContextVar` instances. Early-exits once the number of
+        discovered bindings matches
+        :attr:`ContextVar._construction_count`, since no further
+        module scan can find additional distinct instances.
+
+        :returns:
+            Dict keyed by ``(module_name, attr_name)`` mapping to the
+            ContextVar instance. A single ContextVar that is aliased
+            under multiple names or modules appears once for each
+            binding; ``id(instance)`` deduplication avoids double-
+            counting the same Python object.
+
+        Modules whose name starts with ``wool._vars.`` (the synthetic
+        registrations for ContextVar instances themselves) are
+        skipped.
+        """
+        target_count = ContextVar._construction_count
+        manifest: dict[tuple[str, str], ContextVar] = {}
+        seen: set[int] = set()
+
+        for mod_name, mod in list(sys.modules.items()):
+            if mod is None or mod_name.startswith("wool._vars."):
+                continue
+            try:
+                mod_dict = mod.__dict__
+            except AttributeError:
+                continue
+            for attr_name, attr_value in list(mod_dict.items()):
+                if isinstance(attr_value, ContextVar) and id(attr_value) not in seen:
+                    manifest[(mod_name, attr_name)] = attr_value
+                    seen.add(id(attr_value))
+                    if len(seen) >= target_count:
+                        return manifest
+        return manifest
+
+    @staticmethod
+    def apply(
+        manifest: dict[tuple[str, str], ContextVar],
+        *,
+        target_modules: dict[str, types.ModuleType] | None = None,
+    ) -> None:
+        """Substitute manifest entries into target modules.
+
+        Writes each ``manifest[(mod_name, attr_name)] = instance``
+        binding into ``target_modules[mod_name].__dict__[attr_name]``,
+        overwriting any freshly-constructed instance that lived there
+        (typically a worker-side import of the library that defined
+        the ContextVar).
+
+        :param manifest:
+            ``(module_name, attr_name) → ContextVar`` bindings
+            (usually the output of :meth:`build` on the caller side).
+        :param target_modules:
+            Mapping of module name to module instance to write into.
+            Defaults to :data:`sys.modules`. Worker-side invocations
+            typically pass a task-local dict of cloned modules so the
+            mutation is isolated from other concurrent tasks.
+        """
+        targets = target_modules if target_modules is not None else sys.modules
+        for (mod_name, attr_name), instance in manifest.items():
+            mod = targets.get(mod_name)
+            if mod is None:
+                continue
+            setattr(mod, attr_name, instance)
+
+    @staticmethod
+    def to_wire(
+        manifest: dict[tuple[str, str], ContextVar],
+        *,
+        dumps: Callable[[Any], bytes] = cloudpickle.dumps,
+    ) -> list[tuple[str, str, bytes]]:
+        """Serialize a manifest for the proto ``manifest`` field.
+
+        Each ContextVar is pickled via its :meth:`ContextVar.__reduce__`
+        which ships the UUID + state.
+
+        :returns:
+            List of ``(module_name, attr_name, pickled_var)`` triples.
+        """
+        return [
+            (mod_name, attr_name, dumps(var))
+            for (mod_name, attr_name), var in manifest.items()
+        ]
+
+    @staticmethod
+    def from_wire(
+        entries: list[tuple[str, str, bytes]],
+        *,
+        loads: Callable[[bytes], Any] = cloudpickle.loads,
+    ) -> dict[tuple[str, str], ContextVar]:
+        """Reconstruct a manifest from wire entries.
+
+        Unpickling each entry routes through
+        :func:`_reconstruct_context_var`, which either returns an
+        already-registered instance (multi-unpickle dedup) or
+        constructs and registers a new one in :data:`sys.modules`.
+        The returned manifest is ready to pass to :meth:`apply`.
+        """
+        manifest: dict[tuple[str, str], ContextVar] = {}
+        for mod_name, attr_name, blob in entries:
+            var = loads(blob)
+            if isinstance(var, ContextVar):
+                manifest[(mod_name, attr_name)] = var
+        return manifest
 
 
 dispatch_timeout: Final[contextvars.ContextVar[float | None]] = contextvars.ContextVar(
