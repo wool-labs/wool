@@ -155,27 +155,29 @@ def clone_module(original: types.ModuleType) -> types.ModuleType:
 # ----------------------------------------------------------------------
 
 
-if sys.version_info >= (3, 12):
+if sys.version_info < (3, 12):
 
     def _task_context_id(task: asyncio.Task[Any]) -> int:
         """Return ``id(ctx)`` for the task's bound :class:`contextvars.Context`.
 
-        Uses the public :meth:`asyncio.Task.get_context` introduced
-        in Python 3.12.
+        Python 3.11 fallback: :meth:`asyncio.Task.get_context` was
+        introduced in 3.12, so reach for the non-public ``_context``
+        attribute. Documented in CPython's asyncio internals and
+        stable across 3.11 patch releases. Delete this ``if`` block
+        when 3.11 support is dropped and the long-form implementation
+        below becomes the only path.
         """
-        return id(task.get_context())
+        return id(task._context)  # type: ignore[attr-defined]
 
 else:
 
     def _task_context_id(task: asyncio.Task[Any]) -> int:
         """Return ``id(ctx)`` for the task's bound :class:`contextvars.Context`.
 
-        Falls back to the non-public ``_context`` attribute on
-        Python 3.11 where :meth:`asyncio.Task.get_context` is not
-        yet available. Documented in CPython's asyncio internals and
-        stable across 3.11 patch releases.
+        Uses the public :meth:`asyncio.Task.get_context` (Python
+        3.12+).
         """
-        return id(task._context)  # type: ignore[attr-defined]
+        return id(task.get_context())
 
 
 class _LineageSentinel:
