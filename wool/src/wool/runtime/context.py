@@ -576,11 +576,11 @@ class Manifest:
 
 
 def _reconstruct_context(
-    lineage_id: UUID,
+    id: UUID,
     vars: dict[ContextVar[Any], Any],
 ) -> Context:
     """Unpickle helper for :class:`Context`."""
-    return Context._create(lineage_id, vars)
+    return Context._create(id, vars)
 
 
 # public
@@ -609,9 +609,9 @@ class Context:
     instantiation raises :class:`TypeError` (stdlib parity).
     """
 
-    __slots__ = ("_lineage_id", "_vars")
+    __slots__ = ("_id", "_vars")
 
-    _lineage_id: UUID
+    _id: UUID
     _vars: dict[ContextVar[Any], Any]
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Context:
@@ -622,19 +622,19 @@ class Context:
     @classmethod
     def _create(
         cls,
-        lineage_id: UUID,
+        id: UUID,
         vars: dict[ContextVar[Any], Any],
     ) -> Context:
-        """Private factory used by :func:`copy_context` and unpickle."""
+        """Private factory used by :func:`current_context` and unpickle."""
         instance: Context = object.__new__(cls)
-        instance._lineage_id = lineage_id
+        instance._id = id
         instance._vars = vars
         return instance
 
     @property
-    def lineage_id(self) -> UUID:
-        """The lineage UUID this context is scoped to."""
-        return self._lineage_id
+    def id(self) -> UUID:
+        """The UUID that identifies this context's lineage."""
+        return self._id
 
     def run(self, fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
         """Run *fn* in this context (stdlib parity).
@@ -657,7 +657,7 @@ class Context:
         def _seed_and_call() -> T:
             for var, value in self._vars.items():
                 var.set(value)
-            adopt_lineage(self._lineage_id)
+            adopt_lineage(self._id)
             return fn(*args, **kwargs)
 
         return seeded.run(_seed_and_call)
@@ -681,7 +681,7 @@ class Context:
             # Plant intended so the new task adopts our lineage on
             # first current_lineage() call — parity with the worker
             # dispatch adoption path.
-            _intended_lineage.set(self._lineage_id)
+            _intended_lineage.set(self._id)
 
         seeded.run(_seed)
         return await asyncio.create_task(coro, context=seeded)
@@ -708,14 +708,14 @@ class Context:
         return self._vars.items()
 
     def __repr__(self) -> str:
-        return f"<wool.Context lineage={self._lineage_id} vars={len(self._vars)}>"
+        return f"<wool.Context lineage={self._id} vars={len(self._vars)}>"
 
     def __reduce__(self):
         # The _vars dict holds ContextVar instance keys; each pickles
         # via its own __reduce__ (UUID + state) and reconstructs on
         # the receiver via the same sys.modules unification path,
         # so cross-process Context round-trip preserves identity.
-        return (_reconstruct_context, (self._lineage_id, self._vars))
+        return (_reconstruct_context, (self._id, self._vars))
 
 
 # public
