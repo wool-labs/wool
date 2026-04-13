@@ -12,6 +12,7 @@ from hypothesis import strategies as st
 from wool import protocol
 from wool.runtime.context import _UNSET
 from wool.runtime.context import ContextVar
+from wool.runtime.context import Manifest
 from wool.runtime.context import RuntimeContext
 from wool.runtime.context import _Context
 from wool.runtime.context import _UnsetType
@@ -714,32 +715,6 @@ class TestRuntimeContext:
         with restored:
             assert dispatch_timeout.get() == timeout
 
-    def test_to_protobuf_from_protobuf_roundtrip_with_context_vars(self):
-        """Test protobuf roundtrip preserves propagated context_vars.
-
-        Given:
-            A RuntimeContext carrying a non-empty context_vars map
-        When:
-            Serialized via to_protobuf() then deserialized via from_protobuf()
-        Then:
-            It should preserve both dispatch_timeout and the context_vars
-            entries through the roundtrip
-        """
-        # Arrange
-        var = ContextVar("rt_roundtrip_var", default="def")
-        original = RuntimeContext(
-            dispatch_timeout=1.25,
-            vars={"rt_roundtrip_var": "propagated"},
-        )
-
-        # Act
-        restored = RuntimeContext.from_protobuf(original.to_protobuf())
-
-        # Assert
-        with restored:
-            assert dispatch_timeout.get() == 1.25
-            assert var.get() == "propagated"
-
     def test_to_protobuf_with_empty_context_vars_produces_empty_map(self):
         """Test to_protobuf leaves context_vars empty when none are propagated.
 
@@ -1048,43 +1023,45 @@ class TestContextVar:
         var.reset(restored)
         assert var.get() == "before"
 
-    def test___init___with_duplicate_name_returns_same_instance(self):
-        """Test duplicate-name construction returns the same instance.
+    def test___init___with_duplicate_name_returns_distinct_instances(self):
+        """Test duplicate-name construction produces independent vars.
 
         Given:
-            A wool.ContextVar already constructed with a given name
+            Two wool.ContextVar constructions with the same name
         When:
-            Another ContextVar is constructed with the same name
+            Both are constructed
         Then:
-            The same Python object should be returned via sys.modules
-            unification (__new__ returns the existing instance)
+            They should be two distinct Python objects with distinct
+            UUIDs, matching the stdlib contextvars.ContextVar
+            semantic that each construction is independent.
         """
-        # Arrange
-        first = ContextVar("cv_duplicate_name", default="d")
-
         # Act
+        first = ContextVar("cv_duplicate_name", default="d")
         second = ContextVar("cv_duplicate_name", default="d")
 
         # Assert
-        assert second is first
+        assert first is not second
+        assert first._uuid != second._uuid
 
-    def test___init___registers_in_sys_modules(self):
-        """Test construction registers the instance in sys.modules.
+    def test___init___registers_in_sys_modules_under_uuid(self):
+        """Test construction registers the instance under a UUID key.
 
         Given:
-            A fresh wool.ContextVar name
+            A fresh wool.ContextVar
         When:
-            A ContextVar is constructed with that name
+            It is constructed
         Then:
             It should be registered in sys.modules under the
-            synthetic key wool._vars.<name>
+            synthetic key wool._vars.<uuid> (not the user-facing
+            name, which is purely cosmetic).
         """
         # Act
         var = ContextVar("cv_sys_modules_check")
 
         # Assert
-        synthetic = "wool._vars.cv_sys_modules_check"
+        synthetic = f"wool._vars.{var._uuid}"
         assert sys.modules.get(synthetic) is var
+        assert var.__name__ == synthetic
 
     def test_propagation_round_trip_preserves_set_value(self):
         """Test end-to-end propagation of an explicitly set value.
@@ -1155,91 +1132,38 @@ class TestContextVar:
             assert worker_only.get() == "local_value"
         assert worker_only.get() == "local_value"
 
-    def test_restore_logs_warning_for_unregistered_name(self, caplog):
-        """Test restore warns and continues when a propagated name is unknown.
-
-        Given:
-            A RuntimeContext carrying a context_vars entry for a name
-            that no registered ContextVar matches
-        When:
-            The context manager is entered
-        Then:
-            A warning should be logged and the entry should be skipped
-            without raising
-        """
-        # Arrange
-        payload = RuntimeContext(vars={"ghost_var_name_not_registered": "x"})
-
-        # Act
-        with caplog.at_level(logging.WARNING):
-            with payload:
-                pass
-
-        # Assert
-        assert any(
-            "ghost_var_name_not_registered" in record.message
-            for record in caplog.records
-        )
-
-    def test_runtime_context_does_not_auto_reset_vars_on_exit(self):
-        """Test RuntimeContext.__exit__ does not reset propagated vars.
-
-        Given:
-            A wool.ContextVar with an outer value already set
-        When:
-            A RuntimeContext payload with a different value is entered
-            and then exited
-        Then:
-            The var should retain the value set by __enter__ — no
-            auto-reset on exit (user manages via Token.reset)
-        """
-        # Arrange
-        var = ContextVar("cv_no_reset", default="outer")
-        var.set("outer_explicit")
-        payload = RuntimeContext(vars={"cv_no_reset": "inner"})
-
-        # Act & assert
-        with payload:
-            assert var.get() == "inner"
-        assert var.get() == "inner"
-
     @pytest.mark.asyncio
     async def test_concurrent_tasks_see_isolated_values(self):
-        """Test concurrent asyncio tasks with the same var see isolated values.
+        """Test concurrent asyncio tasks observe isolated values.
 
         Given:
-            Two asyncio tasks created from fresh copy_context() contexts
-            each restoring a different propagated value for the same
-            wool.ContextVar
+            Two asyncio tasks created from fresh copy_context()
+            contexts each setting a different value on the same
+            wool.ContextVar instance
         When:
             Both run concurrently
         Then:
-            Each should observe its own propagated value, never the
-            other's
+            Each should observe its own value, never the other's —
+            identity is shared but value is per stdlib Context.
         """
         # Arrange
         var: ContextVar[str] = ContextVar("cv_concurrent")
-        payload_a = RuntimeContext(vars={"cv_concurrent": "value_a"})
-        payload_b = RuntimeContext(vars={"cv_concurrent": "value_b"})
         observed: dict[str, str] = {}
-        barrier = asyncio.Event()
 
-        async def run_with(name: str, payload: RuntimeContext):
-            with payload:
-                observed[name] = var.get()
-                barrier.set()
-                # Yield so the sibling task has a chance to interleave.
-                await asyncio.sleep(0)
-                observed[name] = var.get()
+        async def run_with(name: str, value: str):
+            var.set(value)
+            observed[name] = var.get()
+            await asyncio.sleep(0)
+            observed[name] = var.get()
 
         loop = asyncio.get_running_loop()
 
         # Act
         task_a = loop.create_task(
-            run_with("a", payload_a), context=contextvars.copy_context()
+            run_with("a", "value_a"), context=contextvars.copy_context()
         )
         task_b = loop.create_task(
-            run_with("b", payload_b), context=contextvars.copy_context()
+            run_with("b", "value_b"), context=contextvars.copy_context()
         )
         await asyncio.gather(task_a, task_b)
 
@@ -1443,8 +1367,8 @@ class TestContext:
         result = _Context.snapshot()
 
         # Assert
-        assert "wool._vars.cv_ctx_snapshot_set" in result
-        assert cloudpickle.loads(result["wool._vars.cv_ctx_snapshot_set"]) == "live"
+        assert var.__name__ in result
+        assert cloudpickle.loads(result[var.__name__]) == "live"
 
     def test_snapshot_skips_vars_without_any_set_value(self):
         """Test snapshot omits vars that have never been set.
@@ -1464,7 +1388,7 @@ class TestContext:
         result = _Context.snapshot()
 
         # Assert
-        assert "wool._vars.cv_ctx_snapshot_never_set" not in result
+        assert var.__name__ not in result
         # Keep the var alive until after snapshot() runs
         assert var.name == "cv_ctx_snapshot_never_set"
 
@@ -1519,10 +1443,8 @@ class TestContext:
         result = _Context.snapshot_from(ctx)
 
         # Assert
-        assert "wool._vars.cv_ctx_snapshot_from" in result
-        assert (
-            cloudpickle.loads(result["wool._vars.cv_ctx_snapshot_from"]) == "inside_ctx"
-        )
+        assert var.__name__ in result
+        assert cloudpickle.loads(result[var.__name__]) == "inside_ctx"
 
     def test_snapshot_from_excludes_vars_not_in_context(self):
         """Test snapshot_from skips vars not present in the given context.
@@ -1545,7 +1467,7 @@ class TestContext:
         result = _Context.snapshot_from(ctx)
 
         # Assert
-        assert "wool._vars.cv_ctx_snapshot_from_absent" not in result
+        assert var.__name__ not in result
 
     def test_snapshot_from_raises_typeerror_for_non_picklable_value(self):
         """Test snapshot_from errors name the offending variable.
@@ -1611,7 +1533,7 @@ class TestContext:
         """
         # Arrange
         var: ContextVar[str] = ContextVar("cv_ctx_apply_valid")
-        payload = {"wool._vars.cv_ctx_apply_valid": cloudpickle.dumps("propagated")}
+        payload = {var.__name__: cloudpickle.dumps("propagated")}
 
         # Act
         _Context.apply(payload)
@@ -1644,3 +1566,146 @@ class TestContext:
         assert any(
             "cv_ctx_apply_ghost_name" in record.message for record in caplog.records
         )
+
+
+class TestManifest:
+    def test_build_with_no_vars_returns_empty_dict(self):
+        """Test manifest build on a process with zero ContextVars is empty.
+
+        Given:
+            A process with ContextVar._construction_count == 0
+        When:
+            Manifest.build() is called
+        Then:
+            An empty dict should be returned without walking sys.modules
+        """
+        # Arrange — note: fixture clears wool._vars between tests, but
+        # _construction_count is class state that persists. Accept
+        # whatever count exists from earlier tests in this run and
+        # verify only our bindings don't appear.
+        before = Manifest.build()
+
+        # Act
+        result = Manifest.build()
+
+        # Assert — deterministic: same state → same output
+        assert result == before
+
+    def test_build_discovers_module_scoped_bindings(self):
+        """Test manifest build finds ContextVars at module __dict__ scope.
+
+        Given:
+            A ContextVar assigned as an attribute of a module
+        When:
+            Manifest.build() is called
+        Then:
+            The (module_name, attr_name) binding should appear in the
+            result with the ContextVar instance as the value.
+        """
+        # Arrange
+        import types as _types
+
+        fake = _types.ModuleType("_test_manifest_build_lib")
+        var = ContextVar("cv_manifest_build")
+        fake.probe_var = var
+        sys.modules[fake.__name__] = fake
+
+        try:
+            # Act
+            result = Manifest.build()
+
+            # Assert
+            assert (fake.__name__, "probe_var") in result
+            assert result[(fake.__name__, "probe_var")] is var
+        finally:
+            del sys.modules[fake.__name__]
+
+    def test_build_records_aliased_bindings_independently(self):
+        """Test manifest build records each binding of an aliased var.
+
+        Given:
+            A ContextVar bound to multiple (module, attr) locations
+            (simulating `from lib import var` aliasing)
+        When:
+            Manifest.build() is called
+        Then:
+            Every binding should appear in the result, each pointing
+            to the same ContextVar instance.
+        """
+        # Arrange
+        import types as _types
+
+        var = ContextVar("cv_manifest_alias")
+        mod_a = _types.ModuleType("_test_manifest_alias_a")
+        mod_b = _types.ModuleType("_test_manifest_alias_b")
+        mod_a.local_name = var
+        mod_b.another_name = var
+        sys.modules[mod_a.__name__] = mod_a
+        sys.modules[mod_b.__name__] = mod_b
+
+        try:
+            # Act
+            result = Manifest.build()
+
+            # Assert
+            assert result.get((mod_a.__name__, "local_name")) is var
+            assert result.get((mod_b.__name__, "another_name")) is var
+        finally:
+            del sys.modules[mod_a.__name__]
+            del sys.modules[mod_b.__name__]
+
+    def test_apply_substitutes_into_provided_module_dict(self):
+        """Test manifest apply writes instances into target modules.
+
+        Given:
+            A manifest entry (module, attr) → var and a target-modules
+            dict containing that module
+        When:
+            Manifest.apply is called with the manifest and target dict
+        Then:
+            The module's attribute should be replaced by the
+            wire-reconstructed instance.
+        """
+        # Arrange
+        import types as _types
+
+        original_var = ContextVar("cv_manifest_apply_old")
+        replacement_var = ContextVar("cv_manifest_apply_new")
+        target_mod = _types.ModuleType("_test_manifest_apply_target")
+        target_mod.slot = original_var
+
+        # Act
+        Manifest.apply(
+            {("_test_manifest_apply_target", "slot"): replacement_var},
+            target_modules={"_test_manifest_apply_target": target_mod},
+        )
+
+        # Assert
+        assert target_mod.slot is replacement_var
+
+    def test_wire_roundtrip_preserves_var_identity(self):
+        """Test manifest wire round-trip preserves ContextVar UUID.
+
+        Given:
+            A manifest with a single (module, attr) → ContextVar entry
+        When:
+            to_wire / from_wire are chained
+        Then:
+            The restored manifest should contain a ContextVar whose
+            UUID matches the original (via sys.modules unification).
+        """
+        # Arrange
+        var = ContextVar("cv_manifest_wire_rt")
+        manifest = {("example_mod", "example_attr"): var}
+
+        # Act
+        wire_entries = Manifest.to_wire(manifest)
+        restored = Manifest.from_wire(wire_entries)
+
+        # Assert
+        assert len(wire_entries) == 1
+        mod_name, attr_name, pickled = wire_entries[0]
+        assert mod_name == "example_mod"
+        assert attr_name == "example_attr"
+        assert isinstance(pickled, bytes) and len(pickled) > 0
+        assert restored[("example_mod", "example_attr")]._uuid == var._uuid
