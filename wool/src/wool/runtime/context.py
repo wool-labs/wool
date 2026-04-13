@@ -457,26 +457,30 @@ class Manifest:
         """Discover ``(module, attr) → ContextVar`` bindings.
 
         Walks :data:`sys.modules`, inspecting each module's
-        ``__dict__`` for attributes that are live
-        :class:`ContextVar` instances. Early-exits once the number of
-        discovered bindings matches
-        :attr:`ContextVar._construction_count`, since no further
-        module scan can find additional distinct instances.
+        ``__dict__`` for attributes that are live :class:`ContextVar`
+        instances.
 
-        :returns:
-            Dict keyed by ``(module_name, attr_name)`` mapping to the
-            ContextVar instance. A single ContextVar that is aliased
-            under multiple names or modules appears once for each
-            binding; ``id(instance)`` deduplication avoids double-
-            counting the same Python object.
+        Every distinct binding is recorded. A single ContextVar that
+        is aliased under multiple modules (e.g., via ``from lib_code
+        import trace_id``) appears once for each binding. This is
+        intentional: on the worker, each binding location needs its
+        substitution so library helpers resolving ``LOAD_GLOBAL``
+        against *their* module's dict see the wire-shipped instance.
+        Since all aliased bindings map to the same var, the wire
+        ships that var's state once and ``_reconstruct_context_var``
+        dedupes on the worker via its UUID-keyed sys.modules entry.
+
+        Returns an empty dict when no ContextVars exist in the
+        process (``ContextVar._construction_count == 0``), skipping
+        the sys.modules walk entirely.
 
         Modules whose name starts with ``wool._vars.`` (the synthetic
         registrations for ContextVar instances themselves) are
         skipped.
         """
-        target_count = ContextVar._construction_count
+        if ContextVar._construction_count == 0:
+            return {}
         manifest: dict[tuple[str, str], ContextVar] = {}
-        seen: set[int] = set()
 
         for mod_name, mod in list(sys.modules.items()):
             if mod is None or mod_name.startswith("wool._vars."):
@@ -486,11 +490,8 @@ class Manifest:
             except AttributeError:
                 continue
             for attr_name, attr_value in list(mod_dict.items()):
-                if isinstance(attr_value, ContextVar) and id(attr_value) not in seen:
+                if isinstance(attr_value, ContextVar):
                     manifest[(mod_name, attr_name)] = attr_value
-                    seen.add(id(attr_value))
-                    if len(seen) >= target_count:
-                        return manifest
         return manifest
 
     @staticmethod
