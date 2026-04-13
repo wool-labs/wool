@@ -39,7 +39,7 @@ def test_public_api_completeness():
         "ContextVar",
         "RuntimeContext",
         "Token",
-        "copy_context",
+        "current_context",
         "LoadBalancerContextLike",
         "LoadBalancerLike",
         "NoWorkersAvailable",

@@ -1739,14 +1739,14 @@ class TestWoolContext:
         Then:
             The returned Context should contain the var and its value.
         """
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
 
         # Arrange
         var = ContextVar("cv_ctx_capture", default="default")
         var.set("explicit")
 
         # Act
-        ctx = copy_context()
+        ctx = current_context()
 
         # Assert
         assert var in ctx
@@ -1762,13 +1762,13 @@ class TestWoolContext:
         Then:
             The var should not appear in the returned Context.
         """
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
 
         # Arrange
         var = ContextVar("cv_ctx_unset", default="default")
 
         # Act
-        ctx = copy_context()
+        ctx = current_context()
 
         # Assert
         assert var not in ctx
@@ -1785,7 +1785,7 @@ class TestWoolContext:
         """
         import uuid as _uuid
 
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
         from wool.runtime.worker import namespace
 
         # Arrange
@@ -1793,7 +1793,7 @@ class TestWoolContext:
 
         # Act
         with namespace.activate(lineage, {}, drop_on_exit=True):
-            ctx = copy_context()
+            ctx = current_context()
 
         # Assert
         assert ctx.lineage_id == lineage
@@ -1810,10 +1810,10 @@ class TestWoolContext:
         """
         import uuid as _uuid
 
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
 
         # Act
-        ctx = copy_context()
+        ctx = current_context()
 
         # Assert
         assert isinstance(ctx.lineage_id, _uuid.UUID)
@@ -1830,12 +1830,12 @@ class TestWoolContext:
             The callable should see the snapshotted value, not the
             post-snapshot mutation.
         """
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
 
         # Arrange
         var = ContextVar("cv_ctx_run_snapshot")
         var.set("at_snapshot")
-        ctx = copy_context()
+        ctx = current_context()
         var.set("after_snapshot")
 
         # Act
@@ -1855,12 +1855,12 @@ class TestWoolContext:
             The caller's context should be unaffected after run
             returns.
         """
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
 
         # Arrange
         var = ContextVar("cv_ctx_run_isolation")
         var.set("outer")
-        ctx = copy_context()
+        ctx = current_context()
 
         # Act
         ctx.run(var.set, "inside_run")
@@ -1880,12 +1880,12 @@ class TestWoolContext:
         Then:
             The coro should observe the snapshotted value.
         """
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
 
         # Arrange
         var = ContextVar("cv_ctx_run_async")
         var.set("snapshot_async")
-        ctx = copy_context()
+        ctx = current_context()
         var.set("after")
 
         async def reader():
@@ -1908,12 +1908,12 @@ class TestWoolContext:
         Then:
             The caller's context should be unaffected after the await.
         """
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
 
         # Arrange
         var = ContextVar("cv_ctx_run_async_isolation")
         var.set("outer_async")
-        ctx = copy_context()
+        ctx = current_context()
 
         async def mutator():
             var.set("inner_async")
@@ -1935,14 +1935,14 @@ class TestWoolContext:
         Then:
             Each should reflect the snapshot.
         """
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
 
         # Arrange
         va = ContextVar("cv_ctx_container_a")
         vb = ContextVar("cv_ctx_container_b")
         va.set("alpha")
         vb.set("beta")
-        ctx = copy_context()
+        ctx = current_context()
 
         # Act & assert
         assert len(ctx) >= 2  # other tests' vars may also be set
@@ -1964,12 +1964,12 @@ class TestWoolContext:
             The restored Context should carry the same lineage id and
             the same var-value mapping.
         """
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
 
         # Arrange
         var = ContextVar("cv_ctx_pickle")
         var.set("pickled_value")
-        ctx = copy_context()
+        ctx = current_context()
 
         # Act
         blob = cloudpickle.dumps(ctx)
@@ -1991,12 +1991,12 @@ class TestWoolContext:
             The repr should include "wool.Context", the lineage id,
             and the var count.
         """
-        from wool.runtime.context import copy_context
+        from wool.runtime.context import current_context
 
         # Arrange
         var = ContextVar("cv_ctx_repr")
         var.set("val")
-        ctx = copy_context()
+        ctx = current_context()
 
         # Act
         text = repr(ctx)

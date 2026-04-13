@@ -232,8 +232,14 @@ _intended_lineage: contextvars.ContextVar[uuid.UUID | None] = contextvars.Contex
 _process_default_lineage: uuid.UUID = uuid.uuid4()
 
 
-def current_lineage() -> uuid.UUID:
-    """Return the lineage UUID for the current execution context.
+def _current_lineage() -> uuid.UUID:
+    """Internal fork-detection primitive. Returns the UUID of the
+    current execution context's lineage.
+
+    Exposed publicly as :attr:`wool.Context.lineage_id` via
+    :func:`wool.current_context`. Kept private because the primary
+    user-facing abstraction is :class:`wool.Context` — lineage is an
+    attribute of a Context, not a top-level concept.
 
     Resolution order:
 
@@ -292,39 +298,6 @@ def adopt_lineage(lineage_id: uuid.UUID) -> None:
     if task is None:
         return
     _wool_sentinel.set(_LineageSentinel(lineage_id, _task_context_id(task)))
-
-
-# Legacy alias — deprecated compatibility for callers that still
-# import :data:`_active_lineage`. New code should call
-# :func:`current_lineage` or :func:`adopt_lineage`.
-class _ActiveLineageShim:
-    """Backport shim for the retired ``_active_lineage`` contextvar.
-
-    Provides ``.get(default=None)`` returning the current lineage
-    (or None when outside an asyncio task / before adopt), and
-    ``.set(value)`` that delegates to :func:`adopt_lineage` when a
-    UUID is provided. Full contextvar semantics are not preserved;
-    callers that need reset-token behavior should migrate to
-    :func:`adopt_lineage` directly.
-    """
-
-    def get(self, default: Any = None) -> uuid.UUID | None:
-        try:
-            task = asyncio.current_task()
-        except RuntimeError:
-            return default
-        if task is None:
-            return default
-        sentinel = _wool_sentinel.get(None)
-        if sentinel is not None and sentinel.ctx_id == _task_context_id(task):
-            return sentinel.lineage_id
-        return default
-
-    def set(self, value: uuid.UUID) -> None:
-        adopt_lineage(value)
-
-
-_active_lineage = _ActiveLineageShim()
 
 
 # In-process cache: lineage_id → {module_name → cloned_module}.
@@ -413,11 +386,11 @@ class TaskLoader(importlib.abc.Loader):
 class TaskMetaPathFinder(importlib.abc.MetaPathFinder):
     """Meta-path finder gated on an active lineage.
 
-    When :data:`_active_lineage` is set, resolves the spec via the
-    underlying meta-path (excluding itself to avoid recursion), then
-    wraps it with :class:`TaskLoader`. When no lineage is active,
-    returns ``None`` so the default finders handle the import
-    normally.
+    When a sentinel is bound (i.e., we're inside an adopted or
+    freshly-minted lineage), resolves the spec via the underlying
+    meta-path (excluding itself to avoid recursion) and wraps it
+    with :class:`TaskLoader`. Otherwise returns ``None`` so the
+    default finders handle the import normally.
     """
 
     def find_spec(
@@ -426,9 +399,16 @@ class TaskMetaPathFinder(importlib.abc.MetaPathFinder):
         path: Any = None,
         target: types.ModuleType | None = None,
     ) -> importlib.machinery.ModuleSpec | None:
-        lineage_id = _active_lineage.get()
-        if lineage_id is None:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
             return None
+        if task is None:
+            return None
+        sentinel = _wool_sentinel.get(None)
+        if sentinel is None or sentinel.ctx_id != _task_context_id(task):
+            return None
+        lineage_id = sentinel.lineage_id
 
         # Resolve via the rest of the meta-path, skipping self.
         for finder in sys.meta_path:

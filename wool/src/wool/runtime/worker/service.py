@@ -379,9 +379,9 @@ class WorkerService(protocol.WorkerServicer):
             # one the worker loop actually runs user code in). Any
             # asyncio.create_task spawned by user code below will
             # observe the sentinel bound to this task, see the
-            # mismatch on their own entry to current_lineage(), and
+            # mismatch on their own entry to _current_lineage(), and
             # mint a fresh lineage — stdlib fork semantics.
-            _namespace.current_lineage()
+            _namespace._current_lineage()
             return await work_task._run()
 
         async with self._loop_pool.get("worker") as (worker_loop, _):

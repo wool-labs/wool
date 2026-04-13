@@ -719,22 +719,29 @@ class Context:
 
 
 # public
-def copy_context() -> Context:
+def current_context() -> Context:
     """Return a snapshot of the current wool context.
 
-    Mirrors :func:`contextvars.copy_context`. The returned
-    :class:`Context` captures every :class:`ContextVar` that has an
-    explicit value set in the current context (unset vars and vars
-    sitting at their class-level default are omitted) plus the active
-    lineage ``UUID``. When no lineage is active, a fresh ``UUID`` is
-    minted — the returned context starts a new lineage.
+    Mirrors :func:`contextvars.copy_context` with the additional
+    semantic that the returned :class:`Context` carries the lineage
+    UUID identifying the current execution chain. The returned
+    Context captures every :class:`ContextVar` that has an explicit
+    value set in the current context (unset vars and vars sitting at
+    their class-level default are omitted) plus the active lineage
+    UUID. When no lineage is active, a fresh UUID is minted — the
+    returned context starts a new lineage.
+
+    Lineage identity follows stdlib asyncio fork semantics: the
+    same :func:`asyncio.Task` sees a stable lineage across sequential
+    awaits; :func:`asyncio.create_task` / :func:`asyncio.gather`
+    children mint fresh lineages on their first wool interaction.
 
     The snapshot is independent of the current context: subsequent
     mutations to wool vars do not affect the returned Context, and
     scoping a call via :meth:`Context.run` does not leak mutations
     back to the current context.
     """
-    from wool.runtime.worker.namespace import current_lineage
+    from wool.runtime.worker.namespace import _current_lineage
 
     vars_dict: dict[ContextVar[Any], Any] = {}
     for var in list(ContextVar._registry):
@@ -743,7 +750,7 @@ def copy_context() -> Context:
             continue
         vars_dict[var] = raw
 
-    return Context._create(current_lineage(), vars_dict)
+    return Context._create(_current_lineage(), vars_dict)
 
 
 def build_task_frame_payload() -> tuple[
@@ -764,12 +771,12 @@ def build_task_frame_payload() -> tuple[
     empty when no lineage is active (root dispatch — the worker
     assigns one).
     """
-    from wool.runtime.worker.namespace import current_lineage
+    from wool.runtime.worker.namespace import _current_lineage
 
     vars_dict = _Context.snapshot()
     manifest = Manifest.build()
     manifest_entries = Manifest.to_wire(manifest)
-    lineage_hex = current_lineage().hex
+    lineage_hex = _current_lineage().hex
     return vars_dict, manifest_entries, lineage_hex
 
 
@@ -782,10 +789,10 @@ def build_stream_frame_payload() -> tuple[dict[str, bytes], str]:
     ID are propagated so back-propagated values reach the caller and
     the worker confirms the lineage.
     """
-    from wool.runtime.worker.namespace import current_lineage
+    from wool.runtime.worker.namespace import _current_lineage
 
     vars_dict = _Context.snapshot()
-    lineage_hex = current_lineage().hex
+    lineage_hex = _current_lineage().hex
     return vars_dict, lineage_hex
 
 
