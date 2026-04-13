@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import sys
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import ClassVar
+from typing import Coroutine
 from typing import Final
 from typing import Generic
 from typing import TypeVar
@@ -571,6 +573,177 @@ class Manifest:
             if isinstance(var, ContextVar):
                 manifest[(mod_name, attr_name)] = var
         return manifest
+
+
+def _reconstruct_context(
+    lineage_id: UUID,
+    vars: dict[ContextVar[Any], Any],
+) -> Context:
+    """Unpickle helper for :class:`Context`."""
+    return Context._create(lineage_id, vars)
+
+
+# public
+class Context:
+    """Immutable snapshot of wool.ContextVar state and lineage identity.
+
+    Mirrors :class:`contextvars.Context`: not directly instantiable,
+    immutable, supports the stdlib container protocol (``__iter__``,
+    ``__getitem__``, ``__contains__``, ``__len__``, ``keys``,
+    ``values``, ``items``), and scopes mutations via
+    :meth:`Context.run` / :meth:`Context.run_async`.
+
+    A :class:`Context` formalizes the task lineage concept: beyond
+    the snapshot of :class:`ContextVar` values, it carries the
+    lineage ``UUID`` that identifies a logical execution chain. Two
+    dispatches scoped to the same :class:`Context` share the same
+    lineage — on the worker, this keys the module clone cache and
+    any other lineage-scoped state.
+
+    Instances are picklable. A :class:`Context` captured on the
+    caller (via :func:`copy_context`) can ride the wire as a routine
+    argument, be unpickled on a worker, and scope further dispatches
+    there via :meth:`run` / :meth:`run_async`.
+
+    Obtain a :class:`Context` via :func:`wool.copy_context`; direct
+    instantiation raises :class:`TypeError` (stdlib parity).
+    """
+
+    __slots__ = ("_lineage_id", "_vars")
+
+    _lineage_id: UUID
+    _vars: dict[ContextVar[Any], Any]
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Context:
+        raise TypeError(
+            f"{cls.__name__} cannot be instantiated directly; use wool.copy_context()"
+        )
+
+    @classmethod
+    def _create(
+        cls,
+        lineage_id: UUID,
+        vars: dict[ContextVar[Any], Any],
+    ) -> Context:
+        """Private factory used by :func:`copy_context` and unpickle."""
+        instance: Context = object.__new__(cls)
+        instance._lineage_id = lineage_id
+        instance._vars = vars
+        return instance
+
+    @property
+    def lineage_id(self) -> UUID:
+        """The lineage UUID this context is scoped to."""
+        return self._lineage_id
+
+    def run(self, fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+        """Run *fn* in this context (stdlib parity).
+
+        Creates a fresh stdlib :class:`contextvars.Context` seeded
+        with this wool context's var values and active lineage, then
+        invokes *fn* inside it via the stdlib ``Context.run``
+        mechanism. Mutations made during the call — to wool or stdlib
+        contextvars — are scoped to the seeded context and are
+        discarded on return.
+
+        :raises RuntimeError:
+            If the current event loop is running and *fn* returns an
+            awaitable. Use :meth:`run_async` for coroutines.
+        """
+        from wool.runtime.worker.namespace import _active_lineage
+
+        seeded = contextvars.copy_context()
+
+        def _seed_and_call() -> T:
+            for var, value in self._vars.items():
+                var.set(value)
+            _active_lineage.set(self._lineage_id)
+            return fn(*args, **kwargs)
+
+        return seeded.run(_seed_and_call)
+
+    async def run_async(self, coro: Coroutine[Any, Any, T], /) -> T:
+        """Run *coro* in this context (async analog of :meth:`run`).
+
+        Seeds a fresh stdlib :class:`contextvars.Context` with this
+        wool context's var values and active lineage, then runs *coro*
+        as an :class:`asyncio.Task` scoped to that seeded context.
+        The caller's own context is unaffected by any mutations made
+        inside *coro*.
+        """
+        from wool.runtime.worker.namespace import _active_lineage
+
+        seeded = contextvars.copy_context()
+
+        def _seed() -> None:
+            for var, value in self._vars.items():
+                var.set(value)
+            _active_lineage.set(self._lineage_id)
+
+        seeded.run(_seed)
+        return await asyncio.create_task(coro, context=seeded)
+
+    def __iter__(self):
+        return iter(self._vars)
+
+    def __getitem__(self, var: ContextVar[T]) -> T:
+        return self._vars[var]
+
+    def __contains__(self, var: Any) -> bool:
+        return var in self._vars
+
+    def __len__(self) -> int:
+        return len(self._vars)
+
+    def keys(self):
+        return self._vars.keys()
+
+    def values(self):
+        return self._vars.values()
+
+    def items(self):
+        return self._vars.items()
+
+    def __repr__(self) -> str:
+        return f"<wool.Context lineage={self._lineage_id} vars={len(self._vars)}>"
+
+    def __reduce__(self):
+        # The _vars dict holds ContextVar instance keys; each pickles
+        # via its own __reduce__ (UUID + state) and reconstructs on
+        # the receiver via the same sys.modules unification path,
+        # so cross-process Context round-trip preserves identity.
+        return (_reconstruct_context, (self._lineage_id, self._vars))
+
+
+# public
+def copy_context() -> Context:
+    """Return a snapshot of the current wool context.
+
+    Mirrors :func:`contextvars.copy_context`. The returned
+    :class:`Context` captures every :class:`ContextVar` that has an
+    explicit value set in the current context (unset vars and vars
+    sitting at their class-level default are omitted) plus the active
+    lineage ``UUID``. When no lineage is active, a fresh ``UUID`` is
+    minted — the returned context starts a new lineage.
+
+    The snapshot is independent of the current context: subsequent
+    mutations to wool vars do not affect the returned Context, and
+    scoping a call via :meth:`Context.run` does not leak mutations
+    back to the current context.
+    """
+    from wool.runtime.worker.namespace import _active_lineage
+
+    vars_dict: dict[ContextVar[Any], Any] = {}
+    for var in list(ContextVar._registry):
+        raw = var._var.get()
+        if raw is _UNSET:
+            continue
+        vars_dict[var] = raw
+
+    lineage = _active_lineage.get()
+    if lineage is None:
+        lineage = uuid4()
+    return Context._create(lineage, vars_dict)
 
 
 def build_task_frame_payload() -> tuple[

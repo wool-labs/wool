@@ -5,9 +5,11 @@ from typing import Final
 
 from tblib import pickling_support
 
+from wool.runtime.context import Context
 from wool.runtime.context import ContextVar
 from wool.runtime.context import RuntimeContext
 from wool.runtime.context import Token
+from wool.runtime.context import copy_context
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryEventType
@@ -74,9 +76,11 @@ __all__ = [
     "UnexpectedResponse",
     "WorkerConnection",
     # Context
+    "Context",
     "ContextVar",
     "RuntimeContext",
     "Token",
+    "copy_context",
     # Load balancing
     "LoadBalancerContextLike",
     "LoadBalancerLike",

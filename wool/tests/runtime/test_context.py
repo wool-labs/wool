@@ -1709,3 +1709,299 @@ class TestManifest:
         assert attr_name == "example_attr"
         assert isinstance(pickled, bytes) and len(pickled) > 0
         assert restored[("example_mod", "example_attr")]._uuid == var._uuid
+
+
+class TestWoolContext:
+    def test_cannot_be_instantiated_directly(self):
+        """Test Context() raises TypeError (stdlib parity).
+
+        Given:
+            The Context class
+        When:
+            It is instantiated directly via Context()
+        Then:
+            TypeError should be raised with a message directing the
+            user to copy_context.
+        """
+        from wool.runtime.context import Context
+
+        # Act & assert
+        with pytest.raises(TypeError, match="cannot be instantiated directly"):
+            Context()
+
+    def test_copy_context_captures_active_vars(self):
+        """Test copy_context snapshots explicitly-set var values.
+
+        Given:
+            A wool.ContextVar with a value set in the current context
+        When:
+            copy_context() is called
+        Then:
+            The returned Context should contain the var and its value.
+        """
+        from wool.runtime.context import copy_context
+
+        # Arrange
+        var = ContextVar("cv_ctx_capture", default="default")
+        var.set("explicit")
+
+        # Act
+        ctx = copy_context()
+
+        # Assert
+        assert var in ctx
+        assert ctx[var] == "explicit"
+
+    def test_copy_context_skips_unset_vars(self):
+        """Test copy_context omits vars that have not been set.
+
+        Given:
+            A wool.ContextVar that was constructed but never set
+        When:
+            copy_context() is called
+        Then:
+            The var should not appear in the returned Context.
+        """
+        from wool.runtime.context import copy_context
+
+        # Arrange
+        var = ContextVar("cv_ctx_unset", default="default")
+
+        # Act
+        ctx = copy_context()
+
+        # Assert
+        assert var not in ctx
+
+    def test_copy_context_captures_active_lineage(self):
+        """Test copy_context captures the active lineage id.
+
+        Given:
+            A namespace.activate() block with a known lineage UUID
+        When:
+            copy_context() is called inside the block
+        Then:
+            The returned Context should carry that lineage id.
+        """
+        import uuid as _uuid
+
+        from wool.runtime.context import copy_context
+        from wool.runtime.worker import namespace
+
+        # Arrange
+        lineage = _uuid.uuid4()
+
+        # Act
+        with namespace.activate(lineage, {}, drop_on_exit=True):
+            ctx = copy_context()
+
+        # Assert
+        assert ctx.lineage_id == lineage
+
+    def test_copy_context_mints_fresh_lineage_when_none_active(self):
+        """Test copy_context mints a fresh UUID when no lineage is active.
+
+        Given:
+            No active namespace.activate() block
+        When:
+            copy_context() is called
+        Then:
+            The returned Context should carry a freshly-minted UUID.
+        """
+        import uuid as _uuid
+
+        from wool.runtime.context import copy_context
+
+        # Act
+        ctx = copy_context()
+
+        # Assert
+        assert isinstance(ctx.lineage_id, _uuid.UUID)
+
+    def test_run_invokes_fn_with_snapshotted_vars(self):
+        """Test Context.run sees the snapshotted var values.
+
+        Given:
+            A Context captured while a var had a specific value, then
+            the var was mutated to a different value
+        When:
+            Context.run(callable) invokes a callable that reads the var
+        Then:
+            The callable should see the snapshotted value, not the
+            post-snapshot mutation.
+        """
+        from wool.runtime.context import copy_context
+
+        # Arrange
+        var = ContextVar("cv_ctx_run_snapshot")
+        var.set("at_snapshot")
+        ctx = copy_context()
+        var.set("after_snapshot")
+
+        # Act
+        result = ctx.run(var.get)
+
+        # Assert
+        assert result == "at_snapshot"
+
+    def test_run_mutations_do_not_leak(self):
+        """Test Context.run mutations are scoped to the seeded copy.
+
+        Given:
+            A Context and a wool.ContextVar with a known value
+        When:
+            A callable invoked via Context.run mutates the var
+        Then:
+            The caller's context should be unaffected after run
+            returns.
+        """
+        from wool.runtime.context import copy_context
+
+        # Arrange
+        var = ContextVar("cv_ctx_run_isolation")
+        var.set("outer")
+        ctx = copy_context()
+
+        # Act
+        ctx.run(var.set, "inside_run")
+
+        # Assert
+        assert var.get() == "outer"
+
+    @pytest.mark.asyncio
+    async def test_run_async_invokes_coro_with_snapshotted_vars(self):
+        """Test Context.run_async seeds the coro's context.
+
+        Given:
+            A Context captured while a var had a specific value, and
+            a coroutine that reads the var
+        When:
+            Context.run_async(coro) awaits the coro
+        Then:
+            The coro should observe the snapshotted value.
+        """
+        from wool.runtime.context import copy_context
+
+        # Arrange
+        var = ContextVar("cv_ctx_run_async")
+        var.set("snapshot_async")
+        ctx = copy_context()
+        var.set("after")
+
+        async def reader():
+            return var.get()
+
+        # Act
+        result = await ctx.run_async(reader())
+
+        # Assert
+        assert result == "snapshot_async"
+
+    @pytest.mark.asyncio
+    async def test_run_async_mutations_do_not_leak(self):
+        """Test Context.run_async mutations are scoped to the seeded copy.
+
+        Given:
+            A Context and a wool.ContextVar with a known value
+        When:
+            A coroutine invoked via Context.run_async mutates the var
+        Then:
+            The caller's context should be unaffected after the await.
+        """
+        from wool.runtime.context import copy_context
+
+        # Arrange
+        var = ContextVar("cv_ctx_run_async_isolation")
+        var.set("outer_async")
+        ctx = copy_context()
+
+        async def mutator():
+            var.set("inner_async")
+
+        # Act
+        await ctx.run_async(mutator())
+
+        # Assert
+        assert var.get() == "outer_async"
+
+    def test_container_protocol(self):
+        """Test Context supports the stdlib container protocol.
+
+        Given:
+            A Context with two explicitly-set vars
+        When:
+            The container protocol (iter, len, keys, values, items) is
+            invoked
+        Then:
+            Each should reflect the snapshot.
+        """
+        from wool.runtime.context import copy_context
+
+        # Arrange
+        va = ContextVar("cv_ctx_container_a")
+        vb = ContextVar("cv_ctx_container_b")
+        va.set("alpha")
+        vb.set("beta")
+        ctx = copy_context()
+
+        # Act & assert
+        assert len(ctx) >= 2  # other tests' vars may also be set
+        assert va in ctx
+        assert vb in ctx
+        assert dict(ctx.items())[va] == "alpha"
+        assert "alpha" in list(ctx.values())
+        assert va in list(ctx.keys())
+        assert va in list(iter(ctx))
+
+    def test_pickle_roundtrip_preserves_identity(self):
+        """Test Context pickle round-trip preserves lineage and vars.
+
+        Given:
+            A Context captured in the current process
+        When:
+            cloudpickle.dumps / loads is applied
+        Then:
+            The restored Context should carry the same lineage id and
+            the same var-value mapping.
+        """
+        from wool.runtime.context import copy_context
+
+        # Arrange
+        var = ContextVar("cv_ctx_pickle")
+        var.set("pickled_value")
+        ctx = copy_context()
+
+        # Act
+        blob = cloudpickle.dumps(ctx)
+        restored = cloudpickle.loads(blob)
+
+        # Assert
+        assert restored.lineage_id == ctx.lineage_id
+        assert var in restored
+        assert restored[var] == "pickled_value"
+
+    def test_repr_includes_lineage_and_var_count(self):
+        """Test Context.__repr__ surfaces lineage id and var count.
+
+        Given:
+            A Context with one explicitly-set var
+        When:
+            repr(ctx) is called
+        Then:
+            The repr should include "wool.Context", the lineage id,
+            and the var count.
+        """
+        from wool.runtime.context import copy_context
+
+        # Arrange
+        var = ContextVar("cv_ctx_repr")
+        var.set("val")
+        ctx = copy_context()
+
+        # Act
+        text = repr(ctx)
+
+        # Assert
+        assert "wool.Context" in text
+        assert str(ctx.lineage_id) in text
+        assert "vars=" in text
