@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import threading
+import uuid
 from contextlib import contextmanager
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -24,10 +25,12 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
+from wool.runtime.context import Manifest
 from wool.runtime.context import _Context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import do_dispatch
+from wool.runtime.worker import namespace as _namespace
 
 # Sentinel to mark end of async generator stream
 _SENTINEL: Final = object()
@@ -210,39 +213,73 @@ class WorkerService(protocol.WorkerServicer):
             )
 
         response = await anext(aiter(request_iterator))
-        work_task = Task.from_protobuf(response.task)
 
-        if self._backpressure is not None:
-            decision = self._backpressure(
-                BackpressureContext(
-                    active_task_count=len(self._docket),
-                    task=work_task,
-                )
-            )
-            if isawaitable(decision):
-                decision = await decision
-            if decision:
-                await context.abort(
-                    StatusCode.RESOURCE_EXHAUSTED,
-                    "Task rejected by backpressure hook",
-                )
+        # Extract lineage + manifest from the first Request before
+        # unpickling the task. This lets Task.from_protobuf — and any
+        # by-reference imports triggered by cloudpickle — route through
+        # the TaskMetaPathFinder so library modules are cloned into the
+        # task-local namespace.
+        lineage_hex = response.lineage_id
+        lineage_id = uuid.UUID(hex=lineage_hex) if lineage_hex else uuid.uuid4()
+        manifest_entries = [
+            (entry.module_name, entry.attr_name, entry.pickled_var)
+            for entry in response.manifest
+        ]
+        manifest = Manifest.from_wire(manifest_entries)
 
-        with self._tracker(work_task, request_iterator) as task:
-            ack = protocol.Ack(version=protocol.__version__)
-            yield protocol.Response(ack=ack)
-            try:
-                if isasyncgen(task):
-                    async for value, ctx_snapshot in task:
+        with _namespace.activate(lineage_id, manifest):
+            # Apply wire-shipped var values to the current (task)
+            # context. This must run after activate() so that the
+            # manifest's wire-reconstructed ContextVars have been
+            # registered in sys.modules — _Context.apply looks them
+            # up by their UUID-keyed synthetic name.
+            if response.vars:
+                _Context.apply(dict(response.vars))
+            work_task = Task.from_protobuf(response.task)
+
+            if self._backpressure is not None:
+                decision = self._backpressure(
+                    BackpressureContext(
+                        active_task_count=len(self._docket),
+                        task=work_task,
+                    )
+                )
+                if isawaitable(decision):
+                    decision = await decision
+                if decision:
+                    await context.abort(
+                        StatusCode.RESOURCE_EXHAUSTED,
+                        "Task rejected by backpressure hook",
+                    )
+
+            with self._tracker(work_task, request_iterator) as task:
+                ack = protocol.Ack(version=protocol.__version__)
+                yield protocol.Response(ack=ack)
+                try:
+                    if isasyncgen(task):
+                        async for value, ctx_snapshot in task:
+                            result = protocol.Message(dump=cloudpickle.dumps(value))
+                            yield protocol.Response(
+                                result=result,
+                                vars=ctx_snapshot,
+                                lineage_id=lineage_hex or lineage_id.hex,
+                            )
+                    elif isinstance(task, asyncio.Task):
+                        value, ctx_snapshot = await task
                         result = protocol.Message(dump=cloudpickle.dumps(value))
-                        yield protocol.Response(result=result, vars=ctx_snapshot)
-                elif isinstance(task, asyncio.Task):
-                    value, ctx_snapshot = await task
-                    result = protocol.Message(dump=cloudpickle.dumps(value))
-                    yield protocol.Response(result=result, vars=ctx_snapshot)
-            except (Exception, asyncio.CancelledError) as e:
-                exception = protocol.Message(dump=cloudpickle.dumps(e))
-                ctx_snapshot = _Context.snapshot()
-                yield protocol.Response(exception=exception, vars=ctx_snapshot)
+                        yield protocol.Response(
+                            result=result,
+                            vars=ctx_snapshot,
+                            lineage_id=lineage_hex or lineage_id.hex,
+                        )
+                except (Exception, asyncio.CancelledError) as e:
+                    exception = protocol.Message(dump=cloudpickle.dumps(e))
+                    ctx_snapshot = _Context.snapshot()
+                    yield protocol.Response(
+                        exception=exception,
+                        vars=ctx_snapshot,
+                        lineage_id=lineage_hex or lineage_id.hex,
+                    )
 
     async def stop(
         self, request: protocol.StopRequest, context: ServicerContext | None

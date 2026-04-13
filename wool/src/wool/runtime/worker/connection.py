@@ -15,6 +15,8 @@ import grpc.aio
 import wool
 from wool import protocol
 from wool.runtime.context import _Context
+from wool.runtime.context import build_stream_frame_payload
+from wool.runtime.context import build_task_frame_payload
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
@@ -127,8 +129,12 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            ctx = _Context.snapshot()
-            request = protocol.Request(next=protocol.Void(), vars=ctx)
+            vars_dict, lineage_hex = build_stream_frame_payload()
+            request = protocol.Request(
+                next=protocol.Void(),
+                vars=vars_dict,
+                lineage_id=lineage_hex,
+            )
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
@@ -212,8 +218,12 @@ class _DispatchStream(Generic[_T]):
         self._running = True
         try:
             dump = cloudpickle.dumps(value)
-            ctx = _Context.snapshot()
-            request = protocol.Request(send=protocol.Message(dump=dump), vars=ctx)
+            vars_dict, lineage_hex = build_stream_frame_payload()
+            request = protocol.Request(
+                send=protocol.Message(dump=dump),
+                vars=vars_dict,
+                lineage_id=lineage_hex,
+            )
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
@@ -256,8 +266,12 @@ class _DispatchStream(Generic[_T]):
                 exc = typ()
 
             dump = cloudpickle.dumps(exc)
-            ctx = _Context.snapshot()
-            request = protocol.Request(throw=protocol.Message(dump=dump), vars=ctx)
+            vars_dict, lineage_hex = build_stream_frame_payload()
+            request = protocol.Request(
+                throw=protocol.Message(dump=dump),
+                vars=vars_dict,
+                lineage_id=lineage_hex,
+            )
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
@@ -482,7 +496,20 @@ class WorkerConnection:
             try:
                 call: _DispatchCall = channel.stub.dispatch()
                 try:
-                    request = protocol.Request(task=task_msg)
+                    vars_dict, manifest_entries, lineage_hex = build_task_frame_payload()
+                    request = protocol.Request(
+                        task=task_msg,
+                        vars=vars_dict,
+                        manifest=[
+                            protocol.ManifestEntry(
+                                module_name=mod,
+                                attr_name=attr,
+                                pickled_var=blob,
+                            )
+                            for (mod, attr, blob) in manifest_entries
+                        ],
+                        lineage_id=lineage_hex,
+                    )
                     await call.write(request)
                     response = await anext(aiter(call))
                     if response.HasField("nack"):

@@ -359,27 +359,32 @@ def activate(
     token = _active_lineage.set(lineage_id)
 
     try:
-        # Ensure every manifested module has a clone in the lineage.
-        for mod_name, _attr_name in manifest:
-            if mod_name in entry:
-                continue
-            original = sys.modules.get(mod_name)
-            if original is None:
+        # Substitute manifest entries directly into the live
+        # sys.modules. Identity mutation is safe across concurrent
+        # tasks because wool.ContextVar identity is deterministic per
+        # (module, attr): the wire always ships the same UUID for
+        # the same caller-side binding, so concurrent substitutions
+        # are idempotent no-ops after the first write.
+        #
+        # Value-level per-task isolation is provided by stdlib
+        # contextvars: the ContextVar's backing ``contextvars.ContextVar``
+        # observes each asyncio task's own Context, so values set on
+        # the shared identity remain task-local.
+        #
+        # The lineage cache (``entry``) is reserved for a future
+        # enhancement that swaps in per-lineage module clones when
+        # full binding-level isolation is required (see
+        # TaskLoader / TaskMetaPathFinder, not yet wired in).
+        for (mod_name, attr_name), var in manifest.items():
+            mod = sys.modules.get(mod_name)
+            if mod is None:
                 _log.debug(
-                    "manifest references module %r not present in sys.modules; "
-                    "skipping clone (will be constructed lazily via TaskLoader "
-                    "if the task imports it)",
+                    "manifest references module %r not present on worker; "
+                    "skipping substitution",
                     mod_name,
                 )
                 continue
-            entry[mod_name] = clone_module(original)
-
-        # Apply manifest substitutions into the clones.
-        for (mod_name, attr_name), var in manifest.items():
-            clone = entry.get(mod_name)
-            if clone is None:
-                continue
-            setattr(clone, attr_name, var)
+            setattr(mod, attr_name, var)
 
         yield entry
     finally:

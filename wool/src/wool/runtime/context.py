@@ -565,6 +565,51 @@ class Manifest:
         return manifest
 
 
+def build_task_frame_payload() -> tuple[
+    dict[str, bytes],
+    list[tuple[str, str, bytes]],
+    str,
+]:
+    """Assemble the wire payload for the initial Task dispatch frame.
+
+    Returns ``(vars, manifest_entries, lineage_id)`` for populating
+    the protobuf ``vars``, ``manifest``, and ``lineage_id`` fields on
+    the first Request of a dispatch stream. The manifest ships the
+    full ``(module, attr) → ContextVar`` binding snapshot so the
+    worker can clone the referenced modules and substitute the
+    wire-reconstructed instances into them.
+
+    ``lineage_id`` is the active lineage UUID as a hex string, or
+    empty when no lineage is active (root dispatch — the worker
+    assigns one).
+    """
+    from wool.runtime.worker.namespace import _active_lineage
+
+    vars_dict = _Context.snapshot()
+    manifest = Manifest.build()
+    manifest_entries = Manifest.to_wire(manifest)
+    lineage = _active_lineage.get()
+    lineage_hex = lineage.hex if lineage is not None else ""
+    return vars_dict, manifest_entries, lineage_hex
+
+
+def build_stream_frame_payload() -> tuple[dict[str, bytes], str]:
+    """Assemble the wire payload for streaming frames (next/send/throw).
+
+    Streaming frames do not re-ship the manifest: the worker has
+    already activated the lineage's module clones from the initial
+    Task frame. Only the current var value snapshot and the lineage
+    ID are propagated so back-propagated values reach the caller and
+    the worker confirms the lineage.
+    """
+    from wool.runtime.worker.namespace import _active_lineage
+
+    vars_dict = _Context.snapshot()
+    lineage = _active_lineage.get()
+    lineage_hex = lineage.hex if lineage is not None else ""
+    return vars_dict, lineage_hex
+
+
 dispatch_timeout: Final[contextvars.ContextVar[float | None]] = contextvars.ContextVar(
     "dispatch_timeout", default=None
 )
@@ -617,19 +662,15 @@ class RuntimeContext:
         else:
             self._dispatch_timeout_token = Undefined
 
-        for name, value in self._vars.items():
-            # Look up by synthetic name in sys.modules
-            synthetic = f"wool._vars.{name}"
-            var = sys.modules.get(synthetic)
-            if var is None or not isinstance(var, ContextVar):
-                logging.warning(
-                    "wool.ContextVar %r not registered on this worker; "
-                    "propagated value dropped",
-                    name,
-                )
-                continue
-            var.set(value)
-
+        # Var propagation is now handled by :class:`Manifest` +
+        # :class:`_Context` via the proto ``manifest`` and ``vars``
+        # fields. RuntimeContext.vars is retained for backwards
+        # compatibility only and is NOT applied here — attempting to
+        # resolve name-keyed vars would be lossy under the new
+        # UUID-keyed identity model. The dispatch pipeline applies
+        # wire values via :meth:`_Context.apply` after
+        # :func:`namespace.activate` has registered the
+        # wire-reconstructed instances.
         return self
 
     def __exit__(self, *_):
