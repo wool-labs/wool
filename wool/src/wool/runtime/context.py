@@ -307,13 +307,21 @@ class ContextVar(types.ModuleType, Generic[T]):
             raise ValueError("Token was created by a different ContextVar")
         token._used = True
         if token._stdlib_token is not None:
-            self._var.reset(token._stdlib_token)
+            try:
+                self._var.reset(token._stdlib_token)
+                return
+            except ValueError:
+                # Token was created in a different stdlib Context
+                # (e.g., the user invoked a nested wool.routine that
+                # runs in a copy-on-inherit context per
+                # :func:`routine._execute`). Fall through to the
+                # _old_value path, which restores the pre-set value
+                # without consulting the stdlib Context identity.
+                pass
+        if isinstance(token._old_value, _UnsetType):
+            self._var.set(_UNSET)
         else:
-            # Deserialized token — restore old value directly.
-            if isinstance(token._old_value, _UnsetType):
-                self._var.set(_UNSET)
-            else:
-                self._var.set(token._old_value)
+            self._var.set(token._old_value)
 
     def __repr__(self) -> str:
         return f"<wool.ContextVar name={self._wool_name!r}>"
