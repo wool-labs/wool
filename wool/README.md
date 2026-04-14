@@ -130,11 +130,11 @@ Two construction modes are supported:
 
 ### How propagation works
 
-At dispatch time, `RuntimeContext` iterates the `wool.ContextVar` registry and snapshots any variable that has been explicitly `set()` in the current context — default-only values are not shipped. The snapshot is serialized into the task's protobuf payload alongside `dispatch_timeout`. On the worker, each task restores the propagated values before the routine executes. When the worker returns (or yields), the current context var state is attached to the gRPC response and applied on the caller side, so worker-side mutations flow back automatically. For async generators, the caller also attaches its current context to each iteration request, enabling bidirectional state exchange between caller and worker at every yield/next boundary.
+At dispatch time, Wool walks `sys.modules` to discover every module-level `wool.ContextVar` binding and snapshots any variable that has been explicitly `set()` in the current context — default-only values are not shipped. The snapshot rides the task's protobuf payload as a `map<string, bytes>` keyed by `"<module>:<attr>"`, alongside a lineage UUID that identifies the logical execution chain. On the worker, each task restores the propagated values into its own seeded `contextvars.Context` before the routine executes. When the worker returns (or yields), the final context-var state is attached to the gRPC response and applied on the caller side, so worker-side mutations flow back automatically. For async generators, the caller also attaches its current context to each iteration request, enabling bidirectional state exchange between caller and worker at every yield/next boundary.
 
 ### Isolation
 
-Each dispatched task runs inside its own `contextvars.Context` copy. Concurrent tasks on the same worker with different values for the same variable never interfere — each sees only its own propagated value. Worker-side mutations (via `set()`) are back-propagated to the caller when the task returns or yields, but they do not leak to other concurrent tasks — the context is exclusively owned by one side at a time.
+Each dispatched task runs inside its own `contextvars.Context` copy, seeded with the caller's propagated values and lineage UUID. Concurrent tasks on the same worker with different values for the same variable never interfere — each sees only its own propagated state. Worker-side mutations (via `set()`) are back-propagated to the caller when the task returns or yields, but they do not leak to other concurrent tasks: the context is exclusively owned by one side at a time within a lineage.
 
 ### Limitations
 
