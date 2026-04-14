@@ -14,12 +14,10 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 try:
     from wool.protocol.wire_pb2 import Ack
     from wool.protocol.wire_pb2 import ChannelOptions
-    from wool.protocol.wire_pb2 import ManifestEntry
     from wool.protocol.wire_pb2 import Message
     from wool.protocol.wire_pb2 import Nack
     from wool.protocol.wire_pb2 import Request
     from wool.protocol.wire_pb2 import Response
-    from wool.protocol.wire_pb2 import RuntimeContext
     from wool.protocol.wire_pb2 import StopRequest
     from wool.protocol.wire_pb2 import Task
     from wool.protocol.wire_pb2 import TaskEnvelope
@@ -46,12 +44,10 @@ add_to_server: dict[type[WorkerServicer], AddServicerToServerProtocol] = {
 __all__ = [
     "Ack",
     "ChannelOptions",
-    "ManifestEntry",
     "Message",
     "Nack",
     "Request",
     "Response",
-    "RuntimeContext",
     "StopRequest",
     "Task",
     "TaskEnvelope",

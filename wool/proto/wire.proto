@@ -2,24 +2,6 @@ syntax = "proto3";
 
 package wool.runtime.protobuf.wire;
 
-message RuntimeContext {
-    optional double dispatch_timeout = 1;
-    map<string, bytes> vars = 2;
-}
-
-// Binding of a wool.ContextVar instance to a module attribute.
-// Ships alongside task dispatches so workers can substitute the
-// wire-reconstructed instance into task-local clones of the defining
-// module, preserving library-helper coherence across process
-// boundaries.
-message ManifestEntry {
-    string module_name = 1;
-    string attr_name = 2;
-    // cloudpickle.dumps of the ContextVar instance; survives via
-    // ContextVar.__reduce__ shipping UUID + state.
-    bytes pickled_var = 3;
-}
-
 message Task {
     string version = 1;
     string id = 2;
@@ -31,8 +13,7 @@ message Task {
     bytes args = 8;
     bytes kwargs = 9;
     int32 timeout = 10;
-    optional RuntimeContext context = 11;
-    optional bytes serializer = 12;
+    optional bytes serializer = 11;
 }
 
 // Minimal envelope for pre-deserialization metadata extraction.
@@ -71,12 +52,16 @@ message Request {
         Message send = 3;
         Message throw = 4;
     }
+    // Cloudpickled wool.ContextVar values keyed by
+    // "<module_path>:<attr_name>". Propagates the caller's context
+    // snapshot to the worker on task frames, and forward-propagates
+    // caller mutations to the worker on streaming frames.
     map<string, bytes> vars = 5;
-    repeated ManifestEntry manifest = 6;
-    // Lineage UUID as hex string. Shared across related dispatches
-    // for lineage-scoped module clone caching. Empty string for
-    // root dispatches that will start a new lineage on the worker.
-    string lineage_id = 7;
+    // Lineage UUID as hex string. Stable across sequential awaits
+    // inside the same asyncio task; fresh on asyncio.create_task
+    // boundaries. Empty string for root dispatches that will start a
+    // new lineage on the worker.
+    string lineage_id = 6;
 }
 
 message Response {
@@ -86,9 +71,11 @@ message Response {
         Message result = 3;
         Message exception = 4;
     }
+    // Cloudpickled wool.ContextVar values keyed by
+    // "<module_path>:<attr_name>". Back-propagates the routine's
+    // post-yield/post-return context snapshot to the caller.
     map<string, bytes> vars = 5;
-    repeated ManifestEntry manifest = 6;
-    string lineage_id = 7;
+    string lineage_id = 6;
 }
 
 message StopRequest {
