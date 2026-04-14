@@ -496,18 +496,10 @@ class WorkerConnection:
             try:
                 call: _DispatchCall = channel.stub.dispatch()
                 try:
-                    vars_dict, manifest_entries, lineage_hex = build_task_frame_payload()
+                    vars_dict, lineage_hex = build_task_frame_payload()
                     request = protocol.Request(
                         task=task_msg,
                         vars=vars_dict,
-                        manifest=[
-                            protocol.ManifestEntry(
-                                module_name=mod,
-                                attr_name=attr,
-                                pickled_var=blob,
-                            )
-                            for (mod, attr, blob) in manifest_entries
-                        ],
                         lineage_id=lineage_hex,
                     )
                     await call.write(request)

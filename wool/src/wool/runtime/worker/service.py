@@ -6,7 +6,6 @@ import contextvars
 import threading
 import uuid
 from contextlib import contextmanager
-from contextlib import nullcontext
 from dataclasses import dataclass
 from inspect import isasyncgen
 from inspect import isasyncgenfunction
@@ -25,7 +24,6 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
-from wool.runtime.context import Manifest
 from wool.runtime.context import _Context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
@@ -161,6 +159,10 @@ class WorkerService(protocol.WorkerServicer):
         self._task_completed = asyncio.Event()
         self._docket = set()
         self._backpressure = backpressure
+        # Route task-active imports through the lineage-scoped module
+        # clone cache. Idempotent: only the first construction mutates
+        # sys.meta_path; subsequent constructions are no-ops.
+        _namespace.install()
         self._loop_pool = ResourcePool(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
@@ -214,34 +216,20 @@ class WorkerService(protocol.WorkerServicer):
 
         response = await anext(aiter(request_iterator))
 
-        # Extract lineage + manifest from the first Request before
-        # unpickling the task. This lets Task.from_protobuf — and any
-        # by-reference imports triggered by cloudpickle — route through
-        # the TaskMetaPathFinder so library modules are cloned into the
-        # task-local namespace.
+        # Extract lineage from the first Request; unpickle the Task,
+        # then activate the lineage + apply wire-shipped var values
+        # to the handler's context. Cloudpickle's by-reference import
+        # resolution during Task.from_protobuf hits the worker's
+        # sys.modules directly — no per-task isolation is needed for
+        # ContextVar propagation under the lineage-owned manifest
+        # design (each wool.ContextVar is a stdlib-wrapping instance
+        # discoverable by module.attr).
         lineage_hex = response.lineage_id
         lineage_id = uuid.UUID(hex=lineage_hex) if lineage_hex else uuid.uuid4()
-        manifest_entries = [
-            (entry.module_name, entry.attr_name, entry.pickled_var)
-            for entry in response.manifest
-        ]
-        manifest = Manifest.from_wire(manifest_entries)
 
-        # Unpickle the Task BEFORE activating the namespace so that
-        # cloudpickle's by-reference imports populate sys.modules
-        # with the library modules the manifest will target. If we
-        # activated first, the manifest's "substitute sys.modules[mod]"
-        # pass would be a no-op on modules that haven't been imported
-        # yet, and the library's fresh ContextVar would remain as the
-        # routine's LOAD_GLOBAL target.
         work_task = Task.from_protobuf(response.task)
 
-        with _namespace.activate(lineage_id, manifest):
-            # Apply wire-shipped var values to the current (task)
-            # context. This must run after activate() so that the
-            # manifest's wire-reconstructed ContextVars have been
-            # registered in sys.modules — _Context.apply looks them
-            # up by their UUID-keyed synthetic name.
+        with _namespace.activate(lineage_id):
             if response.vars:
                 _Context.apply(dict(response.vars))
 
@@ -400,7 +388,7 @@ class WorkerService(protocol.WorkerServicer):
                         future.set_exception(t.exception())
                     else:
                         result = t.result()
-                        snapshot = _Context.snapshot_from(ctx)
+                        snapshot = _Context.snapshot(ctx)
                         future.set_result((result, snapshot))
 
                 task.add_done_callback(_done)
@@ -450,59 +438,49 @@ class WorkerService(protocol.WorkerServicer):
                 proxy = await proxy_ctx.__aenter__() if proxy_ctx else None
                 token = wool.__proxy__.set(proxy) if proxy else None
                 try:
-                    # Enter the task's RuntimeContext so dispatch_timeout
-                    # and any propagated wool.ContextVar values are
-                    # restored before the async generator captures the
-                    # current context on first suspension.
-                    runtime_ctx = (
-                        work_task.context
-                        if work_task.context is not None
-                        else nullcontext()
-                    )
-                    with runtime_ctx:
-                        with work_task:  # sets _current_task for nested dispatch
-                            gen = work_task.callable(*work_task.args, **work_task.kwargs)
-                            try:
-                                while True:
-                                    cmd = await request_queue.get()
-                                    if cmd is _SENTINEL:
-                                        break
-                                    action, payload, caller_ctx = cmd
-                                    if caller_ctx:
-                                        _Context.apply(caller_ctx)
-                                    try:
-                                        with do_dispatch(False):
-                                            match action:
-                                                case "next":
-                                                    value = await gen.asend(None)
-                                                case "send":
-                                                    value = await gen.asend(payload)
-                                                case "throw":
-                                                    value = await gen.athrow(
-                                                        type(payload), payload
-                                                    )
-                                                case _:
-                                                    continue
-                                    except StopAsyncIteration:
-                                        main_loop.call_soon_threadsafe(
-                                            result_queue.put_nowait, _SENTINEL
-                                        )
-                                        return
-                                    except BaseException as e:
-                                        ctx_snapshot = _Context.snapshot()
-                                        main_loop.call_soon_threadsafe(
-                                            result_queue.put_nowait,
-                                            ("error", e, ctx_snapshot),
-                                        )
-                                        return
-                                    else:
-                                        ctx_snapshot = _Context.snapshot()
-                                        main_loop.call_soon_threadsafe(
-                                            result_queue.put_nowait,
-                                            ("value", value, ctx_snapshot),
-                                        )
-                            finally:
-                                await gen.aclose()
+                    with work_task:  # sets _current_task for nested dispatch
+                        gen = work_task.callable(*work_task.args, **work_task.kwargs)
+                        try:
+                            while True:
+                                cmd = await request_queue.get()
+                                if cmd is _SENTINEL:
+                                    break
+                                action, payload, caller_ctx = cmd
+                                if caller_ctx:
+                                    _Context.apply(caller_ctx)
+                                try:
+                                    with do_dispatch(False):
+                                        match action:
+                                            case "next":
+                                                value = await gen.asend(None)
+                                            case "send":
+                                                value = await gen.asend(payload)
+                                            case "throw":
+                                                value = await gen.athrow(
+                                                    type(payload), payload
+                                                )
+                                            case _:
+                                                continue
+                                except StopAsyncIteration:
+                                    main_loop.call_soon_threadsafe(
+                                        result_queue.put_nowait, _SENTINEL
+                                    )
+                                    return
+                                except BaseException as e:
+                                    ctx_snapshot = _Context.snapshot()
+                                    main_loop.call_soon_threadsafe(
+                                        result_queue.put_nowait,
+                                        ("error", e, ctx_snapshot),
+                                    )
+                                    return
+                                else:
+                                    ctx_snapshot = _Context.snapshot()
+                                    main_loop.call_soon_threadsafe(
+                                        result_queue.put_nowait,
+                                        ("value", value, ctx_snapshot),
+                                    )
+                        finally:
+                            await gen.aclose()
                 finally:
                     if token is not None:
                         wool.__proxy__.reset(token)
