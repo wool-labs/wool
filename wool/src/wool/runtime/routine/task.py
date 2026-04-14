@@ -33,6 +33,7 @@ import cloudpickle
 
 import wool
 from wool import protocol
+from wool.runtime.context import _dumps as _context_dumps
 
 Args = Tuple
 Kwargs = Dict
@@ -341,9 +342,9 @@ class Task(Generic[W]):
         :returns:
             A protobuf ``Task`` message.
         """
-        dumps = serializer.dumps if serializer is not None else cloudpickle.dumps
+        dumps = serializer.dumps if serializer is not None else _context_dumps
         proxy_dumps = (
-            dumps if isinstance(serializer, PassthroughSerializer) else cloudpickle.dumps
+            dumps if isinstance(serializer, PassthroughSerializer) else _context_dumps
         )
         task_msg = protocol.Task(
             version=protocol.__version__,

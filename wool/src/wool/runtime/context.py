@@ -189,10 +189,15 @@ class ContextVar(Generic[T]):
     def _resolve_location(self) -> tuple[str, str] | None:
         """Find and cache this instance's ``(module, attr)`` binding.
 
-        Walks :data:`sys.modules` to locate a module-level attribute
-        that holds ``self``. Returns the first match (aliased bindings
-        resolve to the canonical one encountered first) or ``None`` if
-        the instance is not bound at module scope.
+        Walks :data:`sys.modules` once on the first call to locate the
+        module-level attribute that holds ``self``, caches the result,
+        and returns it on every subsequent call in O(1). Re-validates
+        the cache against the live binding so a cached location that
+        has been rebound elsewhere is invalidated and re-resolved.
+
+        :returns:
+            The ``(module_name, attr_name)`` tuple, or ``None`` if the
+            instance is not bound at module scope.
         """
         if self._location is not None:
             mod_name, attr_name = self._location
@@ -212,16 +217,6 @@ class ContextVar(Generic[T]):
                     self._location = (mod_name, attr_name)
                     return self._location
         return None
-
-    def __reduce__(self):
-        location = self._resolve_location()
-        if location is None:
-            raise pickle.PicklingError(
-                f"wool.ContextVar {self._name!r} is not bound to any module "
-                "attribute; instances must be assigned at module level to "
-                "be picklable across worker boundaries"
-            )
-        return (_reconstruct_context_var, location)
 
     @property
     def name(self) -> str:
@@ -314,49 +309,47 @@ class ContextVar(Generic[T]):
         return f"<wool.ContextVar name={self._name!r}>"
 
 
-def _iter_registry_bindings() -> list[tuple[str, str, ContextVar[Any]]]:
-    """Walk :data:`sys.modules` for ``(module, attr) → ContextVar`` bindings.
+class _ManifestPickler(cloudpickle.CloudPickler):
+    """Cloudpickle pickler that reduces :class:`ContextVar` by location.
 
-    Returns every module-level attribute that holds a live
-    :class:`ContextVar` instance. A single instance aliased under
-    multiple modules (e.g. via ``from lib import trace_id``) produces
-    one entry per alias — each aliased location receives the same
-    propagated value on the worker.
+    Overrides :meth:`reducer_override` to emit every
+    :class:`ContextVar` encountered in the object graph — whether the
+    top-level value or nested in a closure, argument, or attribute —
+    as a ``(module_name, attr_name)`` reference via
+    :func:`_reconstruct_context_var`. This is the single authoritative
+    entry point for wool ContextVar serialization; the class itself
+    carries no ``__reduce__`` method.
+
+    Instances MUST be used anywhere wool serializes user data that
+    might transitively reference a :class:`ContextVar` (routine
+    closures, args/kwargs, return values, thrown exceptions, var
+    values). :func:`_dumps` is the canonical helper.
     """
-    if not ContextVar._registry:
-        return []
-    bindings: list[tuple[str, str, ContextVar[Any]]] = []
-    for mod_name, mod in list(sys.modules.items()):
-        if mod is None:
-            continue
-        try:
-            mod_dict = mod.__dict__
-        except AttributeError:
-            continue
-        for attr_name, attr_value in list(mod_dict.items()):
-            if isinstance(attr_value, ContextVar):
-                bindings.append((mod_name, attr_name, attr_value))
-    return bindings
 
-
-class _CloudPickler(cloudpickle.CloudPickler):
-    """Cloudpickle pickler with unified :class:`ContextVar` reduction.
-
-    Emits :class:`ContextVar` instances encountered in the object
-    graph as thin module-attribute references via the default
-    by-reference path. Extension point for future optimizations (e.g.,
-    collapsing a ContextVar reference to a compact key that looks up
-    into the ambient manifest).
-    """
+    def reducer_override(self, obj: Any) -> Any:
+        if isinstance(obj, ContextVar):
+            location = obj._resolve_location()
+            if location is None:
+                raise pickle.PicklingError(
+                    f"wool.ContextVar {obj._name!r} is not bound to any "
+                    "module attribute; instances must be assigned at module "
+                    "level to be picklable across worker boundaries"
+                )
+            return (_reconstruct_context_var, location)
+        # Delegate to cloudpickle's own reducer_override so local
+        # functions, closures, and lambdas continue to pickle.
+        return super().reducer_override(obj)
 
 
 def _dumps(value: Any) -> bytes:
+    """Serialize *value* with wool's ContextVar-aware pickler."""
     buf = io.BytesIO()
-    _CloudPickler(buf).dump(value)
+    _ManifestPickler(buf).dump(value)
     return buf.getvalue()
 
 
 def _loads(data: bytes) -> Any:
+    """Deserialize *data* produced by :func:`_dumps`."""
     return cloudpickle.loads(data)
 
 
@@ -393,7 +386,7 @@ class _Context:
             If a value fails to serialize.
         """
         result: dict[str, bytes] = {}
-        for mod_name, attr_name, var in _iter_registry_bindings():
+        for var in list(ContextVar._registry):
             if ctx is not None:
                 if var._stdlib not in ctx:
                     continue
@@ -402,10 +395,15 @@ class _Context:
                 raw = var._stdlib.get()
             if raw is _UNSET:
                 continue
-            key = f"{mod_name}:{attr_name}"
-            if key in result:
-                # Aliased binding — same instance, same value; skip.
+            location = var._resolve_location()
+            if location is None:
+                _log.warning(
+                    "wool.ContextVar %r is not bound to a module attribute; "
+                    "value dropped from snapshot",
+                    var._name,
+                )
                 continue
+            key = f"{location[0]}:{location[1]}"
             try:
                 result[key] = dumps(raw)
             except Exception as e:

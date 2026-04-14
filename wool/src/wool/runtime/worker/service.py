@@ -25,6 +25,7 @@ from grpc.aio import ServicerContext
 import wool
 from wool import protocol
 from wool.runtime.context import _Context
+from wool.runtime.context import _dumps
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import do_dispatch
@@ -254,7 +255,7 @@ class WorkerService(protocol.WorkerServicer):
                 try:
                     if isasyncgen(task):
                         async for value, ctx_snapshot in task:
-                            result = protocol.Message(dump=cloudpickle.dumps(value))
+                            result = protocol.Message(dump=_dumps(value))
                             yield protocol.Response(
                                 result=result,
                                 vars=ctx_snapshot,
@@ -262,14 +263,14 @@ class WorkerService(protocol.WorkerServicer):
                             )
                     elif isinstance(task, asyncio.Task):
                         value, ctx_snapshot = await task
-                        result = protocol.Message(dump=cloudpickle.dumps(value))
+                        result = protocol.Message(dump=_dumps(value))
                         yield protocol.Response(
                             result=result,
                             vars=ctx_snapshot,
                             lineage_id=lineage_hex or lineage_id.hex,
                         )
                 except (Exception, asyncio.CancelledError) as e:
-                    exception = protocol.Message(dump=cloudpickle.dumps(e))
+                    exception = protocol.Message(dump=_dumps(e))
                     ctx_snapshot = _Context.snapshot()
                     yield protocol.Response(
                         exception=exception,

@@ -15,6 +15,7 @@ import grpc.aio
 import wool
 from wool import protocol
 from wool.runtime.context import _Context
+from wool.runtime.context import _dumps
 from wool.runtime.context import build_stream_frame_payload
 from wool.runtime.context import build_task_frame_payload
 from wool.runtime.resourcepool import ResourcePool
@@ -217,7 +218,7 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            dump = cloudpickle.dumps(value)
+            dump = _dumps(value)
             vars_dict, lineage_hex = build_stream_frame_payload()
             request = protocol.Request(
                 send=protocol.Message(dump=dump),
@@ -265,7 +266,7 @@ class _DispatchStream(Generic[_T]):
             else:  # pragma: no cover
                 exc = typ()
 
-            dump = cloudpickle.dumps(exc)
+            dump = _dumps(exc)
             vars_dict, lineage_hex = build_stream_frame_payload()
             request = protocol.Request(
                 throw=protocol.Message(dump=dump),

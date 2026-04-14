@@ -11,6 +11,8 @@ from wool.runtime.context import Context
 from wool.runtime.context import ContextVar
 from wool.runtime.context import Token
 from wool.runtime.context import _Context
+from wool.runtime.context import _dumps
+from wool.runtime.context import _loads
 from wool.runtime.context import _UnsetType
 from wool.runtime.context import current_context
 from wool.runtime.context import dispatch_timeout
@@ -218,7 +220,7 @@ class TestContextVar:
         fresh_module.shipped = var
 
         # Act
-        restored = cloudpickle.loads(cloudpickle.dumps(var))
+        restored = _loads(_dumps(var))
 
         # Assert
         assert restored is var
@@ -241,7 +243,7 @@ class TestToken:
         token = var.set("mutated")
 
         # Act
-        restored_token = cloudpickle.loads(cloudpickle.dumps(token))
+        restored_token = _loads(_dumps(token))
         assert var.get() == "mutated"
         var.reset(restored_token)
 
@@ -478,7 +480,7 @@ class TestContext:
         ctx = current_context()
 
         # Act
-        restored = cloudpickle.loads(cloudpickle.dumps(ctx))
+        restored = _loads(_dumps(ctx))
 
         # Assert
         assert restored.id == ctx.id
