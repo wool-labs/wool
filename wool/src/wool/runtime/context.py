@@ -55,27 +55,35 @@ class _UnsetType:
 _UNSET: Final = _UnsetType()
 
 
-def _reconstruct_context_var(module_name: str, attr_name: str) -> ContextVar:
-    """Unpickle helper: resolve a ContextVar by its module-attribute location.
+def _reconstruct_context_var(
+    locations: list[tuple[str, str]],
+) -> ContextVar:
+    """Unpickle helper: resolve a ContextVar by any of its locations.
 
-    Imports *module_name* if necessary so the receiver's process has
-    the same binding the caller pickled.
+    Tries each ``(module, attr)`` location in order, importing the
+    module if absent. Returns the first match — all locations of a
+    single caller-side instance share one instance on the receiver
+    when the module graph is consistent, so any successful lookup is
+    correct. The fallback list exists so that if one alias has been
+    added only on the caller (runtime rebinding) the other aliases
+    still resolve on the worker.
     """
-    mod = sys.modules.get(module_name)
-    if mod is None:
-        try:
-            mod = importlib.import_module(module_name)
-        except ImportError as e:
-            raise RuntimeError(
-                f"Cannot resolve wool.ContextVar at {module_name}:{attr_name} — "
-                f"module is not importable: {e}"
-            ) from e
-    var = getattr(mod, attr_name, None)
-    if not isinstance(var, ContextVar):
-        raise RuntimeError(
-            f"{module_name}.{attr_name} is not a wool.ContextVar on this process"
-        )
-    return var
+    errors: list[str] = []
+    for module_name, attr_name in locations:
+        mod = sys.modules.get(module_name)
+        if mod is None:
+            try:
+                mod = importlib.import_module(module_name)
+            except ImportError as e:
+                errors.append(f"{module_name}: {e}")
+                continue
+        var = getattr(mod, attr_name, None)
+        if isinstance(var, ContextVar):
+            return var
+        errors.append(f"{module_name}.{attr_name}: not a wool.ContextVar")
+    raise RuntimeError(
+        "Cannot resolve wool.ContextVar from any bound location: " + "; ".join(errors)
+    )
 
 
 def _reconstruct_token(var: ContextVar, old_value: Any) -> Token:
@@ -161,17 +169,18 @@ class ContextVar(Generic[T]):
     time naming the offending variable.
     """
 
-    __slots__ = ("_name", "_default", "_stdlib", "_location", "__weakref__")
+    __slots__ = ("_name", "_default", "_stdlib", "_locations", "__weakref__")
 
     _registry: ClassVar[weakref.WeakSet[ContextVar[Any]]] = weakref.WeakSet()
 
     _name: str
     _default: Any
     _stdlib: contextvars.ContextVar[T | _UnsetType]
-    # Cached (module_name, attr_name) location, populated lazily on
-    # first pickling or first snapshot-binding discovery. Avoids
-    # re-walking sys.modules on every dispatch.
-    _location: tuple[str, str] | None
+    # Cached list of every ``(module_name, attr_name)`` binding this
+    # instance is reachable from. Populated lazily on first pickling
+    # or first snapshot-binding discovery; re-validated on each call
+    # and re-scanned if any cached entry has become stale.
+    _locations: list[tuple[str, str]] | None
 
     @overload
     def __init__(self, name: str, /) -> None: ...
@@ -183,28 +192,35 @@ class ContextVar(Generic[T]):
         self._name = name
         self._default = default
         self._stdlib = contextvars.ContextVar(name, default=_UNSET)
-        self._location = None
+        self._locations = None
         type(self)._registry.add(self)
 
-    def _resolve_location(self) -> tuple[str, str] | None:
-        """Find and cache this instance's ``(module, attr)`` binding.
+    def _resolve_locations(self) -> list[tuple[str, str]]:
+        """Return every ``(module, attr)`` binding of this instance.
 
-        Walks :data:`sys.modules` once on the first call to locate the
-        module-level attribute that holds ``self``, caches the result,
-        and returns it on every subsequent call in O(1). Re-validates
-        the cache against the live binding so a cached location that
-        has been rebound elsewhere is invalidated and re-resolved.
+        Walks :data:`sys.modules` to find every module-level attribute
+        that holds ``self`` — a ContextVar aliased under multiple
+        names (``foo = bar = wool.ContextVar(...)`` or a
+        ``from lib import trace as other`` re-export) produces one
+        entry per binding. The list is cached on the instance;
+        subsequent calls re-validate the cache and re-scan only if
+        any cached entry has become stale.
 
         :returns:
-            The ``(module_name, attr_name)`` tuple, or ``None`` if the
-            instance is not bound at module scope.
+            A list of ``(module_name, attr_name)`` tuples, or an empty
+            list if the instance is not bound at module scope.
         """
-        if self._location is not None:
-            mod_name, attr_name = self._location
-            mod = sys.modules.get(mod_name)
-            if mod is not None and getattr(mod, attr_name, None) is self:
-                return self._location
-            self._location = None
+        if self._locations is not None:
+            still_valid = True
+            for mod_name, attr_name in self._locations:
+                mod = sys.modules.get(mod_name)
+                if mod is None or getattr(mod, attr_name, None) is not self:
+                    still_valid = False
+                    break
+            if still_valid:
+                return self._locations
+            self._locations = None
+        found: list[tuple[str, str]] = []
         for mod_name, mod in list(sys.modules.items()):
             if mod is None:
                 continue
@@ -214,9 +230,9 @@ class ContextVar(Generic[T]):
                 continue
             for attr_name, value in mod_dict.items():
                 if value is self:
-                    self._location = (mod_name, attr_name)
-                    return self._location
-        return None
+                    found.append((mod_name, attr_name))
+        self._locations = found
+        return found
 
     @property
     def name(self) -> str:
@@ -328,14 +344,14 @@ class _ContextPickler(cloudpickle.CloudPickler):
 
     def reducer_override(self, obj: Any) -> Any:
         if isinstance(obj, ContextVar):
-            location = obj._resolve_location()
-            if location is None:
+            locations = obj._resolve_locations()
+            if not locations:
                 raise pickle.PicklingError(
                     f"wool.ContextVar {obj._name!r} is not bound to any "
                     "module attribute; instances must be assigned at module "
                     "level to be picklable across worker boundaries"
                 )
-            return (_reconstruct_context_var, location)
+            return (_reconstruct_context_var, (locations,))
         # Delegate to cloudpickle's own reducer_override so local
         # functions, closures, and lambdas continue to pickle.
         return super().reducer_override(obj)
@@ -384,21 +400,26 @@ def _snapshot_vars(
             raw = var._stdlib.get()
         if raw is _UNSET:
             continue
-        location = var._resolve_location()
-        if location is None:
+        locations = var._resolve_locations()
+        if not locations:
             _log.warning(
                 "wool.ContextVar %r is not bound to a module attribute; "
                 "value dropped from snapshot",
                 var._name,
             )
             continue
-        key = f"{location[0]}:{location[1]}"
         try:
-            result[key] = dumps(raw)
+            pickled = dumps(raw)
         except Exception as e:
             raise TypeError(
                 f"Failed to serialize wool.ContextVar {var._name!r}: {e}"
             ) from e
+        # Emit one entry per binding so aliased locations on the
+        # receiver (direct aliases, re-exports) each resolve. All
+        # entries share the same pickled value; the receiver applies
+        # them onto the same underlying instance.
+        for mod_name, attr_name in locations:
+            result[f"{mod_name}:{attr_name}"] = pickled
     return result
 
 

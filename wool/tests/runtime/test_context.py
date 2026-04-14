@@ -226,6 +226,81 @@ class TestContextVar:
         # Assert
         assert restored is var
 
+    def test_aliased_bindings_both_see_mutations(self, fresh_module):
+        """Test a ContextVar aliased under multiple attrs shares state.
+
+        Given:
+            A ContextVar bound to two module attributes on the same module
+        When:
+            One alias sets a value
+        Then:
+            The other alias should observe the same value via get()
+        """
+        # Arrange
+        var = ContextVar("aliased")
+        fresh_module.foo = var
+        fresh_module.bar = var
+
+        # Act
+        fresh_module.foo.set("mutation")
+
+        # Assert
+        assert fresh_module.bar.get() == "mutation"
+
+    def test_snapshot_emits_entries_for_every_alias(self, fresh_module):
+        """Test _snapshot_vars includes all bindings of an aliased var.
+
+        Given:
+            A ContextVar aliased under multiple module attributes
+        When:
+            _snapshot_vars() is called after setting a value
+        Then:
+            The snapshot should contain one entry per alias, each
+            carrying the same serialized value
+        """
+        # Arrange
+        var = ContextVar("multi")
+        fresh_module.primary = var
+        fresh_module.secondary = var
+        var.set("value")
+
+        # Act
+        snapshot = _snapshot_vars()
+
+        # Assert
+        primary_key = f"{fresh_module.__name__}:primary"
+        secondary_key = f"{fresh_module.__name__}:secondary"
+        assert primary_key in snapshot
+        assert secondary_key in snapshot
+        assert snapshot[primary_key] == snapshot[secondary_key]
+
+    def test_reconstruct_falls_back_to_later_locations(self, fresh_module):
+        """Test the pickle reconstructor tries every location in order.
+
+        Given:
+            A ContextVar whose cached locations list starts with a
+            location that does not exist on the receiver
+        When:
+            The var is pickled and unpickled
+        Then:
+            The reconstructor should fall back to the next valid
+            location and return the same instance
+        """
+        # Arrange
+        var = ContextVar("fallback")
+        fresh_module.fallback = var
+        # Seed the cache with a bad first entry followed by the real one.
+        var._locations = [
+            ("nonexistent_module_for_fallback_test", "ghost"),
+            (fresh_module.__name__, "fallback"),
+        ]
+
+        # Act
+        restored = _loads(_dumps(var))
+
+        # Assert
+        assert restored is var
+
 
 class TestToken:
     def test_pickle_roundtrip_preserves_reset_semantics(self, fresh_module):
