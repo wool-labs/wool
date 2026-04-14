@@ -200,7 +200,7 @@ def install() -> None:
     imports through per-lineage module clones. The lineage-owned
     manifest design makes that machinery unnecessary: worker-local
     :class:`wool.ContextVar` instances receive values directly via
-    :meth:`_Context.apply`, and per-task ``sys.modules`` isolation is
+    :func:`_apply_vars`, and per-task ``sys.modules`` isolation is
     no longer required for ContextVar propagation.
     """
     return

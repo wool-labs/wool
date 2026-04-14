@@ -309,7 +309,7 @@ class ContextVar(Generic[T]):
         return f"<wool.ContextVar name={self._name!r}>"
 
 
-class _ManifestPickler(cloudpickle.CloudPickler):
+class _ContextPickler(cloudpickle.CloudPickler):
     """Cloudpickle pickler that reduces :class:`ContextVar` by location.
 
     Overrides :meth:`reducer_override` to emit every
@@ -344,7 +344,7 @@ class _ManifestPickler(cloudpickle.CloudPickler):
 def _dumps(value: Any) -> bytes:
     """Serialize *value* with wool's ContextVar-aware pickler."""
     buf = io.BytesIO()
-    _ManifestPickler(buf).dump(value)
+    _ContextPickler(buf).dump(value)
     return buf.getvalue()
 
 
@@ -353,110 +353,99 @@ def _loads(data: bytes) -> Any:
     return cloudpickle.loads(data)
 
 
-class _Context:
-    """Internal wire-level helpers for value propagation.
+def _snapshot_vars(
+    ctx: contextvars.Context | None = None,
+    *,
+    dumps: Callable[[Any], bytes] = _dumps,
+) -> dict[str, bytes]:
+    """Snapshot all registered :class:`ContextVar` values to wire form.
 
-    Handles the conversion between the in-process
-    :class:`ContextVar` registry and the ``map<string, bytes> vars``
-    protobuf field on ``Request`` and ``Response``. Map keys have the
-    form ``"<module_path>:<attr_name>"``, identifying the binding
-    location on both sides. The unpickled values are restored into the
-    worker's local :class:`ContextVar` instance at that location.
+    :param ctx:
+        Optional :class:`contextvars.Context` to read from. When
+        ``None``, reads from the current context via
+        :meth:`ContextVar.get`.
+    :param dumps:
+        Serializer for values. Defaults to :func:`_dumps`.
+    :returns:
+        A ``{"<module>:<attr>": serialized_value}`` dict ready for
+        the proto map. Only vars with an explicit value (not
+        ``_UNSET``) are included. Vars with no module binding are
+        skipped with a log warning.
+    :raises TypeError:
+        If a value fails to serialize.
     """
-
-    @staticmethod
-    def snapshot(
-        ctx: contextvars.Context | None = None,
-        *,
-        dumps: Callable[[Any], bytes] = _dumps,
-    ) -> dict[str, bytes]:
-        """Snapshot all registered :class:`ContextVar` values.
-
-        :param ctx:
-            Optional :class:`contextvars.Context` to read from. When
-            ``None``, reads from the current context via
-            :meth:`ContextVar.get`.
-        :param dumps:
-            Serializer for values. Defaults to cloudpickle.
-        :returns:
-            A ``{"<module>:<attr>": serialized_value}`` dict ready
-            for the proto map. Only vars with an explicit value (not
-            ``_UNSET``) are included.
-        :raises TypeError:
-            If a value fails to serialize.
-        """
-        result: dict[str, bytes] = {}
-        for var in list(ContextVar._registry):
-            if ctx is not None:
-                if var._stdlib not in ctx:
-                    continue
-                raw = ctx[var._stdlib]
-            else:
-                raw = var._stdlib.get()
-            if raw is _UNSET:
+    result: dict[str, bytes] = {}
+    for var in list(ContextVar._registry):
+        if ctx is not None:
+            if var._stdlib not in ctx:
                 continue
-            location = var._resolve_location()
-            if location is None:
-                _log.warning(
-                    "wool.ContextVar %r is not bound to a module attribute; "
-                    "value dropped from snapshot",
-                    var._name,
-                )
-                continue
-            key = f"{location[0]}:{location[1]}"
-            try:
-                result[key] = dumps(raw)
-            except Exception as e:
-                raise TypeError(
-                    f"Failed to serialize wool.ContextVar {var._name!r}: {e}"
-                ) from e
-        return result
+            raw = ctx[var._stdlib]
+        else:
+            raw = var._stdlib.get()
+        if raw is _UNSET:
+            continue
+        location = var._resolve_location()
+        if location is None:
+            _log.warning(
+                "wool.ContextVar %r is not bound to a module attribute; "
+                "value dropped from snapshot",
+                var._name,
+            )
+            continue
+        key = f"{location[0]}:{location[1]}"
+        try:
+            result[key] = dumps(raw)
+        except Exception as e:
+            raise TypeError(
+                f"Failed to serialize wool.ContextVar {var._name!r}: {e}"
+            ) from e
+    return result
 
-    @staticmethod
-    def apply(
-        vars: dict[str, bytes],
-        *,
-        loads: Callable[[bytes], Any] = _loads,
-    ) -> None:
-        """Apply a context snapshot to the current context.
 
-        For each wire entry ``"<module>:<attr>": value``, looks up
-        the :class:`ContextVar` via ``getattr(sys.modules[module],
-        attr)`` and calls :meth:`ContextVar.set` on it. Unknown or
-        non-ContextVar locations log-warn and are skipped.
+def _apply_vars(
+    vars: dict[str, bytes],
+    *,
+    loads: Callable[[bytes], Any] = _loads,
+) -> None:
+    """Apply a wire-form context snapshot to the current context.
 
-        :param vars:
-            A ``{"<module>:<attr>": serialized_value}`` dict from
-            the proto map.
-        :param loads:
-            Deserializer for values. Defaults to cloudpickle.
-        """
-        if not vars:
-            return
-        for key, data in vars.items():
-            mod_name, _, attr_name = key.partition(":")
-            if not mod_name or not attr_name:
-                _log.warning("Malformed wool.ContextVar key %r; skipping", key)
-                continue
-            mod = sys.modules.get(mod_name)
-            if mod is None:
-                _log.warning(
-                    "wool.ContextVar %r.%s not registered on this process; "
-                    "propagated value dropped",
-                    mod_name,
-                    attr_name,
-                )
-                continue
-            var = getattr(mod, attr_name, None)
-            if not isinstance(var, ContextVar):
-                _log.warning(
-                    "wool.ContextVar %r.%s not a ContextVar on this process; "
-                    "propagated value dropped",
-                    mod_name,
-                    attr_name,
-                )
-                continue
-            var.set(loads(data))
+    For each entry ``"<module>:<attr>": value``, looks up the
+    :class:`ContextVar` via ``getattr(sys.modules[module], attr)``
+    and calls :meth:`ContextVar.set` on it. Unknown or non-ContextVar
+    locations log-warn and are skipped.
+
+    :param vars:
+        A ``{"<module>:<attr>": serialized_value}`` dict from the
+        proto map.
+    :param loads:
+        Deserializer for values. Defaults to :func:`_loads`.
+    """
+    if not vars:
+        return
+    for key, data in vars.items():
+        mod_name, _, attr_name = key.partition(":")
+        if not mod_name or not attr_name:
+            _log.warning("Malformed wool.ContextVar key %r; skipping", key)
+            continue
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            _log.warning(
+                "wool.ContextVar %r.%s not registered on this process; "
+                "propagated value dropped",
+                mod_name,
+                attr_name,
+            )
+            continue
+        var = getattr(mod, attr_name, None)
+        if not isinstance(var, ContextVar):
+            _log.warning(
+                "wool.ContextVar %r.%s not a ContextVar on this process; "
+                "propagated value dropped",
+                mod_name,
+                attr_name,
+            )
+            continue
+        var.set(loads(data))
 
 
 def _reconstruct_context(
@@ -646,7 +635,7 @@ def _snapshot_from(ctx: contextvars.Context) -> dict[ContextVar[Any], Any]:
 
     Used by :meth:`Context.run` / :meth:`Context.run_async` to capture
     post-run mutations back onto the :class:`Context`. Different from
-    :meth:`_Context.snapshot` — this one produces a dict keyed by
+    :func:`_snapshot_vars` — this one produces a dict keyed by
     :class:`ContextVar` instances (not wire keys), and does not
     serialize values.
     """
@@ -708,7 +697,7 @@ def build_task_frame_payload() -> tuple[dict[str, bytes], str]:
     """
     from wool.runtime.worker.namespace import _current_lineage
 
-    vars_dict = _Context.snapshot()
+    vars_dict = _snapshot_vars()
     lineage_hex = _current_lineage().hex
     return vars_dict, lineage_hex
 
@@ -722,7 +711,7 @@ def build_stream_frame_payload() -> tuple[dict[str, bytes], str]:
     """
     from wool.runtime.worker.namespace import _current_lineage
 
-    vars_dict = _Context.snapshot()
+    vars_dict = _snapshot_vars()
     lineage_hex = _current_lineage().hex
     return vars_dict, lineage_hex
 

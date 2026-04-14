@@ -10,9 +10,10 @@ from wool.runtime.context import _UNSET
 from wool.runtime.context import Context
 from wool.runtime.context import ContextVar
 from wool.runtime.context import Token
-from wool.runtime.context import _Context
+from wool.runtime.context import _apply_vars
 from wool.runtime.context import _dumps
 from wool.runtime.context import _loads
+from wool.runtime.context import _snapshot_vars
 from wool.runtime.context import _UnsetType
 from wool.runtime.context import current_context
 from wool.runtime.context import dispatch_timeout
@@ -251,14 +252,14 @@ class TestToken:
         assert var.get() == "original"
 
 
-class Test_Context:
-    def test_snapshot_serializes_only_set_vars(self, fresh_module):
-        """Test _Context.snapshot omits vars with no explicit value.
+class Test_snapshot_vars:
+    def test_omits_vars_with_no_explicit_value(self, fresh_module):
+        """Test _snapshot_vars omits vars with no explicit value.
 
         Given:
             A module-bound ContextVar with no value set
         When:
-            _Context.snapshot() is called
+            _snapshot_vars() is called
         Then:
             The resulting dict should not contain that var's key
         """
@@ -267,19 +268,19 @@ class Test_Context:
         fresh_module.snapshot_unset = var
 
         # Act
-        result = _Context.snapshot()
+        result = _snapshot_vars()
 
         # Assert
         key = f"{fresh_module.__name__}:snapshot_unset"
         assert key not in result
 
-    def test_snapshot_includes_set_value_under_module_attr_key(self, fresh_module):
-        """Test _Context.snapshot emits mod:attr keys with serialized values.
+    def test_emits_set_value_under_module_attr_key(self, fresh_module):
+        """Test _snapshot_vars emits mod:attr keys with serialized values.
 
         Given:
             A module-bound ContextVar with a value set
         When:
-            _Context.snapshot() is called
+            _snapshot_vars() is called
         Then:
             The dict should contain 'mod:attr' → cloudpickled value
         """
@@ -289,20 +290,22 @@ class Test_Context:
         var.set({"x": 1})
 
         # Act
-        result = _Context.snapshot()
+        result = _snapshot_vars()
 
         # Assert
         key = f"{fresh_module.__name__}:snap_value"
         assert key in result
         assert cloudpickle.loads(result[key]) == {"x": 1}
 
-    def test_apply_restores_value_on_target_var(self, fresh_module):
-        """Test _Context.apply restores a serialized value onto the local var.
+
+class Test_apply_vars:
+    def test_restores_value_on_target_var(self, fresh_module):
+        """Test _apply_vars restores a serialized value onto the local var.
 
         Given:
             A module-bound ContextVar and a snapshot dict with its key
         When:
-            _Context.apply is called with the dict
+            _apply_vars is called with the dict
         Then:
             get() on the var should return the deserialized value
         """
@@ -314,18 +317,18 @@ class Test_Context:
         }
 
         # Act
-        _Context.apply(snapshot)
+        _apply_vars(snapshot)
 
         # Assert
         assert var.get() == "restored"
 
-    def test_apply_skips_unknown_module(self, caplog):
-        """Test _Context.apply warns and skips entries for unknown modules.
+    def test_skips_unknown_module(self, caplog):
+        """Test _apply_vars warns and skips entries for unknown modules.
 
         Given:
             A snapshot dict keyed by an absent module
         When:
-            _Context.apply is called
+            _apply_vars is called
         Then:
             It should log a warning and not raise
         """
@@ -333,7 +336,7 @@ class Test_Context:
         snapshot = {"no_such_module:nope": cloudpickle.dumps("x")}
 
         # Act
-        _Context.apply(snapshot)
+        _apply_vars(snapshot)
 
         # Assert — no exception; no assertion needed beyond completion
 

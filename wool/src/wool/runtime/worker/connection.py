@@ -14,7 +14,7 @@ import grpc.aio
 
 import wool
 from wool import protocol
-from wool.runtime.context import _Context
+from wool.runtime.context import _apply_vars
 from wool.runtime.context import _dumps
 from wool.runtime.context import build_stream_frame_payload
 from wool.runtime.context import build_task_frame_payload
@@ -159,7 +159,7 @@ class _DispatchStream(Generic[_T]):
         try:
             response = await anext(self._iter)
             if response.vars:
-                _Context.apply(dict(response.vars))
+                _apply_vars(dict(response.vars))
             if response.HasField("result"):
                 return cloudpickle.loads(response.result.dump)
             elif response.HasField("exception"):

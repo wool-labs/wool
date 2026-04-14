@@ -24,8 +24,9 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
-from wool.runtime.context import _Context
+from wool.runtime.context import _apply_vars
 from wool.runtime.context import _dumps
+from wool.runtime.context import _snapshot_vars
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import do_dispatch
@@ -232,7 +233,7 @@ class WorkerService(protocol.WorkerServicer):
 
         with _namespace.activate(lineage_id):
             if response.vars:
-                _Context.apply(dict(response.vars))
+                _apply_vars(dict(response.vars))
 
             if self._backpressure is not None:
                 decision = self._backpressure(
@@ -271,7 +272,7 @@ class WorkerService(protocol.WorkerServicer):
                         )
                 except (Exception, asyncio.CancelledError) as e:
                     exception = protocol.Message(dump=_dumps(e))
-                    ctx_snapshot = _Context.snapshot()
+                    ctx_snapshot = _snapshot_vars()
                     yield protocol.Response(
                         exception=exception,
                         vars=ctx_snapshot,
@@ -389,7 +390,7 @@ class WorkerService(protocol.WorkerServicer):
                         future.set_exception(t.exception())
                     else:
                         result = t.result()
-                        snapshot = _Context.snapshot(ctx)
+                        snapshot = _snapshot_vars(ctx)
                         future.set_result((result, snapshot))
 
                 task.add_done_callback(_done)
@@ -448,7 +449,7 @@ class WorkerService(protocol.WorkerServicer):
                                     break
                                 action, payload, caller_ctx = cmd
                                 if caller_ctx:
-                                    _Context.apply(caller_ctx)
+                                    _apply_vars(caller_ctx)
                                 try:
                                     with do_dispatch(False):
                                         match action:
@@ -468,14 +469,14 @@ class WorkerService(protocol.WorkerServicer):
                                     )
                                     return
                                 except BaseException as e:
-                                    ctx_snapshot = _Context.snapshot()
+                                    ctx_snapshot = _snapshot_vars()
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
                                         ("error", e, ctx_snapshot),
                                     )
                                     return
                                 else:
-                                    ctx_snapshot = _Context.snapshot()
+                                    ctx_snapshot = _snapshot_vars()
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
                                         ("value", value, ctx_snapshot),
