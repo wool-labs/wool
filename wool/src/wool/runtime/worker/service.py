@@ -161,10 +161,6 @@ class WorkerService(protocol.WorkerServicer):
         self._task_completed = asyncio.Event()
         self._docket = set()
         self._backpressure = backpressure
-        # Route task-active imports through the lineage-scoped module
-        # clone cache. Idempotent: only the first construction mutates
-        # sys.meta_path; subsequent constructions are no-ops.
-        _namespace.install()
         self._loop_pool = ResourcePool(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
@@ -218,14 +214,13 @@ class WorkerService(protocol.WorkerServicer):
 
         response = await anext(aiter(request_iterator))
 
-        # Extract lineage from the first Request; unpickle the Task,
-        # then activate the lineage + apply wire-shipped var values
-        # to the handler's context. Cloudpickle's by-reference import
-        # resolution during Task.from_protobuf hits the worker's
-        # sys.modules directly — no per-task isolation is needed for
-        # ContextVar propagation under the lineage-owned manifest
-        # design (each wool.ContextVar is a stdlib-wrapping instance
-        # discoverable by module.attr).
+        # Extract the lineage from the first Request, unpickle the
+        # Task, then activate the lineage and apply wire-shipped var
+        # values to the handler's context. Caller-side snapshots are
+        # keyed by UUID (UUID5 of module:attr for bound vars, UUID4
+        # for unbound); the worker resolves each UUID via the
+        # process-wide ContextVar registry and calls .set() on the
+        # local instance.
         lineage_hex = response.lineage_id
         lineage_id = uuid.UUID(hex=lineage_hex) if lineage_hex else uuid.uuid4()
 

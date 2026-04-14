@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import importlib
 import io
 import logging
-import operator
 import sys
 import weakref
 from typing import Any
@@ -901,28 +899,19 @@ def current_context() -> Context:
     return Context._from_vars(_lineage_id_now(), vars_dict)
 
 
-def build_task_frame_payload() -> tuple[dict[str, bytes], str]:
-    """Assemble the wire payload for the initial Task dispatch frame.
+def build_frame_payload() -> tuple[dict[str, bytes], str]:
+    """Assemble the wire payload for a dispatch or streaming frame.
 
     Returns ``(vars, lineage_id)`` for populating the protobuf
-    ``vars`` map and ``lineage_id`` string on the first Request of a
-    dispatch stream.
+    ``vars`` map and ``lineage_id`` string on any Request — the
+    initial dispatch or a subsequent ``next``/``send``/``throw``.
+    Every frame re-ships the current var snapshot plus the active
+    lineage UUID so forward-propagated caller mutations reach the
+    worker and the worker confirms the lineage on return.
 
-    ``lineage_id`` is the active lineage UUID as a hex string, or
-    empty when no lineage is active (root dispatch — the worker
-    assigns one).
-    """
-    vars_dict = _snapshot_vars()
-    lineage_hex = _lineage_id_now().hex
-    return vars_dict, lineage_hex
-
-
-def build_stream_frame_payload() -> tuple[dict[str, bytes], str]:
-    """Assemble the wire payload for streaming frames (next/send/throw).
-
-    Streaming frames re-ship the current var snapshot plus the
-    lineage ID so back-propagated values reach the caller and the
-    worker confirms the lineage.
+    ``lineage_id`` is the active lineage UUID as a hex string. When
+    no lineage has been adopted (root dispatch), it falls back to
+    the process-default lineage.
     """
     vars_dict = _snapshot_vars()
     lineage_hex = _lineage_id_now().hex
@@ -932,8 +921,3 @@ def build_stream_frame_payload() -> tuple[dict[str, bytes], str]:
 dispatch_timeout: Final[contextvars.ContextVar[float | None]] = contextvars.ContextVar(
     "dispatch_timeout", default=None
 )
-
-
-# Silence unused-import warnings for names retained as re-exportable
-# internals / API surface that static analysis may miss.
-_ = (operator, importlib)

@@ -16,8 +16,7 @@ import wool
 from wool import protocol
 from wool.runtime.context import _apply_vars
 from wool.runtime.context import _dumps
-from wool.runtime.context import build_stream_frame_payload
-from wool.runtime.context import build_task_frame_payload
+from wool.runtime.context import build_frame_payload
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
@@ -130,7 +129,7 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            vars_dict, lineage_hex = build_stream_frame_payload()
+            vars_dict, lineage_hex = build_frame_payload()
             request = protocol.Request(
                 next=protocol.Void(),
                 vars=vars_dict,
@@ -219,7 +218,7 @@ class _DispatchStream(Generic[_T]):
         self._running = True
         try:
             dump = _dumps(value)
-            vars_dict, lineage_hex = build_stream_frame_payload()
+            vars_dict, lineage_hex = build_frame_payload()
             request = protocol.Request(
                 send=protocol.Message(dump=dump),
                 vars=vars_dict,
@@ -267,7 +266,7 @@ class _DispatchStream(Generic[_T]):
                 exc = typ()
 
             dump = _dumps(exc)
-            vars_dict, lineage_hex = build_stream_frame_payload()
+            vars_dict, lineage_hex = build_frame_payload()
             request = protocol.Request(
                 throw=protocol.Message(dump=dump),
                 vars=vars_dict,
@@ -497,7 +496,7 @@ class WorkerConnection:
             try:
                 call: _DispatchCall = channel.stub.dispatch()
                 try:
-                    vars_dict, lineage_hex = build_task_frame_payload()
+                    vars_dict, lineage_hex = build_frame_payload()
                     request = protocol.Request(
                         task=task_msg,
                         vars=vars_dict,

@@ -17,9 +17,10 @@ import wool
 
 # Module-level wool.ContextVars used by the propagation integration tests.
 # They live at module level so cloudpickle imports this module on the
-# worker when it unpickles a routine defined here, which registers the
-# vars in the worker's wool.ContextVar._registry before RuntimeContext
-# restoration looks them up by name.
+# worker when it unpickles a routine defined here. The import causes
+# the worker's own wool.ContextVar instances to self-register in the
+# process-wide UUID registry; caller-side snapshots keyed by UUID5 of
+# "<module>:<attr>" then resolve to those same instances on the worker.
 TENANT_ID: wool.ContextVar[str] = wool.ContextVar("tenant_id", default="unknown")
 REGION: wool.ContextVar[str] = wool.ContextVar("region", default="global")
 TRACE_ID: wool.ContextVar[str] = wool.ContextVar("trace_id", default="none")
@@ -38,18 +39,12 @@ _RESET_TOKENS: wool.ContextVar[dict] = wool.ContextVar("_reset_tokens", default=
 def _var(name: str) -> "wool.ContextVar":
     """Look up a wool.ContextVar by logical name at call time.
 
-    Resolves against the module's live globals so that attribute
-    substitutions performed by wool's manifest machinery on the
-    worker (``sys.modules['integration.routines'].TENANT_ID = ...``)
-    are visible to every caller. A module-level ``dict`` built at
-    import time would retain stale references to the pre-substitution
-    instances; ``globals()[name.upper()]`` re-resolves each call.
+    Resolves against the module's live globals each call. This
+    indirection exists so that routines can take logical var names
+    from the caller-supplied pattern dict (e.g., ``"tenant_id"``)
+    and map them to the module-level ``ContextVar`` instance.
     """
     return globals()[name.upper()]
-
-
-# Deprecated legacy alias. Existing call sites use ``_var(name)``.
-VARS = {"tenant_id": TENANT_ID, "region": REGION, "trace_id": TRACE_ID}
 
 
 def _execute_patterns(patterns, *, step=None):

@@ -28,15 +28,11 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import logging
 import sys
 import uuid
 from contextlib import contextmanager
 from typing import Any
 from typing import Iterator
-
-_log = logging.getLogger(__name__)
-
 
 # ----------------------------------------------------------------------
 # Lineage fork detection
@@ -186,29 +182,6 @@ def adopt_lineage(lineage_id: uuid.UUID) -> None:
     if task is None:
         return
     _wool_sentinel.set(_LineageSentinel(lineage_id, _task_context_id(task)))
-
-
-# ----------------------------------------------------------------------
-# Install hook (kept for worker-service backwards compatibility)
-# ----------------------------------------------------------------------
-
-
-def install() -> None:
-    """No-op. Kept as a stable worker-service entry point.
-
-    Previous versions inserted a meta-path finder that routed task
-    imports through per-lineage module clones. The lineage-owned
-    manifest design makes that machinery unnecessary: worker-local
-    :class:`wool.ContextVar` instances receive values directly via
-    :func:`_apply_vars`, and per-task ``sys.modules`` isolation is
-    no longer required for ContextVar propagation.
-    """
-    return
-
-
-def uninstall() -> None:
-    """No-op. Kept as a stable worker-service entry point."""
-    return
 
 
 # ----------------------------------------------------------------------

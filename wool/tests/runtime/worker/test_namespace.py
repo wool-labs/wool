@@ -77,33 +77,3 @@ class TestActivate:
 
         # Assert
         assert observed == lineage
-
-
-class TestInstallUninstall:
-    def test_install_is_idempotent(self):
-        """Test install() can be called multiple times without error.
-
-        Given:
-            The namespace module
-        When:
-            install() is called twice in succession
-        Then:
-            No exception should be raised
-        """
-        # Act
-        _namespace.install()
-        _namespace.install()
-
-    def test_uninstall_is_idempotent(self):
-        """Test uninstall() can be called multiple times without error.
-
-        Given:
-            The namespace module
-        When:
-            uninstall() is called twice in succession
-        Then:
-            No exception should be raised
-        """
-        # Act
-        _namespace.uninstall()
-        _namespace.uninstall()
