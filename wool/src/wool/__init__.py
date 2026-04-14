@@ -7,6 +7,7 @@ from tblib import pickling_support
 
 from wool.runtime.context import Context
 from wool.runtime.context import ContextVar
+from wool.runtime.context import ContextVarIdentityError
 from wool.runtime.context import Token
 from wool.runtime.context import current_context
 from wool.runtime.discovery.base import Discovery
@@ -77,6 +78,7 @@ __all__ = [
     # Context
     "Context",
     "ContextVar",
+    "ContextVarIdentityError",
     "Token",
     "current_context",
     # Load balancing

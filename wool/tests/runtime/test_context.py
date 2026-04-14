@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import sys
 import types
+from uuid import uuid4
 
 import cloudpickle
 import pytest
@@ -48,18 +49,18 @@ class TestUnsetType:
         assert first is second
         assert first is _UNSET
 
-    def test___repr___returns_unset_literal(self):
-        """Test _UnsetType repr returns the string 'UNSET'.
+    def test___repr___matches_stdlib_token_missing_format(self):
+        """Test _UnsetType repr matches stdlib Token.MISSING format.
 
         Given:
             The _UNSET singleton
         When:
             repr() is called on it
         Then:
-            It should return the string 'UNSET'
+            It should return the stdlib-parity string '<Token.MISSING>'
         """
         # Act & assert
-        assert repr(_UNSET) == "UNSET"
+        assert repr(_UNSET) == "<Token.MISSING>"
 
     def test___bool___returns_false(self):
         """Test _UnsetType is falsy.
@@ -311,268 +312,196 @@ class TestContextVar:
         # Assert
         assert fresh_module.bar.get() == "mutation"
 
-    def test_snapshot_emits_entries_for_every_alias(self, fresh_module):
-        """Test _snapshot_vars includes all bindings of an aliased var.
+    def test_pickling_unbound_var_mints_uuid4_and_roundtrips(self):
+        """Test pickling an unbound ContextVar succeeds via lazy UUID4.
 
         Given:
-            A ContextVar aliased under multiple module attributes
+            A ContextVar never assigned to any module attribute
         When:
-            _snapshot_vars() is called after setting a value
+            It is pickled and unpickled via _dumps / _loads
         Then:
-            The snapshot should contain one entry per alias, each
-            carrying the same serialized value
+            The unpickled instance should be identical to the original
+            (via the UUID4 registry)
         """
         # Arrange
-        var = ContextVar("multi")
-        fresh_module.primary = var
-        fresh_module.secondary = var
-        var.set("value")
+        var = ContextVar("ephemeral")
 
         # Act
-        snapshot = _snapshot_vars()
+        restored = _loads(_dumps(var))
 
-        # Assert
-        primary_key = f"{fresh_module.__name__}:primary"
-        secondary_key = f"{fresh_module.__name__}:secondary"
-        assert primary_key in snapshot
-        assert secondary_key in snapshot
-        assert snapshot[primary_key] == snapshot[secondary_key]
+        # Assert — same instance, identity preserved via UUID4 registry
+        assert restored is var
 
-    def test_reconstruct_falls_back_to_later_locations(self, fresh_module):
-        """Test the pickle reconstructor tries every location in order.
+    def test_resolve_ids_is_deterministic_across_calls(self, fresh_module):
+        """Test _resolve_ids returns a stable id list for a bound var.
 
         Given:
-            A ContextVar whose cached locations list starts with a
-            location that does not exist on the receiver
+            A module-bound ContextVar
+        When:
+            _resolve_ids is called multiple times with no module changes
+        Then:
+            The returned lists should be equal in order and content
+        """
+        # Arrange
+        var = ContextVar("stable")
+        fresh_module.stable = var
+
+        # Act
+        first = var._resolve_ids()
+        second = var._resolve_ids()
+
+        # Assert
+        assert first == second
+        assert all(uid.version == 5 for uid in first)
+
+    def test_class_attribute_contextvar_pickles_via_uuid5(self, fresh_module):
+        """Test a ContextVar bound inside a class body pickles via UUID5.
+
+        Given:
+            A ContextVar bound as a class-level attribute
         When:
             The var is pickled and unpickled
         Then:
-            The reconstructor should fall back to the next valid
-            location and return the same instance
+            The round-trip should return the same instance, resolved
+            via UUID5 of the class-scoped location
         """
+
         # Arrange
-        var = ContextVar("fallback")
-        fresh_module.fallback = var
-        # Seed the cache with a bad first entry followed by the real one.
-        var._locations = [
-            ("nonexistent_module_for_fallback_test", "ghost"),
-            (fresh_module.__name__, "fallback"),
-        ]
+        class Holder:
+            pass
+
+        var = ContextVar("class_bound")
+        Holder.trace = var
+        fresh_module.Holder = Holder
 
         # Act
         restored = _loads(_dumps(var))
 
         # Assert
         assert restored is var
+        # Verify the id list includes a UUID5 for the class-scoped path
+        ids = var._resolve_ids()
+        assert any(uid.version == 5 for uid in ids)
 
-    def test_resolve_locations_cache_hit_avoids_rescan(self, fresh_module):
-        """Test repeated pickling of a bound var reuses the cached locations.
-
-        Given:
-            A module-bound ContextVar that has been pickled once so the
-            locations cache is populated
-        When:
-            The same var is pickled again without any intervening module
-            changes
-        Then:
-            The produced byte strings should be byte-identical, reflecting
-            a cache-hit path that doesn't rescan sys.modules
-        """
-        # Arrange
-        var = ContextVar("cache_hit")
-        fresh_module.cache_hit = var
-        first = _dumps(var)
-
-        # Act
-        second = _dumps(var)
-
-        # Assert
-        assert first == second
-
-    def test_pickling_unbound_var_raises_pickling_error(self):
-        """Test pickling an unbound ContextVar raises PicklingError.
+    def test_divergence_raises_context_var_identity_error(self, fresh_module):
+        """Test multi-instance resolution raises ContextVarIdentityError.
 
         Given:
-            A ContextVar that is never assigned to any module attribute
+            Two distinct ContextVar instances registered under two
+            UUIDs that the reducer would ship together (simulating
+            worker-side drift where caller's aliases resolve to
+            different worker-side instances)
         When:
-            It is pickled via _dumps (inside a closure-carrying tuple)
+            The synthesized pickle is loaded
         Then:
-            It should raise pickle.PicklingError describing the unbound
-            state
+            _reconstruct should raise ContextVarIdentityError
         """
-        # Arrange
-        import pickle as _pickle
+        # Arrange — produce two distinct instances with known UUID4s
+        from wool.runtime.context import ContextVarIdentityError
 
-        var = ContextVar("never_bound")
-        # Deliberately do NOT assign to any module.
+        a = ContextVar("divergent_a")
+        b = ContextVar("divergent_b")
+        # Force each to mint a UUID4 via _resolve_ids (no module binding)
+        a_ids = a._resolve_ids()
+        b_ids = b._resolve_ids()
+        mixed_ids = [a_ids[0], b_ids[0]]
 
         # Act & assert
-        with pytest.raises(_pickle.PicklingError, match="not bound to any"):
-            _dumps(var)
+        from wool.runtime.context import _reconstruct
 
-    def test_resolve_locations_skips_none_module_entries(self, fresh_module):
-        """Test _resolve_locations silently skips None entries in sys.modules.
+        with pytest.raises(ContextVarIdentityError):
+            _reconstruct(mixed_ids, "mixed", False, None)
+
+    def test_reconstruct_constructs_fresh_when_nothing_resolves(self):
+        """Test _reconstruct creates a fresh instance for unknown UUIDs.
 
         Given:
-            A bound ContextVar, with sys.modules containing a None entry
-            (sentinel values can appear in sys.modules during failed imports)
+            A list of UUIDs that are not in the registry and not
+            resolvable via sys.modules walk (fresh UUID4s simulate a
+            worker receiving a caller-minted unbound var)
         When:
-            The var is pickled (triggering _resolve_locations)
+            _reconstruct is invoked
         Then:
-            The pickle should succeed, producing the var's bound location;
-            the None entry does not cause an exception
+            It should construct and register a fresh ContextVar
+            instance, returning it
         """
         # Arrange
-        var = ContextVar("skip_none")
-        fresh_module.skip_none = var
-        # Invalidate cache so sys.modules walk actually runs.
-        var._locations = None
-        sys.modules["__none_sentinel_probe__"] = None
-        try:
-            # Act
-            restored = _loads(_dumps(var))
-        finally:
-            sys.modules.pop("__none_sentinel_probe__", None)
+        from wool.runtime.context import _reconstruct
 
-        # Assert
-        assert restored is var
-
-    def test_resolve_locations_skips_non_dict_modules(self, fresh_module):
-        """Test _resolve_locations silently skips modules whose __dict__ raises.
-
-        Given:
-            A bound ContextVar, with sys.modules containing an object whose
-            __dict__ access raises AttributeError
-        When:
-            The var is pickled (triggering _resolve_locations)
-        Then:
-            The pickle should succeed; the pathological entry is skipped
-            rather than causing the walk to fail
-        """
-
-        # Arrange
-        class _NoDictModule:
-            def __getattribute__(self, item):
-                if item == "__dict__":
-                    raise AttributeError("no dict here")
-                return super().__getattribute__(item)
-
-        var = ContextVar("skip_no_dict")
-        fresh_module.skip_no_dict = var
-        var._locations = None
-        sys.modules["__nodict_sentinel_probe__"] = _NoDictModule()
-        try:
-            # Act
-            restored = _loads(_dumps(var))
-        finally:
-            sys.modules.pop("__nodict_sentinel_probe__", None)
-
-        # Assert
-        assert restored is var
-
-    def test_reconstruct_falls_back_across_import_error(self, fresh_module):
-        """Test the reconstructor falls past locations whose module can't import.
-
-        Given:
-            A module-bound ContextVar pickled while bound at two
-            locations (a temporary module first, then a legitimate one);
-            before unpickling, the temporary module is removed from
-            sys.modules and is not importable
-        When:
-            The pickled form is loaded
-        Then:
-            The reconstructor should encounter ImportError on the first
-            location, fall through, and return the var via the second
-        """
-        # Arrange — bind the var in both modules, forcing temp first
-        temp_name = "__temp_import_fail_module__"
-        temp_mod = types.ModuleType(temp_name)
-        sys.modules[temp_name] = temp_mod
-        var = ContextVar("import_fail_cv")
-        temp_mod.exported = var
-        fresh_module.import_fail_cv = var
-        # Pin the order so the non-importable location is tried first.
-        var._locations = [
-            (temp_name, "exported"),
-            (fresh_module.__name__, "import_fail_cv"),
-        ]
-        try:
-            blob = _dumps(var)
-            sys.modules.pop(temp_name, None)
-            del temp_mod.exported
-
-            # Act
-            restored = _loads(blob)
-
-            # Assert
-            assert restored is fresh_module.import_fail_cv
-        finally:
-            sys.modules.pop(temp_name, None)
-
-    def test_reconstruct_raises_when_no_location_resolves(self, fresh_module):
-        """Test the reconstructor raises RuntimeError when every location fails.
-
-        Given:
-            A ContextVar whose locations list points exclusively to
-            modules that are not in sys.modules and not importable
-        When:
-            The pickled form is loaded
-        Then:
-            It should raise RuntimeError whose message names the failed
-            locations
-        """
-        # Arrange — two temp modules; both removed before unpickling
-        name_a = "__temp_all_fail_a__"
-        name_b = "__temp_all_fail_b__"
-        mod_a = types.ModuleType(name_a)
-        mod_b = types.ModuleType(name_b)
-        sys.modules[name_a] = mod_a
-        sys.modules[name_b] = mod_b
-        var = ContextVar("all_fail_cv")
-        mod_a.exported = var
-        mod_b.exported = var
-        var._locations = [(name_a, "exported"), (name_b, "exported")]
-        try:
-            blob = _dumps(var)
-            sys.modules.pop(name_a, None)
-            sys.modules.pop(name_b, None)
-            del mod_a.exported
-            del mod_b.exported
-
-            # Act & assert
-            with pytest.raises(RuntimeError, match="Cannot resolve"):
-                _loads(blob)
-        finally:
-            sys.modules.pop(name_a, None)
-            sys.modules.pop(name_b, None)
-
-    def test_reconstruct_falls_back_when_attr_is_not_context_var(self, fresh_module):
-        """Test the reconstructor skips locations whose attr is not a ContextVar.
-
-        Given:
-            A module-bound ContextVar pickled at two locations; before
-            unpickling, one of those locations is rebound to a
-            non-ContextVar attribute
-        When:
-            The pickled form is loaded
-        Then:
-            The reconstructor should record the not-a-ContextVar error
-            at the first location, fall through, and return the var via
-            the second
-        """
-        # Arrange — bind the var at a second attribute on fresh_module
-        var = ContextVar("not_cv_cv")
-        fresh_module.not_cv_primary = var
-        fresh_module.not_cv_alias = var
-        blob = _dumps(var)
-        # Rebind primary to a non-ContextVar BEFORE unpickling
-        fresh_module.not_cv_primary = 42
+        fresh_ids = [uuid4(), uuid4()]
 
         # Act
-        restored = _loads(blob)
+        restored = _reconstruct(fresh_ids, "fresh_var", True, "fallback")
+
+        # Assert
+        assert isinstance(restored, ContextVar)
+        assert restored.name == "fresh_var"
+        assert restored.get() == "fallback"
+        # Registered under all ids
+        for uid in fresh_ids:
+            assert ContextVar._uuid_registry.get(uid) is restored
+
+    def test_reconstruct_resolves_via_sys_modules_walk(self, fresh_module):
+        """Test _reconstruct falls back to sys.modules UUID5 match.
+
+        Given:
+            A bound ContextVar whose UUID5 is NOT in the registry yet
+            (simulating receiver first-touch)
+        When:
+            _reconstruct is called with the var's UUID5
+        Then:
+            It should walk sys.modules, compute UUID5 for each bound
+            ContextVar, find the match, and return that instance
+        """
+        # Arrange
+        from wool.runtime.context import _reconstruct
+
+        var = ContextVar("walk_target")
+        fresh_module.walk_target = var
+        # Compute what the UUID5 would be, but DON'T call _resolve_ids
+        # (which would populate the registry).
+        from uuid import uuid5
+
+        from wool.runtime.context import _NAMESPACE_UUID
+
+        target_uuid = uuid5(_NAMESPACE_UUID, f"{fresh_module.__name__}:walk_target")
+        # Ensure not in registry
+        ContextVar._uuid_registry.pop(target_uuid, None)
+
+        # Act
+        restored = _reconstruct([target_uuid], "walk_target", False, None)
 
         # Assert
         assert restored is var
+
+    def test_reconstruct_enriches_registry_with_unresolved_ids(self, fresh_module):
+        """Test reconstruction registers unknown ids under the resolved instance.
+
+        Given:
+            A bound ContextVar known to the registry under one UUID
+            and a wire id list that includes an additional unknown UUID
+        When:
+            _reconstruct is invoked with both ids
+        Then:
+            The resolved instance should be returned, and the unknown
+            UUID should become registered under that instance
+        """
+        # Arrange
+        from wool.runtime.context import _reconstruct
+
+        var = ContextVar("enrich_target")
+        fresh_module.enrich_target = var
+        var._resolve_ids()  # populate registry
+        ids = list(var._ids or [])
+        ghost_id = uuid4()
+        combined_ids = [*ids, ghost_id]
+
+        # Act
+        resolved = _reconstruct(combined_ids, "enrich_target", False, None)
+
+        # Assert
+        assert resolved is var
+        assert ContextVar._uuid_registry.get(ghost_id) is var
 
 
 class TestToken:
@@ -622,15 +551,16 @@ class Test_snapshot_vars:
         key = f"{fresh_module.__name__}:snapshot_unset"
         assert key not in result
 
-    def test_emits_set_value_under_module_attr_key(self, fresh_module):
-        """Test _snapshot_vars emits mod:attr keys with serialized values.
+    def test_emits_set_value_under_uuid_key(self, fresh_module):
+        """Test _snapshot_vars emits UUID-hex keys with serialized values.
 
         Given:
             A module-bound ContextVar with a value set
         When:
             _snapshot_vars() is called
         Then:
-            The dict should contain 'mod:attr' → cloudpickled value
+            The dict should contain the var's canonical UUID hex key
+            mapped to the cloudpickled value
         """
         # Arrange
         var = ContextVar("snap_value")
@@ -641,7 +571,8 @@ class Test_snapshot_vars:
         result = _snapshot_vars()
 
         # Assert
-        key = f"{fresh_module.__name__}:snap_value"
+        ids = var._resolve_ids()
+        key = ids[0].hex
         assert key in result
         assert cloudpickle.loads(result[key]) == {"x": 1}
 
@@ -669,7 +600,8 @@ class Test_snapshot_vars:
         result = _snapshot_vars(seeded)
 
         # Assert
-        key = f"{fresh_module.__name__}:ctx_snap"
+        ids = var._resolve_ids()
+        key = ids[0].hex
         assert key in result
         assert cloudpickle.loads(result[key]) == "inner"
 
@@ -694,37 +626,35 @@ class Test_snapshot_vars:
         result = _snapshot_vars(empty_ctx)
 
         # Assert
-        key = f"{fresh_module.__name__}:ctx_absent"
+        ids = var._resolve_ids()
+        key = ids[0].hex
         assert key not in result
 
-    def test_warns_and_skips_unbound_var_in_current_context(self, caplog):
-        """Test _snapshot_vars omits vars not bound to any module attr.
+    def test_unbound_var_emitted_under_uuid4(self):
+        """Test _snapshot_vars emits unbound vars under their lazy UUID4.
 
         Given:
-            A ContextVar constructed but never assigned to any module
-            attribute, with a value set in the current context
+            A ContextVar never assigned to any module with a value set
         When:
-            _snapshot_vars() is called with caplog capturing WARNINGs
+            _snapshot_vars() is called
         Then:
-            The result should not contain any entry for this var and a
-            WARNING should be logged naming the var
+            The result should include an entry under the var's UUID4
+            (minted lazily during id resolution)
         """
         # Arrange
-        import logging
-
-        var = ContextVar("unbound_snapshot")
-        # Deliberately do NOT bind to a module.
+        var = ContextVar("unbound_emitted")
         var.set("ephemeral")
         try:
             # Act
-            with caplog.at_level(logging.WARNING, logger="wool.runtime.context"):
-                result = _snapshot_vars()
+            result = _snapshot_vars()
 
-            # Assert — no wire entry for the unbound var
-            assert all("unbound_snapshot" not in k for k in result)
-            assert any("unbound_snapshot" in rec.getMessage() for rec in caplog.records)
+            # Assert
+            ids = var._resolve_ids()
+            assert any(uid.version == 4 for uid in ids)
+            uuid4_key = next(uid.hex for uid in ids if uid.version == 4)
+            assert uuid4_key in result
+            assert cloudpickle.loads(result[uuid4_key]) == "ephemeral"
         finally:
-            # Clean up registry-level side-effects from this var.
             var._stdlib.set(_UNSET)
 
     def test_raises_typeerror_on_unpicklable_value(self, fresh_module):
@@ -760,7 +690,8 @@ class Test_apply_vars:
         """Test _apply_vars restores a serialized value onto the local var.
 
         Given:
-            A module-bound ContextVar and a snapshot dict with its key
+            A module-bound ContextVar and a snapshot dict keyed by the
+            var's canonical UUID hex
         When:
             _apply_vars is called with the dict
         Then:
@@ -769,9 +700,8 @@ class Test_apply_vars:
         # Arrange
         var = ContextVar("apply_target")
         fresh_module.apply_target = var
-        snapshot = {
-            f"{fresh_module.__name__}:apply_target": cloudpickle.dumps("restored")
-        }
+        ids = var._resolve_ids()
+        snapshot = {ids[0].hex: cloudpickle.dumps("restored")}
 
         # Act
         _apply_vars(snapshot)
@@ -779,23 +709,27 @@ class Test_apply_vars:
         # Assert
         assert var.get() == "restored"
 
-    def test_skips_unknown_module(self, caplog):
-        """Test _apply_vars warns and skips entries for unknown modules.
+    def test_skips_unknown_uuid(self, caplog):
+        """Test _apply_vars warns and skips entries for unknown UUIDs.
 
         Given:
-            A snapshot dict keyed by an absent module
+            A snapshot dict keyed by a UUID not in the registry
         When:
             _apply_vars is called
         Then:
             It should log a warning and not raise
         """
         # Arrange
-        snapshot = {"no_such_module:nope": cloudpickle.dumps("x")}
+        import logging
+
+        snapshot = {uuid4().hex: cloudpickle.dumps("x")}
 
         # Act
-        _apply_vars(snapshot)
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.context"):
+            _apply_vars(snapshot)
 
-        # Assert — no exception; no assertion needed beyond completion
+        # Assert
+        assert any("not resolvable" in rec.getMessage() for rec in caplog.records)
 
     def test_empty_dict_returns_immediately(self):
         """Test _apply_vars is a no-op for an empty dict.
@@ -813,10 +747,10 @@ class Test_apply_vars:
         # Assert — completion without exception
 
     def test_warns_on_malformed_key(self, caplog):
-        """Test _apply_vars warns on keys missing the module:attr separator.
+        """Test _apply_vars warns on keys that aren't valid UUID hex.
 
         Given:
-            A vars dict with a key that lacks a colon
+            A vars dict with a key that isn't a valid UUID
         When:
             _apply_vars is called with caplog capturing WARNINGs
         Then:
@@ -826,7 +760,7 @@ class Test_apply_vars:
         # Arrange
         import logging
 
-        snapshot = {"no_colon_here": cloudpickle.dumps("x")}
+        snapshot = {"not-a-valid-uuid": cloudpickle.dumps("x")}
 
         # Act
         with caplog.at_level(logging.WARNING, logger="wool.runtime.context"):
@@ -835,47 +769,27 @@ class Test_apply_vars:
         # Assert
         assert any("Malformed" in rec.getMessage() for rec in caplog.records)
 
-    def test_warns_when_attr_is_not_a_context_var(self, fresh_module, caplog):
-        """Test _apply_vars warns when location resolves to a non-ContextVar.
-
-        Given:
-            A module attribute that is not a wool.ContextVar (a plain int)
-            and a vars dict pointing at that location
-        When:
-            _apply_vars is called with caplog capturing WARNINGs
-        Then:
-            It should log a warning and skip the entry; no exception
-            is raised
-        """
-        # Arrange
-        import logging
-
-        fresh_module.not_a_cv = 99
-        snapshot = {f"{fresh_module.__name__}:not_a_cv": cloudpickle.dumps("ignored")}
-
-        # Act
-        with caplog.at_level(logging.WARNING, logger="wool.runtime.context"):
-            _apply_vars(snapshot)
-
-        # Assert
-        assert any("not a ContextVar" in rec.getMessage() for rec in caplog.records)
-        assert fresh_module.not_a_cv == 99  # unchanged
-
 
 class TestContext:
-    def test___new___direct_instantiation_rejected(self):
-        """Test Context.__new__ forbids direct construction.
+    def test___new___allows_direct_instantiation(self):
+        """Test Context() creates an empty context with a fresh lineage UUID.
 
         Given:
             The Context class
         When:
-            A caller attempts Context()
+            Context() is called directly
         Then:
-            It should raise TypeError
+            It should return an empty Context with a freshly-minted
+            lineage UUID; two direct constructions produce distinct
+            lineages
         """
-        # Act & assert
-        with pytest.raises(TypeError):
-            Context()
+        # Act
+        ctx_a = Context()
+        ctx_b = Context()
+
+        # Assert
+        assert len(ctx_a) == 0
+        assert ctx_a.id != ctx_b.id
 
     def test_run_seeds_vars_and_scopes_mutations(self, fresh_module):
         """Test Context.run seeds vars and scopes inner mutations.
