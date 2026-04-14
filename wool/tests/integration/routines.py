@@ -420,8 +420,7 @@ async def get_tenant_id() -> str:
     """Coroutine that returns the worker-side value of TENANT_ID.
 
     Used to verify that a wool.ContextVar value set on the caller is
-    propagated into the worker's RuntimeContext before the routine
-    runs.
+    propagated into the worker's context before the routine runs.
     """
     return TENANT_ID.get()
 

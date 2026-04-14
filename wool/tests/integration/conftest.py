@@ -30,7 +30,7 @@ from cryptography.x509.oid import NameOID
 from hypothesis import strategies as st
 
 import wool
-from wool.runtime.context import RuntimeContext
+from wool.runtime.context import dispatch_timeout
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.worker.auth import WorkerCredentials
@@ -309,9 +309,9 @@ async def build_pool_from_scenario(scenario, credentials_map):
 
                 discovery_obj = _lan_async_cm()
 
-    runtime_ctx = None
+    dispatch_timeout_token = None
     if scenario.timeout is TimeoutKind.VIA_RUNTIME_CONTEXT:
-        runtime_ctx = RuntimeContext(dispatch_timeout=30.0)
+        dispatch_timeout_token = dispatch_timeout.set(30.0)
 
     lazy = scenario.lazy is LazyMode.LAZY
 
@@ -324,9 +324,6 @@ async def build_pool_from_scenario(scenario, credentials_map):
             bp_hook = None
 
     try:
-        if runtime_ctx is not None:
-            runtime_ctx.__enter__()
-
         try:
             if scenario.pool_mode is PoolMode.DURABLE:
                 async with _durable_pool_context(
@@ -395,8 +392,8 @@ async def build_pool_from_scenario(scenario, credentials_map):
                     else:
                         yield pool
         finally:
-            if runtime_ctx is not None:
-                runtime_ctx.__exit__(None, None, None)
+            if dispatch_timeout_token is not None:
+                dispatch_timeout.reset(dispatch_timeout_token)
     finally:
         if _local_cm is not None:
             _local_cm.__exit__(None, None, None)
@@ -1214,8 +1211,8 @@ def _clear_test_context_vars():
         routines.TEST_PATTERNS,
         routines._RESET_TOKENS,
     ):
-        if var._var.get() is not _UNSET:
-            var._var.set(_UNSET)
+        if var._stdlib.get() is not _UNSET:
+            var._stdlib.set(_UNSET)
 
 
 @pytest.fixture

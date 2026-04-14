@@ -290,13 +290,13 @@ class TestPoolComposition:
 
     @pytest.mark.asyncio
     async def test_build_pool_from_scenario_with_dispatch_timeout(self, credentials_map):
-        """Test building a pool with dispatch_timeout via RuntimeContext.
+        """Test building a pool with dispatch_timeout set in the context.
 
         Given:
             A complete scenario using VIA_RUNTIME_CONTEXT timeout.
         When:
-            A pool is built within a RuntimeContext and a coroutine is
-            dispatched.
+            A pool is built with dispatch_timeout set in the ambient
+            context and a coroutine is dispatched.
         Then:
             It should return the correct result with the timeout active.
         """
