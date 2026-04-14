@@ -206,6 +206,70 @@ class TestContextVar:
         with pytest.raises(ValueError):
             b.reset(token)
 
+    def test_reset_falls_back_to_old_value_in_fresh_stdlib_context(self, fresh_module):
+        """Test reset via _old_value fallback when stdlib token is cross-context.
+
+        Given:
+            A module-bound ContextVar that is set twice (so the second
+            Token's captured old_value is a real previous value), then a
+            fresh stdlib Context is entered in which the second Token's
+            stdlib-token is not valid
+        When:
+            reset(token) is invoked inside the fresh stdlib Context
+        Then:
+            It should catch the stdlib ValueError and restore the var to
+            its pre-second-set value via the Token's captured _old_value
+        """
+        # Arrange
+        var = ContextVar("reset_fallback", default="initial")
+        fresh_module.reset_fallback = var
+        var.set("first")
+        token = var.set("second")
+        seeded = contextvars.copy_context()
+
+        def body():
+            var.set("outer-most")
+            # Inside this stdlib Context the outer token is not valid.
+            var.reset(token)
+            return var.get()
+
+        # Act
+        result = seeded.run(body)
+
+        # Assert — reset fell back to _old_value = "first"
+        assert result == "first"
+
+    def test_reset_falls_back_to_unset_old_value_in_fresh_stdlib_context(
+        self, fresh_module
+    ):
+        """Test reset fallback restores _UNSET when that was the prior state.
+
+        Given:
+            A previously-unset ContextVar; a set() produces a Token whose
+            _old_value is _UNSET; a fresh stdlib Context is entered
+        When:
+            reset(token) is invoked in the fresh Context
+        Then:
+            The var should revert to unset; get(fallback) returns the
+            supplied fallback
+        """
+        # Arrange
+        var = ContextVar("reset_unset_fallback")
+        fresh_module.reset_unset_fallback = var
+        token = var.set("briefly")
+        seeded = contextvars.copy_context()
+
+        def body():
+            var.set("nested")
+            var.reset(token)
+            return var.get("<fallback>")
+
+        # Act
+        result = seeded.run(body)
+
+        # Assert
+        assert result == "<fallback>"
+
     def test_pickle_roundtrip_via_module_binding(self, fresh_module):
         """Test cloudpickle roundtrips a module-bound ContextVar to the same instance.
 
@@ -301,6 +365,215 @@ class TestContextVar:
         # Assert
         assert restored is var
 
+    def test_resolve_locations_cache_hit_avoids_rescan(self, fresh_module):
+        """Test repeated pickling of a bound var reuses the cached locations.
+
+        Given:
+            A module-bound ContextVar that has been pickled once so the
+            locations cache is populated
+        When:
+            The same var is pickled again without any intervening module
+            changes
+        Then:
+            The produced byte strings should be byte-identical, reflecting
+            a cache-hit path that doesn't rescan sys.modules
+        """
+        # Arrange
+        var = ContextVar("cache_hit")
+        fresh_module.cache_hit = var
+        first = _dumps(var)
+
+        # Act
+        second = _dumps(var)
+
+        # Assert
+        assert first == second
+
+    def test_pickling_unbound_var_raises_pickling_error(self):
+        """Test pickling an unbound ContextVar raises PicklingError.
+
+        Given:
+            A ContextVar that is never assigned to any module attribute
+        When:
+            It is pickled via _dumps (inside a closure-carrying tuple)
+        Then:
+            It should raise pickle.PicklingError describing the unbound
+            state
+        """
+        # Arrange
+        import pickle as _pickle
+
+        var = ContextVar("never_bound")
+        # Deliberately do NOT assign to any module.
+
+        # Act & assert
+        with pytest.raises(_pickle.PicklingError, match="not bound to any"):
+            _dumps(var)
+
+    def test_resolve_locations_skips_none_module_entries(self, fresh_module):
+        """Test _resolve_locations silently skips None entries in sys.modules.
+
+        Given:
+            A bound ContextVar, with sys.modules containing a None entry
+            (sentinel values can appear in sys.modules during failed imports)
+        When:
+            The var is pickled (triggering _resolve_locations)
+        Then:
+            The pickle should succeed, producing the var's bound location;
+            the None entry does not cause an exception
+        """
+        # Arrange
+        var = ContextVar("skip_none")
+        fresh_module.skip_none = var
+        # Invalidate cache so sys.modules walk actually runs.
+        var._locations = None
+        sys.modules["__none_sentinel_probe__"] = None
+        try:
+            # Act
+            restored = _loads(_dumps(var))
+        finally:
+            sys.modules.pop("__none_sentinel_probe__", None)
+
+        # Assert
+        assert restored is var
+
+    def test_resolve_locations_skips_non_dict_modules(self, fresh_module):
+        """Test _resolve_locations silently skips modules whose __dict__ raises.
+
+        Given:
+            A bound ContextVar, with sys.modules containing an object whose
+            __dict__ access raises AttributeError
+        When:
+            The var is pickled (triggering _resolve_locations)
+        Then:
+            The pickle should succeed; the pathological entry is skipped
+            rather than causing the walk to fail
+        """
+
+        # Arrange
+        class _NoDictModule:
+            def __getattribute__(self, item):
+                if item == "__dict__":
+                    raise AttributeError("no dict here")
+                return super().__getattribute__(item)
+
+        var = ContextVar("skip_no_dict")
+        fresh_module.skip_no_dict = var
+        var._locations = None
+        sys.modules["__nodict_sentinel_probe__"] = _NoDictModule()
+        try:
+            # Act
+            restored = _loads(_dumps(var))
+        finally:
+            sys.modules.pop("__nodict_sentinel_probe__", None)
+
+        # Assert
+        assert restored is var
+
+    def test_reconstruct_falls_back_across_import_error(self, fresh_module):
+        """Test the reconstructor falls past locations whose module can't import.
+
+        Given:
+            A module-bound ContextVar pickled while bound at two
+            locations (a temporary module first, then a legitimate one);
+            before unpickling, the temporary module is removed from
+            sys.modules and is not importable
+        When:
+            The pickled form is loaded
+        Then:
+            The reconstructor should encounter ImportError on the first
+            location, fall through, and return the var via the second
+        """
+        # Arrange — bind the var in both modules, forcing temp first
+        temp_name = "__temp_import_fail_module__"
+        temp_mod = types.ModuleType(temp_name)
+        sys.modules[temp_name] = temp_mod
+        var = ContextVar("import_fail_cv")
+        temp_mod.exported = var
+        fresh_module.import_fail_cv = var
+        # Pin the order so the non-importable location is tried first.
+        var._locations = [
+            (temp_name, "exported"),
+            (fresh_module.__name__, "import_fail_cv"),
+        ]
+        try:
+            blob = _dumps(var)
+            sys.modules.pop(temp_name, None)
+            del temp_mod.exported
+
+            # Act
+            restored = _loads(blob)
+
+            # Assert
+            assert restored is fresh_module.import_fail_cv
+        finally:
+            sys.modules.pop(temp_name, None)
+
+    def test_reconstruct_raises_when_no_location_resolves(self, fresh_module):
+        """Test the reconstructor raises RuntimeError when every location fails.
+
+        Given:
+            A ContextVar whose locations list points exclusively to
+            modules that are not in sys.modules and not importable
+        When:
+            The pickled form is loaded
+        Then:
+            It should raise RuntimeError whose message names the failed
+            locations
+        """
+        # Arrange — two temp modules; both removed before unpickling
+        name_a = "__temp_all_fail_a__"
+        name_b = "__temp_all_fail_b__"
+        mod_a = types.ModuleType(name_a)
+        mod_b = types.ModuleType(name_b)
+        sys.modules[name_a] = mod_a
+        sys.modules[name_b] = mod_b
+        var = ContextVar("all_fail_cv")
+        mod_a.exported = var
+        mod_b.exported = var
+        var._locations = [(name_a, "exported"), (name_b, "exported")]
+        try:
+            blob = _dumps(var)
+            sys.modules.pop(name_a, None)
+            sys.modules.pop(name_b, None)
+            del mod_a.exported
+            del mod_b.exported
+
+            # Act & assert
+            with pytest.raises(RuntimeError, match="Cannot resolve"):
+                _loads(blob)
+        finally:
+            sys.modules.pop(name_a, None)
+            sys.modules.pop(name_b, None)
+
+    def test_reconstruct_falls_back_when_attr_is_not_context_var(self, fresh_module):
+        """Test the reconstructor skips locations whose attr is not a ContextVar.
+
+        Given:
+            A module-bound ContextVar pickled at two locations; before
+            unpickling, one of those locations is rebound to a
+            non-ContextVar attribute
+        When:
+            The pickled form is loaded
+        Then:
+            The reconstructor should record the not-a-ContextVar error
+            at the first location, fall through, and return the var via
+            the second
+        """
+        # Arrange — bind the var at a second attribute on fresh_module
+        var = ContextVar("not_cv_cv")
+        fresh_module.not_cv_primary = var
+        fresh_module.not_cv_alias = var
+        blob = _dumps(var)
+        # Rebind primary to a non-ContextVar BEFORE unpickling
+        fresh_module.not_cv_primary = 42
+
+        # Act
+        restored = _loads(blob)
+
+        # Assert
+        assert restored is var
+
 
 class TestToken:
     def test_pickle_roundtrip_preserves_reset_semantics(self, fresh_module):
@@ -372,6 +645,115 @@ class Test_snapshot_vars:
         assert key in result
         assert cloudpickle.loads(result[key]) == {"x": 1}
 
+    def test_reads_from_explicit_stdlib_context(self, fresh_module):
+        """Test _snapshot_vars(ctx) reads values from the supplied Context.
+
+        Given:
+            A module-bound ContextVar set to value X in an explicit
+            stdlib Context, and a different value Y set in the current
+            context
+        When:
+            _snapshot_vars(explicit_ctx) is called
+        Then:
+            The wire map should contain X (the value from the explicit
+            Context), not Y
+        """
+        # Arrange
+        var = ContextVar("ctx_snap")
+        fresh_module.ctx_snap = var
+        var.set("outer")
+        seeded = contextvars.copy_context()
+        seeded.run(lambda: var.set("inner"))
+
+        # Act
+        result = _snapshot_vars(seeded)
+
+        # Assert
+        key = f"{fresh_module.__name__}:ctx_snap"
+        assert key in result
+        assert cloudpickle.loads(result[key]) == "inner"
+
+    def test_skips_vars_absent_from_explicit_context(self, fresh_module):
+        """Test _snapshot_vars(ctx) skips vars not present in the ctx.
+
+        Given:
+            A registered ContextVar whose stdlib backing has never been
+            set in a freshly-created stdlib Context
+        When:
+            _snapshot_vars(fresh_ctx) is called
+        Then:
+            The result should omit that var entirely
+        """
+        # Arrange
+        var = ContextVar("ctx_absent")
+        fresh_module.ctx_absent = var
+        # A copy_context captured before any set includes no entry for var._stdlib
+        empty_ctx = contextvars.copy_context()
+
+        # Act
+        result = _snapshot_vars(empty_ctx)
+
+        # Assert
+        key = f"{fresh_module.__name__}:ctx_absent"
+        assert key not in result
+
+    def test_warns_and_skips_unbound_var_in_current_context(self, caplog):
+        """Test _snapshot_vars omits vars not bound to any module attr.
+
+        Given:
+            A ContextVar constructed but never assigned to any module
+            attribute, with a value set in the current context
+        When:
+            _snapshot_vars() is called with caplog capturing WARNINGs
+        Then:
+            The result should not contain any entry for this var and a
+            WARNING should be logged naming the var
+        """
+        # Arrange
+        import logging
+
+        var = ContextVar("unbound_snapshot")
+        # Deliberately do NOT bind to a module.
+        var.set("ephemeral")
+        try:
+            # Act
+            with caplog.at_level(logging.WARNING, logger="wool.runtime.context"):
+                result = _snapshot_vars()
+
+            # Assert — no wire entry for the unbound var
+            assert all("unbound_snapshot" not in k for k in result)
+            assert any("unbound_snapshot" in rec.getMessage() for rec in caplog.records)
+        finally:
+            # Clean up registry-level side-effects from this var.
+            var._stdlib.set(_UNSET)
+
+    def test_raises_typeerror_on_unpicklable_value(self, fresh_module):
+        """Test _snapshot_vars raises TypeError naming the failed var.
+
+        Given:
+            A module-bound ContextVar whose current value is unpicklable
+            (a running generator cannot be cloudpickled)
+        When:
+            _snapshot_vars() attempts to serialize it
+        Then:
+            It should raise TypeError whose message includes the var's
+            name
+        """
+
+        # Arrange
+        def _gen():
+            yield 1
+
+        var = ContextVar("unpicklable_snapshot")
+        fresh_module.unpicklable_snapshot = var
+        running = _gen()
+        next(running)  # Advance so it cannot be pickled.
+        var.set(running)
+
+        # Act & assert
+        with pytest.raises(TypeError, match="unpicklable_snapshot"):
+            _snapshot_vars()
+
 
 class Test_apply_vars:
     def test_restores_value_on_target_var(self, fresh_module):
@@ -414,6 +796,70 @@ class Test_apply_vars:
         _apply_vars(snapshot)
 
         # Assert — no exception; no assertion needed beyond completion
+
+    def test_empty_dict_returns_immediately(self):
+        """Test _apply_vars is a no-op for an empty dict.
+
+        Given:
+            An empty vars dict
+        When:
+            _apply_vars({}) is called
+        Then:
+            It should return without raising and perform no work
+        """
+        # Act
+        _apply_vars({})
+
+        # Assert — completion without exception
+
+    def test_warns_on_malformed_key(self, caplog):
+        """Test _apply_vars warns on keys missing the module:attr separator.
+
+        Given:
+            A vars dict with a key that lacks a colon
+        When:
+            _apply_vars is called with caplog capturing WARNINGs
+        Then:
+            It should log a warning naming the malformed key and skip
+            the entry; no exception is raised
+        """
+        # Arrange
+        import logging
+
+        snapshot = {"no_colon_here": cloudpickle.dumps("x")}
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.context"):
+            _apply_vars(snapshot)
+
+        # Assert
+        assert any("Malformed" in rec.getMessage() for rec in caplog.records)
+
+    def test_warns_when_attr_is_not_a_context_var(self, fresh_module, caplog):
+        """Test _apply_vars warns when location resolves to a non-ContextVar.
+
+        Given:
+            A module attribute that is not a wool.ContextVar (a plain int)
+            and a vars dict pointing at that location
+        When:
+            _apply_vars is called with caplog capturing WARNINGs
+        Then:
+            It should log a warning and skip the entry; no exception
+            is raised
+        """
+        # Arrange
+        import logging
+
+        fresh_module.not_a_cv = 99
+        snapshot = {f"{fresh_module.__name__}:not_a_cv": cloudpickle.dumps("ignored")}
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.context"):
+            _apply_vars(snapshot)
+
+        # Assert
+        assert any("not a ContextVar" in rec.getMessage() for rec in caplog.records)
+        assert fresh_module.not_a_cv == 99  # unchanged
 
 
 class TestContext:
@@ -563,6 +1009,206 @@ class TestContext:
         # Assert
         assert restored.id == ctx.id
         assert restored[var] == "captured"
+
+    def test_iter_yields_captured_vars(self, fresh_module):
+        """Test iterating a Context yields the captured ContextVar keys.
+
+        Given:
+            A Context captured with one ContextVar set to a value
+        When:
+            iter(ctx) is consumed
+        Then:
+            The captured ContextVar should appear in the iteration
+        """
+        # Arrange
+        var = ContextVar("iter_var")
+        fresh_module.iter_var = var
+        var.set("value")
+        ctx = current_context()
+
+        # Act
+        captured = list(iter(ctx))
+
+        # Assert
+        assert var in captured
+
+    def test_getitem_returns_captured_value(self, fresh_module):
+        """Test ctx[var] returns the captured value for that var.
+
+        Given:
+            A Context captured with a ContextVar set to a known value
+        When:
+            ctx[var] is accessed
+        Then:
+            It should return the captured value
+        """
+        # Arrange
+        var = ContextVar("item_var")
+        fresh_module.item_var = var
+        var.set(123)
+        ctx = current_context()
+
+        # Act & assert
+        assert ctx[var] == 123
+
+    def test_contains_reports_captured_membership(self, fresh_module):
+        """Test `var in ctx` returns True only for captured vars.
+
+        Given:
+            A Context captured with one ContextVar set, and a separate
+            ContextVar that was never set
+        When:
+            The `in` operator is evaluated for each
+        Then:
+            The captured var reports True; the unset var reports False
+        """
+        # Arrange
+        captured_var = ContextVar("contains_captured")
+        other_var = ContextVar("contains_other")
+        fresh_module.contains_captured = captured_var
+        fresh_module.contains_other = other_var
+        captured_var.set("x")
+        ctx = current_context()
+
+        # Act & assert
+        assert captured_var in ctx
+        assert other_var not in ctx
+
+    def test_len_returns_captured_count(self, fresh_module):
+        """Test len(ctx) matches the number of captured vars.
+
+        Given:
+            A Context captured with two ContextVars each set to a value
+        When:
+            len(ctx) is called
+        Then:
+            It should report at least 2 (and more if other tests have
+            left registered vars with set values)
+        """
+        # Arrange
+        a = ContextVar("len_a")
+        b = ContextVar("len_b")
+        fresh_module.len_a = a
+        fresh_module.len_b = b
+        a.set(1)
+        b.set(2)
+        ctx = current_context()
+
+        # Act & assert
+        assert len(ctx) >= 2
+
+    def test_keys_values_items_expose_captured_pairs(self, fresh_module):
+        """Test keys()/values()/items() expose the captured var→value mapping.
+
+        Given:
+            A Context captured with a ContextVar set to a known value
+        When:
+            keys(), values(), items() are consumed
+        Then:
+            All three views should include the captured var/value
+        """
+        # Arrange
+        var = ContextVar("views_var")
+        fresh_module.views_var = var
+        var.set("shared")
+        ctx = current_context()
+
+        # Act
+        keys = list(ctx.keys())
+        values = list(ctx.values())
+        items = list(ctx.items())
+
+        # Assert
+        assert var in keys
+        assert "shared" in values
+        assert (var, "shared") in items
+
+    def test_repr_includes_lineage_id_and_var_count(self, fresh_module):
+        """Test repr(ctx) exposes the lineage UUID and var count.
+
+        Given:
+            A Context captured with at least one var set
+        When:
+            repr(ctx) is evaluated
+        Then:
+            The string should contain the lineage UUID and the var count
+        """
+        # Arrange
+        var = ContextVar("repr_ctx_var")
+        fresh_module.repr_ctx_var = var
+        var.set("v")
+        ctx = current_context()
+
+        # Act
+        result = repr(ctx)
+
+        # Assert
+        assert str(ctx.id) in result
+        assert f"vars={len(ctx)}" in result
+
+    def test_run_snapshot_omits_vars_left_unset(self, fresh_module):
+        """Test post-run snapshot excludes vars whose final value is _UNSET.
+
+        Given:
+            A Context captured with two vars set; inside Context.run, one
+            var is "unset" (its backing is overwritten with _UNSET via
+            the stdlib contextvar)
+        When:
+            Context.run returns
+        Then:
+            The Context's _vars (observed via the public mapping
+            protocol) should no longer contain the unset var, while the
+            other var remains
+        """
+        # Arrange
+        keep_var = ContextVar("keep_var")
+        drop_var = ContextVar("drop_var")
+        fresh_module.keep_var = keep_var
+        fresh_module.drop_var = drop_var
+        keep_var.set("kept")
+        drop_var.set("will_drop")
+        ctx = current_context()
+
+        def body():
+            # Simulate a var becoming unset within the run
+            drop_var._stdlib.set(_UNSET)
+            return None
+
+        # Act
+        ctx.run(body)
+
+        # Assert — the post-run snapshot excludes drop_var
+        assert keep_var in ctx
+        assert drop_var not in ctx
+
+    def test_run_snapshot_skips_registered_vars_not_touched_in_context(
+        self, fresh_module
+    ):
+        """Test post-run snapshot skips registered vars absent from the run ctx.
+
+        Given:
+            Two registered ContextVars — one set before capturing the
+            Context, the other never set at all
+        When:
+            Context.run completes and the post-run snapshot runs
+        Then:
+            The never-set var should not appear in the Context; the set
+            var should
+        """
+        # Arrange
+        set_var = ContextVar("absent_ctx_set")
+        untouched_var = ContextVar("absent_ctx_untouched")
+        fresh_module.absent_ctx_set = set_var
+        fresh_module.absent_ctx_untouched = untouched_var
+        set_var.set("present")
+        ctx = current_context()
+
+        # Act
+        ctx.run(lambda: None)
+
+        # Assert
+        assert set_var in ctx
+        assert untouched_var not in ctx
 
 
 class Test_current_context:
