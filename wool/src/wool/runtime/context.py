@@ -12,12 +12,10 @@ from typing import ClassVar
 from typing import Coroutine
 from typing import Final
 from typing import Generic
-from typing import Iterator
 from typing import TypeVar
 from typing import overload
 from uuid import UUID
 from uuid import uuid4
-from uuid import uuid5
 
 import cloudpickle
 
@@ -27,17 +25,20 @@ _SENTINEL: Final = object()
 
 _log = logging.getLogger(__name__)
 
-# Fixed namespace UUID for deriving deterministic UUID5 identity from
-# a wool.ContextVar's module-attribute location. Generated once and
-# never changed — changing it would break wire compatibility.
-_NAMESPACE_UUID: Final = UUID("7d3e81b9-3f7c-4e2a-9a47-56c82e1f0aa3")
+# Module name used by :func:`_infer_namespace` to distinguish the
+# library's own frames from user frames during the stack walk.
+_THIS_MODULE: Final = __name__
 
 
 # public
-class ContextVarIdentityError(Exception):
-    """Raised when a wool.ContextVar's wire IDs resolve to different local
-    instances on the receiver, indicating deployment-level drift between
-    caller and worker module state.
+class ContextVarCollision(Exception):
+    """Raised when two distinct :class:`ContextVar` instances are
+    constructed with the same ``(namespace, name)`` key.
+
+    Keys must be unique within the inferred package namespace. Library
+    authors SHOULD pass ``namespace=`` explicitly when constructing
+    vars from shared factory code; application code can rely on the
+    implicit package-name inference.
     """
 
 
@@ -77,135 +78,48 @@ def _lineage_id_now() -> UUID:
     return _current_lineage()
 
 
-def _reconstruct(
-    ids: list[UUID],
-    name: str,
-    has_default: bool,
-    default: Any,
-) -> ContextVar:
-    """Unpickle helper: resolve a ContextVar by any of its shipped UUIDs.
+def _infer_namespace() -> str:
+    """Infer the namespace for a :class:`ContextVar` constructor call.
 
-    Resolution strategy, in order:
-    1. Look up each ID in the process-wide ``_uuid_registry``.
-    2. For IDs not in the registry, search ``sys.modules`` (and class
-       bodies) for a wool.ContextVar whose UUID5 matches.
+    Walks up the call stack from the current frame, skipping frames
+    whose ``__name__`` matches this module, and returns the top-level
+    package of the first user frame encountered. Falls back to
+    ``"__main__"`` if the walk reaches the top of the stack.
 
-    Trichotomy:
-    - Zero resolved: construct a fresh instance, register under all
-      supplied IDs.
-    - One distinct instance resolved: return it; register unresolved
-      IDs under it (enrichment for future lookups).
-    - Multiple distinct instances resolved: raise
-      :class:`ContextVarIdentityError` — real module-level drift.
+    The walk (rather than a fixed ``_getframe(n)``) is resilient to
+    decorators, subclass ``__init__`` chains, and intermediate helpers
+    inside this module.
     """
-    resolved: list[ContextVar] = []
-    unresolved: list[UUID] = []
-    for uid in ids:
-        existing = ContextVar._uuid_registry.get(uid)
-        if existing is None:
-            existing = _find_var_by_uuid(uid)
-        if existing is not None:
-            resolved.append(existing)
-        else:
-            unresolved.append(uid)
+    frame = sys._getframe(1)
+    while frame is not None:
+        mod = frame.f_globals.get("__name__", "")
+        if mod and mod != _THIS_MODULE:
+            return mod.partition(".")[0]
+        frame = frame.f_back
+    return "__main__"  # pragma: no cover — stack always has a caller
 
-    distinct = {id(r) for r in resolved}
 
-    if not distinct:
-        instance = ContextVar.__new__(ContextVar)
-        instance._name = name
-        instance._default = default if has_default else _SENTINEL
-        instance._stdlib = contextvars.ContextVar(name, default=_UNSET)
-        instance._ids = list(ids)
-        instance._uuid4 = _pick_uuid4(ids)
-        ContextVar._instance_registry.add(instance)
-        for uid in ids:
-            ContextVar._uuid_registry[uid] = instance
-        return instance
+def _reconstruct(key: str, has_default: bool, default: Any) -> ContextVar:
+    """Unpickle helper: get-or-create a :class:`ContextVar` by key.
 
-    if len(distinct) == 1:
-        first = resolved[0]
-        for uid in unresolved:
-            ContextVar._uuid_registry[uid] = first
-        return first
+    Normal flow: the worker has already imported the routine's module
+    (via cloudpickle), which constructed the var at module scope and
+    registered it. The lookup hits and returns the existing instance.
 
-    raise ContextVarIdentityError(
-        f"wool.ContextVar {name!r} identity divergence: the caller's "
-        f"bindings resolve to {len(distinct)} different instances on "
-        f"this process. Deployment drift between caller and worker. "
-        f"IDs: {[str(u) for u in ids]}"
+    Defensive fallback: if no instance is registered under *key*,
+    construct one on the fly with the same namespace/name. This keeps
+    wire reception robust in the unlikely case that a value frame
+    arrives before the defining module is imported.
+    """
+    existing = ContextVar._registry.get(key)
+    if existing is not None:
+        return existing
+    ns, _, name = key.partition(":")
+    return ContextVar(
+        name,
+        namespace=ns,
+        default=default if has_default else _SENTINEL,
     )
-
-
-def _pick_uuid4(ids: list[UUID]) -> UUID | None:
-    """Pick the UUID4 from an id list, if present. Used on reconstruction."""
-    for uid in ids:
-        if uid.version == 4:
-            return uid
-    return None  # pragma: no cover — reconstruction path always has a UUID4 when reached
-
-
-def _find_var_by_uuid(target: UUID) -> ContextVar | None:
-    """Search ``sys.modules`` and class bodies for a wool.ContextVar
-    whose UUID5 of location matches *target*.
-
-    Only meaningful for version-5 UUIDs. Returns ``None`` for
-    version-4 UUIDs without a walk (no location to compute).
-    """
-    if target.version != 5:
-        return None
-    visited_classes: set[int] = set()
-    for mod_name, mod in list(sys.modules.items()):
-        if mod is None:
-            continue
-        try:
-            mod_dict = mod.__dict__
-        except AttributeError:
-            continue
-        for attr_name, value in list(mod_dict.items()):
-            if isinstance(value, ContextVar):
-                uid = uuid5(_NAMESPACE_UUID, f"{mod_name}:{attr_name}")
-                if uid == target:
-                    return value
-            elif isinstance(value, type):
-                found = _find_var_in_class(
-                    mod_name, attr_name, value, target, visited_classes
-                )
-                if found is not None:
-                    return found
-    return None
-
-
-def _find_var_in_class(
-    mod_name: str,
-    class_path: str,
-    cls: type,
-    target: UUID,
-    visited: set[int],
-) -> ContextVar | None:
-    """Recurse into a class body searching for a ContextVar whose UUID5
-    matches *target*.
-    """
-    key = id(cls)
-    if key in visited:
-        return None
-    visited.add(key)
-    try:
-        class_dict = cls.__dict__
-    except AttributeError:  # pragma: no cover — real type instances always have __dict__
-        return None
-    for attr_name, value in list(class_dict.items()):
-        if isinstance(value, ContextVar):
-            uid = uuid5(_NAMESPACE_UUID, f"{mod_name}:{class_path}.{attr_name}")
-            if uid == target:
-                return value
-        elif isinstance(value, type):
-            nested = _find_var_in_class(
-                mod_name, f"{class_path}.{attr_name}", value, target, visited
-            )
-            if nested is not None:
-                return nested
-    return None
 
 
 def _reconstruct_token(
@@ -285,67 +199,7 @@ class Token(Generic[T]):
 
     def __repr__(self) -> str:
         used_marker = " used" if self._used else ""
-        return f"<wool.Token var={self._var._name!r}{used_marker}>"
-
-
-def _iter_locations(target: ContextVar) -> Iterator[tuple[str, str]]:
-    """Yield ``(module_name, dotted_attr_path)`` for each binding of *target*.
-
-    Walks ``sys.modules`` for module-level attributes and recurses into
-    class bodies (with cycle protection) for nested bindings. Covers:
-
-    - Module-level: ``lib.foo = ContextVar(...)``.
-    - Class body: ``class C: foo = ContextVar(...)``.
-    - Nested class body: ``class Outer: class Inner: foo = ContextVar(...)``.
-
-    Instance attributes, closures, defaults, and container values are
-    not reachable via this walk; those are handled by the lazy UUID4
-    fallback on the instance.
-    """
-    visited_classes: set[int] = set()
-    for mod_name, mod in list(sys.modules.items()):
-        if mod is None:
-            continue
-        try:
-            mod_dict = mod.__dict__
-        except AttributeError:
-            continue
-        for attr_name, value in list(mod_dict.items()):
-            if value is target:
-                yield (mod_name, attr_name)
-            elif isinstance(value, type):
-                yield from _walk_class(
-                    mod_name, attr_name, value, target, visited_classes
-                )
-
-
-def _walk_class(
-    mod_name: str,
-    class_path: str,
-    cls: type,
-    target: ContextVar,
-    visited: set[int],
-) -> Iterator[tuple[str, str]]:
-    """Recurse into *cls*'s __dict__ for bindings of *target*.
-
-    Uses *visited* (keyed by ``id(cls)``) to break cycles from
-    self-referential class attributes.
-    """
-    key = id(cls)
-    if key in visited:
-        return
-    visited.add(key)
-    try:
-        class_dict = cls.__dict__
-    except AttributeError:  # pragma: no cover — real type instances always have __dict__
-        return
-    for attr_name, value in list(class_dict.items()):
-        if value is target:
-            yield (mod_name, f"{class_path}.{attr_name}")
-        elif isinstance(value, type):
-            yield from _walk_class(
-                mod_name, f"{class_path}.{attr_name}", value, target, visited
-            )
+        return f"<wool.Token var={self._var._key!r}{used_marker}>"
 
 
 # public
@@ -358,29 +212,21 @@ class ContextVar(Generic[T]):
     process boundaries and their values propagate through
     ``@wool.routine`` dispatches.
 
-    Identity across processes is derived from the instance's bindings:
+    **Identity model:** every :class:`ContextVar` has a unique
+    ``(namespace, name)`` key. The ``name`` is the first positional
+    argument; the ``namespace`` is inferred from the top-level package
+    of the calling frame (e.g., code in ``foo.bar.baz`` yields
+    namespace ``"foo"``) or provided explicitly via the
+    ``namespace=`` keyword. Two distinct instances constructed under
+    the same key raise :class:`ContextVarCollision`.
 
-    - **Module-level binding** (``lib.foo = wool.ContextVar(...)``) —
-      the var is identified across processes by its
-      ``(module, attribute_path)`` location. Caller and worker both
-      compute the same UUID5 from that location, so the wire looks up
-      the same logical var on either side.
-    - **Class-level binding** (``class C: foo = wool.ContextVar(...)``)
-      — the dotted class path is included in the canonical location,
-      e.g. ``"lib:C.foo"``. Nested classes work the same way.
-    - **Unbound** (function local, closure cell, default argument,
-      container value) — the instance is assigned a lazy UUID4 at first
-      pickle. Identity is preserved for pickle roundtrips within one
-      process; across processes, each side constructs fresh instances
-      unless the caller's UUID4 is shipped and the receiver
-      reconstructs against the registry.
+    The key travels on the wire and identifies the var on every worker
+    in the cluster. This replaces the earlier location-based identity
+    model and removes the need for module reflection at pickle time.
 
-    Two construction modes:
-
-    - ``ContextVar(name)`` — no default; :meth:`get` raises
-      :class:`LookupError` until a value is set.
-    - ``ContextVar(name, *, default=...)`` — :meth:`get` returns the
-      default when the variable has no value in the current context.
+    **Drop-in stdlib compatibility:** ``wool.ContextVar("foo")`` can
+    be replaced with ``contextvars.ContextVar("foo")`` without code
+    changes outside of imports.
 
     Values propagated across the wire MUST be cloudpicklable.
     Non-serializable values surface a :class:`TypeError` at dispatch
@@ -389,86 +235,99 @@ class ContextVar(Generic[T]):
 
     __slots__ = (
         "_name",
+        "_namespace",
+        "_key",
         "_default",
         "_stdlib",
-        "_ids",
-        "_uuid4",
         "__weakref__",
     )
 
-    _instance_registry: ClassVar[weakref.WeakSet[ContextVar[Any]]] = weakref.WeakSet()
-    _uuid_registry: ClassVar[weakref.WeakValueDictionary[UUID, ContextVar[Any]]] = (
+    _registry: ClassVar[weakref.WeakValueDictionary[str, ContextVar[Any]]] = (
         weakref.WeakValueDictionary()
     )
 
     _name: str
+    _namespace: str
+    _key: str
     _default: Any
     _stdlib: contextvars.ContextVar[T | _UnsetType]
-    # Cached list of UUIDs identifying this instance. Populated lazily
-    # at pickle time via :meth:`_resolve_ids`. UUID5 per module- or
-    # class-level location, plus a lazy UUID4 once one has been minted.
-    _ids: list[UUID] | None
-    # Lazy UUID4 minted on first pickle if the instance has no
-    # discoverable locations. Cached so repeated pickles converge on a
-    # stable identity. Retained even after the instance gains a
-    # location binding, so in-flight wire data still resolves.
-    _uuid4: UUID | None
+
+    def __new__(
+        cls,
+        name: str,
+        /,
+        *,
+        namespace: str | None = None,
+        default: Any = _SENTINEL,
+    ) -> ContextVar[T]:
+        ns = namespace if namespace is not None else _infer_namespace()
+        key = f"{ns}:{name}"
+        existing = cls._registry.get(key)
+        if existing is not None:
+            # Get-or-create semantics: a duplicate construction with
+            # matching params returns the registered instance. This
+            # is what cloudpickle re-execution of module code
+            # produces, and what a simple reimport produces, and what
+            # idiomatic Python expects. Mismatched defaults indicate
+            # a genuine collision between unrelated call sites and
+            # raise.
+            if existing._default != default:
+                raise ContextVarCollision(
+                    f"wool.ContextVar {key!r} already registered with "
+                    f"default={existing._default!r}; new construction "
+                    f"requests default={default!r}. Keys must be "
+                    f"unique within a namespace."
+                )
+            return existing
+        return super().__new__(cls)
 
     @overload
-    def __init__(self, name: str, /) -> None: ...
+    def __init__(self, name: str, /, *, namespace: str | None = None) -> None: ...
 
     @overload
-    def __init__(self, name: str, /, *, default: T) -> None: ...
+    def __init__(
+        self, name: str, /, *, namespace: str | None = None, default: T
+    ) -> None: ...
 
-    def __init__(self, name: str, /, *, default: Any = _SENTINEL):
+    def __init__(
+        self,
+        name: str,
+        /,
+        *,
+        namespace: str | None = None,
+        default: Any = _SENTINEL,
+    ):
+        if getattr(self, "_key", None) is not None:
+            # __new__ returned an already-initialized instance; skip
+            # to preserve its state and avoid redundant registration.
+            return
+        ns = namespace if namespace is not None else _infer_namespace()
+        key = f"{ns}:{name}"
         self._name = name
+        self._namespace = ns
+        self._key = key
         self._default = default
-        self._stdlib = contextvars.ContextVar(name, default=_UNSET)
-        self._ids = None
-        self._uuid4 = None
-        type(self)._instance_registry.add(self)
-
-    def _resolve_ids(self) -> list[UUID]:
-        """Return every UUID identifying this instance, refreshed from
-        current module state.
-
-        Walks ``sys.modules`` (and class bodies) for bindings of
-        ``self``, computes a UUID5 per location using
-        :data:`_NAMESPACE_UUID`, and unions with any previously-minted
-        lazy UUID4. If the instance has no bindings, mints a UUID4
-        lazily on first call and retains it.
-
-        Runs only at pickle time, not on every ``get``/``set``/``reset``.
-        The returned list is cached on the instance; the cache is
-        refreshed unconditionally to pick up runtime alias additions.
-
-        :returns:
-            A non-empty list of UUIDs. Module/class locations produce
-            UUID5s (sorted for determinism); the lazy UUID4 appended
-            last if present.
-        """
-        found_ids: list[UUID] = []
-        seen: set[UUID] = set()
-        for mod_name, dotted in _iter_locations(self):
-            uid = uuid5(_NAMESPACE_UUID, f"{mod_name}:{dotted}")
-            if uid not in seen:
-                found_ids.append(uid)
-                seen.add(uid)
-        found_ids.sort()
-        if not found_ids and self._uuid4 is None:
-            self._uuid4 = uuid4()
-        if self._uuid4 is not None:
-            found_ids.append(self._uuid4)
-        cls = type(self)
-        for uid in found_ids:
-            cls._uuid_registry[uid] = self
-        self._ids = found_ids
-        return found_ids
+        self._stdlib = contextvars.ContextVar(key, default=_UNSET)
+        type(self)._registry[key] = self
 
     @property
     def name(self) -> str:
         """The variable's name (cosmetic, matching stdlib API)."""
         return self._name
+
+    @property
+    def namespace(self) -> str:
+        """The namespace this var belongs to. Defaults to the top-level
+        package of the construction site.
+        """
+        return self._namespace
+
+    @property
+    def key(self) -> str:
+        """The full ``"namespace:name"`` key that identifies this var
+        on the wire.
+        """
+        return self._key
 
     @overload
     def get(self) -> T: ...
@@ -557,29 +416,27 @@ class ContextVar(Generic[T]):
         default_part = (
             f" default={self._default!r}" if self._default is not _SENTINEL else ""
         )
-        return f"<wool.ContextVar name={self._name!r}{default_part} at 0x{id(self):x}>"
+        return f"<wool.ContextVar {self._key!r}{default_part} at 0x{id(self):x}>"
 
 
 class _ContextPickler(cloudpickle.CloudPickler):
-    """Cloudpickle pickler that reduces :class:`ContextVar` by identity.
+    """Cloudpickle pickler that reduces :class:`ContextVar` by key.
 
     Overrides :meth:`reducer_override` to emit every
     :class:`ContextVar` encountered in the object graph as a reduce
-    tuple carrying its full id list plus name/default. On the receiver,
-    :func:`_reconstruct` resolves the IDs to a local instance via the
-    process-wide UUID registry (or sys.modules walk with UUID5 match),
-    or constructs a fresh instance if unknown.
+    tuple carrying its full ``"namespace:name"`` key plus default. On
+    the receiver, :func:`_reconstruct` resolves the key to a local
+    instance via the process-wide registry, or constructs a fresh
+    instance under the same key if unknown.
     """
 
     def reducer_override(self, obj: Any) -> Any:
         if isinstance(obj, ContextVar):
-            ids = obj._resolve_ids()
             has_default = obj._default is not _SENTINEL
             return (
                 _reconstruct,
                 (
-                    ids,
-                    obj._name,
+                    obj._key,
                     has_default,
                     obj._default if has_default else None,
                 ),
@@ -608,12 +465,8 @@ def _snapshot_vars(
 
     Iterates the process-wide registry, reads each var's current value
     (from *ctx* if supplied, else the current stdlib Context), and
-    emits ``{uuid_hex: serialized_value}`` for every var with a set
-    value.
-
-    Wire keys use the first UUID from ``_resolve_ids`` (sorted
-    deterministically), so caller and worker agree on the canonical
-    key for a given var.
+    emits ``{"namespace:name": serialized_value}`` for every var with
+    a set value.
 
     :param ctx:
         Optional :class:`contextvars.Context` to read from. When
@@ -624,7 +477,7 @@ def _snapshot_vars(
         If a value fails to serialize.
     """
     result: dict[str, bytes] = {}
-    for var in list(ContextVar._instance_registry):
+    for var in list(ContextVar._registry.values()):
         if ctx is not None:
             if var._stdlib not in ctx:
                 continue
@@ -633,18 +486,13 @@ def _snapshot_vars(
             raw = var._stdlib.get()
         if raw is _UNSET:
             continue
-        ids = var._resolve_ids()
-        if not ids:  # pragma: no cover — _resolve_ids always returns at least one id
-            continue
         try:
             pickled = dumps(raw)
         except Exception as e:
             raise TypeError(
-                f"Failed to serialize wool.ContextVar {var._name!r}: {e}"
+                f"Failed to serialize wool.ContextVar {var._key!r}: {e}"
             ) from e
-        # Canonical wire key = first (sorted) UUID5, or lazy UUID4 if
-        # that's all we have. Stable across caller and worker.
-        result[ids[0].hex] = pickled
+        result[var._key] = pickled
     return result
 
 
@@ -655,33 +503,30 @@ def _apply_vars(
 ) -> None:
     """Apply a wire-form context snapshot to the current context.
 
-    For each entry ``{uuid_hex: serialized_value}``, resolves the UUID
-    to a local :class:`ContextVar` via the registry (or sys.modules
-    walk as fallback) and calls :meth:`ContextVar.set` on it in the
-    current stdlib Context. Unknown UUIDs log-warn and are skipped.
+    For each ``{"namespace:name": serialized_value}`` entry, looks up
+    the key in the process-wide registry and calls
+    :meth:`ContextVar.set` on the resolved instance. Keys unknown on
+    this process (e.g., a caller-side var whose defining module isn't
+    imported on the worker) log a warning and are skipped — the value
+    has no in-scope var to read it through, so propagating it would be
+    useless.
 
     :param vars:
-        A ``{uuid_hex: serialized_value}`` dict from the proto map.
+        A ``{key: serialized_value}`` dict from the proto map.
     :param loads:
         Deserializer for values. Defaults to :func:`_loads`.
     """
     if not vars:
         return
     for key, data in vars.items():
-        try:
-            uid = UUID(hex=key)
-        except (ValueError, TypeError):
-            _log.warning("Malformed wool.ContextVar wire key %r; skipping", key)
-            continue
-        var = ContextVar._uuid_registry.get(uid) or _find_var_by_uuid(uid)
+        var = ContextVar._registry.get(key)
         if var is None:
             _log.warning(
-                "wool.ContextVar UUID %s not resolvable on this process; "
+                "wool.ContextVar %r not registered on this process; "
                 "propagated value dropped",
-                uid,
+                key,
             )
             continue
-        ContextVar._uuid_registry[uid] = var
         var.set(loads(data))
 
 
@@ -867,7 +712,7 @@ def _snapshot_from(ctx: contextvars.Context) -> dict[ContextVar[Any], Any]:
     :class:`ContextVar` instances and does not serialize values.
     """
     out: dict[ContextVar[Any], Any] = {}
-    for var in list(ContextVar._instance_registry):
+    for var in list(ContextVar._registry.values()):
         if var._stdlib not in ctx:
             continue
         raw = ctx[var._stdlib]
@@ -891,7 +736,7 @@ def current_context() -> Context:
     returned context starts a new lineage.
     """
     vars_dict: dict[ContextVar[Any], Any] = {}
-    for var in list(ContextVar._instance_registry):
+    for var in list(ContextVar._registry.values()):
         raw = var._stdlib.get()
         if raw is _UNSET:
             continue

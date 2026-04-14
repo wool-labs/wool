@@ -37,7 +37,7 @@ def test_public_api_completeness():
         "WorkerConnection",
         "Context",
         "ContextVar",
-        "ContextVarIdentityError",
+        "ContextVarCollision",
         "Token",
         "current_context",
         "LoadBalancerContextLike",
