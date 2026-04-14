@@ -474,6 +474,241 @@ class TestContextVar:
         # Assert
         assert restored is var
 
+    def test_resolve_ids_walk_tolerates_none_and_non_dict_modules(self, fresh_module):
+        """Test _resolve_ids silently skips bad sys.modules entries.
+
+        Given:
+            A bound ContextVar and sys.modules containing both a None
+            entry and an entry whose __dict__ access raises AttributeError
+        When:
+            _resolve_ids walks sys.modules
+        Then:
+            The pathological entries are skipped; the legitimate
+            binding is still discovered
+        """
+
+        class _NoDict:
+            def __getattribute__(self, item):
+                if item == "__dict__":
+                    raise AttributeError("no dict")
+                return super().__getattribute__(item)
+
+        # Arrange
+        var = ContextVar("walk_guards")
+        fresh_module.walk_guards = var
+        sys.modules["__probe_none__"] = None  # type: ignore[assignment]
+        sys.modules["__probe_nodict__"] = _NoDict()  # type: ignore[assignment]
+        try:
+            # Act
+            ids = var._resolve_ids()
+
+            # Assert — a UUID5 for the legit binding was produced
+            assert any(uid.version == 5 for uid in ids)
+        finally:
+            sys.modules.pop("__probe_none__", None)
+            sys.modules.pop("__probe_nodict__", None)
+
+    def test_find_var_by_uuid_returns_none_for_uuid4(self):
+        """Test the UUID5 matcher skips UUID4 inputs.
+
+        Given:
+            A random UUID4 (no location can produce it)
+        When:
+            _find_var_by_uuid is called with the UUID4
+        Then:
+            It should return None without walking sys.modules
+        """
+        # Arrange
+        from wool.runtime.context import _find_var_by_uuid
+
+        # Act
+        result = _find_var_by_uuid(uuid4())
+
+        # Assert
+        assert result is None
+
+    def test_find_var_by_uuid_returns_none_for_unknown_uuid5(self):
+        """Test the UUID5 matcher returns None for unresolvable UUIDs.
+
+        Given:
+            A UUID5 computed for a location that doesn't exist in
+            sys.modules
+        When:
+            _find_var_by_uuid is called
+        Then:
+            It should walk sys.modules without finding a match and
+            return None
+        """
+        # Arrange
+        from uuid import uuid5
+
+        from wool.runtime.context import _NAMESPACE_UUID
+        from wool.runtime.context import _find_var_by_uuid
+
+        ghost = uuid5(_NAMESPACE_UUID, "no.such.module:ghost")
+
+        # Act
+        result = _find_var_by_uuid(ghost)
+
+        # Assert
+        assert result is None
+
+    def test_find_var_by_uuid_traverses_class_bodies(self, fresh_module):
+        """Test the UUID5 matcher recurses into class bodies.
+
+        Given:
+            A ContextVar bound as a class attribute and a UUID5
+            computed from its class-scoped location
+        When:
+            _find_var_by_uuid is invoked with that UUID5
+        Then:
+            It should recursively descend into the class body and
+            return the matching instance
+        """
+
+        # Arrange
+        class Outer:
+            class Inner:
+                pass
+
+        var = ContextVar("class_walked")
+        Outer.Inner.leaf = var
+        fresh_module.Outer = Outer
+
+        from uuid import uuid5
+
+        from wool.runtime.context import _NAMESPACE_UUID
+        from wool.runtime.context import _find_var_by_uuid
+
+        target = uuid5(_NAMESPACE_UUID, f"{fresh_module.__name__}:Outer.Inner.leaf")
+        # Ensure registry miss
+        ContextVar._uuid_registry.pop(target, None)
+
+        # Act
+        result = _find_var_by_uuid(target)
+
+        # Assert
+        assert result is var
+
+    def test_find_var_by_uuid_breaks_self_referential_class_cycles(self, fresh_module):
+        """Test the receiver-side walker breaks cycles in class graphs.
+
+        Given:
+            A class that references itself as a class attribute
+            (creating a cycle in the class walk)
+        When:
+            _find_var_by_uuid searches for an unresolvable UUID5
+        Then:
+            The walk should terminate without stack overflow via the
+            visited-set guard
+        """
+
+        # Arrange
+        class Cyclic:
+            pass
+
+        Cyclic.myself = Cyclic  # type: ignore[attr-defined]
+        fresh_module.Cyclic = Cyclic
+
+        from uuid import uuid5
+
+        from wool.runtime.context import _NAMESPACE_UUID
+        from wool.runtime.context import _find_var_by_uuid
+
+        ghost = uuid5(_NAMESPACE_UUID, "no.match:anywhere")
+
+        # Act
+        result = _find_var_by_uuid(ghost)
+
+        # Assert — walk completed without recursion blowup
+        assert result is None
+
+    def test_find_var_by_uuid_tolerates_none_and_non_dict_modules(self):
+        """Test the UUID5 matcher tolerates bad sys.modules entries.
+
+        Given:
+            sys.modules containing a None entry and a non-dict-module
+            entry, plus an unresolvable UUID5 target
+        When:
+            _find_var_by_uuid is called
+        Then:
+            It should complete the walk without raising and return None
+        """
+
+        class _NoDict:
+            def __getattribute__(self, item):
+                if item == "__dict__":
+                    raise AttributeError
+                return super().__getattribute__(item)
+
+        # Arrange
+        from uuid import uuid5
+
+        from wool.runtime.context import _NAMESPACE_UUID
+        from wool.runtime.context import _find_var_by_uuid
+
+        ghost = uuid5(_NAMESPACE_UUID, "still.absent:ghost")
+        sys.modules["__probe_walk_none__"] = None  # type: ignore[assignment]
+        sys.modules["__probe_walk_nodict__"] = _NoDict()  # type: ignore[assignment]
+        try:
+            # Act
+            result = _find_var_by_uuid(ghost)
+
+            # Assert
+            assert result is None
+        finally:
+            sys.modules.pop("__probe_walk_none__", None)
+            sys.modules.pop("__probe_walk_nodict__", None)
+
+    @pytest.mark.asyncio
+    async def test_token_reset_rejects_cross_lineage_usage(self, fresh_module):
+        """Test Token.reset raises when used outside its creating lineage.
+
+        Given:
+            A Token created in one wool.Context lineage
+        When:
+            reset() is attempted from a wool.Context.run_async with a
+            different lineage (async path adopts lineage via stdlib
+            contextvar sentinel in the new task)
+        Then:
+            It should raise ValueError naming the lineage mismatch
+        """
+        # Arrange
+        var = ContextVar("cross_lineage")
+        fresh_module.cross_lineage = var
+        token = var.set("outer")
+        other_ctx = Context()  # fresh lineage
+
+        async def body():
+            with pytest.raises(ValueError, match="different wool.Context lineage"):
+                var.reset(token)
+
+        # Act
+        await other_ctx.run_async(body())
+
+    def test_token_var_and_old_value_properties(self, fresh_module):
+        """Test Token exposes var and old_value as read-only properties.
+
+        Given:
+            A ContextVar with a prior value, then mutated via set()
+        When:
+            The returned Token's var and old_value properties are read
+        Then:
+            var returns the ContextVar instance; old_value returns the
+            previously-set value
+        """
+        # Arrange
+        var = ContextVar("prop_check", default="default")
+        fresh_module.prop_check = var
+        var.set("first")
+        token = var.set("second")
+        try:
+            # Act & assert
+            assert token.var is var
+            assert token.old_value == "first"
+        finally:
+            var._stdlib.set(_UNSET)
+
     def test_reconstruct_enriches_registry_with_unresolved_ids(self, fresh_module):
         """Test reconstruction registers unknown ids under the resolved instance.
 

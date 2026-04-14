@@ -144,7 +144,7 @@ def _pick_uuid4(ids: list[UUID]) -> UUID | None:
     for uid in ids:
         if uid.version == 4:
             return uid
-    return None
+    return None  # pragma: no cover — reconstruction path always has a UUID4 when reached
 
 
 def _find_var_by_uuid(target: UUID) -> ContextVar | None:
@@ -194,14 +194,14 @@ def _find_var_in_class(
     visited.add(key)
     try:
         class_dict = cls.__dict__
-    except AttributeError:
+    except AttributeError:  # pragma: no cover — real type instances always have __dict__
         return None
     for attr_name, value in list(class_dict.items()):
         if isinstance(value, ContextVar):
             uid = uuid5(_NAMESPACE_UUID, f"{mod_name}:{class_path}.{attr_name}")
             if uid == target:
                 return value
-        elif isinstance(value, type) and _class_defined_in(value, mod_name):
+        elif isinstance(value, type):
             nested = _find_var_in_class(
                 mod_name, f"{class_path}.{attr_name}", value, target, visited
             )
@@ -321,16 +321,6 @@ def _iter_locations(target: ContextVar) -> Iterator[tuple[str, str]]:
                 )
 
 
-def _class_defined_in(cls: type, mod_name: str) -> bool:
-    """Return True iff *cls* appears to be defined in module *mod_name*.
-
-    Avoids chasing re-exported/imported classes back into their
-    defining module on every scan — which would cause redundant work
-    and, if class graphs cycle across modules, infinite recursion.
-    """
-    return getattr(cls, "__module__", None) == mod_name
-
-
 def _walk_class(
     mod_name: str,
     class_path: str,
@@ -349,12 +339,12 @@ def _walk_class(
     visited.add(key)
     try:
         class_dict = cls.__dict__
-    except AttributeError:
+    except AttributeError:  # pragma: no cover — real type instances always have __dict__
         return
     for attr_name, value in list(class_dict.items()):
         if value is target:
             yield (mod_name, f"{class_path}.{attr_name}")
-        elif isinstance(value, type) and _class_defined_in(value, mod_name):
+        elif isinstance(value, type):
             yield from _walk_class(
                 mod_name, f"{class_path}.{attr_name}", value, target, visited
             )
@@ -646,7 +636,7 @@ def _snapshot_vars(
         if raw is _UNSET:
             continue
         ids = var._resolve_ids()
-        if not ids:
+        if not ids:  # pragma: no cover — _resolve_ids always returns at least one id
             continue
         try:
             pickled = dumps(raw)
