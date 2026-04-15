@@ -293,7 +293,7 @@ class TestPoolComposition:
         """Test building a pool with dispatch_timeout set in the context.
 
         Given:
-            A complete scenario using VIA_RUNTIME_CONTEXT timeout.
+            A complete scenario using VIA_DISPATCH_TIMEOUT_VAR timeout.
         When:
             A pool is built with dispatch_timeout set in the ambient
             context and a coroutine is dispatched.
@@ -308,7 +308,7 @@ class TestPoolComposition:
             lb=LbFactory.CLASS_REF,
             credential=CredentialType.INSECURE,
             options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.VIA_RUNTIME_CONTEXT,
+            timeout=TimeoutKind.VIA_DISPATCH_TIMEOUT_VAR,
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.NONE,

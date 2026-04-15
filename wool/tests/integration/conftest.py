@@ -95,7 +95,7 @@ class WorkerOptionsKind(Enum):
 
 class TimeoutKind(Enum):
     NONE = auto()
-    VIA_RUNTIME_CONTEXT = auto()
+    VIA_DISPATCH_TIMEOUT_VAR = auto()
 
 
 class RoutineBinding(Enum):
@@ -310,7 +310,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
                 discovery_obj = _lan_async_cm()
 
     dispatch_timeout_token = None
-    if scenario.timeout is TimeoutKind.VIA_RUNTIME_CONTEXT:
+    if scenario.timeout is TimeoutKind.VIA_DISPATCH_TIMEOUT_VAR:
         dispatch_timeout_token = dispatch_timeout.set(30.0)
 
     lazy = scenario.lazy is LazyMode.LAZY
@@ -1195,24 +1195,14 @@ def _clear_proxy_context():
     __subscriber_pool__.reset(sub_token)
 
 
-@pytest.fixture(autouse=True)
-def _clear_test_context_vars():
-    """Reset integration-test wool.ContextVars between tests."""
-    yield
-    # Force all test-specific vars back to their UNSET state so the
-    # next test starts clean. We do this by reading the current value
-    # and only resetting if it was explicitly set (not the default).
-    from wool.runtime.context import _UNSET
-
-    for var in (
-        routines.TENANT_ID,
-        routines.REGION,
-        routines.TRACE_ID,
-        routines.TEST_PATTERNS,
-        routines._RESET_TOKENS,
-    ):
-        if var._stdlib.get() is not _UNSET:
-            var._stdlib.set(_UNSET)
+# Integration tests rely on pytest-asyncio's Task-per-test scoping
+# for ContextVar isolation: each async test runs inside an
+# asyncio.Task whose ``contextvars.Context`` is a copy, so
+# wool.ContextVar mutations stay scoped to that copy and don't leak
+# to the next test. Sync integration helpers run in the pytest main
+# Context — if they ever mutate routine-level vars, add an explicit
+# per-test teardown at that site rather than reviving a global
+# autouse cleanup.
 
 
 @pytest.fixture
