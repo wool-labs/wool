@@ -430,6 +430,12 @@ class WorkerService(protocol.WorkerServicer):
         async with self._loop_pool.get("worker") as (worker_loop, _):
 
             async def worker_dispatch():
+                # Mirrors _run_with_lineage_adoption in _run_on_worker:
+                # consume _intended_lineage and bind the sentinel to
+                # THIS task before user code runs, so any
+                # asyncio.create_task user code spawns observes the
+                # mismatch and forks a fresh lineage (stdlib parity).
+                _namespace._current_lineage()
                 proxy_pool = wool.__proxy_pool__.get()
                 proxy_ctx = proxy_pool.get(work_task.proxy) if proxy_pool else None
                 proxy = await proxy_ctx.__aenter__() if proxy_ctx else None
