@@ -5,6 +5,7 @@ import contextvars
 import io
 import logging
 import sys
+import threading
 import weakref
 from typing import Any
 from typing import Callable
@@ -140,11 +141,12 @@ def _register_unchecked(key: str, has_default: bool, default: Any) -> ContextVar
     instance._default = default if has_default else _SENTINEL
     instance._stdlib = contextvars.ContextVar(key, default=_UNSET)
     instance._stub = True
-    ContextVar._registry[key] = instance
-    # Paired strong pin: registry is a WeakValueDictionary and the
-    # sallyport has no other caller keeping the instance alive.
-    # Cleared on promotion in :meth:`ContextVar.__new__`.
-    ContextVar._stub_pins[key] = instance
+    with ContextVar._registry_lock:
+        ContextVar._registry[key] = instance
+        # Paired strong pin: registry is a WeakValueDictionary and the
+        # sallyport has no other caller keeping the instance alive.
+        # Cleared on promotion in :meth:`ContextVar.__new__`.
+        ContextVar._stub_pins[key] = instance
     return instance
 
 
@@ -280,6 +282,12 @@ class ContextVar(Generic[T]):
     # the pin is dropped and lifetime defers to the user's module
     # globals) or the process ends.
     _stub_pins: ClassVar[dict[str, ContextVar[Any]]] = {}
+    # Serializes check-then-act on _registry / _stub_pins across the
+    # __new__ promotion path and the _register_unchecked sallyport.
+    # Concurrent importer and gRPC-handler threads can otherwise race
+    # on the stub flag, torn-read _default, or register duplicate
+    # stubs under the same key.
+    _registry_lock: ClassVar[threading.RLock] = threading.RLock()
 
     _name: str
     _namespace: str
@@ -304,27 +312,28 @@ class ContextVar(Generic[T]):
     ) -> ContextVar[T]:
         ns = namespace if namespace is not None else _infer_namespace()
         key = f"{ns}:{name}"
-        existing = cls._registry.get(key)
-        if existing is not None:
-            if existing._stub:
-                # Promote a sallyport-registered stub in place. The
-                # module-scope construction is the authoritative source
-                # for default; adopt it, clear the stub flag, and return
-                # the existing instance so reference identity (and any
-                # wire values already applied to ``_stdlib``) is
-                # preserved.
-                existing._default = default
-                existing._stub = False
-                # Drop the sallyport pin now that the user's module
-                # globals (or equivalent) will hold the strong ref.
-                cls._stub_pins.pop(key, None)
-                return existing
-            raise ContextVarCollision(
-                f"wool.ContextVar {key!r} is already registered "
-                f"({existing!r}). Keys must be unique within a "
-                f"namespace."
-            )
-        return super().__new__(cls)
+        with cls._registry_lock:
+            existing = cls._registry.get(key)
+            if existing is not None:
+                if existing._stub:
+                    # Promote a sallyport-registered stub in place. The
+                    # module-scope construction is the authoritative
+                    # source for default; adopt it, clear the stub
+                    # flag, and return the existing instance so
+                    # reference identity (and any wire values already
+                    # applied to ``_stdlib``) is preserved.
+                    existing._default = default
+                    existing._stub = False
+                    # Drop the sallyport pin now that the user's module
+                    # globals (or equivalent) will hold the strong ref.
+                    cls._stub_pins.pop(key, None)
+                    return existing
+                raise ContextVarCollision(
+                    f"wool.ContextVar {key!r} is already registered "
+                    f"({existing!r}). Keys must be unique within a "
+                    f"namespace."
+                )
+            return super().__new__(cls)
 
     @overload
     def __init__(self, name: str, /, *, namespace: str | None = None) -> None: ...
