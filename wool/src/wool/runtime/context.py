@@ -693,6 +693,11 @@ class Context:
         finally:
             try:
                 self._vars = _snapshot_from(seeded)
+            except Exception:
+                # Never let a snapshot failure mask the user's
+                # exception (if any). Log and drop the partial update;
+                # the captured _vars stays at its prior value.
+                _log.exception("wool.Context.run: failed to capture post-run snapshot")
             finally:
                 self._exit()
         return result
@@ -725,6 +730,10 @@ class Context:
         finally:
             try:
                 self._vars = _snapshot_from(seeded)
+            except Exception:
+                _log.exception(
+                    "wool.Context.run_async: failed to capture post-run snapshot"
+                )
             finally:
                 self._exit()
         return result
