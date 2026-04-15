@@ -17,8 +17,9 @@ Pieces:
   that calls :func:`_current_lineage` adopts it and clears the slot.
 - :func:`_current_lineage` — the fork-detection primitive that
   backs :func:`wool.current_context`.
-- :func:`adopt_lineage` — explicit adoption used by worker-loop
-  sub-tasks that run user code.
+- :func:`adopt_lineage` — explicit adoption used by
+  :meth:`wool.Context.run` when seeding a fresh stdlib Context in
+  async code.
 - :func:`activate` — context manager used by the dispatch handler
   to set the intended lineage and bind the sentinel for its own
   task's duration.
@@ -111,8 +112,11 @@ _intended_lineage: contextvars.ContextVar[uuid.UUID | None] = contextvars.Contex
 )
 
 
-# Fallback lineage for code that dispatches outside any asyncio task
-# (e.g., synchronous tests building payloads manually). One per process.
+# Stable fallback lineage for sync callers outside any asyncio task.
+# Sharing a process-wide UUID across unrelated sync flows is the
+# price for Tokens minted by ``var.set(...)`` in sync code to still
+# match at ``var.reset(...)``. Per-call minting would make the
+# Token lineage check reject every sync reset.
 _process_default_lineage: uuid.UUID = uuid.uuid4()
 
 
@@ -144,7 +148,10 @@ def _current_lineage() -> uuid.UUID:
        sentinel to the current context, and return it (implicit fork
        across an ``asyncio.create_task`` boundary).
     4. Outside any asyncio task and with no intended lineage, return
-       the process-wide default lineage.
+       the process-wide default lineage. Shared across unrelated sync
+       flows in the same process, but stable — Tokens captured at
+       ``set()`` must compare equal on ``reset()`` for the common
+       sync ``var.set(...); var.reset(token)`` case to work.
     """
     try:
         task = asyncio.current_task()

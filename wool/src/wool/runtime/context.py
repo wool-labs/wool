@@ -130,8 +130,8 @@ def _register_unchecked(key: str, has_default: bool, default: Any) -> ContextVar
     would silently overwrite rather than raise.
 
     The produced instance is flagged ``_stub=True`` so a later
-    authoritative module-scope ``ContextVar(key, ...)`` call can
-    promote it in place rather than collide.
+    authoritative module-scope ``ContextVar(name, namespace=...)``
+    call can promote it in place rather than collide.
     """
     ns, _, name = key.partition(":")
     instance: ContextVar = object.__new__(ContextVar)
@@ -249,8 +249,7 @@ class ContextVar(Generic[T]):
     the same key raise :class:`ContextVarCollision`.
 
     The key travels on the wire and identifies the var on every worker
-    in the cluster. This replaces the earlier location-based identity
-    model and removes the need for module reflection at pickle time.
+    in the cluster.
 
     **Drop-in stdlib compatibility:** ``wool.ContextVar("foo")`` can
     be replaced with ``contextvars.ContextVar("foo")`` without code
@@ -464,6 +463,11 @@ class ContextVar(Generic[T]):
                 # Restore via _old_value.
                 pass
         if isinstance(token._old_value, _UnsetType):
+            # Note: explicitly setting _UNSET as a value leaves
+            # ``var._stdlib in ctx`` reporting True for a var that is
+            # semantically unset. Every reader in this module guards on
+            # ``is _UNSET`` so the public API surface is consistent;
+            # don't rely on ``in ctx`` as a proxy for "was set".
             self._stdlib.set(_UNSET)
         else:
             self._stdlib.set(token._old_value)
@@ -596,7 +600,8 @@ def _reconstruct_context(
 
 # public
 class Context:
-    """Immutable snapshot of wool.ContextVar state and lineage identity.
+    """Snapshot of wool.ContextVar state and lineage identity, scoped
+    to a single task at a time.
 
     Mirrors :class:`contextvars.Context`: supports the stdlib container
     protocol (``__iter__``, ``__getitem__``, ``__contains__``,

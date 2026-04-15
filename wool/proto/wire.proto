@@ -53,14 +53,14 @@ message Request {
         Message throw = 4;
     }
     // Cloudpickled wool.ContextVar values keyed by
-    // "<module_path>:<attr_name>". Propagates the caller's context
-    // snapshot to the worker on task frames, and forward-propagates
-    // caller mutations to the worker on streaming frames.
+    // "<namespace>:<name>" (the ContextVar.key). Propagates the
+    // caller's context snapshot to the worker on task frames, and
+    // forward-propagates caller mutations to the worker on streaming
+    // frames.
     map<string, bytes> vars = 5;
     // Lineage UUID as hex string. Stable across sequential awaits
     // inside the same asyncio task; fresh on asyncio.create_task
-    // boundaries. Empty string for root dispatches that will start a
-    // new lineage on the worker.
+    // boundaries.
     string lineage_id = 6;
 }
 
@@ -72,9 +72,10 @@ message Response {
         Message exception = 4;
     }
     // Cloudpickled wool.ContextVar values keyed by
-    // "<module_path>:<attr_name>". Back-propagates the routine's
+    // "<namespace>:<name>". Back-propagates the routine's
     // post-yield/post-return context snapshot to the caller.
     map<string, bytes> vars = 5;
+    // Lineage UUID the worker used, echoed back to the caller.
     string lineage_id = 6;
 }
 

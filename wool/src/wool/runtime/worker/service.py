@@ -218,17 +218,17 @@ class WorkerService(protocol.WorkerServicer):
         response = await anext(aiter(request_iterator))
 
         # Extract the lineage from the first Request, unpickle the
-        # Task, then activate the lineage and apply wire-shipped var
-        # values to the handler's context. Caller-side snapshots are
-        # keyed by UUID (UUID5 of module:attr for bound vars, UUID4
-        # for unbound); the worker resolves each UUID via the
-        # process-wide ContextVar registry and calls .set() on the
-        # local instance.
+        # Task, then activate the lineage and apply the caller's
+        # wire-shipped var snapshot to the handler's context. The
+        # snapshot is keyed by each var's "namespace:name";
+        # _apply_vars resolves each key via the process-wide
+        # ContextVar registry and calls .set() on the local instance.
         lineage_hex = response.lineage_id
         lineage_id = uuid.UUID(hex=lineage_hex) if lineage_hex else uuid.uuid4()
 
         work_task = Task.from_protobuf(response.task)
 
+        response_lineage_hex = lineage_hex or lineage_id.hex
         with _namespace.activate(lineage_id):
             if response.vars:
                 _apply_vars(dict(response.vars))
@@ -258,7 +258,7 @@ class WorkerService(protocol.WorkerServicer):
                             yield protocol.Response(
                                 result=result,
                                 vars=ctx_snapshot,
-                                lineage_id=lineage_hex or lineage_id.hex,
+                                lineage_id=response_lineage_hex,
                             )
                     elif isinstance(task, asyncio.Task):
                         value, ctx_snapshot = await task
@@ -266,7 +266,7 @@ class WorkerService(protocol.WorkerServicer):
                         yield protocol.Response(
                             result=result,
                             vars=ctx_snapshot,
-                            lineage_id=lineage_hex or lineage_id.hex,
+                            lineage_id=response_lineage_hex,
                         )
                 except (Exception, asyncio.CancelledError) as e:
                     exception = protocol.Message(dump=_dumps(e))
@@ -274,7 +274,7 @@ class WorkerService(protocol.WorkerServicer):
                     yield protocol.Response(
                         exception=exception,
                         vars=ctx_snapshot,
-                        lineage_id=lineage_hex or lineage_id.hex,
+                        lineage_id=response_lineage_hex,
                     )
 
     async def stop(

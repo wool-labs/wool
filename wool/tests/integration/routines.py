@@ -19,8 +19,9 @@ import wool
 # They live at module level so cloudpickle imports this module on the
 # worker when it unpickles a routine defined here. The import causes
 # the worker's own wool.ContextVar instances to self-register in the
-# process-wide UUID registry; caller-side snapshots keyed by UUID5 of
-# "<module>:<attr>" then resolve to those same instances on the worker.
+# process-wide registry under their ``"<namespace>:<name>"`` keys;
+# caller-side snapshots with matching keys resolve to the same logical
+# var on the worker.
 TENANT_ID: wool.ContextVar[str] = wool.ContextVar("tenant_id", default="unknown")
 REGION: wool.ContextVar[str] = wool.ContextVar("region", default="global")
 TRACE_ID: wool.ContextVar[str] = wool.ContextVar("trace_id", default="none")
