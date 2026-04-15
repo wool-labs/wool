@@ -131,10 +131,15 @@ def _current_lineage() -> uuid.UUID:
        has a :class:`_LineageSentinel` whose ``ctx_id`` matches the
        current task's context id, return its lineage (continuation).
     2. Else if :data:`_intended_lineage` is set (typically by
-       :func:`activate` on the worker), consume it by writing
-       ``None`` to our own context so descendants don't re-adopt,
-       bind the sentinel to the current context, and return the
-       adopted UUID.
+       :func:`activate` on the worker or by :meth:`wool.Context.run`
+       / :meth:`run_async` when seeding): inside an asyncio task,
+       consume it by writing ``None`` so descendants don't re-adopt
+       and bind the sentinel to the current context; outside an
+       asyncio task, leave :data:`_intended_lineage` set so
+       subsequent reads in the same stdlib ``Context`` scope keep
+       returning the same lineage (the stdlib ``Context`` is the
+       only isolator available when there's no task to bind a
+       sentinel to).
     3. Else in an asyncio task, mint a fresh lineage, bind the
        sentinel to the current context, and return it (implicit fork
        across an ``asyncio.create_task`` boundary).
@@ -155,8 +160,8 @@ def _current_lineage() -> uuid.UUID:
 
     intended = _intended_lineage.get(None)
     if intended is not None:
-        _intended_lineage.set(None)
         if ctx_id is not None:
+            _intended_lineage.set(None)
             _wool_sentinel.set(_LineageSentinel(intended, ctx_id))
         return intended
 

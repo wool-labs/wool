@@ -670,6 +670,7 @@ class Context:
         :raises RuntimeError:
             If this :class:`Context` is already running a task.
         """
+        from wool.runtime.worker.namespace import _intended_lineage
         from wool.runtime.worker.namespace import adopt_lineage
 
         self._enter()
@@ -678,7 +679,13 @@ class Context:
         def _seed_and_call() -> T:
             for var, value in self._vars.items():
                 var._stdlib.set(value)
+            # Bind the sentinel if we're in an asyncio task (fast path
+            # for async-in-sync nesting) and always prime
+            # _intended_lineage so that sync callers — where
+            # adopt_lineage is a no-op — still resolve the lineage
+            # inside the seeded stdlib Context.
             adopt_lineage(self._id)
+            _intended_lineage.set(self._id)
             return fn(*args, **kwargs)
 
         try:

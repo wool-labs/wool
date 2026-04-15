@@ -777,6 +777,23 @@ class TestContext:
         assert result == "mutated"
         assert ctx[var] == "mutated"
 
+    def test_run_binds_lineage_for_sync_callers(self):
+        """Test Context.run makes self.id the active lineage inside fn.
+
+        Given:
+            A Context constructed directly (sync caller, no asyncio task)
+        When:
+            Context.run invokes a function that reads current_context().id
+        Then:
+            The reported lineage id equals the Context's own id, not the
+            process-default lineage
+        """
+        ctx = Context()
+
+        observed = ctx.run(lambda: current_context().id)
+
+        assert observed == ctx.id
+
     def test_run_snapshot_skips_untouched_and_unset_vars(self):
         """Test Context.run's snapshot excludes registered vars that weren't set
         and vars explicitly holding the _UNSET sentinel.
