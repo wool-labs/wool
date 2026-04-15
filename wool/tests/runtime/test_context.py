@@ -446,6 +446,54 @@ class TestContextVar:
 
         assert promoted is reconstructed
 
+    def test_reconstructed_stub_survives_garbage_collection(self):
+        """Test a sallyport-registered stub is not reaped before promotion.
+
+        Given:
+            A stub reconstructed from the wire with no user-visible owner
+        When:
+            The garbage collector runs a full cycle
+        Then:
+            The stub is still in the registry and its applied value
+            remains readable — the sallyport pin keeps it alive
+        """
+        import gc
+
+        _reconstruct("elsewhere:gc_target", True, "fallback")
+        _apply_vars({"elsewhere:gc_target": _dumps("applied_before_gc")})
+        gc.collect()
+        gc.collect()
+
+        survived = ContextVar._registry.get("elsewhere:gc_target")
+
+        assert survived is not None
+        assert survived.get() == "applied_before_gc"
+
+    def test_stub_pin_released_on_promotion_allows_gc(self):
+        """Test promotion drops the sallyport pin so a promoted var can be GC'd.
+
+        Given:
+            A reconstructed stub that is promoted by a module-scope
+            ContextVar construction
+        When:
+            The promoted var's local reference is dropped and GC runs
+        Then:
+            The registry entry is also dropped — the stub pin no longer
+            holds it, so lifetime defers to user code's strong refs
+        """
+        import gc
+
+        _reconstruct("myapp:release_target", False, None)
+        key = "myapp:release_target"
+
+        promoted = ContextVar("release_target", namespace="myapp")
+        assert key not in ContextVar._stub_pins
+
+        del promoted
+        gc.collect()
+
+        assert key not in ContextVar._registry
+
     def test_reconstructed_var_supports_set_get_reset_before_promotion(self):
         """Test a reconstructed stub behaves like a real var before promotion.
 

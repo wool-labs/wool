@@ -141,6 +141,10 @@ def _register_unchecked(key: str, has_default: bool, default: Any) -> ContextVar
     instance._stdlib = contextvars.ContextVar(key, default=_UNSET)
     instance._stub = True
     ContextVar._registry[key] = instance
+    # Paired strong pin: registry is a WeakValueDictionary and the
+    # sallyport has no other caller keeping the instance alive.
+    # Cleared on promotion in :meth:`ContextVar.__new__`.
+    ContextVar._stub_pins[key] = instance
     return instance
 
 
@@ -268,6 +272,14 @@ class ContextVar(Generic[T]):
     _registry: ClassVar[weakref.WeakValueDictionary[str, ContextVar[Any]]] = (
         weakref.WeakValueDictionary()
     )
+    # Strong-ref companion to _registry for sallyport-created stubs.
+    # Instances created via :func:`_register_unchecked` (the unpickle
+    # path) have no user-visible owner — the weak _registry alone
+    # can't keep them alive. They stay pinned here until a
+    # module-scope ``ContextVar(...)`` promotes them (at which point
+    # the pin is dropped and lifetime defers to the user's module
+    # globals) or the process ends.
+    _stub_pins: ClassVar[dict[str, ContextVar[Any]]] = {}
 
     _name: str
     _namespace: str
@@ -303,6 +315,9 @@ class ContextVar(Generic[T]):
                 # preserved.
                 existing._default = default
                 existing._stub = False
+                # Drop the sallyport pin now that the user's module
+                # globals (or equivalent) will hold the strong ref.
+                cls._stub_pins.pop(key, None)
                 return existing
             raise ContextVarCollision(
                 f"wool.ContextVar {key!r} is already registered "
