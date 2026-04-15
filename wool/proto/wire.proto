@@ -58,10 +58,10 @@ message Request {
     // forward-propagates caller mutations to the worker on streaming
     // frames.
     map<string, bytes> vars = 5;
-    // Lineage UUID as hex string. Stable across sequential awaits
+    // wool.Context id as hex string. Stable across sequential awaits
     // inside the same asyncio task; fresh on asyncio.create_task
     // boundaries.
-    string lineage_id = 6;
+    string context_id = 6;
 }
 
 message Response {
@@ -75,8 +75,8 @@ message Response {
     // "<namespace>:<name>". Back-propagates the routine's
     // post-yield/post-return context snapshot to the caller.
     map<string, bytes> vars = 5;
-    // Lineage UUID the worker used, echoed back to the caller.
-    string lineage_id = 6;
+    // wool.Context id the worker used, echoed back to the caller.
+    string context_id = 6;
 }
 
 message StopRequest {

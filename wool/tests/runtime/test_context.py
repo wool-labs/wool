@@ -366,18 +366,18 @@ class TestContextVar:
         assert result == "<fallback>"
 
     @pytest.mark.asyncio
-    async def test_reset_rejects_token_from_different_lineage(self):
-        """Test reset raises ValueError when the token is from another lineage.
+    async def test_reset_rejects_token_from_different_context(self):
+        """Test reset raises ValueError when the token is from another Context.
 
         Given:
-            A Token minted inside one Context's lineage (async run)
+            A Token minted inside one Context (async run)
         When:
-            reset() is called on the var inside a different Context's lineage
+            reset() is called on the var inside a different Context
         Then:
-            It should raise ValueError citing the lineage mismatch
+            It should raise ValueError citing the Context mismatch
         """
         # Arrange
-        var = ContextVar("lineage_check", default="start")
+        var = ContextVar("context_check", default="start")
         ctx_a = Context()
         ctx_b = Context()
         captured: list[Token] = []
@@ -388,7 +388,7 @@ class TestContextVar:
         await ctx_a.run_async(capture())
 
         async def try_reset():
-            with pytest.raises(ValueError, match="different wool.Context lineage"):
+            with pytest.raises(ValueError, match="different wool.Context"):
                 var.reset(captured[0])
 
         # Act & assert
@@ -625,14 +625,14 @@ class TestToken:
 
 class TestContext:
     def test___new___allows_direct_instantiation(self):
-        """Test Context() constructs an empty Context with a fresh lineage UUID.
+        """Test Context() constructs an empty Context with a fresh id.
 
         Given:
             The Context class
         When:
             It is instantiated directly
         Then:
-            The result should have a fresh lineage UUID and no captured vars
+            The result should have a fresh id and no captured vars
         """
         # Act
         ctx = Context()
@@ -668,16 +668,16 @@ class TestContext:
         assert result == "mutated"
         assert ctx[var] == "mutated"
 
-    def test_run_binds_lineage_for_sync_callers(self):
-        """Test Context.run makes self.id the active lineage inside fn.
+    def test_run_binds_context_for_sync_callers(self):
+        """Test Context.run makes self.id the active Context id inside fn.
 
         Given:
             A Context constructed directly (sync caller, no asyncio task)
         When:
             Context.run invokes a function that reads current_context().id
         Then:
-            The reported lineage id equals the Context's own id, not the
-            process-default lineage
+            The reported context id equals the Context's own id, not the
+            process-default id
         """
         # Arrange
         ctx = Context()
@@ -807,7 +807,7 @@ class TestContext:
         ctx.run(outer)
 
     def test_pickle_roundtrip_preserves_id_and_vars(self):
-        """Test Context pickles its lineage id and var dict.
+        """Test Context pickles its id and var dict.
 
         Given:
             A Context captured after setting a var
@@ -936,15 +936,15 @@ class TestContext:
         assert set(ctx.values()) == {"x", "y"}
         assert dict(ctx.items()) == {a: "x", b: "y"}
 
-    def test_repr_includes_lineage_id_and_var_count(self):
-        """Test Context repr mentions lineage id and number of vars.
+    def test_repr_includes_id_and_var_count(self):
+        """Test Context repr mentions id and number of vars.
 
         Given:
             A Context with one captured var
         When:
             repr() is called on it
         Then:
-            The repr should contain 'lineage=' and 'vars=1'
+            The repr should contain "id=" and "vars=1"
         """
         # Arrange
         var = ContextVar("repr_var", default=0)
@@ -955,7 +955,7 @@ class TestContext:
         text = repr(ctx)
 
         # Assert
-        assert "lineage=" in text
+        assert "id=" in text
         assert "vars=1" in text
 
     @pytest.mark.asyncio
@@ -1158,8 +1158,8 @@ class TestContext:
         await task
 
 
-def test_current_context_captures_set_vars_with_lineage():
-    """Test current_context() captures explicitly-set vars and active lineage.
+def test_current_context_captures_set_vars_with_id():
+    """Test current_context() captures explicitly-set vars and active id.
 
     Given:
         A ContextVar with an explicit value set
@@ -1167,7 +1167,7 @@ def test_current_context_captures_set_vars_with_lineage():
         current_context() is called
     Then:
         The returned Context should contain the var with its value
-        and a non-None lineage id
+        and a non-None id
     """
     # Arrange
     var = ContextVar("cur_ctx", default=0)

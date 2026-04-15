@@ -217,19 +217,19 @@ class WorkerService(protocol.WorkerServicer):
 
         response = await anext(aiter(request_iterator))
 
-        # Extract the lineage from the first Request, unpickle the
-        # Task, then activate the lineage and apply the caller's
+        # Extract the context id from the first Request, unpickle
+        # the Task, then activate the id and apply the caller's
         # wire-shipped var snapshot to the handler's context. The
         # snapshot is keyed by each var's "namespace:name";
         # _apply_vars resolves each key via the process-wide
         # ContextVar registry and calls .set() on the local instance.
-        lineage_hex = response.lineage_id
-        lineage_id = uuid.UUID(hex=lineage_hex) if lineage_hex else uuid.uuid4()
+        context_hex = response.context_id
+        context_id = uuid.UUID(hex=context_hex) if context_hex else uuid.uuid4()
 
         work_task = Task.from_protobuf(response.task)
 
-        response_lineage_hex = lineage_hex or lineage_id.hex
-        with _namespace.activate(lineage_id):
+        response_context_hex = context_hex or context_id.hex
+        with _namespace.activate(context_id):
             if response.vars:
                 _apply_vars(dict(response.vars))
 
@@ -258,7 +258,7 @@ class WorkerService(protocol.WorkerServicer):
                             yield protocol.Response(
                                 result=result,
                                 vars=ctx_snapshot,
-                                lineage_id=response_lineage_hex,
+                                context_id=response_context_hex,
                             )
                     elif isinstance(task, asyncio.Task):
                         value, ctx_snapshot = await task
@@ -266,7 +266,7 @@ class WorkerService(protocol.WorkerServicer):
                         yield protocol.Response(
                             result=result,
                             vars=ctx_snapshot,
-                            lineage_id=response_lineage_hex,
+                            context_id=response_context_hex,
                         )
                 except (Exception, asyncio.CancelledError) as e:
                     exception = protocol.Message(dump=_dumps(e))
@@ -274,7 +274,7 @@ class WorkerService(protocol.WorkerServicer):
                     yield protocol.Response(
                         exception=exception,
                         vars=ctx_snapshot,
-                        lineage_id=response_lineage_hex,
+                        context_id=response_context_hex,
                     )
 
     async def stop(
@@ -361,22 +361,22 @@ class WorkerService(protocol.WorkerServicer):
         future: concurrent.futures.Future = concurrent.futures.Future()
         worker_task = None
 
-        async def _run_with_lineage_adoption():
-            # Consume the _intended_lineage that the dispatch handler's
-            # activate() set, binding the sentinel to THIS task (the
-            # one the worker loop actually runs user code in). Any
-            # asyncio.create_task spawned by user code below will
-            # observe the sentinel bound to this task, see the
-            # mismatch on their own entry to _current_lineage(), and
-            # mint a fresh lineage — stdlib fork semantics.
-            _namespace._current_lineage()
+        async def _run_with_context_adoption():
+            # Consume the _intended_context_id that the dispatch
+            # handler's activate() set, binding the sentinel to THIS
+            # task (the one the worker loop actually runs user code
+            # in). Any asyncio.create_task spawned by user code below
+            # will observe the sentinel bound to this task, see the
+            # mismatch on their own entry to _current_context_id(),
+            # and mint a fresh id — stdlib fork semantics.
+            _namespace._current_context_id()
             return await work_task._run()
 
         async with self._loop_pool.get("worker") as (worker_loop, _):
 
             def _schedule():
                 nonlocal worker_task
-                task = worker_loop.create_task(_run_with_lineage_adoption(), context=ctx)
+                task = worker_loop.create_task(_run_with_context_adoption(), context=ctx)
                 worker_task = task
 
                 def _done(t: asyncio.Task):
@@ -433,12 +433,12 @@ class WorkerService(protocol.WorkerServicer):
         async with self._loop_pool.get("worker") as (worker_loop, _):
 
             async def worker_dispatch():
-                # Mirrors _run_with_lineage_adoption in _run_on_worker:
-                # consume _intended_lineage and bind the sentinel to
-                # THIS task before user code runs, so any
+                # Mirrors _run_with_context_adoption in _run_on_worker:
+                # consume _intended_context_id and bind the sentinel
+                # to THIS task before user code runs, so any
                 # asyncio.create_task user code spawns observes the
-                # mismatch and forks a fresh lineage (stdlib parity).
-                _namespace._current_lineage()
+                # mismatch and forks a fresh id (stdlib parity).
+                _namespace._current_context_id()
                 proxy_pool = wool.__proxy_pool__.get()
                 proxy_ctx = proxy_pool.get(work_task.proxy) if proxy_pool else None
                 proxy = await proxy_ctx.__aenter__() if proxy_ctx else None

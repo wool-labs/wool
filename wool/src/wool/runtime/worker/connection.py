@@ -129,11 +129,11 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            vars_dict, lineage_hex = build_frame_payload()
+            vars_dict, context_hex = build_frame_payload()
             request = protocol.Request(
                 next=protocol.Void(),
                 vars=vars_dict,
-                lineage_id=lineage_hex,
+                context_id=context_hex,
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -218,11 +218,11 @@ class _DispatchStream(Generic[_T]):
         self._running = True
         try:
             dump = _dumps(value)
-            vars_dict, lineage_hex = build_frame_payload()
+            vars_dict, context_hex = build_frame_payload()
             request = protocol.Request(
                 send=protocol.Message(dump=dump),
                 vars=vars_dict,
-                lineage_id=lineage_hex,
+                context_id=context_hex,
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -266,11 +266,11 @@ class _DispatchStream(Generic[_T]):
                 exc = typ()
 
             dump = _dumps(exc)
-            vars_dict, lineage_hex = build_frame_payload()
+            vars_dict, context_hex = build_frame_payload()
             request = protocol.Request(
                 throw=protocol.Message(dump=dump),
                 vars=vars_dict,
-                lineage_id=lineage_hex,
+                context_id=context_hex,
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -496,11 +496,11 @@ class WorkerConnection:
             try:
                 call: _DispatchCall = channel.stub.dispatch()
                 try:
-                    vars_dict, lineage_hex = build_frame_payload()
+                    vars_dict, context_hex = build_frame_payload()
                     request = protocol.Request(
                         task=task_msg,
                         vars=vars_dict,
-                        lineage_id=lineage_hex,
+                        context_id=context_hex,
                     )
                     await call.write(request)
                     response = await anext(aiter(call))

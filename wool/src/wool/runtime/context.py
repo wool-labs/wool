@@ -91,11 +91,11 @@ _received_values: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVa
 )
 
 
-def _lineage_id_now() -> UUID:
-    """Return the current lineage UUID, lazily imported to avoid cycles."""
-    from wool.runtime.worker.namespace import _current_lineage
+def _current_context_id() -> UUID:
+    """Return the current wool.Context id, lazily imported to avoid cycles."""
+    from wool.runtime.worker.namespace import _current_context_id as impl
 
-    return _current_lineage()
+    return impl()
 
 
 def _infer_namespace() -> str:
@@ -191,7 +191,7 @@ def _register_unchecked(key: str, has_default: bool, default: Any) -> ContextVar
 def _reconstruct_token(
     var: ContextVar,
     old_value: Any,
-    lineage_id: UUID,
+    context_id: UUID,
     prev_modified_keys: frozenset[str] = frozenset(),
 ) -> Token:
     """Unpickle helper for :class:`Token`."""
@@ -200,7 +200,7 @@ def _reconstruct_token(
     token._old_value = old_value
     token._stdlib_token = None
     token._used = False
-    token._lineage_id = lineage_id
+    token._context_id = context_id
     token._prev_modified_keys = prev_modified_keys
     return token
 
@@ -210,14 +210,15 @@ class Token(Generic[T]):
     """Picklable token for reverting a :class:`ContextVar` mutation.
 
     Mirrors :class:`contextvars.Token`: single-use, same-var rejection,
-    and (per wool) scoped to the lineage in which it was created.
+    and (per wool) scoped to the wool.Context in which it was created.
     Attempting to :meth:`ContextVar.reset` with a token minted in a
-    different wool lineage raises :class:`ValueError`.
+    different wool.Context raises :class:`ValueError`.
 
-    Within the same lineage, the wrapped stdlib token is used for
-    :meth:`ContextVar.reset` when valid. In cross-process dispatch
-    scenarios the stdlib token is invalid on the receiver; the token's
-    captured :attr:`old_value` is restored directly as a fallback.
+    Within the same wool.Context, the wrapped stdlib token is used
+    for :meth:`ContextVar.reset` when valid. In cross-process
+    dispatch scenarios the stdlib token is invalid on the receiver;
+    the token's captured :attr:`old_value` is restored directly as a
+    fallback.
     """
 
     __slots__ = (
@@ -225,7 +226,7 @@ class Token(Generic[T]):
         "_old_value",
         "_stdlib_token",
         "_used",
-        "_lineage_id",
+        "_context_id",
         "_prev_modified_keys",
     )
 
@@ -236,7 +237,7 @@ class Token(Generic[T]):
     _old_value: T | _UnsetType
     _stdlib_token: contextvars.Token[T | _UnsetType] | None
     _used: bool
-    _lineage_id: UUID
+    _context_id: UUID
     # _modified_keys value at set() time. :meth:`ContextVar.reset`
     # restores this so a set+reset pair leaves the tracker unchanged.
     _prev_modified_keys: frozenset[str]
@@ -252,7 +253,7 @@ class Token(Generic[T]):
         self._old_value = old_value
         self._stdlib_token = stdlib_token
         self._used = False
-        self._lineage_id = _lineage_id_now()
+        self._context_id = _current_context_id()
         self._prev_modified_keys = prev_modified_keys
 
     @property
@@ -274,7 +275,7 @@ class Token(Generic[T]):
             (
                 self._var,
                 self._old_value,
-                self._lineage_id,
+                self._context_id,
                 self._prev_modified_keys,
             ),
         )
@@ -485,14 +486,15 @@ class ContextVar(Generic[T]):
         """Restore the variable to the value it had before *token*.
 
         Matches :meth:`contextvars.ContextVar.reset` semantics, scoped
-        to the wool lineage: the token must have been created in the
-        same lineage as the one currently active, else
+        to the wool.Context: the token must have been created in the
+        same wool.Context as the one currently active, else
         :class:`ValueError`.
 
-        Within a single lineage, the wrapped stdlib token is used for
-        the reset when valid. Cross-stdlib-Context dispatch (same
-        lineage on caller and worker, different stdlib Contexts) falls
-        back to restoring the token's captured ``_old_value``.
+        Within a single wool.Context, the wrapped stdlib token is
+        used for the reset when valid. Cross-stdlib-Context dispatch
+        (same wool.Context on caller and worker, different stdlib
+        Contexts) falls back to restoring the token's captured
+        ``_old_value``.
 
         :param token:
             A token previously returned by :meth:`set`.
@@ -500,14 +502,14 @@ class ContextVar(Generic[T]):
             If the token has already been used.
         :raises ValueError:
             If the token was created by a different
-            :class:`ContextVar` or in a different wool lineage.
+            :class:`ContextVar` or in a different wool.Context.
         """
         if token._used:
             raise RuntimeError("Token has already been used")
         if token._var is not self:
             raise ValueError("Token was created by a different ContextVar")
-        if token._lineage_id != _lineage_id_now():
-            raise ValueError("Token was created in a different wool.Context lineage")
+        if token._context_id != _current_context_id():
+            raise ValueError("Token was created in a different wool.Context")
         token._used = True
         # Restore the modified-keys tracker to its pre-set state so a
         # net-zero set+reset leaves the tracker unchanged; snapshots
@@ -518,9 +520,9 @@ class ContextVar(Generic[T]):
                 self._stdlib.reset(token._stdlib_token)
                 return
             except ValueError:
-                # Same lineage but different stdlib Context (e.g.,
-                # across a dispatch boundary on the worker-side run).
-                # Restore via _old_value.
+                # Same wool.Context but different stdlib Context
+                # (e.g., across a dispatch boundary on the worker-side
+                # run). Restore via _old_value.
                 pass
         if isinstance(token._old_value, _UnsetType):
             # Note: explicitly setting _UNSET as a value leaves
@@ -683,21 +685,21 @@ def _reconstruct_context(
 
 # public
 class Context:
-    """Snapshot of wool.ContextVar state and lineage identity, scoped
-    to a single task at a time.
+    """Snapshot of wool.ContextVar state and context id, scoped to a
+    single task at a time.
 
     Mirrors :class:`contextvars.Context`: supports the stdlib container
     protocol (``__iter__``, ``__getitem__``, ``__contains__``,
     ``__len__``, ``keys``, ``values``, ``items``) and scopes mutations
     via :meth:`Context.run` / :meth:`Context.run_async`.
 
-    A :class:`Context` formalizes the task lineage concept: beyond
-    the snapshot of :class:`ContextVar` values, it carries the
-    lineage ``UUID`` that identifies a logical execution chain.
+    Beyond the snapshot of :class:`ContextVar` values, a
+    :class:`Context` carries a ``UUID`` id that identifies the
+    logical execution chain it belongs to.
 
     Instances can be constructed directly (``wool.Context()`` returns
-    an empty Context with a fresh lineage UUID) or via
-    :func:`current_context` (snapshot of the current ambient state).
+    an empty Context with a fresh id) or via :func:`current_context`
+    (snapshot of the current ambient state).
 
     Instances are picklable. A :class:`Context` captured on the
     caller can ride the wire as a routine argument, be unpickled on
@@ -739,7 +741,7 @@ class Context:
 
     @property
     def id(self) -> UUID:
-        """The UUID that identifies this context's lineage."""
+        """The UUID that identifies this Context's logical chain."""
         return self._id
 
     def _enter(self) -> None:
@@ -759,16 +761,16 @@ class Context:
         """Run *fn* in this context (stdlib parity).
 
         Seeds a fresh stdlib :class:`contextvars.Context` with this
-        wool context's var values and active lineage, then invokes
-        *fn* inside it via :meth:`contextvars.Context.run`. Mutations
-        made during the call flow back into this :class:`Context`'s
-        :attr:`_vars` on exit so that back-propagation can read them.
+        wool.Context's var values and id, then invokes *fn* inside it
+        via :meth:`contextvars.Context.run`. Mutations made during
+        the call flow back into this :class:`Context`'s :attr:`_vars`
+        on exit so that back-propagation can read them.
 
         :raises RuntimeError:
             If this :class:`Context` is already running a task.
         """
-        from wool.runtime.worker.namespace import _intended_lineage
-        from wool.runtime.worker.namespace import adopt_lineage
+        from wool.runtime.worker.namespace import _intended_context_id
+        from wool.runtime.worker.namespace import adopt_context
 
         self._enter()
         seeded = contextvars.copy_context()
@@ -784,13 +786,13 @@ class Context:
                 var.set(value)
                 received[var._key] = value
             _received_values.set(received)
-            # Bind the sentinel if we're in an asyncio task (fast path
-            # for async-in-sync nesting) and always prime
-            # _intended_lineage so that sync callers — where
-            # adopt_lineage is a no-op — still resolve the lineage
-            # inside the seeded stdlib Context.
-            adopt_lineage(self._id)
-            _intended_lineage.set(self._id)
+            # Bind the sentinel if we're in an asyncio task (fast
+            # path for async-in-sync nesting) and always prime
+            # _intended_context_id so that sync callers — where
+            # adopt_context is a no-op — still resolve the id inside
+            # the seeded stdlib Context.
+            adopt_context(self._id)
+            _intended_context_id.set(self._id)
             return fn(*args, **kwargs)
 
         try:
@@ -811,15 +813,15 @@ class Context:
         """Run *coro* in this context (async analog of :meth:`run`).
 
         Seeds a fresh stdlib :class:`contextvars.Context` with this
-        wool context's var values and active lineage, then runs *coro*
-        as an :class:`asyncio.Task` scoped to that seeded context.
+        wool.Context's var values and id, then runs *coro* as an
+        :class:`asyncio.Task` scoped to that seeded context.
         Mutations during the task flow back into this Context's
         :attr:`_vars` on completion.
 
         :raises RuntimeError:
             If this :class:`Context` is already running a task.
         """
-        from wool.runtime.worker.namespace import _intended_lineage
+        from wool.runtime.worker.namespace import _intended_context_id
 
         self._enter()
         seeded = contextvars.copy_context()
@@ -835,7 +837,7 @@ class Context:
                 var.set(value)
                 received[var._key] = value
             _received_values.set(received)
-            _intended_lineage.set(self._id)
+            _intended_context_id.set(self._id)
 
         seeded.run(_seed)
         try:
@@ -873,7 +875,7 @@ class Context:
         return self._vars.items()
 
     def __repr__(self) -> str:
-        return f"<wool.Context lineage={self._id} vars={len(self._vars)}>"
+        return f"<wool.Context id={self._id} vars={len(self._vars)}>"
 
     def __reduce__(self):
         return (_reconstruct_context, (self._id, dict(self._vars)))
@@ -909,16 +911,16 @@ def _snapshot_from(ctx: contextvars.Context) -> dict[ContextVar[Any], Any]:
 
 # public
 def current_context() -> Context:
-    """Return a snapshot of the current wool context.
+    """Return a snapshot of the current wool.Context.
 
     Mirrors :func:`contextvars.copy_context` with the additional
-    semantic that the returned :class:`Context` carries the lineage
-    UUID identifying the current execution chain. The returned
-    Context captures every :class:`ContextVar` that has an explicit
-    value set in the current context (unset vars and vars sitting at
-    their class-level default are omitted) plus the active lineage
-    UUID. When no lineage is active, a fresh UUID is minted — the
-    returned context starts a new lineage.
+    semantic that the returned :class:`Context` carries the UUID
+    identifying the current execution chain. The returned Context
+    captures every :class:`ContextVar` that has an explicit value set
+    in the current context (unset vars and vars sitting at their
+    class-level default are omitted) plus the active context id.
+    When no context is active, a fresh UUID is minted — the returned
+    context starts a new chain.
     """
     vars_dict: dict[ContextVar[Any], Any] = {}
     for var in list(ContextVar._registry.values()):
@@ -926,26 +928,26 @@ def current_context() -> Context:
         if raw is _UNSET:
             continue
         vars_dict[var] = raw
-    return Context._from_vars(_lineage_id_now(), vars_dict)
+    return Context._from_vars(_current_context_id(), vars_dict)
 
 
 def build_frame_payload() -> tuple[dict[str, bytes], str]:  # pragma: no cover
     """Assemble the wire payload for a dispatch or streaming frame.
 
-    Returns ``(vars, lineage_id)`` for populating the protobuf
-    ``vars`` map and ``lineage_id`` string on any Request — the
+    Returns ``(vars, context_id)`` for populating the protobuf
+    ``vars`` map and ``context_id`` string on any Request — the
     initial dispatch or a subsequent ``next``/``send``/``throw``.
     Every frame re-ships the current var snapshot plus the active
-    lineage UUID so forward-propagated caller mutations reach the
-    worker and the worker confirms the lineage on return.
+    context id so forward-propagated caller mutations reach the
+    worker and the worker confirms the id on return.
 
-    ``lineage_id`` is the active lineage UUID as a hex string. When
-    no lineage has been adopted (root dispatch), it falls back to
-    the process-default lineage.
+    ``context_id`` is the active wool.Context id as a hex string.
+    When no context has been adopted (root dispatch), it falls back
+    to the process-default id.
     """
     vars_dict = _snapshot_vars()
-    lineage_hex = _lineage_id_now().hex
-    return vars_dict, lineage_hex
+    context_hex = _current_context_id().hex
+    return vars_dict, context_hex
 
 
 dispatch_timeout: Final[contextvars.ContextVar[float | None]] = contextvars.ContextVar(
