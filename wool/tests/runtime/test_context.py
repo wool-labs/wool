@@ -1015,6 +1015,118 @@ class TestContext:
         assert set_then_reset not in ctx
 
     @pytest.mark.asyncio
+    async def test_run_async_snapshot_skips_seeded_var_worker_did_not_modify(self):
+        """Test Context.run_async omits seed-only values that the coro didn't modify.
+
+        Given:
+            A Context seeded with a var value and a coroutine that
+            doesn't touch that var
+        When:
+            Context.run_async runs the coroutine
+        Then:
+            The Context's post-run snapshot should not include the var —
+            its current value equals the seeded (received) value, so the
+            diff-skip excludes it
+        """
+        # Arrange
+        var = ContextVar("runa_skip_seed", default="initial")
+        var.set("seeded")
+        ctx = current_context()
+
+        async def body():
+            return var.get()
+
+        # Act
+        result = await ctx.run_async(body())
+
+        # Assert
+        assert result == "seeded"
+        assert var not in ctx
+
+    @pytest.mark.asyncio
+    async def test_run_async_snapshot_captures_only_worker_mutations(self):
+        """Test Context.run_async captures only vars the coro actually changed.
+
+        Given:
+            A Context seeded with two vars and a coro that modifies one
+        When:
+            Context.run_async runs the coroutine
+        Then:
+            Only the modified var appears in the captured snapshot
+        """
+        # Arrange
+        untouched = ContextVar("runa_untouched", default="initial")
+        touched = ContextVar("runa_touched", default="initial")
+        untouched.set("seed_untouched")
+        touched.set("seed_touched")
+        ctx = current_context()
+
+        async def body():
+            touched.set("mutated")
+
+        # Act
+        await ctx.run_async(body())
+
+        # Assert
+        assert untouched not in ctx
+        assert ctx[touched] == "mutated"
+
+    def test_pickle_roundtrip_embeds_current_value(self):
+        """Test pickling a ContextVar captures its current value for the receiver.
+
+        Given:
+            A ContextVar set to a specific value in the current context
+        When:
+            The var is pickled and unpickled inside a fresh stdlib Context
+        Then:
+            The receiver's var.get() returns the value that was set at
+            pickle time — the reducer-override embedded it
+        """
+        # Arrange
+        var = ContextVar("pickle_with_value", default="default_value")
+        var.set("pickled_value")
+        pickled = _dumps(var)
+
+        # Act
+        observed: list[object] = []
+
+        def in_fresh():
+            restored = _loads(pickled)
+            observed.append(restored.get())
+
+        contextvars.copy_context().run(in_fresh)
+
+        # Assert
+        assert observed == ["pickled_value"]
+
+    def test_pickle_roundtrip_carries_no_value_when_unset(self):
+        """Test pickling a never-set ContextVar doesn't apply a value on receive.
+
+        Given:
+            A ContextVar that has never been set in the current context
+        When:
+            The var is pickled and unpickled inside a fresh stdlib Context
+        Then:
+            The receiver's var.get() returns the class-level default
+            (nothing was applied from the pickle)
+        """
+        # Arrange
+        var = ContextVar("pickle_no_value", default="default_value")
+        pickled = _dumps(var)
+
+        # Act
+        observed: list[object] = []
+
+        def in_fresh():
+            restored = _loads(pickled)
+            observed.append(restored.get())
+
+        contextvars.copy_context().run(in_fresh)
+
+        # Assert
+        assert observed == ["default_value"]
+
+    @pytest.mark.asyncio
     async def test_run_async_concurrent_entry_raises(self):
         """Test Context.run_async raises on re-entry while a task is running.
 

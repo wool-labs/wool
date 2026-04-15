@@ -72,6 +72,25 @@ class _UnsetType:
 _UNSET: Final = _UnsetType()
 
 
+# Set of wool.ContextVar keys that have been set() in the current stdlib
+# Context. Populated by :meth:`ContextVar.set`, :func:`_apply_vars`, and
+# the reducer-override's unpickle path. Restored to the pre-set value by
+# :meth:`ContextVar.reset`. Snapshot helpers iterate this set instead of
+# walking the full process-wide registry on every frame.
+_modified_keys: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "wool._modified_keys", default=frozenset()
+)
+
+# Last-received value per key, populated on incoming wire frames (via
+# :func:`_apply_vars`) and on unpickle-time reducer-embedded values.
+# Snapshot helpers diff current stdlib values against these to skip
+# shipping keys whose value hasn't changed since the other side last
+# sent it.
+_received_values: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+    "wool._received_values", default={}
+)
+
+
 def _lineage_id_now() -> UUID:
     """Return the current lineage UUID, lazily imported to avoid cycles."""
     from wool.runtime.worker.namespace import _current_lineage
@@ -100,7 +119,12 @@ def _infer_namespace() -> str:
     return "__main__"  # pragma: no cover — stack always has a caller
 
 
-def _reconstruct(key: str, has_default: bool, default: Any) -> ContextVar:
+def _reconstruct(
+    key: str,
+    has_default: bool,
+    default: Any,
+    current_value: Any = _UNSET,
+) -> ContextVar:
     """Unpickle helper: get-or-create a :class:`ContextVar` by key.
 
     Normal flow: the worker has already imported the routine's module
@@ -112,11 +136,25 @@ def _reconstruct(key: str, has_default: bool, default: Any) -> ContextVar:
     sallyport so the duplicate-key check in the public constructor
     doesn't fire here — the whole point of the unpickle path is to
     adopt the caller's identity on this process.
+
+    If *current_value* is not :data:`_UNSET` (i.e., the pickler
+    embedded the var's live value), the value is applied to the
+    receiver's stdlib var and recorded in :data:`_received_values`
+    so subsequent outbound snapshots can diff-skip this key.
+    *current_value* defaults to :data:`_UNSET` for backward compat
+    with 3-arg reduce tuples (e.g., pickled data that predates the
+    embedded-value format).
     """
     existing = ContextVar._registry.get(key)
-    if existing is not None:
-        return existing
-    return _register_unchecked(key, has_default, default)
+    if existing is None:
+        existing = _register_unchecked(key, has_default, default)
+    if current_value is not _UNSET:
+        existing._stdlib.set(current_value)
+        _modified_keys.set(_modified_keys.get() | {key})
+        received = dict(_received_values.get())
+        received[key] = current_value
+        _received_values.set(received)
+    return existing
 
 
 def _register_unchecked(key: str, has_default: bool, default: Any) -> ContextVar:
@@ -154,6 +192,7 @@ def _reconstruct_token(
     var: ContextVar,
     old_value: Any,
     lineage_id: UUID,
+    prev_modified_keys: frozenset[str] = frozenset(),
 ) -> Token:
     """Unpickle helper for :class:`Token`."""
     token = object.__new__(Token)
@@ -162,6 +201,7 @@ def _reconstruct_token(
     token._stdlib_token = None
     token._used = False
     token._lineage_id = lineage_id
+    token._prev_modified_keys = prev_modified_keys
     return token
 
 
@@ -186,6 +226,7 @@ class Token(Generic[T]):
         "_stdlib_token",
         "_used",
         "_lineage_id",
+        "_prev_modified_keys",
     )
 
     # Class-level alias for the stdlib-compatible missing sentinel.
@@ -196,18 +237,23 @@ class Token(Generic[T]):
     _stdlib_token: contextvars.Token[T | _UnsetType] | None
     _used: bool
     _lineage_id: UUID
+    # _modified_keys value at set() time. :meth:`ContextVar.reset`
+    # restores this so a set+reset pair leaves the tracker unchanged.
+    _prev_modified_keys: frozenset[str]
 
     def __init__(
         self,
         var: ContextVar[T],
         old_value: T | _UnsetType,
         stdlib_token: contextvars.Token[T | _UnsetType],
+        prev_modified_keys: frozenset[str] = frozenset(),
     ):
         self._var = var
         self._old_value = old_value
         self._stdlib_token = stdlib_token
         self._used = False
         self._lineage_id = _lineage_id_now()
+        self._prev_modified_keys = prev_modified_keys
 
     @property
     def var(self) -> ContextVar[T]:
@@ -223,7 +269,15 @@ class Token(Generic[T]):
         return self._old_value
 
     def __reduce__(self):
-        return (_reconstruct_token, (self._var, self._old_value, self._lineage_id))
+        return (
+            _reconstruct_token,
+            (
+                self._var,
+                self._old_value,
+                self._lineage_id,
+                self._prev_modified_keys,
+            ),
+        )
 
     def __repr__(self) -> str:
         used_marker = " used" if self._used else ""
@@ -423,7 +477,9 @@ class ContextVar(Generic[T]):
         """
         old_value = self._stdlib.get()
         stdlib_token = self._stdlib.set(value)
-        return Token(self, old_value, stdlib_token)
+        prev_modified = _modified_keys.get()
+        _modified_keys.set(prev_modified | {self._key})
+        return Token(self, old_value, stdlib_token, prev_modified)
 
     def reset(self, token: Token[T]) -> None:
         """Restore the variable to the value it had before *token*.
@@ -453,6 +509,10 @@ class ContextVar(Generic[T]):
         if token._lineage_id != _lineage_id_now():
             raise ValueError("Token was created in a different wool.Context lineage")
         token._used = True
+        # Restore the modified-keys tracker to its pre-set state so a
+        # net-zero set+reset leaves the tracker unchanged; snapshots
+        # subsequently skip the key entirely.
+        _modified_keys.set(token._prev_modified_keys)
         if token._stdlib_token is not None:
             try:
                 self._stdlib.reset(token._stdlib_token)
@@ -493,12 +553,18 @@ class _ContextPickler(cloudpickle.CloudPickler):
     def reducer_override(self, obj: Any) -> Any:
         if isinstance(obj, ContextVar):
             has_default = obj._default is not _SENTINEL
+            # Embed the var's CURRENT value at pickle time so the
+            # receiver's ``_reconstruct`` can apply it and also record
+            # it as a received value — letting the receiver skip
+            # re-shipping this key unless it locally modifies the var.
+            current_value = obj._stdlib.get()
             return (
                 _reconstruct,
                 (
                     obj._key,
                     has_default,
                     obj._default if has_default else None,
+                    current_value,
                 ),
             )
         return super().reducer_override(obj)
@@ -521,12 +587,14 @@ def _snapshot_vars(  # pragma: no cover
     *,
     dumps: Callable[[Any], bytes] = _dumps,
 ) -> dict[str, bytes]:
-    """Snapshot all registered :class:`ContextVar` values to wire form.
+    """Snapshot locally-modified :class:`ContextVar` values to wire form.
 
-    Iterates the process-wide registry, reads each var's current value
-    (from *ctx* if supplied, else the current stdlib Context), and
-    emits ``{"namespace:name": serialized_value}`` for every var with
-    a set value.
+    Iterates only the keys recorded in :data:`_modified_keys` for the
+    current stdlib Context (or *ctx* if supplied) — not the full
+    process-wide registry. Skips any key whose current value equals
+    the most-recently-received value recorded in
+    :data:`_received_values`, since the other side already has that
+    exact value.
 
     :param ctx:
         Optional :class:`contextvars.Context` to read from. When
@@ -536,17 +604,26 @@ def _snapshot_vars(  # pragma: no cover
     :raises TypeError:
         If a value fails to serialize.
     """
-    # Covered by the integration dispatch suite, not by unit tests;
-    # the whole function body is pragma'd on the def line above.
+    if ctx is not None:
+        modified = ctx.run(_modified_keys.get)
+        received = ctx.run(_received_values.get)
+    else:
+        modified = _modified_keys.get()
+        received = _received_values.get()
     result: dict[str, bytes] = {}
-    for var in list(ContextVar._registry.values()):
+    for key in modified:
+        var = ContextVar._registry.get(key)
+        if var is None:  # pragma: no cover — key in tracker implies registry hit
+            continue
         if ctx is not None:
-            if var._stdlib not in ctx:
+            if var._stdlib not in ctx:  # pragma: no cover — defensive
                 continue
             raw = ctx[var._stdlib]
         else:
             raw = var._stdlib.get()
         if raw is _UNSET:
+            continue
+        if key in received and received[key] == raw:
             continue
         try:
             pickled = dumps(raw)
@@ -566,22 +643,21 @@ def _apply_vars(  # pragma: no cover
     """Apply a wire-form context snapshot to the current context.
 
     For each ``{"namespace:name": serialized_value}`` entry, looks up
-    the key in the process-wide registry and calls
-    :meth:`ContextVar.set` on the resolved instance. Keys unknown on
-    this process (e.g., a caller-side var whose defining module isn't
-    imported on the worker) log a warning and are skipped — the value
-    has no in-scope var to read it through, so propagating it would be
-    useless.
+    the key in the process-wide registry, calls :meth:`ContextVar.set`
+    on the resolved instance (which updates :data:`_modified_keys`),
+    and records the applied value in :data:`_received_values` so
+    subsequent outbound snapshots can diff-skip the key unless local
+    code re-mutates it. Keys unknown on this process log a warning
+    and are skipped.
 
     :param vars:
         A ``{key: serialized_value}`` dict from the proto map.
     :param loads:
         Deserializer for values. Defaults to :func:`_loads`.
     """
-    # Covered by the integration dispatch suite, not by unit tests;
-    # the whole function body is pragma'd on the def line above.
     if not vars:
         return
+    received = dict(_received_values.get())
     for key, data in vars.items():
         var = ContextVar._registry.get(key)
         if var is None:
@@ -591,7 +667,10 @@ def _apply_vars(  # pragma: no cover
                 key,
             )
             continue
-        var.set(loads(data))
+        value = loads(data)
+        var.set(value)
+        received[key] = value
+    _received_values.set(received)
 
 
 def _reconstruct_context(
@@ -695,8 +774,16 @@ class Context:
         seeded = contextvars.copy_context()
 
         def _seed_and_call() -> T:
+            # Route seeded values through the public .set() so each
+            # key registers in _modified_keys for the run. Also
+            # record them in _received_values so the post-run diff
+            # skips any seeded key whose value the body didn't
+            # change — the outer Context already has that value.
+            received = dict(_received_values.get())
             for var, value in self._vars.items():
-                var._stdlib.set(value)
+                var.set(value)
+                received[var._key] = value
+            _received_values.set(received)
             # Bind the sentinel if we're in an asyncio task (fast path
             # for async-in-sync nesting) and always prime
             # _intended_lineage so that sync callers — where
@@ -738,8 +825,16 @@ class Context:
         seeded = contextvars.copy_context()
 
         def _seed() -> None:
+            # Route seeded values through the public .set() so each
+            # key registers in _modified_keys for the run, and also
+            # record them in _received_values so the post-run diff
+            # skips any seeded key whose value the coroutine didn't
+            # change.
+            received = dict(_received_values.get())
             for var, value in self._vars.items():
-                var._stdlib.set(value)
+                var.set(value)
+                received[var._key] = value
+            _received_values.set(received)
             _intended_lineage.set(self._id)
 
         seeded.run(_seed)
@@ -785,21 +880,28 @@ class Context:
 
 
 def _snapshot_from(ctx: contextvars.Context) -> dict[ContextVar[Any], Any]:
-    """In-process snapshot of set :class:`ContextVar` values in *ctx*.
+    """In-process snapshot of modified :class:`ContextVar` values in *ctx*.
 
     Used by :meth:`Context.run` / :meth:`Context.run_async` to capture
-    post-run mutations back onto the :class:`Context`. Different from
-    :func:`_snapshot_vars` — this one produces a dict keyed by
-    :class:`ContextVar` instances and does not serialize values.
+    post-run mutations back onto the :class:`Context`. Iterates the
+    keys tracked in :data:`_modified_keys` for *ctx*, not the full
+    registry, and applies the same received-value diff skip as
+    :func:`_snapshot_vars`. Produces a dict keyed by
+    :class:`ContextVar` instances; does not serialize.
     """
+    modified = ctx.run(_modified_keys.get)
+    received = ctx.run(_received_values.get)
     out: dict[ContextVar[Any], Any] = {}
-    for var in list(ContextVar._registry.values()):
-        if var._stdlib not in ctx:
+    for key in modified:
+        var = ContextVar._registry.get(key)
+        if var is None:  # pragma: no cover — key in tracker implies registry hit
+            continue
+        if var._stdlib not in ctx:  # pragma: no cover — defensive
             continue
         raw = ctx[var._stdlib]
-        # The ``is _UNSET`` branch is only reachable via the cross-Context
-        # reset fallback, which is exercised by the integration suite.
-        if raw is _UNSET:  # pragma: no cover
+        if raw is _UNSET:  # pragma: no cover — only hit via cross-Context reset fallback
+            continue
+        if key in received and received[key] == raw:
             continue
         out[var] = raw
     return out
