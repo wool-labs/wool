@@ -107,19 +107,41 @@ def _reconstruct(key: str, has_default: bool, default: Any) -> ContextVar:
     registered it. The lookup hits and returns the existing instance.
 
     Defensive fallback: if no instance is registered under *key*,
-    construct one on the fly with the same namespace/name. This keeps
-    wire reception robust in the unlikely case that a value frame
-    arrives before the defining module is imported.
+    :func:`_register_unchecked` builds and registers one. Uses the
+    sallyport so the duplicate-key check in the public constructor
+    doesn't fire here — the whole point of the unpickle path is to
+    adopt the caller's identity on this process.
     """
     existing = ContextVar._registry.get(key)
     if existing is not None:
         return existing
+    return _register_unchecked(key, has_default, default)
+
+
+def _register_unchecked(key: str, has_default: bool, default: Any) -> ContextVar:
+    """Sallyport: build and register a :class:`ContextVar` by key without
+    running the public constructor's duplicate-key check.
+
+    Intended exclusively for the unpickle path (:func:`_reconstruct`).
+    The caller MUST verify the key is unregistered before calling — no
+    internal check is done. Allocating via :func:`object.__new__`
+    bypasses :meth:`ContextVar.__new__` entirely, so a key collision
+    would silently overwrite rather than raise.
+
+    The produced instance is flagged ``_stub=True`` so a later
+    authoritative module-scope ``ContextVar(key, ...)`` call can
+    promote it in place rather than collide.
+    """
     ns, _, name = key.partition(":")
-    return ContextVar(
-        name,
-        namespace=ns,
-        default=default if has_default else _SENTINEL,
-    )
+    instance: ContextVar = object.__new__(ContextVar)
+    instance._name = name
+    instance._namespace = ns
+    instance._key = key
+    instance._default = default if has_default else _SENTINEL
+    instance._stdlib = contextvars.ContextVar(key, default=_UNSET)
+    instance._stub = True
+    ContextVar._registry[key] = instance
+    return instance
 
 
 def _reconstruct_token(
@@ -239,6 +261,7 @@ class ContextVar(Generic[T]):
         "_key",
         "_default",
         "_stdlib",
+        "_stub",
         "__weakref__",
     )
 
@@ -251,6 +274,13 @@ class ContextVar(Generic[T]):
     _key: str
     _default: Any
     _stdlib: contextvars.ContextVar[T | _UnsetType]
+    # True when this instance was registered via :func:`_register_unchecked`
+    # (the unpickle sallyport) but has not yet been "promoted" by an
+    # authoritative module-scope construction. Stubs behave identically
+    # to real vars at runtime; the flag exists so a subsequent
+    # module-body ``ContextVar(key, ...)`` call can promote the stub
+    # rather than collide with it.
+    _stub: bool
 
     def __new__(
         cls,
@@ -264,21 +294,21 @@ class ContextVar(Generic[T]):
         key = f"{ns}:{name}"
         existing = cls._registry.get(key)
         if existing is not None:
-            # Get-or-create semantics: a duplicate construction with
-            # matching params returns the registered instance. This
-            # is what cloudpickle re-execution of module code
-            # produces, and what a simple reimport produces, and what
-            # idiomatic Python expects. Mismatched defaults indicate
-            # a genuine collision between unrelated call sites and
-            # raise.
-            if existing._default != default:
-                raise ContextVarCollision(
-                    f"wool.ContextVar {key!r} already registered with "
-                    f"default={existing._default!r}; new construction "
-                    f"requests default={default!r}. Keys must be "
-                    f"unique within a namespace."
-                )
-            return existing
+            if existing._stub:
+                # Promote a sallyport-registered stub in place. The
+                # module-scope construction is the authoritative source
+                # for default; adopt it, clear the stub flag, and return
+                # the existing instance so reference identity (and any
+                # wire values already applied to ``_stdlib``) is
+                # preserved.
+                existing._default = default
+                existing._stub = False
+                return existing
+            raise ContextVarCollision(
+                f"wool.ContextVar {key!r} is already registered "
+                f"({existing!r}). Keys must be unique within a "
+                f"namespace."
+            )
         return super().__new__(cls)
 
     @overload
@@ -297,9 +327,10 @@ class ContextVar(Generic[T]):
         namespace: str | None = None,
         default: Any = _SENTINEL,
     ):
+        # Promotion path: __new__ returned an already-initialized stub
+        # whose fields were updated in place. Skip re-init so we don't
+        # clobber its ``_stdlib`` (which may already hold wire values).
         if getattr(self, "_key", None) is not None:
-            # __new__ returned an already-initialized instance; skip
-            # to preserve its state and avoid redundant registration.
             return
         ns = namespace if namespace is not None else _infer_namespace()
         key = f"{ns}:{name}"
@@ -308,6 +339,7 @@ class ContextVar(Generic[T]):
         self._key = key
         self._default = default
         self._stdlib = contextvars.ContextVar(key, default=_UNSET)
+        self._stub = False
         type(self)._registry[key] = self
 
     @property
