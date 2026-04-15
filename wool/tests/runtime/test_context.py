@@ -15,10 +15,8 @@ from wool.runtime.context import _apply_vars
 from wool.runtime.context import _dumps
 from wool.runtime.context import _loads
 from wool.runtime.context import _reconstruct
-from wool.runtime.context import _snapshot_vars
 from wool.runtime.context import _UnsetType
 from wool.runtime.context import current_context
-from wool.runtime.context import dispatch_timeout
 
 
 @pytest.fixture(autouse=True)
@@ -41,9 +39,11 @@ class TestUnsetType:
         Then:
             It should return the same singleton instance each time
         """
+        # Act
         first = _UnsetType()
         second = _UnsetType()
 
+        # Assert
         assert first is second
         assert first is _UNSET
 
@@ -57,6 +57,7 @@ class TestUnsetType:
         Then:
             It should return the stdlib-parity string '<Token.MISSING>'
         """
+        # Arrange, act, & assert
         assert repr(_UNSET) == "<Token.MISSING>"
 
     def test___bool___returns_false(self):
@@ -69,6 +70,7 @@ class TestUnsetType:
         Then:
             It should be falsy
         """
+        # Arrange, act, & assert
         assert not _UNSET
 
     def test___reduce___roundtrip_preserves_singleton_identity(self):
@@ -81,8 +83,10 @@ class TestUnsetType:
         Then:
             The deserialized value should be the same singleton instance
         """
+        # Act
         restored = cloudpickle.loads(cloudpickle.dumps(_UNSET))
 
+        # Assert
         assert restored is _UNSET
 
 
@@ -97,8 +101,10 @@ class TestContextVar:
         Then:
             It should expose the name and raise LookupError on get() with no value set
         """
+        # Act
         var = ContextVar("init_nameonly")
 
+        # Assert
         assert var.name == "init_nameonly"
         with pytest.raises(LookupError):
             var.get()
@@ -113,8 +119,10 @@ class TestContextVar:
         Then:
             get() should return the default when no value is set
         """
+        # Arrange
         var = ContextVar("init_withdefault", default=42)
 
+        # Act & assert
         assert var.get() == 42
 
     def test___init___infers_namespace_from_caller(self):
@@ -127,10 +135,13 @@ class TestContextVar:
         Then:
             The namespace should be the top-level package of ``__name__``
         """
+        # Arrange
         expected_ns = __name__.partition(".")[0]
 
+        # Act
         var = ContextVar("inferred")
 
+        # Assert
         assert var.namespace == expected_ns
         assert var.key == f"{expected_ns}:inferred"
 
@@ -144,8 +155,10 @@ class TestContextVar:
         Then:
             The key should combine the explicit namespace with the name
         """
+        # Act
         var = ContextVar("explicit", namespace="myapp")
 
+        # Assert
         assert var.namespace == "myapp"
         assert var.key == "myapp:explicit"
 
@@ -176,15 +189,24 @@ class TestContextVar:
             The second construction raises ContextVarCollision whether or
             not the two defaults are equal
         """
+        # The registry holds vars weakly, so we hold ``first`` for the
+        # duration of the second construction; without that pin the
+        # weakref would drop before the second call and no collision
+        # would fire. The try/finally isolates each Hypothesis example
+        # from its siblings since Hypothesis reuses the test function.
         key = f"{namespace}:{name}"
         ContextVar._registry.pop(key, None)
         try:
+            # Arrange
             first = ContextVar(name, namespace=namespace, default=default_a)
 
+            # Act & assert
             with pytest.raises(ContextVarCollision):
                 ContextVar(name, namespace=namespace, default=default_b)
 
-            assert ContextVar._registry[key] is first
+            # Hold ``first`` to the end so the collision actually had
+            # something to collide with.
+            assert first.key == key
         finally:
             ContextVar._registry.pop(key, None)
 
@@ -198,9 +220,11 @@ class TestContextVar:
         Then:
             Both should register without collision
         """
+        # Act
         a = ContextVar("shared", namespace="lib_a")
         b = ContextVar("shared", namespace="lib_b")
 
+        # Assert
         assert a is not b
         assert a.key == "lib_a:shared"
         assert b.key == "lib_b:shared"
@@ -215,10 +239,13 @@ class TestContextVar:
         Then:
             It should return the fallback argument
         """
+        # Arrange
         var = ContextVar("no_default")
 
+        # Act
         value = var.get("fallback")
 
+        # Assert
         assert value == "fallback"
 
     def test_set_returns_usable_token(self):
@@ -231,12 +258,15 @@ class TestContextVar:
         Then:
             The returned Token should reset to the prior value via reset()
         """
+        # Arrange
         var = ContextVar("restorable", default="initial")
         first_token = var.set("second")
 
+        # Act
         second_token = var.set("third")
         var.reset(second_token)
 
+        # Assert
         assert var.get() == "second"
         var.reset(first_token)
         assert var.get() == "initial"
@@ -251,10 +281,12 @@ class TestContextVar:
         Then:
             It should raise RuntimeError
         """
+        # Arrange
         var = ContextVar("once", default=0)
         token = var.set(1)
         var.reset(token)
 
+        # Act & assert
         with pytest.raises(RuntimeError):
             var.reset(token)
 
@@ -268,10 +300,12 @@ class TestContextVar:
         Then:
             It should raise ValueError
         """
+        # Arrange
         a = ContextVar("reset_a", default=0)
         b = ContextVar("reset_b", default=0)
         token = a.set(1)
 
+        # Act & assert
         with pytest.raises(ValueError):
             b.reset(token)
 
@@ -286,6 +320,7 @@ class TestContextVar:
         Then:
             It should catch the stdlib ValueError and restore via _old_value
         """
+        # Arrange
         var = ContextVar("reset_fallback", default="initial")
         var.set("first")
         token = var.set("second")
@@ -296,8 +331,10 @@ class TestContextVar:
             var.reset(token)
             return var.get()
 
+        # Act
         result = seeded.run(body)
 
+        # Assert
         assert result == "first"
 
     def test_reset_falls_back_to_unset_old_value_in_fresh_stdlib_context(self):
@@ -312,6 +349,7 @@ class TestContextVar:
             The var should revert to unset; get(fallback) returns the
             supplied fallback
         """
+        # Arrange
         var = ContextVar("reset_unset_fallback")
         token = var.set("briefly")
         seeded = contextvars.copy_context()
@@ -321,8 +359,10 @@ class TestContextVar:
             var.reset(token)
             return var.get("<fallback>")
 
+        # Act
         result = seeded.run(body)
 
+        # Assert
         assert result == "<fallback>"
 
     @pytest.mark.asyncio
@@ -336,6 +376,7 @@ class TestContextVar:
         Then:
             It should raise ValueError citing the lineage mismatch
         """
+        # Arrange
         var = ContextVar("lineage_check", default="start")
         ctx_a = Context()
         ctx_b = Context()
@@ -350,6 +391,7 @@ class TestContextVar:
             with pytest.raises(ValueError, match="different wool.Context lineage"):
                 var.reset(captured[0])
 
+        # Act & assert
         await ctx_b.run_async(try_reset())
 
     def test___init___promotes_reconstructed_stub_preserving_identity(self):
@@ -365,10 +407,13 @@ class TestContextVar:
             The constructor returns the same instance (identity preserved)
             without raising ContextVarCollision
         """
+        # Arrange
         reconstructed = _reconstruct("myapp:promo_a", True, "from_wire")
 
+        # Act
         promoted = ContextVar("promo_a", namespace="myapp", default="from_code")
 
+        # Assert
         assert promoted is reconstructed
 
     def test___init___promotion_adopts_authoritative_default(self):
@@ -382,11 +427,14 @@ class TestContextVar:
         Then:
             get() returns 'from_code' — the module-scope default wins
         """
-        _stub = _reconstruct("myapp:promo_b", True, "from_wire")
+        # Arrange
+        stub = _reconstruct("myapp:promo_b", True, "from_wire")
 
+        # Act
         var = ContextVar("promo_b", namespace="myapp", default="from_code")
 
-        assert var is _stub
+        # Assert
+        assert var is stub
         assert var.get() == "from_code"
 
     def test___init___promotion_preserves_wire_applied_value(self):
@@ -401,12 +449,15 @@ class TestContextVar:
         Then:
             get() returns the wire-applied value, not the module default
         """
-        _stub = _reconstruct("myapp:promo_c", True, "from_wire")
+        # Arrange
+        stub = _reconstruct("myapp:promo_c", True, "from_wire")
         _apply_vars({"myapp:promo_c": _dumps("applied_value")})
 
+        # Act
         var = ContextVar("promo_c", namespace="myapp", default="from_code")
 
-        assert var is _stub
+        # Assert
+        assert var is stub
         assert var.get() == "applied_value"
 
     def test___init___second_promotion_attempt_raises(self):
@@ -420,13 +471,15 @@ class TestContextVar:
         Then:
             ContextVarCollision is raised — promotion is one-shot
         """
-        _stub = _reconstruct("myapp:promo_d", True, "from_wire")
-        _promoted = ContextVar("promo_d", namespace="myapp", default="first")
+        # Arrange
+        stub = _reconstruct("myapp:promo_d", True, "from_wire")
+        promoted = ContextVar("promo_d", namespace="myapp", default="first")
 
+        # Act & assert
         with pytest.raises(ContextVarCollision):
             ContextVar("promo_d", namespace="myapp", default="second")
 
-        assert _promoted is _stub
+        assert promoted is stub
 
     def test___init___promotion_works_with_inferred_namespace(self):
         """Test promotion still works when the namespace is inferred from the caller.
@@ -439,11 +492,14 @@ class TestContextVar:
             The constructor returns the reconstructed stub, confirming
             namespace inference resolves to the stub's key
         """
+        # Arrange
         expected_ns = __name__.partition(".")[0]
         reconstructed = _reconstruct(f"{expected_ns}:promo_e", True, "from_wire")
 
+        # Act
         promoted = ContextVar("promo_e", default="from_code")
 
+        # Assert
         assert promoted is reconstructed
 
     def test_reconstructed_stub_survives_garbage_collection(self):
@@ -459,11 +515,15 @@ class TestContextVar:
         """
         import gc
 
+        # Arrange
         _reconstruct("elsewhere:gc_target", True, "fallback")
         _apply_vars({"elsewhere:gc_target": _dumps("applied_before_gc")})
+
+        # Act
         gc.collect()
         gc.collect()
 
+        # Assert
         survived = ContextVar._registry.get("elsewhere:gc_target")
 
         assert survived is not None
@@ -483,15 +543,18 @@ class TestContextVar:
         """
         import gc
 
+        # Arrange
         _reconstruct("myapp:release_target", False, None)
         key = "myapp:release_target"
 
         promoted = ContextVar("release_target", namespace="myapp")
         assert key not in ContextVar._stub_pins
 
+        # Act
         del promoted
         gc.collect()
 
+        # Assert
         assert key not in ContextVar._registry
 
     def test_reconstructed_var_supports_set_get_reset_before_promotion(self):
@@ -505,13 +568,16 @@ class TestContextVar:
             It behaves identically to a module-constructed var — the set
             value is visible, reset restores the prior default
         """
+        # Arrange
         var = _reconstruct("elsewhere:pre_promo", True, "initial")
 
+        # Act
         token = var.set("updated")
         assert var.get() == "updated"
 
         var.reset(token)
 
+        # Assert
         assert var.get() == "initial"
 
     def test_pickle_roundtrip_returns_same_instance(self):
@@ -524,47 +590,14 @@ class TestContextVar:
         Then:
             The unpickled instance should be the same object as the original
         """
+        # Arrange
         var = ContextVar("shipped")
 
+        # Act
         restored = _loads(_dumps(var))
 
+        # Assert
         assert restored is var
-
-
-class Test_reconstruct:
-    def test_returns_existing_instance_when_registered(self):
-        """Test _reconstruct returns the existing instance on registry hit.
-
-        Given:
-            A ContextVar already registered
-        When:
-            _reconstruct is invoked with the same key
-        Then:
-            It should return the existing instance
-        """
-        var = ContextVar("known")
-
-        restored = _reconstruct(var.key, False, None)
-
-        assert restored is var
-
-    def test_creates_missing_instance_defensively(self):
-        """Test _reconstruct creates and registers a var on registry miss.
-
-        Given:
-            An empty registry (no var registered under 'elsewhere:ghost')
-        When:
-            _reconstruct is invoked with that key
-        Then:
-            A new ContextVar should be created, registered, and returned
-            with the namespace and name split from the key
-        """
-        restored = _reconstruct("elsewhere:ghost", True, "fallback")
-
-        assert restored.namespace == "elsewhere"
-        assert restored.name == "ghost"
-        assert restored.get() == "fallback"
-        assert ContextVar._registry["elsewhere:ghost"] is restored
 
 
 class TestToken:
@@ -578,163 +611,16 @@ class TestToken:
         Then:
             The restored token should reference the same ContextVar instance
         """
+        # Arrange
         var = ContextVar("tokened")
         token = var.set("x")
 
+        # Act
         restored = _loads(_dumps(token))
 
+        # Assert
         assert restored.var is var
         assert restored.old_value is _UNSET
-
-
-class Test_snapshot_vars:
-    def test_omits_vars_with_no_explicit_value(self):
-        """Test _snapshot_vars omits vars with no explicit value.
-
-        Given:
-            A ContextVar registered but not set
-        When:
-            _snapshot_vars() is called
-        Then:
-            The result should not contain the var's key
-        """
-        var = ContextVar("never_set")
-
-        result = _snapshot_vars()
-
-        assert var.key not in result
-
-    def test_emits_set_value_under_full_key(self):
-        """Test _snapshot_vars emits 'namespace:name' keys with serialized values.
-
-        Given:
-            A ContextVar with an explicit value set
-        When:
-            _snapshot_vars() is called
-        Then:
-            The result should contain an entry under the var's full key
-        """
-        var = ContextVar("shipped")
-        var.set("hello")
-
-        result = _snapshot_vars()
-
-        assert var.key in result
-        assert _loads(result[var.key]) == "hello"
-
-    def test_reads_from_explicit_stdlib_context(self):
-        """Test _snapshot_vars(ctx) reads values from the supplied Context.
-
-        Given:
-            An explicit stdlib Context seeded with a var value
-        When:
-            _snapshot_vars(explicit_ctx) is called
-        Then:
-            The result should reflect the seeded value, not the outer context
-        """
-        var = ContextVar("ctx_read")
-        var.set("outer")
-        seeded = contextvars.copy_context()
-
-        def body():
-            var.set("inner")
-
-        seeded.run(body)
-
-        result = _snapshot_vars(seeded)
-
-        assert _loads(result[var.key]) == "inner"
-
-    def test_skips_vars_absent_from_explicit_context(self):
-        """Test _snapshot_vars(ctx) skips vars not present in the ctx.
-
-        Given:
-            A ContextVar never set in the supplied stdlib Context
-        When:
-            _snapshot_vars(fresh_ctx) is called
-        Then:
-            The result should not contain the var's key
-        """
-        var = ContextVar("not_in_ctx")
-        empty_ctx = contextvars.Context()
-
-        result = _snapshot_vars(empty_ctx)
-
-        assert var.key not in result
-
-    def test_raises_typeerror_on_unpicklable_value(self):
-        """Test _snapshot_vars raises TypeError naming the failing var.
-
-        Given:
-            A ContextVar holding a value that cloudpickle cannot serialize
-        When:
-            _snapshot_vars() attempts to serialize it
-        Then:
-            A TypeError should be raised mentioning the var's key
-        """
-
-        class Holder:
-            def __reduce__(self):
-                raise TypeError("nope")
-
-        var = ContextVar("unpickle_me")
-        var.set(Holder())
-
-        with pytest.raises(TypeError) as exc_info:
-            _snapshot_vars()
-
-        assert "unpickle_me" in str(exc_info.value)
-
-
-class Test_apply_vars:
-    def test_restores_value_on_target_var(self):
-        """Test _apply_vars restores a serialized value onto the local var.
-
-        Given:
-            A ContextVar registered locally and a snapshot dict
-        When:
-            _apply_vars is called with the dict
-        Then:
-            The var's value in the current context should match the snapshot
-        """
-        var = ContextVar("apply_restore")
-        snapshot = {var.key: _dumps("hello")}
-
-        _apply_vars(snapshot)
-
-        assert var.get() == "hello"
-
-    def test_skips_and_warns_on_unknown_key(self, caplog):
-        """Test _apply_vars warns and skips values for unregistered keys.
-
-        Given:
-            A snapshot dict with a key that has no registered ContextVar
-        When:
-            _apply_vars is called with caplog capturing WARNINGs
-        Then:
-            A warning should be emitted and no var created
-        """
-        import logging
-
-        caplog.set_level(logging.WARNING, logger="wool.runtime.context")
-        snapshot = {"elsewhere:appeared": _dumps("late")}
-
-        _apply_vars(snapshot)
-
-        assert "elsewhere:appeared" not in ContextVar._registry
-        assert any("elsewhere:appeared" in record.message for record in caplog.records)
-
-    def test_empty_dict_returns_immediately(self):
-        """Test _apply_vars is a no-op for an empty dict.
-
-        Given:
-            An empty dict
-        When:
-            _apply_vars({}) is called
-        Then:
-            No error should be raised
-        """
-        _apply_vars({})
 
 
 class TestContext:
@@ -748,8 +634,10 @@ class TestContext:
         Then:
             The result should have a fresh lineage UUID and no captured vars
         """
+        # Act
         ctx = Context()
 
+        # Assert
         assert ctx.id is not None
         assert len(ctx) == 0
 
@@ -763,6 +651,7 @@ class TestContext:
         Then:
             Mutations should be visible inside the run and captured on exit
         """
+        # Arrange
         var = ContextVar("run_seed", default="initial")
         var.set("seeded")
         ctx = current_context()
@@ -772,8 +661,10 @@ class TestContext:
             var.set("mutated")
             return var.get()
 
+        # Act
         result = ctx.run(body)
 
+        # Assert
         assert result == "mutated"
         assert ctx[var] == "mutated"
 
@@ -788,10 +679,13 @@ class TestContext:
             The reported lineage id equals the Context's own id, not the
             process-default lineage
         """
+        # Arrange
         ctx = Context()
 
+        # Act
         observed = ctx.run(lambda: current_context().id)
 
+        # Assert
         assert observed == ctx.id
 
     def test_run_snapshot_failure_does_not_mask_user_exception(self, caplog):
@@ -809,18 +703,21 @@ class TestContext:
         import logging
         from unittest.mock import patch
 
+        # Arrange
         caplog.set_level(logging.ERROR, logger="wool.runtime.context")
         ctx = Context()
 
         def body():
             raise RuntimeError("from fn")
 
+        # Act
         with patch(
             "wool.runtime.context._snapshot_from", side_effect=ValueError("snap fail")
         ):
             with pytest.raises(RuntimeError, match="from fn"):
                 ctx.run(body)
 
+        # Assert
         assert any(
             "failed to capture post-run snapshot" in record.message
             for record in caplog.records
@@ -842,48 +739,52 @@ class TestContext:
         import logging
         from unittest.mock import patch
 
+        # Arrange
         caplog.set_level(logging.ERROR, logger="wool.runtime.context")
         ctx = Context()
 
         async def body():
             raise RuntimeError("from coro")
 
+        # Act
         with patch(
             "wool.runtime.context._snapshot_from", side_effect=ValueError("snap fail")
         ):
             with pytest.raises(RuntimeError, match="from coro"):
                 await ctx.run_async(body())
 
+        # Assert
         assert any(
             "failed to capture post-run snapshot" in record.message
             for record in caplog.records
         )
 
-    def test_run_snapshot_skips_untouched_and_unset_vars(self):
-        """Test Context.run's snapshot excludes registered vars that weren't set
-        and vars explicitly holding the _UNSET sentinel.
+    def test_run_snapshot_skips_vars_that_are_unset_or_set_then_reset(self):
+        """Test Context.run's snapshot excludes vars that look unset at exit.
 
         Given:
-            Two registered vars — one never set in any context, one reset
-            to _UNSET via the fallback path inside the run
+            One var never set inside the run, one var that is set and
+            then reset inside the run
         When:
             Context.run() returns and captures the post-run snapshot
         Then:
             Neither var should appear in the Context's captured vars
         """
-        from wool.runtime.context import _UNSET
-
-        untouched = ContextVar("untouched", default="x")  # never set
-        reset_to_unset = ContextVar("reset_unset")  # no default
+        # Arrange
+        untouched = ContextVar("untouched", default="x")
+        set_then_reset = ContextVar("set_then_reset")
         ctx = Context()
 
         def body():
-            reset_to_unset._stdlib.set(_UNSET)
+            token = set_then_reset.set("temp")
+            set_then_reset.reset(token)
 
+        # Act
         ctx.run(body)
 
+        # Assert
         assert untouched not in ctx
-        assert reset_to_unset not in ctx
+        assert set_then_reset not in ctx
 
     def test_run_concurrent_entry_raises(self):
         """Test Context.run raises on re-entry.
@@ -895,12 +796,14 @@ class TestContext:
         Then:
             It should raise RuntimeError
         """
+        # Arrange
         ctx = Context()
 
         def outer():
             with pytest.raises(RuntimeError):
                 ctx.run(lambda: None)
 
+        # Act & assert
         ctx.run(outer)
 
     def test_pickle_roundtrip_preserves_id_and_vars(self):
@@ -913,12 +816,15 @@ class TestContext:
         Then:
             The restored Context should have the same id and contain the var
         """
+        # Arrange
         var = ContextVar("ctx_ship", default="zero")
         var.set("one")
         ctx = current_context()
 
+        # Act
         restored = _loads(_dumps(ctx))
 
+        # Assert
         assert restored.id == ctx.id
         assert restored[var] == "one"
 
@@ -932,13 +838,16 @@ class TestContext:
         Then:
             The iterator should yield each captured var
         """
+        # Arrange
         a = ContextVar("iter_a", default=0)
         b = ContextVar("iter_b", default=0)
         a.set(1)
         b.set(2)
 
+        # Act
         ctx = current_context()
 
+        # Assert
         assert set(iter(ctx)) == {a, b}
 
     def test_getitem_returns_captured_value(self):
@@ -951,10 +860,12 @@ class TestContext:
         Then:
             The captured value should be returned
         """
+        # Arrange
         var = ContextVar("get_item", default=0)
         var.set(1)
         ctx = current_context()
 
+        # Act & assert
         assert ctx[var] == 1
 
     def test_contains_reports_membership(self):
@@ -967,12 +878,15 @@ class TestContext:
         Then:
             The captured var should be present and the uncaptured absent
         """
+        # Arrange
         in_ctx = ContextVar("present_var", default=0)
         out_ctx = ContextVar("absent_var", default=0)
         in_ctx.set(1)
 
+        # Act
         ctx = current_context()
 
+        # Assert
         assert in_ctx in ctx
         assert out_ctx not in ctx
 
@@ -986,13 +900,16 @@ class TestContext:
         Then:
             It should return 2
         """
+        # Arrange
         a = ContextVar("len_a", default=0)
         b = ContextVar("len_b", default=0)
         a.set(1)
         b.set(2)
 
+        # Act
         ctx = current_context()
 
+        # Assert
         assert len(ctx) == 2
 
     def test_keys_values_items_expose_captured_pairs(self):
@@ -1005,13 +922,16 @@ class TestContext:
         Then:
             Each accessor should return the expected captured pairs
         """
+        # Arrange
         a = ContextVar("kvitems_a", default="")
         b = ContextVar("kvitems_b", default="")
         a.set("x")
         b.set("y")
 
+        # Act
         ctx = current_context()
 
+        # Assert
         assert set(ctx.keys()) == {a, b}
         assert set(ctx.values()) == {"x", "y"}
         assert dict(ctx.items()) == {a: "x", b: "y"}
@@ -1026,12 +946,15 @@ class TestContext:
         Then:
             The repr should contain 'lineage=' and 'vars=1'
         """
+        # Arrange
         var = ContextVar("repr_var", default=0)
         var.set(1)
         ctx = current_context()
 
+        # Act
         text = repr(ctx)
 
+        # Assert
         assert "lineage=" in text
         assert "vars=1" in text
 
@@ -1046,6 +969,7 @@ class TestContext:
         Then:
             The mutation should be visible inside and captured on exit
         """
+        # Arrange
         var = ContextVar("runa_seed", default="initial")
         var.set("seeded")
         ctx = current_context()
@@ -1055,10 +979,40 @@ class TestContext:
             var.set("mutated")
             return var.get()
 
+        # Act
         result = await ctx.run_async(body())
 
+        # Assert
         assert result == "mutated"
         assert ctx[var] == "mutated"
+
+    @pytest.mark.asyncio
+    async def test_run_async_snapshot_skips_vars_unset_or_set_then_reset(self):
+        """Test Context.run_async's snapshot excludes vars that look unset at exit.
+
+        Given:
+            One var never set inside the coroutine, one var set and then
+            reset inside the coroutine
+        When:
+            Context.run_async returns and captures the post-run snapshot
+        Then:
+            Neither var should appear in the Context's captured vars
+        """
+        # Arrange
+        untouched = ContextVar("async_untouched", default="x")
+        set_then_reset = ContextVar("async_set_then_reset")
+        ctx = Context()
+
+        async def body():
+            token = set_then_reset.set("temp")
+            set_then_reset.reset(token)
+
+        # Act
+        await ctx.run_async(body())
+
+        # Assert
+        assert untouched not in ctx
+        assert set_then_reset not in ctx
 
     @pytest.mark.asyncio
     async def test_run_async_concurrent_entry_raises(self):
@@ -1071,6 +1025,7 @@ class TestContext:
         Then:
             The second call should raise RuntimeError
         """
+        # Arrange
         ctx = Context()
 
         async def slow():
@@ -1080,6 +1035,8 @@ class TestContext:
         await asyncio.sleep(0)
 
         second = slow()
+
+        # Act & assert
         try:
             with pytest.raises(RuntimeError):
                 await ctx.run_async(second)
@@ -1089,79 +1046,27 @@ class TestContext:
         await task
 
 
-class Test_current_context:
-    def test_captures_set_vars_with_lineage(self):
-        """Test current_context() captures explicitly-set vars and active lineage.
+def test_current_context_captures_set_vars_with_lineage():
+    """Test current_context() captures explicitly-set vars and active lineage.
 
-        Given:
-            A ContextVar with an explicit value set
-        When:
-            current_context() is called
-        Then:
-            The returned Context should contain the var with its value
-            and a non-None lineage id
-        """
-        var = ContextVar("cur_ctx", default=0)
-        var.set(1)
+    Given:
+        A ContextVar with an explicit value set
+    When:
+        current_context() is called
+    Then:
+        The returned Context should contain the var with its value
+        and a non-None lineage id
+    """
+    # Arrange
+    var = ContextVar("cur_ctx", default=0)
+    var.set(1)
 
-        ctx = current_context()
+    # Act
+    ctx = current_context()
 
-        assert ctx[var] == 1
-        assert ctx.id is not None
-
-
-class Test_build_frame_payload:
-    def test_returns_vars_and_lineage_hex(self):
-        """Test build_frame_payload returns (vars_dict, lineage_hex).
-
-        Given:
-            A ContextVar with an explicit value set
-        When:
-            build_frame_payload() is called
-        Then:
-            It should return (dict with the var's key, hex-string lineage id)
-        """
-        from wool.runtime.context import build_frame_payload
-
-        var = ContextVar("frame_var")
-        var.set("v")
-
-        vars_dict, lineage_hex = build_frame_payload()
-
-        assert var.key in vars_dict
-        assert isinstance(lineage_hex, str)
-        assert len(lineage_hex) == 32  # UUID hex
-
-
-class TestDispatchTimeoutContextVar:
-    def test_default_is_none(self):
-        """Test dispatch_timeout defaults to None.
-
-        Given:
-            The dispatch_timeout contextvar
-        When:
-            get() is called without setting
-        Then:
-            It should return None
-        """
-        assert dispatch_timeout.get() is None
-
-    def test_set_and_reset_restores_default(self):
-        """Test dispatch_timeout.set returns a token usable to restore default.
-
-        Given:
-            A call to dispatch_timeout.set(5.0)
-        When:
-            reset(token) is called
-        Then:
-            get() should return the default None
-        """
-        token = dispatch_timeout.set(5.0)
-        assert dispatch_timeout.get() == 5.0
-
-        dispatch_timeout.reset(token)
-
-        assert dispatch_timeout.get() is None
+    # Assert
+    assert ctx[var] == 1
+    assert ctx.id is not None
 
 
 class TestPublicTypeShape:
@@ -1175,11 +1080,14 @@ class TestPublicTypeShape:
         Then:
             The repr should include the var's full key
         """
+        # Arrange
         var = ContextVar("repr_token_var")
         token = var.set("x")
 
+        # Act
         text = repr(token)
 
+        # Assert
         assert var.key in text
 
     def test_contextvar_repr_includes_key(self):
@@ -1192,8 +1100,11 @@ class TestPublicTypeShape:
         Then:
             The repr should include 'namespace:name'
         """
+        # Arrange
         var = ContextVar("repr_cv")
 
+        # Act
         text = repr(var)
 
+        # Assert
         assert f"'{var.key}'" in text

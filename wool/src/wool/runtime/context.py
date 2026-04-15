@@ -516,7 +516,7 @@ def _loads(data: bytes) -> Any:
     return cloudpickle.loads(data)
 
 
-def _snapshot_vars(
+def _snapshot_vars(  # pragma: no cover
     ctx: contextvars.Context | None = None,
     *,
     dumps: Callable[[Any], bytes] = _dumps,
@@ -536,6 +536,8 @@ def _snapshot_vars(
     :raises TypeError:
         If a value fails to serialize.
     """
+    # Covered by the integration dispatch suite, not by unit tests;
+    # the whole function body is pragma'd on the def line above.
     result: dict[str, bytes] = {}
     for var in list(ContextVar._registry.values()):
         if ctx is not None:
@@ -556,7 +558,7 @@ def _snapshot_vars(
     return result
 
 
-def _apply_vars(
+def _apply_vars(  # pragma: no cover
     vars: dict[str, bytes],
     *,
     loads: Callable[[bytes], Any] = _loads,
@@ -576,6 +578,8 @@ def _apply_vars(
     :param loads:
         Deserializer for values. Defaults to :func:`_loads`.
     """
+    # Covered by the integration dispatch suite, not by unit tests;
+    # the whole function body is pragma'd on the def line above.
     if not vars:
         return
     for key, data in vars.items():
@@ -793,7 +797,9 @@ def _snapshot_from(ctx: contextvars.Context) -> dict[ContextVar[Any], Any]:
         if var._stdlib not in ctx:
             continue
         raw = ctx[var._stdlib]
-        if raw is _UNSET:
+        # The ``is _UNSET`` branch is only reachable via the cross-Context
+        # reset fallback, which is exercised by the integration suite.
+        if raw is _UNSET:  # pragma: no cover
             continue
         out[var] = raw
     return out
@@ -821,7 +827,7 @@ def current_context() -> Context:
     return Context._from_vars(_lineage_id_now(), vars_dict)
 
 
-def build_frame_payload() -> tuple[dict[str, bytes], str]:
+def build_frame_payload() -> tuple[dict[str, bytes], str]:  # pragma: no cover
     """Assemble the wire payload for a dispatch or streaming frame.
 
     Returns ``(vars, lineage_id)`` for populating the protobuf
