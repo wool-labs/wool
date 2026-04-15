@@ -3,6 +3,8 @@ import contextvars
 
 import cloudpickle
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from wool.runtime.context import _UNSET
 from wool.runtime.context import Context
@@ -147,38 +149,44 @@ class TestContextVar:
         assert var.namespace == "myapp"
         assert var.key == "myapp:explicit"
 
-    def test___init___returns_same_instance_on_matching_params(self):
-        """Test constructing two vars with the same key and params returns the
-        already-registered instance.
+    @given(
+        name=st.text(
+            alphabet=st.characters(min_codepoint=ord("a"), max_codepoint=ord("z")),
+            min_size=1,
+            max_size=12,
+        ),
+        namespace=st.text(
+            alphabet=st.characters(min_codepoint=ord("a"), max_codepoint=ord("z")),
+            min_size=1,
+            max_size=12,
+        ),
+        default_a=st.one_of(st.integers(), st.text(), st.booleans()),
+        default_b=st.one_of(st.integers(), st.text(), st.booleans()),
+    )
+    def test___init___raises_on_duplicate_key(
+        self, name, namespace, default_a, default_b
+    ):
+        """Test duplicate-key construction raises regardless of default match.
 
         Given:
-            A ContextVar already registered with a given default
+            Any non-empty name, namespace, and pair of default values
         When:
-            A second ContextVar is constructed with the same key and default
+            A ContextVar is constructed, then a second with the identical key
         Then:
-            Both references should be the same object
+            The second construction raises ContextVarCollision whether or
+            not the two defaults are equal
         """
-        first = ContextVar("samekey", default="x")
-        second = ContextVar("samekey", default="x")
+        key = f"{namespace}:{name}"
+        ContextVar._registry.pop(key, None)
+        try:
+            first = ContextVar(name, namespace=namespace, default=default_a)
 
-        assert first is second
+            with pytest.raises(ContextVarCollision):
+                ContextVar(name, namespace=namespace, default=default_b)
 
-    def test___init___raises_on_mismatched_default(self):
-        """Test constructing a duplicate-key var with a different default raises.
-
-        Given:
-            A ContextVar registered with default='a'
-        When:
-            A second ContextVar is constructed with the same key but default='b'
-        Then:
-            ContextVarCollision should be raised
-        """
-        _first = ContextVar("mismatch", default="a")
-
-        with pytest.raises(ContextVarCollision):
-            ContextVar("mismatch", default="b")
-
-        assert _first._default == "a"
+            assert ContextVar._registry[key] is first
+        finally:
+            ContextVar._registry.pop(key, None)
 
     def test___init___allows_same_name_in_different_namespace(self):
         """Test duplicate names across different namespaces are allowed.
@@ -343,6 +351,120 @@ class TestContextVar:
                 var.reset(captured[0])
 
         await ctx_b.run_async(try_reset())
+
+    def test___init___promotes_reconstructed_stub_preserving_identity(self):
+        """Test constructing a var whose key was reconstructed from the wire
+        returns the same instance instead of raising.
+
+        Given:
+            A ContextVar previously reconstructed under key 'myapp:promo_a'
+            with no prior module-scope construction
+        When:
+            A module-scope ContextVar is constructed with the same key
+        Then:
+            The constructor returns the same instance (identity preserved)
+            without raising ContextVarCollision
+        """
+        reconstructed = _reconstruct("myapp:promo_a", True, "from_wire")
+
+        promoted = ContextVar("promo_a", namespace="myapp", default="from_code")
+
+        assert promoted is reconstructed
+
+    def test___init___promotion_adopts_authoritative_default(self):
+        """Test promotion adopts the module-scope default over the wire default.
+
+        Given:
+            A reconstructed stub with default 'from_wire'
+        When:
+            A module-scope ContextVar with default 'from_code' is constructed
+            and get() is called with no value set
+        Then:
+            get() returns 'from_code' — the module-scope default wins
+        """
+        _stub = _reconstruct("myapp:promo_b", True, "from_wire")
+
+        var = ContextVar("promo_b", namespace="myapp", default="from_code")
+
+        assert var is _stub
+        assert var.get() == "from_code"
+
+    def test___init___promotion_preserves_wire_applied_value(self):
+        """Test a value applied to the stub survives promotion.
+
+        Given:
+            A reconstructed stub to which a wire value has been applied
+            via _apply_vars
+        When:
+            A module-scope ContextVar for the same key is constructed and
+            get() is called
+        Then:
+            get() returns the wire-applied value, not the module default
+        """
+        _stub = _reconstruct("myapp:promo_c", True, "from_wire")
+        _apply_vars({"myapp:promo_c": _dumps("applied_value")})
+
+        var = ContextVar("promo_c", namespace="myapp", default="from_code")
+
+        assert var is _stub
+        assert var.get() == "applied_value"
+
+    def test___init___second_promotion_attempt_raises(self):
+        """Test a real (promoted) var still collides on subsequent construction.
+
+        Given:
+            A reconstructed stub that has been promoted by a first
+            module-scope construction
+        When:
+            A second module-scope construction with the same key runs
+        Then:
+            ContextVarCollision is raised — promotion is one-shot
+        """
+        _stub = _reconstruct("myapp:promo_d", True, "from_wire")
+        _promoted = ContextVar("promo_d", namespace="myapp", default="first")
+
+        with pytest.raises(ContextVarCollision):
+            ContextVar("promo_d", namespace="myapp", default="second")
+
+        assert _promoted is _stub
+
+    def test___init___promotion_works_with_inferred_namespace(self):
+        """Test promotion still works when the namespace is inferred from the caller.
+
+        Given:
+            A reconstructed stub under '<caller-package>:promo_e'
+        When:
+            A ContextVar is constructed with only the name (namespace inferred)
+        Then:
+            The constructor returns the reconstructed stub, confirming
+            namespace inference resolves to the stub's key
+        """
+        expected_ns = __name__.partition(".")[0]
+        reconstructed = _reconstruct(f"{expected_ns}:promo_e", True, "from_wire")
+
+        promoted = ContextVar("promo_e", default="from_code")
+
+        assert promoted is reconstructed
+
+    def test_reconstructed_var_supports_set_get_reset_before_promotion(self):
+        """Test a reconstructed stub behaves like a real var before promotion.
+
+        Given:
+            A ContextVar reconstructed from the wire but never promoted
+        When:
+            set, get, and reset are exercised on it through the public API
+        Then:
+            It behaves identically to a module-constructed var — the set
+            value is visible, reset restores the prior default
+        """
+        var = _reconstruct("elsewhere:pre_promo", True, "initial")
+
+        token = var.set("updated")
+        assert var.get() == "updated"
+
+        var.reset(token)
+
+        assert var.get() == "initial"
 
     def test_pickle_roundtrip_returns_same_instance(self):
         """Test cloudpickle roundtrips a ContextVar to the same registered instance.
