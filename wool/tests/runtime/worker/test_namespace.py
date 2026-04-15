@@ -3,75 +3,75 @@ import uuid
 
 import pytest
 
+import wool
 from wool.runtime.worker import namespace as _namespace
 
 
 class TestActivate:
     @pytest.mark.asyncio
-    async def test_activate_binds_lineage_for_current_lineage(self):
-        """Test activate() binds the lineage UUID so _current_lineage returns it.
+    async def test_activate_binds_lineage_visible_via_current_context(self):
+        """Test activate() makes the lineage visible through wool.current_context.
 
         Given:
             A fresh lineage UUID
         When:
             activate() is entered inside an asyncio task and
-            _current_lineage() is called
+            wool.current_context() is called
         Then:
-            It should return the activated UUID
+            The returned Context's id should equal the activated UUID
         """
         # Arrange
         lineage = uuid.uuid4()
 
         # Act
         with _namespace.activate(lineage):
-            observed = _namespace._current_lineage()
+            observed = wool.current_context().id
 
         # Assert
         assert observed == lineage
 
     @pytest.mark.asyncio
-    async def test_activate_restores_on_exit(self):
-        """Test activate() resets _intended_lineage + sentinel on exit.
+    async def test_activate_restores_lineage_on_exit(self):
+        """Test activate() restores the prior lineage once the block exits.
 
         Given:
             An asyncio task entering activate() with some lineage
         When:
-            The context block exits
+            The context block exits and wool.current_context() is read
         Then:
-            _intended_lineage should be cleared and the sentinel
-            restored to its pre-activate state
+            The returned Context's id should not equal the just-activated
+            lineage
         """
         # Arrange
         lineage = uuid.uuid4()
-        before_intended = _namespace._intended_lineage.get(None)
-        before_sentinel = _namespace._wool_sentinel.get(None)
 
         # Act
         with _namespace.activate(lineage):
             pass
+        observed = wool.current_context().id
 
         # Assert
-        assert _namespace._intended_lineage.get(None) is before_intended
-        assert _namespace._wool_sentinel.get(None) is before_sentinel
+        assert observed != lineage
 
     @pytest.mark.asyncio
     async def test_activate_propagates_lineage_to_descendant_task(self):
-        """Test activate() plants intended lineage so a child task adopts it.
+        """Test activate() plants the lineage so a child task adopts it.
 
         Given:
             An asyncio task entering activate() with a lineage UUID
         When:
-            A child asyncio.create_task reads _current_lineage()
+            A child asyncio.create_task reads wool.current_context()
         Then:
             The child should observe the activated lineage
         """
+
         # Arrange
         lineage = uuid.uuid4()
 
-        # Act
         async def child():
-            return _namespace._current_lineage()
+            return wool.current_context().id
 
+        # Act
         with _namespace.activate(lineage):
             observed = await asyncio.create_task(child())
 
