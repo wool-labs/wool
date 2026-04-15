@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextvars
+import logging
 import threading
 import uuid
 from contextlib import contextmanager
@@ -31,6 +32,8 @@ from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import do_dispatch
 from wool.runtime.worker import namespace as _namespace
+
+_log = logging.getLogger(__name__)
 
 # Sentinel to mark end of async generator stream
 _SENTINEL: Final = object()
@@ -483,7 +486,18 @@ class WorkerService(protocol.WorkerServicer):
                                         ("value", value, ctx_snapshot),
                                     )
                         finally:
-                            await gen.aclose()
+                            try:
+                                await gen.aclose()
+                            except (asyncio.CancelledError, GeneratorExit):
+                                # During shutdown the aclose() may be
+                                # cancelled or exit before the generator
+                                # finishes its own teardown. Log and
+                                # swallow so cleanup continues.
+                                _log.warning(
+                                    "wool routine generator interrupted during "
+                                    "aclose on teardown",
+                                    exc_info=True,
+                                )
                 finally:
                     if token is not None:
                         wool.__proxy__.reset(token)
