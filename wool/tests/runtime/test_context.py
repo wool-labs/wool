@@ -1015,8 +1015,8 @@ class TestContext:
         assert set_then_reset not in ctx
 
     @pytest.mark.asyncio
-    async def test_run_async_snapshot_skips_seeded_var_worker_did_not_modify(self):
-        """Test Context.run_async omits seed-only values that the coro didn't modify.
+    async def test_run_async_snapshot_preserves_seeded_value(self):
+        """Test Context.run_async captures seeded values after the coroutine runs.
 
         Given:
             A Context seeded with a var value and a coroutine that
@@ -1024,12 +1024,11 @@ class TestContext:
         When:
             Context.run_async runs the coroutine
         Then:
-            The Context's post-run snapshot should not include the var —
-            its current value equals the seeded (received) value, so the
-            diff-skip excludes it
+            The captured snapshot still holds the seeded value — the
+            var was set (in the seeded Context) and counts as modified
         """
         # Arrange
-        var = ContextVar("runa_skip_seed", default="initial")
+        var = ContextVar("runa_preserve_seed", default="initial")
         var.set("seeded")
         ctx = current_context()
 
@@ -1041,22 +1040,23 @@ class TestContext:
 
         # Assert
         assert result == "seeded"
-        assert var not in ctx
+        assert ctx[var] == "seeded"
 
     @pytest.mark.asyncio
-    async def test_run_async_snapshot_captures_only_worker_mutations(self):
-        """Test Context.run_async captures only vars the coro actually changed.
+    async def test_run_async_snapshot_reflects_worker_mutations(self):
+        """Test Context.run_async captures worker-side mutations on top of seed values.
 
         Given:
             A Context seeded with two vars and a coro that modifies one
         When:
             Context.run_async runs the coroutine
         Then:
-            Only the modified var appears in the captured snapshot
+            The captured snapshot reflects the mutation for the touched
+            var while the untouched var still shows the seed value
         """
         # Arrange
-        untouched = ContextVar("runa_untouched", default="initial")
-        touched = ContextVar("runa_touched", default="initial")
+        untouched = ContextVar("runa_untouched_seed", default="initial")
+        touched = ContextVar("runa_touched_seed", default="initial")
         untouched.set("seed_untouched")
         touched.set("seed_touched")
         ctx = current_context()
@@ -1068,7 +1068,7 @@ class TestContext:
         await ctx.run_async(body())
 
         # Assert
-        assert untouched not in ctx
+        assert ctx[untouched] == "seed_untouched"
         assert ctx[touched] == "mutated"
 
     def test_pickle_roundtrip_embeds_current_value(self):

@@ -8,10 +8,12 @@ import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from dataclasses import field
 from inspect import isasyncgen
 from inspect import isasyncgenfunction
 from inspect import isawaitable
 from inspect import iscoroutinefunction
+from typing import Any
 from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Awaitable
@@ -37,6 +39,20 @@ _log = logging.getLogger(__name__)
 
 # Sentinel to mark end of async generator stream
 _SENTINEL: Final = object()
+
+
+@dataclass
+class _WorkerOutcome:
+    """Result of a worker-loop task execution.
+
+    Always carries the post-run context snapshot so the handler can
+    ship caller-visible mutations on the Response regardless of
+    whether the routine returned normally or raised.
+    """
+
+    result: Any = None
+    exception: BaseException | None = None
+    snapshot: dict[str, bytes] = field(default_factory=dict)
 
 
 # public
@@ -215,7 +231,7 @@ class WorkerService(protocol.WorkerServicer):
                 StatusCode.UNAVAILABLE, "Worker service is shutting down"
             )
 
-        response = await anext(aiter(request_iterator))
+        request = await anext(aiter(request_iterator))
 
         # Extract the context id from the first Request, unpickle
         # the Task, then activate the id and apply the caller's
@@ -223,15 +239,15 @@ class WorkerService(protocol.WorkerServicer):
         # snapshot is keyed by each var's "namespace:name";
         # _apply_vars resolves each key via the process-wide
         # ContextVar registry and calls .set() on the local instance.
-        context_hex = response.context_id
+        context_hex = request.context_id
         context_id = uuid.UUID(hex=context_hex) if context_hex else uuid.uuid4()
 
-        work_task = Task.from_protobuf(response.task)
+        work_task = Task.from_protobuf(request.task)
 
         response_context_hex = context_hex or context_id.hex
         with _namespace.activate(context_id):
-            if response.vars:
-                _apply_vars(dict(response.vars))
+            if request.vars:
+                _apply_vars(dict(request.vars))
 
             if self._backpressure is not None:
                 decision = self._backpressure(
@@ -261,14 +277,27 @@ class WorkerService(protocol.WorkerServicer):
                                 context_id=response_context_hex,
                             )
                     elif isinstance(task, asyncio.Task):
-                        value, ctx_snapshot = await task
-                        result = protocol.Message(dump=_dumps(value))
-                        yield protocol.Response(
-                            result=result,
-                            vars=ctx_snapshot,
-                            context_id=response_context_hex,
-                        )
+                        outcome: _WorkerOutcome = await task
+                        if outcome.exception is not None:
+                            exception = protocol.Message(dump=_dumps(outcome.exception))
+                            yield protocol.Response(
+                                exception=exception,
+                                vars=outcome.snapshot,
+                                context_id=response_context_hex,
+                            )
+                        else:
+                            result = protocol.Message(dump=_dumps(outcome.result))
+                            yield protocol.Response(
+                                result=result,
+                                vars=outcome.snapshot,
+                                context_id=response_context_hex,
+                            )
                 except (Exception, asyncio.CancelledError) as e:
+                    # Streaming async-gen path or cancellation of the
+                    # awaited coroutine task bubbles here. Best-effort
+                    # snapshot from the handler context; worker-side
+                    # mutations from the coroutine path are already
+                    # captured in ``outcome.snapshot`` above.
                     exception = protocol.Message(dump=_dumps(e))
                     ctx_snapshot = _snapshot_vars()
                     yield protocol.Response(
@@ -340,22 +369,24 @@ class WorkerService(protocol.WorkerServicer):
         thread.join(timeout=5)
         loop.close()
 
-    async def _run_on_worker(self, work_task: Task):
+    async def _run_on_worker(self, work_task: Task) -> _WorkerOutcome:
         """Run a task on the shared worker event loop.
 
         Offloads task execution to a dedicated worker event loop to
         prevent blocking the main gRPC event loop. Context variables
         are propagated from the calling context to the worker loop.
 
-        The return value is always a ``(result, context_snapshot)``
-        tuple so that the caller can attach the snapshot to the gRPC
-        response.
+        Always returns a :class:`_WorkerOutcome` carrying the
+        post-run context snapshot, regardless of whether the routine
+        returned normally or raised. Exceptions are captured as
+        ``outcome.exception`` so the handler can ship them on the
+        Response alongside the worker-side mutations.
 
         :param work_task:
             The :class:`Task` instance to execute.
         :returns:
-            A ``(result, dict)`` tuple containing the task result and
-            a context snapshot of mutated wool.ContextVar values.
+            A :class:`_WorkerOutcome` with ``result``, ``exception``,
+            and ``snapshot`` fields.
         """
         ctx = contextvars.copy_context()
         future: concurrent.futures.Future = concurrent.futures.Future()
@@ -363,13 +394,15 @@ class WorkerService(protocol.WorkerServicer):
 
         async def _run_with_context_adoption():
             # Consume the _intended_context_id that the dispatch
-            # handler's activate() set, binding the sentinel to THIS
-            # task (the one the worker loop actually runs user code
-            # in). Any asyncio.create_task spawned by user code below
-            # will observe the sentinel bound to this task, see the
-            # mismatch on their own entry to _current_context_id(),
-            # and mint a fresh id — stdlib fork semantics.
-            _namespace._current_context_id()
+            # handler's activate() set, binding THIS task (the one
+            # the worker loop actually runs user code in) to that
+            # id. Any asyncio.create_task spawned by user code below
+            # will see the binding on this task, detect the mismatch
+            # on their own entry, and mint a fresh id — stdlib fork
+            # semantics.
+            task = asyncio.current_task()
+            assert task is not None
+            _namespace._bind_context_id(task)
             return await work_task._run()
 
         async with self._loop_pool.get("worker") as (worker_loop, _):
@@ -384,12 +417,17 @@ class WorkerService(protocol.WorkerServicer):
                         return
                     if t.cancelled():
                         future.cancel()
-                    elif t.exception() is not None:
-                        future.set_exception(t.exception())
+                        return
+                    snapshot = _snapshot_vars(ctx)
+                    exc = t.exception()
+                    if exc is not None:
+                        future.set_result(
+                            _WorkerOutcome(exception=exc, snapshot=snapshot)
+                        )
                     else:
-                        result = t.result()
-                        snapshot = _snapshot_vars(ctx)
-                        future.set_result((result, snapshot))
+                        future.set_result(
+                            _WorkerOutcome(result=t.result(), snapshot=snapshot)
+                        )
 
                 task.add_done_callback(_done)
 
@@ -434,11 +472,13 @@ class WorkerService(protocol.WorkerServicer):
 
             async def worker_dispatch():
                 # Mirrors _run_with_context_adoption in _run_on_worker:
-                # consume _intended_context_id and bind the sentinel
-                # to THIS task before user code runs, so any
+                # consume _intended_context_id and bind THIS task's
+                # context id before user code runs, so any
                 # asyncio.create_task user code spawns observes the
                 # mismatch and forks a fresh id (stdlib parity).
-                _namespace._current_context_id()
+                task = asyncio.current_task()
+                assert task is not None
+                _namespace._bind_context_id(task)
                 proxy_pool = wool.__proxy_pool__.get()
                 proxy_ctx = proxy_pool.get(work_task.proxy) if proxy_pool else None
                 proxy = await proxy_ctx.__aenter__() if proxy_ctx else None

@@ -1192,6 +1192,52 @@ class TestWorkerService:
             WorkerService._destroy_worker_loop(entry.obj)
 
     @pytest.mark.asyncio
+    async def test_run_on_worker_exception_path_captures_snapshot(
+        self, mock_worker_proxy_cache
+    ):
+        """Exception path carries worker-side ContextVar mutations.
+
+        Given:
+            A worker task that mutates a :class:`wool.ContextVar` and then
+            raises
+        When:
+            The task is executed via :meth:`WorkerService._run_on_worker`
+        Then:
+            The returned :class:`_WorkerOutcome` carries both the captured
+            exception and a snapshot containing the mutation, so the
+            handler can ship the caller's updated view on the Response.
+        """
+        from wool.runtime.worker.service import _WorkerOutcome
+
+        var = wool.ContextVar("c2_outcome_var", namespace="test_c2_svc")
+        service = WorkerService()
+
+        async def mutating_failure():
+            var.set("mutated-before-raise")
+            raise ValueError("worker boom")
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        work_task = Task(
+            id=uuid4(),
+            callable=mutating_failure,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        try:
+            outcome = await service._run_on_worker(work_task)
+        finally:
+            for entry in service._loop_pool._cache.values():
+                WorkerService._destroy_worker_loop(entry.obj)
+
+        assert isinstance(outcome, _WorkerOutcome)
+        assert isinstance(outcome.exception, ValueError)
+        assert str(outcome.exception) == "worker boom"
+        assert var.key in outcome.snapshot
+        assert cloudpickle.loads(outcome.snapshot[var.key]) == "mutated-before-raise"
+
+    @pytest.mark.asyncio
     async def test_dispatch_with_version_in_ack(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):

@@ -193,7 +193,8 @@ class Task(Generic[W]):
     :param kwargs:
         Keyword arguments for the function.
     :param proxy:
-        Proxy object for task dispatch and routing (satisfies WorkerProxyLike).
+        Proxy object for task dispatch and routing (satisfies
+        :class:`WorkerProxyLike`).
     :param timeout:
         Task timeout in seconds (0 means no timeout).
     :param caller:

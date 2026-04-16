@@ -1,5 +1,4 @@
 import asyncio
-import logging
 from typing import Callable
 from uuid import uuid4
 
@@ -11,12 +10,10 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool import protocol
-from wool.runtime.context import dispatch_timeout
 from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Serializer
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
-from wool.runtime.routine.task import WorkerProxyLike
 from wool.runtime.routine.task import current_task
 from wool.runtime.routine.task import do_dispatch
 

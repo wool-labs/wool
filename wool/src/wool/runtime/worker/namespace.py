@@ -8,10 +8,10 @@ interaction, mirroring stdlib ``contextvars.Context`` fork semantics.
 
 Pieces:
 
-- :data:`_wool_sentinel` — stdlib contextvar carrying the active
-  wool.Context id paired with the ``id`` of the stdlib Context it
-  was bound in. The ctx_id comparison is how we detect implicit
-  forks.
+- :data:`_wool_context_binding` — stdlib contextvar carrying the
+  active wool.Context id paired with the ``id`` of the stdlib
+  Context it was bound in. The ``stdlib_ctx_id`` comparison is how
+  we detect implicit forks.
 - :data:`_intended_context_id` — worker-side handoff: the dispatch
   handler plants the caller's id here; the first descendant task
   that calls :func:`_current_context_id` adopts it and clears the
@@ -22,7 +22,7 @@ Pieces:
   :meth:`wool.Context.run` when seeding a fresh stdlib Context in
   async code.
 - :func:`activate` — context manager used by the dispatch handler
-  to set the intended context id and bind the sentinel for its own
+  to set the intended context id and bind the binding for its own
   task's duration.
 """
 
@@ -66,38 +66,43 @@ else:
         return id(task.get_context())
 
 
-class _ContextSentinel:
-    """Marker that binds a wool.Context id to the stdlib Context it was
-    established in.
+class _ContextBinding:
+    """Pairs a wool.Context id with the stdlib Context it was bound in.
 
-    Stored in the :data:`_wool_sentinel` stdlib contextvar so the id
-    is recoverable from the current context. When stdlib copies the
-    contextvar across an ``asyncio.create_task`` boundary, the
-    sentinel's value propagates verbatim — but ``ctx_id`` still
-    identifies the PARENT task's :class:`contextvars.Context` via
-    :func:`_task_context_id`. :func:`_current_context_id` uses this
-    to detect implicit forks: a mismatch between the sentinel's
-    stored ``ctx_id`` and the current task's context id means we're
-    inside a forked context (``asyncio.create_task`` or equivalent),
-    which mints a fresh id.
+    A binding is the primitive that lets :func:`_current_context_id`
+    distinguish "still inside the same logical execution chain" from
+    "forked into a child task." The wool.Context id is the logical
+    identity; the stdlib Context id (``stdlib_ctx_id``, obtained via
+    :func:`_task_context_id`) records where that logical id was
+    originally anchored.
+
+    When stdlib copies the backing contextvar across an
+    ``asyncio.create_task`` boundary, the binding's value propagates
+    verbatim — but its ``stdlib_ctx_id`` still identifies the PARENT
+    task. A mismatch between the binding's ``stdlib_ctx_id`` and the
+    current task's context id means we're inside a forked context
+    and should mint a fresh wool.Context id.
+
+    Stored in the :data:`_wool_context_binding` stdlib contextvar
+    so it is recoverable from the current context.
     """
 
-    __slots__ = ("context_id", "ctx_id")
+    __slots__ = ("context_id", "stdlib_ctx_id")
 
-    def __init__(self, context_id: uuid.UUID, ctx_id: int):
+    def __init__(self, context_id: uuid.UUID, stdlib_ctx_id: int):
         self.context_id = context_id
-        self.ctx_id = ctx_id
+        self.stdlib_ctx_id = stdlib_ctx_id
 
 
-# Sentinel holding the active wool.Context id and the task it was
-# bound to. Inside the same asyncio Task, the id is constant and
-# continues across sequential awaits. Crossing an
+# Binding holding the active wool.Context id and the task it was
+# established on. Inside the same asyncio Task, the id is constant
+# and continues across sequential awaits. Crossing an
 # asyncio.create_task boundary flips the current task,
 # :func:`_current_context_id` detects the mismatch, and mints a
 # fresh id — stdlib parity with ``contextvars.Context`` fork
 # semantics.
-_wool_sentinel: contextvars.ContextVar[_ContextSentinel | None] = contextvars.ContextVar(
-    "wool.namespace.wool_sentinel", default=None
+_wool_context_binding: contextvars.ContextVar[_ContextBinding | None] = (
+    contextvars.ContextVar("wool.namespace.wool_context_binding", default=None)
 )
 
 
@@ -122,6 +127,39 @@ _intended_context_id: contextvars.ContextVar[uuid.UUID | None] = contextvars.Con
 _process_default_context_id: uuid.UUID = uuid.uuid4()
 
 
+def _bind_context_id(task: asyncio.Task[Any]) -> None:
+    """Establish a wool.Context-id binding for *task*.
+
+    Idempotent: if *task* already has a valid binding on the
+    current stdlib ``Context``, returns without mutating state.
+    Otherwise adopts a caller-planted :data:`_intended_context_id`
+    if one is waiting (consuming it so descendants don't re-adopt),
+    or mints a fresh :class:`uuid.UUID` and binds it.
+
+    Caller is responsible for supplying a non-None task —
+    typically by calling :func:`asyncio.current_task` inside a
+    coroutine.
+
+    :param task:
+        The :class:`asyncio.Task` to bind the context id to. Must
+        be non-None.
+    :raises ValueError:
+        If *task* is None.
+    """
+    if task is None:
+        raise ValueError("_bind_context_id requires a non-None task")
+    stdlib_ctx_id = _task_context_id(task)
+    binding = _wool_context_binding.get(None)
+    if binding is not None and binding.stdlib_ctx_id == stdlib_ctx_id:
+        return
+    intended = _intended_context_id.get(None)
+    if intended is not None:
+        _intended_context_id.set(None)
+        _wool_context_binding.set(_ContextBinding(intended, stdlib_ctx_id))
+        return
+    _wool_context_binding.set(_ContextBinding(uuid.uuid4(), stdlib_ctx_id))
+
+
 def _current_context_id() -> uuid.UUID:
     """Internal fork-detection primitive. Returns the UUID of the
     current execution context.
@@ -131,55 +169,31 @@ def _current_context_id() -> uuid.UUID:
     user-facing abstraction is :class:`wool.Context` — the id is an
     attribute of a Context, not a top-level concept.
 
-    Resolution order:
-
-    1. If we're in an asyncio task and the current stdlib ``Context``
-       has a :class:`_ContextSentinel` whose ``ctx_id`` matches the
-       current task's context id, return its context id (continuation).
-    2. Else if :data:`_intended_context_id` is set (typically by
-       :func:`activate` on the worker or by :meth:`wool.Context.run`
-       / :meth:`run_async` when seeding): inside an asyncio task,
-       consume it by writing ``None`` so descendants don't re-adopt
-       and bind the sentinel to the current context; outside an
-       asyncio task, leave :data:`_intended_context_id` set so
-       subsequent reads in the same stdlib ``Context`` scope keep
-       returning the same id (the stdlib ``Context`` is the only
-       isolator available when there's no task to bind a sentinel
-       to).
-    3. Else in an asyncio task, mint a fresh id, bind the sentinel
-       to the current context, and return it (implicit fork across
-       an ``asyncio.create_task`` boundary).
-    4. Outside any asyncio task and with no intended context id,
-       return the process-wide default id. Shared across unrelated
-       sync flows in the same process, but stable — Tokens captured
-       at ``set()`` must compare equal on ``reset()`` for the common
-       sync ``var.set(...); var.reset(token)`` case to work.
+    Inside an asyncio task, delegates to :func:`_bind_context_id`
+    to establish a binding on first call (adopting a waiting
+    :data:`_intended_context_id` or minting fresh), then reads the
+    binding back. Outside any asyncio task, returns
+    :data:`_intended_context_id` if set — leaving it in place so
+    subsequent reads in the same stdlib ``Context`` keep returning
+    the same id — otherwise falls back to a process-wide default.
+    The sync fallback is shared across unrelated sync flows in the
+    same process, but stable — Tokens captured at ``set()`` must
+    compare equal on ``reset()`` for the common sync
+    ``var.set(...); var.reset(token)`` case to work.
     """
     try:
         task = asyncio.current_task()
     except RuntimeError:
         task = None
 
-    ctx_id = task and _task_context_id(task)
+    if task is None:
+        intended = _intended_context_id.get(None)
+        return intended if intended is not None else _process_default_context_id
 
-    if ctx_id is not None:
-        sentinel = _wool_sentinel.get(None)
-        if sentinel is not None and sentinel.ctx_id == ctx_id:
-            return sentinel.context_id
-
-    intended = _intended_context_id.get(None)
-    if intended is not None:
-        if ctx_id is not None:
-            _intended_context_id.set(None)
-            _wool_sentinel.set(_ContextSentinel(intended, ctx_id))
-        return intended
-
-    if ctx_id is None:
-        return _process_default_context_id
-
-    context_id = uuid.uuid4()
-    _wool_sentinel.set(_ContextSentinel(context_id, ctx_id))
-    return context_id
+    _bind_context_id(task)
+    binding = _wool_context_binding.get(None)
+    assert binding is not None
+    return binding.context_id
 
 
 def adopt_context(context_id: uuid.UUID) -> None:
@@ -195,7 +209,7 @@ def adopt_context(context_id: uuid.UUID) -> None:
         task = None
     if task is None:
         return
-    _wool_sentinel.set(_ContextSentinel(context_id, _task_context_id(task)))
+    _wool_context_binding.set(_ContextBinding(context_id, _task_context_id(task)))
 
 
 # ----------------------------------------------------------------------
@@ -209,7 +223,7 @@ def activate(context_id: uuid.UUID) -> Iterator[None]:
 
     Plants :data:`_intended_context_id` so the worker-loop sub-task
     adopts the caller's id on its first
-    :func:`_current_context_id` call, and binds the sentinel to the
+    :func:`_current_context_id` call, and binds the context to the
     current (handler) task so the id is also recoverable from the
     handler's context.
 
@@ -222,15 +236,15 @@ def activate(context_id: uuid.UUID) -> Iterator[None]:
         handler_task = asyncio.current_task()
     except RuntimeError:
         handler_task = None
-    handler_sentinel_token = None
+    handler_binding_token = None
     if handler_task is not None:
-        handler_sentinel_token = _wool_sentinel.set(
-            _ContextSentinel(context_id, _task_context_id(handler_task))
+        handler_binding_token = _wool_context_binding.set(
+            _ContextBinding(context_id, _task_context_id(handler_task))
         )
 
     try:
         yield
     finally:
-        if handler_sentinel_token is not None:
-            _wool_sentinel.reset(handler_sentinel_token)
+        if handler_binding_token is not None:
+            _wool_context_binding.reset(handler_binding_token)
         _intended_context_id.reset(intended_token)
