@@ -600,7 +600,7 @@ def _snapshot_vars(
             raw = ctx[var._stdlib]
         else:
             raw = var._stdlib.get()
-        if raw is _UNSET:
+        if raw is _UNSET:  # pragma: no cover — reset clears tracker before stdlib
             continue
         try:
             pickled = dumps(raw)

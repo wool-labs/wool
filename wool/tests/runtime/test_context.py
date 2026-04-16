@@ -1157,6 +1157,159 @@ class TestContext:
 
         await task
 
+    def test_build_frame_payload_raises_typeerror_for_unpicklable_value(self):
+        """Test build_frame_payload raises TypeError naming the offending var.
+
+        Given:
+            A ContextVar set to an unpicklable value (a local generator
+            function object)
+        When:
+            build_frame_payload() is called to snapshot the current vars
+        Then:
+            TypeError is raised with a message naming the offending var
+            key, per the public serialization contract that
+            non-serializable values surface a TypeError at dispatch
+            time.
+        """
+        from wool.runtime.context import build_frame_payload
+
+        # Arrange
+        var = ContextVar("ctx001_unpicklable")
+
+        def _local_gen():
+            yield 1
+
+        var.set(_local_gen())
+
+        # Act & assert
+        with pytest.raises(TypeError, match=var.key):
+            build_frame_payload()
+
+    def test_apply_vars_with_empty_map_is_noop(self):
+        """Test _apply_vars returns without touching state on an empty map.
+
+        Given:
+            A fresh wool Context and an empty ``vars`` map
+        When:
+            _apply_vars is invoked with the empty map
+        Then:
+            The current context is unchanged and no exception is raised,
+            mirroring the dispatch handler's behavior for requests with
+            empty vars (i.e., the empty-map short-circuit path).
+        """
+        # Arrange
+        var = ContextVar("ctx002_seed", default="default")
+        var.set("before")
+        before = current_context()
+
+        # Act
+        _apply_vars({})
+
+        # Assert
+        after = current_context()
+        assert after[var] == before[var]
+        assert set(after.keys()) == set(before.keys())
+
+    def test_apply_vars_with_unknown_key_drops_silently(self):
+        """Test _apply_vars drops unknown keys without raising.
+
+        Given:
+            A wire-form ``vars`` payload containing a key that is not
+            registered on this process
+        When:
+            _apply_vars is invoked with the payload
+        Then:
+            It returns without raising; unknown keys are silently
+            dropped (rolling-deploy scenario where the caller has a
+            var not yet present on the worker).
+        """
+        # Arrange
+        known_var = ContextVar("ctx003_known", default="initial")
+        payload = {
+            "ctx003_unknown:missing": _dumps("ignored"),
+            known_var.key: _dumps("applied"),
+        }
+
+        # Act
+        _apply_vars(payload)
+
+        # Assert
+        assert known_var.get() == "applied"
+
+    def test_pickle_roundtrip_of_var_updates_modified_keys_on_receiver(self):
+        """Test reconstructing a var with a value updates the receiver's
+        modified-keys tracker.
+
+        Given:
+            A wool.ContextVar set to value ``v`` and pickled via
+            _dumps
+        When:
+            The pickled bytes are unpickled inside a fresh stdlib
+            Context via ``contextvars.copy_context().run``, and
+            current_context() is captured there
+        Then:
+            The reconstructed var's key appears in the new context's
+            captured vars — confirming reconstruct-with-embedded-value
+            updates the receiver's modified-keys tracker (observable
+            via ``var in ctx``).
+        """
+        # Arrange — pickle while the var holds "wire_value", then
+        # reset so the receiver's fresh stdlib (inherited via
+        # copy_context) no longer matches the embedded value. That
+        # forces _reconstruct to actually apply the embedded
+        # current_value and update the modified-keys tracker on the
+        # receiver side.
+        var = ContextVar("ctx004_roundtrip", default="d")
+        token = var.set("wire_value")
+        pickled = _dumps(var)
+        var.reset(token)
+
+        observed: list[Context] = []
+
+        def in_fresh():
+            restored = _loads(pickled)
+            observed.append(current_context())
+            assert restored.get() == "wire_value"
+
+        # Act
+        contextvars.copy_context().run(in_fresh)
+
+        # Assert
+        assert len(observed) == 1
+        assert var in observed[0]
+        assert observed[0][var] == "wire_value"
+
+    @pytest.mark.asyncio
+    async def test_current_context_skips_var_with_unset_stdlib_after_reset(self):
+        """Test current_context omits vars whose stdlib is _UNSET after reset.
+
+        Given:
+            A ContextVar set then reset inside Context.run_async, so the
+            stdlib tracker enters the reset-fallback path and the var
+            ends up effectively unset
+        When:
+            current_context() is invoked mid-run after the reset
+        Then:
+            The returned Context does not contain the var — the skip
+            path for unset-stdlib entries is honored.
+        """
+        # Arrange
+        var = ContextVar("ctx005_reset_then_probe")
+        ctx = Context()
+        observed: list[Context] = []
+
+        async def body():
+            token = var.set("temporary")
+            var.reset(token)
+            observed.append(current_context())
+
+        # Act
+        await ctx.run_async(body())
+
+        # Assert
+        assert len(observed) == 1
+        assert var not in observed[0]
+
 
 def test_current_context_captures_set_vars_with_id():
     """Test current_context() captures explicitly-set vars and active id.
