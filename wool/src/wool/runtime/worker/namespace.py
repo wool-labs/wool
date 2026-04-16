@@ -9,9 +9,9 @@ interaction, mirroring stdlib ``contextvars.Context`` fork semantics.
 Pieces:
 
 - :data:`_wool_context_binding` — stdlib contextvar carrying the
-  active wool.Context id paired with the ``id`` of the stdlib
-  Context it was bound in. The ``stdlib_ctx_id`` comparison is how
-  we detect implicit forks.
+  active wool.Context id paired with a :class:`weakref.ref` to the
+  :class:`asyncio.Task` it was bound to. Identity comparison
+  against the current task is how we detect implicit forks.
 - :data:`_intended_context_id` — worker-side handoff: the dispatch
   handler plants the caller's id here; the first descendant task
   that calls :func:`_current_context_id` adopts it and clears the
@@ -30,68 +30,51 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import sys
 import uuid
+import weakref
 from contextlib import contextmanager
 from typing import Any
 from typing import Iterator
 
-# ----------------------------------------------------------------------
-# Context-id fork detection
-# ----------------------------------------------------------------------
-
-
-if sys.version_info < (3, 12):
-
-    def _task_context_id(task: asyncio.Task[Any]) -> int:
-        """Return ``id(ctx)`` for the task's bound :class:`contextvars.Context`.
-
-        Python 3.11 fallback: :meth:`asyncio.Task.get_context` was
-        introduced in 3.12, so reach for the non-public ``_context``
-        attribute. Documented in CPython's asyncio internals and
-        stable across 3.11 patch releases. Delete this ``if`` block
-        when 3.11 support is dropped and the long-form implementation
-        below becomes the only path.
-        """
-        return id(task._context)  # type: ignore[attr-defined]
-
-else:
-
-    def _task_context_id(task: asyncio.Task[Any]) -> int:
-        """Return ``id(ctx)`` for the task's bound :class:`contextvars.Context`.
-
-        Uses the public :meth:`asyncio.Task.get_context` (Python
-        3.12+).
-        """
-        return id(task.get_context())
-
 
 class _ContextBinding:
-    """Pairs a wool.Context id with the stdlib Context it was bound in.
+    """Pairs a wool.Context id with the asyncio.Task it was bound to.
 
     A binding is the primitive that lets :func:`_current_context_id`
     distinguish "still inside the same logical execution chain" from
     "forked into a child task." The wool.Context id is the logical
-    identity; the stdlib Context id (``stdlib_ctx_id``, obtained via
-    :func:`_task_context_id`) records where that logical id was
-    originally anchored.
+    identity; ``task_ref`` holds a :class:`weakref.ref` to the
+    :class:`asyncio.Task` the id was originally anchored to.
 
     When stdlib copies the backing contextvar across an
     ``asyncio.create_task`` boundary, the binding's value propagates
-    verbatim — but its ``stdlib_ctx_id`` still identifies the PARENT
-    task. A mismatch between the binding's ``stdlib_ctx_id`` and the
-    current task's context id means we're inside a forked context
-    and should mint a fresh wool.Context id.
+    verbatim — but ``task_ref`` still points at the PARENT task. An
+    identity mismatch between the binding's referent and the current
+    task means we're inside a forked context and should mint a
+    fresh wool.Context id.
+
+    A ``weakref`` is used rather than :func:`id` because
+    :func:`asyncio.create_task` only records weak references to
+    tasks (see ``Lib/asyncio/tasks.py`` ``_scheduled_tasks`` and the
+    asyncio docs' creating-tasks warning). A completed parent task
+    may be garbage-collected while the stdlib Context carrying this
+    binding stays alive in a child or in a captured snapshot.
+    :func:`id` values are permitted to be reused across disjoint
+    object lifetimes (Python docs, ``id`` builtin), so a post-GC
+    address reuse could make a fresh descendant task appear
+    identical to its parent and suppress fork detection. A
+    ``weakref`` collapses to ``None`` once the referent is gone,
+    which the fork-detection read treats as "not the same task."
 
     Stored in the :data:`_wool_context_binding` stdlib contextvar
     so it is recoverable from the current context.
     """
 
-    __slots__ = ("context_id", "stdlib_ctx_id")
+    __slots__ = ("context_id", "task_ref")
 
-    def __init__(self, context_id: uuid.UUID, stdlib_ctx_id: int):
+    def __init__(self, context_id: uuid.UUID, task: asyncio.Task[Any]) -> None:
         self.context_id = context_id
-        self.stdlib_ctx_id = stdlib_ctx_id
+        self.task_ref: weakref.ref[asyncio.Task[Any]] = weakref.ref(task)
 
 
 # Binding holding the active wool.Context id and the task it was
@@ -148,16 +131,15 @@ def _bind_context_id(task: asyncio.Task[Any]) -> None:
     """
     if task is None:
         raise ValueError("_bind_context_id requires a non-None task")
-    stdlib_ctx_id = _task_context_id(task)
     binding = _wool_context_binding.get(None)
-    if binding is not None and binding.stdlib_ctx_id == stdlib_ctx_id:
+    if binding is not None and binding.task_ref() is task:
         return
     intended = _intended_context_id.get(None)
     if intended is not None:
         _intended_context_id.set(None)
-        _wool_context_binding.set(_ContextBinding(intended, stdlib_ctx_id))
+        _wool_context_binding.set(_ContextBinding(intended, task))
         return
-    _wool_context_binding.set(_ContextBinding(uuid.uuid4(), stdlib_ctx_id))
+    _wool_context_binding.set(_ContextBinding(uuid.uuid4(), task))
 
 
 def _current_context_id() -> uuid.UUID:
@@ -209,7 +191,7 @@ def adopt_context(context_id: uuid.UUID) -> None:
         task = None
     if task is None:
         return
-    _wool_context_binding.set(_ContextBinding(context_id, _task_context_id(task)))
+    _wool_context_binding.set(_ContextBinding(context_id, task))
 
 
 # ----------------------------------------------------------------------
@@ -239,7 +221,7 @@ def activate(context_id: uuid.UUID) -> Iterator[None]:
     handler_binding_token = None
     if handler_task is not None:
         handler_binding_token = _wool_context_binding.set(
-            _ContextBinding(context_id, _task_context_id(handler_task))
+            _ContextBinding(context_id, handler_task)
         )
 
     try:
