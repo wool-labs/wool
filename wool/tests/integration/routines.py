@@ -503,3 +503,195 @@ async def mutate_on_each_yield(count: int):
         TENANT_ID.set(f"step-{i}")
         yield TENANT_ID.get()
         await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Routines supporting the wool.Context / Token / exception path / fork /
+# stub-promotion / mid-stream integration tests.
+# ---------------------------------------------------------------------------
+
+
+@wool.routine
+async def return_current_context_id_hex() -> str:
+    """Coroutine that returns ``wool.current_context().id.hex`` from the worker.
+
+    Used to verify that the caller's context id propagates through a
+    dispatch boundary — the worker should observe the same id as the
+    caller captured pre-dispatch.
+    """
+    return wool.current_context().id.hex
+
+
+@wool.routine
+async def run_context_and_read(ctx: wool.Context) -> str:
+    """Coroutine that runs a sub-dispatch inside a caller-supplied Context.
+
+    Accepts a pickled :class:`wool.Context` argument and enters it via
+    :meth:`wool.Context.run_async`. Inside, dispatches
+    :func:`get_tenant_id` which reads ``TENANT_ID``. Proves the
+    worker-side Context seed replays vars and the sub-dispatch observes
+    them.
+    """
+
+    async def _inner() -> str:
+        return await get_tenant_id()
+
+    return await ctx.run_async(_inner())
+
+
+@wool.routine
+async def accept_token_and_reset(token: wool.Token) -> str:
+    """Coroutine that calls ``var.reset(token)`` on the worker and returns var.get().
+
+    The caller sets ``TENANT_ID`` before dispatch and passes the
+    resulting Token. On the worker, ``reset`` restores the pre-set
+    value. The returned value is the post-reset read, which should
+    equal the default (or prior value) captured at ``set`` time.
+    """
+    TENANT_ID.reset(token)
+    return TENANT_ID.get()
+
+
+@wool.routine
+async def accept_token_and_double_reset(token: wool.Token) -> str:
+    """Coroutine that calls ``reset(token)`` twice, the second call raising.
+
+    Returns the caught exception's repr so the caller can verify a
+    RuntimeError ("Token has already been used") was raised inside the
+    routine.
+    """
+    TENANT_ID.reset(token)
+    try:
+        TENANT_ID.reset(token)
+    except RuntimeError as exc:
+        return repr(exc)
+    return "no-error"
+
+
+@wool.routine
+async def mutate_then_raise_tenant_id(value: str) -> str:
+    """Coroutine that sets ``TENANT_ID`` to *value* then raises ValueError.
+
+    Used by exception-path back-propagation tests — the worker's mutation
+    should reach the caller via the exception's snapshot path.
+    """
+    TENANT_ID.set(value)
+    raise ValueError("mutate_then_raise_tenant_id")
+
+
+@wool.routine
+async def yield_then_mutate_and_raise(sentinel: str):
+    """Async generator that yields once, then sets ``TENANT_ID`` and raises.
+
+    Yields ``"ready"`` first so the caller can iterate once, then sets
+    ``TENANT_ID`` to *sentinel* before raising ``ValueError``. Used to
+    verify that mid-stream mutations are back-propagated through the
+    exception snapshot.
+    """
+    yield "ready"
+    TENANT_ID.set(sentinel)
+    raise ValueError("yield_then_mutate_and_raise")
+
+
+@wool.routine
+async def spawn_and_mutate_tenant_id() -> tuple[str, str]:
+    """Coroutine: parent sets, spawns child that mutates, parent reads.
+
+    Stdlib copy-on-fork parity: the child task runs with a COPY of the
+    parent's stdlib Context, so the child's mutation does not leak
+    back into the parent. Returns ``(child_read, parent_read)`` for
+    assertion.
+    """
+    TENANT_ID.set("parent")
+
+    async def _child():
+        TENANT_ID.set("child")
+        return TENANT_ID.get()
+
+    child_value = await asyncio.create_task(_child())
+    parent_value = TENANT_ID.get()
+    return child_value, parent_value
+
+
+@wool.routine
+async def parent_sets_child_reads() -> str:
+    """Coroutine: parent sets TENANT_ID, child task reads without mutating.
+
+    Verifies that a stdlib-fork child inherits the parent's pre-fork
+    value (copy-on-inherit).
+    """
+    TENANT_ID.set("parent-set")
+
+    async def _child():
+        return TENANT_ID.get()
+
+    return await asyncio.create_task(_child())
+
+
+@wool.routine
+async def two_children_mutate_tenant_id() -> tuple[str, str, str]:
+    """Coroutine that spawns two children mutating TENANT_ID to distinct values.
+
+    Returns ``(a_value, b_value, parent_value)``. Neither child's
+    mutation should leak into the other's context nor into the parent.
+    """
+
+    async def _child(value: str) -> str:
+        TENANT_ID.set(value)
+        return TENANT_ID.get()
+
+    a_value, b_value = await asyncio.gather(_child("alpha"), _child("beta"))
+    parent_value = TENANT_ID.get()
+    return a_value, b_value, parent_value
+
+
+@wool.routine
+async def stream_tenant_id_echo(count: int):
+    """Async generator that yields ``TENANT_ID.get()`` on each iteration.
+
+    Used by forward-propagation mid-stream tests — between iterations
+    the caller mutates the var; each new yield should observe the
+    latest caller value.
+    """
+    for _ in range(count):
+        yield TENANT_ID.get()
+        await asyncio.sleep(0)
+
+
+@wool.routine
+async def echo_tenant_id_on_send(count: int):
+    """Async generator that echoes ``TENANT_ID.get()`` each asend round-trip.
+
+    First yields ``"ready"``; then for each sent value echoes
+    ``TENANT_ID.get()``. The caller mutates ``TENANT_ID`` before each
+    ``asend``; the echoed value should track the caller's current
+    value at the moment of each send.
+    """
+    yield "ready"
+    for _ in range(count):
+        _ = yield TENANT_ID.get()
+
+
+@wool.routine
+async def read_on_athrow(sentinel: str):
+    """Async generator that reads ``TENANT_ID`` inside an athrow handler.
+
+    Yields once; on ``athrow`` yields ``TENANT_ID.get()`` from inside
+    the handler, then returns. Used to verify that a forward-propagated
+    mutation reaches the worker in the frame of an ``athrow`` call.
+    """
+    try:
+        yield "ready"
+    except BaseException:
+        yield TENANT_ID.get()
+        return
+
+
+@wool.routine
+async def read_tenant_id_only() -> str:
+    """Coroutine that reads ``TENANT_ID`` only.
+
+    The caller may additionally set an unregistered-on-worker var; the
+    worker must silently drop that key and still see ``TENANT_ID``.
+    """
+    return TENANT_ID.get()
