@@ -422,10 +422,10 @@ class ContextVar(Generic[T]):
 
         :param default:
             Optional fallback returned when the variable has no value
-            and no class-level default.
+            and no constructor default.
         :returns:
             The current value, the supplied fallback, or the
-            class-level default.
+            constructor default.
         :raises LookupError:
             If the variable has no value, no fallback, and no default.
         """
@@ -889,7 +889,7 @@ def current_context() -> Context:
     identifying the current execution chain. The returned Context
     captures every :class:`ContextVar` whose key appears in
     :data:`_modified_keys` (unset vars and vars sitting at their
-    class-level default are omitted) plus the active context id.
+    constructor default are omitted) plus the active context id.
     When no context is active, a fresh UUID is minted — the returned
     context starts a new chain.
     """

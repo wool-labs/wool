@@ -110,8 +110,8 @@ _wool_context_binding: contextvars.ContextVar[_ContextBinding | None] = (
 # :func:`activate`, it sets this contextvar to the caller's wire
 # context id. The first asyncio task descendant that calls
 # :func:`_current_context_id` consumes the intended value (by
-# writing ``None`` to its own local context) and binds the sentinel
-# to itself. Descendants of that task (via the user's own
+# writing ``None`` to its own local context) and establishes a
+# binding on itself. Descendants of that task (via the user's own
 # ``asyncio.create_task``) see ``None`` and mint fresh ids — stdlib
 # fork semantics.
 _intended_context_id: contextvars.ContextVar[uuid.UUID | None] = contextvars.ContextVar(

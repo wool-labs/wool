@@ -202,13 +202,17 @@ class Task(Generic[W]):
     :param exception:
         Exception information if task execution failed.
     :param filename:
-        Source filename where the task was defined.
+        Source filename where the task was defined (legacy; unused
+        by the primary construction path which uses *tag* instead).
     :param function:
-        Name of the function being executed.
+        Name of the function being executed (legacy; unused by the
+        primary construction path which uses *tag* instead).
     :param line_no:
-        Line number where the task was defined.
+        Line number where the task was defined (legacy; unused by
+        the primary construction path which uses *tag* instead).
     :param tag:
-        Optional descriptive tag for the task.
+        Descriptive label identifying the call site, formatted as
+        ``module.qualname:lineno`` by the ``@routine`` wrapper.
     """
 
     id: UUID
@@ -397,7 +401,7 @@ class Task(Generic[W]):
 
     async def _stream(self):
         """
-        Execute the task's callable with its arguments in proxy context.
+        Stream the task's async generator callable in proxy context.
 
         :returns:
             An async generator that yields values from the callable.

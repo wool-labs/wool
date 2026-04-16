@@ -642,11 +642,11 @@ class WorkerService(protocol.WorkerServicer):
             self._stopped.set()
 
     async def _await_or_cancel(self, *, timeout: float | None = 0) -> None:
-        """Stop the worker service gracefully.
+        """Drain or cancel in-flight tasks in the docket.
 
-        Gracefully shuts down the worker service by canceling or waiting
-        for running tasks. This method is idempotent and can be called
-        multiple times safely.
+        Waits for running tasks to complete or cancels them depending
+        on the timeout value. Called by :meth:`_stop` as part of the
+        shutdown sequence.
 
         :param timeout:
             Maximum time to wait for tasks to complete. If 0 (default),
