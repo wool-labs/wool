@@ -823,17 +823,6 @@ class TestExceptionPathBackPropagation:
 
         await retry_grpc_internal(body)
 
-    @pytest.mark.xfail(
-        reason=(
-            "bug: src/wool/runtime/worker/service.py:581 raises the async-gen "
-            "exception WITHOUT forwarding the worker-captured ctx_snapshot "
-            "(line 516). The outer handler then re-snapshots from its own "
-            "context (line 302) which never observed the worker's mutations, "
-            "dropping mid-stream mutations that occurred on the frame that "
-            "raised."
-        ),
-        strict=True,
-    )
     @pytest.mark.asyncio
     async def test_async_gen_exception_back_propagates_worker_mutation(
         self, credentials_map, retry_grpc_internal

@@ -269,11 +269,21 @@ class WorkerService(protocol.WorkerServicer):
                 yield protocol.Response(ack=ack)
                 try:
                     if isasyncgen(task):
-                        async for value, ctx_snapshot in task:
-                            result = protocol.Message(dump=_dumps(value))
+                        async for outcome in task:
+                            if outcome.exception is not None:
+                                exception = protocol.Message(
+                                    dump=_dumps(outcome.exception)
+                                )
+                                yield protocol.Response(
+                                    exception=exception,
+                                    vars=outcome.snapshot,
+                                    context_id=response_context_hex,
+                                )
+                                return
+                            result = protocol.Message(dump=_dumps(outcome.result))
                             yield protocol.Response(
                                 result=result,
-                                vars=ctx_snapshot,
+                                vars=outcome.snapshot,
                                 context_id=response_context_hex,
                             )
                     elif isinstance(task, asyncio.Task):
@@ -293,11 +303,13 @@ class WorkerService(protocol.WorkerServicer):
                                 context_id=response_context_hex,
                             )
                 except (Exception, asyncio.CancelledError) as e:
-                    # Streaming async-gen path or cancellation of the
-                    # awaited coroutine task bubbles here. Best-effort
-                    # snapshot from the handler context; worker-side
-                    # mutations from the coroutine path are already
-                    # captured in ``outcome.snapshot`` above.
+                    # Cancellation of the awaited coroutine task or
+                    # an unexpected handler-level failure bubbles
+                    # here. Routine errors from the streaming path
+                    # are surfaced through the outcome frame above,
+                    # so this branch does not see them. Best-effort
+                    # snapshot from the handler context since no
+                    # frame-level snapshot is available at this point.
                     exception = protocol.Message(dump=_dumps(e))
                     ctx_snapshot = _snapshot_vars()
                     yield protocol.Response(
@@ -453,6 +465,15 @@ class WorkerService(protocol.WorkerServicer):
         worker loop via a queue, and the resulting values are returned
         to the main loop for yielding.
 
+        Each frame is surfaced as a :class:`_WorkerOutcome`. Success
+        frames carry ``result`` and ``snapshot``; an exception raised
+        by the routine yields a terminal frame with ``exception`` and
+        ``snapshot`` populated — the caller is responsible for
+        emitting the error Response and terminating the stream. The
+        generator does not raise routine errors itself so the
+        worker-side context snapshot taken at the mutation point is
+        never dropped.
+
         :param work_task:
             The :class:`Task` instance containing an async
             generator.
@@ -460,8 +481,9 @@ class WorkerService(protocol.WorkerServicer):
             The incoming bidirectional request stream for reading
             client-driven iteration commands.
         :yields:
-            Values yielded by the async generator, streamed from
-            the worker loop.
+            :class:`_WorkerOutcome` frames — one per successful
+            routine yield, plus one terminal error frame if the
+            routine raises.
         """
         main_loop = asyncio.get_running_loop()
         ctx = contextvars.copy_context()
@@ -578,8 +600,16 @@ class WorkerService(protocol.WorkerServicer):
                         break
                     tag, payload, ctx_snapshot = result
                     if tag == "error":
-                        raise payload
-                    yield (payload, ctx_snapshot)
+                        # Terminal error frame: surface the exception
+                        # alongside the worker-side snapshot so the
+                        # caller can ship worker mutations on the
+                        # error Response. Do not raise — raising would
+                        # let the snapshot fall on the floor and the
+                        # dispatch handler's fallback snapshot never
+                        # saw the worker's mutations.
+                        yield _WorkerOutcome(exception=payload, snapshot=ctx_snapshot)
+                        return
+                    yield _WorkerOutcome(result=payload, snapshot=ctx_snapshot)
             finally:
                 worker_loop.call_soon_threadsafe(request_queue.put_nowait, _SENTINEL)
 
