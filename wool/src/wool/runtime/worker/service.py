@@ -419,9 +419,15 @@ class WorkerService(protocol.WorkerServicer):
         :param work_task:
             The :class:`Task` instance to execute.
         :param handler_ctx:
-            The handler's wool.Context.
+            The handler's :class:`~wool.runtime.context.Context`,
+            captured before ``_tracker`` forks a worker task.
+            Preserves the activated context id and any vars applied
+            by the dispatch handler so the worker-loop copy starts
+            from the correct snapshot.
         :param passthrough:
-            Use PassthroughSerializer for response var snapshots.
+            If ``True``, use :class:`PassthroughSerializer` for
+            response var snapshots (self-dispatch optimization that
+            avoids redundant cloudpickle round-trips).
         """
         worker_ctx = handler_ctx.copy()
         future: concurrent.futures.Future = concurrent.futures.Future()
@@ -498,6 +504,15 @@ class WorkerService(protocol.WorkerServicer):
         :param request_iterator:
             The incoming bidirectional request stream for reading
             client-driven iteration commands.
+        :param handler_ctx:
+            The handler's :class:`~wool.runtime.context.Context`,
+            captured before the tracker forks. Preserves the
+            activated context id and applied vars so the worker-loop
+            copy starts from the correct snapshot. When ``None``,
+            falls back to :func:`_current_context`.
+        :param passthrough:
+            If ``True``, use :class:`PassthroughSerializer` for
+            response var snapshots (self-dispatch optimization).
         :yields:
             :class:`_WorkerOutcome` frames — one per successful
             routine yield, plus one terminal error frame if the
@@ -661,9 +676,16 @@ class WorkerService(protocol.WorkerServicer):
             The :class:`Task` instance to execute and track.
         :param request_iterator:
             The incoming bidirectional request stream.
+        :param handler_ctx:
+            The handler's :class:`~wool.runtime.context.Context`,
+            captured before the tracker forks a worker task. Preserves
+            the activated context id and any vars applied by the
+            dispatch handler so the worker-loop copy starts from the
+            correct snapshot.
         :param passthrough:
             If ``True``, use :class:`PassthroughSerializer` for var
-            snapshots (self-dispatch optimization).
+            snapshots on response frames (self-dispatch optimization
+            that avoids redundant cloudpickle round-trips).
         :yields:
             The :class:`asyncio.Task` or async generator for the
             wool task.

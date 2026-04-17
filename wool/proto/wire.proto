@@ -13,7 +13,8 @@ message Task {
     bytes args = 8;
     bytes kwargs = 9;
     int32 timeout = 10;
-    optional bytes serializer = 11;
+    reserved 11;  // was RuntimeContext context, removed
+    optional bytes serializer = 12;
 }
 
 // Minimal envelope for pre-deserialization metadata extraction.

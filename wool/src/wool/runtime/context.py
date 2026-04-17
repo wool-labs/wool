@@ -598,7 +598,21 @@ def _snapshot_vars(
     """
     if ctx is None:
         ctx = _current_context()
-    _ser = dumps if dumps is not None else lambda v: _dumps(v, ctx=ctx)
+    if dumps is not None:
+        _ser = dumps
+    else:
+        # Each value needs a fresh pickler (pickle.Pickler.memo
+        # accumulates cross-references across dump() calls which
+        # would corrupt independent value blobs), but we reuse
+        # a single BytesIO to cut allocation overhead.
+        _buf = io.BytesIO()
+
+        def _ser(v: Any) -> bytes:
+            _buf.seek(0)
+            _buf.truncate()
+            _ContextPickler(_buf, ctx=ctx).dump(v)
+            return _buf.getvalue()
+
     result: dict[str, bytes] = {}
     for var, value in ctx._data.items():
         try:
