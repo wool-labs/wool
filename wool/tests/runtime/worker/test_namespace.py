@@ -249,23 +249,17 @@ class TestActivate:
         # Assert
         assert observed == "propagated"
 
-
-class TestAdoptContext:
-    def test_run_adopts_outer_context_id_for_sync_caller_without_task(self):
-        """Test Context.run propagates id via adopt_context for sync callers.
+    def test_context_run_binds_id_for_sync_caller(self):
+        """Test Context.run installs the Context for sync callers.
 
         Given:
-            A sync caller with no running asyncio task and an outer
-            wool.Context whose ``run`` invokes a function that reads
+            A sync caller with no running asyncio task and a
+            wool.Context whose run invokes a function that reads
             wool.current_context()
         When:
-            Context.run is invoked with a sync fn that observes the
-            current context id
+            Context.run is invoked
         Then:
-            The observed id equals the outer Context's id — the
-            adopt_context no-asyncio-task branch leaves the seeded
-            ``_intended_context_id`` in place, and current_context()
-            reads it back.
+            The observed id equals the outer Context's id
         """
         # Arrange
         outer = wool.Context()
@@ -281,19 +275,16 @@ class TestAdoptContext:
         assert observed == [outer.id]
 
     @pytest.mark.asyncio
-    async def test_run_binds_context_id_via_adopt_when_task_is_running(self):
-        """Test Context.run binds the id via adopt_context when a task is present.
+    async def test_context_run_binds_id_with_running_task(self):
+        """Test Context.run installs the Context when a task is running.
 
         Given:
             An async caller with a running asyncio task invoking
             wool.Context.run(fn), where fn reads current_context().id
         When:
-            The Context id inside fn is observed
+            Context.run is invoked
         Then:
-            It equals the outer Context's id — adopt_context's
-            task-is-not-None branch binds the wool.Context id onto
-            the current asyncio task so subsequent current_context()
-            reads return it.
+            The observed id equals the Context's id
         """
         # Arrange
         outer = wool.Context()

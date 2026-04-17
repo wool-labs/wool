@@ -559,7 +559,12 @@ def _dumps(value: Any, ctx: Context | None = None) -> bytes:
 
 
 def _loads(data: bytes) -> Any:
-    """Deserialize *data* produced by :func:`_dumps`."""
+    """Deserialize *data* produced by :func:`_dumps`.
+
+    Thin wrapper retained as the default for :func:`_apply_vars`'s
+    ``loads`` parameter — a future self-dispatch passthrough can
+    swap in a no-op loader without changing call sites.
+    """
     return cloudpickle.loads(data)
 
 
@@ -589,8 +594,6 @@ def _snapshot_vars(
         ctx = _current_context()
     result: dict[str, bytes] = {}
     for var, value in ctx._data.items():
-        if not isinstance(var, ContextVar):
-            continue
         try:
             pickled = _dumps(value, ctx=ctx)
         except Exception as e:
@@ -602,7 +605,7 @@ def _snapshot_vars(
 
 
 def _apply_vars(
-    vars: dict[str, bytes],
+    wire_vars: dict[str, bytes],
     *,
     loads: Callable[[bytes], Any] = _loads,
 ) -> None:
@@ -613,15 +616,15 @@ def _apply_vars(
     directly into the current :class:`Context`'s data dict. Keys
     unknown on this process log at debug and are skipped.
 
-    :param vars:
+    :param wire_vars:
         A ``{key: serialized_value}`` dict from the proto map.
     :param loads:
         Deserializer for values. Defaults to :func:`_loads`.
     """
-    if not vars:
+    if not wire_vars:
         return
     ctx = _current_context()
-    for key, data in vars.items():
+    for key, data in wire_vars.items():
         var = ContextVar._registry.get(key)
         if var is None:
             _log.debug(

@@ -318,16 +318,16 @@ class TestContextVar:
         with pytest.raises(ValueError):
             b.reset(token)
 
-    def test_reset_falls_back_to_old_value_in_fresh_stdlib_context(self):
-        """Test reset via _old_value fallback when stdlib token is cross-context.
+    def test_reset_restores_old_value_in_different_context_scope(self):
+        """Test reset restores old_value when invoked in a different Context scope.
 
         Given:
-            A ContextVar set twice, then a fresh stdlib Context is entered
-            in which the captured Token's stdlib-token is no longer valid
+            A ContextVar set twice in the original Context, then a
+            different wool.Context scope entered via Context.run
         When:
-            reset(token) is invoked inside the fresh stdlib Context
+            reset(token) is invoked inside the scoped Context
         Then:
-            It should catch the stdlib ValueError and restore via _old_value
+            The var should revert to the value captured in the token
         """
         # Arrange
         var = ContextVar("reset_fallback", default="initial")
@@ -346,14 +346,15 @@ class TestContextVar:
         # Assert
         assert result == "first"
 
-    def test_reset_falls_back_to_unset_old_value_in_fresh_stdlib_context(self):
-        """Test reset fallback restores _UNSET when that was the prior state.
+    def test_reset_restores_unset_in_different_context_scope(self):
+        """Test reset restores unset state when old_value was MISSING.
 
         Given:
-            A previously-unset ContextVar; a set() produces a Token whose
-            _old_value is _UNSET; a fresh stdlib Context is entered
+            A previously-unset ContextVar whose set() Token captured
+            MISSING as the old_value, then a different wool.Context
+            scope entered via Context.run
         When:
-            reset(token) is invoked in the fresh Context
+            reset(token) is invoked in the scoped Context
         Then:
             The var should revert to unset; get(fallback) returns the
             supplied fallback
@@ -1174,29 +1175,27 @@ class TestContext:
         # Assert
         assert known_var.get() == "applied"
 
-    def test_pickle_roundtrip_of_var_updates_modified_keys_on_receiver(self):
-        """Test reconstructing a var with a value updates the receiver's
-        modified-keys tracker.
+    def test_pickle_roundtrip_applies_embedded_value_to_receiver_context(self):
+        """Test reconstructing a var writes its embedded value into the
+        receiver's Context.
 
         Given:
             A wool.ContextVar set to value ``v`` and pickled via
-            _dumps
+            _dumps (which embeds the current value in the reduce
+            tuple)
         When:
-            The pickled bytes are unpickled inside a fresh stdlib
-            Context via ``contextvars.copy_context().run``, and
-            current_context() is captured there
+            The pickled bytes are unpickled inside a fresh
+            wool.Context scope and current_context() is captured
         Then:
-            The reconstructed var's key appears in the new context's
-            captured vars — confirming reconstruct-with-embedded-value
-            updates the receiver's modified-keys tracker (observable
-            via ``var in ctx``).
+            The reconstructed var appears in the captured Context
+            with the embedded value — confirming _reconstruct writes
+            into the receiver's Context._data (observable via
+            ``var in ctx``).
         """
         # Arrange — pickle while the var holds "wire_value", then
-        # reset so the receiver's fresh stdlib (inherited via
-        # copy_context) no longer matches the embedded value. That
-        # forces _reconstruct to actually apply the embedded
-        # current_value and update the modified-keys tracker on the
-        # receiver side.
+        # reset so the receiver's Context no longer has the value.
+        # Unpickling forces _reconstruct to apply the embedded
+        # current_value into the receiver's Context._data.
         var = ContextVar("ctx004_roundtrip", default="d")
         token = var.set("wire_value")
         pickled = _dumps(var)
@@ -1218,18 +1217,17 @@ class TestContext:
         assert observed[0][var] == "wire_value"
 
     @pytest.mark.asyncio
-    async def test_current_context_skips_var_with_unset_stdlib_after_reset(self):
-        """Test current_context omits vars whose stdlib is _UNSET after reset.
+    async def test_current_context_omits_var_after_reset_to_unset(self):
+        """Test current_context omits vars removed by reset.
 
         Given:
-            A ContextVar set then reset inside Context.run_async, so the
-            stdlib tracker enters the reset-fallback path and the var
-            ends up effectively unset
+            A ContextVar set then immediately reset inside
+            Context.run_async, removing it from the Context's data
         When:
             current_context() is invoked mid-run after the reset
         Then:
-            The returned Context does not contain the var — the skip
-            path for unset-stdlib entries is honored.
+            The returned Context does not contain the var — reset
+            popped it from _data so the snapshot excludes it.
         """
         # Arrange
         var = ContextVar("ctx005_reset_then_probe")

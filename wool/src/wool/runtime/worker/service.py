@@ -26,6 +26,7 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
+from wool.runtime.context import Context
 from wool.runtime.context import _apply_vars
 from wool.runtime.context import _current_context
 from wool.runtime.context import _dumps
@@ -40,7 +41,7 @@ from wool.runtime.worker import namespace as _namespace
 _log = logging.getLogger(__name__)
 
 # Sentinel to mark end of async generator stream
-_SENTINEL: Final = object()
+_STREAM_END: Final = object()
 
 
 @dataclass
@@ -387,7 +388,9 @@ class WorkerService(protocol.WorkerServicer):
         thread.join(timeout=5)
         loop.close()
 
-    async def _run_on_worker(self, work_task: Task, handler_ctx: Any) -> _WorkerOutcome:
+    async def _run_on_worker(
+        self, work_task: Task, handler_ctx: Context
+    ) -> _WorkerOutcome:
         """Run a task on the shared worker event loop.
 
         :param work_task:
@@ -443,7 +446,7 @@ class WorkerService(protocol.WorkerServicer):
         self,
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
-        handler_ctx: Any = None,
+        handler_ctx: Context | None = None,
     ):
         """Run a streaming task on the shared worker event loop.
 
@@ -493,7 +496,7 @@ class WorkerService(protocol.WorkerServicer):
                         try:
                             while True:
                                 cmd = await request_queue.get()
-                                if cmd is _SENTINEL:
+                                if cmd is _STREAM_END:
                                     break
                                 action, payload, caller_ctx = cmd
                                 if caller_ctx:
@@ -513,7 +516,7 @@ class WorkerService(protocol.WorkerServicer):
                                                 continue
                                 except StopAsyncIteration:
                                     main_loop.call_soon_threadsafe(
-                                        result_queue.put_nowait, _SENTINEL
+                                        result_queue.put_nowait, _STREAM_END
                                     )
                                     return
                                 except BaseException as e:
@@ -581,7 +584,7 @@ class WorkerService(protocol.WorkerServicer):
 
                     result = await result_queue.get()
 
-                    if result is _SENTINEL:
+                    if result is _STREAM_END:
                         break
                     tag, payload, ctx_snapshot = result
                     if tag == "error":
@@ -596,14 +599,14 @@ class WorkerService(protocol.WorkerServicer):
                         return
                     yield _WorkerOutcome(result=payload, snapshot=ctx_snapshot)
             finally:
-                worker_loop.call_soon_threadsafe(request_queue.put_nowait, _SENTINEL)
+                worker_loop.call_soon_threadsafe(request_queue.put_nowait, _STREAM_END)
 
     @contextmanager
     def _tracker(
         self,
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
-        handler_ctx: Any = None,
+        handler_ctx: Context | None = None,
     ):
         """Context manager for tracking running tasks.
 
