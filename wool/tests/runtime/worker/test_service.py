@@ -1176,7 +1176,9 @@ class TestWorkerService:
         )
 
         with pytest.raises(asyncio.CancelledError):
-            await service._run_on_worker(work_task)
+            from wool.runtime.context import _current_context
+
+            await service._run_on_worker(work_task, _current_context())
 
         # Allow the worker task's done callback to fire on the
         # worker loop.
@@ -1225,8 +1227,10 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
+        from wool.runtime.context import _current_context
+
         try:
-            outcome = await service._run_on_worker(work_task)
+            outcome = await service._run_on_worker(work_task, _current_context())
         finally:
             for entry in service._loop_pool._cache.values():
                 WorkerService._destroy_worker_loop(entry.obj)

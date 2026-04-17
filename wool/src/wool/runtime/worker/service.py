@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextvars
 import logging
 import threading
 import uuid
@@ -28,8 +27,11 @@ from grpc.aio import ServicerContext
 import wool
 from wool import protocol
 from wool.runtime.context import _apply_vars
+from wool.runtime.context import _current_context
 from wool.runtime.context import _dumps
 from wool.runtime.context import _snapshot_vars
+from wool.runtime.context import _task_contexts
+from wool.runtime.context import _task_contexts_lock
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import do_dispatch
@@ -264,7 +266,8 @@ class WorkerService(protocol.WorkerServicer):
                         "Task rejected by backpressure hook",
                     )
 
-            with self._tracker(work_task, request_iterator) as task:
+            handler_ctx = _current_context()
+            with self._tracker(work_task, request_iterator, handler_ctx) as task:
                 ack = protocol.Ack(version=protocol.__version__)
                 yield protocol.Response(ack=ack)
                 try:
@@ -350,7 +353,10 @@ class WorkerService(protocol.WorkerServicer):
         :returns:
             A tuple of the event loop and the thread running it.
         """
+        from wool.runtime.context import install_task_factory
+
         loop = asyncio.new_event_loop()
+        install_task_factory(loop)
         thread = threading.Thread(target=loop.run_forever, daemon=True)
         thread.start()
         return loop, thread
@@ -381,48 +387,27 @@ class WorkerService(protocol.WorkerServicer):
         thread.join(timeout=5)
         loop.close()
 
-    async def _run_on_worker(self, work_task: Task) -> _WorkerOutcome:
+    async def _run_on_worker(self, work_task: Task, handler_ctx: Any) -> _WorkerOutcome:
         """Run a task on the shared worker event loop.
-
-        Offloads task execution to a dedicated worker event loop to
-        prevent blocking the main gRPC event loop. Context variables
-        are propagated from the calling context to the worker loop.
-
-        Always returns a :class:`_WorkerOutcome` carrying the
-        post-run context snapshot, regardless of whether the routine
-        returned normally or raised. Exceptions are captured as
-        ``outcome.exception`` so the handler can ship them on the
-        Response alongside the worker-side mutations.
 
         :param work_task:
             The :class:`Task` instance to execute.
-        :returns:
-            A :class:`_WorkerOutcome` with ``result``, ``exception``,
-            and ``snapshot`` fields.
+        :param handler_ctx:
+            The handler's wool.Context (captured before _tracker
+            forks a child task).
         """
-        ctx = contextvars.copy_context()
+        worker_ctx = handler_ctx.copy()
         future: concurrent.futures.Future = concurrent.futures.Future()
         worker_task = None
-
-        async def _run_with_context_adoption():
-            # Consume the _intended_context_id that the dispatch
-            # handler's activate() set, binding THIS task (the one
-            # the worker loop actually runs user code in) to that
-            # id. Any asyncio.create_task spawned by user code below
-            # will see the binding on this task, detect the mismatch
-            # on their own entry, and mint a fresh id — stdlib fork
-            # semantics.
-            task = asyncio.current_task()
-            assert task is not None
-            _namespace._bind_context_id(task)
-            return await work_task._run()
 
         async with self._loop_pool.get("worker") as (worker_loop, _):
 
             def _schedule():
                 nonlocal worker_task
-                task = worker_loop.create_task(_run_with_context_adoption(), context=ctx)
+                task = worker_loop.create_task(work_task._run())
                 worker_task = task
+                with _task_contexts_lock:
+                    _task_contexts[task] = worker_ctx
 
                 def _done(t: asyncio.Task):
                     if future.done():
@@ -430,7 +415,7 @@ class WorkerService(protocol.WorkerServicer):
                     if t.cancelled():
                         future.cancel()
                         return
-                    snapshot = _snapshot_vars(ctx)
+                    snapshot = _snapshot_vars(worker_ctx)
                     exc = t.exception()
                     if exc is not None:
                         future.set_result(
@@ -456,6 +441,7 @@ class WorkerService(protocol.WorkerServicer):
         self,
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
+        handler_ctx: Any = None,
     ):
         """Run a streaming task on the shared worker event loop.
 
@@ -486,21 +472,15 @@ class WorkerService(protocol.WorkerServicer):
             routine raises.
         """
         main_loop = asyncio.get_running_loop()
-        ctx = contextvars.copy_context()
+        if handler_ctx is None:
+            handler_ctx = _current_context()
+        worker_ctx = handler_ctx.copy()
         request_queue: asyncio.Queue = asyncio.Queue()
         result_queue: asyncio.Queue = asyncio.Queue()
 
         async with self._loop_pool.get("worker") as (worker_loop, _):
 
             async def worker_dispatch():
-                # Mirrors _run_with_context_adoption in _run_on_worker:
-                # consume _intended_context_id and bind THIS task's
-                # context id before user code runs, so any
-                # asyncio.create_task user code spawns observes the
-                # mismatch and forks a fresh id (stdlib parity).
-                task = asyncio.current_task()
-                assert task is not None
-                _namespace._bind_context_id(task)
                 proxy_pool = wool.__proxy_pool__.get()
                 proxy_ctx = proxy_pool.get(work_task.proxy) if proxy_pool else None
                 proxy = await proxy_ctx.__aenter__() if proxy_ctx else None
@@ -566,9 +546,12 @@ class WorkerService(protocol.WorkerServicer):
                     if proxy_ctx is not None:
                         await proxy_ctx.__aexit__(None, None, None)
 
-            worker_loop.call_soon_threadsafe(
-                lambda: worker_loop.create_task(worker_dispatch(), context=ctx)
-            )
+            def _start_worker():
+                task = worker_loop.create_task(worker_dispatch())
+                with _task_contexts_lock:
+                    _task_contexts[task] = worker_ctx
+
+            worker_loop.call_soon_threadsafe(_start_worker)
 
             try:
                 async for request in request_iterator:
@@ -618,6 +601,7 @@ class WorkerService(protocol.WorkerServicer):
         self,
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
+        handler_ctx: Any = None,
     ):
         """Context manager for tracking running tasks.
 
@@ -640,11 +624,11 @@ class WorkerService(protocol.WorkerServicer):
         """
         if iscoroutinefunction(work_task.callable):
             # Regular async function -> run on worker loop
-            task = asyncio.create_task(self._run_on_worker(work_task))
+            task = asyncio.create_task(self._run_on_worker(work_task, handler_ctx))
             watcher = _Task(task)
         elif isasyncgenfunction(work_task.callable):
             # Async generator -> stream from worker loop via queue
-            task = self._stream_from_worker(work_task, request_iterator)
+            task = self._stream_from_worker(work_task, request_iterator, handler_ctx)
             watcher = _AsyncGen(task)
         else:
             raise ValueError("Expected coroutine function or async generator function")

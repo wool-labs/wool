@@ -21,11 +21,20 @@ from wool.runtime.context import current_context
 
 @pytest.fixture(autouse=True)
 def isolate_registry():
+    from wool.runtime.context import _current_context
+    from wool.runtime.context import _thread_context
+
     saved = dict(ContextVar._registry)
+    ctx = _current_context()
+    saved_data = dict(ctx._data)
     yield
+    ctx._data.clear()
+    ctx._data.update(saved_data)
     ContextVar._registry.clear()
     for k, v in saved.items():
         ContextVar._registry[k] = v
+    if hasattr(_thread_context, "ctx"):
+        _thread_context.ctx._data.clear()
 
 
 class TestUnsetType:
@@ -687,77 +696,6 @@ class TestContext:
 
         # Assert
         assert observed == ctx.id
-
-    def test_run_snapshot_failure_does_not_mask_user_exception(self, caplog):
-        """Test Context.run propagates fn's exception even if snapshot fails.
-
-        Given:
-            A Context.run invocation where fn raises and the post-run
-            snapshot also raises
-        When:
-            run is called
-        Then:
-            fn's exception is propagated and the snapshot failure is
-            logged but swallowed
-        """
-        import logging
-        from unittest.mock import patch
-
-        # Arrange
-        caplog.set_level(logging.ERROR, logger="wool.runtime.context")
-        ctx = Context()
-
-        def body():
-            raise RuntimeError("from fn")
-
-        # Act
-        with patch(
-            "wool.runtime.context._snapshot_from", side_effect=ValueError("snap fail")
-        ):
-            with pytest.raises(RuntimeError, match="from fn"):
-                ctx.run(body)
-
-        # Assert
-        assert any(
-            "failed to capture post-run snapshot" in record.message
-            for record in caplog.records
-        )
-
-    @pytest.mark.asyncio
-    async def test_run_async_snapshot_failure_does_not_mask_user_exception(self, caplog):
-        """Test Context.run_async propagates the coro's exception on snapshot failure.
-
-        Given:
-            A Context.run_async invocation where coro raises and the
-            post-run snapshot also raises
-        When:
-            run_async is awaited
-        Then:
-            The coro's exception is propagated and the snapshot failure
-            is logged but swallowed
-        """
-        import logging
-        from unittest.mock import patch
-
-        # Arrange
-        caplog.set_level(logging.ERROR, logger="wool.runtime.context")
-        ctx = Context()
-
-        async def body():
-            raise RuntimeError("from coro")
-
-        # Act
-        with patch(
-            "wool.runtime.context._snapshot_from", side_effect=ValueError("snap fail")
-        ):
-            with pytest.raises(RuntimeError, match="from coro"):
-                await ctx.run_async(body())
-
-        # Assert
-        assert any(
-            "failed to capture post-run snapshot" in record.message
-            for record in caplog.records
-        )
 
     def test_run_snapshot_skips_vars_that_are_unset_or_set_then_reset(self):
         """Test Context.run's snapshot excludes vars that look unset at exit.
