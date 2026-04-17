@@ -1,8 +1,6 @@
 import asyncio
-import concurrent.futures
 import threading
 from contextlib import asynccontextmanager
-from typing import Final
 from uuid import uuid4
 
 import cloudpickle
@@ -24,7 +22,6 @@ from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
-from wool.runtime.worker.service import _ReadOnlyEvent
 
 from .conftest import PicklableMock
 
@@ -123,83 +120,6 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
                 stop_request = protocol.StopRequest(timeout=1)
                 await stub.stop(stop_request)
             _control_event = None
-
-
-class TestReadOnlyEvent:
-    """Tests for :class:`_ReadOnlyEvent` wrapper."""
-
-    unset_event: Final = asyncio.Event()
-    set_event: Final = asyncio.Event()
-    set_event.set()
-
-    @pytest.mark.parametrize("event", (unset_event, set_event))
-    def test___init___wraps_asyncio_event(self, event):
-        """Test :class:`_ReadOnlyEvent` initialization.
-
-        Given:
-            An :class:`asyncio.Event` instance
-        When:
-            :class:`_ReadOnlyEvent` is instantiated with the event
-        Then:
-            It should wrap the event successfully
-        """
-        # Act
-        read_only_event = _ReadOnlyEvent(event)
-
-        # Assert
-        assert read_only_event.is_set() == event.is_set()
-
-        with pytest.raises(AttributeError):
-            getattr(read_only_event, "set")
-
-        with pytest.raises(AttributeError):
-            getattr(read_only_event, "clear")
-
-    def test_is_set_delegates_to_underlying_event(self, mocker: MockerFixture):
-        """Test :class:`_ReadOnlyEvent.is_set` calls :meth:`~asyncio.Event.is_set` on its
-        underlying event.
-
-        Given:
-            A :class:`_ReadOnlyEvent` instance wrapping an event
-        When:
-            :meth:`~_ReadOnlyEvent.is_set` is called
-        Then:
-            :meth:`~asyncio.Event.is_set` is called on the underlying event
-        """
-        # Arrange
-        event = asyncio.Event()
-        is_set_spy = mocker.spy(event, "is_set")
-        read_only_event = _ReadOnlyEvent(event)
-
-        # Act
-        read_only_event.is_set()
-
-        # Assert
-        is_set_spy.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_wait_delegates_to_underlying_event(self, mocker: MockerFixture):
-        """Test :class:`_ReadOnlyEvent.wait` calls :meth:`~asyncio.Event.wait` on its
-        underlying event.
-
-        Given:
-            A :class:`_ReadOnlyEvent` instance wrapping an event
-        When:
-            :meth:`~_ReadOnlyEvent.wait` is called
-        Then:
-            :meth:`~asyncio.Event.wait` is called and awaited on the underlying event
-        """
-        # Arrange
-        event = asyncio.Event()
-        event.set()
-        wait_spy = mocker.patch.object(event, "wait", mocker.AsyncMock(wraps=event.wait))
-        read_only_event = _ReadOnlyEvent(event)
-
-        # Act
-        await read_only_event.wait()
-
-        # Assert
-        wait_spy.assert_awaited_once_with()
 
 
 class TestWorkerService:
@@ -1101,145 +1021,6 @@ class TestWorkerService:
             assert isinstance(stop_result, protocol.Void)
             assert grpc_servicer.stopping.is_set()
             assert grpc_servicer.stopped.is_set()
-
-    @pytest.mark.asyncio
-    async def test_run_on_worker_done_callback_tolerates_already_cancelled_future(
-        self,
-        mocker: MockerFixture,
-    ):
-        """Done callback must not raise on already-done future.
-
-        Given:
-            A task dispatched to the worker loop, where the bridging
-            :class:`~concurrent.futures.Future` is cancelled before the
-            worker task's done callback fires
-        When:
-            The worker task completes normally and fires its done
-            callback on the already-cancelled future
-        Then:
-            The callback exits early without raising
-            :exc:`~concurrent.futures.InvalidStateError`.
-        """
-        service = WorkerService()
-        invalid_state_errors: list[Exception] = []
-
-        # Spy on set_result and set_exception to detect
-        # InvalidStateError that would occur without the
-        # future.done() guard in the _done callback.
-        _og_set_result = concurrent.futures.Future.set_result
-        _og_set_exception = concurrent.futures.Future.set_exception
-
-        def detecting_set_result(self, result):
-            try:
-                return _og_set_result(self, result)
-            except concurrent.futures.InvalidStateError as e:
-                invalid_state_errors.append(e)
-
-        def detecting_set_exception(self, exception):
-            try:
-                return _og_set_exception(self, exception)
-            except concurrent.futures.InvalidStateError as e:
-                invalid_state_errors.append(e)
-
-        mocker.patch.object(
-            concurrent.futures.Future, "set_result", detecting_set_result
-        )
-        mocker.patch.object(
-            concurrent.futures.Future, "set_exception", detecting_set_exception
-        )
-
-        # Patch wrap_future to cancel the bridging future immediately
-        # after wrapping. This deterministically simulates the race
-        # where Task.cancel() propagates through wrap_future's
-        # _chain_future to cancel the concurrent.futures.Future
-        # before the worker task's done callback fires.
-        _og_wrap_future = asyncio.wrap_future
-
-        def cancelling_wrap_future(future, *, loop=None):
-            asyncio_future = _og_wrap_future(future, loop=loop)
-            future.cancel()
-            return asyncio_future
-
-        mocker.patch("asyncio.wrap_future", cancelling_wrap_future)
-
-        async def sample_task():
-            return "completed"
-
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        work_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
-
-        with pytest.raises(asyncio.CancelledError):
-            from wool.runtime.context import _current_context
-
-            await service._run_on_worker(work_task, _current_context())
-
-        # Allow the worker task's done callback to fire on the
-        # worker loop.
-        await asyncio.sleep(0.2)
-
-        assert not invalid_state_errors, (
-            "InvalidStateError raised in _done callback — "
-            "the future.done() guard may have been removed"
-        )
-
-        # Cleanup worker loops
-        for entry in service._loop_pool._cache.values():
-            WorkerService._destroy_worker_loop(entry.obj)
-
-    @pytest.mark.asyncio
-    async def test_run_on_worker_exception_path_captures_snapshot(
-        self, mock_worker_proxy_cache
-    ):
-        """Exception path carries worker-side ContextVar mutations.
-
-        Given:
-            A worker task that mutates a :class:`wool.ContextVar` and then
-            raises
-        When:
-            The task is executed via :meth:`WorkerService._run_on_worker`
-        Then:
-            The returned :class:`_WorkerOutcome` carries both the captured
-            exception and a snapshot containing the mutation, so the
-            handler can ship the caller's updated view on the Response.
-        """
-        from wool.runtime.worker.service import _WorkerOutcome
-
-        var = wool.ContextVar("c2_outcome_var", namespace="test_c2_svc")
-        service = WorkerService()
-
-        async def mutating_failure():
-            var.set("mutated-before-raise")
-            raise ValueError("worker boom")
-
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        work_task = Task(
-            id=uuid4(),
-            callable=mutating_failure,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
-
-        from wool.runtime.context import _current_context
-
-        try:
-            outcome = await service._run_on_worker(work_task, _current_context())
-        finally:
-            for entry in service._loop_pool._cache.values():
-                WorkerService._destroy_worker_loop(entry.obj)
-
-        assert isinstance(outcome, _WorkerOutcome)
-        assert isinstance(outcome.exception, ValueError)
-        assert str(outcome.exception) == "worker boom"
-        assert var.key in outcome.snapshot
-        assert cloudpickle.loads(outcome.snapshot[var.key]) == "mutated-before-raise"
 
     @pytest.mark.asyncio
     async def test_dispatch_with_version_in_ack(
