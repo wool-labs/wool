@@ -575,27 +575,32 @@ def _loads(data: bytes) -> Any:
 
 def _snapshot_vars(
     ctx: Context | None = None,
+    *,
+    dumps: Callable[..., bytes] | None = None,
 ) -> dict[str, bytes]:
     """Snapshot :class:`ContextVar` values to wire form.
 
     Iterates every var→value pair in the given (or current)
-    :class:`Context` and serializes each value. The explicit *ctx*
-    is forwarded to the pickler so embedded ContextVar references
-    read values from the correct Context (important when called
-    from the ``_done`` callback which runs outside any task).
+    :class:`Context` and serializes each value.
 
     :param ctx:
         Optional :class:`Context` to read from. When ``None``,
         reads from the current Context.
+    :param dumps:
+        Serializer for values. When ``None`` (default), uses
+        :func:`_dumps` with the explicit *ctx* forwarded to the
+        pickler. Pass a ``PassthroughSerializer.dumps`` on
+        self-dispatch to avoid cloudpickle overhead.
     :raises TypeError:
         If a value fails to serialize.
     """
     if ctx is None:
         ctx = _current_context()
+    _ser = dumps if dumps is not None else lambda v: _dumps(v, ctx=ctx)
     result: dict[str, bytes] = {}
     for var, value in ctx._data.items():
         try:
-            pickled = _dumps(value, ctx=ctx)
+            pickled = _ser(value)
         except Exception as e:
             raise TypeError(
                 f"Failed to serialize wool.ContextVar {var._key!r}: {e}"
@@ -822,14 +827,22 @@ def current_context() -> Context:
     return Context._create(ctx._id, dict(ctx._data))
 
 
-def build_frame_payload() -> tuple[dict[str, bytes], str]:
+def build_frame_payload(
+    *,
+    dumps: Callable[..., bytes] | None = None,
+) -> tuple[dict[str, bytes], str]:
     """Assemble the wire payload for a dispatch or streaming frame.
 
     Returns ``(vars, context_id)`` for populating the protobuf
     ``vars`` map and ``context_id`` string on any Request.
+
+    :param dumps:
+        Optional serializer for var values. Pass
+        ``PassthroughSerializer.dumps`` on self-dispatch to avoid
+        cloudpickle overhead. When ``None``, uses cloudpickle.
     """
     ctx = _current_context()
-    vars_dict = _snapshot_vars(ctx)
+    vars_dict = _snapshot_vars(ctx, dumps=dumps)
     context_hex = ctx._id.hex
     return vars_dict, context_hex
 

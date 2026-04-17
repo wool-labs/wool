@@ -34,7 +34,9 @@ from wool.runtime.context import _snapshot_vars
 from wool.runtime.context import _task_contexts
 from wool.runtime.context import _task_contexts_lock
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
+from wool.runtime.routine.task import _unpickle_serializer
 from wool.runtime.routine.task import do_dispatch
 from wool.runtime.worker import namespace as _namespace
 
@@ -247,10 +249,20 @@ class WorkerService(protocol.WorkerServicer):
 
         work_task = Task.from_protobuf(request.task)
 
+        _is_passthrough = False
+        if request.task.HasField("serializer"):
+            _ser = _unpickle_serializer(request.task.serializer)
+            _is_passthrough = isinstance(_ser, PassthroughSerializer)
+
         response_context_hex = context_hex or context_id.hex
         with _namespace.activate(context_id):
             if request.vars:
-                _apply_vars(dict(request.vars))
+                _apply_vars(
+                    dict(request.vars),
+                    **(
+                        {"loads": PassthroughSerializer.loads} if _is_passthrough else {}
+                    ),
+                )
 
             if self._backpressure is not None:
                 decision = self._backpressure(
@@ -268,7 +280,12 @@ class WorkerService(protocol.WorkerServicer):
                     )
 
             handler_ctx = _current_context()
-            with self._tracker(work_task, request_iterator, handler_ctx) as task:
+            with self._tracker(
+                work_task,
+                request_iterator,
+                handler_ctx,
+                passthrough=_is_passthrough,
+            ) as task:
                 ack = protocol.Ack(version=protocol.__version__)
                 yield protocol.Response(ack=ack)
                 try:
@@ -315,7 +332,10 @@ class WorkerService(protocol.WorkerServicer):
                     # snapshot from the handler context since no
                     # frame-level snapshot is available at this point.
                     exception = protocol.Message(dump=_dumps(e))
-                    ctx_snapshot = _snapshot_vars()
+                    _fallback_ser = PassthroughSerializer() if _is_passthrough else None
+                    ctx_snapshot = _snapshot_vars(
+                        dumps=_fallback_ser.dumps if _fallback_ser else None
+                    )
                     yield protocol.Response(
                         exception=exception,
                         vars=ctx_snapshot,
@@ -389,26 +409,29 @@ class WorkerService(protocol.WorkerServicer):
         loop.close()
 
     async def _run_on_worker(
-        self, work_task: Task, handler_ctx: Context
+        self,
+        work_task: Task,
+        handler_ctx: Context,
+        passthrough: bool = False,
     ) -> _WorkerOutcome:
         """Run a task on the shared worker event loop.
 
         :param work_task:
             The :class:`Task` instance to execute.
         :param handler_ctx:
-            The handler's wool.Context (captured before _tracker
-            forks a child task).
+            The handler's wool.Context.
+        :param passthrough:
+            Use PassthroughSerializer for response var snapshots.
         """
         worker_ctx = handler_ctx.copy()
         future: concurrent.futures.Future = concurrent.futures.Future()
         worker_task = None
+        _resp_ser = PassthroughSerializer() if passthrough else None
 
         async with self._loop_pool.get("worker") as (worker_loop, _):
 
             def _schedule():
                 nonlocal worker_task
-                # Bypass the task factory — we assign worker_ctx
-                # explicitly, so the factory's fork would be wasted.
                 task = asyncio.Task(work_task._run(), loop=worker_loop)
                 worker_task = task
                 with _task_contexts_lock:
@@ -420,7 +443,10 @@ class WorkerService(protocol.WorkerServicer):
                     if t.cancelled():
                         future.cancel()
                         return
-                    snapshot = _snapshot_vars(worker_ctx)
+                    snapshot = _snapshot_vars(
+                        worker_ctx,
+                        dumps=_resp_ser.dumps if _resp_ser else None,
+                    )
                     exc = t.exception()
                     if exc is not None:
                         future.set_result(
@@ -447,6 +473,7 @@ class WorkerService(protocol.WorkerServicer):
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
         handler_ctx: Context | None = None,
+        passthrough: bool = False,
     ):
         """Run a streaming task on the shared worker event loop.
 
@@ -480,6 +507,8 @@ class WorkerService(protocol.WorkerServicer):
         if handler_ctx is None:
             handler_ctx = _current_context()
         worker_ctx = handler_ctx.copy()
+        _resp_ser = PassthroughSerializer() if passthrough else None
+        _resp_dumps = _resp_ser.dumps if _resp_ser else None
         request_queue: asyncio.Queue = asyncio.Queue()
         result_queue: asyncio.Queue = asyncio.Queue()
 
@@ -520,14 +549,14 @@ class WorkerService(protocol.WorkerServicer):
                                     )
                                     return
                                 except BaseException as e:
-                                    ctx_snapshot = _snapshot_vars()
+                                    ctx_snapshot = _snapshot_vars(dumps=_resp_dumps)
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
                                         ("error", e, ctx_snapshot),
                                     )
                                     return
                                 else:
-                                    ctx_snapshot = _snapshot_vars()
+                                    ctx_snapshot = _snapshot_vars(dumps=_resp_dumps)
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
                                         ("value", value, ctx_snapshot),
@@ -607,6 +636,7 @@ class WorkerService(protocol.WorkerServicer):
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
         handler_ctx: Context | None = None,
+        passthrough: bool = False,
     ):
         """Context manager for tracking running tasks.
 
@@ -614,26 +644,27 @@ class WorkerService(protocol.WorkerServicer):
         active tasks set. Ensures proper cleanup when the task
         completes or fails.
 
-        Tasks are executed in a thread pool to prevent blocking the
-        main gRPC event loop, allowing the worker to remain responsive
-        to health checks and new task dispatches.
-
         :param work_task:
             The :class:`Task` instance to execute and track.
         :param request_iterator:
             The incoming bidirectional request stream.
+        :param passthrough:
+            If ``True``, use :class:`PassthroughSerializer` for var
+            snapshots (self-dispatch optimization).
         :yields:
             The :class:`asyncio.Task` or async generator for the
             wool task.
 
         """
         if iscoroutinefunction(work_task.callable):
-            # Regular async function -> run on worker loop
-            task = asyncio.create_task(self._run_on_worker(work_task, handler_ctx))
+            task = asyncio.create_task(
+                self._run_on_worker(work_task, handler_ctx, passthrough)
+            )
             watcher = _Task(task)
         elif isasyncgenfunction(work_task.callable):
-            # Async generator -> stream from worker loop via queue
-            task = self._stream_from_worker(work_task, request_iterator, handler_ctx)
+            task = self._stream_from_worker(
+                work_task, request_iterator, handler_ctx, passthrough
+            )
             watcher = _AsyncGen(task)
         else:
             raise ValueError("Expected coroutine function or async generator function")
