@@ -74,20 +74,20 @@ _UNSET: Final = _UnsetType()
 
 # Per-task wool.Context, keyed by the live asyncio.Task object.
 # Entries vanish when the task is garbage-collected.
-_task_contexts: weakref.WeakKeyDictionary[asyncio.Task[Any], Context] = (
+task_contexts: weakref.WeakKeyDictionary[asyncio.Task[Any], Context] = (
     weakref.WeakKeyDictionary()
 )
-_task_contexts_lock: threading.Lock = threading.Lock()
+task_contexts_lock: threading.Lock = threading.Lock()
 
 # Sync/no-task fallback: one wool.Context per thread.
 _thread_context: threading.local = threading.local()
 
 
-def _current_context() -> Context:
+def resolve_context() -> Context:
     """Return the wool.Context for the current execution scope.
 
     Inside an asyncio task, looks up the task's Context in the
-    process-wide :data:`_task_contexts` dict. Outside a task (sync
+    process-wide :data:`task_contexts` dict. Outside a task (sync
     code), uses a per-thread fallback. If no Context exists for the
     current scope, one is created lazily and registered.
     """
@@ -96,12 +96,12 @@ def _current_context() -> Context:
     except RuntimeError:
         task = None
     if task is not None:
-        with _task_contexts_lock:
-            ctx = _task_contexts.get(task)
+        with task_contexts_lock:
+            ctx = task_contexts.get(task)
             if ctx is not None:
                 return ctx
             ctx = Context()
-            _task_contexts[task] = ctx
+            task_contexts[task] = ctx
             return ctx
     ctx = getattr(_thread_context, "ctx", None)
     if ctx is None:
@@ -110,7 +110,7 @@ def _current_context() -> Context:
     return ctx
 
 
-def _swap_context(new: Context) -> Context:
+def swap_context(new: Context) -> Context:
     """Replace the current scope's Context and return the previous one.
 
     Used by :meth:`Context.run` and :func:`activate` to temporarily
@@ -121,9 +121,9 @@ def _swap_context(new: Context) -> Context:
     except RuntimeError:
         task = None
     if task is not None:
-        with _task_contexts_lock:
-            prev = _task_contexts.get(task)
-            _task_contexts[task] = new
+        with task_contexts_lock:
+            prev = task_contexts.get(task)
+            task_contexts[task] = new
         if prev is None:
             prev = Context()
         return prev
@@ -161,7 +161,7 @@ def _infer_namespace() -> str:
 # ---------------------------------------------------------------
 
 
-def _reconstruct(
+def reconstruct(
     key: str,
     has_default: bool,
     default: Any,
@@ -186,7 +186,7 @@ def _reconstruct(
     if existing is None:
         existing = _register_unchecked(key, has_default, default)
     if current_value is not _UNSET:
-        ctx = _current_context()
+        ctx = resolve_context()
         ctx._data[existing] = current_value
     return existing
 
@@ -196,7 +196,7 @@ def _register_unchecked(key: str, has_default: bool, default: Any) -> ContextVar
     without running the public constructor's duplicate-key check.
 
     Intended exclusively for the unpickle path
-    (:func:`_reconstruct`). The produced instance is flagged
+    (:func:`reconstruct`). The produced instance is flagged
     ``_stub=True`` so a later authoritative module-scope
     ``ContextVar(name, namespace=...)`` call can promote it in place.
     """
@@ -213,7 +213,7 @@ def _register_unchecked(key: str, has_default: bool, default: Any) -> ContextVar
     return instance
 
 
-def _reconstruct_token(
+def reconstruct_token(
     var: ContextVar,
     old_value: Any,
     context_id: UUID,
@@ -290,7 +290,7 @@ class Token(Generic[T]):
 
     def __reduce__(self):
         return (
-            _reconstruct_token,
+            reconstruct_token,
             (self._var, self._old_value, self._context_id),
         )
 
@@ -443,7 +443,7 @@ class ContextVar(Generic[T]):
         :raises LookupError:
             If the variable has no value, no fallback, and no default.
         """
-        ctx = _current_context()
+        ctx = resolve_context()
         try:
             return ctx._data[self]
         except KeyError:
@@ -462,7 +462,7 @@ class ContextVar(Generic[T]):
             A :class:`Token` usable with :meth:`reset` to restore
             the previous value.
         """
-        ctx = _current_context()
+        ctx = resolve_context()
         old_value = ctx._data.get(self, _UNSET)
         ctx._data[self] = value
         return Token(self, old_value, ctx)
@@ -490,7 +490,7 @@ class ContextVar(Generic[T]):
             raise RuntimeError("Token has already been used")
         if token._var is not self:
             raise ValueError("Token was created by a different ContextVar")
-        ctx = _current_context()
+        ctx = resolve_context()
         if token._context is not None:
             if token._context is not ctx:
                 raise ValueError("Token was created in a different wool.Context")
@@ -521,8 +521,8 @@ class _ContextPickler(cloudpickle.CloudPickler):
     so the receiver can apply it and arrive at the sender's state.
 
     When *ctx* is provided, the pickler reads var values from that
-    Context. Otherwise it reads from :func:`_current_context`. The
-    explicit-ctx path is used by :func:`_snapshot_vars` so the
+    Context. Otherwise it reads from :func:`resolve_context`. The
+    explicit-ctx path is used by :func:`snapshot_vars` so the
     worker-side ``_done`` callback (which runs outside any task)
     serializes from the correct Context.
     """
@@ -534,10 +534,10 @@ class _ContextPickler(cloudpickle.CloudPickler):
     def reducer_override(self, obj: Any) -> Any:
         if isinstance(obj, ContextVar):
             has_default = obj._default is not _SENTINEL
-            ctx = self._wool_ctx if self._wool_ctx is not None else _current_context()
+            ctx = self._wool_ctx if self._wool_ctx is not None else resolve_context()
             current_value = ctx._data.get(obj, _UNSET)
             return (
-                _reconstruct,
+                reconstruct,
                 (
                     obj._key,
                     has_default,
@@ -548,7 +548,7 @@ class _ContextPickler(cloudpickle.CloudPickler):
         return super().reducer_override(obj)
 
 
-def _dumps(value: Any, ctx: Context | None = None) -> bytes:
+def dumps(value: Any, ctx: Context | None = None) -> bytes:
     """Serialize *value* with wool's ContextVar-aware pickler.
 
     :param ctx:
@@ -560,10 +560,10 @@ def _dumps(value: Any, ctx: Context | None = None) -> bytes:
     return buf.getvalue()
 
 
-def _loads(data: bytes) -> Any:
-    """Deserialize *data* produced by :func:`_dumps`.
+def loads(data: bytes) -> Any:
+    """Deserialize *data* produced by :func:`dumps`.
 
-    Thin wrapper retained as the default for :func:`_apply_vars`'s
+    Thin wrapper retained as the default for :func:`apply_vars`'s
     ``loads`` parameter — a future self-dispatch passthrough can
     swap in a no-op loader without changing call sites.
     """
@@ -575,7 +575,7 @@ def _loads(data: bytes) -> Any:
 # ---------------------------------------------------------------
 
 
-def _snapshot_vars(
+def snapshot_vars(
     ctx: Context | None = None,
     *,
     dumps: Callable[..., bytes] | None = None,
@@ -590,14 +590,14 @@ def _snapshot_vars(
         reads from the current Context.
     :param dumps:
         Serializer for values. When ``None`` (default), uses
-        :func:`_dumps` with the explicit *ctx* forwarded to the
+        :func:`dumps` with the explicit *ctx* forwarded to the
         pickler. Pass a ``PassthroughSerializer.dumps`` on
         self-dispatch to avoid cloudpickle overhead.
     :raises TypeError:
         If a value fails to serialize.
     """
     if ctx is None:
-        ctx = _current_context()
+        ctx = resolve_context()
     if dumps is not None:
         _ser = dumps
     else:
@@ -625,10 +625,10 @@ def _snapshot_vars(
     return result
 
 
-def _apply_vars(
+def apply_vars(
     wire_vars: dict[str, bytes],
     *,
-    loads: Callable[[bytes], Any] = _loads,
+    loads: Callable[[bytes], Any] = loads,
 ) -> None:
     """Apply a wire-form context snapshot to the current Context.
 
@@ -640,11 +640,11 @@ def _apply_vars(
     :param wire_vars:
         A ``{key: serialized_value}`` dict from the proto map.
     :param loads:
-        Deserializer for values. Defaults to :func:`_loads`.
+        Deserializer for values. Defaults to :func:`loads`.
     """
     if not wire_vars:
         return
-    ctx = _current_context()
+    ctx = resolve_context()
     for key, data in wire_vars.items():
         var = ContextVar._registry.get(key)
         if var is None:
@@ -662,7 +662,7 @@ def _apply_vars(
 # ---------------------------------------------------------------
 
 
-def _reconstruct_context(
+def reconstruct_context(
     id: UUID,
     vars: dict[ContextVar[Any], Any],
 ) -> Context:
@@ -767,11 +767,11 @@ class Context:
             If this :class:`Context` is already running a task.
         """
         self._enter()
-        prev = _swap_context(self)
+        prev = swap_context(self)
         try:
             return fn(*args, **kwargs)
         finally:
-            _swap_context(prev)
+            swap_context(prev)
             self._exit()
 
     async def run_async(self, coro: Coroutine[Any, Any, T], /) -> T:
@@ -790,8 +790,8 @@ class Context:
             # allocation that we'd immediately overwrite.
             loop = asyncio.get_running_loop()
             task = asyncio.Task(coro, loop=loop)
-            with _task_contexts_lock:
-                _task_contexts[task] = self
+            with task_contexts_lock:
+                task_contexts[task] = self
             result = await task
         finally:
             self._exit()
@@ -822,7 +822,7 @@ class Context:
         return f"<wool.Context id={self._id} vars={len(self._data)}>"
 
     def __reduce__(self):
-        return (_reconstruct_context, (self._id, dict(self._data)))
+        return (reconstruct_context, (self._id, dict(self._data)))
 
 
 # ---------------------------------------------------------------
@@ -839,7 +839,7 @@ def current_context() -> Context:
     current scope's data and whose ``id`` matches the current
     execution chain.
     """
-    ctx = _current_context()
+    ctx = resolve_context()
     return Context._create(ctx._id, dict(ctx._data))
 
 
@@ -857,8 +857,8 @@ def build_frame_payload(
         ``PassthroughSerializer.dumps`` on self-dispatch to avoid
         cloudpickle overhead. When ``None``, uses cloudpickle.
     """
-    ctx = _current_context()
-    vars_dict = _snapshot_vars(ctx, dumps=dumps)
+    ctx = resolve_context()
+    vars_dict = snapshot_vars(ctx, dumps=dumps)
     context_hex = ctx._id.hex
     return vars_dict, context_hex
 
@@ -876,7 +876,7 @@ def _wool_task_factory(
     """Task factory that seeds each new Task with a wool.Context.
 
     The parent's Context is found by looking up
-    ``asyncio.current_task()`` in :data:`_task_contexts`. The child
+    ``asyncio.current_task()`` in :data:`task_contexts`. The child
     gets a shallow copy with a fresh UUID (copy-on-fork). No stdlib
     ContextVar is needed — the factory runs synchronously inside
     ``create_task``, so ``current_task()`` is the parent.
@@ -889,11 +889,11 @@ def _wool_task_factory(
         parent_task = asyncio.current_task()
     except RuntimeError:
         parent_task = None
-    with _task_contexts_lock:
-        parent_ctx = _task_contexts.get(parent_task) if parent_task else None
+    with task_contexts_lock:
+        parent_ctx = task_contexts.get(parent_task) if parent_task else None
     child_ctx = parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
-    with _task_contexts_lock:
-        _task_contexts[task] = child_ctx
+    with task_contexts_lock:
+        task_contexts[task] = child_ctx
     return task
 
 
@@ -920,18 +920,18 @@ def install_task_factory(
             coro: Coroutine[Any, Any, Any],
             **kwargs: Any,
         ) -> asyncio.Task[Any]:
-            task = existing(loop, coro, **kwargs)
+            task: asyncio.Task[Any] = existing(loop, coro, **kwargs)  # type: ignore[assignment]
             try:
                 parent_task = asyncio.current_task()
             except RuntimeError:
                 parent_task = None
-            with _task_contexts_lock:
-                parent_ctx = _task_contexts.get(parent_task) if parent_task else None
+            with task_contexts_lock:
+                parent_ctx = task_contexts.get(parent_task) if parent_task else None
             child_ctx = (
                 parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
             )
-            with _task_contexts_lock:
-                _task_contexts[task] = child_ctx
+            with task_contexts_lock:
+                task_contexts[task] = child_ctx
             return task
 
         composed._wool_wrapped = True  # type: ignore[attr-defined]

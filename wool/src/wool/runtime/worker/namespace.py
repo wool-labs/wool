@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from wool.runtime.context import Context
-from wool.runtime.context import _swap_context
+from wool.runtime.context import swap_context
 
 
 @contextmanager
@@ -29,15 +29,15 @@ def activate(context_id: uuid.UUID) -> Iterator[None]:
     Creates a new empty :class:`Context` whose ``_id`` is
     *context_id* and swaps it into the current scope. On exit,
     the previous Context is restored. Used by the dispatch handler
-    so that ``_apply_vars`` writes into the handler's Context and
+    so that ``apply_vars`` writes into the handler's Context and
     the worker-loop task can copy it.
 
     :param context_id:
         The wool.Context id to activate.
     """
     new_ctx = Context._create(context_id, {})
-    prev = _swap_context(new_ctx)
+    prev = swap_context(new_ctx)
     try:
         yield
     finally:
-        _swap_context(prev)
+        swap_context(prev)

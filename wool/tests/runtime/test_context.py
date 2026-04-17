@@ -1,25 +1,33 @@
 import asyncio
 import contextvars
 
+import cloudpickle
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from wool.runtime.context import _UNSET
 from wool.runtime.context import Context
 from wool.runtime.context import ContextVar
 from wool.runtime.context import ContextVarCollision
 from wool.runtime.context import Token
+from wool.runtime.context import _UnsetType
+from wool.runtime.context import apply_vars
 from wool.runtime.context import build_frame_payload
 from wool.runtime.context import current_context
+from wool.runtime.context import dumps
+from wool.runtime.context import loads
+from wool.runtime.context import reconstruct
+from wool.runtime.context import snapshot_vars
 
 
 @pytest.fixture(autouse=True)
 def isolate_registry():
-    from wool.runtime.context import _current_context
     from wool.runtime.context import _thread_context
+    from wool.runtime.context import resolve_context
 
     saved = dict(ContextVar._registry)
-    ctx = _current_context()
+    ctx = resolve_context()
     saved_data = dict(ctx._data)
     yield
     ctx._data.clear()
@@ -29,6 +37,68 @@ def isolate_registry():
         ContextVar._registry[k] = v
     if hasattr(_thread_context, "ctx"):
         _thread_context.ctx._data.clear()
+
+
+class TestUnsetType:
+    def test___new___returns_singleton_instance(self):
+        """Test _UnsetType returns the same instance on every construction.
+
+        Given:
+            The _UnsetType class
+        When:
+            It is instantiated multiple times
+        Then:
+            It should return the same singleton instance each time
+        """
+        # Act
+        first = _UnsetType()
+        second = _UnsetType()
+
+        # Assert
+        assert first is second
+        assert first is _UNSET
+
+    def test___repr___matches_stdlib_token_missing_format(self):
+        """Test _UnsetType repr matches stdlib Token.MISSING format.
+
+        Given:
+            The _UNSET singleton
+        When:
+            repr() is called on it
+        Then:
+            It should return the stdlib-parity string '<Token.MISSING>'
+        """
+        # Arrange, act, & assert
+        assert repr(_UNSET) == "<Token.MISSING>"
+
+    def test___bool___returns_false(self):
+        """Test _UnsetType is falsy.
+
+        Given:
+            The _UNSET singleton
+        When:
+            It is evaluated in a boolean context
+        Then:
+            It should be falsy
+        """
+        # Arrange, act, & assert
+        assert not _UNSET
+
+    def test___reduce___roundtrip_preserves_singleton_identity(self):
+        """Test cloudpickle roundtrip returns the same singleton.
+
+        Given:
+            The _UNSET singleton
+        When:
+            It is serialized via cloudpickle.dumps and deserialized via cloudpickle.loads
+        Then:
+            The deserialized value should be the same singleton instance
+        """
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(_UNSET))
+
+        # Assert
+        assert restored is _UNSET
 
 
 class TestContextVar:
@@ -336,9 +406,233 @@ class TestContextVar:
         # Act & assert
         await ctx_b.run_async(try_reset())
 
+    def test___init___promotes_reconstructed_stub_preserving_identity(self):
+        """Test constructing a var whose key was reconstructed from the wire
+        returns the same instance instead of raising.
+
+        Given:
+            A ContextVar previously reconstructed under key 'myapp:promo_a'
+            with no prior module-scope construction
+        When:
+            A module-scope ContextVar is constructed with the same key
+        Then:
+            The constructor returns the same instance (identity preserved)
+            without raising ContextVarCollision
+        """
+        # Arrange
+        reconstructed = reconstruct("myapp:promo_a", True, "from_wire")
+
+        # Act
+        promoted = ContextVar("promo_a", namespace="myapp", default="from_code")
+
+        # Assert
+        assert promoted is reconstructed
+
+    def test___init___promotion_adopts_authoritative_default(self):
+        """Test promotion adopts the module-scope default over the wire default.
+
+        Given:
+            A reconstructed stub with default 'from_wire'
+        When:
+            A module-scope ContextVar with default 'from_code' is constructed
+            and get() is called with no value set
+        Then:
+            get() returns 'from_code' --- the module-scope default wins
+        """
+        # Arrange
+        stub = reconstruct("myapp:promo_b", True, "from_wire")
+
+        # Act
+        var = ContextVar("promo_b", namespace="myapp", default="from_code")
+
+        # Assert
+        assert var is stub
+        assert var.get() == "from_code"
+
+    def test___init___promotion_preserves_wire_applied_value(self):
+        """Test a value applied to the stub survives promotion.
+
+        Given:
+            A reconstructed stub to which a wire value has been applied
+            via apply_vars
+        When:
+            A module-scope ContextVar for the same key is constructed and
+            get() is called
+        Then:
+            get() returns the wire-applied value, not the module default
+        """
+        # Arrange
+        stub = reconstruct("myapp:promo_c", True, "from_wire")
+        apply_vars({"myapp:promo_c": dumps("applied_value")})
+
+        # Act
+        var = ContextVar("promo_c", namespace="myapp", default="from_code")
+
+        # Assert
+        assert var is stub
+        assert var.get() == "applied_value"
+
+    def test___init___second_promotion_attempt_raises(self):
+        """Test a real (promoted) var still collides on subsequent construction.
+
+        Given:
+            A reconstructed stub that has been promoted by a first
+            module-scope construction
+        When:
+            A second module-scope construction with the same key runs
+        Then:
+            ContextVarCollision is raised --- promotion is one-shot
+        """
+        # Arrange
+        stub = reconstruct("myapp:promo_d", True, "from_wire")
+        promoted = ContextVar("promo_d", namespace="myapp", default="first")
+
+        # Act & assert
+        with pytest.raises(ContextVarCollision):
+            ContextVar("promo_d", namespace="myapp", default="second")
+
+        assert promoted is stub
+
+    def test___init___promotion_works_with_inferred_namespace(self):
+        """Test promotion still works when the namespace is inferred from the caller.
+
+        Given:
+            A reconstructed stub under '<caller-package>:promo_e'
+        When:
+            A ContextVar is constructed with only the name (namespace inferred)
+        Then:
+            The constructor returns the reconstructed stub, confirming
+            namespace inference resolves to the stub's key
+        """
+        # Arrange
+        expected_ns = __name__.partition(".")[0]
+        reconstructed = reconstruct(f"{expected_ns}:promo_e", True, "from_wire")
+
+        # Act
+        promoted = ContextVar("promo_e", default="from_code")
+
+        # Assert
+        assert promoted is reconstructed
+
+    def test_reconstructed_stub_survives_garbage_collection(self):
+        """Test a sallyport-registered stub is not reaped before promotion.
+
+        Given:
+            A stub reconstructed from the wire with no user-visible owner
+        When:
+            The garbage collector runs a full cycle
+        Then:
+            The stub is still in the registry and its applied value
+            remains readable --- the sallyport pin keeps it alive
+        """
+        import gc
+
+        # Arrange
+        reconstruct("elsewhere:gc_target", True, "fallback")
+        apply_vars({"elsewhere:gc_target": dumps("applied_before_gc")})
+
+        # Act
+        gc.collect()
+        gc.collect()
+
+        # Assert
+        survived = ContextVar._registry.get("elsewhere:gc_target")
+
+        assert survived is not None
+        assert survived.get() == "applied_before_gc"
+
+    def test_stub_pin_released_on_promotion_allows_gc(self):
+        """Test promotion drops the sallyport pin so a promoted var can be GC'd.
+
+        Given:
+            A reconstructed stub that is promoted by a module-scope
+            ContextVar construction
+        When:
+            The promoted var's local reference is dropped and GC runs
+        Then:
+            The registry entry is also dropped --- the stub pin no longer
+            holds it, so lifetime defers to user code's strong refs
+        """
+        import gc
+
+        # Arrange
+        reconstruct("myapp:release_target", False, None)
+        key = "myapp:release_target"
+
+        promoted = ContextVar("release_target", namespace="myapp")
+        assert key not in ContextVar._stub_pins
+
+        # Act
+        del promoted
+        gc.collect()
+
+        # Assert
+        assert key not in ContextVar._registry
+
+    def test_reconstructed_var_supports_set_get_reset_before_promotion(self):
+        """Test a reconstructed stub behaves like a real var before promotion.
+
+        Given:
+            A ContextVar reconstructed from the wire but never promoted
+        When:
+            set, get, and reset are exercised on it through the public API
+        Then:
+            It behaves identically to a module-constructed var --- the set
+            value is visible, reset restores the prior default
+        """
+        # Arrange
+        var = reconstruct("elsewhere:pre_promo", True, "initial")
+
+        # Act
+        token = var.set("updated")
+        assert var.get() == "updated"
+
+        var.reset(token)
+
+        # Assert
+        assert var.get() == "initial"
+
+    def test_pickle_roundtrip_returns_same_instance(self):
+        """Test cloudpickle roundtrips a ContextVar to the same registered instance.
+
+        Given:
+            A ContextVar registered in the process-wide registry
+        When:
+            It is pickled and unpickled via dumps / loads
+        Then:
+            The unpickled instance should be the same object as the original
+        """
+        # Arrange
+        var = ContextVar("shipped")
+
+        # Act
+        restored = loads(dumps(var))
+
+        # Assert
+        assert restored is var
+
 
 class TestToken:
-    pass
+    def test_pickle_roundtrip_preserves_var_reference(self):
+        """Test Token pickle roundtrip carries its owning ContextVar by key.
+
+        Given:
+            A ContextVar and a Token produced by set()
+        When:
+            The Token is pickled and unpickled
+        Then:
+            The restored token should reference the same ContextVar instance
+        """
+        # Arrange
+        var = ContextVar("tokened")
+        token = var.set("x")
+
+        # Act
+        restored = loads(dumps(token))
+
+        # Assert
+        assert restored.var is var
+        assert restored.old_value is _UNSET
 
 
 class TestContext:
@@ -696,6 +990,83 @@ class TestContext:
         assert ctx[untouched] == "seed_untouched"
         assert ctx[touched] == "mutated"
 
+    def test_pickle_roundtrip_preserves_id_and_vars(self):
+        """Test Context pickles its id and var dict.
+
+        Given:
+            A Context captured after setting a var
+        When:
+            It is pickled and unpickled via dumps / loads
+        Then:
+            The restored Context should have the same id and contain the var
+        """
+        # Arrange
+        var = ContextVar("ctx_ship", default="zero")
+        var.set("one")
+        ctx = current_context()
+
+        # Act
+        restored = loads(dumps(ctx))
+
+        # Assert
+        assert restored.id == ctx.id
+        assert restored[var] == "one"
+
+    def test_pickle_roundtrip_embeds_current_value(self):
+        """Test pickling a ContextVar captures its current value for the receiver.
+
+        Given:
+            A ContextVar set to a specific value in the current context
+        When:
+            The var is pickled and unpickled inside a fresh stdlib Context
+        Then:
+            The receiver's var.get() returns the value that was set at
+            pickle time --- the reducer-override embedded it
+        """
+        # Arrange
+        var = ContextVar("pickle_with_value", default="default_value")
+        var.set("pickled_value")
+        pickled = dumps(var)
+
+        # Act
+        observed: list[object] = []
+
+        def in_fresh():
+            restored = loads(pickled)
+            observed.append(restored.get())
+
+        contextvars.copy_context().run(in_fresh)
+
+        # Assert
+        assert observed == ["pickled_value"]
+
+    def test_pickle_roundtrip_carries_no_value_when_unset(self):
+        """Test pickling a never-set ContextVar doesn't apply a value on receive.
+
+        Given:
+            A ContextVar that has never been set in the current context
+        When:
+            The var is pickled and unpickled inside a fresh stdlib Context
+        Then:
+            The receiver's var.get() returns the class-level default
+            (nothing was applied from the pickle)
+        """
+        # Arrange
+        var = ContextVar("pickle_no_value", default="default_value")
+        pickled = dumps(var)
+
+        # Act
+        observed: list[object] = []
+
+        def in_fresh():
+            restored = loads(pickled)
+            observed.append(restored.get())
+
+        contextvars.copy_context().run(in_fresh)
+
+        # Assert
+        assert observed == ["default_value"]
+
     @pytest.mark.asyncio
     async def test_run_async_concurrent_entry_raises(self):
         """Test Context.run_async raises on re-entry while a task is running.
@@ -752,6 +1123,98 @@ class TestContext:
         # Act & assert
         with pytest.raises(TypeError, match=var.key):
             build_frame_payload()
+
+    def test_apply_vars_with_empty_map_is_noop(self):
+        """Test apply_vars returns without touching state on an empty map.
+
+        Given:
+            A fresh wool Context and an empty ``vars`` map
+        When:
+            apply_vars is invoked with the empty map
+        Then:
+            The current context is unchanged and no exception is raised,
+            mirroring the dispatch handler's behavior for requests with
+            empty vars (i.e., the empty-map short-circuit path).
+        """
+        # Arrange
+        var = ContextVar("ctx002_seed", default="default")
+        var.set("before")
+        before = current_context()
+
+        # Act
+        apply_vars({})
+
+        # Assert
+        after = current_context()
+        assert after[var] == before[var]
+        assert set(after.keys()) == set(before.keys())
+
+    def test_apply_vars_with_unknown_key_drops_silently(self):
+        """Test apply_vars drops unknown keys without raising.
+
+        Given:
+            A wire-form ``vars`` payload containing a key that is not
+            registered on this process
+        When:
+            apply_vars is invoked with the payload
+        Then:
+            It returns without raising; unknown keys are silently
+            dropped (rolling-deploy scenario where the caller has a
+            var not yet present on the worker).
+        """
+        # Arrange
+        known_var = ContextVar("ctx003_known", default="initial")
+        payload = {
+            "ctx003_unknown:missing": dumps("ignored"),
+            known_var.key: dumps("applied"),
+        }
+
+        # Act
+        apply_vars(payload)
+
+        # Assert
+        assert known_var.get() == "applied"
+
+    def test_pickle_roundtrip_applies_embedded_value_to_receiver_context(self):
+        """Test reconstructing a var writes its embedded value into the
+        receiver's Context.
+
+        Given:
+            A wool.ContextVar set to value ``v`` and pickled via
+            dumps (which embeds the current value in the reduce
+            tuple)
+        When:
+            The pickled bytes are unpickled inside a fresh
+            wool.Context scope and current_context() is captured
+        Then:
+            The reconstructed var appears in the captured Context
+            with the embedded value --- confirming reconstruct writes
+            into the receiver's Context._data (observable via
+            ``var in ctx``).
+        """
+        # Arrange --- pickle while the var holds "wire_value", then
+        # reset so the receiver's Context no longer has the value.
+        # Unpickling forces reconstruct to apply the embedded
+        # current_value into the receiver's Context._data.
+        var = ContextVar("ctx004_roundtrip", default="d")
+        token = var.set("wire_value")
+        pickled = dumps(var)
+        var.reset(token)
+
+        observed: list[Context] = []
+
+        def in_fresh():
+            restored = loads(pickled)
+            observed.append(current_context())
+            assert restored.get() == "wire_value"
+
+        # Act
+        contextvars.copy_context().run(in_fresh)
+
+        # Assert
+        assert len(observed) == 1
+        assert var in observed[0]
+        assert observed[0][var] == "wire_value"
 
     @pytest.mark.asyncio
     async def test_current_context_omits_var_after_reset_to_unset(self):
@@ -846,3 +1309,90 @@ class TestPublicTypeShape:
 
         # Assert
         assert f"'{var.key}'" in text
+
+
+def test_snapshot_vars_with_custom_dumps():
+    """Test snapshot_vars serializes values via a custom dumps callable.
+
+    Given:
+        A ContextVar with a value set and a custom dumps function
+    When:
+        snapshot_vars is called with the custom dumps
+    Then:
+        It should serialize each value through the custom callable
+    """
+    # Arrange
+    var = ContextVar("snap_custom_dumps", namespace="snap")
+    var.set("hello")
+
+    calls: list[object] = []
+
+    def custom_dumps(value: object) -> bytes:
+        calls.append(value)
+        return b"custom:" + str(value).encode()
+
+    # Act
+    result = snapshot_vars(dumps=custom_dumps)
+
+    # Assert
+    assert var.key in result
+    assert result[var.key] == b"custom:hello"
+    assert calls == ["hello"]
+
+
+def test_build_frame_payload_with_custom_dumps():
+    """Test build_frame_payload returns vars serialized via custom dumps.
+
+    Given:
+        A ContextVar with a value set and a custom dumps function
+    When:
+        build_frame_payload(dumps=custom) is called
+    Then:
+        It should return a vars dict whose values were produced by
+        the custom serializer and a hex context id string
+    """
+    # Arrange
+    var = ContextVar("bfp_custom_dumps", namespace="bfp")
+    var.set(42)
+
+    def custom_dumps(value: object) -> bytes:
+        return b"bfp:" + str(value).encode()
+
+    # Act
+    vars_dict, context_hex = build_frame_payload(dumps=custom_dumps)
+
+    # Assert
+    assert var.key in vars_dict
+    assert vars_dict[var.key] == b"bfp:42"
+    assert isinstance(context_hex, str)
+    assert len(context_hex) == 32  # UUID hex
+
+
+def test_apply_vars_with_custom_loads():
+    """Test apply_vars deserializes values via a custom loads callable.
+
+    Given:
+        A ContextVar registered in the process and a wire-form vars
+        map with a custom-encoded value
+    When:
+        apply_vars is called with a custom loads function
+    Then:
+        It should deserialize each value through the custom callable
+        and apply it to the current Context
+    """
+    # Arrange
+    var = ContextVar("apply_custom_loads", namespace="apcl")
+    wire_vars = {var.key: b"custom-payload"}
+
+    calls: list[bytes] = []
+
+    def custom_loads(data: bytes) -> object:
+        calls.append(data)
+        return "decoded-" + data.decode()
+
+    # Act
+    apply_vars(wire_vars, loads=custom_loads)
+
+    # Assert
+    assert var.get() == "decoded-custom-payload"
+    assert calls == [b"custom-payload"]

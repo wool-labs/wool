@@ -23,7 +23,7 @@ import grpc.aio
 
 import wool
 from wool import protocol
-from wool.runtime.context import _dumps
+from wool.runtime.context import dumps
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
@@ -128,7 +128,7 @@ class WorkerProcess(Process):
         self._tags = tags
         self._extra = extra if extra is not None else {}
         self._metadata = None
-        self._backpressure = _dumps(backpressure) if backpressure is not None else None
+        self._backpressure = dumps(backpressure) if backpressure is not None else None
         self._get_metadata, self._set_metadata = Pipe(duplex=False)
 
     @property

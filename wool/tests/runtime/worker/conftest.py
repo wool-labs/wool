@@ -5,7 +5,6 @@ from types import MappingProxyType
 from typing import Any
 from unittest.mock import MagicMock
 
-import grpc
 import pytest
 import pytest_asyncio
 
@@ -43,11 +42,11 @@ def _isolate_wool_context():
     from leaking into subsequent tests.
     """
     from wool.runtime.context import ContextVar
-    from wool.runtime.context import _current_context
     from wool.runtime.context import _thread_context
+    from wool.runtime.context import resolve_context
 
     saved_registry = dict(ContextVar._registry)
-    ctx = _current_context()
+    ctx = resolve_context()
     saved_data = dict(ctx._data)
     yield
     ctx._data.clear()
@@ -504,7 +503,6 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata)
     Yields:
         WorkerProxy instance with 2 pre-configured mock workers
     """
-    from wool.runtime.worker.proxy import WorkerProxy
 
     # Inject 2 mock workers into discovery
     worker1 = WorkerMetadata(

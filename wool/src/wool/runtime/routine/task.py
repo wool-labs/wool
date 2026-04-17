@@ -33,7 +33,7 @@ import cloudpickle
 
 import wool
 from wool import protocol
-from wool.runtime.context import _dumps as _context_dumps
+from wool.runtime.context import dumps as _context_dumps
 
 Args = Tuple
 Kwargs = Dict

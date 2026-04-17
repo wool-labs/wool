@@ -14,9 +14,9 @@ import grpc.aio
 
 import wool
 from wool import protocol
-from wool.runtime.context import _apply_vars
-from wool.runtime.context import _dumps
+from wool.runtime.context import apply_vars
 from wool.runtime.context import build_frame_payload
+from wool.runtime.context import dumps
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
@@ -135,8 +135,8 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            _dumps_fn = self._serializer.dumps if self._serializer else None
-            vars_dict, context_hex = build_frame_payload(dumps=_dumps_fn)
+            dumps_fn = self._serializer.dumps if self._serializer else None
+            vars_dict, context_hex = build_frame_payload(dumps=dumps_fn)
             request = protocol.Request(
                 next=protocol.Void(),
                 vars=vars_dict,
@@ -166,7 +166,7 @@ class _DispatchStream(Generic[_T]):
             response = await anext(self._iter)
             if response.vars:
                 _loads_fn = PassthroughSerializer.loads if self._serializer else None
-                _apply_vars(
+                apply_vars(
                     dict(response.vars),
                     **({"loads": _loads_fn} if _loads_fn else {}),
                 )
@@ -228,7 +228,7 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            dump = _dumps(value)
+            dump = dumps(value)
             vars_dict, context_hex = build_frame_payload(
                 dumps=self._serializer.dumps if self._serializer else None
             )
@@ -278,7 +278,7 @@ class _DispatchStream(Generic[_T]):
             else:  # pragma: no cover
                 exc = typ()
 
-            dump = _dumps(exc)
+            dump = dumps(exc)
             vars_dict, context_hex = build_frame_payload(
                 dumps=self._serializer.dumps if self._serializer else None
             )

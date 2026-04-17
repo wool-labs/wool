@@ -27,12 +27,12 @@ from grpc.aio import ServicerContext
 import wool
 from wool import protocol
 from wool.runtime.context import Context
-from wool.runtime.context import _apply_vars
-from wool.runtime.context import _current_context
-from wool.runtime.context import _dumps
-from wool.runtime.context import _snapshot_vars
-from wool.runtime.context import _task_contexts
-from wool.runtime.context import _task_contexts_lock
+from wool.runtime.context import apply_vars
+from wool.runtime.context import dumps
+from wool.runtime.context import resolve_context
+from wool.runtime.context import snapshot_vars
+from wool.runtime.context import task_contexts
+from wool.runtime.context import task_contexts_lock
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
@@ -242,7 +242,7 @@ class WorkerService(protocol.WorkerServicer):
         # the Task, then activate the id and apply the caller's
         # wire-shipped var snapshot to the handler's context. The
         # snapshot is keyed by each var's "namespace:name";
-        # _apply_vars resolves each key via the process-wide
+        # apply_vars resolves each key via the process-wide
         # ContextVar registry and calls .set() on the local instance.
         context_hex = request.context_id
         context_id = uuid.UUID(hex=context_hex) if context_hex else uuid.uuid4()
@@ -257,7 +257,7 @@ class WorkerService(protocol.WorkerServicer):
         response_context_hex = context_hex or context_id.hex
         with _namespace.activate(context_id):
             if request.vars:
-                _apply_vars(
+                apply_vars(
                     dict(request.vars),
                     **(
                         {"loads": PassthroughSerializer.loads} if _is_passthrough else {}
@@ -279,7 +279,7 @@ class WorkerService(protocol.WorkerServicer):
                         "Task rejected by backpressure hook",
                     )
 
-            handler_ctx = _current_context()
+            handler_ctx = resolve_context()
             with self._tracker(
                 work_task,
                 request_iterator,
@@ -293,7 +293,7 @@ class WorkerService(protocol.WorkerServicer):
                         async for outcome in task:
                             if outcome.exception is not None:
                                 exception = protocol.Message(
-                                    dump=_dumps(outcome.exception)
+                                    dump=dumps(outcome.exception)
                                 )
                                 yield protocol.Response(
                                     exception=exception,
@@ -301,7 +301,7 @@ class WorkerService(protocol.WorkerServicer):
                                     context_id=response_context_hex,
                                 )
                                 return
-                            result = protocol.Message(dump=_dumps(outcome.result))
+                            result = protocol.Message(dump=dumps(outcome.result))
                             yield protocol.Response(
                                 result=result,
                                 vars=outcome.snapshot,
@@ -310,14 +310,14 @@ class WorkerService(protocol.WorkerServicer):
                     elif isinstance(task, asyncio.Task):
                         outcome: _WorkerOutcome = await task
                         if outcome.exception is not None:
-                            exception = protocol.Message(dump=_dumps(outcome.exception))
+                            exception = protocol.Message(dump=dumps(outcome.exception))
                             yield protocol.Response(
                                 exception=exception,
                                 vars=outcome.snapshot,
                                 context_id=response_context_hex,
                             )
                         else:
-                            result = protocol.Message(dump=_dumps(outcome.result))
+                            result = protocol.Message(dump=dumps(outcome.result))
                             yield protocol.Response(
                                 result=result,
                                 vars=outcome.snapshot,
@@ -331,9 +331,9 @@ class WorkerService(protocol.WorkerServicer):
                     # so this branch does not see them. Best-effort
                     # snapshot from the handler context since no
                     # frame-level snapshot is available at this point.
-                    exception = protocol.Message(dump=_dumps(e))
+                    exception = protocol.Message(dump=dumps(e))
                     _fallback_ser = PassthroughSerializer() if _is_passthrough else None
-                    ctx_snapshot = _snapshot_vars(
+                    ctx_snapshot = snapshot_vars(
                         dumps=_fallback_ser.dumps if _fallback_ser else None
                     )
                     yield protocol.Response(
@@ -440,8 +440,8 @@ class WorkerService(protocol.WorkerServicer):
                 nonlocal worker_task
                 task = asyncio.Task(work_task._run(), loop=worker_loop)
                 worker_task = task
-                with _task_contexts_lock:
-                    _task_contexts[task] = worker_ctx
+                with task_contexts_lock:
+                    task_contexts[task] = worker_ctx
 
                 def _done(t: asyncio.Task):
                     if future.done():
@@ -449,7 +449,7 @@ class WorkerService(protocol.WorkerServicer):
                     if t.cancelled():
                         future.cancel()
                         return
-                    snapshot = _snapshot_vars(
+                    snapshot = snapshot_vars(
                         worker_ctx,
                         dumps=_resp_ser.dumps if _resp_ser else None,
                     )
@@ -478,7 +478,7 @@ class WorkerService(protocol.WorkerServicer):
         self,
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
-        handler_ctx: Context | None = None,
+        handler_ctx: Context,
         passthrough: bool = False,
     ):
         """Run a streaming task on the shared worker event loop.
@@ -509,7 +509,7 @@ class WorkerService(protocol.WorkerServicer):
             captured before the tracker forks. Preserves the
             activated context id and applied vars so the worker-loop
             copy starts from the correct snapshot. When ``None``,
-            falls back to :func:`_current_context`.
+            falls back to :func:`resolve_context`.
         :param passthrough:
             If ``True``, use :class:`PassthroughSerializer` for
             response var snapshots (self-dispatch optimization).
@@ -520,10 +520,10 @@ class WorkerService(protocol.WorkerServicer):
         """
         main_loop = asyncio.get_running_loop()
         if handler_ctx is None:
-            handler_ctx = _current_context()
+            handler_ctx = resolve_context()
         worker_ctx = handler_ctx.copy()
         _resp_ser = PassthroughSerializer() if passthrough else None
-        _resp_dumps = _resp_ser.dumps if _resp_ser else None
+        _respdumps = _resp_ser.dumps if _resp_ser else None
         request_queue: asyncio.Queue = asyncio.Queue()
         result_queue: asyncio.Queue = asyncio.Queue()
 
@@ -544,7 +544,7 @@ class WorkerService(protocol.WorkerServicer):
                                     break
                                 action, payload, caller_ctx = cmd
                                 if caller_ctx:
-                                    _apply_vars(
+                                    apply_vars(
                                         caller_ctx,
                                         **(
                                             {"loads": PassthroughSerializer.loads}
@@ -571,20 +571,20 @@ class WorkerService(protocol.WorkerServicer):
                                     )
                                     return
                                 except BaseException as e:
-                                    # _current_context() resolves to
+                                    # resolve_context() resolves to
                                     # worker_ctx here because _start_worker
-                                    # registered the task in _task_contexts.
-                                    ctx_snapshot = _snapshot_vars(dumps=_resp_dumps)
+                                    # registered the task in task_contexts.
+                                    ctx_snapshot = snapshot_vars(dumps=_respdumps)
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
                                         ("error", e, ctx_snapshot),
                                     )
                                     return
                                 else:
-                                    # _current_context() resolves to
+                                    # resolve_context() resolves to
                                     # worker_ctx here because _start_worker
-                                    # registered the task in _task_contexts.
-                                    ctx_snapshot = _snapshot_vars(dumps=_resp_dumps)
+                                    # registered the task in task_contexts.
+                                    ctx_snapshot = snapshot_vars(dumps=_respdumps)
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
                                         ("value", value, ctx_snapshot),
@@ -610,8 +610,8 @@ class WorkerService(protocol.WorkerServicer):
 
             def _start_worker():
                 task = asyncio.Task(worker_dispatch(), loop=worker_loop)
-                with _task_contexts_lock:
-                    _task_contexts[task] = worker_ctx
+                with task_contexts_lock:
+                    task_contexts[task] = worker_ctx
 
             worker_loop.call_soon_threadsafe(_start_worker)
 
@@ -663,7 +663,7 @@ class WorkerService(protocol.WorkerServicer):
         self,
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
-        handler_ctx: Context | None = None,
+        handler_ctx: Context,
         passthrough: bool = False,
     ):
         """Context manager for tracking running tasks.

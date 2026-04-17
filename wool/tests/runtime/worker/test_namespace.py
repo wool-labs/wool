@@ -95,7 +95,7 @@ class TestActivate:
             on exit current_context().id no longer equals it — the
             handler-task-is-None branch of activate correctly swaps
             in a fresh Context and restores the previous one via
-            _swap_context.
+            swap_context.
         """
         # Arrange
         context_id = uuid.uuid4()
