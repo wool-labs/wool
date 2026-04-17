@@ -508,8 +508,7 @@ class WorkerService(protocol.WorkerServicer):
             The handler's :class:`~wool.runtime.context.Context`,
             captured before the tracker forks. Preserves the
             activated context id and applied vars so the worker-loop
-            copy starts from the correct snapshot. When ``None``,
-            falls back to :func:`resolve_context`.
+            copy starts from the correct snapshot.
         :param passthrough:
             If ``True``, use :class:`PassthroughSerializer` for
             response var snapshots (self-dispatch optimization).

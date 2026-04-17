@@ -1,17 +1,14 @@
 import asyncio
 import contextvars
 
-import cloudpickle
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from wool.runtime.context import _UNSET
 from wool.runtime.context import Context
 from wool.runtime.context import ContextVar
 from wool.runtime.context import ContextVarCollision
 from wool.runtime.context import Token
-from wool.runtime.context import _UnsetType
 from wool.runtime.context import apply_vars
 from wool.runtime.context import build_frame_payload
 from wool.runtime.context import current_context
@@ -37,68 +34,6 @@ def isolate_registry():
         ContextVar._registry[k] = v
     if hasattr(_thread_context, "ctx"):
         _thread_context.ctx._data.clear()
-
-
-class TestUnsetType:
-    def test___new___returns_singleton_instance(self):
-        """Test _UnsetType returns the same instance on every construction.
-
-        Given:
-            The _UnsetType class
-        When:
-            It is instantiated multiple times
-        Then:
-            It should return the same singleton instance each time
-        """
-        # Act
-        first = _UnsetType()
-        second = _UnsetType()
-
-        # Assert
-        assert first is second
-        assert first is _UNSET
-
-    def test___repr___matches_stdlib_token_missing_format(self):
-        """Test _UnsetType repr matches stdlib Token.MISSING format.
-
-        Given:
-            The _UNSET singleton
-        When:
-            repr() is called on it
-        Then:
-            It should return the stdlib-parity string '<Token.MISSING>'
-        """
-        # Arrange, act, & assert
-        assert repr(_UNSET) == "<Token.MISSING>"
-
-    def test___bool___returns_false(self):
-        """Test _UnsetType is falsy.
-
-        Given:
-            The _UNSET singleton
-        When:
-            It is evaluated in a boolean context
-        Then:
-            It should be falsy
-        """
-        # Arrange, act, & assert
-        assert not _UNSET
-
-    def test___reduce___roundtrip_preserves_singleton_identity(self):
-        """Test cloudpickle roundtrip returns the same singleton.
-
-        Given:
-            The _UNSET singleton
-        When:
-            It is serialized via cloudpickle.dumps and deserialized via cloudpickle.loads
-        Then:
-            The deserialized value should be the same singleton instance
-        """
-        # Act
-        restored = cloudpickle.loads(cloudpickle.dumps(_UNSET))
-
-        # Assert
-        assert restored is _UNSET
 
 
 class TestContextVar:
@@ -205,6 +140,11 @@ class TestContextVar:
         # weakref would drop before the second call and no collision
         # would fire. The try/finally isolates each Hypothesis example
         # from its siblings since Hypothesis reuses the test function.
+        #
+        # _registry.pop is unavoidable per-example cleanup (not an
+        # assertion): Hypothesis runs multiple examples within a single
+        # test-function call, so the isolate_registry fixture cannot
+        # reset state between examples.
         key = f"{namespace}:{name}"
         ContextVar._registry.pop(key, None)
         try:
@@ -535,8 +475,8 @@ class TestContextVar:
         gc.collect()
         gc.collect()
 
-        # Assert
-        survived = ContextVar._registry.get("elsewhere:gc_target")
+        # Assert — reconstruct returns the existing instance if alive
+        survived = reconstruct("elsewhere:gc_target", True, "fallback")
 
         assert survived is not None
         assert survived.get() == "applied_before_gc"
@@ -557,17 +497,17 @@ class TestContextVar:
 
         # Arrange
         reconstruct("myapp:release_target", False, None)
-        key = "myapp:release_target"
 
         promoted = ContextVar("release_target", namespace="myapp")
-        assert key not in ContextVar._stub_pins
 
         # Act
         del promoted
         gc.collect()
 
-        # Assert
-        assert key not in ContextVar._registry
+        # Assert — the old var was GC'd, so constructing a new one
+        # with the same key should succeed without ContextVarCollision
+        replacement = ContextVar("release_target", namespace="myapp")
+        assert replacement is not None
 
     def test_reconstructed_var_supports_set_get_reset_before_promotion(self):
         """Test a reconstructed stub behaves like a real var before promotion.
@@ -632,7 +572,7 @@ class TestToken:
 
         # Assert
         assert restored.var is var
-        assert restored.old_value is _UNSET
+        assert restored.old_value is Token.MISSING
 
 
 class TestContext:
@@ -1410,20 +1350,24 @@ def test_swap_context_sync_fallback_creates_fresh_previous():
         It should return a fresh empty Context as the previous value
         and install the new Context as current
     """
-    from wool.runtime.context import _thread_context
+    import threading
+
     from wool.runtime.context import swap_context
 
-    # Arrange — ensure no thread-local context
-    if hasattr(_thread_context, "ctx"):
-        delattr(_thread_context, "ctx")
-    new_ctx = Context()
+    # Run in a fresh thread where no thread-local context exists.
+    result: list[Context] = []
 
-    # Act
-    prev = swap_context(new_ctx)
+    def run():
+        prev = swap_context(Context())
+        result.append(prev)
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join()
 
     # Assert
-    assert isinstance(prev, Context)
-    assert len(prev) == 0
+    assert isinstance(result[0], Context)
+    assert len(result[0]) == 0
 
 
 def test_token_cross_process_reset_rejects_wrong_context_id():

@@ -608,7 +608,8 @@ def apply_vars(
         return
     ctx = resolve_context()
     for key, data in wire_vars.items():
-        var = ContextVar._registry.get(key)
+        with ContextVar._registry_lock:
+            var = ContextVar._registry.get(key)
         if var is None:
             _log.debug(
                 "wool.ContextVar %r not registered on this process; "
@@ -853,8 +854,7 @@ def _wool_task_factory(
         parent_task = None
     with task_contexts_lock:
         parent_ctx = task_contexts.get(parent_task) if parent_task else None
-    child_ctx = parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
-    with task_contexts_lock:
+        child_ctx = parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
         task_contexts[task] = child_ctx
     return task
 
@@ -889,10 +889,9 @@ def install_task_factory(
                 parent_task = None
             with task_contexts_lock:
                 parent_ctx = task_contexts.get(parent_task) if parent_task else None
-            child_ctx = (
-                parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
-            )
-            with task_contexts_lock:
+                child_ctx = (
+                    parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
+                )
                 task_contexts[task] = child_ctx
             return task
 
