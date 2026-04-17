@@ -1358,6 +1358,62 @@ class TestSequentialDispatchIsolation:
 
 
 # ---------------------------------------------------------------------------
+# SDS-* tests: self-dispatch streaming var mutation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestSelfDispatchStreamingVarMutation:
+    @pytest.mark.asyncio
+    async def test_self_dispatch_streaming_var_mutation_between_yields(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test self-dispatch streaming applies caller var mutations per yield.
+
+        Given:
+            A DEFAULT pool (size=1, guaranteed self-dispatch) running an
+            async-generator routine that yields ``TENANT_ID.get()`` on
+            each iteration
+        When:
+            The caller mutates TENANT_ID to a distinct value between
+            each ``__anext__`` call
+        Then:
+            Each yielded value reflects the caller's latest mutation,
+            proving that per-frame forward-propagation through the
+            PassthroughSerializer self-dispatch path applies
+            ``PassthroughSerializer.loads`` for streaming var updates
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = _default_scenario(
+                shape=RoutineShape.ASYNC_GEN_ANEXT,
+                pool_mode=PoolMode.DEFAULT,
+            )
+            async with build_pool_from_scenario(scenario, credentials_map):
+                gen = routines.stream_tenant_id_echo(3)
+                try:
+                    collected: list[str] = []
+                    values = ["sds-first", "sds-second", "sds-third"]
+                    tokens: list = []
+                    try:
+                        for v in values:
+                            tokens.append(routines.TENANT_ID.set(v))
+                            collected.append(await gen.__anext__())
+                    finally:
+                        for tok in reversed(tokens):
+                            try:
+                                routines.TENANT_ID.reset(tok)
+                            except RuntimeError:
+                                pass
+                finally:
+                    await gen.aclose()
+            assert collected == values
+
+        await retry_grpc_internal(body)
+
+
+# ---------------------------------------------------------------------------
 # DP-* tests: durable pool context propagation
 # ---------------------------------------------------------------------------
 

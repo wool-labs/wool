@@ -181,7 +181,8 @@ def _reconstruct(
     sender's state. Defaults to :data:`_UNSET` so callers
     reconstructing a var without a known value can omit the argument.
     """
-    existing = ContextVar._registry.get(key)
+    with ContextVar._registry_lock:
+        existing = ContextVar._registry.get(key)
     if existing is None:
         existing = _register_unchecked(key, has_default, default)
     if current_value is not _UNSET:
@@ -372,7 +373,9 @@ class ContextVar(Generic[T]):
                     f"({existing!r}). Keys must be unique within a "
                     f"namespace."
                 )
-            return super().__new__(cls)
+            instance = super().__new__(cls)
+            instance._namespace = ns
+            return instance
 
     @overload
     def __init__(self, name: str, /, *, namespace: str | None = None) -> None: ...
@@ -397,10 +400,9 @@ class ContextVar(Generic[T]):
     ):
         if getattr(self, "_key", None) is not None:
             return
-        ns = namespace if namespace is not None else _infer_namespace()
+        ns = self._namespace
         key = f"{ns}:{name}"
         self._name = name
-        self._namespace = ns
         self._key = key
         self._default = default
         self._stub = False
@@ -873,7 +875,8 @@ def _wool_task_factory(
         parent_task = asyncio.current_task()
     except RuntimeError:
         parent_task = None
-    parent_ctx = _task_contexts.get(parent_task) if parent_task else None
+    with _task_contexts_lock:
+        parent_ctx = _task_contexts.get(parent_task) if parent_task else None
     child_ctx = parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
     with _task_contexts_lock:
         _task_contexts[task] = child_ctx
@@ -908,7 +911,8 @@ def install_task_factory(
                 parent_task = asyncio.current_task()
             except RuntimeError:
                 parent_task = None
-            parent_ctx = _task_contexts.get(parent_task) if parent_task else None
+            with _task_contexts_lock:
+                parent_ctx = _task_contexts.get(parent_task) if parent_task else None
             child_ctx = (
                 parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
             )

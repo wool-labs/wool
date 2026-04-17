@@ -2803,3 +2803,74 @@ class TestWorkerService:
         finally:
             target_logger.removeHandler(handler)
             target_logger.setLevel(prior_level)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_applies_passthrough_loads_for_streaming_self_dispatch(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test streaming self-dispatch applies PassthroughSerializer.loads for vars.
+
+        Given:
+            An async-generator Task configured with a
+            PassthroughSerializer whose streaming next-frames carry
+            var updates serialized via PassthroughSerializer.dumps
+        When:
+            The stream is iterated with changing vars on each frame
+        Then:
+            Each response reflects the updated value — proving that
+            the worker-side _apply_vars uses PassthroughSerializer.loads
+            rather than cloudpickle.loads for passthrough self-dispatch
+            frames.
+        """
+        from wool.runtime.routine.task import PassthroughSerializer
+
+        # Arrange
+        var = wool.ContextVar(
+            "passthrough_stream_var", namespace="test_passthrough_stream"
+        )
+        serializer = PassthroughSerializer()
+
+        async def streaming_task():
+            while True:
+                yield var.get()
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=streaming_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        initial_request = protocol.Request(
+            task=wool_task.to_protobuf(serializer=serializer),
+            vars={var.key: serializer.dumps("alpha")},
+        )
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(initial_request)
+
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            results: list = []
+            for frame_value in ("alpha", "bravo", "charlie"):
+                await stream.write(
+                    protocol.Request(
+                        next=protocol.Void(),
+                        vars={var.key: serializer.dumps(frame_value)},
+                    )
+                )
+                response = await anext(aiter(stream))
+                assert response.HasField("result")
+                results.append(cloudpickle.loads(response.result.dump))
+
+            await stream.done_writing()
+            async for _ in stream:
+                pass
+
+        # Assert
+        assert results == ["alpha", "bravo", "charlie"]

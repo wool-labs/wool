@@ -529,7 +529,14 @@ class WorkerService(protocol.WorkerServicer):
                                     break
                                 action, payload, caller_ctx = cmd
                                 if caller_ctx:
-                                    _apply_vars(caller_ctx)
+                                    _apply_vars(
+                                        caller_ctx,
+                                        **(
+                                            {"loads": PassthroughSerializer.loads}
+                                            if passthrough
+                                            else {}
+                                        ),
+                                    )
                                 try:
                                     with do_dispatch(False):
                                         match action:
@@ -549,6 +556,9 @@ class WorkerService(protocol.WorkerServicer):
                                     )
                                     return
                                 except BaseException as e:
+                                    # _current_context() resolves to
+                                    # worker_ctx here because _start_worker
+                                    # registered the task in _task_contexts.
                                     ctx_snapshot = _snapshot_vars(dumps=_resp_dumps)
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
@@ -556,6 +566,9 @@ class WorkerService(protocol.WorkerServicer):
                                     )
                                     return
                                 else:
+                                    # _current_context() resolves to
+                                    # worker_ctx here because _start_worker
+                                    # registered the task in _task_contexts.
                                     ctx_snapshot = _snapshot_vars(dumps=_resp_dumps)
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
