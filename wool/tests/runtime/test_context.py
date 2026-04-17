@@ -15,7 +15,9 @@ from wool.runtime.context import _apply_vars
 from wool.runtime.context import _dumps
 from wool.runtime.context import _loads
 from wool.runtime.context import _reconstruct
+from wool.runtime.context import _snapshot_vars
 from wool.runtime.context import _UnsetType
+from wool.runtime.context import build_frame_payload
 from wool.runtime.context import current_context
 
 
@@ -1309,3 +1311,90 @@ class TestPublicTypeShape:
 
         # Assert
         assert f"'{var.key}'" in text
+
+
+def test_snapshot_vars_with_custom_dumps():
+    """Test _snapshot_vars serializes values via a custom dumps callable.
+
+    Given:
+        A ContextVar with a value set and a custom dumps function
+    When:
+        _snapshot_vars is called with the custom dumps
+    Then:
+        It should serialize each value through the custom callable
+    """
+    # Arrange
+    var = ContextVar("snap_custom_dumps", namespace="snap")
+    var.set("hello")
+
+    calls: list[object] = []
+
+    def custom_dumps(value: object) -> bytes:
+        calls.append(value)
+        return b"custom:" + str(value).encode()
+
+    # Act
+    result = _snapshot_vars(dumps=custom_dumps)
+
+    # Assert
+    assert var.key in result
+    assert result[var.key] == b"custom:hello"
+    assert calls == ["hello"]
+
+
+def test_build_frame_payload_with_custom_dumps():
+    """Test build_frame_payload returns vars serialized via custom dumps.
+
+    Given:
+        A ContextVar with a value set and a custom dumps function
+    When:
+        build_frame_payload(dumps=custom) is called
+    Then:
+        It should return a vars dict whose values were produced by
+        the custom serializer and a hex context id string
+    """
+    # Arrange
+    var = ContextVar("bfp_custom_dumps", namespace="bfp")
+    var.set(42)
+
+    def custom_dumps(value: object) -> bytes:
+        return b"bfp:" + str(value).encode()
+
+    # Act
+    vars_dict, context_hex = build_frame_payload(dumps=custom_dumps)
+
+    # Assert
+    assert var.key in vars_dict
+    assert vars_dict[var.key] == b"bfp:42"
+    assert isinstance(context_hex, str)
+    assert len(context_hex) == 32  # UUID hex
+
+
+def test_apply_vars_with_custom_loads():
+    """Test _apply_vars deserializes values via a custom loads callable.
+
+    Given:
+        A ContextVar registered in the process and a wire-form vars
+        map with a custom-encoded value
+    When:
+        _apply_vars is called with a custom loads function
+    Then:
+        It should deserialize each value through the custom callable
+        and apply it to the current Context
+    """
+    # Arrange
+    var = ContextVar("apply_custom_loads", namespace="apcl")
+    wire_vars = {var.key: b"custom-payload"}
+
+    calls: list[bytes] = []
+
+    def custom_loads(data: bytes) -> object:
+        calls.append(data)
+        return "decoded-" + data.decode()
+
+    # Act
+    _apply_vars(wire_vars, loads=custom_loads)
+
+    # Assert
+    assert var.get() == "decoded-custom-payload"
+    assert calls == [b"custom-payload"]

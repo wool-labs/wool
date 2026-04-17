@@ -35,6 +35,30 @@ from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.metadata import WorkerMetadata
 
 
+@pytest.fixture(autouse=True)
+def _isolate_wool_context():
+    """Isolate wool.ContextVar registry and per-task context data between tests.
+
+    Prevents ContextVar instances and their values created in one test
+    from leaking into subsequent tests.
+    """
+    from wool.runtime.context import ContextVar
+    from wool.runtime.context import _current_context
+    from wool.runtime.context import _thread_context
+
+    saved_registry = dict(ContextVar._registry)
+    ctx = _current_context()
+    saved_data = dict(ctx._data)
+    yield
+    ctx._data.clear()
+    ctx._data.update(saved_data)
+    ContextVar._registry.clear()
+    for k, v in saved_registry.items():
+        ContextVar._registry[k] = v
+    if hasattr(_thread_context, "ctx"):
+        _thread_context.ctx._data.clear()
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _clear_channel_pool():
     """Clear the module-level gRPC channel pool between tests.
