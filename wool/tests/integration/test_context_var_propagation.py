@@ -503,8 +503,8 @@ class TestWoolContextAcrossWorkers:
             The Context is used as the ambient context via
             ``wool.Context.run_async(dispatch())``
         Then:
-            The worker routine observes the var value set inside
-            the Context
+            The worker routine should observe the var value set
+            inside the Context
         """
 
         # Arrange, act, & assert
@@ -539,8 +539,8 @@ class TestWoolContextAcrossWorkers:
         When:
             The caller dispatches the routine passing a populated Context
         Then:
-            The sub-routine observes the Context's vars and completes
-            without RuntimeError
+            The sub-routine should observe the Context's vars and
+            complete without RuntimeError
         """
 
         # Arrange, act, & assert
@@ -571,8 +571,8 @@ class TestWoolContextAcrossWorkers:
         When:
             The same Context is used to run a second task concurrently
         Then:
-            ``RuntimeError`` is raised by the second ``run_async`` call
-            (single-task invariant)
+            It should raise ``RuntimeError`` from the second
+            ``run_async`` call (single-task invariant)
         """
 
         # Arrange, act, & assert
@@ -588,6 +588,9 @@ class TestWoolContextAcrossWorkers:
                 first_coro = routines.get_tenant_id()
                 first_task = asyncio.create_task(ctx.run_async(first_coro))
                 await asyncio.sleep(0)
+                assert not first_task.done(), (
+                    "first_task completed before second run_async — timing too loose"
+                )
 
                 # Attempt a second concurrent run_async on the same ctx.
                 second_coro = routines.get_tenant_id()
@@ -614,7 +617,8 @@ class TestWoolContextAcrossWorkers:
         When:
             The caller dispatches the routine
         Then:
-            The returned id hex equals the caller's captured id hex
+            It should return the same id hex as the caller's
+            captured id hex
         """
 
         # Arrange, act, & assert
@@ -641,8 +645,8 @@ class TestWoolContextAcrossWorkers:
             The child dispatches a routine that returns its own
             observed context id
         Then:
-            The routine's observed id differs from the parent's id
-            (stdlib fork parity)
+            The routine should observe a different id from the
+            parent's id (stdlib fork parity)
         """
 
         # Arrange, act, & assert
@@ -685,8 +689,8 @@ class TestTokenAcrossWorkers:
         When:
             The caller dispatches passing the pickled Token
         Then:
-            The reset succeeds on the worker and the routine's
-            post-reset read equals the var's pre-set default
+            The reset should succeed on the worker and the routine's
+            post-reset read should equal the var's pre-set default
         """
 
         # Arrange, act, & assert
@@ -724,7 +728,7 @@ class TestTokenAcrossWorkers:
         When:
             The worker invokes ``reset(token)``
         Then:
-            ValueError is raised citing the Context mismatch
+            It should raise ValueError citing the Context mismatch
         """
 
         # Arrange, act, & assert
@@ -764,8 +768,8 @@ class TestTokenAcrossWorkers:
         When:
             The second reset fires on the worker
         Then:
-            The routine catches RuntimeError ("Token has already been
-            used") and returns its repr to the caller
+            The routine should catch RuntimeError ("Token has already
+            been used") and return its repr to the caller
         """
 
         # Arrange, act, & assert
@@ -804,8 +808,9 @@ class TestExceptionPathBackPropagation:
         When:
             The caller dispatches and catches the exception
         Then:
-            The caller's TENANT_ID reflects the worker-side sentinel
-            value (back-propagated via exception snapshot path)
+            The caller's TENANT_ID should reflect the worker-side
+            sentinel value (back-propagated via exception snapshot
+            path)
         """
 
         # Arrange, act, & assert
@@ -835,7 +840,7 @@ class TestExceptionPathBackPropagation:
         When:
             The caller iterates and catches the exception
         Then:
-            The caller's TENANT_ID reflects the last mid-stream
+            The caller's TENANT_ID should reflect the last mid-stream
             mutation performed on the worker before the raise
         """
 
@@ -885,8 +890,8 @@ class TestAsyncioForkOnWorker:
         When:
             The caller dispatches the routine
         Then:
-            The parent's post-child read equals ``"parent"``
-            (stdlib copy-on-fork parity)
+            It should return the original value for the parent's
+            post-child read (stdlib copy-on-fork parity)
         """
 
         # Arrange, act, & assert
@@ -911,7 +916,8 @@ class TestAsyncioForkOnWorker:
         When:
             The caller dispatches the routine
         Then:
-            The child's read equals the parent's pre-fork value
+            It should return the parent's pre-fork value for the
+            child's read
         """
 
         # Arrange, act, & assert
@@ -936,9 +942,9 @@ class TestAsyncioForkOnWorker:
         When:
             The caller dispatches the routine
         Then:
-            Each child observes its own value, and the parent's var is
-            unchanged (neither child leaks into the other nor into the
-            parent)
+            Each child should observe its own value, and the parent's
+            var should remain unchanged (neither child leaks into the
+            other nor into the parent)
         """
 
         # Arrange, act, & assert
@@ -979,9 +985,9 @@ class TestStubPromotionAcrossWorkers:
         When:
             The caller dispatches the routine
         Then:
-            The worker unpickles the var (stub), imports the module
-            (promotes the stub), and the routine reads the propagated
-            value without a collision
+            The worker should unpickle the var (stub), import the
+            module (promote the stub), and the routine should read
+            the propagated value without a collision
         """
 
         # Arrange, act, & assert
@@ -1013,8 +1019,8 @@ class TestStubPromotionAcrossWorkers:
             The caller dispatches the first sibling (registering the
             key on the worker) then dispatches the second sibling
         Then:
-            The second dispatch raises wool.ContextVarCollision on the
-            caller via the worker's exception snapshot path
+            The second dispatch should raise wool.ContextVarCollision
+            on the caller via the worker's exception snapshot path
         """
 
         # Arrange, act, & assert
@@ -1057,8 +1063,8 @@ class TestForwardPropagationMidStream:
             The caller drives the generator manually, setting the var
             to a distinct value before each ``__anext__``
         Then:
-            Each yielded value reflects the caller's most recent value
-            at the moment of the call
+            Each yielded value should reflect the caller's most recent
+            value at the moment of the call
         """
 
         # Arrange, act, & assert
@@ -1099,8 +1105,8 @@ class TestForwardPropagationMidStream:
             The caller calls ``gen.asend(x)`` with TENANT_ID set to a
             distinct value before each send
         Then:
-            Each echoed value reflects the caller's var value at the
-            moment of the corresponding ``asend`` frame
+            Each echoed value should reflect the caller's var value at
+            the moment of the corresponding ``asend`` frame
         """
 
         # Arrange, act, & assert
@@ -1142,8 +1148,8 @@ class TestForwardPropagationMidStream:
         When:
             The caller mutates TENANT_ID then calls ``gen.athrow``
         Then:
-            The yielded value reflects the caller's most recent var
-            value at the moment of the ``athrow`` call
+            The yielded value should reflect the caller's most recent
+            var value at the moment of the ``athrow`` call
         """
 
         # Arrange, act, & assert
@@ -1197,10 +1203,10 @@ class TestUnregisteredKeyBehavior:
         When:
             The caller dispatches the routine
         Then:
-            The dispatch completes; the routine observes its own
-            (worker-known) var; and the synthetic caller-only key is
-            silently dropped on the worker (debug-log only, no
-            exception)
+            The dispatch should complete; the routine should observe
+            its own (worker-known) var; and the synthetic caller-only
+            key should be silently dropped on the worker (debug-log
+            only, no exception)
         """
 
         # Arrange, act, & assert

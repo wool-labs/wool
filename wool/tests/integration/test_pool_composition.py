@@ -32,7 +32,9 @@ from .conftest import invoke_routine
 @pytest.mark.integration
 class TestPoolComposition:
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_default_mode(self, credentials_map):
+    async def test_build_pool_from_scenario_with_default_mode(
+        self, credentials_map, retry_grpc_internal
+    ):
         """Test building a pool with DEFAULT mode.
 
         Given:
@@ -43,32 +45,38 @@ class TestPoolComposition:
         Then:
             It should return the correct result (add(1, 2) == 3).
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.DEFAULT,
-            discovery=DiscoveryFactory.NONE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.LAZY,
-            backpressure=BackpressureMode.NONE,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DEFAULT,
+                discovery=DiscoveryFactory.NONE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.DEFAULT,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.NONE,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_ephemeral_mode(self, credentials_map):
+    async def test_build_pool_from_scenario_with_ephemeral_mode(
+        self, credentials_map, retry_grpc_internal
+    ):
         """Test building a pool with EPHEMERAL mode and size=2.
 
         Given:
@@ -79,32 +87,38 @@ class TestPoolComposition:
         Then:
             It should return the correct result.
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.EPHEMERAL,
-            discovery=DiscoveryFactory.NONE,
-            lb=LbFactory.INSTANCE,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.EAGER,
-            backpressure=BackpressureMode.NONE,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.EPHEMERAL,
+                discovery=DiscoveryFactory.NONE,
+                lb=LbFactory.INSTANCE,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.DEFAULT,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.EAGER,
+                backpressure=BackpressureMode.NONE,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_durable_mode(self, credentials_map):
+    async def test_build_pool_from_scenario_with_durable_mode(
+        self, credentials_map, retry_grpc_internal
+    ):
         """Test building a pool with DURABLE mode.
 
         Given:
@@ -115,32 +129,38 @@ class TestPoolComposition:
         Then:
             It should return the correct result.
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.DURABLE,
-            discovery=DiscoveryFactory.NONE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.LAZY,
-            backpressure=BackpressureMode.NONE,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DURABLE,
+                discovery=DiscoveryFactory.NONE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.DEFAULT,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.NONE,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_hybrid_mode(self, credentials_map):
+    async def test_build_pool_from_scenario_with_hybrid_mode(
+        self, credentials_map, retry_grpc_internal
+    ):
         """Test building a pool with HYBRID mode and LOCAL_CALLABLE discovery.
 
         Given:
@@ -151,33 +171,37 @@ class TestPoolComposition:
         Then:
             It should return the correct result.
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.HYBRID,
-            discovery=DiscoveryFactory.LOCAL_CALLABLE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.LAZY,
-            backpressure=BackpressureMode.NONE,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.HYBRID,
+                discovery=DiscoveryFactory.LOCAL_CALLABLE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.DEFAULT,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.NONE,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
     async def test_build_pool_from_scenario_with_durable_joined_local(
-        self, credentials_map
+        self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with DURABLE_JOINED mode and LOCAL_CALLABLE.
 
@@ -191,32 +215,38 @@ class TestPoolComposition:
             It should return the correct result via the non-owner
             LocalDiscovery.
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.DURABLE_JOINED,
-            discovery=DiscoveryFactory.LOCAL_CALLABLE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.LAZY,
-            backpressure=BackpressureMode.NONE,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DURABLE_JOINED,
+                discovery=DiscoveryFactory.LOCAL_CALLABLE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.DEFAULT,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.NONE,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_restrictive_opts(self, credentials_map):
+    async def test_build_pool_from_scenario_with_restrictive_opts(
+        self, credentials_map, retry_grpc_internal
+    ):
         """Test building a pool with restrictive message size options.
 
         Given:
@@ -227,32 +257,38 @@ class TestPoolComposition:
         Then:
             It should return the correct result within the size limits.
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.DEFAULT,
-            discovery=DiscoveryFactory.NONE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.RESTRICTIVE,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.LAZY,
-            backpressure=BackpressureMode.NONE,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DEFAULT,
+                discovery=DiscoveryFactory.NONE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.RESTRICTIVE,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.NONE,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_keepalive_opts(self, credentials_map):
+    async def test_build_pool_from_scenario_with_keepalive_opts(
+        self, credentials_map, retry_grpc_internal
+    ):
         """Test building a pool with keepalive worker options.
 
         Given:
@@ -264,32 +300,38 @@ class TestPoolComposition:
             It should return the correct result with keepalive options
             active on both server and client.
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.DEFAULT,
-            discovery=DiscoveryFactory.NONE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.KEEPALIVE,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.LAZY,
-            backpressure=BackpressureMode.NONE,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DEFAULT,
+                discovery=DiscoveryFactory.NONE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.KEEPALIVE,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.NONE,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_dispatch_timeout(self, credentials_map):
+    async def test_build_pool_from_scenario_with_dispatch_timeout(
+        self, credentials_map, retry_grpc_internal
+    ):
         """Test building a pool with dispatch_timeout set in the context.
 
         Given:
@@ -300,32 +342,38 @@ class TestPoolComposition:
         Then:
             It should return the correct result with the timeout active.
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.DEFAULT,
-            discovery=DiscoveryFactory.NONE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.VIA_DISPATCH_TIMEOUT_VAR,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.LAZY,
-            backpressure=BackpressureMode.NONE,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DEFAULT,
+                discovery=DiscoveryFactory.NONE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.DEFAULT,
+                timeout=TimeoutKind.VIA_DISPATCH_TIMEOUT_VAR,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.NONE,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_shared_discovery(self, credentials_map):
+    async def test_build_pool_from_scenario_with_shared_discovery(
+        self, credentials_map, retry_grpc_internal
+    ):
         """Test two pools sharing the same discovery subscriber.
 
         Given:
@@ -339,33 +387,37 @@ class TestPoolComposition:
             It should discover the worker and return the correct
             result.
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.DURABLE_SHARED,
-            discovery=DiscoveryFactory.NONE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.LAZY,
-            backpressure=BackpressureMode.NONE,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DURABLE_SHARED,
+                discovery=DiscoveryFactory.NONE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.DEFAULT,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.NONE,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
     async def test_build_pool_from_scenario_with_sync_backpressure(
-        self, credentials_map
+        self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with a sync backpressure accept hook.
 
@@ -378,33 +430,37 @@ class TestPoolComposition:
         Then:
             It should return the correct result.
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.DEFAULT,
-            discovery=DiscoveryFactory.NONE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.LAZY,
-            backpressure=BackpressureMode.SYNC,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DEFAULT,
+                discovery=DiscoveryFactory.NONE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.DEFAULT,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.SYNC,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
     async def test_build_pool_from_scenario_with_async_backpressure(
-        self, credentials_map
+        self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with an async backpressure accept hook.
 
@@ -417,29 +473,33 @@ class TestPoolComposition:
         Then:
             It should return the correct result.
         """
-        # Arrange
-        scenario = Scenario(
-            shape=RoutineShape.COROUTINE,
-            pool_mode=PoolMode.DEFAULT,
-            discovery=DiscoveryFactory.NONE,
-            lb=LbFactory.CLASS_REF,
-            credential=CredentialType.INSECURE,
-            options=WorkerOptionsKind.DEFAULT,
-            timeout=TimeoutKind.NONE,
-            binding=RoutineBinding.MODULE_FUNCTION,
-            lazy=LazyMode.LAZY,
-            backpressure=BackpressureMode.ASYNC,
-            ctx_var_1=ContextVarPattern.NONE,
-            ctx_var_2=ContextVarPattern.NONE,
-            ctx_var_3=ContextVarPattern.NONE,
-        )
 
-        # Act
-        async with build_pool_from_scenario(scenario, credentials_map):
-            result = await invoke_routine(scenario)
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DEFAULT,
+                discovery=DiscoveryFactory.NONE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.DEFAULT,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.ASYNC,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+            )
 
-        # Assert
-        assert result == 3
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
 
 
 def _sync_reject_hook(ctx):
@@ -455,7 +515,7 @@ async def _async_reject_hook(ctx):
 @pytest.mark.integration
 class TestBackpressureRejection:
     @pytest.mark.asyncio
-    async def test_sync_backpressure_rejection(self):
+    async def test_sync_backpressure_rejection(self, retry_grpc_internal):
         """Test sync backpressure hook rejects task end-to-end.
 
         Given:
@@ -467,20 +527,24 @@ class TestBackpressureRejection:
             It should raise NoWorkersAvailable because the only worker
             rejects with RESOURCE_EXHAUSTED.
         """
-        # Arrange
-        pool = WorkerPool(
-            size=1,
-            loadbalancer=RoundRobinLoadBalancer,
-            worker=partial(LocalWorker, backpressure=_sync_reject_hook),
-        )
 
-        # Act & assert
-        async with pool:
-            with pytest.raises(NoWorkersAvailable):
-                await routines.add(1, 2)
+        async def body():
+            # Arrange
+            pool = WorkerPool(
+                size=1,
+                loadbalancer=RoundRobinLoadBalancer,
+                worker=partial(LocalWorker, backpressure=_sync_reject_hook),
+            )
+
+            # Act & assert
+            async with pool:
+                with pytest.raises(NoWorkersAvailable):
+                    await routines.add(1, 2)
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_async_backpressure_rejection(self):
+    async def test_async_backpressure_rejection(self, retry_grpc_internal):
         """Test async backpressure hook rejects task end-to-end.
 
         Given:
@@ -492,20 +556,24 @@ class TestBackpressureRejection:
             It should raise NoWorkersAvailable because the only worker
             rejects with RESOURCE_EXHAUSTED.
         """
-        # Arrange
-        pool = WorkerPool(
-            size=1,
-            loadbalancer=RoundRobinLoadBalancer,
-            worker=partial(LocalWorker, backpressure=_async_reject_hook),
-        )
 
-        # Act & assert
-        async with pool:
-            with pytest.raises(NoWorkersAvailable):
-                await routines.add(1, 2)
+        async def body():
+            # Arrange
+            pool = WorkerPool(
+                size=1,
+                loadbalancer=RoundRobinLoadBalancer,
+                worker=partial(LocalWorker, backpressure=_async_reject_hook),
+            )
+
+            # Act & assert
+            async with pool:
+                with pytest.raises(NoWorkersAvailable):
+                    await routines.add(1, 2)
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_backpressure_fallback_to_accepting_worker(self):
+    async def test_backpressure_fallback_to_accepting_worker(self, retry_grpc_internal):
         """Test load balancer falls through to an accepting worker.
 
         Given:
@@ -518,33 +586,45 @@ class TestBackpressureRejection:
             worker after the rejecting worker returns
             RESOURCE_EXHAUSTED.
         """
-        # Arrange
-        namespace = f"bp-fallback-{uuid.uuid4().hex[:12]}"
-        rejecting_worker = LocalWorker(backpressure=_sync_reject_hook)
-        accepting_worker = LocalWorker()
 
-        await rejecting_worker.start()
-        await accepting_worker.start()
-        try:
-            with LocalDiscovery(namespace) as discovery:
-                publisher = discovery.publisher
-                async with publisher:
-                    await publisher.publish("worker-added", rejecting_worker.metadata)
-                    await publisher.publish("worker-added", accepting_worker.metadata)
-                    pool = WorkerPool(
-                        discovery=_DirectDiscovery(discovery),
-                        loadbalancer=RoundRobinLoadBalancer,
-                    )
+        async def body():
+            # Arrange
+            namespace = f"bp-fallback-{uuid.uuid4().hex[:12]}"
+            rejecting_worker = LocalWorker(backpressure=_sync_reject_hook)
+            accepting_worker = LocalWorker()
 
-                    # Act
-                    async with pool:
-                        result = await routines.add(1, 2)
+            await rejecting_worker.start()
+            await accepting_worker.start()
+            try:
+                with LocalDiscovery(namespace) as discovery:
+                    publisher = discovery.publisher
+                    async with publisher:
+                        await publisher.publish(
+                            "worker-added", rejecting_worker.metadata
+                        )
+                        await publisher.publish(
+                            "worker-added", accepting_worker.metadata
+                        )
+                        pool = WorkerPool(
+                            discovery=_DirectDiscovery(discovery),
+                            loadbalancer=RoundRobinLoadBalancer,
+                        )
 
-                    # Assert
-                    assert result == 3
+                        # Act
+                        async with pool:
+                            result = await routines.add(1, 2)
 
-                    await publisher.publish("worker-dropped", rejecting_worker.metadata)
-                    await publisher.publish("worker-dropped", accepting_worker.metadata)
-        finally:
-            await accepting_worker.stop()
-            await rejecting_worker.stop()
+                        # Assert
+                        assert result == 3
+
+                        await publisher.publish(
+                            "worker-dropped", rejecting_worker.metadata
+                        )
+                        await publisher.publish(
+                            "worker-dropped", accepting_worker.metadata
+                        )
+            finally:
+                await accepting_worker.stop()
+                await rejecting_worker.stop()
+
+        await retry_grpc_internal(body)

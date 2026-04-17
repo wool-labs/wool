@@ -250,6 +250,8 @@ class TestActivate:
         # Assert
         assert observed == "propagated"
 
+
+class TestContextRun:
     def test_context_run_binds_id_for_sync_caller(self):
         """Test Context.run installs the Context for sync callers.
 
