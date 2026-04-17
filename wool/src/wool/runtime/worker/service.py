@@ -519,8 +519,6 @@ class WorkerService(protocol.WorkerServicer):
             routine raises.
         """
         main_loop = asyncio.get_running_loop()
-        if handler_ctx is None:
-            handler_ctx = resolve_context()
         worker_ctx = handler_ctx.copy()
         _resp_ser = PassthroughSerializer() if passthrough else None
         _respdumps = _resp_ser.dumps if _resp_ser else None

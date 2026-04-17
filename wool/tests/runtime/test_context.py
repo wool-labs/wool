@@ -1396,3 +1396,120 @@ def test_apply_vars_with_custom_loads():
     # Assert
     assert var.get() == "decoded-custom-payload"
     assert calls == [b"custom-payload"]
+
+
+def test_swap_context_sync_fallback_creates_fresh_previous():
+    """Test swap_context returns a fresh Context when no prior thread context.
+
+    Given:
+        A sync caller with no prior wool.Context in the thread-local
+        fallback (first swap in this thread scope)
+    When:
+        swap_context is called with a new Context
+    Then:
+        It should return a fresh empty Context as the previous value
+        and install the new Context as current
+    """
+    from wool.runtime.context import _thread_context
+    from wool.runtime.context import swap_context
+
+    # Arrange — ensure no thread-local context
+    if hasattr(_thread_context, "ctx"):
+        delattr(_thread_context, "ctx")
+    new_ctx = Context()
+
+    # Act
+    prev = swap_context(new_ctx)
+
+    # Assert
+    assert isinstance(prev, Context)
+    assert len(prev) == 0
+
+
+def test_token_cross_process_reset_rejects_wrong_context_id():
+    """Test cross-process token reset rejects mismatched context id.
+
+    Given:
+        A Token reconstructed via reconstruct_token with _context=None
+        and a context_id that differs from the current Context
+    When:
+        reset is called
+    Then:
+        It should raise ValueError citing the Context mismatch
+    """
+    from wool.runtime.context import reconstruct_token
+
+    # Arrange
+    var = ContextVar("xproc_reject", namespace="test_xproc")
+    var.set("current")
+    from uuid import uuid4
+
+    wrong_id = uuid4()
+    token = reconstruct_token(var, "old_val", wrong_id)
+
+    # Act & assert
+    with pytest.raises(ValueError, match="different wool.Context"):
+        var.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_install_task_factory_idempotent():
+    """Test install_task_factory is a no-op when already installed.
+
+    Given:
+        install_task_factory has been called on the running loop
+    When:
+        install_task_factory is called again
+    Then:
+        It should return without error (idempotent)
+    """
+    from wool.runtime.context import install_task_factory
+
+    # Arrange
+    install_task_factory()
+
+    # Act & assert — no error
+    install_task_factory()
+
+
+@pytest.mark.asyncio
+async def test_install_task_factory_composes_with_existing():
+    """Test install_task_factory wraps an existing factory.
+
+    Given:
+        A custom task factory already set on the loop
+    When:
+        install_task_factory is called
+    Then:
+        It should wrap the existing factory, creating tasks via the
+        original while also seeding wool Context on the child
+    """
+    from wool.runtime.context import install_task_factory
+
+    # Arrange
+    loop = asyncio.get_running_loop()
+    calls = []
+
+    def custom_factory(loop, coro, **kwargs):
+        calls.append("custom")
+        return asyncio.Task(coro, loop=loop, **kwargs)
+
+    loop.set_task_factory(custom_factory)
+
+    # Act
+    install_task_factory()
+
+    var = ContextVar("compose_test", namespace="test_compose")
+    var.set("parent_value")
+
+    async def child():
+        return var.get("missing")
+
+    result = await asyncio.create_task(child())
+
+    # Assert
+    assert len(calls) > 0  # custom factory was called
+    assert result == "parent_value"  # wool context inherited
+
+    # Cleanup
+    loop.set_task_factory(None)
