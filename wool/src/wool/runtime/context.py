@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import io
 import logging
 import sys
@@ -83,14 +82,6 @@ _task_contexts_lock: threading.Lock = threading.Lock()
 # Sync/no-task fallback: one wool.Context per thread.
 _thread_context: threading.local = threading.local()
 
-# Sole remaining stdlib ContextVar — propagation hint for the task
-# factory. stdlib's built-in copy-on-fork carries this from parent
-# to child during asyncio.create_task, letting the factory find the
-# parent's wool.Context and copy it.
-_parent_hint: contextvars.ContextVar[Context | None] = contextvars.ContextVar(
-    "wool._parent_hint", default=None
-)
-
 
 def _current_context() -> Context:
     """Return the wool.Context for the current execution scope.
@@ -108,12 +99,9 @@ def _current_context() -> Context:
         with _task_contexts_lock:
             ctx = _task_contexts.get(task)
             if ctx is not None:
-                _parent_hint.set(ctx)
                 return ctx
-            parent = _parent_hint.get(None)
-            ctx = parent.copy() if parent is not None else Context()
+            ctx = Context()
             _task_contexts[task] = ctx
-            _parent_hint.set(ctx)
             return ctx
     ctx = getattr(_thread_context, "ctx", None)
     if ctx is None:
@@ -136,7 +124,6 @@ def _swap_context(new: Context) -> Context:
         with _task_contexts_lock:
             prev = _task_contexts.get(task)
             _task_contexts[task] = new
-        _parent_hint.set(new)
         if prev is None:
             prev = Context()
         return prev
@@ -199,8 +186,7 @@ def _reconstruct(
         existing = _register_unchecked(key, has_default, default)
     if current_value is not _UNSET:
         ctx = _current_context()
-        if ctx._data.get(existing) != current_value:
-            ctx._data[existing] = current_value
+        ctx._data[existing] = current_value
     return existing
 
 
@@ -531,12 +517,22 @@ class _ContextPickler(cloudpickle.CloudPickler):
 
     Embeds each :class:`ContextVar`'s current value at pickle time
     so the receiver can apply it and arrive at the sender's state.
+
+    When *ctx* is provided, the pickler reads var values from that
+    Context. Otherwise it reads from :func:`_current_context`. The
+    explicit-ctx path is used by :func:`_snapshot_vars` so the
+    worker-side ``_done`` callback (which runs outside any task)
+    serializes from the correct Context.
     """
+
+    def __init__(self, file: Any, ctx: Context | None = None, **kwargs: Any):
+        super().__init__(file, **kwargs)
+        self._wool_ctx = ctx
 
     def reducer_override(self, obj: Any) -> Any:
         if isinstance(obj, ContextVar):
             has_default = obj._default is not _SENTINEL
-            ctx = _current_context()
+            ctx = self._wool_ctx if self._wool_ctx is not None else _current_context()
             current_value = ctx._data.get(obj, _UNSET)
             return (
                 _reconstruct,
@@ -550,10 +546,15 @@ class _ContextPickler(cloudpickle.CloudPickler):
         return super().reducer_override(obj)
 
 
-def _dumps(value: Any) -> bytes:
-    """Serialize *value* with wool's ContextVar-aware pickler."""
+def _dumps(value: Any, ctx: Context | None = None) -> bytes:
+    """Serialize *value* with wool's ContextVar-aware pickler.
+
+    :param ctx:
+        Optional Context for the pickler to read var values from.
+        When ``None``, reads from the current Context.
+    """
     buf = io.BytesIO()
-    _ContextPickler(buf).dump(value)
+    _ContextPickler(buf, ctx=ctx).dump(value)
     return buf.getvalue()
 
 
@@ -569,19 +570,18 @@ def _loads(data: bytes) -> Any:
 
 def _snapshot_vars(
     ctx: Context | None = None,
-    *,
-    dumps: Callable[[Any], bytes] = _dumps,
 ) -> dict[str, bytes]:
     """Snapshot :class:`ContextVar` values to wire form.
 
     Iterates every var→value pair in the given (or current)
-    :class:`Context` and serializes each value.
+    :class:`Context` and serializes each value. The explicit *ctx*
+    is forwarded to the pickler so embedded ContextVar references
+    read values from the correct Context (important when called
+    from the ``_done`` callback which runs outside any task).
 
     :param ctx:
         Optional :class:`Context` to read from. When ``None``,
         reads from the current Context.
-    :param dumps:
-        Serializer for values. Defaults to :func:`_dumps`.
     :raises TypeError:
         If a value fails to serialize.
     """
@@ -592,7 +592,7 @@ def _snapshot_vars(
         if not isinstance(var, ContextVar):
             continue
         try:
-            pickled = dumps(value)
+            pickled = _dumps(value, ctx=ctx)
         except Exception as e:
             raise TypeError(
                 f"Failed to serialize wool.ContextVar {var._key!r}: {e}"
@@ -676,11 +676,12 @@ class Context:
     raise :class:`RuntimeError` on re-entry.
     """
 
-    __slots__ = ("_id", "_data", "_running")
+    __slots__ = ("_id", "_data", "_running", "_running_lock")
 
     _id: UUID
     _data: dict[ContextVar[Any], Any]
     _running: bool
+    _running_lock: threading.Lock
 
     def __new__(cls) -> Context:
         return cls._create(uuid4(), {})
@@ -696,6 +697,7 @@ class Context:
         instance._id = id
         instance._data = data
         instance._running = False
+        instance._running_lock = threading.Lock()
         return instance
 
     @property
@@ -716,17 +718,19 @@ class Context:
         return Context._create(new_id, dict(self._data))
 
     def _enter(self) -> None:
-        """Acquire the single-task flag or raise."""
-        if self._running:
-            raise RuntimeError(
-                "wool.Context is already running; at most one task "
-                "may run inside a given Context at a time"
-            )
-        self._running = True
+        """Acquire the single-task flag or raise. Thread-safe."""
+        with self._running_lock:
+            if self._running:
+                raise RuntimeError(
+                    "wool.Context is already running; at most one "
+                    "task may run inside a given Context at a time"
+                )
+            self._running = True
 
     def _exit(self) -> None:
-        """Release the single-task flag."""
-        self._running = False
+        """Release the single-task flag. Thread-safe."""
+        with self._running_lock:
+            self._running = False
 
     def run(self, fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
         """Run *fn* in this Context (stdlib parity).
@@ -757,12 +761,13 @@ class Context:
             If this :class:`Context` is already running a task.
         """
         self._enter()
-        _parent_hint.set(self)
         try:
-            task = asyncio.create_task(coro)
+            # Bypass the task factory to avoid a wasted fork
+            # allocation that we'd immediately overwrite.
+            loop = asyncio.get_running_loop()
+            task = asyncio.Task(coro, loop=loop)
             with _task_contexts_lock:
                 _task_contexts[task] = self
-            _parent_hint.set(self)
             result = await task
         finally:
             self._exit()
@@ -838,20 +843,24 @@ def _wool_task_factory(
 ) -> asyncio.Task[Any]:
     """Task factory that seeds each new Task with a wool.Context.
 
-    The parent's Context is found via :data:`_parent_hint` (a
-    stdlib ContextVar that propagates automatically on
-    ``asyncio.create_task``). The child gets a shallow copy so
-    mutations are isolated (copy-on-fork).
+    The parent's Context is found by looking up
+    ``asyncio.current_task()`` in :data:`_task_contexts`. The child
+    gets a shallow copy with a fresh UUID (copy-on-fork). No stdlib
+    ContextVar is needed — the factory runs synchronously inside
+    ``create_task``, so ``current_task()`` is the parent.
 
-    If no parent hint is available (e.g., tasks created before wool
-    is initialized), the child starts with an empty Context.
+    If no parent Context is registered (e.g., tasks created before
+    wool is initialized), the child starts with an empty Context.
     """
     task: asyncio.Task[Any] = asyncio.Task(coro, loop=loop, **kwargs)
-    parent_ctx = _parent_hint.get(None)
+    try:
+        parent_task = asyncio.current_task()
+    except RuntimeError:
+        parent_task = None
+    parent_ctx = _task_contexts.get(parent_task) if parent_task else None
     child_ctx = parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
     with _task_contexts_lock:
         _task_contexts[task] = child_ctx
-    _parent_hint.set(child_ctx)
     return task
 
 
@@ -879,13 +888,16 @@ def install_task_factory(
             **kwargs: Any,
         ) -> asyncio.Task[Any]:
             task = existing(loop, coro, **kwargs)
-            parent_ctx = _parent_hint.get(None)
+            try:
+                parent_task = asyncio.current_task()
+            except RuntimeError:
+                parent_task = None
+            parent_ctx = _task_contexts.get(parent_task) if parent_task else None
             child_ctx = (
                 parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
             )
             with _task_contexts_lock:
                 _task_contexts[task] = child_ctx
-            _parent_hint.set(child_ctx)
             return task
 
         composed._wool_wrapped = True  # type: ignore[attr-defined]

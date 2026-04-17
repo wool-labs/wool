@@ -54,19 +54,23 @@ class TestActivate:
         assert observed != context_id
 
     @pytest.mark.asyncio
-    async def test_activate_propagates_context_id_to_descendant_task(self):
-        """Test activate() plants the context id so a child task adopts it.
+    async def test_activate_child_task_forks_with_fresh_id(self):
+        """Test child task inside activate() gets a forked (fresh) id.
 
         Given:
             An asyncio task entering activate() with a context UUID
+            and the wool task factory installed
         When:
             A child asyncio.create_task reads wool.current_context()
         Then:
-            The child should observe the activated context id
+            The child should observe a DIFFERENT context id (strict
+            copy-on-fork semantics — every create_task mints fresh)
         """
+        from wool.runtime.context import install_task_factory
 
         # Arrange
         context_id = uuid.uuid4()
+        install_task_factory()
 
         async def child():
             return wool.current_context().id
@@ -76,7 +80,7 @@ class TestActivate:
             observed = await asyncio.create_task(child())
 
         # Assert
-        assert observed == context_id
+        assert observed != context_id
 
     def test_activate_without_running_task_binds_context_id_for_sync_caller(self):
         """Test activate() binds the context id for sync callers with no task.
@@ -219,13 +223,18 @@ class TestActivate:
         """Test a ContextVar set inside activate propagates to a child task.
 
         Given:
-            An activate block with a ContextVar set inside it
+            An activate block with a ContextVar set inside it and
+            the wool task factory installed
         When:
             A child task reads the var
         Then:
-            The child task should see the value set in the activate block
+            The child task should see the value set in the activate
+            block (task factory copies the parent's Context data)
         """
+        from wool.runtime.context import install_task_factory
+
         # Arrange
+        install_task_factory()
         var = wool.ContextVar("ns_test_child_prop", namespace="test_ns_child")
         context_id = uuid.uuid4()
 

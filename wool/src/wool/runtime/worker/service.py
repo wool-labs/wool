@@ -404,7 +404,9 @@ class WorkerService(protocol.WorkerServicer):
 
             def _schedule():
                 nonlocal worker_task
-                task = worker_loop.create_task(work_task._run())
+                # Bypass the task factory — we assign worker_ctx
+                # explicitly, so the factory's fork would be wasted.
+                task = asyncio.Task(work_task._run(), loop=worker_loop)
                 worker_task = task
                 with _task_contexts_lock:
                     _task_contexts[task] = worker_ctx
@@ -547,7 +549,7 @@ class WorkerService(protocol.WorkerServicer):
                         await proxy_ctx.__aexit__(None, None, None)
 
             def _start_worker():
-                task = worker_loop.create_task(worker_dispatch())
+                task = asyncio.Task(worker_dispatch(), loop=worker_loop)
                 with _task_contexts_lock:
                     _task_contexts[task] = worker_ctx
 
