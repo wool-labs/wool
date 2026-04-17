@@ -1332,7 +1332,7 @@ def test_snapshot_vars_with_custom_dumps():
         return b"custom:" + str(value).encode()
 
     # Act
-    result = snapshot_vars(dumps=custom_dumps)
+    result = snapshot_vars(dumps_param=custom_dumps)
 
     # Assert
     assert var.key in result
@@ -1346,7 +1346,7 @@ def test_build_frame_payload_with_custom_dumps():
     Given:
         A ContextVar with a value set and a custom dumps function
     When:
-        build_frame_payload(dumps=custom) is called
+        build_frame_payload(dumps_param=custom) is called
     Then:
         It should return a vars dict whose values were produced by
         the custom serializer and a hex context id string
@@ -1359,7 +1359,7 @@ def test_build_frame_payload_with_custom_dumps():
         return b"bfp:" + str(value).encode()
 
     # Act
-    vars_dict, context_hex = build_frame_payload(dumps=custom_dumps)
+    vars_dict, context_hex = build_frame_payload(dumps_param=custom_dumps)
 
     # Assert
     assert var.key in vars_dict

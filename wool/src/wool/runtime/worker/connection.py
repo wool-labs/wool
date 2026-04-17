@@ -136,7 +136,7 @@ class _DispatchStream(Generic[_T]):
         self._running = True
         try:
             dumps_fn = self._serializer.dumps if self._serializer else None
-            vars_dict, context_hex = build_frame_payload(dumps=dumps_fn)
+            vars_dict, context_hex = build_frame_payload(dumps_param=dumps_fn)
             request = protocol.Request(
                 next=protocol.Void(),
                 vars=vars_dict,
@@ -230,7 +230,7 @@ class _DispatchStream(Generic[_T]):
         try:
             dump = dumps(value)
             vars_dict, context_hex = build_frame_payload(
-                dumps=self._serializer.dumps if self._serializer else None
+                dumps_param=self._serializer.dumps if self._serializer else None
             )
             request = protocol.Request(
                 send=protocol.Message(dump=dump),
@@ -280,7 +280,7 @@ class _DispatchStream(Generic[_T]):
 
             dump = dumps(exc)
             vars_dict, context_hex = build_frame_payload(
-                dumps=self._serializer.dumps if self._serializer else None
+                dumps_param=self._serializer.dumps if self._serializer else None
             )
             request = protocol.Request(
                 throw=protocol.Message(dump=dump),
@@ -516,7 +516,7 @@ class WorkerConnection:
                 call: _DispatchCall = channel.stub.dispatch()
                 try:
                     vars_dict, context_hex = build_frame_payload(
-                        dumps=serializer.dumps if serializer else None
+                        dumps_param=serializer.dumps if serializer else None
                     )
                     request = protocol.Request(
                         task=task_msg,

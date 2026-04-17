@@ -334,7 +334,7 @@ class WorkerService(protocol.WorkerServicer):
                     exception = protocol.Message(dump=dumps(e))
                     _fallback_ser = PassthroughSerializer() if _is_passthrough else None
                     ctx_snapshot = snapshot_vars(
-                        dumps=_fallback_ser.dumps if _fallback_ser else None
+                        dumps_param=_fallback_ser.dumps if _fallback_ser else None
                     )
                     yield protocol.Response(
                         exception=exception,
@@ -451,7 +451,7 @@ class WorkerService(protocol.WorkerServicer):
                         return
                     snapshot = snapshot_vars(
                         worker_ctx,
-                        dumps=_resp_ser.dumps if _resp_ser else None,
+                        dumps_param=_resp_ser.dumps if _resp_ser else None,
                     )
                     exc = t.exception()
                     if exc is not None:
@@ -572,7 +572,7 @@ class WorkerService(protocol.WorkerServicer):
                                     # resolve_context() resolves to
                                     # worker_ctx here because _start_worker
                                     # registered the task in task_contexts.
-                                    ctx_snapshot = snapshot_vars(dumps=_respdumps)
+                                    ctx_snapshot = snapshot_vars(dumps_param=_respdumps)
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
                                         ("error", e, ctx_snapshot),
@@ -582,7 +582,7 @@ class WorkerService(protocol.WorkerServicer):
                                     # resolve_context() resolves to
                                     # worker_ctx here because _start_worker
                                     # registered the task in task_contexts.
-                                    ctx_snapshot = snapshot_vars(dumps=_respdumps)
+                                    ctx_snapshot = snapshot_vars(dumps_param=_respdumps)
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
                                         ("value", value, ctx_snapshot),

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import sys
 import threading
@@ -502,6 +501,20 @@ class ContextVar(Generic[T]):
         else:
             ctx._data[self] = token._old_value
 
+    def __reduce__(self):
+        has_default = self._default is not _SENTINEL
+        ctx = resolve_context()
+        current_value = ctx._data.get(self, _UNSET)
+        return (
+            reconstruct,
+            (
+                self._key,
+                has_default,
+                self._default if has_default else None,
+                current_value,
+            ),
+        )
+
     def __repr__(self) -> str:
         default_part = (
             f" default={self._default!r}" if self._default is not _SENTINEL else ""
@@ -510,54 +523,18 @@ class ContextVar(Generic[T]):
 
 
 # ---------------------------------------------------------------
-# Pickler
+# Serialization
 # ---------------------------------------------------------------
 
 
-class _ContextPickler(cloudpickle.CloudPickler):
-    """Cloudpickle pickler that reduces :class:`ContextVar` by key.
+def dumps(value: Any) -> bytes:
+    """Serialize *value* via cloudpickle.
 
-    Embeds each :class:`ContextVar`'s current value at pickle time
-    so the receiver can apply it and arrive at the sender's state.
-
-    When *ctx* is provided, the pickler reads var values from that
-    Context. Otherwise it reads from :func:`resolve_context`. The
-    explicit-ctx path is used by :func:`snapshot_vars` so the
-    worker-side ``_done`` callback (which runs outside any task)
-    serializes from the correct Context.
+    wool.ContextVar instances in the object graph are reduced via
+    their ``__reduce__`` method, which embeds the var's current
+    value from the active Context.
     """
-
-    def __init__(self, file: Any, ctx: Context | None = None, **kwargs: Any):
-        super().__init__(file, **kwargs)
-        self._wool_ctx = ctx
-
-    def reducer_override(self, obj: Any) -> Any:
-        if isinstance(obj, ContextVar):
-            has_default = obj._default is not _SENTINEL
-            ctx = self._wool_ctx if self._wool_ctx is not None else resolve_context()
-            current_value = ctx._data.get(obj, _UNSET)
-            return (
-                reconstruct,
-                (
-                    obj._key,
-                    has_default,
-                    obj._default if has_default else None,
-                    current_value,
-                ),
-            )
-        return super().reducer_override(obj)
-
-
-def dumps(value: Any, ctx: Context | None = None) -> bytes:
-    """Serialize *value* with wool's ContextVar-aware pickler.
-
-    :param ctx:
-        Optional Context for the pickler to read var values from.
-        When ``None``, reads from the current Context.
-    """
-    buf = io.BytesIO()
-    _ContextPickler(buf, ctx=ctx).dump(value)
-    return buf.getvalue()
+    return cloudpickle.dumps(value)
 
 
 def loads(data: bytes) -> Any:
@@ -578,7 +555,7 @@ def loads(data: bytes) -> Any:
 def snapshot_vars(
     ctx: Context | None = None,
     *,
-    dumps: Callable[..., bytes] | None = None,
+    dumps_param: Callable[..., bytes] | None = None,
 ) -> dict[str, bytes]:
     """Snapshot :class:`ContextVar` values to wire form.
 
@@ -588,31 +565,16 @@ def snapshot_vars(
     :param ctx:
         Optional :class:`Context` to read from. When ``None``,
         reads from the current Context.
-    :param dumps:
+    :param dumps_param:
         Serializer for values. When ``None`` (default), uses
-        :func:`dumps` with the explicit *ctx* forwarded to the
-        pickler. Pass a ``PassthroughSerializer.dumps`` on
+        :func:`dumps`. Pass a ``PassthroughSerializer.dumps`` on
         self-dispatch to avoid cloudpickle overhead.
     :raises TypeError:
         If a value fails to serialize.
     """
     if ctx is None:
         ctx = resolve_context()
-    if dumps is not None:
-        _ser = dumps
-    else:
-        # Each value needs a fresh pickler (pickle.Pickler.memo
-        # accumulates cross-references across dump() calls which
-        # would corrupt independent value blobs), but we reuse
-        # a single BytesIO to cut allocation overhead.
-        _buf = io.BytesIO()
-
-        def _ser(v: Any) -> bytes:
-            _buf.seek(0)
-            _buf.truncate()
-            _ContextPickler(_buf, ctx=ctx).dump(v)
-            return _buf.getvalue()
-
+    _ser = dumps_param if dumps_param is not None else dumps
     result: dict[str, bytes] = {}
     for var, value in ctx._data.items():
         try:
@@ -845,20 +807,20 @@ def current_context() -> Context:
 
 def build_frame_payload(
     *,
-    dumps: Callable[..., bytes] | None = None,
+    dumps_param: Callable[..., bytes] | None = None,
 ) -> tuple[dict[str, bytes], str]:
     """Assemble the wire payload for a dispatch or streaming frame.
 
     Returns ``(vars, context_id)`` for populating the protobuf
     ``vars`` map and ``context_id`` string on any Request.
 
-    :param dumps:
+    :param dumps_param:
         Optional serializer for var values. Pass
         ``PassthroughSerializer.dumps`` on self-dispatch to avoid
         cloudpickle overhead. When ``None``, uses cloudpickle.
     """
     ctx = resolve_context()
-    vars_dict = snapshot_vars(ctx, dumps=dumps)
+    vars_dict = snapshot_vars(ctx, dumps_param=dumps_param)
     context_hex = ctx._id.hex
     return vars_dict, context_hex
 
