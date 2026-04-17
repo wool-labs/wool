@@ -104,6 +104,142 @@ class TestActivate:
         assert inside == context_id
         assert outside != context_id
 
+    @pytest.mark.asyncio
+    async def test_activate_restores_context_id_on_exception(self):
+        """Test activate() restores the prior context id when the body raises.
+
+        Given:
+            An asyncio task with a known pre-activate context id
+        When:
+            activate() is entered and the body raises an exception
+        Then:
+            The context id after catching the exception should not equal
+            the activated id
+        """
+        # Arrange
+        context_id = uuid.uuid4()
+        before_id = wool.current_context().id
+
+        # Act
+        with pytest.raises(RuntimeError):
+            with _namespace.activate(context_id):
+                raise RuntimeError("boom")
+        after_id = wool.current_context().id
+
+        # Assert
+        assert after_id != context_id
+        assert after_id == before_id
+
+    @pytest.mark.asyncio
+    async def test_activate_nested_restores_outer_context_id(self):
+        """Test nested activate() restores the outer context id on exit.
+
+        Given:
+            Two distinct context ids (outer and inner)
+        When:
+            activate() is nested with the inner id inside the outer id
+        Then:
+            Inside the inner block the inner id should be visible,
+            after the inner exits the outer id should be restored,
+            and after both exit the original id should be restored
+        """
+        # Arrange
+        outer_id = uuid.uuid4()
+        inner_id = uuid.uuid4()
+        original_id = wool.current_context().id
+
+        # Act
+        with _namespace.activate(outer_id):
+            observed_outer = wool.current_context().id
+            with _namespace.activate(inner_id):
+                observed_inner = wool.current_context().id
+            observed_after_inner = wool.current_context().id
+        observed_after_outer = wool.current_context().id
+
+        # Assert
+        assert observed_outer == outer_id
+        assert observed_inner == inner_id
+        assert observed_after_inner == outer_id
+        assert observed_after_outer == original_id
+
+    @pytest.mark.asyncio
+    async def test_activate_creates_empty_context_for_block(self):
+        """Test activate() starts with an empty context that has no vars.
+
+        Given:
+            A ContextVar with a value set before the activate block
+        When:
+            activate() is entered and the var is read inside the block
+        Then:
+            The var should not have a value set in the new context
+            (get with a default should return the default)
+        """
+        # Arrange
+        var = wool.ContextVar("ns_test_isolation", namespace="test_ns")
+        var.set("before_activate")
+        context_id = uuid.uuid4()
+
+        # Act
+        with _namespace.activate(context_id):
+            inside_value = var.get("fallback")
+
+        # Assert
+        assert inside_value == "fallback"
+
+    @pytest.mark.asyncio
+    async def test_activate_vars_set_inside_do_not_leak_outside(self):
+        """Test vars set inside activate() do not leak to the outer context.
+
+        Given:
+            A ContextVar with no value in the outer context
+        When:
+            activate() is entered and the var is set inside the block
+        Then:
+            After exiting the block the var should not have the value
+            set inside
+        """
+        # Arrange
+        var = wool.ContextVar("ns_test_leak", namespace="test_ns_leak")
+        context_id = uuid.uuid4()
+
+        # Act
+        with _namespace.activate(context_id):
+            var.set("inside_only")
+        has_value = True
+        try:
+            var.get()
+        except LookupError:
+            has_value = False
+
+        # Assert
+        assert not has_value
+
+    @pytest.mark.asyncio
+    async def test_activate_var_set_inside_visible_to_child_task(self):
+        """Test a ContextVar set inside activate propagates to a child task.
+
+        Given:
+            An activate block with a ContextVar set inside it
+        When:
+            A child task reads the var
+        Then:
+            The child task should see the value set in the activate block
+        """
+        # Arrange
+        var = wool.ContextVar("ns_test_child_prop", namespace="test_ns_child")
+        context_id = uuid.uuid4()
+
+        async def child():
+            return var.get("missing")
+
+        # Act
+        with _namespace.activate(context_id):
+            var.set("propagated")
+            observed = await asyncio.create_task(child())
+
+        # Assert
+        assert observed == "propagated"
+
 
 class TestAdoptContext:
     def test_run_adopts_outer_context_id_for_sync_caller_without_task(self):
@@ -162,3 +298,54 @@ class TestAdoptContext:
 
         # Assert
         assert observed == [outer.id]
+
+    @pytest.mark.asyncio
+    async def test_run_restores_previous_context_on_exit(self):
+        """Test Context.run restores the previous context after fn returns.
+
+        Given:
+            An asyncio task with a known current context id and a
+            separate wool.Context
+        When:
+            Context.run is invoked and returns
+        Then:
+            The current context id after run exits should equal the
+            original id, not the run context's id
+        """
+        # Arrange
+        original_id = wool.current_context().id
+        other = wool.Context()
+
+        def fn():
+            pass
+
+        # Act
+        other.run(fn)
+        after_id = wool.current_context().id
+
+        # Assert
+        assert after_id == original_id
+        assert after_id != other.id
+
+    @pytest.mark.asyncio
+    async def test_run_async_binds_context_id_for_coroutine(self):
+        """Test Context.run_async binds the context id for an async coroutine.
+
+        Given:
+            A wool.Context and a coroutine that reads current_context().id
+        When:
+            Context.run_async is invoked with the coroutine
+        Then:
+            The coroutine should observe the Context's id
+        """
+        # Arrange
+        ctx = wool.Context()
+
+        async def coro():
+            return wool.current_context().id
+
+        # Act
+        observed = await ctx.run_async(coro())
+
+        # Assert
+        assert observed == ctx.id

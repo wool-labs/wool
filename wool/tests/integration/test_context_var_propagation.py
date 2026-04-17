@@ -1217,3 +1217,181 @@ class TestUnregisteredKeyBehavior:
             assert observed == "visible-on-worker"
 
         await retry_grpc_internal(body)
+
+
+# ---------------------------------------------------------------------------
+# CF-* tests: caller-side asyncio.create_task fork parity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestCallerSideTaskFactoryFork:
+    @pytest.mark.asyncio
+    async def test_caller_child_task_inherits_var_through_dispatch(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test caller child asyncio task inherits var and dispatches correctly.
+
+        Given:
+            A caller that sets TENANT_ID and spawns an asyncio child
+            task via ``create_task`` which dispatches a routine that
+            reads the var from the worker
+        When:
+            The child task dispatches the routine
+        Then:
+            The routine should return the caller's propagated value,
+            proving the child task inherited the parent's context and
+            the dispatch propagated it to the worker
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = _default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("parent-caller-value")
+                try:
+
+                    async def _child():
+                        return await routines.get_tenant_id()
+
+                    result = await asyncio.create_task(_child())
+                finally:
+                    routines.TENANT_ID.reset(token)
+            assert result == "parent-caller-value"
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_caller_child_dispatch_mutation_does_not_leak_to_parent(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test caller child task's back-propagated mutation stays isolated.
+
+        Given:
+            A caller that sets TENANT_ID and spawns an asyncio child
+            task via ``create_task`` with a copied ``contextvars``
+            context, where the child dispatches a routine that mutates
+            the var on the worker
+        When:
+            The child task completes and the parent reads its own
+            TENANT_ID
+        Then:
+            The parent's value should remain unchanged because the
+            child task's back-propagation is scoped to its own
+            ``contextvars.Context`` copy
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = _default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("parent-original")
+                try:
+                    ctx = contextvars.copy_context()
+
+                    async def _child():
+                        worker_read = await routines.mutate_and_read_tenant_id()
+                        child_after = routines.TENANT_ID.get()
+                        return worker_read, child_after
+
+                    task = asyncio.create_task(_child(), context=ctx)
+                    worker_read, child_after = await task
+                    parent_after = routines.TENANT_ID.get()
+                finally:
+                    routines.TENANT_ID.reset(token)
+            assert worker_read == "mutated_on_worker"
+            assert child_after == "mutated_on_worker"
+            assert parent_after == "parent-original"
+
+        await retry_grpc_internal(body)
+
+
+# ---------------------------------------------------------------------------
+# SD-* tests: sequential dispatch isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestSequentialDispatchIsolation:
+    @pytest.mark.asyncio
+    async def test_sequential_dispatches_do_not_bleed_context(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test sequential dispatches do not leak var state between calls.
+
+        Given:
+            A DEFAULT pool, a first dispatch that mutates TENANT_ID on
+            the worker (back-propagating to the caller), and a caller
+            that resets the var to a fresh value before the second
+            dispatch
+        When:
+            The second dispatch reads TENANT_ID on the worker
+        Then:
+            The second dispatch should observe the caller's freshly set
+            value, not the residual mutation from the first dispatch,
+            proving each dispatch snapshots the caller's current context
+            independently
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = _default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                # First dispatch: worker mutates to "mutated_on_worker"
+                token1 = routines.TENANT_ID.set("first-dispatch-value")
+                try:
+                    first_result = await routines.mutate_and_read_tenant_id()
+                finally:
+                    routines.TENANT_ID.reset(token1)
+
+                # Second dispatch: caller sets a fresh value
+                token2 = routines.TENANT_ID.set("second-dispatch-value")
+                try:
+                    second_result = await routines.get_tenant_id()
+                finally:
+                    routines.TENANT_ID.reset(token2)
+
+            assert first_result == "mutated_on_worker"
+            assert second_result == "second-dispatch-value"
+
+        await retry_grpc_internal(body)
+
+
+# ---------------------------------------------------------------------------
+# DP-* tests: durable pool context propagation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestDurablePoolContextPropagation:
+    @pytest.mark.asyncio
+    async def test_durable_pool_propagates_wool_context_var(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test wool.ContextVar propagation works through a DURABLE pool.
+
+        Given:
+            A DURABLE pool backed by a manually started worker
+            discovered via LocalDiscovery and a caller that sets
+            TENANT_ID before dispatch
+        When:
+            The caller dispatches a coroutine that reads TENANT_ID on
+            the worker
+        Then:
+            The routine should return the caller's propagated value,
+            proving the serialization and restoration path works
+            identically for DURABLE pools
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = _default_scenario(pool_mode=PoolMode.DURABLE)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("durable-tenant")
+                try:
+                    result = await routines.get_tenant_id()
+                finally:
+                    routines.TENANT_ID.reset(token)
+            assert result == "durable-tenant"
+
+        await retry_grpc_internal(body)
