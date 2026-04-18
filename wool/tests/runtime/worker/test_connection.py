@@ -664,9 +664,10 @@ class TestWorkerConnection:
         )
         wool.__worker_uds_address__ = uds_target
 
+        _resp_ser = PassthroughSerializer()
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("result"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -1434,9 +1435,10 @@ class TestWorkerConnection:
             version="1.0.0",
         )
 
+        _resp_ser = PassthroughSerializer()
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("result"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -1492,9 +1494,10 @@ class TestWorkerConnection:
         )
         wool.__worker_uds_address__ = uds_target
 
+        _resp_ser = PassthroughSerializer()
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("result"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -1649,10 +1652,11 @@ class TestWorkerConnection:
         var = ContextVar("conn_d_var", namespace="conn_d")
         var.set("test_value")
 
+        _resp_ser = PassthroughSerializer()
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("first"))),
-            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("second"))),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("first"))),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("second"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -1714,7 +1718,7 @@ class TestWorkerConnection:
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(
-                result=protocol.Message(dump=cloudpickle.dumps("result")),
+                result=protocol.Message(dump=serializer.dumps("result")),
                 vars={var.key: pt_bytes},
             ),
         )
@@ -1818,9 +1822,10 @@ class TestWorkerConnection:
         var = ContextVar("conn_g_var", namespace="conn_g")
         var.set("initial_value")
 
+        _resp_ser = PassthroughSerializer()
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("done"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 

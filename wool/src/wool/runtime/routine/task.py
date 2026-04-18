@@ -309,20 +309,15 @@ class Task(Generic[W]):
         if task.HasField("serializer"):
             s = _unpickle_serializer(task.serializer)
             loads = s.loads
-            if isinstance(s, PassthroughSerializer):
-                proxy_loads = s.loads
-            else:
-                proxy_loads = cloudpickle.loads
         else:
             loads = cloudpickle.loads
-            proxy_loads = cloudpickle.loads
         return cls(
             id=UUID(task.id),
             callable=loads(task.callable),
             args=loads(task.args),
             kwargs=loads(task.kwargs),
             caller=UUID(task.caller) if task.caller else None,
-            proxy=proxy_loads(task.proxy),
+            proxy=loads(task.proxy),
             timeout=task.timeout if task.timeout else 0,
             tag=task.tag if task.tag else None,
         )
@@ -348,9 +343,6 @@ class Task(Generic[W]):
             A protobuf ``Task`` message.
         """
         dumps = serializer.dumps if serializer is not None else _context_dumps
-        proxy_dumps = (
-            dumps if isinstance(serializer, PassthroughSerializer) else _context_dumps
-        )
         task_msg = protocol.Task(
             version=protocol.__version__,
             id=str(self.id),
@@ -358,7 +350,7 @@ class Task(Generic[W]):
             args=dumps(self.args),
             kwargs=dumps(self.kwargs),
             caller=str(self.caller) if self.caller else "",
-            proxy=proxy_dumps(self.proxy),
+            proxy=dumps(self.proxy),
             proxy_id=str(self.proxy.id),
             timeout=int(self.timeout) if self.timeout else 0,
             tag=self.tag if self.tag else "",

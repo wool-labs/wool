@@ -14,7 +14,7 @@ from wool.runtime.context import build_frame_payload
 from wool.runtime.context import current_context
 from wool.runtime.context import dumps
 from wool.runtime.context import loads
-from wool.runtime.context import reconstruct
+from wool.runtime.context import reconstruct_var
 from wool.runtime.context import snapshot_vars
 
 
@@ -360,7 +360,7 @@ class TestContextVar:
             without raising ContextVarCollision
         """
         # Arrange
-        reconstructed = reconstruct("myapp:promo_a", True, "from_wire")
+        reconstructed = reconstruct_var("myapp:promo_a", True, "from_wire")
 
         # Act
         promoted = ContextVar("promo_a", namespace="myapp", default="from_code")
@@ -380,7 +380,7 @@ class TestContextVar:
             get() returns 'from_code' --- the module-scope default wins
         """
         # Arrange
-        stub = reconstruct("myapp:promo_b", True, "from_wire")
+        stub = reconstruct_var("myapp:promo_b", True, "from_wire")
 
         # Act
         var = ContextVar("promo_b", namespace="myapp", default="from_code")
@@ -402,7 +402,7 @@ class TestContextVar:
             get() returns the wire-applied value, not the module default
         """
         # Arrange
-        stub = reconstruct("myapp:promo_c", True, "from_wire")
+        stub = reconstruct_var("myapp:promo_c", True, "from_wire")
         apply_vars({"myapp:promo_c": dumps("applied_value")})
 
         # Act
@@ -424,7 +424,7 @@ class TestContextVar:
             ContextVarCollision is raised --- promotion is one-shot
         """
         # Arrange
-        stub = reconstruct("myapp:promo_d", True, "from_wire")
+        stub = reconstruct_var("myapp:promo_d", True, "from_wire")
         promoted = ContextVar("promo_d", namespace="myapp", default="first")
 
         # Act & assert
@@ -446,7 +446,7 @@ class TestContextVar:
         """
         # Arrange
         expected_ns = __name__.partition(".")[0]
-        reconstructed = reconstruct(f"{expected_ns}:promo_e", True, "from_wire")
+        reconstructed = reconstruct_var(f"{expected_ns}:promo_e", True, "from_wire")
 
         # Act
         promoted = ContextVar("promo_e", default="from_code")
@@ -455,7 +455,7 @@ class TestContextVar:
         assert promoted is reconstructed
 
     def test_reconstructed_stub_survives_garbage_collection(self):
-        """Test a sallyport-registered stub is not reaped before promotion.
+        """Test a reconstructed stub is not reaped before promotion.
 
         Given:
             A stub reconstructed from the wire with no user-visible owner
@@ -463,12 +463,12 @@ class TestContextVar:
             The garbage collector runs a full cycle
         Then:
             The stub is still in the registry and its applied value
-            remains readable --- the sallyport pin keeps it alive
+            remains readable --- the Context-scoped pin keeps it alive
         """
         import gc
 
         # Arrange
-        reconstruct("elsewhere:gc_target", True, "fallback")
+        reconstruct_var("elsewhere:gc_target", True, "fallback")
         apply_vars({"elsewhere:gc_target": dumps("applied_before_gc")})
 
         # Act
@@ -476,13 +476,13 @@ class TestContextVar:
         gc.collect()
 
         # Assert — reconstruct returns the existing instance if alive
-        survived = reconstruct("elsewhere:gc_target", True, "fallback")
+        survived = reconstruct_var("elsewhere:gc_target", True, "fallback")
 
         assert survived is not None
         assert survived.get() == "applied_before_gc"
 
     def test_stub_pin_released_on_promotion_allows_gc(self):
-        """Test promotion drops the sallyport pin so a promoted var can be GC'd.
+        """Test promotion drops the stub pin so a promoted var can be GC'd.
 
         Given:
             A reconstructed stub that is promoted by a module-scope
@@ -494,18 +494,20 @@ class TestContextVar:
             holds it, so lifetime defers to user code's strong refs
         """
         import gc
+        import weakref
 
         # Arrange
-        reconstruct("myapp:release_target", False, None)
-
+        reconstruct_var("myapp:release_target", False, None)
         promoted = ContextVar("release_target", namespace="myapp")
+        ref = weakref.ref(promoted)
 
         # Act
         del promoted
         gc.collect()
 
-        # Assert — the old var was GC'd, so constructing a new one
-        # with the same key should succeed without ContextVarCollision
+        # Assert — direct evidence the promoted var was reclaimed
+        assert ref() is None
+        # And re-constructing with the same key succeeds (no collision)
         replacement = ContextVar("release_target", namespace="myapp")
         assert replacement is not None
 
@@ -521,7 +523,7 @@ class TestContextVar:
             value is visible, reset restores the prior default
         """
         # Arrange
-        var = reconstruct("elsewhere:pre_promo", True, "initial")
+        var = reconstruct_var("elsewhere:pre_promo", True, "initial")
 
         # Act
         token = var.set("updated")
@@ -551,6 +553,25 @@ class TestContextVar:
         # Assert
         assert restored is var
 
+    def test_repr_includes_key(self):
+        """Test ContextVar repr includes the full key.
+
+        Given:
+            A ContextVar with a name
+        When:
+            repr() is called on it
+        Then:
+            The repr should include 'namespace:name'
+        """
+        # Arrange
+        var = ContextVar("repr_cv")
+
+        # Act
+        text = repr(var)
+
+        # Assert
+        assert f"'{var.key}'" in text
+
 
 class TestToken:
     def test_pickle_roundtrip_preserves_var_reference(self):
@@ -573,6 +594,26 @@ class TestToken:
         # Assert
         assert restored.var is var
         assert restored.old_value is Token.MISSING
+
+    def test_repr_includes_var_key(self):
+        """Test Token repr includes the owning var's key.
+
+        Given:
+            A Token produced by set() on a ContextVar
+        When:
+            repr() is called on it
+        Then:
+            The repr should include the var's full key
+        """
+        # Arrange
+        var = ContextVar("repr_token_var")
+        token = var.set("x")
+
+        # Act
+        text = repr(token)
+
+        # Assert
+        assert var.key in text
 
 
 class TestContext:
@@ -958,7 +999,7 @@ class TestContext:
         Given:
             A ContextVar set to a specific value in the current context
         When:
-            The var is pickled and unpickled inside a fresh stdlib Context
+            The var is pickled and unpickled inside a fresh wool.Context
         Then:
             The receiver's var.get() returns the value that was set at
             pickle time --- the reducer-override embedded it
@@ -975,7 +1016,7 @@ class TestContext:
             restored = loads(pickled)
             observed.append(restored.get())
 
-        contextvars.copy_context().run(in_fresh)
+        Context().run(in_fresh)
 
         # Assert
         assert observed == ["pickled_value"]
@@ -986,26 +1027,30 @@ class TestContext:
         Given:
             A ContextVar that has never been set in the current context
         When:
-            The var is pickled and unpickled inside a fresh stdlib Context
+            The var is pickled and unpickled inside a fresh wool.Context
         Then:
             The receiver's var.get() returns the class-level default
-            (nothing was applied from the pickle)
+            and the receiver's Context does not contain the var
+            (no value was embedded in the pickle)
         """
         # Arrange
         var = ContextVar("pickle_no_value", default="default_value")
         pickled = dumps(var)
 
         # Act
-        observed: list[object] = []
+        observed_get: list[object] = []
+        observed_ctx: list[Context] = []
 
         def in_fresh():
             restored = loads(pickled)
-            observed.append(restored.get())
+            observed_get.append(restored.get())
+            observed_ctx.append(current_context())
 
-        contextvars.copy_context().run(in_fresh)
+        Context().run(in_fresh)
 
         # Assert
-        assert observed == ["default_value"]
+        assert observed_get == ["default_value"]
+        assert var not in observed_ctx[0]
 
     @pytest.mark.asyncio
     async def test_run_async_concurrent_entry_raises(self):
@@ -1210,47 +1255,6 @@ def test_current_context_captures_set_vars_with_id():
     assert ctx.id is not None
 
 
-class TestPublicTypeShape:
-    def test_token_repr_includes_var_key(self):
-        """Test Token repr includes the owning var's key.
-
-        Given:
-            A Token produced by set() on a ContextVar
-        When:
-            repr() is called on it
-        Then:
-            The repr should include the var's full key
-        """
-        # Arrange
-        var = ContextVar("repr_token_var")
-        token = var.set("x")
-
-        # Act
-        text = repr(token)
-
-        # Assert
-        assert var.key in text
-
-    def test_contextvar_repr_includes_key(self):
-        """Test ContextVar repr includes the full key.
-
-        Given:
-            A ContextVar with a name
-        When:
-            repr() is called on it
-        Then:
-            The repr should include 'namespace:name'
-        """
-        # Arrange
-        var = ContextVar("repr_cv")
-
-        # Act
-        text = repr(var)
-
-        # Assert
-        assert f"'{var.key}'" in text
-
-
 def test_snapshot_vars_with_custom_dumps():
     """Test snapshot_vars serializes values via a custom dumps callable.
 
@@ -1331,7 +1335,7 @@ def test_apply_vars_with_custom_loads():
         return "decoded-" + data.decode()
 
     # Act
-    apply_vars(wire_vars, loads=custom_loads)
+    apply_vars(wire_vars, loads_param=custom_loads)
 
     # Assert
     assert var.get() == "decoded-custom-payload"
@@ -1454,6 +1458,97 @@ async def test_install_task_factory_composes_with_existing():
     # Assert
     assert len(calls) > 0  # custom factory was called
     assert result == "parent_value"  # wool context inherited
+
+    # Cleanup
+    loop.set_task_factory(None)
+
+
+@pytest.mark.asyncio
+async def test_install_task_factory_idempotent_over_composed():
+    """Test install_task_factory is a no-op when a wool-composed factory is installed.
+
+    Given:
+        A user factory was set on the loop and install_task_factory
+        composed around it
+    When:
+        install_task_factory is called again
+    Then:
+        The second call recognizes the _wool_wrapped marker and
+        returns without replacing the composed factory
+    """
+    from wool.runtime.context import install_task_factory
+
+    # Arrange
+    loop = asyncio.get_running_loop()
+
+    def custom_factory(loop, coro, **kwargs):
+        return asyncio.Task(coro, loop=loop, **kwargs)
+
+    loop.set_task_factory(custom_factory)
+    install_task_factory()
+    composed = loop.get_task_factory()
+
+    # Act
+    install_task_factory()
+
+    # Assert
+    assert loop.get_task_factory() is composed
+
+    # Cleanup
+    loop.set_task_factory(None)
+
+
+@pytest.mark.asyncio
+async def test_install_task_factory_emits_debug_log_for_each_path(caplog):
+    """Test install_task_factory emits a debug log for each install path.
+
+    Given:
+        A running event loop and the wool context module's logger at
+        DEBUG level
+    When:
+        install_task_factory runs against no prior factory, an already
+        installed wool factory, and a custom user factory
+    Then:
+        Each invocation emits a debug log naming the path taken
+    """
+    from wool.runtime.context import install_task_factory
+
+    # Arrange
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(None)
+
+    # Act & assert — fresh install path
+    with caplog.at_level("DEBUG", logger="wool.runtime.context"):
+        install_task_factory()
+    assert any("wool task factory installed" in r.message for r in caplog.records)
+    caplog.clear()
+
+    # Act & assert — already-installed path
+    with caplog.at_level("DEBUG", logger="wool.runtime.context"):
+        install_task_factory()
+    assert any("already installed" in r.message for r in caplog.records)
+    caplog.clear()
+
+    # Arrange — custom factory in place
+    loop.set_task_factory(None)
+
+    def custom_factory(loop, coro, **kwargs):
+        return asyncio.Task(coro, loop=loop, **kwargs)
+
+    loop.set_task_factory(custom_factory)
+
+    # Act & assert — compose path
+    with caplog.at_level("DEBUG", logger="wool.runtime.context"):
+        install_task_factory()
+    assert any("composed with existing factory" in r.message for r in caplog.records)
+    caplog.clear()
+
+    # Act & assert — already-composed path
+    with caplog.at_level("DEBUG", logger="wool.runtime.context"):
+        install_task_factory()
+    assert any(
+        "composed task factory already installed" in r.message for r in caplog.records
+    )
 
     # Cleanup
     loop.set_task_factory(None)

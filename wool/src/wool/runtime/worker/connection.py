@@ -165,15 +165,19 @@ class _DispatchStream(Generic[_T]):
         try:
             response = await anext(self._iter)
             if response.vars:
-                _loads_fn = PassthroughSerializer.loads if self._serializer else None
                 apply_vars(
                     dict(response.vars),
-                    **({"loads": _loads_fn} if _loads_fn else {}),
+                    loads_param=(
+                        PassthroughSerializer.loads if self._serializer else None
+                    ),
                 )
+            _msg_loads = (
+                self._serializer.loads if self._serializer else cloudpickle.loads
+            )
             if response.HasField("result"):
-                return cloudpickle.loads(response.result.dump)
+                return _msg_loads(response.result.dump)
             elif response.HasField("exception"):
-                raise cloudpickle.loads(response.exception.dump)
+                raise _msg_loads(response.exception.dump)
             else:
                 raise UnexpectedResponse(
                     f"Expected 'result' or 'exception' response, "
@@ -228,7 +232,8 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            dump = dumps(value)
+            _msg_dumps = self._serializer.dumps if self._serializer else dumps
+            dump = _msg_dumps(value)
             vars_dict, context_hex = build_frame_payload(
                 dumps_param=self._serializer.dumps if self._serializer else None
             )
@@ -278,7 +283,8 @@ class _DispatchStream(Generic[_T]):
             else:  # pragma: no cover
                 exc = typ()
 
-            dump = dumps(exc)
+            _msg_dumps = self._serializer.dumps if self._serializer else dumps
+            dump = _msg_dumps(exc)
             vars_dict, context_hex = build_frame_payload(
                 dumps_param=self._serializer.dumps if self._serializer else None
             )

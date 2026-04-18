@@ -2647,7 +2647,7 @@ class TestWorkerService:
                 )
                 response = await anext(aiter(stream))
                 assert response.HasField("result")
-                results.append(cloudpickle.loads(response.result.dump))
+                results.append(PassthroughSerializer.loads(response.result.dump))
 
             await stream.done_writing()
             async for _ in stream:

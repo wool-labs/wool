@@ -27,12 +27,12 @@ from grpc.aio import ServicerContext
 import wool
 from wool import protocol
 from wool.runtime.context import Context
+from wool.runtime.context import _task_contexts
+from wool.runtime.context import _task_contexts_lock
 from wool.runtime.context import apply_vars
 from wool.runtime.context import dumps
 from wool.runtime.context import resolve_context
 from wool.runtime.context import snapshot_vars
-from wool.runtime.context import task_contexts
-from wool.runtime.context import task_contexts_lock
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import PassthroughSerializer
 from wool.runtime.routine.task import Task
@@ -90,6 +90,13 @@ class BackpressureLike(Protocol):
     transient and skips to the next worker.
 
     Pass ``None`` (the default) to accept all tasks unconditionally.
+
+    The hook runs after the caller's wire-shipped ContextVar snapshot
+    is applied to the handler's context, so a hook that reads a
+    :class:`wool.ContextVar` (e.g., a tenant id) observes the caller's
+    value for that dispatch. This enables tenant- or request-scoped
+    admission decisions without plumbing values through the
+    :class:`BackpressureContext` explicitly.
 
     Both sync and async implementations are supported::
 
@@ -259,8 +266,8 @@ class WorkerService(protocol.WorkerServicer):
             if request.vars:
                 apply_vars(
                     dict(request.vars),
-                    **(
-                        {"loads": PassthroughSerializer.loads} if _is_passthrough else {}
+                    loads_param=(
+                        PassthroughSerializer.loads if _is_passthrough else None
                     ),
                 )
 
@@ -280,6 +287,13 @@ class WorkerService(protocol.WorkerServicer):
                     )
 
             handler_ctx = resolve_context()
+            # Message bodies use the negotiated serializer for parity
+            # with vars and the Task payload. The PassthroughSerializer
+            # instance must outlive every dumps call (it strong-refs
+            # the stored objects via self._keys), so bind it to a local
+            # that lives for the duration of the handler.
+            _msg_ser = PassthroughSerializer() if _is_passthrough else None
+            _msg_dumps = _msg_ser.dumps if _msg_ser else dumps
             with self._tracker(
                 work_task,
                 request_iterator,
@@ -293,7 +307,7 @@ class WorkerService(protocol.WorkerServicer):
                         async for outcome in task:
                             if outcome.exception is not None:
                                 exception = protocol.Message(
-                                    dump=dumps(outcome.exception)
+                                    dump=_msg_dumps(outcome.exception)
                                 )
                                 yield protocol.Response(
                                     exception=exception,
@@ -301,7 +315,7 @@ class WorkerService(protocol.WorkerServicer):
                                     context_id=response_context_hex,
                                 )
                                 return
-                            result = protocol.Message(dump=dumps(outcome.result))
+                            result = protocol.Message(dump=_msg_dumps(outcome.result))
                             yield protocol.Response(
                                 result=result,
                                 vars=outcome.snapshot,
@@ -310,14 +324,16 @@ class WorkerService(protocol.WorkerServicer):
                     elif isinstance(task, asyncio.Task):
                         outcome: _WorkerOutcome = await task
                         if outcome.exception is not None:
-                            exception = protocol.Message(dump=dumps(outcome.exception))
+                            exception = protocol.Message(
+                                dump=_msg_dumps(outcome.exception)
+                            )
                             yield protocol.Response(
                                 exception=exception,
                                 vars=outcome.snapshot,
                                 context_id=response_context_hex,
                             )
                         else:
-                            result = protocol.Message(dump=dumps(outcome.result))
+                            result = protocol.Message(dump=_msg_dumps(outcome.result))
                             yield protocol.Response(
                                 result=result,
                                 vars=outcome.snapshot,
@@ -331,7 +347,7 @@ class WorkerService(protocol.WorkerServicer):
                     # so this branch does not see them. Best-effort
                     # snapshot from the handler context since no
                     # frame-level snapshot is available at this point.
-                    exception = protocol.Message(dump=dumps(e))
+                    exception = protocol.Message(dump=_msg_dumps(e))
                     _fallback_ser = PassthroughSerializer() if _is_passthrough else None
                     ctx_snapshot = snapshot_vars(
                         dumps_param=_fallback_ser.dumps if _fallback_ser else None
@@ -440,8 +456,8 @@ class WorkerService(protocol.WorkerServicer):
                 nonlocal worker_task
                 task = asyncio.Task(work_task._run(), loop=worker_loop)
                 worker_task = task
-                with task_contexts_lock:
-                    task_contexts[task] = worker_ctx
+                with _task_contexts_lock:
+                    _task_contexts[task] = worker_ctx
 
                 def _done(t: asyncio.Task):
                     if future.done():
@@ -521,6 +537,7 @@ class WorkerService(protocol.WorkerServicer):
         worker_ctx = handler_ctx.copy()
         _resp_ser = PassthroughSerializer() if passthrough else None
         _respdumps = _resp_ser.dumps if _resp_ser else None
+        _msg_loads = PassthroughSerializer.loads if passthrough else cloudpickle.loads
         request_queue: asyncio.Queue = asyncio.Queue()
         result_queue: asyncio.Queue = asyncio.Queue()
 
@@ -543,10 +560,10 @@ class WorkerService(protocol.WorkerServicer):
                                 if caller_ctx:
                                     apply_vars(
                                         caller_ctx,
-                                        **(
-                                            {"loads": PassthroughSerializer.loads}
+                                        loads_param=(
+                                            PassthroughSerializer.loads
                                             if passthrough
-                                            else {}
+                                            else None
                                         ),
                                     )
                                 try:
@@ -570,7 +587,7 @@ class WorkerService(protocol.WorkerServicer):
                                 except BaseException as e:
                                     # resolve_context() resolves to
                                     # worker_ctx here because _start_worker
-                                    # registered the task in task_contexts.
+                                    # registered the task in _task_contexts.
                                     ctx_snapshot = snapshot_vars(dumps_param=_respdumps)
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
@@ -580,7 +597,7 @@ class WorkerService(protocol.WorkerServicer):
                                 else:
                                     # resolve_context() resolves to
                                     # worker_ctx here because _start_worker
-                                    # registered the task in task_contexts.
+                                    # registered the task in _task_contexts.
                                     ctx_snapshot = snapshot_vars(dumps_param=_respdumps)
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
@@ -607,8 +624,8 @@ class WorkerService(protocol.WorkerServicer):
 
             def _start_worker():
                 task = asyncio.Task(worker_dispatch(), loop=worker_loop)
-                with task_contexts_lock:
-                    task_contexts[task] = worker_ctx
+                with _task_contexts_lock:
+                    _task_contexts[task] = worker_ctx
 
             worker_loop.call_soon_threadsafe(_start_worker)
 
@@ -622,13 +639,13 @@ class WorkerService(protocol.WorkerServicer):
                                 ("next", None, caller_ctx),
                             )
                         case "send":
-                            value = cloudpickle.loads(request.send.dump)
+                            value = _msg_loads(request.send.dump)
                             worker_loop.call_soon_threadsafe(
                                 request_queue.put_nowait,
                                 ("send", value, caller_ctx),
                             )
                         case "throw":
-                            exc = cloudpickle.loads(request.throw.dump)
+                            exc = _msg_loads(request.throw.dump)
                             worker_loop.call_soon_threadsafe(
                                 request_queue.put_nowait,
                                 ("throw", exc, caller_ctx),

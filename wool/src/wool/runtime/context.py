@@ -68,15 +68,69 @@ _UNSET: Final = _UnsetType()
 
 
 # ---------------------------------------------------------------
+# Stub pin anchors
+# ---------------------------------------------------------------
+
+
+class _StubPin:
+    """Severable anchor that keeps a stub :class:`ContextVar` alive.
+
+    Held strongly by each :class:`Context` that observed the stub's
+    creation (via :data:`Context._stub_pins`), and weakly indexed by
+    var key in :data:`_stub_pin_anchors`. Because the only path from
+    a Context to its pinned stub goes through this anchor, promotion
+    can release the stub in O(1) by nulling :attr:`stub` — live
+    Contexts retain the gutted anchor until they are themselves
+    collected, but the stub itself is free to be reclaimed as soon
+    as user references drop.
+    """
+
+    __slots__ = ("stub", "__weakref__")
+
+    stub: ContextVar[Any] | None
+
+    def __init__(self, stub: ContextVar[Any]):
+        self.stub = stub
+
+
+# Weakly indexes anchors by var key for O(1) release on promotion.
+# Entries auto-prune when the anchor has no strong refs (all pinning
+# Contexts have died without promotion occurring).
+_stub_pin_anchors: weakref.WeakValueDictionary[str, _StubPin] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _pin_stub(stub: ContextVar[Any], ctx: Context) -> None:
+    """Pin a freshly reconstructed stub to ``ctx`` and the global index."""
+    anchor = _StubPin(stub)
+    _stub_pin_anchors[stub._key] = anchor
+    ctx._stub_pins.add(anchor)
+
+
+def _release_stub_pin(key: str) -> None:
+    """Release the stub pin for ``key`` so the stub can be reclaimed.
+
+    Called on stub promotion. Pops the anchor from the global index
+    and severs its strong reference to the stub; any live Context
+    still holding the (now gutted) anchor in its pin set drops it
+    naturally when the Context itself is collected.
+    """
+    anchor = _stub_pin_anchors.pop(key, None)
+    if anchor is not None:
+        anchor.stub = None
+
+
+# ---------------------------------------------------------------
 # Task-keyed context store
 # ---------------------------------------------------------------
 
 # Per-task wool.Context, keyed by the live asyncio.Task object.
 # Entries vanish when the task is garbage-collected.
-task_contexts: weakref.WeakKeyDictionary[asyncio.Task[Any], Context] = (
+_task_contexts: weakref.WeakKeyDictionary[asyncio.Task[Any], Context] = (
     weakref.WeakKeyDictionary()
 )
-task_contexts_lock: threading.Lock = threading.Lock()
+_task_contexts_lock: threading.Lock = threading.Lock()
 
 # Sync/no-task fallback: one wool.Context per thread.
 _thread_context: threading.local = threading.local()
@@ -86,7 +140,7 @@ def resolve_context() -> Context:
     """Return the wool.Context for the current execution scope.
 
     Inside an asyncio task, looks up the task's Context in the
-    process-wide :data:`task_contexts` dict. Outside a task (sync
+    process-wide :data:`_task_contexts` dict. Outside a task (sync
     code), uses a per-thread fallback. If no Context exists for the
     current scope, one is created lazily and registered.
     """
@@ -95,12 +149,12 @@ def resolve_context() -> Context:
     except RuntimeError:
         task = None
     if task is not None:
-        with task_contexts_lock:
-            ctx = task_contexts.get(task)
+        with _task_contexts_lock:
+            ctx = _task_contexts.get(task)
             if ctx is not None:
                 return ctx
             ctx = Context()
-            task_contexts[task] = ctx
+            _task_contexts[task] = ctx
             return ctx
     ctx = getattr(_thread_context, "ctx", None)
     if ctx is None:
@@ -114,22 +168,29 @@ def swap_context(new: Context) -> Context:
 
     Used by :meth:`Context.run` and :func:`activate` to temporarily
     install a specific Context.
+
+    When no Context was previously registered for the current scope,
+    a fresh :class:`Context` is returned as a restore-sentinel. Its
+    UUID does not match any downstream lineage, but that is
+    indistinguishable from the state callers would have observed
+    before the swap: :func:`resolve_context` would have lazily
+    created a Context with a fresh UUID on the first access.
     """
     try:
         task = asyncio.current_task()
     except RuntimeError:
         task = None
     if task is not None:
-        with task_contexts_lock:
-            prev = task_contexts.get(task)
-            task_contexts[task] = new
+        with _task_contexts_lock:
+            prev = _task_contexts.get(task)
+            _task_contexts[task] = new
         if prev is None:
-            prev = Context()
+            prev = Context()  # restore-sentinel; see docstring
         return prev
     prev = getattr(_thread_context, "ctx", None)
     _thread_context.ctx = new
     if prev is None:
-        prev = Context()
+        prev = Context()  # restore-sentinel; see docstring
     return prev
 
 
@@ -160,7 +221,7 @@ def _infer_namespace() -> str:
 # ---------------------------------------------------------------
 
 
-def reconstruct(
+def reconstruct_var(
     key: str,
     has_default: bool,
     default: Any,
@@ -180,24 +241,29 @@ def reconstruct(
     sender's state. Defaults to :data:`_UNSET` so callers
     reconstructing a var without a known value can omit the argument.
     """
+    ctx = resolve_context()
     with ContextVar._registry_lock:
         existing = ContextVar._registry.get(key)
-    if existing is None:
-        existing = _register_unchecked(key, has_default, default)
+        if existing is None:
+            existing = _register_unchecked(key, has_default, default)
+            _pin_stub(existing, ctx)
     if current_value is not _UNSET:
-        ctx = resolve_context()
         ctx._data[existing] = current_value
     return existing
 
 
 def _register_unchecked(key: str, has_default: bool, default: Any) -> ContextVar:
-    """Sallyport: build and register a :class:`ContextVar` by key
-    without running the public constructor's duplicate-key check.
+    """Build and register a :class:`ContextVar` by key, bypassing the
+    public constructor's duplicate-key check.
 
     Intended exclusively for the unpickle path
-    (:func:`reconstruct`). The produced instance is flagged
+    (:func:`reconstruct_var`). The produced instance is flagged
     ``_stub=True`` so a later authoritative module-scope
     ``ContextVar(name, namespace=...)`` call can promote it in place.
+
+    Caller MUST hold :data:`ContextVar._registry_lock` and is
+    responsible for pinning the returned stub to a Context via
+    :func:`_pin_stub` to keep it alive.
     """
     ns, _, name = key.partition(":")
     instance: ContextVar = object.__new__(ContextVar)
@@ -206,9 +272,7 @@ def _register_unchecked(key: str, has_default: bool, default: Any) -> ContextVar
     instance._key = key
     instance._default = default if has_default else _SENTINEL
     instance._stub = True
-    with ContextVar._registry_lock:
-        ContextVar._registry[key] = instance
-        ContextVar._stub_pins[key] = instance
+    ContextVar._registry[key] = instance
     return instance
 
 
@@ -320,6 +384,17 @@ class ContextVar(Generic[T]):
     Two distinct instances constructed under the same key raise
     :class:`ContextVarCollision`.
 
+    **Namespace stability:** the inferred namespace is the top-level
+    package of the calling frame. This is deliberately coarse so that
+    wire keys stay stable when a module is refactored deeper within
+    its package — a rolling deploy that moves
+    ``myapp.auth.tokens`` to ``myapp.auth.credentials.tokens``
+    continues to propagate values between caller and worker. The
+    trade-off is that two subpackages of the same library cannot
+    define distinct vars with the same ``name`` without one of them
+    passing ``namespace=`` explicitly; the construction raises
+    :class:`ContextVarCollision` instead.
+
     **Storage model:** values are stored in the current
     :class:`Context` (one per asyncio.Task, one per thread for sync
     code). A task factory seeds each new task with a copy of the
@@ -340,7 +415,6 @@ class ContextVar(Generic[T]):
     _registry: ClassVar[weakref.WeakValueDictionary[str, ContextVar[Any]]] = (
         weakref.WeakValueDictionary()
     )
-    _stub_pins: ClassVar[dict[str, ContextVar[Any]]] = {}
     _registry_lock: ClassVar[threading.RLock] = threading.RLock()
 
     _name: str
@@ -348,6 +422,25 @@ class ContextVar(Generic[T]):
     _key: str
     _default: Any
     _stub: bool
+
+    @overload
+    def __new__(
+        cls,
+        name: str,
+        /,
+        *,
+        namespace: str | None = None,
+    ) -> ContextVar[T]: ...
+
+    @overload
+    def __new__(
+        cls,
+        name: str,
+        /,
+        *,
+        namespace: str | None = None,
+        default: T,
+    ) -> ContextVar[T]: ...
 
     def __new__(
         cls,
@@ -357,6 +450,12 @@ class ContextVar(Generic[T]):
         namespace: str | None = None,
         default: Any = _SENTINEL,
     ) -> ContextVar[T]:
+        # All fields are initialized here under _registry_lock to close
+        # the race between instance creation and registry visibility.
+        # No __init__ is defined — ``object.__init__`` silently accepts
+        # the extra args (CPython short-circuit when __new__ is
+        # overridden), so callers using the overload signatures above
+        # still construct cleanly without an empty __init__ body.
         ns = namespace if namespace is not None else _infer_namespace()
         key = f"{ns}:{name}"
         with cls._registry_lock:
@@ -365,7 +464,7 @@ class ContextVar(Generic[T]):
                 if existing._stub:
                     existing._default = default
                     existing._stub = False
-                    cls._stub_pins.pop(key, None)
+                    _release_stub_pin(key)
                     return existing
                 raise ContextVarCollision(
                     f"wool.ContextVar {key!r} is already registered "
@@ -373,39 +472,13 @@ class ContextVar(Generic[T]):
                     f"namespace."
                 )
             instance = super().__new__(cls)
+            instance._name = name
             instance._namespace = ns
+            instance._key = key
+            instance._default = default
+            instance._stub = False
+            cls._registry[key] = instance
             return instance
-
-    @overload
-    def __init__(self, name: str, /, *, namespace: str | None = None) -> None: ...
-
-    @overload
-    def __init__(
-        self,
-        name: str,
-        /,
-        *,
-        namespace: str | None = None,
-        default: T,
-    ) -> None: ...
-
-    def __init__(
-        self,
-        name: str,
-        /,
-        *,
-        namespace: str | None = None,
-        default: Any = _SENTINEL,
-    ):
-        if getattr(self, "_key", None) is not None:
-            return
-        ns = self._namespace
-        key = f"{ns}:{name}"
-        self._name = name
-        self._key = key
-        self._default = default
-        self._stub = False
-        type(self)._registry[key] = self
 
     @property
     def name(self) -> str:
@@ -506,7 +579,7 @@ class ContextVar(Generic[T]):
         ctx = resolve_context()
         current_value = ctx._data.get(self, _UNSET)
         return (
-            reconstruct,
+            reconstruct_var,
             (
                 self._key,
                 has_default,
@@ -590,7 +663,7 @@ def snapshot_vars(
 def apply_vars(
     wire_vars: dict[str, bytes],
     *,
-    loads: Callable[[bytes], Any] = loads,
+    loads_param: Callable[[bytes], Any] | None = None,
 ) -> None:
     """Apply a wire-form context snapshot to the current Context.
 
@@ -601,11 +674,14 @@ def apply_vars(
 
     :param wire_vars:
         A ``{key: serialized_value}`` dict from the proto map.
-    :param loads:
-        Deserializer for values. Defaults to :func:`loads`.
+    :param loads_param:
+        Deserializer for values. When ``None`` (default), uses
+        :func:`loads`. Pass ``PassthroughSerializer.loads`` on
+        self-dispatch to avoid cloudpickle overhead.
     """
     if not wire_vars:
         return
+    _deser = loads_param if loads_param is not None else loads
     ctx = resolve_context()
     for key, data in wire_vars.items():
         with ContextVar._registry_lock:
@@ -617,7 +693,12 @@ def apply_vars(
                 key,
             )
             continue
-        ctx._data[var] = loads(data)
+        try:
+            ctx._data[var] = _deser(data)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to deserialize wool.ContextVar {key!r}: {e}"
+            ) from e
 
 
 # ---------------------------------------------------------------
@@ -625,7 +706,7 @@ def apply_vars(
 # ---------------------------------------------------------------
 
 
-def reconstruct_context(
+def _reconstruct_context(
     id: UUID,
     vars: dict[ContextVar[Any], Any],
 ) -> Context:
@@ -663,12 +744,13 @@ class Context:
     raise :class:`RuntimeError` on re-entry.
     """
 
-    __slots__ = ("_id", "_data", "_running", "_running_lock")
+    __slots__ = ("_id", "_data", "_running", "_running_lock", "_stub_pins")
 
     _id: UUID
     _data: dict[ContextVar[Any], Any]
     _running: bool
     _running_lock: threading.Lock
+    _stub_pins: set[_StubPin]
 
     def __new__(cls) -> Context:
         return cls._create(uuid4(), {})
@@ -685,6 +767,7 @@ class Context:
         instance._data = data
         instance._running = False
         instance._running_lock = threading.Lock()
+        instance._stub_pins = set()
         return instance
 
     @property
@@ -753,8 +836,8 @@ class Context:
             # allocation that we'd immediately overwrite.
             loop = asyncio.get_running_loop()
             task = asyncio.Task(coro, loop=loop)
-            with task_contexts_lock:
-                task_contexts[task] = self
+            with _task_contexts_lock:
+                _task_contexts[task] = self
             result = await task
         finally:
             self._exit()
@@ -785,7 +868,7 @@ class Context:
         return f"<wool.Context id={self._id} vars={len(self._data)}>"
 
     def __reduce__(self):
-        return (reconstruct_context, (self._id, dict(self._data)))
+        return (_reconstruct_context, (self._id, dict(self._data)))
 
 
 # ---------------------------------------------------------------
@@ -831,6 +914,24 @@ def build_frame_payload(
 # ---------------------------------------------------------------
 
 
+def _seed_task_context(task: asyncio.Task[Any]) -> None:
+    """Seed a wool.Context for ``task`` based on the current parent.
+
+    Called by the wool task factory (and its composed variant) right
+    after the asyncio.Task is constructed. Forks the parent's Context
+    when one is registered; otherwise starts the child with an empty
+    Context.
+    """
+    try:
+        parent_task = asyncio.current_task()
+    except RuntimeError:
+        parent_task = None
+    with _task_contexts_lock:
+        parent_ctx = _task_contexts.get(parent_task) if parent_task else None
+        child_ctx = parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
+        _task_contexts[task] = child_ctx
+
+
 def _wool_task_factory(
     loop: asyncio.AbstractEventLoop,
     coro: Coroutine[Any, Any, Any],
@@ -839,7 +940,7 @@ def _wool_task_factory(
     """Task factory that seeds each new Task with a wool.Context.
 
     The parent's Context is found by looking up
-    ``asyncio.current_task()`` in :data:`task_contexts`. The child
+    ``asyncio.current_task()`` in :data:`_task_contexts`. The child
     gets a shallow copy with a fresh UUID (copy-on-fork). No stdlib
     ContextVar is needed — the factory runs synchronously inside
     ``create_task``, so ``current_task()`` is the parent.
@@ -848,14 +949,7 @@ def _wool_task_factory(
     wool is initialized), the child starts with an empty Context.
     """
     task: asyncio.Task[Any] = asyncio.Task(coro, loop=loop, **kwargs)
-    try:
-        parent_task = asyncio.current_task()
-    except RuntimeError:
-        parent_task = None
-    with task_contexts_lock:
-        parent_ctx = task_contexts.get(parent_task) if parent_task else None
-        child_ctx = parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
-        task_contexts[task] = child_ctx
+    _seed_task_context(task)
     return task
 
 
@@ -867,13 +961,21 @@ def install_task_factory(
     Composes with an existing factory if one is set. Safe to call
     multiple times — subsequent calls are no-ops if the factory is
     already installed.
+
+    **Ordering contract:** if a user installs their own task factory
+    *after* wool's, wool's seeding of :data:`_task_contexts` is dropped
+    and copy-on-fork breaks silently for subsequently-created tasks.
+    Install wool's factory last (or compose manually) when other
+    libraries also want a factory on the same loop.
     """
     if loop is None:
         loop = asyncio.get_running_loop()
     existing = loop.get_task_factory()
     if existing is _wool_task_factory:
+        _log.debug("wool task factory already installed on %r", loop)
         return
     if existing is not None and getattr(existing, "_wool_wrapped", False):
+        _log.debug("wool-composed task factory already installed on %r", loop)
         return
     if existing is not None:
 
@@ -883,19 +985,16 @@ def install_task_factory(
             **kwargs: Any,
         ) -> asyncio.Task[Any]:
             task: asyncio.Task[Any] = existing(loop, coro, **kwargs)  # type: ignore[assignment]
-            try:
-                parent_task = asyncio.current_task()
-            except RuntimeError:
-                parent_task = None
-            with task_contexts_lock:
-                parent_ctx = task_contexts.get(parent_task) if parent_task else None
-                child_ctx = (
-                    parent_ctx.copy(fork=True) if parent_ctx is not None else Context()
-                )
-                task_contexts[task] = child_ctx
+            _seed_task_context(task)
             return task
 
         composed._wool_wrapped = True  # type: ignore[attr-defined]
         loop.set_task_factory(composed)
+        _log.debug(
+            "wool task factory composed with existing factory %r on %r",
+            existing,
+            loop,
+        )
     else:
         loop.set_task_factory(_wool_task_factory)
+        _log.debug("wool task factory installed on %r", loop)
