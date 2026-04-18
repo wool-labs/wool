@@ -128,11 +128,13 @@ Two construction modes are supported:
 - `wool.ContextVar("name")` — no default; `get()` raises `LookupError` until a value is set.
 - `wool.ContextVar("name", default=...)` — `get()` returns the default when the variable has no value in the current context.
 
+Each var's namespace is inferred from the top-level package of the calling frame, producing a `"<namespace>:<name>"` key that is stable across every process in the cluster. Library authors constructing vars from shared factory code should pass `namespace=` explicitly to avoid collisions with application-scope vars under the same package.
+
 ### How propagation works
 
 Each `wool.ContextVar` is identified by a `"<namespace>:<name>"` key that is stable across every process in the cluster. At dispatch time, Wool snapshots only the vars that have been explicitly `set()` in the current wool.Context — default-only values are not shipped. The snapshot is assembled in O(k) time by iterating the per-Context data dict (which contains only explicitly-set vars), not the full process-wide registry. It rides the task's protobuf payload as a `map<string, bytes>` keyed by each var's `"<namespace>:<name>"`, alongside the active wool.Context id that identifies the logical execution chain.
 
-The wire uses the same pickler on both directions. When a `wool.ContextVar` appears anywhere in a pickled object graph, its current value is embedded directly in the reduce tuple, so unifying references across a task's args, kwargs, and ContextVar snapshot all land on the same local instance on the receiver. Unpickling goes through a strict construction path: if no var is yet registered under the key, a "stub" instance is registered via an internal sallyport and the var's value is applied from the wire; when the worker's module-scope constructor later runs, it promotes the stub in place, preserving any wire state and reference identity.
+`wool.ContextVar.__reduce__` embeds the var's current value directly in the reduce tuple, so when a `wool.ContextVar` appears anywhere in a pickled object graph its value travels with it. References across a task's args, kwargs, and ContextVar snapshot all land on the same local instance on the receiver. Unpickling goes through a strict construction path: if no var is yet registered under the key, a "stub" instance is registered through an internal back-door that bypasses the duplicate-key check, and the var's value is applied from the wire; when the worker's module-scope constructor later runs, it promotes the stub in place, preserving any wire state and reference identity.
 
 On the worker, each task is activated in a fresh `wool.Context` seeded with the caller's propagated values and the caller's wool.Context id. When the worker returns (or yields), the final var state is attached to the gRPC response and applied on the caller side, so worker-side mutations flow back automatically. For async generators, the caller also attaches its current context to each iteration request, enabling bidirectional state exchange between caller and worker at every yield/next boundary.
 
@@ -140,10 +142,17 @@ On the worker, each task is activated in a fresh `wool.Context` seeded with the 
 
 Each dispatched task runs inside its own `wool.Context` copy, seeded with the caller's propagated values and wool.Context id. Concurrent tasks on the same worker with different values for the same variable never interfere — each sees only its own propagated state. Worker-side mutations (via `set()`) are back-propagated to the caller when the task returns or yields, but they do not leak to other concurrent tasks: at most one task runs inside a given `wool.Context` at a time, which makes bidirectional value propagation coherent under the transparent-dispatch model.
 
+### Backpressure hooks
+
+`BackpressureLike` hooks run after the caller's propagated `wool.ContextVar` snapshot is applied to the worker's context, so a hook can read caller-provided values (e.g., a tenant id) to make admission decisions without the caller having to plumb them through the `BackpressureContext` explicitly.
+
 ### Limitations
 
 - **Values must be _cloudpicklable_.** A `TypeError` naming the offending variable is raised at dispatch time if serialization fails.
 - **Only explicitly set values propagate.** A variable that has never been `set()` (only has a class-level default) is not included in the snapshot — the worker falls through to its own default.
+- **Receiver must have the var registered.** If the worker process has not imported the module that constructs the var, the wire-shipped value is logged at debug and dropped. The usual dispatch path avoids this because cloudpickle pulls the callable's module in on demand, but manually-attached vars on unrelated workers silently fall through to their local default.
+- **Tokens are scoped to their originating Context.** A `Token` minted inside a task cannot be reset from outside that Context — including after crossing an `asyncio.create_task` fork boundary, since child tasks receive fresh `wool.Context` ids. Reset the token in the same logical chain that produced it, or use `var.set(...)` to install a new value without relying on the token.
+- **Wire keys are tied to the top-level package name.** Renaming the top-level package (e.g., `myapp` → `myapp_v2`) changes every var's wire key, so a rolling deploy that has callers and workers on different top-level names will silently drop propagated values on the mismatched side. Keep the top-level package name stable across rolling deploys, or bridge the transition with explicit `namespace=` overrides. Moving a module deeper within the same top-level package is safe — the key is the package root, not the full module path.
 
 ## Worker pools
 
