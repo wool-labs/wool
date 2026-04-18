@@ -203,15 +203,15 @@ class TestContextVarPropagation:
 
         Given:
             An EPHEMERAL pool with two workers and two asyncio tasks
-            running in isolated copy_context() contexts, each setting
-            the same wool.ContextVar to a different value
+            each setting the same wool.ContextVar to a different value
         When:
             Both tasks dispatch the routine concurrently and are
             gathered
         Then:
             Each task should observe its own propagated value with no
-            cross-contamination — verifies per-dispatch context
-            isolation across real worker subprocesses
+            cross-contamination — the wool task factory's copy-on-fork
+            isolates the two dispatches end-to-end across real worker
+            subprocesses.
         """
 
         # Arrange, act, & assert
@@ -226,10 +226,8 @@ class TestContextVarPropagation:
                     routines.TENANT_ID.reset(token)
 
             async with build_pool_from_scenario(scenario, credentials_map):
-                ctx_a = contextvars.copy_context()
-                ctx_b = contextvars.copy_context()
-                task_a = asyncio.create_task(dispatch_with("tenant-a"), context=ctx_a)
-                task_b = asyncio.create_task(dispatch_with("tenant-b"), context=ctx_b)
+                task_a = asyncio.create_task(dispatch_with("tenant-a"))
+                task_b = asyncio.create_task(dispatch_with("tenant-b"))
                 results = await asyncio.gather(task_a, task_b)
             assert results == ["tenant-a", "tenant-b"]
 
@@ -707,8 +705,9 @@ class TestTokenAcrossWorkers:
                     # with a fresh token for test hygiene.
                     try:
                         routines.TENANT_ID.reset(token)
-                    except RuntimeError:
-                        pass
+                    except RuntimeError as e:
+                        if "already been used" not in str(e):
+                            raise
             # Post-reset read on the worker restores pre-set _UNSET,
             # which surfaces as the var's constructor default.
             assert worker_read == "unknown"
@@ -782,8 +781,9 @@ class TestTokenAcrossWorkers:
                 finally:
                     try:
                         routines.TENANT_ID.reset(token)
-                    except RuntimeError:
-                        pass
+                    except RuntimeError as e:
+                        if "already been used" not in str(e):
+                            raise
             assert "Token has already been used" in observed
 
         await retry_grpc_internal(body)
@@ -1084,8 +1084,9 @@ class TestForwardPropagationMidStream:
                         for tok in reversed(tokens):
                             try:
                                 routines.TENANT_ID.reset(tok)
-                            except RuntimeError:
-                                pass
+                            except RuntimeError as e:
+                                if "already been used" not in str(e):
+                                    raise
                 finally:
                     await gen.aclose()
             assert collected == values
@@ -1128,8 +1129,9 @@ class TestForwardPropagationMidStream:
                         for tok in reversed(tokens):
                             try:
                                 routines.TENANT_ID.reset(tok)
-                            except RuntimeError:
-                                pass
+                            except RuntimeError as e:
+                                if "already been used" not in str(e):
+                                    raise
                 finally:
                     await gen.aclose()
             assert collected == values
@@ -1410,8 +1412,9 @@ class TestSelfDispatchStreamingVarMutation:
                         for tok in reversed(tokens):
                             try:
                                 routines.TENANT_ID.reset(tok)
-                            except RuntimeError:
-                                pass
+                            except RuntimeError as e:
+                                if "already been used" not in str(e):
+                                    raise
                 finally:
                     await gen.aclose()
             assert collected == values

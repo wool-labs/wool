@@ -120,6 +120,17 @@ def _post_nested_teardown(patterns):
             var.set(f"outer-reset-{var_name}")
 
 
+_PATTERN_NAMES: frozenset[str] = frozenset(
+    {
+        "ROUND_TRIP",
+        "LOCAL_RESET",
+        "DOWNSTREAM_OVERWRITE",
+        "DOWNSTREAM_RESET",
+        "UPSTREAM_RESET",
+        "PER_YIELD",
+    }
+)
+
 _NESTED_PATTERN_NAMES = frozenset(
     {
         "DOWNSTREAM_OVERWRITE",

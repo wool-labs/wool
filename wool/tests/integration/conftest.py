@@ -576,6 +576,10 @@ def _build_patterns_dict(scenario):
     for idx, var_name in enumerate(_VAR_NAMES):
         pattern = getattr(scenario, f"ctx_var_{idx + 1}")
         if pattern is not None and pattern is not ContextVarPattern.NONE:
+            assert pattern.name in routines._PATTERN_NAMES, (
+                f"ContextVarPattern.{pattern.name} has no matching "
+                f"arm in routines._execute_patterns"
+            )
             result[var_name] = pattern.name
     return result
 
