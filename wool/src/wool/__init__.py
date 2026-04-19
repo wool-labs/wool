@@ -15,7 +15,10 @@ from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
 from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.loadbalancer.base import DelegatingLoadBalancerLike
+from wool.runtime.loadbalancer.base import DispatchingLoadBalancerLike
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
+from wool.runtime.loadbalancer.base import LoadBalancerContextView
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
@@ -72,7 +75,10 @@ __all__ = [
     # Context
     "RuntimeContext",
     # Load balancing
+    "DelegatingLoadBalancerLike",
+    "DispatchingLoadBalancerLike",
     "LoadBalancerContextLike",
+    "LoadBalancerContextView",
     "LoadBalancerLike",
     "NoWorkersAvailable",
     "RoundRobinLoadBalancer",
