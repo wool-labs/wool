@@ -8,6 +8,7 @@ EXPECTED_MESSAGE_EXPORTS = [
     "Nack",
     "Request",
     "Response",
+    "RuntimeContext",
     "StopRequest",
     "Task",
     "TaskEnvelope",
@@ -88,6 +89,24 @@ class TestMessageConstruction:
         assert task.args == b"args-bytes"
         assert task.kwargs == b"kwargs-bytes"
         assert task.timeout == 30
+
+    def test_runtime_context_fields(self):
+        """Test RuntimeContext optional dispatch_timeout semantics.
+
+        Given:
+            A ``dispatch_timeout`` value for the backcompat
+            RuntimeContext submessage.
+        When:
+            RuntimeContext is constructed with and without the value.
+        Then:
+            The value round-trips and ``HasField`` reflects presence.
+        """
+        populated = protocol.RuntimeContext(dispatch_timeout=5.5)
+        assert populated.dispatch_timeout == 5.5
+        assert populated.HasField("dispatch_timeout") is True
+
+        empty = protocol.RuntimeContext()
+        assert empty.HasField("dispatch_timeout") is False
 
     def test_task_envelope_fields(self):
         """Test TaskEnvelope message is a strict subset of Task.

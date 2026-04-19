@@ -642,6 +642,197 @@ class TestTask:
         assert task.timeout == 0
         assert task.tag is None
 
+    @pytest.mark.asyncio
+    async def test_from_protobuf_old_runtime_context_preserves_dispatch_timeout(
+        self, sample_async_callable, picklable_proxy
+    ):
+        """Test backwards-compat path reads Task.context.dispatch_timeout.
+
+        Given:
+            A protobuf Task from a pre-0.9 client carrying an optional
+            RuntimeContext submessage with a dispatch_timeout value.
+        When:
+            ``from_protobuf`` is called.
+        Then:
+            The Task's ``dispatch_timeout`` attribute should reflect the
+            value carried in the old-style RuntimeContext field.
+        """
+        # Arrange
+        task_msg = protocol.Task(
+            version="0.8.0",
+            id=str(uuid4()),
+            callable=cloudpickle.dumps(sample_async_callable),
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            caller="",
+            proxy=cloudpickle.dumps(picklable_proxy),
+            proxy_id=str(picklable_proxy.id),
+            timeout=0,
+            tag="",
+            context=protocol.RuntimeContext(dispatch_timeout=12.5),
+        )
+
+        # Act
+        task = Task.from_protobuf(task_msg)
+
+        # Assert
+        assert task.dispatch_timeout == 12.5
+
+    @pytest.mark.asyncio
+    async def test_from_protobuf_new_version_ignores_runtime_context(
+        self, sample_async_callable, picklable_proxy
+    ):
+        """Test current-version tasks leave dispatch_timeout unset.
+
+        Given:
+            A protobuf Task from a post-0.9 client (even if it
+            accidentally carries an old RuntimeContext submessage).
+        When:
+            ``from_protobuf`` is called.
+        Then:
+            The Task's ``dispatch_timeout`` attribute should be ``None``
+            because new clients propagate runtime state via the
+            ``Request.context`` / ``context_id`` wire fields instead.
+        """
+        # Arrange
+        task_msg = protocol.Task(
+            version="0.9.0",
+            id=str(uuid4()),
+            callable=cloudpickle.dumps(sample_async_callable),
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            caller="",
+            proxy=cloudpickle.dumps(picklable_proxy),
+            proxy_id=str(picklable_proxy.id),
+            timeout=0,
+            tag="",
+            context=protocol.RuntimeContext(dispatch_timeout=9.0),
+        )
+
+        # Act
+        task = Task.from_protobuf(task_msg)
+
+        # Assert
+        assert task.dispatch_timeout is None
+
+    @pytest.mark.asyncio
+    async def test_from_protobuf_invalid_version_ignores_runtime_context(
+        self, sample_async_callable, picklable_proxy
+    ):
+        """Test unparseable version does not trigger the backcompat branch.
+
+        Given:
+            A protobuf Task with ``version=""`` (unparseable under
+            PEP 440) and a populated RuntimeContext submessage.
+        When:
+            ``from_protobuf`` is called.
+        Then:
+            The Task's ``dispatch_timeout`` attribute should be ``None``;
+            an unparseable version must not be treated as pre-0.9.
+        """
+        # Arrange
+        task_msg = protocol.Task(
+            version="",
+            id=str(uuid4()),
+            callable=cloudpickle.dumps(sample_async_callable),
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            caller="",
+            proxy=cloudpickle.dumps(picklable_proxy),
+            proxy_id=str(picklable_proxy.id),
+            timeout=0,
+            tag="",
+            context=protocol.RuntimeContext(dispatch_timeout=4.0),
+        )
+
+        # Act
+        task = Task.from_protobuf(task_msg)
+
+        # Assert
+        assert task.dispatch_timeout is None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_applies_dispatch_timeout_on_coroutine(
+        self, mock_worker_proxy_cache
+    ):
+        """Test coroutine dispatch applies dispatch_timeout to the stdlib var.
+
+        Given:
+            A coroutine Task with ``dispatch_timeout=7.5`` and the
+            process-wide dispatch_timeout stdlib ContextVar at its
+            default.
+        When:
+            ``task.dispatch()`` completes.
+        Then:
+            The coroutine reads the applied dispatch_timeout value of
+            ``7.5`` from :py:data:`wool.runtime.routine.wrapper.dispatch_timeout`.
+        """
+        # Arrange
+        from wool.runtime.routine.wrapper import dispatch_timeout
+
+        captured: list[float | None] = []
+
+        async def capture_timeout():
+            captured.append(dispatch_timeout.get())
+
+        task = Task(
+            id=uuid4(),
+            callable=capture_timeout,
+            args=(),
+            kwargs={},
+            proxy=_PicklableProxy(),
+            dispatch_timeout=7.5,
+        )
+
+        # Act
+        await task.dispatch()
+
+        # Assert
+        assert captured == [7.5]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_applies_dispatch_timeout_on_async_generator(
+        self, mock_worker_proxy_cache
+    ):
+        """Test async-gen dispatch applies dispatch_timeout each iteration.
+
+        Given:
+            An async-generator Task with ``dispatch_timeout=3.0``
+            yielding twice, and the process-wide dispatch_timeout
+            stdlib ContextVar at its default.
+        When:
+            ``task.dispatch()`` is iterated to completion.
+        Then:
+            Each iteration's captured value is ``3.0``, confirming the
+            branch fires on every frame.
+        """
+        # Arrange
+        from wool.runtime.routine.wrapper import dispatch_timeout
+
+        captured: list[float | None] = []
+
+        async def capture_timeout_stream():
+            captured.append(dispatch_timeout.get())
+            yield 1
+            captured.append(dispatch_timeout.get())
+            yield 2
+
+        task = Task(
+            id=uuid4(),
+            callable=capture_timeout_stream,
+            args=(),
+            kwargs={},
+            proxy=_PicklableProxy(),
+            dispatch_timeout=3.0,
+        )
+
+        # Act
+        async for _ in task.dispatch():
+            pass
+
+        # Assert
+        assert captured == [3.0, 3.0]
+
     def test_to_protobuf_all_fields(self, sample_async_callable, picklable_proxy):
         """Test to_protobuf serializes all fields correctly.
 
