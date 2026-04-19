@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextvars
 from collections.abc import Callable
 from functools import wraps
 from inspect import getsourcelines
@@ -10,23 +9,14 @@ from inspect import iscoroutinefunction
 from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import Coroutine
-from typing import Final
 from typing import TypeVar
 from typing import cast
 from uuid import uuid4
 
 import wool
+from wool.runtime.context import dispatch_timeout
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import do_dispatch
-
-# Ambient dispatch timeout for routines dispatched in this context.
-# A ``None`` value (the default) means no timeout. Set at any
-# caller-side scope to bound how long a dispatched task may take;
-# :func:`routine` reads this value when building the dispatch
-# request.
-dispatch_timeout: Final[contextvars.ContextVar[float | None]] = contextvars.ContextVar(
-    "dispatch_timeout", default=None
-)
 
 if TYPE_CHECKING:
     from wool.runtime.worker.proxy import WorkerProxy

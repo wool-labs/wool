@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import sys
 import threading
 import weakref
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import ClassVar
@@ -18,6 +20,12 @@ from uuid import uuid4
 
 import cloudpickle
 
+from wool.runtime.typing import Undefined
+from wool.runtime.typing import UndefinedType
+
+if TYPE_CHECKING:
+    from wool import protocol
+
 T = TypeVar("T")
 
 _SENTINEL: Final = object()
@@ -25,6 +33,83 @@ _SENTINEL: Final = object()
 _log = logging.getLogger(__name__)
 
 _THIS_MODULE: Final = __name__
+
+
+# Ambient dispatch timeout for routines dispatched in this context.
+# A ``None`` value (the default) means no timeout. Users may bound
+# dispatch duration either by assigning this ContextVar directly or
+# by entering a :class:`RuntimeContext` block.
+dispatch_timeout: Final[contextvars.ContextVar[float | None]] = contextvars.ContextVar(
+    "dispatch_timeout", default=None
+)
+
+
+# public
+class RuntimeContext:
+    """Block-scoped runtime option overrides for wool routines.
+
+    Used as a context manager to override runtime options (currently
+    only ``dispatch_timeout``) for the duration of a block. Auto-
+    captured on every :class:`Task` at construction time, which ships
+    the caller's snapshot across the wire so the worker restores it
+    before running the routine.
+
+    :param dispatch_timeout:
+        Default timeout for task dispatch operations. ``None`` means
+        no timeout. Leaving this argument out (the default sentinel)
+        causes ``__enter__`` to skip setting the stdlib var — useful
+        for constructing an empty ``RuntimeContext`` whose sole
+        purpose is to ride the wire.
+    """
+
+    _dispatch_timeout: float | None | UndefinedType
+    _dispatch_timeout_token: contextvars.Token[float | None] | None
+
+    def __init__(
+        self,
+        *,
+        dispatch_timeout: float | None | UndefinedType = Undefined,
+    ):
+        self._dispatch_timeout = dispatch_timeout
+        self._dispatch_timeout_token = None
+
+    def __enter__(self) -> RuntimeContext:
+        if self._dispatch_timeout is not Undefined:
+            self._dispatch_timeout_token = dispatch_timeout.set(self._dispatch_timeout)
+        return self
+
+    def __exit__(self, *_):
+        if self._dispatch_timeout_token is not None:
+            dispatch_timeout.reset(self._dispatch_timeout_token)
+            self._dispatch_timeout_token = None
+
+    @classmethod
+    def get_current(cls) -> RuntimeContext:
+        """Capture the current stdlib ``dispatch_timeout`` value."""
+        return cls(dispatch_timeout=dispatch_timeout.get())
+
+    def to_protobuf(self) -> protocol.RuntimeContext:
+        """Serialize to a protobuf ``RuntimeContext`` message."""
+        from wool import protocol
+
+        pb = protocol.RuntimeContext()
+        dt = self._dispatch_timeout
+        if dt is Undefined:
+            dt = dispatch_timeout.get()
+        if dt is not None:
+            pb.dispatch_timeout = dt
+        return pb
+
+    @classmethod
+    def from_protobuf(cls, context: protocol.RuntimeContext) -> RuntimeContext:
+        """Reconstruct from a protobuf ``RuntimeContext`` message."""
+        return cls(
+            dispatch_timeout=(
+                context.dispatch_timeout
+                if context.HasField("dispatch_timeout")
+                else None
+            )
+        )
 
 
 # public

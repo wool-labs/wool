@@ -30,22 +30,11 @@ from uuid import UUID
 from uuid import uuid4
 
 import cloudpickle
-from packaging.version import InvalidVersion
-from packaging.version import Version
 
 import wool
 from wool import protocol
+from wool.runtime.context import RuntimeContext
 from wool.runtime.context import dumps as _context_dumps
-
-_MIN_NEW_CONTEXT_VERSION = Version("0.9.0")
-
-
-def _parse_version(version: str) -> Version | None:
-    try:
-        return Version(version)
-    except InvalidVersion:
-        return None
-
 
 Args = Tuple
 Kwargs = Dict
@@ -239,21 +228,18 @@ class Task(Generic[W]):
     function: str | None = None
     line_no: int | None = None
     tag: str | None = None
-    dispatch_timeout: float | None = None
+    context: RuntimeContext | None = None
 
-    def __post_init__(self, **kwargs):
-        """
-        Initialize the task and set up caller tracking.
-
-        :param kwargs:
-            Additional keyword arguments (unused).
-        """
+    def __post_init__(self):
+        """Initialize the task and set up caller tracking."""
         if not isinstance(self.proxy, WorkerProxyLike):
             raise TypeError(
                 f"proxy must conform to WorkerProxyLike, got {type(self.proxy).__name__}"
             )
         if caller := _current_task.get():
             self.caller = caller.id
+        if self.context is None:
+            self.context = RuntimeContext.get_current()
 
     def __enter__(self) -> Callable[[], Coroutine | AsyncGenerator]:
         """
@@ -324,14 +310,11 @@ class Task(Generic[W]):
             loads = s.loads
         else:
             loads = cloudpickle.loads
-        # Pre-0.9 clients carry dispatch_timeout inside an optional
-        # RuntimeContext submessage; newer clients propagate runtime
-        # state through Request.context / context_id instead.
-        dispatch_timeout = None
-        client_version = _parse_version(task.version)
-        if client_version is not None and client_version < _MIN_NEW_CONTEXT_VERSION:
-            if task.HasField("context") and task.context.HasField("dispatch_timeout"):
-                dispatch_timeout = task.context.dispatch_timeout
+        context = (
+            RuntimeContext.from_protobuf(task.context)
+            if task.HasField("context")
+            else None
+        )
         return cls(
             id=UUID(task.id),
             callable=loads(task.callable),
@@ -341,7 +324,7 @@ class Task(Generic[W]):
             proxy=loads(task.proxy),
             timeout=task.timeout if task.timeout else 0,
             tag=task.tag if task.tag else None,
-            dispatch_timeout=dispatch_timeout,
+            context=context,
         )
 
     def to_protobuf(self, serializer: Serializer | None = None) -> protocol.Task:
@@ -376,6 +359,7 @@ class Task(Generic[W]):
             proxy_id=str(self.proxy.id),
             timeout=int(self.timeout) if self.timeout else 0,
             tag=self.tag if self.tag else "",
+            context=self.context.to_protobuf() if self.context else None,
         )
         if serializer is not None:
             task_msg.serializer = _pickle_serializer(serializer)
@@ -406,16 +390,12 @@ class Task(Generic[W]):
             # Set the proxy in context variable for nested task dispatch
             token = wool.__proxy__.set(proxy)
             try:
-                with self:
-                    with do_dispatch(False):
-                        if self.dispatch_timeout is not None:
-                            from wool.runtime.routine.wrapper import (
-                                dispatch_timeout as _dispatch_timeout_var,
-                            )
-
-                            _dispatch_timeout_var.set(self.dispatch_timeout)
-                        await asyncio.sleep(0)
-                        return await self.callable(*self.args, **self.kwargs)
+                assert self.context is not None
+                with self.context:
+                    with self:
+                        with do_dispatch(False):
+                            await asyncio.sleep(0)
+                            return await self.callable(*self.args, **self.kwargs)
             finally:
                 wool.__proxy__.reset(token)
 
@@ -440,18 +420,14 @@ class Task(Generic[W]):
                     # Set the proxy in context variable for nested task dispatch
                     token = wool.__proxy__.set(proxy)
                     try:
-                        with self:
-                            with do_dispatch(False):
-                                if self.dispatch_timeout is not None:
-                                    from wool.runtime.routine.wrapper import (
-                                        dispatch_timeout as _dispatch_timeout_var,
-                                    )
-
-                                    _dispatch_timeout_var.set(self.dispatch_timeout)
-                                try:
-                                    result = await anext(gen)
-                                except StopAsyncIteration:
-                                    break
+                        assert self.context is not None
+                        with self.context:
+                            with self:
+                                with do_dispatch(False):
+                                    try:
+                                        result = await anext(gen)
+                                    except StopAsyncIteration:
+                                        break
                     finally:
                         wool.__proxy__.reset(token)
 

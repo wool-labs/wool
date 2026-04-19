@@ -30,9 +30,9 @@ from cryptography.x509.oid import NameOID
 from hypothesis import strategies as st
 
 import wool
+from wool.runtime.context import dispatch_timeout
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-from wool.runtime.routine.wrapper import dispatch_timeout
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
