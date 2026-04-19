@@ -30,10 +30,22 @@ from uuid import UUID
 from uuid import uuid4
 
 import cloudpickle
+from packaging.version import InvalidVersion
+from packaging.version import Version
 
 import wool
 from wool import protocol
 from wool.runtime.context import dumps as _context_dumps
+
+_MIN_NEW_CONTEXT_VERSION = Version("0.9.0")
+
+
+def _parse_version(version: str) -> Version | None:
+    try:
+        return Version(version)
+    except InvalidVersion:
+        return None
+
 
 Args = Tuple
 Kwargs = Dict
@@ -227,6 +239,7 @@ class Task(Generic[W]):
     function: str | None = None
     line_no: int | None = None
     tag: str | None = None
+    dispatch_timeout: float | None = None
 
     def __post_init__(self, **kwargs):
         """
@@ -311,6 +324,14 @@ class Task(Generic[W]):
             loads = s.loads
         else:
             loads = cloudpickle.loads
+        # Pre-0.9 clients carry dispatch_timeout inside an optional
+        # RuntimeContext submessage; newer clients propagate runtime
+        # state through Request.context / context_id instead.
+        dispatch_timeout = None
+        client_version = _parse_version(task.version)
+        if client_version is not None and client_version < _MIN_NEW_CONTEXT_VERSION:
+            if task.HasField("context") and task.context.HasField("dispatch_timeout"):
+                dispatch_timeout = task.context.dispatch_timeout
         return cls(
             id=UUID(task.id),
             callable=loads(task.callable),
@@ -320,6 +341,7 @@ class Task(Generic[W]):
             proxy=loads(task.proxy),
             timeout=task.timeout if task.timeout else 0,
             tag=task.tag if task.tag else None,
+            dispatch_timeout=dispatch_timeout,
         )
 
     def to_protobuf(self, serializer: Serializer | None = None) -> protocol.Task:
@@ -386,6 +408,12 @@ class Task(Generic[W]):
             try:
                 with self:
                     with do_dispatch(False):
+                        if self.dispatch_timeout is not None:
+                            from wool.runtime.routine.wrapper import (
+                                dispatch_timeout as _dispatch_timeout_var,
+                            )
+
+                            _dispatch_timeout_var.set(self.dispatch_timeout)
                         await asyncio.sleep(0)
                         return await self.callable(*self.args, **self.kwargs)
             finally:
@@ -414,6 +442,12 @@ class Task(Generic[W]):
                     try:
                         with self:
                             with do_dispatch(False):
+                                if self.dispatch_timeout is not None:
+                                    from wool.runtime.routine.wrapper import (
+                                        dispatch_timeout as _dispatch_timeout_var,
+                                    )
+
+                                    _dispatch_timeout_var.set(self.dispatch_timeout)
                                 try:
                                     result = await anext(gen)
                                 except StopAsyncIteration:

@@ -18,6 +18,7 @@ try:
     from wool.protocol.wire_pb2 import Nack
     from wool.protocol.wire_pb2 import Request
     from wool.protocol.wire_pb2 import Response
+    from wool.protocol.wire_pb2 import RuntimeContext
     from wool.protocol.wire_pb2 import StopRequest
     from wool.protocol.wire_pb2 import Task
     from wool.protocol.wire_pb2 import TaskEnvelope
@@ -48,6 +49,7 @@ __all__ = [
     "Nack",
     "Request",
     "Response",
+    "RuntimeContext",
     "StopRequest",
     "Task",
     "TaskEnvelope",

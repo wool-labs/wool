@@ -2,6 +2,10 @@ syntax = "proto3";
 
 package wool.runtime.protobuf.wire;
 
+message RuntimeContext {
+    optional double dispatch_timeout = 1;
+}
+
 message Task {
     string version = 1;
     string id = 2;
@@ -13,7 +17,7 @@ message Task {
     bytes args = 8;
     bytes kwargs = 9;
     int32 timeout = 10;
-    reserved 11;  // was RuntimeContext context, removed
+    optional RuntimeContext context = 11;
     optional bytes serializer = 12;
 }
 
