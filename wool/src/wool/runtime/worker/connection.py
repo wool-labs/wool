@@ -139,7 +139,7 @@ class _DispatchStream(Generic[_T]):
             vars_dict, context_hex = build_frame_payload(dumps_param=dumps_fn)
             request = protocol.Request(
                 next=protocol.Void(),
-                vars=vars_dict,
+                context=vars_dict,
                 context_id=context_hex,
             )
             await self._call.write(request)
@@ -164,9 +164,9 @@ class _DispatchStream(Generic[_T]):
         """
         try:
             response = await anext(self._iter)
-            if response.vars:
+            if response.context:
                 apply_vars(
-                    dict(response.vars),
+                    dict(response.context),
                     loads_param=(
                         PassthroughSerializer.loads if self._serializer else None
                     ),
@@ -239,7 +239,7 @@ class _DispatchStream(Generic[_T]):
             )
             request = protocol.Request(
                 send=protocol.Message(dump=dump),
-                vars=vars_dict,
+                context=vars_dict,
                 context_id=context_hex,
             )
             await self._call.write(request)
@@ -290,7 +290,7 @@ class _DispatchStream(Generic[_T]):
             )
             request = protocol.Request(
                 throw=protocol.Message(dump=dump),
-                vars=vars_dict,
+                context=vars_dict,
                 context_id=context_hex,
             )
             await self._call.write(request)
@@ -526,7 +526,7 @@ class WorkerConnection:
                     )
                     request = protocol.Request(
                         task=task_msg,
-                        vars=vars_dict,
+                        context=vars_dict,
                         context_id=context_hex,
                     )
                     await call.write(request)

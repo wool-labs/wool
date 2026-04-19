@@ -58,7 +58,7 @@ message Request {
     // caller's context snapshot to the worker on task frames, and
     // forward-propagates caller mutations to the worker on streaming
     // frames.
-    map<string, bytes> vars = 5;
+    map<string, bytes> context = 5;
     // wool.Context id as hex string. Stable across sequential awaits
     // inside the same asyncio task; fresh on asyncio.create_task
     // boundaries.
@@ -75,7 +75,7 @@ message Response {
     // Cloudpickled wool.ContextVar values keyed by
     // "<namespace>:<name>". Back-propagates the routine's
     // post-yield/post-return context snapshot to the caller.
-    map<string, bytes> vars = 5;
+    map<string, bytes> context = 5;
     // wool.Context id the worker used, echoed back to the caller.
     string context_id = 6;
 }
