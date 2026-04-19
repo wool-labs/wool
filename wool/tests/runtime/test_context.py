@@ -1285,15 +1285,16 @@ def test_snapshot_vars_with_custom_dumps():
 
 
 def test_build_frame_payload_with_custom_dumps():
-    """Test build_frame_payload returns vars serialized via custom dumps.
+    """Test build_frame_payload returns a Context with custom-serialized vars.
 
     Given:
         A ContextVar with a value set and a custom dumps function
     When:
         build_frame_payload(dumps_param=custom) is called
     Then:
-        It should return a vars dict whose values were produced by
-        the custom serializer and a hex context id string
+        It should return a protocol.Context whose vars map was
+        produced by the custom serializer and whose id is a 32-char
+        UUID hex string.
     """
     # Arrange
     var = ContextVar("bfp_custom_dumps", namespace="bfp")
@@ -1303,13 +1304,13 @@ def test_build_frame_payload_with_custom_dumps():
         return b"bfp:" + str(value).encode()
 
     # Act
-    vars_dict, context_hex = build_frame_payload(dumps_param=custom_dumps)
+    ctx_msg = build_frame_payload(dumps_param=custom_dumps)
 
     # Assert
-    assert var.key in vars_dict
-    assert vars_dict[var.key] == b"bfp:42"
-    assert isinstance(context_hex, str)
-    assert len(context_hex) == 32  # UUID hex
+    assert var.key in ctx_msg.vars
+    assert ctx_msg.vars[var.key] == b"bfp:42"
+    assert isinstance(ctx_msg.id, str)
+    assert len(ctx_msg.id) == 32
 
 
 def test_apply_vars_with_custom_loads():

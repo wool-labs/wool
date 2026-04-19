@@ -977,21 +977,21 @@ def current_context() -> Context:
 def build_frame_payload(
     *,
     dumps_param: Callable[..., bytes] | None = None,
-) -> tuple[dict[str, bytes], str]:
-    """Assemble the wire payload for a dispatch or streaming frame.
-
-    Returns ``(vars, context_id)`` for populating the protobuf
-    ``vars`` map and ``context_id`` string on any Request.
+) -> protocol.Context:
+    """Assemble the wire Context for a dispatch or streaming frame.
 
     :param dumps_param:
         Optional serializer for var values. Pass
         ``PassthroughSerializer.dumps`` on self-dispatch to avoid
         cloudpickle overhead. When ``None``, uses cloudpickle.
     """
+    from wool import protocol
+
     ctx = resolve_context()
-    vars_dict = snapshot_vars(ctx, dumps_param=dumps_param)
-    context_hex = ctx._id.hex
-    return vars_dict, context_hex
+    return protocol.Context(
+        id=ctx._id.hex,
+        vars=snapshot_vars(ctx, dumps_param=dumps_param),
+    )
 
 
 # ---------------------------------------------------------------

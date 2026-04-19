@@ -1677,8 +1677,8 @@ class TestWorkerConnection:
         # 16-byte passthrough tokens as var values, not cloudpickle bytes
         assert len(results) == 2
         next_request = mock_call.write.call_args_list[1][0][0]
-        assert var.key in next_request.context
-        assert len(next_request.context[var.key]) == 16
+        assert var.key in next_request.context.vars
+        assert len(next_request.context.vars[var.key]) == 16
 
     @pytest.mark.asyncio
     async def test_dispatch_self_dispatch_read_next_applies_vars_via_passthrough(
@@ -1719,7 +1719,7 @@ class TestWorkerConnection:
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(
                 result=protocol.Message(dump=serializer.dumps("result")),
-                context={var.key: pt_bytes},
+                context=protocol.Context(vars={var.key: pt_bytes}),
             ),
         )
         mock_call = mock_grpc_call(async_stream(responses))
@@ -1788,8 +1788,8 @@ class TestWorkerConnection:
         # which are longer than a 16-byte passthrough token
         assert results == ["result"]
         initial_request = mock_call.write.call_args_list[0][0][0]
-        assert var.key in initial_request.context
-        assert len(initial_request.context[var.key]) > 16
+        assert var.key in initial_request.context.vars
+        assert len(initial_request.context.vars[var.key]) > 16
 
     @pytest.mark.asyncio
     async def test_dispatch_self_dispatch_initial_request_includes_passthrough_vars(
@@ -1845,6 +1845,6 @@ class TestWorkerConnection:
         # Assert — initial request (first write) should carry passthrough vars
         assert results == ["done"]
         initial_request = mock_call.write.call_args_list[0][0][0]
-        assert var.key in initial_request.context
+        assert var.key in initial_request.context.vars
         # Passthrough tokens are exactly 16 bytes (UUID bytes)
-        assert len(initial_request.context[var.key]) == 16
+        assert len(initial_request.context.vars[var.key]) == 16

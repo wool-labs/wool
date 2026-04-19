@@ -136,11 +136,9 @@ class _DispatchStream(Generic[_T]):
         self._running = True
         try:
             dumps_fn = self._serializer.dumps if self._serializer else None
-            vars_dict, context_hex = build_frame_payload(dumps_param=dumps_fn)
             request = protocol.Request(
                 next=protocol.Void(),
-                context=vars_dict,
-                context_id=context_hex,
+                context=build_frame_payload(dumps_param=dumps_fn),
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -164,9 +162,9 @@ class _DispatchStream(Generic[_T]):
         """
         try:
             response = await anext(self._iter)
-            if response.context:
+            if response.context.vars:
                 apply_vars(
-                    dict(response.context),
+                    dict(response.context.vars),
                     loads_param=(
                         PassthroughSerializer.loads if self._serializer else None
                     ),
@@ -234,13 +232,11 @@ class _DispatchStream(Generic[_T]):
         try:
             _msg_dumps = self._serializer.dumps if self._serializer else dumps
             dump = _msg_dumps(value)
-            vars_dict, context_hex = build_frame_payload(
-                dumps_param=self._serializer.dumps if self._serializer else None
-            )
             request = protocol.Request(
                 send=protocol.Message(dump=dump),
-                context=vars_dict,
-                context_id=context_hex,
+                context=build_frame_payload(
+                    dumps_param=self._serializer.dumps if self._serializer else None
+                ),
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -285,13 +281,11 @@ class _DispatchStream(Generic[_T]):
 
             _msg_dumps = self._serializer.dumps if self._serializer else dumps
             dump = _msg_dumps(exc)
-            vars_dict, context_hex = build_frame_payload(
-                dumps_param=self._serializer.dumps if self._serializer else None
-            )
             request = protocol.Request(
                 throw=protocol.Message(dump=dump),
-                context=vars_dict,
-                context_id=context_hex,
+                context=build_frame_payload(
+                    dumps_param=self._serializer.dumps if self._serializer else None
+                ),
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -521,13 +515,11 @@ class WorkerConnection:
             try:
                 call: _DispatchCall = channel.stub.dispatch()
                 try:
-                    vars_dict, context_hex = build_frame_payload(
-                        dumps_param=serializer.dumps if serializer else None
-                    )
                     request = protocol.Request(
                         task=task_msg,
-                        context=vars_dict,
-                        context_id=context_hex,
+                        context=build_frame_payload(
+                            dumps_param=serializer.dumps if serializer else None
+                        ),
                     )
                     await call.write(request)
                     response = await anext(aiter(call))

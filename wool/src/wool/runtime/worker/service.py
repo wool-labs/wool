@@ -251,7 +251,7 @@ class WorkerService(protocol.WorkerServicer):
         # snapshot is keyed by each var's "namespace:name";
         # apply_vars resolves each key via the process-wide
         # ContextVar registry and calls .set() on the local instance.
-        context_hex = request.context_id
+        context_hex = request.context.id
         context_id = uuid.UUID(hex=context_hex) if context_hex else uuid.uuid4()
 
         work_task = Task.from_protobuf(request.task)
@@ -263,9 +263,9 @@ class WorkerService(protocol.WorkerServicer):
 
         response_context_hex = context_hex or context_id.hex
         with _namespace.activate(context_id):
-            if request.context:
+            if request.context.vars:
                 apply_vars(
-                    dict(request.context),
+                    dict(request.context.vars),
                     loads_param=(
                         PassthroughSerializer.loads if _is_passthrough else None
                     ),
@@ -311,15 +311,19 @@ class WorkerService(protocol.WorkerServicer):
                                 )
                                 yield protocol.Response(
                                     exception=exception,
-                                    context=outcome.snapshot,
-                                    context_id=response_context_hex,
+                                    context=protocol.Context(
+                                        id=response_context_hex,
+                                        vars=outcome.snapshot,
+                                    ),
                                 )
                                 return
                             result = protocol.Message(dump=_msg_dumps(outcome.result))
                             yield protocol.Response(
                                 result=result,
-                                context=outcome.snapshot,
-                                context_id=response_context_hex,
+                                context=protocol.Context(
+                                    id=response_context_hex,
+                                    vars=outcome.snapshot,
+                                ),
                             )
                     elif isinstance(task, asyncio.Task):
                         outcome: _WorkerOutcome = await task
@@ -329,15 +333,19 @@ class WorkerService(protocol.WorkerServicer):
                             )
                             yield protocol.Response(
                                 exception=exception,
-                                context=outcome.snapshot,
-                                context_id=response_context_hex,
+                                context=protocol.Context(
+                                    id=response_context_hex,
+                                    vars=outcome.snapshot,
+                                ),
                             )
                         else:
                             result = protocol.Message(dump=_msg_dumps(outcome.result))
                             yield protocol.Response(
                                 result=result,
-                                context=outcome.snapshot,
-                                context_id=response_context_hex,
+                                context=protocol.Context(
+                                    id=response_context_hex,
+                                    vars=outcome.snapshot,
+                                ),
                             )
                 except (Exception, asyncio.CancelledError) as e:
                     # Cancellation of the awaited coroutine task or
@@ -354,8 +362,10 @@ class WorkerService(protocol.WorkerServicer):
                     )
                     yield protocol.Response(
                         exception=exception,
-                        context=ctx_snapshot,
-                        context_id=response_context_hex,
+                        context=protocol.Context(
+                            id=response_context_hex,
+                            vars=ctx_snapshot,
+                        ),
                     )
 
     async def stop(
@@ -631,7 +641,9 @@ class WorkerService(protocol.WorkerServicer):
 
             try:
                 async for request in request_iterator:
-                    caller_ctx = dict(request.context) if request.context else {}
+                    caller_ctx = (
+                        dict(request.context.vars) if request.context.vars else {}
+                    )
                     match request.WhichOneof("payload"):
                         case "next":
                             worker_loop.call_soon_threadsafe(

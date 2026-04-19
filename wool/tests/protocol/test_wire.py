@@ -4,6 +4,7 @@ from wool import protocol
 
 EXPECTED_MESSAGE_EXPORTS = [
     "Ack",
+    "Context",
     "Message",
     "Nack",
     "Request",
@@ -89,6 +90,20 @@ class TestMessageConstruction:
         assert task.args == b"args-bytes"
         assert task.kwargs == b"kwargs-bytes"
         assert task.timeout == 30
+
+    def test_context_fields(self):
+        """Test Context message field round-trip.
+
+        Given:
+            An id hex string and a vars map.
+        When:
+            A Context message is constructed.
+        Then:
+            Both fields round-trip correctly.
+        """
+        ctx = protocol.Context(id="abc", vars={"ns:key": b"value"})
+        assert ctx.id == "abc"
+        assert dict(ctx.vars) == {"ns:key": b"value"}
 
     def test_runtime_context_fields(self):
         """Test RuntimeContext optional dispatch_timeout semantics.

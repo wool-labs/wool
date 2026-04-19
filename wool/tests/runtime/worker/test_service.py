@@ -2408,7 +2408,10 @@ class TestWorkerService:
         )
 
         caller_vars = {var.key: cloudpickle.dumps("caller-side-value")}
-        request = protocol.Request(task=wool_task.to_protobuf(), context=caller_vars)
+        request = protocol.Request(
+            task=wool_task.to_protobuf(),
+            context=protocol.Context(vars=caller_vars),
+        )
 
         # Act
         async with grpc_aio_stub() as stub:
@@ -2458,7 +2461,7 @@ class TestWorkerService:
 
         initial_request = protocol.Request(
             task=wool_task.to_protobuf(),
-            context={var.key: cloudpickle.dumps("first")},
+            context=protocol.Context(vars={var.key: cloudpickle.dumps("first")}),
         )
 
         # Act
@@ -2474,7 +2477,9 @@ class TestWorkerService:
                 await stream.write(
                     protocol.Request(
                         next=protocol.Void(),
-                        context={var.key: cloudpickle.dumps(frame_value)},
+                        context=protocol.Context(
+                            vars={var.key: cloudpickle.dumps(frame_value)},
+                        ),
                     )
                 )
                 response = await anext(aiter(stream))
@@ -2626,7 +2631,7 @@ class TestWorkerService:
 
         initial_request = protocol.Request(
             task=wool_task.to_protobuf(serializer=serializer),
-            context={var.key: serializer.dumps("alpha")},
+            context=protocol.Context(vars={var.key: serializer.dumps("alpha")}),
         )
 
         # Act
@@ -2642,7 +2647,9 @@ class TestWorkerService:
                 await stream.write(
                     protocol.Request(
                         next=protocol.Void(),
-                        context={var.key: serializer.dumps(frame_value)},
+                        context=protocol.Context(
+                            vars={var.key: serializer.dumps(frame_value)},
+                        ),
                     )
                 )
                 response = await anext(aiter(stream))
