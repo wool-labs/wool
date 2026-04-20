@@ -1,6 +1,7 @@
 """Full integration tests — pairwise parametrized and Hypothesis exploration."""
 
 import asyncio
+import contextvars
 
 import pytest
 from hypothesis import HealthCheck
@@ -10,6 +11,7 @@ from hypothesis import settings
 
 from .conftest import PAIRWISE_SCENARIOS
 from .conftest import BackpressureMode
+from .conftest import ContextVarPattern
 from .conftest import CredentialType
 from .conftest import DiscoveryFactory
 from .conftest import LazyMode
@@ -45,7 +47,17 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
     async def body():
         async with asyncio.timeout(_INTEGRATION_TIMEOUT):
             async with build_pool_from_scenario(scenario, credentials_map):
-                await invoke_routine(scenario)
+                # Each invocation runs in an isolated stdlib Context
+                # copy. pytest-asyncio re-uses a single ``context=``
+                # across every test invocation, so mutations made
+                # inside ``invoke_routine`` otherwise leak into the
+                # shared context and cross-contaminate other
+                # parametrized cases. See pytest-asyncio #136 /
+                # AnyIO testing docs for the known interaction
+                # between pytest runners, ``asyncio.Task(context=)``
+                # and ContextVar mutation visibility.
+                isolated = contextvars.copy_context()
+                await asyncio.create_task(invoke_routine(scenario), context=isolated)
 
     await retry_grpc_internal(body)
 
@@ -72,6 +84,9 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         RoutineBinding.MODULE_FUNCTION,
         LazyMode.LAZY,
         BackpressureMode.NONE,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
     )
 )
 @example(
@@ -86,6 +101,9 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         RoutineBinding.MODULE_FUNCTION,
         LazyMode.LAZY,
         BackpressureMode.SYNC,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
     )
 )
 @example(
@@ -100,6 +118,9 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         RoutineBinding.MODULE_FUNCTION,
         LazyMode.LAZY,
         BackpressureMode.ASYNC,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
+        ContextVarPattern.NONE,
     )
 )
 @given(scenario=scenarios_strategy())
@@ -118,6 +139,10 @@ async def test_dispatch_hypothesis(scenario, credentials_map, retry_grpc_interna
     async def body():
         async with asyncio.timeout(_INTEGRATION_TIMEOUT):
             async with build_pool_from_scenario(scenario, credentials_map):
-                await invoke_routine(scenario)
+                # See ``test_dispatch_pairwise`` above for the
+                # rationale behind isolating each Hypothesis example
+                # in its own stdlib Context copy.
+                isolated = contextvars.copy_context()
+                await asyncio.create_task(invoke_routine(scenario), context=isolated)
 
     await retry_grpc_internal(body)

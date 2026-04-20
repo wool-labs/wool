@@ -14,7 +14,7 @@ from typing import cast
 from uuid import uuid4
 
 import wool
-from wool.runtime import context as ctx
+from wool.runtime.context import dispatch_timeout
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import do_dispatch
 
@@ -251,7 +251,7 @@ def _dispatch(
         tag=f"{module}.{qualname}:{lineno}",
         proxy=proxy,
     )
-    return proxy.dispatch(task, timeout=ctx.dispatch_timeout.get())
+    return proxy.dispatch(task, timeout=dispatch_timeout.get())
 
 
 async def _stream(fn, *args, **kwargs):

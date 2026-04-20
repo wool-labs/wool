@@ -320,6 +320,10 @@ class WorkerProcess(Process):
             service = WorkerService(backpressure=backpressure)
             protocol.add_to_server[protocol.WorkerServicer](service, server)
 
+            from wool.runtime.context import install_task_factory
+
+            install_task_factory(asyncio.get_running_loop())
+
             with _signal_handlers(service):
                 try:
                     await server.start()

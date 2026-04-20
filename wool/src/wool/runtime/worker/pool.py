@@ -412,6 +412,9 @@ class WorkerPool:
             contexts are single-use — create a new instance instead
             of re-entering.
         """
+        from wool.runtime.context import install_task_factory
+
+        install_task_factory()
         self._proxy_context = self._proxy_factory()
         await self._proxy_context.__aenter__()
         return self

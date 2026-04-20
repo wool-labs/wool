@@ -30,7 +30,7 @@ from cryptography.x509.oid import NameOID
 from hypothesis import strategies as st
 
 import wool
-from wool.runtime.context import RuntimeContext
+from wool.runtime.context import dispatch_timeout
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.worker.auth import WorkerCredentials
@@ -95,7 +95,7 @@ class WorkerOptionsKind(Enum):
 
 class TimeoutKind(Enum):
     NONE = auto()
-    VIA_RUNTIME_CONTEXT = auto()
+    VIA_DISPATCH_TIMEOUT_VAR = auto()
 
 
 class RoutineBinding(Enum):
@@ -114,6 +114,16 @@ class BackpressureMode(Enum):
 class LazyMode(Enum):
     LAZY = auto()
     EAGER = auto()
+
+
+class ContextVarPattern(Enum):
+    NONE = auto()
+    ROUND_TRIP = auto()
+    LOCAL_RESET = auto()
+    DOWNSTREAM_OVERWRITE = auto()
+    DOWNSTREAM_RESET = auto()
+    UPSTREAM_RESET = auto()
+    PER_YIELD = auto()
 
 
 def _sync_accept_hook(ctx):
@@ -144,6 +154,9 @@ class Scenario:
     binding: RoutineBinding | None = None
     lazy: LazyMode | None = None
     backpressure: BackpressureMode | None = None
+    ctx_var_1: ContextVarPattern | None = None
+    ctx_var_2: ContextVarPattern | None = None
+    ctx_var_3: ContextVarPattern | None = None
 
     def __or__(self, other: Scenario) -> Scenario:
         """Merge two partial scenarios. Right side wins on ``None`` fields.
@@ -164,7 +177,7 @@ class Scenario:
 
     @property
     def is_complete(self) -> bool:
-        """True when all 10 dimensions are set."""
+        """True when all 13 dimensions are set."""
         return all(getattr(self, f.name) is not None for f in fields(self))
 
     def __str__(self) -> str:
@@ -296,9 +309,9 @@ async def build_pool_from_scenario(scenario, credentials_map):
 
                 discovery_obj = _lan_async_cm()
 
-    runtime_ctx = None
-    if scenario.timeout is TimeoutKind.VIA_RUNTIME_CONTEXT:
-        runtime_ctx = RuntimeContext(dispatch_timeout=30.0)
+    dispatch_timeout_token = None
+    if scenario.timeout is TimeoutKind.VIA_DISPATCH_TIMEOUT_VAR:
+        dispatch_timeout_token = dispatch_timeout.set(30.0)
 
     lazy = scenario.lazy is LazyMode.LAZY
 
@@ -311,9 +324,6 @@ async def build_pool_from_scenario(scenario, credentials_map):
             bp_hook = None
 
     try:
-        if runtime_ctx is not None:
-            runtime_ctx.__enter__()
-
         try:
             if scenario.pool_mode is PoolMode.DURABLE:
                 async with _durable_pool_context(
@@ -382,8 +392,8 @@ async def build_pool_from_scenario(scenario, credentials_map):
                     else:
                         yield pool
         finally:
-            if runtime_ctx is not None:
-                runtime_ctx.__exit__(None, None, None)
+            if dispatch_timeout_token is not None:
+                dispatch_timeout.reset(dispatch_timeout_token)
     finally:
         if _local_cm is not None:
             _local_cm.__exit__(None, None, None)
@@ -548,80 +558,271 @@ async def _durable_joined_pool_context(
         await worker.stop()
 
 
+_VAR_NAMES = ("tenant_id", "region", "trace_id")
+_CALLER_VARS = {
+    "tenant_id": routines.TENANT_ID,
+    "region": routines.REGION,
+    "trace_id": routines.TRACE_ID,
+}
+
+
+def _build_patterns_dict(scenario):
+    """Build a patterns dict from the scenario's ctx_var fields.
+
+    Maps var names to pattern name strings for non-NONE patterns.
+    Returns an empty dict when all three patterns are NONE.
+    """
+    result = {}
+    for idx, var_name in enumerate(_VAR_NAMES):
+        pattern = getattr(scenario, f"ctx_var_{idx + 1}")
+        if pattern is not None and pattern is not ContextVarPattern.NONE:
+            assert pattern.name in routines._PATTERN_NAMES, (
+                f"ContextVarPattern.{pattern.name} has no matching "
+                f"arm in routines._execute_patterns"
+            )
+            result[var_name] = pattern.name
+    return result
+
+
+def _setup_caller_vars(patterns):
+    """Set caller-side initial values for patterns that need them.
+
+    Returns a dict of {var_name: token} for cleanup, and a dict of
+    {var_name: initial_value} for later assertion.
+    """
+    tokens = {}
+    initial_values = {}
+    for var_name, pattern in patterns.items():
+        var = _CALLER_VARS[var_name]
+        if pattern in (
+            "ROUND_TRIP",
+            "LOCAL_RESET",
+            "DOWNSTREAM_OVERWRITE",
+            "DOWNSTREAM_RESET",
+            "UPSTREAM_RESET",
+            "PER_YIELD",
+        ):
+            initial = f"caller-initial-{var_name}"
+            tokens[var_name] = var.set(initial)
+            initial_values[var_name] = initial
+    return tokens, initial_values
+
+
+def _assert_caller_vars(patterns, initial_values, *, shape=None):
+    """Assert caller-side var state after dispatch completes.
+
+    Nested patterns (DOWNSTREAM_OVERWRITE, DOWNSTREAM_RESET,
+    UPSTREAM_RESET) assert the outer worker's final state, which is
+    what the caller observes via back-propagation. The inner worker's
+    mutations do not reach the outer worker's copied context because
+    the nested dispatch crosses event loop boundaries; only the outer
+    worker's own writes are captured in its snapshot.
+
+    For NESTED_ASYNC_GEN shapes, the async generator's final context
+    snapshot is sent with the last yield, not after exhaustion.
+    Post-teardown mutations (UPSTREAM_RESET) are not visible to the
+    caller because there is no subsequent yield to carry them. For
+    DOWNSTREAM_OVERWRITE and DOWNSTREAM_RESET the outer worker's
+    ``_pre_nested_setup`` runs before the first inner yield, so those
+    values ARE captured in per-yield snapshots.
+    """
+    is_nested_gen = shape is RoutineShape.NESTED_ASYNC_GEN
+    for var_name, pattern in patterns.items():
+        var = _CALLER_VARS[var_name]
+        match pattern:
+            case "ROUND_TRIP":
+                assert var.get() == f"worker-mutated-{var_name}", (
+                    f"ROUND_TRIP: expected caller {var_name} to reflect "
+                    f"worker mutation, got {var.get()!r}"
+                )
+            case "LOCAL_RESET":
+                assert var.get() == initial_values[var_name], (
+                    f"LOCAL_RESET: expected caller {var_name} to be "
+                    f"unchanged at {initial_values[var_name]!r}, "
+                    f"got {var.get()!r}"
+                )
+            case "DOWNSTREAM_OVERWRITE":
+                # Under stdlib-mirror semantics, wool routines run in
+                # the caller's stdlib Context — outer sets, inner
+                # overwrites in the same Context, and back-prop
+                # carries the final state (inner's overwrite) to the
+                # caller. Matches `await coro()` semantics.
+                assert var.get() == f"inner-overwrite-{var_name}", (
+                    f"DOWNSTREAM_OVERWRITE: expected inner-overwrite value, "
+                    f"got {var.get()!r}"
+                )
+            case "DOWNSTREAM_RESET":
+                # Outer sets and passes token; inner resets using the
+                # token, restoring the pre-outer value. Caller sees
+                # its own initial value.
+                assert var.get() == initial_values[var_name], (
+                    f"DOWNSTREAM_RESET: expected caller's initial value "
+                    f"{initial_values[var_name]!r}, got {var.get()!r}"
+                )
+            case "UPSTREAM_RESET":
+                if is_nested_gen:
+                    # Async gen: inner sets "inner-set-" before
+                    # yielding; that value is captured in a
+                    # per-yield snapshot and back-propagated to the
+                    # caller. _post_nested_teardown runs after the
+                    # gen exhausts — no subsequent yield carries
+                    # its mutation — so the caller's final visible
+                    # state is inner's set.
+                    assert var.get() == f"inner-set-{var_name}", (
+                        f"UPSTREAM_RESET (async gen): expected "
+                        f"inner-set value, got {var.get()!r}"
+                    )
+                else:
+                    # Coroutine: inner sets, then _post_nested_teardown
+                    # overwrites with outer-reset before the response
+                    # snapshot ships.
+                    assert var.get() == f"outer-reset-{var_name}", (
+                        f"UPSTREAM_RESET: expected outer-reset value, got {var.get()!r}"
+                    )
+            case "PER_YIELD":
+                # After iteration, caller should see the last
+                # step value back-propagated.
+                pass  # validated inline during iteration
+
+
+def _cleanup_caller_vars(tokens):
+    """Reset caller-side vars using saved tokens."""
+    for var_name, token in tokens.items():
+        _CALLER_VARS[var_name].reset(token)
+
+
 async def invoke_routine(scenario):
     """Invoke the appropriate routine for the given scenario and return results."""
     binding = scenario.binding
     shape = scenario.shape
 
-    obj = routines.Routines() if binding is not RoutineBinding.MODULE_FUNCTION else None
+    patterns = _build_patterns_dict(scenario)
 
-    routine = _select_routine(shape, binding)
+    # Set up TEST_PATTERNS so the worker decorator picks them up.
+    patterns_token = None
+    caller_tokens = {}
+    initial_values = {}
+    if patterns:
+        patterns_token = routines.TEST_PATTERNS.set(patterns)
+        caller_tokens, initial_values = _setup_caller_vars(patterns)
 
-    match shape:
-        case RoutineShape.COROUTINE:
-            if binding is RoutineBinding.INSTANCE_METHOD:
-                result = await routine(obj, 1, 2)
-            else:
-                result = await routine(1, 2)
-            assert result == 3
-            return result
+    try:
+        obj = (
+            routines.Routines()
+            if binding is not RoutineBinding.MODULE_FUNCTION
+            else None
+        )
 
-        case RoutineShape.ASYNC_GEN_ANEXT:
-            collected = []
-            if binding is RoutineBinding.INSTANCE_METHOD:
-                gen = routine(obj, 3)
-            else:
-                gen = routine(3)
-            async for item in gen:
-                collected.append(item)
-            assert collected == [0, 1, 2]
-            return collected
+        routine = _select_routine(shape, binding)
 
-        case RoutineShape.ASYNC_GEN_ASEND:
-            if binding is RoutineBinding.INSTANCE_METHOD:
-                gen = routine(obj, 2)
-            else:
-                gen = routine(2)
-            first = await gen.__anext__()
-            assert first == "ready"
-            echoed = await gen.asend(42)
-            assert echoed == 42
-            await gen.aclose()
-            return echoed
+        match shape:
+            case RoutineShape.COROUTINE:
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    result = await routine(obj, 1, 2)
+                else:
+                    result = await routine(1, 2)
+                assert result == 3
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return result
 
-        case RoutineShape.ASYNC_GEN_ATHROW:
-            if binding is RoutineBinding.INSTANCE_METHOD:
-                gen = routine(obj, 10)
-            else:
-                gen = routine(10)
-            first = await gen.__anext__()
-            assert first == 10
-            reset = await gen.athrow(ValueError)
-            assert reset == 0
-            await gen.aclose()
-            return reset
+            case RoutineShape.ASYNC_GEN_ANEXT:
+                collected = []
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    gen = routine(obj, 3)
+                else:
+                    gen = routine(3)
+                step = 0
+                async for item in gen:
+                    collected.append(item)
+                    if patterns:
+                        per_yield = {
+                            k: v for k, v in patterns.items() if v == "PER_YIELD"
+                        }
+                        for var_name in per_yield:
+                            var = _CALLER_VARS[var_name]
+                            assert var.get() == f"step-{step}", (
+                                f"PER_YIELD step {step}: expected "
+                                f"'step-{step}', got {var.get()!r}"
+                            )
+                    step += 1
+                assert collected == [0, 1, 2]
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return collected
 
-        case RoutineShape.ASYNC_GEN_ACLOSE:
-            if binding is RoutineBinding.INSTANCE_METHOD:
-                gen = routine(obj)
-            else:
-                gen = routine()
-            first = await gen.__anext__()
-            assert first == "alive"
-            await gen.aclose()
-            return first
+            case RoutineShape.ASYNC_GEN_ASEND:
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    gen = routine(obj, 2)
+                else:
+                    gen = routine(2)
+                first = await gen.__anext__()
+                assert first == "ready"
+                echoed = await gen.asend(42)
+                assert echoed == 42
+                await gen.aclose()
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return echoed
 
-        case RoutineShape.NESTED_COROUTINE:
-            result = await routines.nested_add(1, 2)
-            assert result == 3
-            return result
+            case RoutineShape.ASYNC_GEN_ATHROW:
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    gen = routine(obj, 10)
+                else:
+                    gen = routine(10)
+                first = await gen.__anext__()
+                assert first == 10
+                reset = await gen.athrow(ValueError)
+                assert reset == 0
+                await gen.aclose()
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return reset
 
-        case RoutineShape.NESTED_ASYNC_GEN:
-            collected = []
-            async for item in routines.nested_gen(3):
-                collected.append(item)
-            assert collected == [0, 1, 2]
-            return collected
+            case RoutineShape.ASYNC_GEN_ACLOSE:
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    gen = routine(obj)
+                else:
+                    gen = routine()
+                first = await gen.__anext__()
+                assert first == "alive"
+                await gen.aclose()
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return first
+
+            case RoutineShape.NESTED_COROUTINE:
+                result = await routines.nested_add(1, 2)
+                assert result == 3
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return result
+
+            case RoutineShape.NESTED_ASYNC_GEN:
+                collected = []
+                step = 0
+                async for item in routines.nested_gen(3):
+                    collected.append(item)
+                    if patterns:
+                        per_yield = {
+                            k: v for k, v in patterns.items() if v == "PER_YIELD"
+                        }
+                        for var_name in per_yield:
+                            var = _CALLER_VARS[var_name]
+                            assert var.get() == f"step-{step}", (
+                                f"PER_YIELD step {step}: expected "
+                                f"'step-{step}', got {var.get()!r}"
+                            )
+                    step += 1
+                assert collected == [0, 1, 2]
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return collected
+    finally:
+        if caller_tokens:
+            _cleanup_caller_vars(caller_tokens)
+        if patterns_token is not None:
+            routines.TEST_PATTERNS.reset(patterns_token)
 
 
 def _select_routine(shape, binding):
@@ -684,6 +885,18 @@ _NESTED_SHAPES = (
     RoutineShape.NESTED_COROUTINE,
     RoutineShape.NESTED_ASYNC_GEN,
 )
+_ASYNC_GEN_SHAPES = (
+    RoutineShape.ASYNC_GEN_ANEXT,
+    RoutineShape.ASYNC_GEN_ASEND,
+    RoutineShape.ASYNC_GEN_ATHROW,
+    RoutineShape.ASYNC_GEN_ACLOSE,
+    RoutineShape.NESTED_ASYNC_GEN,
+)
+_NESTED_ONLY_PATTERNS = (
+    ContextVarPattern.DOWNSTREAM_OVERWRITE,
+    ContextVarPattern.DOWNSTREAM_RESET,
+    ContextVarPattern.UPSTREAM_RESET,
+)
 
 
 def _is_grpc_internal(exc: BaseException) -> bool:
@@ -710,6 +923,9 @@ def _pairwise_filter(row):
       for these shapes)
     - D8 must be MODULE_FUNCTION when D1 is NESTED_* (nested dispatch
       always uses module-level routines)
+    - D11/D12/D13 (ctx_var_1/2/3): DOWNSTREAM_OVERWRITE,
+      DOWNSTREAM_RESET, UPSTREAM_RESET only valid with NESTED_* shapes;
+      PER_YIELD only valid with ASYNC_GEN_* shapes
     """
     if len(row) > 2:
         pool_mode = row[1]
@@ -746,6 +962,15 @@ def _pairwise_filter(row):
             return False
         if shape in _NESTED_SHAPES and binding is not RoutineBinding.MODULE_FUNCTION:
             return False
+    # Context var pattern constraints (indices 10, 11, 12)
+    shape = row[0]
+    for idx in (10, 11, 12):
+        if len(row) > idx:
+            pattern = row[idx]
+            if pattern in _NESTED_ONLY_PATTERNS and shape not in _NESTED_SHAPES:
+                return False
+            if pattern is ContextVarPattern.PER_YIELD and shape not in _ASYNC_GEN_SHAPES:
+                return False
     return True
 
 
@@ -761,6 +986,9 @@ PAIRWISE_SCENARIOS = [
         binding=row[7],
         lazy=row[8],
         backpressure=row[9],
+        ctx_var_1=row[10],
+        ctx_var_2=row[11],
+        ctx_var_3=row[12],
     )
     for row in AllPairs(
         [
@@ -774,6 +1002,9 @@ PAIRWISE_SCENARIOS = [
             list(RoutineBinding),
             list(LazyMode),
             list(BackpressureMode),
+            list(ContextVarPattern),
+            list(ContextVarPattern),
+            list(ContextVarPattern),
         ],
         filter_func=_pairwise_filter,
     )
@@ -836,6 +1067,18 @@ def scenarios_strategy(draw):
     lazy = draw(st.sampled_from(LazyMode))
     backpressure = draw(st.sampled_from(BackpressureMode))
 
+    def _draw_ctx_var_pattern(draw):
+        valid = list(ContextVarPattern)
+        if shape not in _NESTED_SHAPES:
+            valid = [p for p in valid if p not in _NESTED_ONLY_PATTERNS]
+        if shape not in _ASYNC_GEN_SHAPES:
+            valid = [p for p in valid if p is not ContextVarPattern.PER_YIELD]
+        return draw(st.sampled_from(valid))
+
+    ctx_var_1 = _draw_ctx_var_pattern(draw)
+    ctx_var_2 = _draw_ctx_var_pattern(draw)
+    ctx_var_3 = _draw_ctx_var_pattern(draw)
+
     return Scenario(
         shape=shape,
         pool_mode=pool_mode,
@@ -847,6 +1090,9 @@ def scenarios_strategy(draw):
         binding=binding,
         lazy=lazy,
         backpressure=backpressure,
+        ctx_var_1=ctx_var_1,
+        ctx_var_2=ctx_var_2,
+        ctx_var_3=ctx_var_3,
     )
 
 
@@ -951,6 +1197,16 @@ def _clear_proxy_context():
     wool.__proxy__.reset(proxy_token)
     wool.__proxy_pool__.reset(pool_token)
     __subscriber_pool__.reset(sub_token)
+
+
+# Integration tests rely on pytest-asyncio's Task-per-test scoping
+# for ContextVar isolation: each async test runs inside an
+# asyncio.Task whose ``contextvars.Context`` is a copy, so
+# wool.ContextVar mutations stay scoped to that copy and don't leak
+# to the next test. Sync integration helpers run in the pytest main
+# Context — if they ever mutate routine-level vars, add an explicit
+# per-test teardown at that site rather than reviving a global
+# autouse cleanup.
 
 
 @pytest.fixture

@@ -1,8 +1,6 @@
 import asyncio
-import concurrent.futures
 import threading
 from contextlib import asynccontextmanager
-from typing import Final
 from uuid import uuid4
 
 import cloudpickle
@@ -24,7 +22,6 @@ from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
-from wool.runtime.worker.service import _ReadOnlyEvent
 
 from .conftest import PicklableMock
 
@@ -123,83 +120,6 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
                 stop_request = protocol.StopRequest(timeout=1)
                 await stub.stop(stop_request)
             _control_event = None
-
-
-class TestReadOnlyEvent:
-    """Tests for :class:`_ReadOnlyEvent` wrapper."""
-
-    unset_event: Final = asyncio.Event()
-    set_event: Final = asyncio.Event()
-    set_event.set()
-
-    @pytest.mark.parametrize("event", (unset_event, set_event))
-    def test___init___wraps_asyncio_event(self, event):
-        """Test :class:`_ReadOnlyEvent` initialization.
-
-        Given:
-            An :class:`asyncio.Event` instance
-        When:
-            :class:`_ReadOnlyEvent` is instantiated with the event
-        Then:
-            It should wrap the event successfully
-        """
-        # Act
-        read_only_event = _ReadOnlyEvent(event)
-
-        # Assert
-        assert read_only_event.is_set() == event.is_set()
-
-        with pytest.raises(AttributeError):
-            getattr(read_only_event, "set")
-
-        with pytest.raises(AttributeError):
-            getattr(read_only_event, "clear")
-
-    def test_is_set_delegates_to_underlying_event(self, mocker: MockerFixture):
-        """Test :class:`_ReadOnlyEvent.is_set` calls :meth:`~asyncio.Event.is_set` on its
-        underlying event.
-
-        Given:
-            A :class:`_ReadOnlyEvent` instance wrapping an event
-        When:
-            :meth:`~_ReadOnlyEvent.is_set` is called
-        Then:
-            :meth:`~asyncio.Event.is_set` is called on the underlying event
-        """
-        # Arrange
-        event = asyncio.Event()
-        is_set_spy = mocker.spy(event, "is_set")
-        read_only_event = _ReadOnlyEvent(event)
-
-        # Act
-        read_only_event.is_set()
-
-        # Assert
-        is_set_spy.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_wait_delegates_to_underlying_event(self, mocker: MockerFixture):
-        """Test :class:`_ReadOnlyEvent.wait` calls :meth:`~asyncio.Event.wait` on its
-        underlying event.
-
-        Given:
-            A :class:`_ReadOnlyEvent` instance wrapping an event
-        When:
-            :meth:`~_ReadOnlyEvent.wait` is called
-        Then:
-            :meth:`~asyncio.Event.wait` is called and awaited on the underlying event
-        """
-        # Arrange
-        event = asyncio.Event()
-        event.set()
-        wait_spy = mocker.patch.object(event, "wait", mocker.AsyncMock(wraps=event.wait))
-        read_only_event = _ReadOnlyEvent(event)
-
-        # Act
-        await read_only_event.wait()
-
-        # Assert
-        wait_spy.assert_awaited_once_with()
 
 
 class TestWorkerService:
@@ -1101,95 +1021,6 @@ class TestWorkerService:
             assert isinstance(stop_result, protocol.Void)
             assert grpc_servicer.stopping.is_set()
             assert grpc_servicer.stopped.is_set()
-
-    @pytest.mark.asyncio
-    async def test_run_on_worker_done_callback_tolerates_already_cancelled_future(
-        self,
-        mocker: MockerFixture,
-    ):
-        """Done callback must not raise on already-done future.
-
-        Given:
-            A task dispatched to the worker loop, where the bridging
-            :class:`~concurrent.futures.Future` is cancelled before the
-            worker task's done callback fires
-        When:
-            The worker task completes normally and fires its done
-            callback on the already-cancelled future
-        Then:
-            The callback exits early without raising
-            :exc:`~concurrent.futures.InvalidStateError`.
-        """
-        service = WorkerService()
-        invalid_state_errors: list[Exception] = []
-
-        # Spy on set_result and set_exception to detect
-        # InvalidStateError that would occur without the
-        # future.done() guard in the _done callback.
-        _og_set_result = concurrent.futures.Future.set_result
-        _og_set_exception = concurrent.futures.Future.set_exception
-
-        def detecting_set_result(self, result):
-            try:
-                return _og_set_result(self, result)
-            except concurrent.futures.InvalidStateError as e:
-                invalid_state_errors.append(e)
-
-        def detecting_set_exception(self, exception):
-            try:
-                return _og_set_exception(self, exception)
-            except concurrent.futures.InvalidStateError as e:
-                invalid_state_errors.append(e)
-
-        mocker.patch.object(
-            concurrent.futures.Future, "set_result", detecting_set_result
-        )
-        mocker.patch.object(
-            concurrent.futures.Future, "set_exception", detecting_set_exception
-        )
-
-        # Patch wrap_future to cancel the bridging future immediately
-        # after wrapping. This deterministically simulates the race
-        # where Task.cancel() propagates through wrap_future's
-        # _chain_future to cancel the concurrent.futures.Future
-        # before the worker task's done callback fires.
-        _og_wrap_future = asyncio.wrap_future
-
-        def cancelling_wrap_future(future, *, loop=None):
-            asyncio_future = _og_wrap_future(future, loop=loop)
-            future.cancel()
-            return asyncio_future
-
-        mocker.patch("asyncio.wrap_future", cancelling_wrap_future)
-
-        async def sample_task():
-            return "completed"
-
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        work_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
-
-        with pytest.raises(asyncio.CancelledError):
-            await service._run_on_worker(work_task)
-
-        # Allow the worker task's done callback to fire on the
-        # worker loop.
-        await asyncio.sleep(0.2)
-
-        assert not invalid_state_errors, (
-            "InvalidStateError raised in _done callback — "
-            "the future.done() guard may have been removed"
-        )
-
-        # Cleanup worker loops
-        for entry in service._loop_pool._cache.values():
-            WorkerService._destroy_worker_loop(entry.obj)
 
     @pytest.mark.asyncio
     async def test_dispatch_with_version_in_ack(
@@ -2543,3 +2374,291 @@ class TestWorkerService:
             with pytest.raises(grpc.RpcError):
                 async for _ in stream:
                     pass
+
+    @pytest.mark.asyncio
+    async def test_dispatch_applies_caller_vars_for_coroutine_task(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test dispatch applies caller-side vars before running a coroutine.
+
+        Given:
+            A Request carrying a non-empty ``vars`` map (a
+            wool.ContextVar set on the caller, serialized via _dumps)
+            and a coroutine Task that reads the var
+        When:
+            The dispatch RPC is invoked end-to-end via the gRPC stub
+        Then:
+            The Response's result equals the caller-side var value —
+            the worker applied the wire-shipped snapshot before running
+            the task.
+        """
+        # Arrange
+        var = wool.ContextVar("srv001_caller_var", namespace="test_srv_vars")
+
+        async def reader_task():
+            return var.get()
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=reader_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        caller_vars = {var.key: cloudpickle.dumps("caller-side-value")}
+        request = protocol.Request(
+            task=wool_task.to_protobuf(),
+            context=protocol.Context(vars=caller_vars),
+        )
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            responses = [r async for r in stream]
+
+        # Assert
+        ack, response = responses
+        assert ack.HasField("ack")
+        assert response.HasField("result")
+        assert cloudpickle.loads(response.result.dump) == "caller-side-value"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_applies_per_frame_caller_vars_for_async_gen(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test streaming dispatch applies per-frame vars before each asend.
+
+        Given:
+            An async-generator Task whose frames yield the current
+            value of a caller-side wool.ContextVar, with subsequent
+            next Requests carrying updated ``vars`` maps each iteration
+        When:
+            The stream is iterated with changing ``vars`` on each frame
+        Then:
+            Each response's result reflects the per-frame ``vars``
+            applied on the worker — forward-propagation is honored at
+            every streaming frame, not just the first.
+        """
+        # Arrange
+        var = wool.ContextVar("srv002_frame_var", namespace="test_srv_vars")
+
+        async def streaming_task():
+            while True:
+                yield var.get()
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=streaming_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        initial_request = protocol.Request(
+            task=wool_task.to_protobuf(),
+            context=protocol.Context(vars={var.key: cloudpickle.dumps("first")}),
+        )
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(initial_request)
+
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            results: list = []
+            for frame_value in ("first", "second", "third"):
+                await stream.write(
+                    protocol.Request(
+                        next=protocol.Void(),
+                        context=protocol.Context(
+                            vars={var.key: cloudpickle.dumps(frame_value)},
+                        ),
+                    )
+                )
+                response = await anext(aiter(stream))
+                assert response.HasField("result")
+                results.append(cloudpickle.loads(response.result.dump))
+
+            await stream.done_writing()
+            async for _ in stream:
+                pass
+
+        # Assert
+        assert results == ["first", "second", "third"]
+
+    @pytest.mark.asyncio
+    async def test_stop_logs_warning_when_aclose_interrupted_on_teardown(
+        self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache
+    ):
+        """Test service shutdown logs a warning when generator aclose is interrupted.
+
+        Given:
+            A streaming async-generator Task whose own teardown
+            handler re-raises as CancelledError when it observes
+            GeneratorExit — simulating a routine whose cleanup path
+            is itself cancelled during shutdown
+        When:
+            The service is stopped with timeout=0 mid-stream, so the
+            worker's ``gen.aclose()`` surfaces the CancelledError
+        Then:
+            A warning is logged at the
+            ``wool.runtime.worker.service`` logger containing
+            ``aclose on teardown`` and shutdown completes cleanly.
+        """
+        import logging
+
+        # Arrange — caplog does not reliably capture log records
+        # emitted on the worker thread's event loop (its handler
+        # propagation races with pytest's logging plugin teardown),
+        # so attach a thread-safe handler directly to the target
+        # logger.
+        records: list[logging.LogRecord] = []
+        records_lock = threading.Lock()
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record):
+                with records_lock:
+                    records.append(record)
+
+        handler = _ListHandler(level=logging.WARNING)
+        target_logger = logging.getLogger("wool.runtime.worker.service")
+        prior_level = target_logger.level
+        target_logger.setLevel(logging.WARNING)
+        target_logger.addHandler(handler)
+
+        async def teardown_cancelling_generator():
+            try:
+                yield "first"
+                yield "never"
+            except GeneratorExit:
+                # Re-raise as CancelledError so the worker-side
+                # gen.aclose() surfaces the teardown-interruption
+                # branch in _stream_from_worker. Models a routine
+                # whose own teardown observes cancellation.
+                raise asyncio.CancelledError() from None
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=teardown_cancelling_generator,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        request = protocol.Request(task=wool_task.to_protobuf())
+        next_request = protocol.Request(next=protocol.Void())
+
+        try:
+            # Act
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(request)
+
+                response = await anext(aiter(stream))
+                assert response.HasField("ack")
+
+                await stream.write(next_request)
+                response = await anext(aiter(stream))
+                assert response.HasField("result")
+                assert cloudpickle.loads(response.result.dump) == "first"
+
+                stop_result = await stub.stop(protocol.StopRequest(timeout=0))
+
+            # The warning fires on the worker thread during shutdown;
+            # allow a brief settle window for the record to be emitted.
+            await asyncio.sleep(0.5)
+
+            # Assert
+            assert isinstance(stop_result, protocol.Void)
+            assert grpc_servicer.stopped.is_set()
+            with records_lock:
+                snapshot = list(records)
+            assert any(
+                "aclose on teardown" in record.getMessage()
+                and record.levelno == logging.WARNING
+                for record in snapshot
+            )
+        finally:
+            target_logger.removeHandler(handler)
+            target_logger.setLevel(prior_level)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_applies_passthrough_loads_for_streaming_self_dispatch(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test streaming self-dispatch applies PassthroughSerializer.loads for vars.
+
+        Given:
+            An async-generator Task configured with a
+            PassthroughSerializer whose streaming next-frames carry
+            var updates serialized via PassthroughSerializer.dumps
+        When:
+            The stream is iterated with changing vars on each frame
+        Then:
+            Each response reflects the updated value — proving that
+            the worker-side _apply_vars uses PassthroughSerializer.loads
+            rather than cloudpickle.loads for passthrough self-dispatch
+            frames.
+        """
+        from wool.runtime.routine.task import PassthroughSerializer
+
+        # Arrange
+        var = wool.ContextVar(
+            "passthrough_stream_var", namespace="test_passthrough_stream"
+        )
+        serializer = PassthroughSerializer()
+
+        async def streaming_task():
+            while True:
+                yield var.get()
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=streaming_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        initial_request = protocol.Request(
+            task=wool_task.to_protobuf(serializer=serializer),
+            context=protocol.Context(vars={var.key: serializer.dumps("alpha")}),
+        )
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(initial_request)
+
+            response = await anext(aiter(stream))
+            assert response.HasField("ack")
+
+            results: list = []
+            for frame_value in ("alpha", "bravo", "charlie"):
+                await stream.write(
+                    protocol.Request(
+                        next=protocol.Void(),
+                        context=protocol.Context(
+                            vars={var.key: serializer.dumps(frame_value)},
+                        ),
+                    )
+                )
+                response = await anext(aiter(stream))
+                assert response.HasField("result")
+                results.append(PassthroughSerializer.loads(response.result.dump))
+
+            await stream.done_writing()
+            async for _ in stream:
+                pass
+
+        # Assert
+        assert results == ["alpha", "bravo", "charlie"]

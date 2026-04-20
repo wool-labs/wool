@@ -14,8 +14,10 @@ import grpc.aio
 
 import wool
 from wool import protocol
+from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import PassthroughSerializer
+from wool.runtime.routine.task import Serializer
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.base import ChannelOptions
 
@@ -95,9 +97,17 @@ class _DispatchStream(Generic[_T]):
         The underlying gRPC response stream.
     """
 
-    def __init__(self, call: _DispatchCall, task: Task):
+    def __init__(
+        self,
+        call: _DispatchCall,
+        task: Task,
+        serializer: Serializer | None = None,
+    ):
         self._call = call
         self._task = task
+        self._serializer: Serializer = (
+            serializer if serializer is not None else cast(Serializer, cloudpickle)
+        )
         self._step = 0
         self._iter = aiter(call)
         self._closed = False
@@ -126,7 +136,10 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            request = protocol.Request(next=protocol.Void())
+            request = protocol.Request(
+                next=protocol.Void(),
+                context=context.build_frame_payload(serializer=self._serializer),
+            )
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
@@ -140,15 +153,24 @@ class _DispatchStream(Generic[_T]):
         Used by :meth:`asend` and :meth:`athrow` which have already
         written their own request to the stream.
 
+        If the response carries a non-empty ``vars`` map, the
+        back-propagated var mutations are applied to the current
+        context before the result is returned.
+
         :returns:
             The next task result from the worker.
         """
         try:
             response = await anext(self._iter)
+            if response.context.vars:
+                context.apply_vars(
+                    dict(response.context.vars),
+                    serializer=self._serializer,
+                )
             if response.HasField("result"):
-                return cloudpickle.loads(response.result.dump)
+                return self._serializer.loads(response.result.dump)
             elif response.HasField("exception"):
-                raise cloudpickle.loads(response.exception.dump)
+                raise self._serializer.loads(response.exception.dump)
             else:
                 raise UnexpectedResponse(
                     f"Expected 'result' or 'exception' response, "
@@ -203,8 +225,10 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            dump = cloudpickle.dumps(value)
-            request = protocol.Request(send=protocol.Message(dump=dump))
+            request = protocol.Request(
+                send=protocol.Message(dump=self._serializer.dumps(value)),
+                context=context.build_frame_payload(serializer=self._serializer),
+            )
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
@@ -246,8 +270,10 @@ class _DispatchStream(Generic[_T]):
             else:  # pragma: no cover
                 exc = typ()
 
-            dump = cloudpickle.dumps(exc)
-            request = protocol.Request(throw=protocol.Message(dump=dump))
+            request = protocol.Request(
+                throw=protocol.Message(dump=self._serializer.dumps(exc)),
+                context=context.build_frame_payload(serializer=self._serializer),
+            )
             await self._call.write(request)
             result = await self._read_next()
             self._step += 1
@@ -425,7 +451,10 @@ class WorkerConnection:
         try:
             try:
                 call = await self._dispatch(
-                    channel, task.to_protobuf(serializer=serializer), timeout
+                    channel,
+                    task.to_protobuf(serializer=serializer),
+                    timeout,
+                    serializer=serializer,
                 )
             except grpc.RpcError as error:
                 code = error.code()
@@ -435,7 +464,7 @@ class WorkerConnection:
                 else:
                     raise RpcError(code, details) from error
 
-            stream = self._execute(call, task, key)
+            stream = self._execute(call, task, key, serializer)
             await stream.__anext__()  # Prime: _execute acquires its own ref
         except BaseException:
             await _channel_pool.release(key)
@@ -466,13 +495,17 @@ class WorkerConnection:
         channel: _Channel,
         task_msg: protocol.Task,
         timeout: float | None,
+        serializer: PassthroughSerializer | None = None,
     ) -> _DispatchCall:
         async with asyncio.timeout(timeout):
             await channel.semaphore.acquire()
             try:
                 call: _DispatchCall = channel.stub.dispatch()
                 try:
-                    request = protocol.Request(task=task_msg)
+                    request = protocol.Request(
+                        task=task_msg,
+                        context=context.build_frame_payload(serializer=serializer),
+                    )
                     await call.write(request)
                     response = await anext(aiter(call))
                     if response.HasField("nack"):
@@ -496,12 +529,16 @@ class WorkerConnection:
         return call
 
     async def _execute(
-        self, call: _DispatchCall, task: Task, key: _PoolKey
+        self,
+        call: _DispatchCall,
+        task: Task,
+        key: _PoolKey,
+        serializer: PassthroughSerializer | None = None,
     ) -> AsyncGenerator[protocol.Message | None, None]:
         channel = await _channel_pool.acquire(key)
         try:
             yield  # Priming yield — signals dispatch() that ref is held
-            stream = _DispatchStream(call, task)
+            stream = _DispatchStream(call, task, serializer=serializer)
             try:
                 sent = None
                 result = await anext(stream)
