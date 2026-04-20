@@ -34,7 +34,6 @@ import cloudpickle
 import wool
 from wool import protocol
 from wool.runtime.context import RuntimeContext
-from wool.runtime.context import dumps as _context_dumps
 
 Args = Tuple
 Kwargs = Dict
@@ -126,7 +125,7 @@ def _pickle_serializer(s: Serializer) -> bytes:
 
 
 @functools.lru_cache(maxsize=8)
-def _unpickle_serializer(data: bytes) -> Serializer:
+def unpickle_serializer(data: bytes) -> Serializer:
     return cloudpickle.loads(data)
 
 
@@ -306,7 +305,7 @@ class Task(Generic[W]):
             A :class:`Task` instance with all fields restored.
         """
         if task.HasField("serializer"):
-            s = _unpickle_serializer(task.serializer)
+            s = unpickle_serializer(task.serializer)
             loads = s.loads
         else:
             loads = cloudpickle.loads
@@ -347,7 +346,7 @@ class Task(Generic[W]):
         :returns:
             A protobuf ``Task`` message.
         """
-        dumps = serializer.dumps if serializer is not None else _context_dumps
+        dumps = serializer.dumps if serializer is not None else cloudpickle.dumps
         task_msg = protocol.Task(
             version=protocol.__version__,
             id=str(self.id),

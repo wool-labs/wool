@@ -1,6 +1,9 @@
 import asyncio
 import contextvars
+from types import SimpleNamespace
+from typing import cast
 
+import cloudpickle
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -12,10 +15,12 @@ from wool.runtime.context import Token
 from wool.runtime.context import apply_vars
 from wool.runtime.context import build_frame_payload
 from wool.runtime.context import current_context
-from wool.runtime.context import dumps
-from wool.runtime.context import loads
 from wool.runtime.context import reconstruct_var
 from wool.runtime.context import snapshot_vars
+from wool.runtime.routine.task import Serializer
+
+dumps = cloudpickle.dumps
+loads = cloudpickle.loads
 
 
 @pytest.fixture(autouse=True)
@@ -1276,7 +1281,9 @@ def test_snapshot_vars_with_custom_dumps():
         return b"custom:" + str(value).encode()
 
     # Act
-    result = snapshot_vars(dumps_param=custom_dumps)
+    result = snapshot_vars(
+        serializer=cast(Serializer, SimpleNamespace(dumps=custom_dumps))
+    )
 
     # Assert
     assert var.key in result
@@ -1290,7 +1297,7 @@ def test_build_frame_payload_with_custom_dumps():
     Given:
         A ContextVar with a value set and a custom dumps function
     When:
-        build_frame_payload(dumps_param=custom) is called
+        build_frame_payload(serializer=custom) is called
     Then:
         It should return a protocol.Context whose vars map was
         produced by the custom serializer and whose id is a 32-char
@@ -1304,7 +1311,9 @@ def test_build_frame_payload_with_custom_dumps():
         return b"bfp:" + str(value).encode()
 
     # Act
-    ctx_msg = build_frame_payload(dumps_param=custom_dumps)
+    ctx_msg = build_frame_payload(
+        serializer=cast(Serializer, SimpleNamespace(dumps=custom_dumps))
+    )
 
     # Assert
     assert var.key in ctx_msg.vars
@@ -1336,11 +1345,44 @@ def test_apply_vars_with_custom_loads():
         return "decoded-" + data.decode()
 
     # Act
-    apply_vars(wire_vars, loads_param=custom_loads)
+    apply_vars(
+        wire_vars, serializer=cast(Serializer, SimpleNamespace(loads=custom_loads))
+    )
 
     # Assert
     assert var.get() == "decoded-custom-payload"
     assert calls == [b"custom-payload"]
+
+
+@pytest.mark.asyncio
+async def test_task_contexts_register_is_visible_to_resolve_context():
+    """Test resolve_context sees a task pre-registered in task_contexts.
+
+    Given:
+        An asyncio.Task with a wool.Context pre-registered in the
+        task_contexts store under task_contexts_lock.
+    When:
+        The task's coroutine calls resolve_context().
+    Then:
+        It receives the pre-registered Context.
+    """
+    from wool.runtime.context import resolve_context
+    from wool.runtime.context import task_contexts
+    from wool.runtime.context import task_contexts_lock
+
+    seeded = Context()
+    captured: list[Context] = []
+
+    async def body():
+        captured.append(resolve_context())
+
+    loop = asyncio.get_running_loop()
+    task = asyncio.Task(body(), loop=loop)
+    with task_contexts_lock:
+        task_contexts[task] = seeded
+    await task
+
+    assert captured == [seeded]
 
 
 def test_swap_context_sync_fallback_creates_fresh_previous():

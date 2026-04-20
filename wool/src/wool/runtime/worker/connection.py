@@ -14,11 +14,10 @@ import grpc.aio
 
 import wool
 from wool import protocol
-from wool.runtime.context import apply_vars
-from wool.runtime.context import build_frame_payload
-from wool.runtime.context import dumps
+from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import PassthroughSerializer
+from wool.runtime.routine.task import Serializer
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.base import ChannelOptions
 
@@ -102,11 +101,13 @@ class _DispatchStream(Generic[_T]):
         self,
         call: _DispatchCall,
         task: Task,
-        serializer: PassthroughSerializer | None = None,
+        serializer: Serializer | None = None,
     ):
         self._call = call
         self._task = task
-        self._serializer = serializer
+        self._serializer: Serializer = (
+            serializer if serializer is not None else cast(Serializer, cloudpickle)
+        )
         self._step = 0
         self._iter = aiter(call)
         self._closed = False
@@ -135,10 +136,9 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            dumps_fn = self._serializer.dumps if self._serializer else None
             request = protocol.Request(
                 next=protocol.Void(),
-                context=build_frame_payload(dumps_param=dumps_fn),
+                context=context.build_frame_payload(serializer=self._serializer),
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -163,19 +163,14 @@ class _DispatchStream(Generic[_T]):
         try:
             response = await anext(self._iter)
             if response.context.vars:
-                apply_vars(
+                context.apply_vars(
                     dict(response.context.vars),
-                    loads_param=(
-                        PassthroughSerializer.loads if self._serializer else None
-                    ),
+                    serializer=self._serializer,
                 )
-            _msg_loads = (
-                self._serializer.loads if self._serializer else cloudpickle.loads
-            )
             if response.HasField("result"):
-                return _msg_loads(response.result.dump)
+                return self._serializer.loads(response.result.dump)
             elif response.HasField("exception"):
-                raise _msg_loads(response.exception.dump)
+                raise self._serializer.loads(response.exception.dump)
             else:
                 raise UnexpectedResponse(
                     f"Expected 'result' or 'exception' response, "
@@ -230,13 +225,9 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            _msg_dumps = self._serializer.dumps if self._serializer else dumps
-            dump = _msg_dumps(value)
             request = protocol.Request(
-                send=protocol.Message(dump=dump),
-                context=build_frame_payload(
-                    dumps_param=self._serializer.dumps if self._serializer else None
-                ),
+                send=protocol.Message(dump=self._serializer.dumps(value)),
+                context=context.build_frame_payload(serializer=self._serializer),
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -279,13 +270,9 @@ class _DispatchStream(Generic[_T]):
             else:  # pragma: no cover
                 exc = typ()
 
-            _msg_dumps = self._serializer.dumps if self._serializer else dumps
-            dump = _msg_dumps(exc)
             request = protocol.Request(
-                throw=protocol.Message(dump=dump),
-                context=build_frame_payload(
-                    dumps_param=self._serializer.dumps if self._serializer else None
-                ),
+                throw=protocol.Message(dump=self._serializer.dumps(exc)),
+                context=context.build_frame_payload(serializer=self._serializer),
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -517,9 +504,7 @@ class WorkerConnection:
                 try:
                     request = protocol.Request(
                         task=task_msg,
-                        context=build_frame_payload(
-                            dumps_param=serializer.dumps if serializer else None
-                        ),
+                        context=context.build_frame_payload(serializer=serializer),
                     )
                     await call.write(request)
                     response = await anext(aiter(call))

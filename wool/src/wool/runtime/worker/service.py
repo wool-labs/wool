@@ -18,6 +18,7 @@ from typing import AsyncIterator
 from typing import Awaitable
 from typing import Final
 from typing import Protocol
+from typing import cast
 from typing import runtime_checkable
 
 import cloudpickle
@@ -26,18 +27,13 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
-from wool.runtime.context import Context
-from wool.runtime.context import _task_contexts
-from wool.runtime.context import _task_contexts_lock
-from wool.runtime.context import apply_vars
-from wool.runtime.context import dumps
-from wool.runtime.context import resolve_context
-from wool.runtime.context import snapshot_vars
+from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import PassthroughSerializer
+from wool.runtime.routine.task import Serializer
 from wool.runtime.routine.task import Task
-from wool.runtime.routine.task import _unpickle_serializer
 from wool.runtime.routine.task import do_dispatch
+from wool.runtime.routine.task import unpickle_serializer
 from wool.runtime.worker import namespace as _namespace
 
 _log = logging.getLogger(__name__)
@@ -216,10 +212,10 @@ class WorkerService(protocol.WorkerServicer):
         """
         return _ReadOnlyEvent(self._stopped)
 
-    async def dispatch(
+    async def dispatch(  # type: ignore[override]
         self,
         request_iterator: AsyncIterator[protocol.Request],
-        context: ServicerContext,
+        servicer_context: ServicerContext,
     ) -> AsyncIterator[protocol.Response]:
         """Execute a task in the current event loop.
 
@@ -231,7 +227,7 @@ class WorkerService(protocol.WorkerServicer):
 
         :param request_iterator:
             The incoming bidirectional request stream.
-        :param context:
+        :param servicer_context:
             The :class:`grpc.aio.ServicerContext` for this request.
         :yields:
             First yields an Ack Response when task processing begins,
@@ -239,7 +235,7 @@ class WorkerService(protocol.WorkerServicer):
 
         """
         if self._stopping.is_set():
-            await context.abort(
+            await servicer_context.abort(
                 StatusCode.UNAVAILABLE, "Worker service is shutting down"
             )
 
@@ -256,20 +252,24 @@ class WorkerService(protocol.WorkerServicer):
 
         work_task = Task.from_protobuf(request.task)
 
+        # Resolve the handler's serializer once. Self-dispatch uses a
+        # fresh PassthroughSerializer (stateful: strong-refs outbound
+        # objects via self._keys, so it must outlive the handler);
+        # every other dispatch uses cloudpickle. Nested helpers apply
+        # this one instance uniformly for wire var snapshots, the
+        # Task payload, and Message bodies.
         _is_passthrough = False
         if request.task.HasField("serializer"):
-            _ser = _unpickle_serializer(request.task.serializer)
-            _is_passthrough = isinstance(_ser, PassthroughSerializer)
+            _sniff = unpickle_serializer(request.task.serializer)
+            _is_passthrough = isinstance(_sniff, PassthroughSerializer)
+        serializer: Serializer = (
+            PassthroughSerializer() if _is_passthrough else cast(Serializer, cloudpickle)
+        )
 
         response_context_hex = context_hex or context_id.hex
         with _namespace.activate(context_id):
             if request.context.vars:
-                apply_vars(
-                    dict(request.context.vars),
-                    loads_param=(
-                        PassthroughSerializer.loads if _is_passthrough else None
-                    ),
-                )
+                context.apply_vars(dict(request.context.vars), serializer=serializer)
 
             if self._backpressure is not None:
                 decision = self._backpressure(
@@ -281,24 +281,17 @@ class WorkerService(protocol.WorkerServicer):
                 if isawaitable(decision):
                     decision = await decision
                 if decision:
-                    await context.abort(
+                    await servicer_context.abort(
                         StatusCode.RESOURCE_EXHAUSTED,
                         "Task rejected by backpressure hook",
                     )
 
-            handler_ctx = resolve_context()
-            # Message bodies use the negotiated serializer for parity
-            # with vars and the Task payload. The PassthroughSerializer
-            # instance must outlive every dumps call (it strong-refs
-            # the stored objects via self._keys), so bind it to a local
-            # that lives for the duration of the handler.
-            _msg_ser = PassthroughSerializer() if _is_passthrough else None
-            _msg_dumps = _msg_ser.dumps if _msg_ser else dumps
+            handler_ctx = context.resolve_context()
             with self._tracker(
                 work_task,
                 request_iterator,
                 handler_ctx,
-                passthrough=_is_passthrough,
+                serializer=serializer,
             ) as task:
                 ack = protocol.Ack(version=protocol.__version__)
                 yield protocol.Response(ack=ack)
@@ -306,20 +299,20 @@ class WorkerService(protocol.WorkerServicer):
                     if isasyncgen(task):
                         async for outcome in task:
                             if outcome.exception is not None:
-                                exception = protocol.Message(
-                                    dump=_msg_dumps(outcome.exception)
-                                )
                                 yield protocol.Response(
-                                    exception=exception,
+                                    exception=protocol.Message(
+                                        dump=serializer.dumps(outcome.exception)
+                                    ),
                                     context=protocol.Context(
                                         id=response_context_hex,
                                         vars=outcome.snapshot,
                                     ),
                                 )
                                 return
-                            result = protocol.Message(dump=_msg_dumps(outcome.result))
                             yield protocol.Response(
-                                result=result,
+                                result=protocol.Message(
+                                    dump=serializer.dumps(outcome.result)
+                                ),
                                 context=protocol.Context(
                                     id=response_context_hex,
                                     vars=outcome.snapshot,
@@ -328,20 +321,20 @@ class WorkerService(protocol.WorkerServicer):
                     elif isinstance(task, asyncio.Task):
                         outcome: _WorkerOutcome = await task
                         if outcome.exception is not None:
-                            exception = protocol.Message(
-                                dump=_msg_dumps(outcome.exception)
-                            )
                             yield protocol.Response(
-                                exception=exception,
+                                exception=protocol.Message(
+                                    dump=serializer.dumps(outcome.exception)
+                                ),
                                 context=protocol.Context(
                                     id=response_context_hex,
                                     vars=outcome.snapshot,
                                 ),
                             )
                         else:
-                            result = protocol.Message(dump=_msg_dumps(outcome.result))
                             yield protocol.Response(
-                                result=result,
+                                result=protocol.Message(
+                                    dump=serializer.dumps(outcome.result)
+                                ),
                                 context=protocol.Context(
                                     id=response_context_hex,
                                     vars=outcome.snapshot,
@@ -355,16 +348,11 @@ class WorkerService(protocol.WorkerServicer):
                     # so this branch does not see them. Best-effort
                     # snapshot from the handler context since no
                     # frame-level snapshot is available at this point.
-                    exception = protocol.Message(dump=_msg_dumps(e))
-                    _fallback_ser = PassthroughSerializer() if _is_passthrough else None
-                    ctx_snapshot = snapshot_vars(
-                        dumps_param=_fallback_ser.dumps if _fallback_ser else None
-                    )
                     yield protocol.Response(
-                        exception=exception,
+                        exception=protocol.Message(dump=serializer.dumps(e)),
                         context=protocol.Context(
                             id=response_context_hex,
-                            vars=ctx_snapshot,
+                            vars=context.snapshot_vars(serializer=serializer),
                         ),
                     )
 
@@ -437,8 +425,8 @@ class WorkerService(protocol.WorkerServicer):
     async def _run_on_worker(
         self,
         work_task: Task,
-        handler_ctx: Context,
-        passthrough: bool = False,
+        handler_ctx: context.Context,
+        serializer: Serializer,
     ) -> _WorkerOutcome:
         """Run a task on the shared worker event loop.
 
@@ -450,15 +438,12 @@ class WorkerService(protocol.WorkerServicer):
             Preserves the activated context id and any vars applied
             by the dispatch handler so the worker-loop copy starts
             from the correct snapshot.
-        :param passthrough:
-            If ``True``, use :class:`PassthroughSerializer` for
-            response var snapshots (self-dispatch optimization that
-            avoids redundant cloudpickle round-trips).
+        :param serializer:
+            Negotiated serializer for response var snapshots.
         """
         worker_ctx = handler_ctx.copy()
         future: concurrent.futures.Future = concurrent.futures.Future()
         worker_task = None
-        _resp_ser = PassthroughSerializer() if passthrough else None
 
         async with self._loop_pool.get("worker") as (worker_loop, _):
 
@@ -466,8 +451,8 @@ class WorkerService(protocol.WorkerServicer):
                 nonlocal worker_task
                 task = asyncio.Task(work_task._run(), loop=worker_loop)
                 worker_task = task
-                with _task_contexts_lock:
-                    _task_contexts[task] = worker_ctx
+                with context.task_contexts_lock:
+                    context.task_contexts[task] = worker_ctx
 
                 def _done(t: asyncio.Task):
                     if future.done():
@@ -475,10 +460,7 @@ class WorkerService(protocol.WorkerServicer):
                     if t.cancelled():
                         future.cancel()
                         return
-                    snapshot = snapshot_vars(
-                        worker_ctx,
-                        dumps_param=_resp_ser.dumps if _resp_ser else None,
-                    )
+                    snapshot = context.snapshot_vars(worker_ctx, serializer=serializer)
                     exc = t.exception()
                     if exc is not None:
                         future.set_result(
@@ -504,8 +486,8 @@ class WorkerService(protocol.WorkerServicer):
         self,
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
-        handler_ctx: Context,
-        passthrough: bool = False,
+        handler_ctx: context.Context,
+        serializer: Serializer,
     ):
         """Run a streaming task on the shared worker event loop.
 
@@ -535,9 +517,9 @@ class WorkerService(protocol.WorkerServicer):
             captured before the tracker forks. Preserves the
             activated context id and applied vars so the worker-loop
             copy starts from the correct snapshot.
-        :param passthrough:
-            If ``True``, use :class:`PassthroughSerializer` for
-            response var snapshots (self-dispatch optimization).
+        :param serializer:
+            Negotiated serializer for response var snapshots and
+            Message bodies.
         :yields:
             :class:`_WorkerOutcome` frames — one per successful
             routine yield, plus one terminal error frame if the
@@ -545,9 +527,6 @@ class WorkerService(protocol.WorkerServicer):
         """
         main_loop = asyncio.get_running_loop()
         worker_ctx = handler_ctx.copy()
-        _resp_ser = PassthroughSerializer() if passthrough else None
-        _respdumps = _resp_ser.dumps if _resp_ser else None
-        _msg_loads = PassthroughSerializer.loads if passthrough else cloudpickle.loads
         request_queue: asyncio.Queue = asyncio.Queue()
         result_queue: asyncio.Queue = asyncio.Queue()
 
@@ -568,14 +547,7 @@ class WorkerService(protocol.WorkerServicer):
                                     break
                                 action, payload, caller_ctx = cmd
                                 if caller_ctx:
-                                    apply_vars(
-                                        caller_ctx,
-                                        loads_param=(
-                                            PassthroughSerializer.loads
-                                            if passthrough
-                                            else None
-                                        ),
-                                    )
+                                    context.apply_vars(caller_ctx, serializer=serializer)
                                 try:
                                     with do_dispatch(False):
                                         match action:
@@ -595,20 +567,24 @@ class WorkerService(protocol.WorkerServicer):
                                     )
                                     return
                                 except BaseException as e:
-                                    # resolve_context() resolves to
+                                    # context.resolve_context() resolves to
                                     # worker_ctx here because _start_worker
-                                    # registered the task in _task_contexts.
-                                    ctx_snapshot = snapshot_vars(dumps_param=_respdumps)
+                                    # registered the task in task_contexts.
+                                    ctx_snapshot = context.snapshot_vars(
+                                        serializer=serializer
+                                    )
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
                                         ("error", e, ctx_snapshot),
                                     )
                                     return
                                 else:
-                                    # resolve_context() resolves to
+                                    # context.resolve_context() resolves to
                                     # worker_ctx here because _start_worker
-                                    # registered the task in _task_contexts.
-                                    ctx_snapshot = snapshot_vars(dumps_param=_respdumps)
+                                    # registered the task in task_contexts.
+                                    ctx_snapshot = context.snapshot_vars(
+                                        serializer=serializer
+                                    )
                                     main_loop.call_soon_threadsafe(
                                         result_queue.put_nowait,
                                         ("value", value, ctx_snapshot),
@@ -634,8 +610,8 @@ class WorkerService(protocol.WorkerServicer):
 
             def _start_worker():
                 task = asyncio.Task(worker_dispatch(), loop=worker_loop)
-                with _task_contexts_lock:
-                    _task_contexts[task] = worker_ctx
+                with context.task_contexts_lock:
+                    context.task_contexts[task] = worker_ctx
 
             worker_loop.call_soon_threadsafe(_start_worker)
 
@@ -651,13 +627,13 @@ class WorkerService(protocol.WorkerServicer):
                                 ("next", None, caller_ctx),
                             )
                         case "send":
-                            value = _msg_loads(request.send.dump)
+                            value = serializer.loads(request.send.dump)
                             worker_loop.call_soon_threadsafe(
                                 request_queue.put_nowait,
                                 ("send", value, caller_ctx),
                             )
                         case "throw":
-                            exc = _msg_loads(request.throw.dump)
+                            exc = serializer.loads(request.throw.dump)
                             worker_loop.call_soon_threadsafe(
                                 request_queue.put_nowait,
                                 ("throw", exc, caller_ctx),
@@ -689,8 +665,8 @@ class WorkerService(protocol.WorkerServicer):
         self,
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
-        handler_ctx: Context,
-        passthrough: bool = False,
+        handler_ctx: context.Context,
+        serializer: Serializer,
     ):
         """Context manager for tracking running tasks.
 
@@ -708,10 +684,10 @@ class WorkerService(protocol.WorkerServicer):
             the activated context id and any vars applied by the
             dispatch handler so the worker-loop copy starts from the
             correct snapshot.
-        :param passthrough:
-            If ``True``, use :class:`PassthroughSerializer` for var
-            snapshots on response frames (self-dispatch optimization
-            that avoids redundant cloudpickle round-trips).
+        :param serializer:
+            Negotiated serializer for var snapshots and Message
+            bodies. Cloudpickle for cross-process dispatch;
+            :class:`PassthroughSerializer` for self-dispatch.
         :yields:
             The :class:`asyncio.Task` or async generator for the
             wool task.
@@ -719,12 +695,12 @@ class WorkerService(protocol.WorkerServicer):
         """
         if iscoroutinefunction(work_task.callable):
             task = asyncio.create_task(
-                self._run_on_worker(work_task, handler_ctx, passthrough)
+                self._run_on_worker(work_task, handler_ctx, serializer)
             )
             watcher = _Task(task)
         elif isasyncgenfunction(work_task.callable):
             task = self._stream_from_worker(
-                work_task, request_iterator, handler_ctx, passthrough
+                work_task, request_iterator, handler_ctx, serializer
             )
             watcher = _AsyncGen(task)
         else:

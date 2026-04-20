@@ -1586,6 +1586,26 @@ class TestRuntimeContext:
             assert dispatch_timeout.get() == 1.25
 
 
+def test_unpickle_serializer_roundtrips_passthrough():
+    """Test unpickle_serializer restores a PassthroughSerializer.
+
+    Given:
+        A cloudpickle-dumped PassthroughSerializer byte string.
+    When:
+        unpickle_serializer is called with those bytes.
+    Then:
+        It returns a PassthroughSerializer instance usable for
+        dumps / loads on the receiving side.
+    """
+    import cloudpickle
+
+    from wool.runtime.routine.task import unpickle_serializer
+
+    pickled = cloudpickle.dumps(PassthroughSerializer())
+    restored = unpickle_serializer(pickled)
+    assert isinstance(restored, PassthroughSerializer)
+
+
 class TestPassthroughSerializer:
     """Tests for :py:class:`PassthroughSerializer`."""
 
