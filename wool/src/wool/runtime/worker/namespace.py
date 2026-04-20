@@ -5,11 +5,6 @@ caller and worker. The dispatch handler uses :func:`activate` to
 install a Context with the caller's id for the duration of the
 handler scope. Worker-loop tasks inherit a copy of that Context
 so they share the caller's id and var state.
-
-Pieces:
-
-- :func:`activate` — context manager used by the dispatch handler
-  to install a fresh wool.Context with the caller's wire id.
 """
 
 from __future__ import annotations

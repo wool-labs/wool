@@ -255,16 +255,6 @@ def _dispatch(
 
 
 async def _stream(fn, *args, **kwargs):
-    """Iterate a local async generator in the caller's context.
-
-    Nested async-generator routines run here when ``do_dispatch()``
-    is ``False`` (we're inside a running task). The generator
-    executes sequentially in the caller's stdlib ``Context`` — same
-    as a plain ``async for`` on a local async generator. Mutations
-    the generator makes are visible to the caller after each yield.
-    A caller that wants value isolation uses ``asyncio.create_task``
-    explicitly (stdlib parity).
-    """
     gen = fn(*args, **kwargs)
     try:
         sent = None
@@ -292,15 +282,6 @@ async def _stream(fn, *args, **kwargs):
 
 
 async def _execute(fn, *args, **kwargs):
-    """Run *fn* locally in the caller's context.
-
-    Nested routine calls dispatched on the same worker land here when
-    ``do_dispatch()`` is ``False``. The routine executes in the
-    caller's stdlib ``Context`` — same as a plain ``await fn()`` on a
-    local async function. Mutations are visible to the caller after
-    the routine returns. A caller that wants value isolation uses
-    ``asyncio.create_task(fn())`` explicitly (stdlib parity).
-    """
     with do_dispatch(True):
         return await fn(*args, **kwargs)
 
