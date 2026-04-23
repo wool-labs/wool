@@ -10,6 +10,8 @@ from uuid import uuid4
 
 import cloudpickle
 
+from wool.runtime.resourcepool import ResourcePool
+
 
 # public
 @runtime_checkable
@@ -122,7 +124,7 @@ class _PassthroughKey:
         return self.token == other.token
 
 
-# Weak keys let the owning PassthroughSerializer's `_keys` list act as the
+# Weak keys let the owning PassthroughSerializer's `_keys` map act as the
 # lifetime anchor: when the serializer goes out of scope, its keys are
 # garbage-collected and the corresponding entries here are removed
 # automatically without any explicit cleanup.
@@ -141,16 +143,17 @@ class PassthroughSerializer:
     serializer goes out of scope the keys are garbage-collected and
     the weak-dict entries are removed automatically.
 
-    ``loads`` is static — it reconstructs the key from the bytes
-    token in the protobuf message and pops the entry from the store.
+    ``loads`` reconstructs the key from the bytes token in the protobuf
+    message, pops the entry from the store, and prunes the matching
+    keep-alive entry on this instance.
 
     All instances hash and compare equal so the LRU cache that pickles
     serializer instances for transport hits on every call.
     """
 
     def __init__(self) -> None:
-        """Initialize an empty list of strong key references for this dispatch scope."""
-        self._keys: list[_PassthroughKey] = []
+        """Initialize an empty map of strong key references for this dispatch scope."""
+        self._keys: dict[UUID, _PassthroughKey] = {}
 
     def __hash__(self) -> int:
         """Return a constant hash so all instances share an LRU-cache slot."""
@@ -167,12 +170,29 @@ class PassthroughSerializer:
     def dumps(self, obj: Any) -> bytes:
         """Stash *obj* in the module store and return its weak-key token."""
         key = _PassthroughKey()
-        self._keys.append(key)
+        self._keys[key.token] = key
         _passthrough_store[key] = obj
         return key.token.bytes
 
-    @staticmethod
-    def loads(data: bytes) -> Any:
+    def loads(self, data: bytes) -> Any:
         """Pop and return the object stashed under the token in *data*."""
-        key = _PassthroughKey(UUID(bytes=data))
-        return _passthrough_store.pop(key)
+        token = UUID(bytes=data)
+        value = _passthrough_store.pop(_PassthroughKey(token))
+        # Prune the keep-alive entry — without this, ``_keys`` would
+        # accumulate one entry per ``dumps`` over the serializer's
+        # lifetime, which becomes load-bearing on long streaming
+        # dispatches that share one serializer instance.
+        self._keys.pop(token, None)
+        return value
+
+
+# Per-dispatch :class:`PassthroughSerializer` cache, keyed by
+# :attr:`~wool.runtime.routine.task.Task.id`. Caller-side and worker-side
+# acquisitions for the same task id share one instance, so prune-at-loads
+# on either side bounds the shared keep-alive set. Reference-counted
+# cleanup means that once both sides release (including on error paths),
+# the entry is evicted and any unconsumed keep-alive entries are reclaimed
+# along with it.
+_passthrough_pool: ResourcePool[PassthroughSerializer] = ResourcePool(
+    factory=lambda _: PassthroughSerializer()
+)

@@ -95,9 +95,6 @@ def sample_task(
             "timeout": 0,
             "caller": None,
             "exception": None,
-            "filename": None,
-            "function": None,
-            "line_no": None,
             "tag": None,
         }
         defaults.update(overrides)
@@ -122,18 +119,3 @@ async def picklable_async_function_no_return():
 async def picklable_async_function_raises():
     """A picklable async function that raises an exception."""
     raise ValueError("Test exception")
-
-
-class PicklableTestClass:
-    """A picklable class for testing instance and class methods."""
-
-    @wool.routine
-    async def instance_method(self, x: int) -> int:
-        """A picklable instance method."""
-        return x * 3
-
-    @classmethod
-    @wool.routine
-    async def class_method(cls, x: int) -> int:
-        """A picklable class method."""
-        return x * 4

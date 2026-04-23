@@ -23,6 +23,7 @@ import grpc.aio
 
 import wool
 from wool import protocol
+from wool.runtime.context import install_task_factory
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
@@ -217,7 +218,10 @@ class WorkerProcess(Process):
         # Configure logging for this subprocess
         logging.basicConfig(
             level=logging.INFO,
-            format=f"%(asctime)s - WORKER[{self.pid}] - %(name)s - %(levelname)s - %(message)s",
+            format=(
+                f"%(asctime)s - WORKER[{self.pid}] - "
+                f"%(name)s - %(levelname)s - %(message)s"
+            ),
             stream=sys.stderr,
         )
         logger.info(f"Worker process starting on {self._host}:{self._port}")
@@ -236,11 +240,12 @@ class WorkerProcess(Process):
             raise
 
     async def _serve(self):
-        """Start the gRPC server in this worker process.
+        """Run the worker's gRPC server for the lifetime of the process.
 
-        This method is called by the event loop to start serving
-        requests. It creates a gRPC server, adds the worker service, and
-        starts listening for incoming connections.
+        Creates the gRPC server with the configured channel options,
+        registers the worker service, installs credential and signal-
+        handler context managers, and blocks until a shutdown signal
+        fires.
         """
         creds_ctx = (
             CredentialContext(self._credentials)
@@ -319,6 +324,8 @@ class WorkerProcess(Process):
             )
             service = WorkerService(backpressure=backpressure)
             protocol.add_to_server[protocol.WorkerServicer](service, server)
+
+            install_task_factory()
 
             with _signal_handlers(service):
                 try:
@@ -412,7 +419,9 @@ def _sigint_handler(loop, service, signum, frame):
         )
 
 
-async def _proxy_factory(proxy: WorkerProxy):
+async def _proxy_factory(
+    proxy: WorkerProxy,
+):  # pragma: no cover — runs in worker subprocess; integration-tested
     """Factory function for WorkerProxy instances in ResourcePool.
 
     Calls ``enter()`` on the proxy.  Lazy proxies defer actual
@@ -428,7 +437,9 @@ async def _proxy_factory(proxy: WorkerProxy):
     return proxy
 
 
-async def _proxy_finalizer(proxy: WorkerProxy):
+async def _proxy_finalizer(
+    proxy: WorkerProxy,
+):  # pragma: no cover — runs in worker subprocess; integration-tested
     """Finalizer function for WorkerProxy instances in ResourcePool.
 
     Exits the proxy context when it's being cleaned up from the

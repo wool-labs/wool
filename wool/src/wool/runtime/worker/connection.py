@@ -17,6 +17,7 @@ from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import PassthroughSerializer
+from wool.runtime.serializer import _passthrough_pool
 from wool.runtime.worker.base import ChannelOptions
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
@@ -413,7 +414,7 @@ class WorkerConnection:
         if (
             metadata := wool.__worker_metadata__
         ) is not None and metadata.address == self._target:
-            serializer = PassthroughSerializer()
+            serializer = await _passthrough_pool.acquire(task.id)
             if (uds_address := wool.__worker_uds_address__) is not None:
                 key = (uds_address, None, self._options)
                 self._uds_key = key
@@ -441,9 +442,13 @@ class WorkerConnection:
             await stream.__anext__()  # Prime: _execute acquires its own ref
         except BaseException:
             await _channel_pool.release(key)
+            if serializer is not None:
+                await _passthrough_pool.release(task.id)
             raise
 
         await _channel_pool.release(key)
+        if serializer is not None:
+            await _passthrough_pool.release(task.id)
         return cast(AsyncGenerator[protocol.Message, None], stream)
 
     async def close(self):
@@ -501,6 +506,13 @@ class WorkerConnection:
         self, call: _DispatchCall, task: Task, key: _PoolKey
     ) -> AsyncGenerator[protocol.Message | None, None]:
         channel = await _channel_pool.acquire(key)
+        if serializer is not None:
+            # Reacquire the per-task passthrough serializer so its
+            # lifetime spans the streaming generator. The dispatch()
+            # caller already holds one ref; this second ref is
+            # released in the matching finally below, mirroring the
+            # channel-pool pattern.
+            await _passthrough_pool.acquire(task.id)
         try:
             yield  # Priming yield — signals dispatch() that ref is held
             stream = _DispatchStream(call, task)
@@ -529,3 +541,5 @@ class WorkerConnection:
                 channel.semaphore.release()
         finally:
             await _channel_pool.release(key)
+            if serializer is not None:
+                await _passthrough_pool.release(task.id)

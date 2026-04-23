@@ -131,12 +131,6 @@ class Task(Generic[W]):
         UUID of the calling task if this is a nested task.
     :param exception:
         Exception information if task execution failed.
-    :param filename:
-        Source filename where the task was defined.
-    :param function:
-        Name of the function being executed.
-    :param line_no:
-        Line number where the task was defined.
     :param tag:
         Optional descriptive tag for the task.
     :param context:
@@ -153,9 +147,6 @@ class Task(Generic[W]):
     timeout: Timeout = 0
     caller: UUID | None = None
     exception: TaskException | None = None
-    filename: str | None = None
-    function: str | None = None
-    line_no: int | None = None
     tag: str | None = None
     context: RuntimeContext | None = None
 

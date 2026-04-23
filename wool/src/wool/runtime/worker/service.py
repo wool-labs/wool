@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextvars
+import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
+from dataclasses import field
 from inspect import isasyncgen
 from inspect import isasyncgenfunction
-from inspect import isawaitable
 from inspect import iscoroutinefunction
+from typing import Any
 from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Awaitable
+from typing import Final
 from typing import Protocol
+from typing import assert_never
+from typing import cast
 from typing import runtime_checkable
 
 import cloudpickle
@@ -22,12 +26,58 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
+from wool.runtime.context import Context
+from wool.runtime.context import carries_state
+from wool.runtime.context import create_bound_task
+from wool.runtime.context import current_context
+from wool.runtime.context import install_task_factory
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
+from wool.runtime.routine.task import _unpickle_serializer
 from wool.runtime.routine.task import do_dispatch
+from wool.runtime.serializer import PassthroughSerializer
+from wool.runtime.serializer import Serializer
+from wool.runtime.serializer import _passthrough_pool
+
+_log = logging.getLogger(__name__)
 
 # Sentinel to mark end of async generator stream
-_SENTINEL = object()
+_STREAM_END: Final = object()
+
+
+@dataclass
+class _WorkerOutcome:
+    """Result of a worker-loop task execution.
+
+    Always carries the post-run :class:`protocol.Context` so the
+    handler can ship caller-visible mutations on the Response
+    regardless of whether the routine returned normally or raised.
+    """
+
+    result: Any = None
+    exception: BaseException | None = None
+    context: protocol.Context = field(default_factory=protocol.Context)
+
+
+def _response_from_outcome(
+    outcome: _WorkerOutcome,
+    serializer: Serializer,
+) -> protocol.Response:
+    """Build a :class:`protocol.Response` frame from a worker outcome.
+
+    Picks the ``exception`` or ``result`` oneof based on which field
+    is set, serializes the payload, and attaches the worker's context
+    (ID + var snapshot) on the response.
+    """
+    if outcome.exception is not None:
+        return protocol.Response(
+            exception=protocol.Message(dump=serializer.dumps(outcome.exception)),
+            context=outcome.context,
+        )
+    return protocol.Response(
+        result=protocol.Message(dump=serializer.dumps(outcome.result)),
+        context=outcome.context,
+    )
 
 
 # public
@@ -60,6 +110,13 @@ class BackpressureLike(Protocol):
     transient and skips to the next worker.
 
     Pass ``None`` (the default) to accept all tasks unconditionally.
+
+    The hook runs after the caller's wire-shipped ContextVar snapshot
+    is applied to the handler's context, so a hook that reads a
+    :class:`wool.ContextVar` (e.g., a tenant id) observes the caller's
+    value for that dispatch. This enables tenant- or request-scoped
+    admission decisions without plumbing values through the
+    :class:`BackpressureContext` explicitly.
 
     Both sync and async implementations are supported::
 
@@ -206,41 +263,107 @@ class WorkerService(protocol.WorkerServicer):
                 StatusCode.UNAVAILABLE, "Worker service is shutting down"
             )
 
-        response = await anext(aiter(request_iterator))
-        work_task = Task.from_protobuf(response.task)
+        request = await anext(aiter(request_iterator))
 
-        if self._backpressure is not None:
-            decision = self._backpressure(
-                BackpressureContext(
-                    active_task_count=len(self._docket),
-                    task=work_task,
-                )
-            )
-            if isawaitable(decision):
-                decision = await decision
-            if decision:
-                await context.abort(
-                    StatusCode.RESOURCE_EXHAUSTED,
-                    "Task rejected by backpressure hook",
-                )
+        work_task = Task.from_protobuf(request.task)
 
-        with self._tracker(work_task, request_iterator) as task:
-            ack = protocol.Ack(version=protocol.__version__)
-            yield protocol.Response(ack=ack)
+        # Resolve the handler's serializer once. Self-dispatch
+        # acquires a per-task PassthroughSerializer from the
+        # process-wide pool; the caller side acquires the same
+        # instance from the same key, so prune-at-loads on either
+        # side bounds the shared keep-alive set. The pool's
+        # reference-counted cleanup evicts the entry when both sides
+        # release, so error-path keep-alive entries are not retained
+        # across dispatch boundaries.
+        is_passthrough = False
+        if request.task.HasField("serializer"):
+            sniff = _unpickle_serializer(request.task.serializer)
+            is_passthrough = isinstance(sniff, PassthroughSerializer)
+        serializer: Serializer
+        if is_passthrough:
+            serializer = await _passthrough_pool.acquire(work_task.id)
+        else:
+            serializer = cast(Serializer, cloudpickle)
+
+        try:
+            # Build the caller-state Context as a local object on the
+            # main handler task. It is *not* installed in the scope
+            # registry here — main loop must not own a Context that
+            # the worker loop will later mutate. The backpressure
+            # hook scopes work_ctx transiently via ``Context.run`` so
+            # hooks that read wool.ContextVars see the caller's
+            # state; after the handoff, ``create_bound_task``
+            # registers work_ctx against the worker task and the
+            # worker loop becomes the exclusive mutator.
             try:
-                if isasyncgen(task):
-                    async for result in task:
-                        result = protocol.Message(dump=wool.__serializer__.dumps(result))
-                        yield protocol.Response(result=result)
-                elif isinstance(task, asyncio.Task):
-                    result = protocol.Message(dump=wool.__serializer__.dumps(await task))
-                    yield protocol.Response(result=result)
-            except (Exception, asyncio.CancelledError) as e:
-                exception = protocol.Message(dump=wool.__serializer__.dumps(e))
-                yield protocol.Response(exception=exception)
+                work_ctx = Context.from_protobuf(request.context, serializer=serializer)
+            except ValueError as e:
+                _log.warning("Rejecting dispatch with corrupt context payload: %s", e)
+                await context.abort(
+                    StatusCode.INVALID_ARGUMENT,
+                    f"Context payload is corrupt: {e}",
+                )
+                assert_never(  # pragma: no cover
+                    "ServicerContext.abort returned unexpectedly"
+                )
+
+            if self._backpressure is not None:
+
+                def _evaluate_backpressure():
+                    return self._backpressure(
+                        BackpressureContext(
+                            active_task_count=len(self._docket),
+                            task=work_task,
+                        )
+                    )
+
+                decision = await work_ctx.run_async(_evaluate_backpressure)
+                if decision:
+                    await context.abort(
+                        StatusCode.RESOURCE_EXHAUSTED,
+                        "Task rejected by backpressure hook",
+                    )
+
+            with self._tracker(
+                work_task,
+                request_iterator,
+                work_ctx,
+                serializer=serializer,
+            ) as task:
+                ack = protocol.Ack(version=protocol.__version__)
+                yield protocol.Response(ack=ack)
+                try:
+                    if isasyncgen(task):
+                        async for outcome in task:
+                            yield _response_from_outcome(outcome, serializer)
+                            if outcome.exception is not None:
+                                return
+                    elif isinstance(task, asyncio.Task):
+                        outcome: _WorkerOutcome = await task
+                        yield _response_from_outcome(outcome, serializer)
+                except (Exception, asyncio.CancelledError) as e:
+                    # Cancellation of the awaited coroutine task or
+                    # an unexpected handler-level failure bubbles
+                    # here. Routine errors from the streaming path
+                    # are surfaced through the outcome frame above,
+                    # so this branch does not see them. work_ctx is
+                    # safe to read here because the tracker's cancel
+                    # path has drained the worker task — no loop is
+                    # mutating it at this point.
+                    yield protocol.Response(
+                        exception=protocol.Message(dump=serializer.dumps(e)),
+                        context=_snapshot_with_fallback(
+                            work_ctx, serializer=serializer, primary_exc=e
+                        ),
+                    )
+        finally:
+            if is_passthrough:
+                await _passthrough_pool.release(work_task.id)
 
     async def stop(
-        self, request: protocol.StopRequest, context: ServicerContext | None
+        self,
+        request: protocol.StopRequest,
+        context: ServicerContext | None,
     ) -> protocol.Void:
         """Stop the worker service and its thread.
 
@@ -272,6 +395,7 @@ class WorkerService(protocol.WorkerServicer):
             A tuple of the event loop and the thread running it.
         """
         loop = asyncio.new_event_loop()
+        install_task_factory(loop)
         thread = threading.Thread(target=loop.run_forever, daemon=True)
         thread.start()
         return loop, thread
@@ -302,19 +426,26 @@ class WorkerService(protocol.WorkerServicer):
         thread.join(timeout=5)
         loop.close()
 
-    async def _run_on_worker(self, work_task: Task):
+    async def _run_on_worker(
+        self,
+        work_task: Task,
+        work_ctx: Context,
+        serializer: Serializer,
+    ) -> _WorkerOutcome:
         """Run a task on the shared worker event loop.
-
-        Offloads task execution to a dedicated worker event loop to
-        prevent blocking the main gRPC event loop. Context variables
-        are propagated from the calling context to the worker loop.
 
         :param work_task:
             The :class:`Task` instance to execute.
-        :returns:
-            The result of the task execution.
+        :param work_ctx:
+            The dispatch handler's local :class:`~wool.runtime.context.Context`,
+            passed by reference. Main never scopes it against its own
+            task after the backpressure hook returns, so the worker-loop
+            task is the exclusive mutator for the duration of the
+            routine. The done-callback's snapshot reflects the
+            post-run state for the response frame.
+        :param serializer:
+            Negotiated serializer for response var snapshots.
         """
-        ctx = contextvars.copy_context()
         future: concurrent.futures.Future = concurrent.futures.Future()
         worker_task = None
 
@@ -322,7 +453,7 @@ class WorkerService(protocol.WorkerServicer):
 
             def _schedule():
                 nonlocal worker_task
-                task = worker_loop.create_task(work_task._run(), context=ctx)
+                task = create_bound_task(worker_loop, work_task._run(), work_ctx)
                 worker_task = task
 
                 def _done(t: asyncio.Task):
@@ -330,10 +461,15 @@ class WorkerService(protocol.WorkerServicer):
                         return
                     if t.cancelled():
                         future.cancel()
-                    elif t.exception() is not None:
-                        future.set_exception(t.exception())
+                        return
+                    ctx_pb = work_ctx.to_protobuf(serializer=serializer)
+                    exc = t.exception()
+                    if exc is not None:
+                        future.set_result(_WorkerOutcome(exception=exc, context=ctx_pb))
                     else:
-                        future.set_result(t.result())
+                        future.set_result(
+                            _WorkerOutcome(result=t.result(), context=ctx_pb)
+                        )
 
                 task.add_done_callback(_done)
 
@@ -344,12 +480,26 @@ class WorkerService(protocol.WorkerServicer):
             except asyncio.CancelledError:
                 if worker_task is not None:
                     worker_loop.call_soon_threadsafe(worker_task.cancel)
+                    # Wait for the worker task to unwind before letting
+                    # CancelledError bubble up. This guarantees that by
+                    # the time the dispatch handler's fallback path
+                    # reads work_ctx._data, the worker loop is no
+                    # longer mutating it — no cross-loop race on the
+                    # dict iterator. Swallow any outcome from this
+                    # follow-up await; the worker's result is not used
+                    # on the cancellation path.
+                    try:
+                        await asyncio.wrap_future(future)
+                    except (Exception, asyncio.CancelledError):
+                        pass
                 raise
 
     async def _stream_from_worker(
         self,
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
+        work_ctx: Context,
+        serializer: Serializer,
     ):
         """Run a streaming task on the shared worker event loop.
 
@@ -359,18 +509,37 @@ class WorkerService(protocol.WorkerServicer):
         worker loop via a queue, and the resulting values are returned
         to the main loop for yielding.
 
+        Each frame is surfaced as a :class:`_WorkerOutcome`. Success
+        frames carry ``result`` and ``context``; an exception raised
+        by the routine yields a terminal frame with ``exception`` and
+        ``context`` populated — the caller is responsible for
+        emitting the error Response and terminating the stream. The
+        generator does not raise routine errors itself so the
+        worker-side context snapshot taken at the mutation point is
+        never dropped.
+
         :param work_task:
             The :class:`Task` instance containing an async
             generator.
         :param request_iterator:
             The incoming bidirectional request stream for reading
             client-driven iteration commands.
+        :param work_ctx:
+            The dispatch handler's local :class:`~wool.runtime.context.Context`,
+            passed by reference. Main never scopes it against its own
+            task after the backpressure hook returns, so the
+            worker-loop task is the exclusive mutator for the
+            generator's lifetime. Every per-frame snapshot reflects
+            its live state.
+        :param serializer:
+            Negotiated serializer for response var snapshots and
+            Message bodies.
         :yields:
-            Values yielded by the async generator, streamed from
-            the worker loop.
+            :class:`_WorkerOutcome` frames — one per successful
+            routine yield, plus one terminal error frame if the
+            routine raises.
         """
         main_loop = asyncio.get_running_loop()
-        ctx = contextvars.copy_context()
         request_queue: asyncio.Queue = asyncio.Queue()
         result_queue: asyncio.Queue = asyncio.Queue()
 
@@ -382,92 +551,207 @@ class WorkerService(protocol.WorkerServicer):
                 proxy = await proxy_ctx.__aenter__() if proxy_ctx else None
                 token = wool.__proxy__.set(proxy) if proxy else None
                 try:
-                    gen = work_task.callable(*work_task.args, **work_task.kwargs)
-                    try:
-                        while True:
-                            cmd = await request_queue.get()
-                            if cmd is _SENTINEL:
-                                break
-                            action, payload = cmd
+                    assert work_task.context is not None
+                    with work_task.context, work_task:
+                        # RuntimeContext restores dispatch_timeout from the
+                        # wire; Task.__enter__ sets _current_task for
+                        # nested dispatch. Both __enter__ calls run once
+                        # here but the generator below is driven across
+                        # many ``cmd`` loop iterations — dispatch_timeout
+                        # and _current_task therefore remain set for the
+                        # full generator lifespan, matching the coroutine
+                        # path's single-enter contract via ``Task._run``.
+                        # Load-bearing for the regression guard in #176.
+                        gen = work_task.callable(*work_task.args, **work_task.kwargs)
+
+                        def _snapshot_or_empty() -> protocol.Context:
+                            # Best-effort snapshot for error frames — if
+                            # the snapshot itself raises (e.g. a worker
+                            # mutation produced an unpicklable value), we
+                            # ship an empty Context rather than re-enter
+                            # the failure that brought us here.
                             try:
-                                with do_dispatch(False):
-                                    match action:
-                                        case "next":
-                                            value = await gen.asend(None)
-                                        case "send":
-                                            value = await gen.asend(payload)
-                                        case "throw":
-                                            value = await gen.athrow(
-                                                type(payload), payload
+                                return current_context().to_protobuf(
+                                    serializer=serializer
+                                )
+                            except Exception:
+                                return protocol.Context()
+
+                        try:
+                            while True:
+                                cmd = await request_queue.get()
+                                if cmd is _STREAM_END:
+                                    break
+                                action, payload, caller_ctx = cmd
+                                # Outer guard: every exit from this
+                                # iteration body must push to result_queue
+                                # so the main loop's await never hangs on
+                                # a silently-failed worker task.
+                                try:
+                                    if caller_ctx is not None and carries_state(
+                                        caller_ctx
+                                    ):
+                                        try:
+                                            incoming = Context.from_protobuf(
+                                                caller_ctx, serializer=serializer
                                             )
-                                        case _:
-                                            continue
-                            except StopAsyncIteration:
-                                main_loop.call_soon_threadsafe(
-                                    result_queue.put_nowait, _SENTINEL
+                                        except ValueError as e:
+                                            # Forward-prop precise: caller's
+                                            # context payload failed to decode.
+                                            _log.warning(
+                                                "Rejecting mid-stream frame "
+                                                "with corrupt context: %s",
+                                                e,
+                                            )
+                                            main_loop.call_soon_threadsafe(
+                                                result_queue.put_nowait,
+                                                ("error", e, _snapshot_or_empty()),
+                                            )
+                                            return
+                                        current_context().update(incoming)
+                                    try:
+                                        with do_dispatch(False):
+                                            match action:
+                                                case "next":
+                                                    value = await gen.asend(None)
+                                                case "send":
+                                                    value = await gen.asend(payload)
+                                                case "throw":
+                                                    value = await gen.athrow(
+                                                        type(payload), payload
+                                                    )
+                                                case _:
+                                                    continue
+                                    except StopAsyncIteration:
+                                        main_loop.call_soon_threadsafe(
+                                            result_queue.put_nowait, _STREAM_END
+                                        )
+                                        return
+                                    except BaseException as e:
+                                        tag, outcome_value = "error", e
+                                        terminate = True
+                                    else:
+                                        tag, outcome_value = "value", value
+                                        terminate = False
+                                    # current_context() resolves to work_ctx
+                                    # because _start_worker registered the task
+                                    # in the context registry.
+                                    try:
+                                        ctx_pb = current_context().to_protobuf(
+                                            serializer=serializer
+                                        )
+                                    except TypeError as e:
+                                        # Back-prop precise: worker-side
+                                        # snapshot failed (e.g. a routine
+                                        # set() an unpicklable value).
+                                        # Symmetric with the forward-prop
+                                        # precise handler above.
+                                        _log.warning(
+                                            "Aborting mid-stream dispatch: "
+                                            "worker-side context snapshot "
+                                            "failed: %s",
+                                            e,
+                                        )
+                                        main_loop.call_soon_threadsafe(
+                                            result_queue.put_nowait,
+                                            ("error", e, protocol.Context()),
+                                        )
+                                        return
+                                    main_loop.call_soon_threadsafe(
+                                        result_queue.put_nowait,
+                                        (tag, outcome_value, ctx_pb),
+                                    )
+                                    if terminate:
+                                        return
+                                except BaseException as e:
+                                    # Catch-all: any exception escaping
+                                    # the precise handlers above (e.g.
+                                    # Context.update raising) still
+                                    # surfaces as a terminal error frame.
+                                    _log.warning(
+                                        "Aborting streaming dispatch on "
+                                        "unhandled error: %s",
+                                        e,
+                                    )
+                                    main_loop.call_soon_threadsafe(
+                                        result_queue.put_nowait,
+                                        ("error", e, _snapshot_or_empty()),
+                                    )
+                                    return
+                        finally:
+                            try:
+                                await gen.aclose()
+                            except (asyncio.CancelledError, GeneratorExit):
+                                # During shutdown the aclose() may be
+                                # cancelled or exit before the generator
+                                # finishes its own teardown. Log and
+                                # swallow so cleanup continues.
+                                _log.warning(
+                                    "wool routine generator interrupted during "
+                                    "aclose on teardown",
+                                    exc_info=True,
                                 )
-                                return
-                            except BaseException as e:
-                                main_loop.call_soon_threadsafe(
-                                    result_queue.put_nowait, ("error", e)
-                                )
-                                return
-                            else:
-                                main_loop.call_soon_threadsafe(
-                                    result_queue.put_nowait,
-                                    ("value", value),
-                                )
-                    finally:
-                        await gen.aclose()
                 finally:
                     if token is not None:
                         wool.__proxy__.reset(token)
                     if proxy_ctx is not None:
                         await proxy_ctx.__aexit__(None, None, None)
 
-            worker_loop.call_soon_threadsafe(
-                lambda: worker_loop.create_task(worker_dispatch(), context=ctx)
-            )
+            def _start_worker():
+                create_bound_task(worker_loop, worker_dispatch(), work_ctx)
+
+            worker_loop.call_soon_threadsafe(_start_worker)
 
             try:
                 async for request in request_iterator:
+                    caller_ctx = request.context
                     match request.WhichOneof("payload"):
                         case "next":
                             worker_loop.call_soon_threadsafe(
                                 request_queue.put_nowait,
-                                ("next", None),
+                                ("next", None, caller_ctx),
                             )
                         case "send":
-                            value = cloudpickle.loads(request.send.dump)
+                            value = serializer.loads(request.send.dump)
                             worker_loop.call_soon_threadsafe(
                                 request_queue.put_nowait,
-                                ("send", value),
+                                ("send", value, caller_ctx),
                             )
                         case "throw":
-                            exc = cloudpickle.loads(request.throw.dump)
+                            exc = serializer.loads(request.throw.dump)
                             worker_loop.call_soon_threadsafe(
                                 request_queue.put_nowait,
-                                ("throw", exc),
+                                ("throw", exc, caller_ctx),
                             )
                         case _:
                             continue
 
                     result = await result_queue.get()
 
-                    if result is _SENTINEL:
+                    if result is _STREAM_END:
                         break
-                    tag, payload = result
+                    tag, payload, ctx_pb = result
                     if tag == "error":
-                        raise payload
-                    yield payload
+                        # Terminal error frame: surface the exception
+                        # alongside the worker-side snapshot so the
+                        # caller can ship worker mutations on the
+                        # error Response. Do not raise — raising would
+                        # let the snapshot fall on the floor and the
+                        # dispatch handler's fallback snapshot never
+                        # saw the worker's mutations.
+                        yield _WorkerOutcome(exception=payload, context=ctx_pb)
+                        return
+                    yield _WorkerOutcome(result=payload, context=ctx_pb)
             finally:
-                worker_loop.call_soon_threadsafe(request_queue.put_nowait, _SENTINEL)
+                worker_loop.call_soon_threadsafe(request_queue.put_nowait, _STREAM_END)
 
     @contextmanager
     def _tracker(
         self,
         work_task: Task,
         request_iterator: AsyncIterator[protocol.Request],
+        work_ctx: Context,
+        serializer: Serializer,
     ):
         """Context manager for tracking running tasks.
 
@@ -475,26 +759,33 @@ class WorkerService(protocol.WorkerServicer):
         active tasks set. Ensures proper cleanup when the task
         completes or fails.
 
-        Tasks are executed in a thread pool to prevent blocking the
-        main gRPC event loop, allowing the worker to remain responsive
-        to health checks and new task dispatches.
-
         :param work_task:
             The :class:`Task` instance to execute and track.
         :param request_iterator:
             The incoming bidirectional request stream.
+        :param work_ctx:
+            The dispatch handler's local :class:`~wool.runtime.context.Context`,
+            passed by reference. Since main does not scope it against
+            its own task after backpressure, the worker-loop task is
+            the exclusive mutator — no cross-loop race.
+        :param serializer:
+            Negotiated serializer for var snapshots and Message
+            bodies. Cloudpickle for cross-process dispatch;
+            :class:`PassthroughSerializer` for self-dispatch.
         :yields:
             The :class:`asyncio.Task` or async generator for the
             Wool task.
 
         """
         if iscoroutinefunction(work_task.callable):
-            # Regular async function -> run on worker loop
-            task = asyncio.create_task(self._run_on_worker(work_task))
+            task = asyncio.create_task(
+                self._run_on_worker(work_task, work_ctx, serializer)
+            )
             watcher = _Task(task)
         elif isasyncgenfunction(work_task.callable):
-            # Async generator -> stream from worker loop via queue
-            task = self._stream_from_worker(work_task, request_iterator)
+            task = self._stream_from_worker(
+                work_task, request_iterator, work_ctx, serializer
+            )
             watcher = _AsyncGen(task)
         else:
             raise ValueError("Expected coroutine function or async generator function")
@@ -522,11 +813,10 @@ class WorkerService(protocol.WorkerServicer):
             self._stopped.set()
 
     async def _await_or_cancel(self, *, timeout: float | None = 0) -> None:
-        """Stop the worker service gracefully.
+        """Drain or cancel in-flight tasks in the docket.
 
-        Gracefully shuts down the worker service by canceling or waiting
-        for running tasks. This method is idempotent and can be called
-        multiple times safely.
+        Waits for running tasks to complete or cancels them depending
+        on the timeout value.
 
         :param timeout:
             Maximum time to wait for tasks to complete. If 0 (default),
