@@ -103,6 +103,135 @@ Task serialization has two layers. [cloudpickle](https://github.com/cloudpipe/cl
 
 [Protocol Buffers](https://protobuf.dev/) provides the wire format. Scalar task metadata (id, caller, tag, timeout) maps directly to protobuf fields, while Python-specific objects are nested as cloudpickle byte blobs. The protobuf definitions in the `proto/` directory define the gRPC wire protocol for task dispatch, acknowledgment, and result streaming between workers.
 
+## Context propagation
+
+Python's `contextvars.ContextVar` cannot be pickled — it's a C extension type that explicitly blocks serialization — so ambient state has no built-in way to cross process boundaries. `wool.ContextVar` solves this by mirroring the stdlib API (`get`, `set`, `reset`) and adding automatic propagation across the dispatch chain.
+
+```python
+import asyncio
+
+import wool
+
+tenant_id: wool.ContextVar[str] = wool.ContextVar("tenant_id", default="unknown")
+
+
+@wool.routine
+async def handle_request() -> str:
+    return tenant_id.get()
+
+
+async def main():
+    async with wool.WorkerPool(spawn=2):
+        token = tenant_id.set("acme-corp")
+        try:
+            result = await handle_request()
+            print(result)  # "acme-corp" — propagated to the worker
+        finally:
+            tenant_id.reset(token)
+
+
+asyncio.run(main())
+```
+
+Two construction modes are supported:
+
+- `wool.ContextVar("name")` — no default; `get()` raises `LookupError` until a value is set.
+- `wool.ContextVar("name", default=...)` — `get()` returns the default when the variable has no value in the current context.
+
+`set()` returns a `Token` whose `reset()` restores the prior value (or the default if none was set), mirroring the stdlib `contextvars` API. Tokens are single-use across the logical chain — see Limitations below for the cross-task and cross-process scoping rules.
+
+Each var's namespace is inferred from the top-level package of the calling frame, producing a `"<namespace>:<name>"` key that is stable across every process in the cluster. Library authors constructing vars from shared factory code should pass `namespace=` explicitly to avoid collisions with application-scope vars under the same package.
+
+### How propagation works
+
+At dispatch time, Wool snapshots only the vars that have been explicitly `set()` in the current `wool.Context` — default-only values are not shipped. The snapshot is assembled in O(k) time by iterating the per-Context data dict (which contains only explicitly-set vars), not the full process-wide registry. It rides every dispatch frame as a `Context` protobuf message carrying a `map<string, bytes>` keyed by each var's `"<namespace>:<name>"`, alongside the active `wool.Context` id that identifies the logical chain.
+
+`wool.ContextVar.__reduce__` embeds the var's current value directly in the reduce tuple, so when a `wool.ContextVar` appears anywhere in a pickled object graph its value travels with it. References across a task's args, kwargs, and ContextVar snapshot all land on the same local instance on the receiver. Unpickling goes through a strict construction path: if no var is yet registered under the key, a "stub" instance is registered through an internal back-door that bypasses the duplicate-key check, and the var's value is applied from the wire; when the worker's module-scope constructor later runs, it promotes the stub in place, preserving any wire state and reference identity.
+
+On the worker, each task is activated in its own `wool.Context` carrying the caller's chain id and the caller's propagated values, distinct from any concurrent task's `wool.Context` on the same worker. When the worker returns (or yields), the final var state is attached to the gRPC response and applied on the caller side, so worker-side mutations flow back automatically. For async generators, the caller also attaches its current context to each iteration request, enabling bidirectional state exchange between caller and worker at every yield/next boundary.
+
+### Isolation
+
+Each dispatched task runs inside its own `wool.Context`, carrying the caller's chain id and the caller's propagated values. Concurrent tasks on the same worker with different values for the same variable never interfere — each sees only its own propagated state. Worker-side mutations (via `set()`) are back-propagated to the caller when the task returns or yields, but they do not leak to other concurrent tasks: each dispatch activates its own `wool.Context` on the worker, and `asyncio.create_task` children fork a copy of the parent's `wool.Context` on creation (mirroring `contextvars.copy_context()` semantics), so concurrent execution paths do not share a mutable `wool.Context` and bidirectional value propagation stays coherent under the transparent-dispatch model.
+
+### Decode failure semantics
+
+Context propagation is **ancillary state** in wool's wire protocol — a separate channel from the routine's primary signal (its return value or raised exception). When a wire context fails to decode (cross-version pickle skew, custom class missing on the receiver, on-wire corruption of a single var value), wool never preempts the primary signal to surface the ancillary failure. The routine's outcome is delivered, and the failure is reported via Python's standard `warnings` mechanism with a `wool.ContextDecodeWarning` so callers can decide how to respond.
+
+Three modes are available, and they compose with the standard Python warnings system rather than wool-specific API:
+
+| Mode | How to enable | Behavior |
+| ---- | ------------- | -------- |
+| Lenient (default) | _no opt-in_ | Decode failure emits `wool.ContextDecodeWarning`; primary signal returned. Caller-side exception frames also receive the failure on `__notes__`. |
+| Inspect | `warnings.catch_warnings(record=True)` | Decode failure captured into a list; primary signal returned. Standard pattern for "best effort with audit trail". |
+| Strict | `warnings.filterwarnings("error", category=wool.ContextDecodeWarning)` | Decode failure raises (the warning is promoted to an exception); primary signal lost. |
+
+The lenient default keeps wool useful for callers that treat tracing-style state as advisory. Strict mode is for callers whose correctness depends on context state and prefer to fail fast. Inspect mode is the right choice when you want both the primary signal and visibility into ancillary failures:
+
+```python
+import warnings
+import wool
+
+with warnings.catch_warnings(record=True) as captured:
+    warnings.simplefilter("always", category=wool.ContextDecodeWarning)
+    result = await some_routine()  # always returns
+    decode_failures = [w for w in captured if issubclass(w.category, wool.ContextDecodeWarning)]
+if decode_failures:
+    log.warning("context propagation degraded for %d frame(s)", len(decode_failures))
+```
+
+The same semantics apply on both sides of the wire: the worker emits `ContextDecodeWarning` when a request context fails to decode (and runs the routine with a fresh empty context as fallback), and the caller emits `ContextDecodeWarning` when a response context fails to decode (and delivers the result anyway). On the caller side, an exception-frame decode failure additionally rides on the routine's exception via `__notes__` so the failure surfaces in tracebacks. On the worker side, a snapshot encode failure that coincides with a routine exception rides similarly on the routine exception via `__notes__`. There is no `ExceptionGroup` chaining and no wrapper-exception API to learn — just a standard warning class and standard `try/except` around primary signals.
+
+#### Worker-side strict mode
+
+Strict mode applies symmetrically on the worker side via Python's standard `PYTHONWARNINGS` environment variable, which `multiprocessing` propagates to spawned worker subprocesses by default:
+
+```bash
+export PYTHONWARNINGS="error::wool.ContextDecodeWarning"
+python my_app.py
+```
+
+Or programmatically before constructing the pool:
+
+```python
+import os
+os.environ["PYTHONWARNINGS"] = "error::wool.ContextDecodeWarning"
+
+import wool
+
+async with wool.WorkerPool():
+    ...   # workers spawned now promote the warning to an exception
+```
+
+When the worker promotes the warning to an exception, wool ships it back through the routine-exception channel, so the caller catches the exact same `wool.ContextDecodeWarning` class — symmetric with caller-side strict mode. No `RpcError` to special-case, no out-of-band wire metadata.
+
+### Binding a `wool.Context` to a task
+
+The canonical way to bind a `wool.Context` to a freshly-spawned `asyncio.Task` is `wool.create_task` (typed shim) or `asyncio.create_task` (or `loop.create_task`) directly with `context=wool_ctx`:
+
+```python
+ctx = wool.copy_context()
+task = wool.create_task(some_coro(), context=ctx)
+# Equivalent at runtime:
+task = asyncio.create_task(some_coro(), context=ctx)  # type: ignore[arg-type]
+```
+
+Both forms route through Wool's task factory, which self-installs on the running loop the first time any Wool API is touched (or on demand via `wool.install_task_factory(loop)`). The factory wraps the coroutine so the `wool.Context`'s single-task guard is held continuously across awaits — any concurrent attempt to bind a second task to the same `wool.Context` raises `RuntimeError` immediately when that task starts running. `wool.create_task` exists purely as a typing shim: stdlib's `context=` kwarg is typed for `contextvars.Context` and `wool.Context` cannot subclass it (the C type disallows subclassing), so the Wool helper hides the cast.
+
+When `context=` is omitted, the factory forks `wool.copy_context()` from the parent task and binds the fresh chain id to the child. This is the default `asyncio.create_task(coro)` path and matches stdlib's `contextvars.copy_context()` semantics with wool's chain-id contract layered on top.
+
+### Backpressure hooks
+
+`BackpressureLike` hooks run after the caller's propagated `wool.ContextVar` snapshot is applied to the worker's context, so a hook can read caller-provided values (e.g., a tenant id) to make admission decisions without the caller having to plumb them through the `BackpressureContext` explicitly.
+
+### Limitations
+
+- **Values must be _cloudpicklable_.** A `TypeError` naming the offending variable is raised at dispatch time if serialization fails.
+- **Only explicitly set values propagate.** A variable that has never been `set()` (only has a class-level default) is not included in the snapshot — the worker falls through to its own default.
+- **Receivers must eventually declare the var.** Until the worker imports the module that constructs the var, the wire-shipped value is held on a stub pinned to the receiver `wool.Context`; a later `wool.ContextVar(...)` declaration promotes the stub and the propagated value applies transparently. If the worker never declares the var, the stub is collected with its receiver `wool.Context` and the value is dropped.
+- **Tokens are scoped to their originating `wool.Context`.** A `Token` minted inside a task cannot be reset from outside that `wool.Context` — including after crossing an `asyncio.create_task` fork boundary, since child tasks receive fresh `wool.Context` ids. Reset the token in the same logical chain that produced it, or use `var.set(...)` to install a new value without relying on the token.
+- **Wire keys are tied to the top-level package name.** Renaming the top-level package (e.g., `myapp` → `myapp_v2`) changes every var's wire key, so a rolling deploy that has callers and workers on different top-level names will silently drop propagated values on the mismatched side. Keep the top-level package name stable across rolling deploys, or bridge the transition with explicit `namespace=` overrides. Moving a module deeper within the same top-level package is safe — the key is the package root, not the full module path.
+
 ## Worker pools
 
 `WorkerPool` is the main entry point for running routines. It orchestrates worker subprocess lifecycles, discovery, and load-balanced dispatch. The pool supports four configurations depending on which arguments are provided:
@@ -156,7 +285,7 @@ async with wool.WorkerPool(discovery=wool.LanDiscovery(), lease=10):
     result = await my_routine()
 ```
 
-`lazy` controls whether the pool's internal `WorkerProxy` defers startup until the first task is dispatched. Defaults to `True`. The pool propagates this flag to every `WorkerProxy` it constructs, and each task serializes the proxy (including the flag) so that workers receiving the task inherit the same laziness setting. With `lazy=True`, worker subprocesses that never invoke nested `@wool.routine` calls avoid the cost of discovery subscription and sentinel setup entirely. Set `lazy=False` to start proxies eagerly — useful when you want connections established before the first dispatch.
+`lazy` controls whether the pool's internal `WorkerProxy` defers startup until the first task is dispatched. Defaults to `True`. The pool propagates this flag to every `WorkerProxy` it constructs, and each task serializes the proxy (including the flag) so that workers receiving the task inherit the same laziness setting. With `lazy=True`, worker subprocesses that never invoke nested `@wool.routine` calls avoid the cost of discovery subscription and worker-sentinel task setup entirely. Set `lazy=False` to start proxies eagerly — useful when you want connections established before the first dispatch.
 
 ```python
 # Eager proxy startup — connections established before first dispatch

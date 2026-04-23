@@ -112,6 +112,58 @@ def routine(fn: C) -> C:
        consider using shared memory or passing references instead of the
        data itself.
 
+    **Context propagation and decode-failure semantics:**
+
+    Routines run inside their own :class:`wool.Context` on the worker,
+    which receives the caller's :class:`wool.ContextVar` snapshot on
+    dispatch and ships post-run mutations back on the response. Wool
+    treats this propagation as **ancillary state** — separate from the
+    routine's primary signal (its return value or raised exception):
+
+    - **Primary signal preservation.** A failure to decode the wire
+      :class:`wool.Context` (e.g., cross-version pickle skew on a
+      single var value) never preempts the routine's outcome. The
+      result is still returned; a routine exception is still raised.
+    - **Visibility via warning.** Every ancillary decode failure emits
+      a :class:`wool.ContextDecodeWarning` on the side that observed
+      the failure. On the caller, an exception-frame decode failure
+      is bundled alongside the routine's raised exception in a
+      :class:`BaseExceptionGroup` so both signals reach user code —
+      ``except*`` splits the worker exception from the per-entry
+      decode failures.
+    - **Strict mode (opt-in).** Promote the warning to an exception
+      to treat ancillary failures as fatal::
+
+          import warnings
+          import wool
+
+          warnings.filterwarnings("error", category=wool.ContextDecodeWarning)
+
+      In strict mode :meth:`wool.Context.from_protobuf` aggregates
+      the per-entry exceptions into a :class:`BaseExceptionGroup`
+      that the caller observes in place of the primary signal:
+
+      * Result frames lose the routine's return value — the group
+        raises instead.
+      * Exception frames preserve the routine exception as a peer
+        of the decode-failure group, so ``except*`` recovers both.
+
+      Callers that want both result preservation *and* failure
+      visibility should instead use ``warnings.catch_warnings(record=True)``
+      to capture warnings without globally promoting them.
+
+      Strict mode applies symmetrically on the worker side via the
+      standard ``PYTHONWARNINGS`` environment variable, which
+      ``multiprocessing`` propagates to spawned worker subprocesses
+      by default::
+
+          PYTHONWARNINGS = "error::wool.ContextDecodeWarning"
+
+      When the worker promotes the warning, wool ships it back
+      through the routine-exception channel so the caller catches
+      the same ``wool.ContextDecodeWarning`` class — no
+      :class:`grpc.aio.AioRpcError` to special-case.
+
     Example usage with coroutines:
 
     .. code-block:: python

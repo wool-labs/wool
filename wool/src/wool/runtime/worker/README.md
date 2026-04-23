@@ -170,7 +170,19 @@ Each worker subprocess has a two-loop architecture:
 - The **gRPC event loop** runs the gRPC server (`WorkerService`). It receives dispatch RPCs, sends acknowledgments, and streams results back.
 - A dedicated **worker event loop** runs on a daemon thread. Tasks are offloaded here so that long-running work never blocks gRPC operations like health checks or new dispatches.
 
-Context variables are propagated from the gRPC loop to the worker loop. Coroutines use `concurrent.futures.Future` to bridge the result back; async generators stream results via an `asyncio.Queue`.
+The dispatch handler decodes the wire context into a fresh `wool.Context`, then schedules the routine on the worker loop with that instance as the `context=` argument to `loop.create_task`. Wool's task factory routes the explicit `wool.Context` through its scoped-binding path, registering the same instance against the worker task — not a copy — so mutations under the worker task are observable to the handler when it later snapshots the `wool.Context` for back-propagation. Coroutines use `concurrent.futures.Future` to bridge the result back; async generators stream results via an `asyncio.Queue`.
+
+### Context decode failures
+
+Wire context is **ancillary state** in Wool's protocol contract: a failure to decode an incoming context — whether on the initial dispatch frame, a mid-stream frame, or a back-propagated response — never preempts the routine's primary signal (its return value or raised exception). The worker's contract on each side:
+
+- **Initial-frame decode failure (request).** The routine still runs, with a fresh empty `wool.Context` as fallback. A `wool.ContextDecodeWarning` is emitted on the worker.
+- **Mid-stream decode failure (request).** The current iteration continues without applying the upstream merge. A `wool.ContextDecodeWarning` is emitted on the worker.
+- **Snapshot encode failure (response).** The back-propagated wire context is replaced with an empty context; the response still carries the routine's result or exception. A `wool.ContextDecodeWarning` is emitted on the worker. When the snapshot encode failure coincides with a routine exception, the snapshot failure additionally rides on the routine exception via `__notes__` so the caller's traceback shows both signals.
+
+The caller side mirrors this contract: response-context decode failures emit `wool.ContextDecodeWarning` on the caller and never preempt the routine's outcome. See the top-level [`wool/README.md`](../../../../README.md#decode-failure-semantics) for the full lenient/inspect/strict modes.
+
+Worker-side strict mode is enabled via Python's standard `PYTHONWARNINGS` environment variable (which `multiprocessing` propagates to spawned worker subprocesses by default). When the worker promotes the warning to an exception, the dispatch handler catches it before the routine starts and ships it via the routine-exception channel, so the caller observes a `wool.ContextDecodeWarning` raised — symmetric with caller-side strict mode rather than a generic gRPC error. Promotions raised after the routine starts surface through the existing routine-exception machinery.
 
 ### Dispatch protocol
 
@@ -193,9 +205,9 @@ Signal handlers map `SIGTERM` to timeout 0 (cancel immediately) and `SIGINT` to 
 
 ### Nested routines
 
-Worker subprocesses can dispatch tasks to other workers. Each subprocess is configured with a `ResourcePool` of `WorkerProxy` instances (via `wool.__proxy_pool__`), so `@wool.routine` calls within a task transparently route to the target pool. Spinning up a `WorkerProxy` is not free — it involves establishing a discovery subscription, starting a sentinel task, and opening gRPC connections — so the resource pool caches proxies with a configurable TTL (default 60 seconds, set via `proxy_pool_ttl` on `LocalWorker`). If the interval between dispatches for a given pool on a given worker is shorter than the TTL, the cached proxy is reused. If it exceeds the TTL, the proxy is finalized and must be recreated on the next dispatch. Tuning `proxy_pool_ttl` above the expected dispatch interval keeps proxies warm and avoids this cold-start overhead.
+Worker subprocesses can dispatch tasks to other workers. Each subprocess is configured with a `ResourcePool` of `WorkerProxy` instances (via `wool.__proxy_pool__`), so `@wool.routine` calls within a task transparently route to the target pool. Spinning up a `WorkerProxy` is not free — it involves establishing a discovery subscription, starting a worker-sentinel task (a background coroutine that keeps the proxy's connection context alive), and opening gRPC connections — so the resource pool caches proxies with a configurable TTL (default 60 seconds, set via `proxy_pool_ttl` on `LocalWorker`). If the interval between dispatches for a given pool on a given worker is shorter than the TTL, the cached proxy is reused. If it exceeds the TTL, the proxy is finalized and must be recreated on the next dispatch. Tuning `proxy_pool_ttl` above the expected dispatch interval keeps proxies warm and avoids this cold-start overhead.
 
-Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagates its `lazy` flag to every `WorkerProxy` it constructs, and each task serializes the proxy (including the flag) so that workers receiving the task inherit the same laziness setting. A lazy proxy defers discovery subscription and sentinel setup until its first `dispatch()` call, so workers that never invoke nested routines pay no startup cost.
+Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagates its `lazy` flag to every `WorkerProxy` it constructs, and each task serializes the proxy (including the flag) so that workers receiving the task inherit the same laziness setting. A lazy proxy defers discovery subscription and worker-sentinel task setup until its first `dispatch()` call, so workers that never invoke nested routines pay no startup cost.
 
 ## Connections
 
