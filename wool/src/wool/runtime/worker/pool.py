@@ -15,6 +15,7 @@ from typing import overload
 
 from typing_extensions import deprecated
 
+from wool.runtime.context import install_task_factory
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.local import LocalDiscovery
@@ -408,10 +409,11 @@ class WorkerPool:
         :returns:
             The :class:`WorkerPool` instance itself for method chaining.
         :raises RuntimeError:
-            If the pool has already been entered.  ``WorkerPool``
+            If the pool has already been entered.  :class:`WorkerPool`
             contexts are single-use — create a new instance instead
             of re-entering.
         """
+        install_task_factory()
         self._proxy_context = self._proxy_factory()
         await self._proxy_context.__aenter__()
         return self

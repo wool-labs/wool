@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import AsyncGenerator
 from typing import Final
@@ -9,14 +10,15 @@ from typing import TypeAlias
 from typing import TypeVar
 from typing import cast
 
-import cloudpickle
 import grpc.aio
 
 import wool
 from wool import protocol
+from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import PassthroughSerializer
+from wool.runtime.serializer import Serializer
 from wool.runtime.serializer import _passthrough_pool
 from wool.runtime.worker.base import ChannelOptions
 
@@ -86,6 +88,15 @@ _channel_pool: ResourcePool[_Channel] = ResourcePool(
 )
 
 
+async def clear_channel_pool() -> None:
+    """Close and clear every gRPC channel in the process-wide pool.
+
+    Invalidates cached channels across every pool key, including
+    UDS targets.
+    """
+    await _channel_pool.clear()
+
+
 class _DispatchStream(Generic[_T]):
     """Async iterator wrapper for streaming task results from workers.
 
@@ -96,10 +107,17 @@ class _DispatchStream(Generic[_T]):
         The underlying gRPC response stream.
     """
 
-    def __init__(self, call: _DispatchCall, task: Task):
+    def __init__(
+        self,
+        call: _DispatchCall,
+        task: Task,
+        serializer: Serializer | None = None,
+    ):
         self._call = call
         self._task = task
-        self._step = 0
+        self._serializer: Serializer = (
+            serializer if serializer is not None else wool.__serializer__
+        )
         self._iter = aiter(call)
         self._closed = False
         self._running = False
@@ -127,10 +145,14 @@ class _DispatchStream(Generic[_T]):
             raise RuntimeError("anext(): asynchronous generator is already running")
         self._running = True
         try:
-            request = protocol.Request(next=protocol.Void())
+            request = protocol.Request(
+                next=protocol.Void(),
+                context=context.current_context().to_protobuf(
+                    serializer=self._serializer
+                ),
+            )
             await self._call.write(request)
             result = await self._read_next()
-            self._step += 1
             return result
         finally:
             self._running = False
@@ -141,15 +163,48 @@ class _DispatchStream(Generic[_T]):
         Used by :meth:`asend` and :meth:`athrow` which have already
         written their own request to the stream.
 
+        Applies the response's :class:`Context` into the caller's
+        current :class:`Context` — var mutations and consumed-token
+        state both ride back-propagation.
+
         :returns:
             The next task result from the worker.
         """
         try:
             response = await anext(self._iter)
+            # Wool treats response context as ancillary state. Per-var
+            # decode failures aggregate inside
+            # :meth:`Context.from_protobuf` and surface as a
+            # :class:`BaseExceptionGroup` only under strict mode; on the
+            # primary-signal path we bundle them with the worker
+            # exception (or the result-bearing response's group) so
+            # callers can extract both signals via ``except*``.
+            decode_failures: list[BaseException] = []
+            try:
+                incoming_context = context.Context.from_protobuf(
+                    response.context, serializer=self._serializer
+                )
+            except BaseExceptionGroup as eg:
+                decode_failures.extend(eg.exceptions)
+            else:
+                if incoming_context.has_state():
+                    context.current_context().update(incoming_context)
             if response.HasField("result"):
-                return cloudpickle.loads(response.result.dump)
+                result = self._serializer.loads(response.result.dump)
+                if decode_failures:
+                    raise BaseExceptionGroup(
+                        "response context decode failed",
+                        decode_failures,
+                    )
+                return result
             elif response.HasField("exception"):
-                raise cloudpickle.loads(response.exception.dump)
+                worker_exc = self._serializer.loads(response.exception.dump)
+                if decode_failures:
+                    raise BaseExceptionGroup(
+                        "response context decode failed alongside worker exception",
+                        [worker_exc, *decode_failures],
+                    )
+                raise worker_exc
             else:
                 raise UnexpectedResponse(
                     f"Expected 'result' or 'exception' response, "
@@ -201,15 +256,17 @@ class _DispatchStream(Generic[_T]):
         if self._closed:  # pragma: no cover
             raise StopAsyncIteration
         if self._running:  # pragma: no cover
-            raise RuntimeError("anext(): asynchronous generator is already running")
+            raise RuntimeError("asend(): asynchronous generator is already running")
         self._running = True
         try:
             request = protocol.Request(
-                send=protocol.Message(dump=wool.__serializer__.dumps(value))
+                send=protocol.Message(dump=self._serializer.dumps(value)),
+                context=context.current_context().to_protobuf(
+                    serializer=self._serializer
+                ),
             )
             await self._call.write(request)
             result = await self._read_next()
-            self._step += 1
             return result
         finally:
             self._running = False
@@ -249,11 +306,13 @@ class _DispatchStream(Generic[_T]):
                 exc = typ()
 
             request = protocol.Request(
-                throw=protocol.Message(dump=wool.__serializer__.dumps(exc))
+                throw=protocol.Message(dump=self._serializer.dumps(exc)),
+                context=context.current_context().to_protobuf(
+                    serializer=self._serializer
+                ),
             )
             await self._call.write(request)
             result = await self._read_next()
-            self._step += 1
             return result
         finally:
             self._running = False
@@ -388,6 +447,32 @@ class WorkerConnection:
            instead of being serialized.  The request still travels
            through gRPC so the full streaming protocol is preserved.
 
+        **Context decode failures (caller-side).**
+        Each response frame may carry a back-propagated wire context
+        that needs decoding before the caller can merge worker-side
+        mutations. Wire context is **ancillary state** under wool's
+        protocol contract: per-entry decode failures emit
+        :class:`wool.ContextDecodeWarning` instances inside
+        :meth:`Context.from_protobuf`. Under the warnings system's
+        default filter these surface once as warnings and decoding
+        returns the partial Context; under a filter that promotes
+        :class:`wool.ContextDecodeWarning` to an error,
+        :meth:`Context.from_protobuf` aggregates the per-entry
+        exceptions into a :class:`BaseExceptionGroup` and raises in
+        place of returning. Caller-side handling after loading the
+        primary signal:
+
+        * On a result frame, if decoding aggregated, the
+          :class:`BaseExceptionGroup` raises in place of the return —
+          strict mode loses the primary value but every decode
+          failure surfaces, not just the first.
+        * On an exception frame, the worker exception is bundled as
+          a peer alongside the decode failures in a
+          :class:`BaseExceptionGroup` so both signals reach the
+          caller (``except*`` splits them). Under the default filter
+          the per-entry warnings emit once during decode and the
+          worker exception raises unwrapped.
+
         :param task:
             The :class:`Task` instance to dispatch to the worker.
         :param timeout:
@@ -411,24 +496,30 @@ class WorkerConnection:
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
 
-        if (
-            metadata := wool.__worker_metadata__
-        ) is not None and metadata.address == self._target:
-            serializer = await _passthrough_pool.acquire(task.id)
-            if (uds_address := wool.__worker_uds_address__) is not None:
-                key = (uds_address, None, self._options)
-                self._uds_key = key
+        async with AsyncExitStack() as stack:
+            if (
+                metadata := wool.__worker_metadata__
+            ) is not None and metadata.address == self._target:
+                serializer = await stack.enter_async_context(
+                    _passthrough_pool.get(task.id)
+                )
+                if (uds_address := wool.__worker_uds_address__) is not None:
+                    key = (uds_address, None, self._options)
+                    self._uds_key = key
+                else:
+                    key = self._key
             else:
+                serializer = None
                 key = self._key
-        else:
-            serializer = None
-            key = self._key
 
-        channel = await _channel_pool.acquire(key)
-        try:
+            channel = await stack.enter_async_context(_channel_pool.get(key))
+
             try:
                 call = await self._dispatch(
-                    channel, task.to_protobuf(serializer=serializer), timeout
+                    channel,
+                    task.to_protobuf(serializer=serializer),
+                    timeout,
+                    serializer=serializer,
                 )
             except grpc.RpcError as error:
                 code = error.code()
@@ -438,17 +529,9 @@ class WorkerConnection:
                 else:
                     raise RpcError(code, details) from error
 
-            stream = self._execute(call, task, key)
+            stream = self._execute(call, task, key, serializer)
             await stream.__anext__()  # Prime: _execute acquires its own ref
-        except BaseException:
-            await _channel_pool.release(key)
-            if serializer is not None:
-                await _passthrough_pool.release(task.id)
-            raise
 
-        await _channel_pool.release(key)
-        if serializer is not None:
-            await _passthrough_pool.release(task.id)
         return cast(AsyncGenerator[protocol.Message, None], stream)
 
     async def close(self):
@@ -473,13 +556,19 @@ class WorkerConnection:
         channel: _Channel,
         task_msg: protocol.Task,
         timeout: float | None,
+        serializer: PassthroughSerializer | None = None,
     ) -> _DispatchCall:
         async with asyncio.timeout(timeout):
             await channel.semaphore.acquire()
             try:
                 call: _DispatchCall = channel.stub.dispatch()
                 try:
-                    request = protocol.Request(task=task_msg)
+                    request = protocol.Request(
+                        task=task_msg,
+                        context=context.current_context().to_protobuf(
+                            serializer=serializer
+                        ),
+                    )
                     await call.write(request)
                     response = await anext(aiter(call))
                     if response.HasField("nack"):
@@ -503,43 +592,50 @@ class WorkerConnection:
         return call
 
     async def _execute(
-        self, call: _DispatchCall, task: Task, key: _PoolKey
+        self,
+        call: _DispatchCall,
+        task: Task,
+        key: _PoolKey,
+        serializer: PassthroughSerializer | None = None,
     ) -> AsyncGenerator[protocol.Message | None, None]:
-        channel = await _channel_pool.acquire(key)
-        if serializer is not None:
-            # Reacquire the per-task passthrough serializer so its
-            # lifetime spans the streaming generator. The dispatch()
-            # caller already holds one ref; this second ref is
-            # released in the matching finally below, mirroring the
-            # channel-pool pattern.
-            await _passthrough_pool.acquire(task.id)
-        try:
-            yield  # Priming yield — signals dispatch() that ref is held
-            stream = _DispatchStream(call, task)
+        async with AsyncExitStack() as stack:
+            if serializer is not None:
+                # Re-pin the per-task passthrough serializer for the
+                # streaming generator's lifetime. The dispatch() caller
+                # already holds one ref; this second ref is released
+                # when the stack exits, mirroring the channel-pool
+                # pattern.
+                await stack.enter_async_context(_passthrough_pool.get(task.id))
+            channel = await stack.enter_async_context(_channel_pool.get(key))
             try:
-                sent = None
-                result = await anext(stream)
-                while True:
-                    try:
-                        sent = yield result
-                    except GeneratorExit:
-                        await stream.aclose()
-                        return
-                    except BaseException as exc:
-                        result = await stream.athrow(type(exc), exc)
-                    else:
-                        result = await stream.asend(sent)
-            except StopAsyncIteration:
-                return
-            except (Exception, asyncio.CancelledError):
+                # Priming yield. By this point both pool refs (channel,
+                # plus passthrough when applicable) are pinned to this
+                # generator's :class:`AsyncExitStack`. ``dispatch()``'s
+                # caller resumes from its ``await stream.__anext__()``
+                # and can safely exit its own dispatch-scope ExitStack:
+                # the long-lived refs now live here, not there.
+                yield
+                stream = _DispatchStream(call, task, serializer=serializer)
                 try:
-                    await stream.aclose()
-                except Exception:  # pragma: no cover
-                    pass
-                raise
+                    sent = None
+                    result = await anext(stream)
+                    while True:
+                        try:
+                            sent = yield result
+                        except GeneratorExit:
+                            await stream.aclose()
+                            return
+                        except BaseException as exc:
+                            result = await stream.athrow(type(exc), exc)
+                        else:
+                            result = await stream.asend(sent)
+                except StopAsyncIteration:
+                    return
+                except (Exception, asyncio.CancelledError):
+                    try:
+                        await stream.aclose()
+                    except Exception:  # pragma: no cover
+                        pass
+                    raise
             finally:
                 channel.semaphore.release()
-        finally:
-            await _channel_pool.release(key)
-            if serializer is not None:
-                await _passthrough_pool.release(task.id)

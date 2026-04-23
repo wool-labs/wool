@@ -81,6 +81,16 @@ def do_dispatch(flag: bool, /) -> ContextManager[None]: ...
 
 
 def do_dispatch(flag: bool | None = None, /) -> bool | ContextManager[None]:
+    """Read or scope the dispatch-routing flag.
+
+    Called with no argument, returns the current flag value. Called
+    with a *flag* argument, returns a context manager that sets the
+    flag for the duration of its ``with`` block and restores the
+    prior value on exit. The flag governs whether the surrounding
+    ``@routine`` invocation routes through the worker pool (``True``,
+    the default) or runs locally (``False``); ``with do_dispatch(False):``
+    is the standard way to opt a nested call out of dispatch.
+    """
     if flag is None:
         return _do_dispatch.get()
     else:
@@ -107,8 +117,7 @@ class WorkerProxyLike(Protocol):
 # public
 @dataclass
 class Task(Generic[W]):
-    """
-    Represents a distributed task to be executed in the worker pool.
+    """Represents a distributed task to be executed in the worker pool.
 
     Each task encapsulates a function call along with its arguments and
     execution context. Tasks are created when decorated functions are
@@ -124,7 +133,8 @@ class Task(Generic[W]):
     :param kwargs:
         Keyword arguments for the function.
     :param proxy:
-        Proxy object for task dispatch and routing (satisfies WorkerProxyLike).
+        Proxy object for task dispatch and routing (satisfies
+        :class:`WorkerProxyLike`).
     :param timeout:
         Task timeout in seconds (0 means no timeout).
     :param caller:
@@ -132,11 +142,14 @@ class Task(Generic[W]):
     :param exception:
         Exception information if task execution failed.
     :param tag:
-        Optional descriptive tag for the task.
-    :param context:
-        RuntimeContext snapshot captured at task creation time.
-        Propagated over the wire so workers can restore the caller's
-        runtime settings (e.g. dispatch_timeout) before execution.
+        Descriptive label identifying the call site, formatted as
+        ``module.qualname:lineno`` by the ``@routine`` wrapper.
+    :param runtime_context:
+        Snapshot of the active :class:`RuntimeContext` at construction
+        time, captured by :meth:`__post_init__` if not supplied. Ships
+        with the dispatch frame so the worker side can restore wire
+        defaults (notably ``dispatch_timeout``) for the routine's
+        execution.
     """
 
     id: UUID
@@ -148,14 +161,15 @@ class Task(Generic[W]):
     caller: UUID | None = None
     exception: TaskException | None = None
     tag: str | None = None
-    context: RuntimeContext | None = None
+    runtime_context: RuntimeContext | None = None
 
-    def __post_init__(self, **kwargs):
-        """
-        Initialize the task and set up caller tracking.
+    def __post_init__(self):
+        """Validate the proxy, capture the calling task's id, and seed
+        a :class:`RuntimeContext` snapshot if one was not supplied.
 
-        :param kwargs:
-            Additional keyword arguments (unused).
+        The runtime-context seed lets a Task built outside an active
+        :class:`RuntimeContext` scope still ship the wire defaults
+        when it dispatches.
         """
         if not isinstance(self.proxy, WorkerProxyLike):
             raise TypeError(
@@ -163,12 +177,11 @@ class Task(Generic[W]):
             )
         if caller := _current_task.get():
             self.caller = caller.id
-        if self.context is None:
-            self.context = RuntimeContext.get_current()
+        if self.runtime_context is None:
+            self.runtime_context = RuntimeContext.get_current()
 
     def __enter__(self) -> Callable[[], Coroutine | AsyncGenerator]:
-        """
-        Enter the task context for execution.
+        """Enter the task context for execution.
 
         :returns:
             The task's run method as a callable coroutine.
@@ -231,39 +244,40 @@ class Task(Generic[W]):
         standard reduce tuples that stock unpickling executes natively.
 
         :param task:
-            A protobuf ``Task`` message.
+            A :class:`protocol.Task` message.
         :returns:
             A :class:`Task` instance with all fields restored.
         """
-        context = (
-            RuntimeContext.from_protobuf(task.context)
-            if task.HasField("context")
-            else None
-        )
         if task.HasField("serializer"):
             s = _unpickle_serializer(task.serializer)
             loads = s.loads
-            if isinstance(s, PassthroughSerializer):
-                proxy_loads = s.loads
-            else:
-                proxy_loads = cloudpickle.loads
         else:
             loads = cloudpickle.loads
-            proxy_loads = cloudpickle.loads
+        runtime_context = (
+            RuntimeContext.from_protobuf(task.runtime_context)
+            if task.HasField("runtime_context")
+            else None
+        )
         return cls(
             id=UUID(task.id),
             callable=loads(task.callable),
             args=loads(task.args),
             kwargs=loads(task.kwargs),
             caller=UUID(task.caller) if task.caller else None,
-            proxy=proxy_loads(task.proxy),
+            proxy=loads(task.proxy),
             timeout=task.timeout if task.timeout else 0,
             tag=task.tag if task.tag else None,
-            context=context,
+            runtime_context=runtime_context,
         )
 
     def to_protobuf(self, serializer: Serializer | None = None) -> protocol.Task:
         """Serialize this Task to a protobuf message.
+
+        The serializer itself is pickled via :func:`_pickle_serializer`
+        which uses an LRU cache keyed on the serializer instance.
+        :class:`PassthroughSerializer` instances all hash and compare
+        equal, so repeated calls hit the cache and avoid redundant
+        pickling.
 
         :param serializer:
             Optional serializer for the callable and its arguments.  When
@@ -276,7 +290,7 @@ class Task(Generic[W]):
             :class:`PassthroughSerializer`, in which case the proxy uses
             the same serializer as the rest of the payload.
         :returns:
-            A protobuf ``Task`` message.
+            A :class:`protocol.Task` message.
         """
         dumps = serializer.dumps if serializer is not None else wool.__serializer__.dumps
         proxy_dumps = (
@@ -295,7 +309,9 @@ class Task(Generic[W]):
             proxy_id=str(self.proxy.id),
             timeout=int(self.timeout) if self.timeout else 0,
             tag=self.tag if self.tag else "",
-            context=self.context.to_protobuf() if self.context else None,
+            runtime_context=(
+                self.runtime_context.to_protobuf() if self.runtime_context else None
+            ),
         )
         if serializer is not None:
             task_msg.serializer = _pickle_serializer(serializer)
@@ -326,8 +342,8 @@ class Task(Generic[W]):
             # Set the proxy in context variable for nested task dispatch
             token = wool.__proxy__.set(proxy)
             try:
-                assert self.context is not None
-                with self.context:
+                assert self.runtime_context is not None
+                with self.runtime_context:
                     with self:
                         with do_dispatch(False):
                             await asyncio.sleep(0)
@@ -337,7 +353,7 @@ class Task(Generic[W]):
 
     async def _stream(self):
         """
-        Execute the task's callable with its arguments in proxy context.
+        Stream the task's async generator callable in proxy context.
 
         :returns:
             An async generator that yields values from the callable.
@@ -356,8 +372,8 @@ class Task(Generic[W]):
                     # Set the proxy in context variable for nested task dispatch
                     token = wool.__proxy__.set(proxy)
                     try:
-                        assert self.context is not None
-                        with self.context:
+                        assert self.runtime_context is not None
+                        with self.runtime_context:
                             with self:
                                 with do_dispatch(False):
                                     try:
@@ -375,8 +391,7 @@ class Task(Generic[W]):
 # public
 @dataclass
 class TaskException:
-    """
-    Represents an exception that occurred during distributed task execution.
+    """Represents an exception that occurred during distributed task execution.
 
     Captures exception information from remote task execution for proper
     error reporting and debugging. The exception details are serialized
