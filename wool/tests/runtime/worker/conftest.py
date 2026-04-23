@@ -5,7 +5,6 @@ from types import MappingProxyType
 from typing import Any
 from unittest.mock import MagicMock
 
-import grpc
 import pytest
 import pytest_asyncio
 
@@ -30,9 +29,24 @@ from cryptography.x509.oid import NameOID
 from pytest_mock import MockerFixture
 
 import wool.runtime.worker.pool as wp
+from tests.helpers import scoped_context
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.metadata import WorkerMetadata
+
+
+@pytest.fixture(autouse=True)
+def _isolate_wool_context():
+    """Install a fresh wool.Context for the duration of the test.
+
+    Each test runs under its own scoped Context so var values set in
+    one test do not leak into subsequent tests via the per-task data
+    map. The process-wide var_registry is not reset; tests SHOULD
+    use unique key namespaces (e.g. via uuid suffix) to avoid
+    cross-test collisions on shared keys.
+    """
+    with scoped_context():
+        yield
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -45,7 +59,7 @@ async def _clear_channel_pool():
     yield
     import wool.runtime.worker.connection as _conn
 
-    await _conn._channel_pool.clear()
+    await _conn.clear_channel_pool()
 
 
 @pytest.fixture(autouse=True)
@@ -480,7 +494,6 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata)
     Yields:
         WorkerProxy instance with 2 pre-configured mock workers
     """
-    from wool.runtime.worker.proxy import WorkerProxy
 
     # Inject 2 mock workers into discovery
     worker1 = WorkerMetadata(

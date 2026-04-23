@@ -84,6 +84,7 @@ path = "../build-hooks/metadata.py"
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--cov --cov-config=.coveragerc"
+pythonpath = ["."]
 markers = [
     "integration: end-to-end integration tests against real WorkerPool",
 ]

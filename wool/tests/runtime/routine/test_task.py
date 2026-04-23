@@ -1948,6 +1948,125 @@ class TestPassthroughSerializer:
         # Assert
         assert result is obj
 
+    def test_loads_prunes_keys_from_serializer_storage(self):
+        """Test PassthroughSerializer.loads drops the consumed key
+        from the per-instance keep-alive set so a long-running
+        dump/load cycle does not accumulate keep-alive entries.
+
+        Given:
+            A PassthroughSerializer with one value already dumped
+            (the keep-alive set holds one entry to keep the
+            ``_passthrough_store`` weak entry alive)
+        When:
+            ``loads`` consumes that value
+        Then:
+            The keep-alive set should return to empty --- prune-at-
+            loads bounds the keep-alive footprint to the in-flight
+            dump-but-not-yet-loaded count, not the total dumps over
+            the serializer's lifetime
+        """
+        # Arrange
+        serializer = PassthroughSerializer()
+        data = serializer.dumps("temporary")
+        assert len(serializer._keys) == 1
+
+        # Act
+        serializer.loads(data)
+
+        # Assert
+        assert len(serializer._keys) == 0
+
+    def test_streaming_dump_load_cycle_keeps_keys_bounded(self):
+        """Test repeated dump/load cycles on a single
+        PassthroughSerializer keep the keep-alive set bounded by
+        in-flight count, not total cycles.
+
+        Given:
+            A PassthroughSerializer driven through many dump/load
+            iterations of one value at a time --- the streaming
+            self-dispatch usage pattern
+        When:
+            100 dump + load cycles run sequentially
+        Then:
+            The keep-alive set length should stay at 0 between
+            cycles and after the loop --- the regression guard
+            against unbounded growth flagged for the
+            long-streaming-dispatch case
+        """
+        # Arrange
+        serializer = PassthroughSerializer()
+
+        # Act
+        for i in range(100):
+            data = serializer.dumps(f"value_{i}")
+            assert len(serializer._keys) == 1
+            result = serializer.loads(data)
+            assert result == f"value_{i}"
+            assert len(serializer._keys) == 0
+
+        # Assert
+        assert len(serializer._keys) == 0
+
+    @pytest.mark.asyncio
+    async def test_pool_shares_instance_for_same_task_id(self):
+        """Test the per-task-id PassthroughSerializer pool returns
+        the same instance for overlapping acquisitions sharing a key.
+
+        Given:
+            The module-level _passthrough_pool ResourcePool keyed by
+            task id, and two overlapping acquisitions for the same
+            task id (modeling caller-side and worker-side
+            self-dispatch acquiring the serializer for one dispatch)
+        When:
+            Both acquisitions run concurrently
+        Then:
+            The two acquired serializers should be the same Python
+            object --- caller and worker sides share one instance
+            per dispatch so prune-at-loads on either side bounds the
+            shared _keys
+        """
+        # Arrange
+        from wool.runtime.serializer import _passthrough_pool
+
+        task_id = uuid4()
+
+        # Act
+        async with _passthrough_pool.get(task_id) as caller_side:
+            async with _passthrough_pool.get(task_id) as worker_side:
+                # Assert
+                assert caller_side is worker_side
+
+    @pytest.mark.asyncio
+    async def test_pool_evicts_entry_when_refcount_drops_to_zero(self):
+        """Test the per-task-id pool evicts a serializer entry once
+        all acquisitions for that task id are released.
+
+        Given:
+            The module-level _passthrough_pool with one acquired
+            entry for some task id
+        When:
+            The acquisition releases and the cleanup task runs
+        Then:
+            ``pool.stats.total_entries`` should drop to its
+            pre-acquisition baseline --- error-path keep-alive
+            entries are not retained beyond dispatch lifetime
+        """
+        # Arrange
+        from wool.runtime.serializer import _passthrough_pool
+
+        task_id = uuid4()
+        baseline = _passthrough_pool.stats.total_entries
+
+        # Act
+        async with _passthrough_pool.get(task_id):
+            assert _passthrough_pool.stats.total_entries == baseline + 1
+
+        # Allow the cleanup task to run.
+        await asyncio.sleep(0)
+
+        # Assert
+        assert _passthrough_pool.stats.total_entries == baseline
+
 
 class TestTaskException:
     """Tests for :py:class:`TaskException`."""
