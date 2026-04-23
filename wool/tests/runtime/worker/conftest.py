@@ -7,19 +7,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
-
-
-class PicklableMock(MagicMock):
-    """A :class:`MagicMock` subclass that survives ``cloudpickle``.
-
-    Intended for mock proxies that must be serialized in
-    ``Task.to_protobuf()`` calls during integration tests.
-    """
-
-    def __reduce__(self):
-        return (MagicMock, (self._spec_class,))
-
-
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
@@ -33,6 +20,17 @@ from tests.helpers import scoped_context
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.metadata import WorkerMetadata
+
+
+class PicklableMock(MagicMock):
+    """A :class:`MagicMock` subclass that survives ``cloudpickle``.
+
+    Intended for mock proxies that must be serialized in
+    ``Task.to_protobuf()`` calls during integration tests.
+    """
+
+    def __reduce__(self):
+        return (MagicMock, (self._spec_class,))
 
 
 @pytest.fixture(autouse=True)

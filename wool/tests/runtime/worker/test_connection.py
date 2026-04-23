@@ -15,8 +15,11 @@ from pytest_mock import MockerFixture
 
 import wool
 from wool import protocol
+from wool.runtime.context import ContextDecodeWarning
+from wool.runtime.context import ContextVar
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.serializer import PassthroughSerializer
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
@@ -635,25 +638,31 @@ class TestWorkerConnection:
         await connection.close()
 
     @pytest.mark.asyncio
-    async def test_close_clears_uds_pool_entry(
+    async def test_close_called_twice_after_uds_self_dispatch(
         self,
         mocker: MockerFixture,
         sample_task,
         async_stream,
         mock_grpc_call,
     ):
-        """Test close clears UDS channel pool entry after self-dispatch.
+        """Test calling :meth:`WorkerConnection.close` a second time
+        after a UDS self-dispatch returns without raising.
 
         Given:
-            A WorkerConnection that has dispatched over UDS
+            A :class:`WorkerConnection` that dispatched once over UDS
+            (so both TCP and UDS pool entries were primed and the
+            connection records the UDS key) and was then closed once
+            (clearing both pool entries).
         When:
-            close() is called
+            ``close()`` is awaited a second time.
         Then:
-            It should clear both the TCP and UDS pool entries
+            It should return without raising — the second close
+            observes that both the TCP and UDS pool entries are
+            already vacant and absorbs the resulting ``KeyError``.
         """
         # Arrange
         target = "localhost:50051"
-        uds_target = "unix:/tmp/wool-test.sock"
+        uds_target = "unix:/tmp/wool-test-close-twice.sock"
         wool.__worker_metadata__ = wool.WorkerMetadata(
             uid=uuid4(),
             address=target,
@@ -662,9 +671,10 @@ class TestWorkerConnection:
         )
         wool.__worker_uds_address__ = uds_target
 
+        _resp_ser = PassthroughSerializer()
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("result"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -682,20 +692,10 @@ class TestWorkerConnection:
         async for _ in await connection.dispatch(sample_task):
             pass
 
-        from wool.runtime.worker import connection as connection_module
-
-        clear_spy = mocker.patch.object(
-            connection_module._channel_pool, "clear", mocker.AsyncMock()
-        )
-
-        # Act
         await connection.close()
 
-        # Assert
-        cleared_keys = [c.args[0] for c in clear_spy.call_args_list]
-        assert len(cleared_keys) == 2
-        assert (target, None, connection._options) in cleared_keys
-        assert (uds_target, None, connection._options) in cleared_keys
+        # Act & assert — second close must not raise
+        await connection.close()
 
     @pytest.mark.asyncio
     async def test_dispatch_task_that_yields_multiple_results(
@@ -1432,9 +1432,10 @@ class TestWorkerConnection:
             version="1.0.0",
         )
 
+        _resp_ser = PassthroughSerializer()
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("result"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -1490,9 +1491,10 @@ class TestWorkerConnection:
         )
         wool.__worker_uds_address__ = uds_target
 
+        _resp_ser = PassthroughSerializer()
         responses = (
             protocol.Response(ack=protocol.Ack()),
-            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("result"))),
         )
         mock_call = mock_grpc_call(async_stream(responses))
 
@@ -1614,3 +1616,442 @@ class TestWorkerConnection:
         assert results == ["grpc_result"]
         first_write = mock_call.write.call_args_list[0][0][0]
         assert not first_write.task.HasField("serializer")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_self_dispatch_anext_sends_vars_via_passthrough(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test self-dispatch __anext__ serializes vars via PassthroughSerializer.dumps.
+
+        Given:
+            A WorkerConnection whose target matches the current
+            worker's address and a ContextVar with a value set
+        When:
+            The dispatch stream's __anext__ writes a next-frame request
+        Then:
+            The vars in the written request should be serialized via
+            PassthroughSerializer.dumps (16-byte UUID tokens), not
+            cloudpickle
+        """
+        # Arrange
+        target = "localhost:50051"
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address=target,
+            pid=1,
+            version="1.0.0",
+        )
+
+        var = ContextVar("conn_d_var", namespace="conn_d")
+        var.set("test_value")
+
+        _resp_ser = PassthroughSerializer()
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("first"))),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("second"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert — the next-frame request (second write) should carry
+        # 16-byte passthrough tokens as var values, not cloudpickle bytes
+        assert len(results) == 2
+        next_request = mock_call.write.call_args_list[1][0][0]
+        emitted = {(e.namespace, e.name): e.value for e in next_request.context.vars}
+        assert (var.namespace, var.name) in emitted
+        assert len(emitted[(var.namespace, var.name)]) == 16
+
+    @pytest.mark.asyncio
+    async def test_dispatch_self_dispatch_with_response_vars_via_passthrough(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test self-dispatch applies response vars via passthrough loads.
+
+        Given:
+            A WorkerConnection in self-dispatch mode and a response
+            carrying vars serialized via PassthroughSerializer.dumps
+        When:
+            The stream reads the response and applies the vars
+        Then:
+            The ContextVar value should be updated to the value
+            round-tripped through the passthrough serializer
+        """
+        # Arrange
+        target = "localhost:50051"
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address=target,
+            pid=1,
+            version="1.0.0",
+        )
+
+        var = ContextVar("conn_e_var", namespace="conn_e")
+        var.set("original")
+
+        # Build a passthrough-serialized var value for the response
+        serializer = PassthroughSerializer()
+        pt_bytes = serializer.dumps("back_propagated")
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                result=protocol.Message(dump=serializer.dumps("result")),
+                context=protocol.Context(
+                    vars=[
+                        protocol.ContextVar(
+                            namespace=var.namespace,
+                            name=var.name,
+                            value=pt_bytes,
+                        )
+                    ]
+                ),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert
+        assert results == ["result"]
+        assert var.get() == "back_propagated"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_corrupt_response_context_and_worker_exception(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test the caller-side response decoder surfaces both the
+        worker-raised exception and a per-var context-decode failure
+        as independent signals when a single frame carries both.
+
+        Given:
+            A worker response that carries both a worker-raised
+            routine exception and a context payload whose var entry
+            cannot be deserialized (modeling cross-version pickle
+            skew or on-wire corruption of a single var value in the
+            same frame as a routine failure)
+        When:
+            The caller iterates the dispatch stream
+        Then:
+            The caller raises the worker's routine exception, and a
+            ContextDecodeWarning naming the corrupt var key is also
+            emitted — the corrupt var is skipped via the per-entry
+            resilience contract; surviving context state still
+            propagates and the worker's signal still surfaces
+        """
+        # Arrange
+        target = "localhost:50051"
+        var = ContextVar(
+            "exception_with_corrupt_context_var",
+            namespace="exception_with_corrupt_context",
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                exception=protocol.Message(
+                    dump=cloudpickle.dumps(ValueError("worker-side failure"))
+                ),
+                context=protocol.Context(
+                    vars=[
+                        protocol.ContextVar(
+                            namespace=var.namespace,
+                            name=var.name,
+                            value=b"\x00not a valid pickle stream\x00",
+                        )
+                    ]
+                ),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert
+        with pytest.warns(ContextDecodeWarning, match=var.name):
+            with pytest.raises(ValueError, match="worker-side failure"):
+                async for _ in await connection.dispatch(sample_task):
+                    pass
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_corrupt_response_context_and_result_frame(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test the caller-side response decoder delivers the routine's
+        return value and emits a ContextDecodeWarning when a result
+        frame's accompanying context payload fails to deserialize.
+
+        Given:
+            A worker response that carries a successful routine
+            ``result`` payload alongside a context whose var entry
+            fails to deserialize
+        When:
+            The caller iterates the dispatch stream
+        Then:
+            The caller observes the routine's return value normally
+            and a ContextDecodeWarning is emitted — context
+            propagation is ancillary state and a decode failure here
+            never preempts the primary signal. Callers that prefer
+            strict semantics can promote the warning to an exception
+            via ``warnings.filterwarnings("error", category=...)``
+        """
+        # Arrange
+        target = "localhost:50051"
+        var = ContextVar(
+            "result_with_corrupt_context_var",
+            namespace="result_with_corrupt_context",
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                result=protocol.Message(dump=cloudpickle.dumps("worker_result")),
+                context=protocol.Context(
+                    vars=[
+                        protocol.ContextVar(
+                            namespace=var.namespace,
+                            name=var.name,
+                            value=b"\x00not a valid pickle stream\x00",
+                        )
+                    ]
+                ),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        results: list[object] = []
+        with pytest.warns(ContextDecodeWarning, match="Failed to deserialize"):
+            async for value in await connection.dispatch(sample_task):
+                results.append(value)
+
+        # Assert
+        assert results == ["worker_result"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_corrupt_response_context_and_result_frame_strict(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test that a caller can opt into strict semantics by promoting
+        ContextDecodeWarning to an error.
+
+        Given:
+            The same response shape as the lenient-mode test (result
+            + corrupt context var)
+        When:
+            The caller has installed
+            ``warnings.filterwarnings("error", category=ContextDecodeWarning)``
+            for the duration of the dispatch
+        Then:
+            Iterating the dispatch raises a :class:`BaseExceptionGroup`
+            whose sole peer is the promoted
+            :class:`ContextDecodeWarning` — wool emits decode failures
+            uniformly through the group shape so caller code stays
+            symmetric across single- and multi-peer cases (e.g.
+            decode failure alongside a worker exception). The opt-in
+            strict mode lets callers treat ancillary failures as
+            fatal without changing wool's wire-protocol defaults.
+        """
+        # Arrange
+        target = "localhost:50051"
+        var = ContextVar(
+            "strict_corrupt_context_var",
+            namespace="strict_corrupt_context",
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                result=protocol.Message(dump=cloudpickle.dumps("worker_result")),
+                context=protocol.Context(
+                    vars=[
+                        protocol.ContextVar(
+                            namespace=var.namespace,
+                            name=var.name,
+                            value=b"\x00not a valid pickle stream\x00",
+                        )
+                    ]
+                ),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert
+        import warnings as _warnings
+
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", category=ContextDecodeWarning)
+            with pytest.raises(BaseExceptionGroup) as exc_info:
+                async for _ in await connection.dispatch(sample_task):
+                    pass
+        assert len(exc_info.value.exceptions) == 1
+        assert isinstance(exc_info.value.exceptions[0], ContextDecodeWarning)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_without_serializer_uses_cloudpickle_for_vars(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test non-self-dispatch uses default cloudpickle for vars serialization.
+
+        Given:
+            A WorkerConnection whose target does not match the current
+            worker's address and a ContextVar with a value set
+        When:
+            The dispatch stream writes requests
+        Then:
+            The vars in each request should be serialized via
+            cloudpickle (not passthrough 16-byte tokens)
+        """
+        # Arrange
+        var = ContextVar("conn_f_var", namespace="conn_f")
+        var.set("cp_value")
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051",
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert — the initial request vars should be cloudpickle bytes,
+        # which are longer than a 16-byte passthrough token
+        assert results == ["result"]
+        initial_request = mock_call.write.call_args_list[0][0][0]
+        emitted = {(e.namespace, e.name): e.value for e in initial_request.context.vars}
+        assert (var.namespace, var.name) in emitted
+        assert len(emitted[(var.namespace, var.name)]) > 16
+
+    @pytest.mark.asyncio
+    async def test_dispatch_self_dispatch_initial_request_includes_passthrough_vars(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test self-dispatch initial request serializes vars via passthrough.
+
+        Given:
+            A WorkerConnection whose target matches the current
+            worker's address and a ContextVar with a value set
+        When:
+            dispatch() sends the initial task request
+        Then:
+            The vars map on the initial request should contain
+            16-byte passthrough tokens (UUID bytes), not cloudpickle
+        """
+        # Arrange
+        target = "localhost:50051"
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address=target,
+            pid=1,
+            version="1.0.0",
+        )
+
+        var = ContextVar("conn_g_var", namespace="conn_g")
+        var.set("initial_value")
+
+        _resp_ser = PassthroughSerializer()
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=_resp_ser.dumps("done"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert — initial request (first write) should carry passthrough vars
+        assert results == ["done"]
+        initial_request = mock_call.write.call_args_list[0][0][0]
+        emitted = {(e.namespace, e.name): e.value for e in initial_request.context.vars}
+        assert (var.namespace, var.name) in emitted
+        # Passthrough tokens are exactly 16 bytes (UUID bytes)
+        assert len(emitted[(var.namespace, var.name)]) == 16

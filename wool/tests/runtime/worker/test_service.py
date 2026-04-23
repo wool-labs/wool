@@ -233,30 +233,106 @@ class TestWorkerService:
         assert str(exception) == "test_exception"
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_corrupt_context_var_value(
+    async def test_dispatch_with_corrupt_context_strict_ships_warning_class(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch aborts with
-        ``INVALID_ARGUMENT`` when a caller-shipped ``request.context.vars``
-        entry cannot be deserialized.
+        """Test :class:`WorkerService` dispatch ships a strict-mode
+        promoted :class:`ContextDecodeWarning` via the routine-
+        exception channel so the caller observes the same group
+        shape worker-side strict mode produces symmetrically with
+        caller-side strict mode.
 
         Given:
             A dispatch Request whose ``context.vars`` map carries a
-            known var key bound to a corrupt byte payload (not a
-            valid pickle stream) --- modeling cross-version pickle
-            skew or wire corruption of a single var value
+            corrupt byte payload, and the worker-side warning filter
+            promotes :class:`ContextDecodeWarning` to an exception
+            (modeling
+            ``warnings.filterwarnings("error", category=...)`` set
+            via ``PYTHONWARNINGS`` or programmatic config in the
+            worker subprocess)
         When:
             The dispatch RPC is invoked with that request
         Then:
-            The RPC aborts with INVALID_ARGUMENT rather than
-            surfacing a generic UNKNOWN, so the caller sees a
-            structured "your payload is corrupt" signal at the same
-            boundary where malformed ``context.id`` hex is rejected
+            The caller observes a :class:`BaseExceptionGroup` on the
+            response whose sole peer is the promoted
+            :class:`ContextDecodeWarning` — not a generic gRPC error
+            — so worker-side strict mode preserves the same uniform
+            group shape that caller-side strict mode produces, and
+            the leaf class identity remains addressable via
+            ``except*`` regardless of peer cardinality.
         """
+        import warnings as _warnings
 
         # Arrange
         async def sample_task():
             return "should_not_execute"
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=sample_task,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        namespace = f"strict_corrupt_{uuid4().hex}"
+        var: wool.ContextVar[str] = wool.ContextVar("x", namespace=namespace)
+        context_pb = protocol.Context(id=uuid4().hex)
+        context_pb.vars.add(
+            namespace=var.namespace,
+            name=var.name,
+            value=b"\x00not a valid pickle stream\x00",
+        )
+        request = protocol.Request(
+            task=wool_task.to_protobuf(),
+            context=context_pb,
+        )
+
+        # Act & assert
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", category=wool.ContextDecodeWarning)
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(request)
+                await stream.done_writing()
+                responses = [r async for r in stream]
+
+        exc_responses = [r for r in responses if r.HasField("exception")]
+        assert len(exc_responses) == 1
+        raised = cloudpickle.loads(exc_responses[0].exception.dump)
+        assert isinstance(raised, BaseExceptionGroup)
+        assert len(raised.exceptions) == 1
+        peer = raised.exceptions[0]
+        assert isinstance(peer, wool.ContextDecodeWarning)
+        assert "Failed to deserialize" in str(peer)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_corrupt_context_var_value(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test :class:`WorkerService` dispatch runs the routine when a
+        caller-shipped ``request.context.vars`` entry cannot be
+        deserialized, falling back to a fresh empty context and
+        emitting a :class:`ContextDecodeWarning`.
+
+        Given:
+            A dispatch Request whose ``context.vars`` map carries a
+            known var key bound to a corrupt byte payload (not a
+            valid pickle stream) — modeling cross-version pickle
+            skew or wire corruption of a single var value
+        When:
+            The dispatch RPC is invoked with that request
+        Then:
+            The routine still runs and returns its value, a
+            :class:`ContextDecodeWarning` is emitted on the worker,
+            and the response is delivered normally — context
+            propagation is ancillary state and a decode failure here
+            does not preempt the primary signal
+        """
+
+        # Arrange
+        async def sample_task():
+            return "routine_ran"
 
         mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
         wool_task = Task(
@@ -269,46 +345,54 @@ class TestWorkerService:
         namespace = f"corrupt_val_{uuid4().hex}"
         var: wool.ContextVar[str] = wool.ContextVar("x", namespace=namespace)
         context_pb = protocol.Context(id=uuid4().hex)
-        context_pb.vars[var.key] = b"\x00not a valid pickle stream\x00"
+        context_pb.vars.add(
+            namespace=var.namespace,
+            name=var.name,
+            value=b"\x00not a valid pickle stream\x00",
+        )
         request = protocol.Request(
             task=wool_task.to_protobuf(),
             context=context_pb,
         )
 
-        # Act & assert
-        async with grpc_aio_stub() as stub:
-            with pytest.raises(grpc.RpcError) as exc_info:
+        # Act
+        with pytest.warns(wool.ContextDecodeWarning, match="Failed to deserialize"):
+            async with grpc_aio_stub() as stub:
                 stream = stub.dispatch()
                 await stream.write(request)
                 await stream.done_writing()
-                async for _ in stream:
-                    pass
+                responses = [r async for r in stream]
 
-        assert exc_info.value.code() == StatusCode.INVALID_ARGUMENT
+        # Assert
+        result_responses = [r for r in responses if r.HasField("result")]
+        assert len(result_responses) == 1
+        assert cloudpickle.loads(result_responses[0].result.dump) == "routine_ran"
 
     @pytest.mark.asyncio
-    async def test_dispatch_rejects_request_with_malformed_context_id(
+    async def test_dispatch_with_malformed_context_id(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch aborts when the caller's
-        ``request.context.id`` is not a valid hex UUID.
+        """Test :class:`WorkerService` dispatch runs the routine when the
+        caller's ``request.context.id`` is not a valid hex UUID,
+        falling back to a fresh empty context and emitting a
+        :class:`ContextDecodeWarning`.
 
         Given:
             A dispatch Request whose ``context.id`` field is a
-            non-hex string (e.g., ``"not-a-uuid"``) --- the only
-            boundary at which the worker parses the caller-supplied
-            logical-chain UUID
+            non-hex string (e.g., ``"not-a-uuid"``)
         When:
             The dispatch RPC is invoked with that request
         Then:
-            The RPC aborts with INVALID_ARGUMENT --- malformed hex
-            is rejected at the handler's entry point before any
-            task execution is attempted
+            The routine still runs and returns its value, a
+            :class:`ContextDecodeWarning` is emitted, and the
+            response is delivered normally — malformed wire context
+            is treated as ancillary state lost, not a request
+            rejection
         """
 
         # Arrange
         async def sample_task():
-            return "should_not_execute"
+            return "routine_ran"
 
         mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
         wool_task = Task(
@@ -318,30 +402,36 @@ class TestWorkerService:
             kwargs={},
             proxy=mock_proxy,
         )
+        # carries_state requires a non-empty vars list for
+        # from_protobuf to even attempt parsing the id, so seed a
+        # ContextVar entry carrying a consumed-token id alongside
+        # the malformed Context id.
+        bad_ctx = protocol.Context(id="not-a-uuid")
+        bad_ctx.vars.add(namespace="", name="", consumed_tokens=[uuid4().hex])
         task_pb = wool_task.to_protobuf()
-        request = protocol.Request(
-            task=task_pb,
-            context=protocol.Context(id="not-a-uuid"),
-        )
+        request = protocol.Request(task=task_pb, context=bad_ctx)
 
-        # Act & assert
-        async with grpc_aio_stub() as stub:
-            with pytest.raises(grpc.RpcError) as exc_info:
+        # Act
+        with pytest.warns(wool.ContextDecodeWarning):
+            async with grpc_aio_stub() as stub:
                 stream = stub.dispatch()
                 await stream.write(request)
                 await stream.done_writing()
-                async for _ in stream:
-                    pass
+                responses = [r async for r in stream]
 
-        assert exc_info.value.code() == StatusCode.INVALID_ARGUMENT
+        # Assert
+        result_responses = [r for r in responses if r.HasField("result")]
+        assert len(result_responses) == 1
+        assert cloudpickle.loads(result_responses[0].result.dump) == "routine_ran"
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_rejects_mid_stream_corrupt_context(
+    async def test_dispatch_streaming_with_mid_stream_corrupt_context(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch surfaces a mid-stream
-        corrupt-context frame as a terminal error rather than hanging
-        the streaming dispatch.
+        """Test :class:`WorkerService` dispatch continues an async-generator
+        iteration when a mid-stream frame carries a corrupt context,
+        emitting a :class:`ContextDecodeWarning` instead of failing
+        the dispatch.
 
         Given:
             An async-generator dispatch where the first ``next``
@@ -352,12 +442,11 @@ class TestWorkerService:
             The caller sends the second request and consumes the
             stream
         Then:
-            The dispatch must terminate within the asyncio timeout
-            window with the corrupt-context error surfaced as an
-            exception Response --- a regression against the
-            mid-stream forward-prop decode failure that previously
-            stranded the worker task and hung
-            ``result_queue.get()``
+            The generator's second yield is delivered as a normal
+            result frame and a :class:`ContextDecodeWarning` is
+            emitted on the worker — the corrupt mid-stream context
+            is treated as ancillary state lost rather than a
+            terminal failure
         """
 
         # Arrange
@@ -378,11 +467,12 @@ class TestWorkerService:
             next=protocol.Void(),
             context=protocol.Context(id=uuid4().hex),
         )
-        # State-bearing context (vars non-empty triggers from_protobuf
-        # via the carries_state gate) with corrupt cloudpickle bytes
-        # that fail to decode.
         bad_ctx = protocol.Context(id=uuid4().hex)
-        bad_ctx.vars["test:corrupt_key"] = b"\x00\x01garbage_not_pickle"
+        bad_ctx.vars.add(
+            namespace="test",
+            name="corrupt_key",
+            value=b"\x00\x01garbage_not_pickle",
+        )
         bad_next = protocol.Request(next=protocol.Void(), context=bad_ctx)
 
         # Act
@@ -399,40 +489,41 @@ class TestWorkerService:
                 assert cloudpickle.loads(first.result.dump) == "value_0"
 
                 await stream.write(bad_next)
+                second = await anext(aiter(stream))
                 await stream.done_writing()
-                return [r async for r in stream]
+                return second
 
-        responses = await asyncio.wait_for(drive(), timeout=5.0)
+        with pytest.warns(wool.ContextDecodeWarning):
+            second = await asyncio.wait_for(drive(), timeout=5.0)
 
         # Assert
-        assert any(r.HasField("exception") for r in responses)
-        exc_response = next(r for r in responses if r.HasField("exception"))
-        raised = cloudpickle.loads(exc_response.exception.dump)
-        assert isinstance(raised, ValueError)
+        assert second.HasField("result")
+        assert cloudpickle.loads(second.result.dump) == "value_1"
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_rejects_unpicklable_worker_mutation(
+    async def test_dispatch_streaming_with_unpicklable_worker_mutation(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch surfaces a worker-side
-        snapshot serialization failure as a terminal error rather than
-        hanging the streaming dispatch.
+        """Test :class:`WorkerService` dispatch delivers the next yield
+        when a worker-side snapshot serialization fails between
+        iterations, emitting a :class:`ContextDecodeWarning` instead
+        of failing the dispatch.
 
         Given:
             An async-generator routine that, between yields, sets a
             :class:`wool.ContextVar` to a value whose ``__reduce__``
-            raises --- the wool back-prop snapshot
+            raises — the wool back-prop snapshot
             (``Context.to_protobuf``) on the next iteration cannot
             serialize the var
         When:
             The caller drives the generator past the unpicklable
             assignment
         Then:
-            The dispatch must terminate within the asyncio timeout
-            window with the snapshot failure surfaced as an exception
-            Response --- the worker-side back-prop precise handler
-            mirrors the forward-prop ``from_protobuf`` precise
-            handler
+            The next yield is delivered as a normal result frame
+            with an empty wire context, and a
+            :class:`ContextDecodeWarning` is emitted on the worker —
+            the snapshot failure is ancillary state and does not
+            preempt the routine's primary signal
         """
         # Arrange
         namespace = f"unpicklable_mut_{uuid4().hex}"
@@ -472,19 +563,267 @@ class TestWorkerService:
                 assert cloudpickle.loads(first.result.dump) == "first"
 
                 await stream.write(next_request)
+                second = await anext(aiter(stream))
+                await stream.done_writing()
+                return second
+
+        with pytest.warns(wool.ContextDecodeWarning):
+            second = await asyncio.wait_for(drive(), timeout=5.0)
+
+        # Assert
+        assert second.HasField("result")
+        assert cloudpickle.loads(second.result.dump) == "second"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_unpicklable_worker_mutation(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test :class:`WorkerService` dispatch delivers the routine's
+        return value on the coroutine path when a worker-side
+        snapshot serialization fails, emitting a
+        :class:`ContextDecodeWarning` instead of failing the
+        dispatch.
+
+        Given:
+            A coroutine routine that sets a :class:`wool.ContextVar`
+            to a value whose ``__reduce__`` raises before
+            returning — the wool back-prop snapshot
+            (``Context.to_protobuf``) in the done-callback cannot
+            serialize the post-run state
+        When:
+            The caller dispatches the routine
+        Then:
+            The routine's return value is delivered as a normal
+            result frame with an empty wire context, and a
+            :class:`ContextDecodeWarning` is emitted on the worker
+        """
+        # Arrange
+        namespace = f"unpicklable_coro_{uuid4().hex}"
+        var = wool.ContextVar("trap", namespace=namespace)
+
+        class _Unpicklable:
+            def __reduce__(self):
+                raise TypeError("synthetic unpicklable")
+
+        async def coroutine():
+            var.set(_Unpicklable())
+            return "ok"
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=coroutine,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        request = protocol.Request(task=wool_task.to_protobuf())
+
+        # Act
+        async def drive():
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(request)
                 await stream.done_writing()
                 return [r async for r in stream]
 
-        responses = await asyncio.wait_for(drive(), timeout=5.0)
+        with pytest.warns(wool.ContextDecodeWarning):
+            responses = await asyncio.wait_for(drive(), timeout=5.0)
 
         # Assert
-        assert any(r.HasField("exception") for r in responses)
-        exc_response = next(r for r in responses if r.HasField("exception"))
-        raised = cloudpickle.loads(exc_response.exception.dump)
-        assert isinstance(raised, TypeError)
+        result_responses = [r for r in responses if r.HasField("result")]
+        assert len(result_responses) == 1
+        assert cloudpickle.loads(result_responses[0].result.dump) == "ok"
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_rejects_when_update_raises(
+    async def test_dispatch_with_routine_raise_and_unpicklable_mutation(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test :class:`WorkerService` dispatch surfaces the routine
+        exception and the worker-side snapshot failure as peer
+        members of a :class:`BaseExceptionGroup` when both occur in
+        the same done-callback on the coroutine path under strict
+        mode.
+
+        Given:
+            A coroutine routine that sets a :class:`wool.ContextVar`
+            to a value whose ``__reduce__`` raises and then itself
+            raises an unrelated exception, with the worker-side
+            warnings filter promoting :class:`ContextDecodeWarning`
+            to an exception — both the routine's failure and the
+            wool back-prop snapshot's failure occur in the same
+            done-callback
+        When:
+            The caller dispatches the routine
+        Then:
+            The dispatch surfaces a :class:`BaseExceptionGroup`
+            bundling the routine exception and the snapshot encode
+            failure as peers, so neither is demoted relative to the
+            other. The encode peer is a
+            :class:`ContextDecodeWarning` naming the offending var
+            (mirroring the per-entry resilience surface), and the
+            group rides through the response-frame exception channel
+            with no context patch
+        """
+        import warnings as _warnings
+
+        # Arrange
+        namespace = f"unpicklable_chain_{uuid4().hex}"
+        var = wool.ContextVar("trap", namespace=namespace)
+
+        class _Unpicklable:
+            def __reduce__(self):
+                raise TypeError("synthetic unpicklable")
+
+        async def coroutine():
+            var.set(_Unpicklable())
+            raise ValueError("routine failure")
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=coroutine,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        request = protocol.Request(task=wool_task.to_protobuf())
+
+        # Act
+        async def drive():
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(request)
+                await stream.done_writing()
+                return [r async for r in stream]
+
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", category=wool.ContextDecodeWarning)
+            responses = await asyncio.wait_for(drive(), timeout=5.0)
+
+        # Assert
+        exc_responses = [r for r in responses if r.HasField("exception")]
+        assert len(exc_responses) == 1
+        raised = cloudpickle.loads(exc_responses[0].exception.dump)
+        assert isinstance(raised, BaseExceptionGroup)
+        routine_failures = [
+            x
+            for x in raised.exceptions
+            if isinstance(x, ValueError) and "routine failure" in str(x)
+        ]
+        snapshot_failures = [
+            x
+            for x in raised.exceptions
+            if isinstance(x, wool.ContextDecodeWarning)
+            and "synthetic unpicklable" in str(x)
+        ]
+        assert len(routine_failures) == 1, (
+            "Routine ValueError should be a peer member of the group"
+        )
+        assert len(snapshot_failures) == 1, (
+            "Snapshot ContextDecodeWarning should be a peer member of the group"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_streaming_with_routine_raise_and_unpicklable_mutation(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test :class:`WorkerService` dispatch surfaces the routine
+        exception and the worker-side snapshot failure as peer
+        members of a :class:`BaseExceptionGroup` when both occur in
+        the same iteration on the streaming path under strict mode.
+
+        Given:
+            An async-generator routine that yields once
+            successfully, then sets a :class:`wool.ContextVar` to a
+            value whose ``__reduce__`` raises and itself raises an
+            unrelated exception on the next iteration, with the
+            worker-side warnings filter promoting
+            :class:`ContextDecodeWarning` to an exception — both the
+            routine's failure and the back-prop snapshot's failure
+            occur in the same iteration
+        When:
+            The caller drives the generator past the yielded value
+            and into the failing iteration
+        Then:
+            The dispatch surfaces a :class:`BaseExceptionGroup`
+            bundling the routine exception and the snapshot encode
+            failure as peers, symmetric with the coroutine path. The
+            encode peer is a :class:`ContextDecodeWarning` naming
+            the offending var
+        """
+        import warnings as _warnings
+
+        # Arrange
+        namespace = f"unpicklable_stream_chain_{uuid4().hex}"
+        var = wool.ContextVar("trap", namespace=namespace)
+
+        class _Unpicklable:
+            def __reduce__(self):
+                raise TypeError("synthetic unpicklable")
+
+        async def streamer():
+            yield "first"
+            var.set(_Unpicklable())
+            raise ValueError("routine failure")
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=streamer,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        first_request = protocol.Request(task=wool_task.to_protobuf())
+        next_request = protocol.Request(next=protocol.Void())
+
+        # Act
+        async def drive():
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(first_request)
+                ack = await anext(aiter(stream))
+                assert ack.HasField("ack")
+
+                await stream.write(next_request)
+                first = await anext(aiter(stream))
+                assert first.HasField("result")
+                assert cloudpickle.loads(first.result.dump) == "first"
+
+                await stream.write(next_request)
+                await stream.done_writing()
+                return [r async for r in stream]
+
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", category=wool.ContextDecodeWarning)
+            responses = await asyncio.wait_for(drive(), timeout=5.0)
+
+        # Assert
+        exc_responses = [r for r in responses if r.HasField("exception")]
+        assert len(exc_responses) == 1
+        raised = cloudpickle.loads(exc_responses[0].exception.dump)
+        assert isinstance(raised, BaseExceptionGroup)
+        routine_failures = [
+            x
+            for x in raised.exceptions
+            if isinstance(x, ValueError) and "routine failure" in str(x)
+        ]
+        snapshot_failures = [
+            x
+            for x in raised.exceptions
+            if isinstance(x, wool.ContextDecodeWarning)
+            and "synthetic unpicklable" in str(x)
+        ]
+        assert len(routine_failures) == 1, (
+            "Routine ValueError should be a peer member of the group"
+        )
+        assert len(snapshot_failures) == 1, (
+            "Snapshot ContextDecodeWarning should be a peer member of the group"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_streaming_when_update_raises(
         self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
     ):
         """Test :class:`WorkerService` dispatch surfaces unhandled
@@ -494,7 +833,7 @@ class TestWorkerService:
         Given:
             An async-generator dispatch where the second ``next``
             frame carries a state-bearing context, but
-            ``Context.update`` is patched to raise on invocation ---
+            ``Context.update`` is patched to raise on invocation —
             the unprotected merge that would otherwise strand the
             worker task
         When:
@@ -503,7 +842,7 @@ class TestWorkerService:
         Then:
             The dispatch must terminate within the asyncio timeout
             window with the synthetic error surfaced as an exception
-            Response --- the iteration-body catch-all guarantees
+            Response — the iteration-body catch-all guarantees
             that any exception escaping the precise handlers is
             still pushed to the result queue
         """
@@ -530,7 +869,7 @@ class TestWorkerService:
         # State-bearing context (carries_state True) so the worker
         # invokes update on receive.
         bad_ctx = protocol.Context(id=uuid4().hex)
-        bad_ctx.consumed_tokens.append(uuid4().hex)
+        bad_ctx.vars.add(namespace="", name="", consumed_tokens=[uuid4().hex])
         bad_next = protocol.Request(next=protocol.Void(), context=bad_ctx)
 
         mocker.patch.object(
@@ -564,6 +903,161 @@ class TestWorkerService:
         raised = cloudpickle.loads(exc_response.exception.dump)
         assert isinstance(raised, RuntimeError)
         assert "synthetic update failure" in str(raised)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_streaming_surfaces_pre_loop_setup_failure(
+        self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
+    ):
+        """Test :class:`WorkerService` streaming dispatch surfaces a
+        worker-task setup failure as a terminal exception frame
+        rather than hanging the caller.
+
+        Given:
+            An async-generator dispatch where the worker task's
+            ``RuntimeContext.__enter__`` is patched to raise — the
+            failure precedes the worker's request-queue loop, so the
+            worker pushes nothing to the result queue
+        When:
+            The caller sends the task and a follow-up ``next`` frame
+        Then:
+            The dispatch terminates within the asyncio timeout window
+            with the synthetic exception surfaced as a Response —
+            the main loop's ``result_queue.get()`` is unblocked by
+            the done-callback, and the finally yields a terminal
+            outcome built from the worker's exception rather than
+            silently swallowing it.
+        """
+        # Arrange
+        from wool.runtime.context import RuntimeContext
+
+        async def streamer():
+            yield "unreachable"
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=streamer,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        first_request = protocol.Request(task=wool_task.to_protobuf())
+        next_request = protocol.Request(
+            next=protocol.Void(),
+            context=protocol.Context(id=uuid4().hex),
+        )
+
+        mocker.patch.object(
+            RuntimeContext,
+            "__enter__",
+            side_effect=RuntimeError("synthetic pre-loop failure"),
+        )
+
+        # Act
+        async def drive():
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(first_request)
+                ack = await anext(aiter(stream))
+                assert ack.HasField("ack")
+
+                await stream.write(next_request)
+                await stream.done_writing()
+                return [r async for r in stream]
+
+        responses = await asyncio.wait_for(drive(), timeout=5.0)
+
+        # Assert
+        assert any(r.HasField("exception") for r in responses), (
+            "Pre-loop worker failure must surface as an exception "
+            "frame rather than a silent stream end"
+        )
+        exc_response = next(r for r in responses if r.HasField("exception"))
+        raised = cloudpickle.loads(exc_response.exception.dump)
+        assert isinstance(raised, RuntimeError)
+        assert "synthetic pre-loop failure" in str(raised)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_streaming_logs_teardown_failure_after_completion(
+        self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
+    ):
+        """Test :class:`WorkerService` streaming dispatch logs a
+        worker-side teardown failure that occurs after the primary
+        signal has already reached the caller.
+
+        Given:
+            An async-generator dispatch whose generator's ``finally``
+            block raises a non-cancellation exception, so
+            ``gen.aclose()`` re-raises during worker teardown after
+            the routine yielded its value
+        When:
+            The caller consumes the routine's output, closes the
+            stream, and exhausts the response iterator
+        Then:
+            The caller receives the original outcome unmodified, and
+            the worker-side teardown failure is logged via
+            ``_log.warning(..., exc_info=...)`` rather than silently
+            swallowed — operators retain visibility into the failure
+            without the gRPC stream being double-framed with a
+            trailing exception response.
+        """
+
+        # Arrange
+        async def streamer():
+            try:
+                yield "outcome_a"
+            finally:
+                raise RuntimeError("synthetic teardown failure")
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=streamer,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+        first_request = protocol.Request(task=wool_task.to_protobuf())
+        next_request = protocol.Request(
+            next=protocol.Void(),
+            context=protocol.Context(id=uuid4().hex),
+        )
+
+        warning_spy = mocker.patch("wool.runtime.worker.service._log.warning")
+
+        # Act
+        async def drive():
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(first_request)
+                ack = await anext(aiter(stream))
+                assert ack.HasField("ack")
+
+                await stream.write(next_request)
+                first = await anext(aiter(stream))
+                assert first.HasField("result")
+                assert cloudpickle.loads(first.result.dump) == "outcome_a"
+
+                await stream.done_writing()
+                return [r async for r in stream]
+
+        remaining = await asyncio.wait_for(drive(), timeout=5.0)
+
+        # Assert
+        assert len(remaining) == 0, (
+            "Teardown failure must not produce a trailing exception "
+            "frame when the primary signal already streamed"
+        )
+        teardown_logged = any(
+            "teardown" in str(call.args[0]).lower()
+            and isinstance(call.kwargs.get("exc_info"), RuntimeError)
+            and "synthetic teardown failure" in str(call.kwargs["exc_info"])
+            for call in warning_spy.call_args_list
+        )
+        assert teardown_logged, (
+            "Worker teardown failure must surface via _log.warning "
+            "with exc_info rather than being silently swallowed"
+        )
 
     @pytest.mark.asyncio
     async def test_dispatch_while_stopping(
@@ -1085,6 +1579,79 @@ class TestWorkerService:
         assert len(remaining) == 0
 
     @pytest.mark.asyncio
+    async def test_dispatch_streaming_with_dispatch_timeout(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test :class:`WorkerService` streaming dispatch restores the
+        caller's ``dispatch_timeout`` for every iteration of an
+        async-generator routine.
+
+        Given:
+            An async-generator :class:`Task` whose
+            :class:`RuntimeContext` carries a non-default
+            ``dispatch_timeout`` and whose routine reads
+            ``wool.runtime.context.dispatch_timeout.get()`` on each
+            iteration
+        When:
+            The caller drives the generator across multiple ``next``
+            frames via ``WorkerService.dispatch``
+        Then:
+            Every yielded value equals the caller-supplied
+            ``dispatch_timeout`` — confirming that
+            ``_stream_from_worker`` enters ``work_task.runtime_context`` for
+            the lifetime of the generator. Regression guard for #176,
+            where the prior code dropped the context after the first
+            ``__enter__`` and left ``dispatch_timeout`` at its default
+            on subsequent frames.
+        """
+        # Arrange
+        from wool.runtime.context import RuntimeContext
+
+        async def capture_timeout():
+            from wool.runtime.context import dispatch_timeout
+
+            yield dispatch_timeout.get()
+            yield dispatch_timeout.get()
+            yield dispatch_timeout.get()
+
+        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+        wool_task = Task(
+            id=uuid4(),
+            callable=capture_timeout,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+            runtime_context=RuntimeContext(dispatch_timeout=2.5),
+        )
+        first_request = protocol.Request(task=wool_task.to_protobuf())
+        next_request = protocol.Request(next=protocol.Void())
+
+        # Act
+        async def drive():
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(first_request)
+                ack = await anext(aiter(stream))
+                assert ack.HasField("ack")
+
+                captured: list[float | None] = []
+                for _ in range(3):
+                    await stream.write(next_request)
+                    response = await anext(aiter(stream))
+                    assert response.HasField("result")
+                    captured.append(cloudpickle.loads(response.result.dump))
+
+                await stream.done_writing()
+                async for _ in stream:
+                    pass
+                return captured
+
+        captured = await asyncio.wait_for(drive(), timeout=5.0)
+
+        # Assert
+        assert captured == [2.5, 2.5, 2.5]
+
+    @pytest.mark.asyncio
     async def test_dispatch_async_generator_raises_during_iteration(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
@@ -1095,7 +1662,8 @@ class TestWorkerService:
         When:
             The client sends next requests and the generator raises
         Then:
-            Yields ack, the first result, then exception response containing the raised exception
+            Yields ack, the first result, then an exception response
+            containing the raised exception
         """
 
         # Arrange
@@ -2377,7 +2945,7 @@ class TestWorkerService:
             The hook should observe the caller-shipped value (not
             ``LookupError``), because the dispatch handler scopes the
             caller-state Context via ``Context.run`` for the duration
-            of hook evaluation --- the handler does not install it
+            of hook evaluation — the handler does not install it
             against the main-loop task and so does not leak ownership
             across the main/worker boundary
         """
@@ -2402,7 +2970,11 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
         context_pb = protocol.Context(id=uuid4().hex)
-        context_pb.vars[tenant.key] = cloudpickle.dumps("acme-corp")
+        context_pb.vars.add(
+            namespace=tenant.namespace,
+            name=tenant.name,
+            value=cloudpickle.dumps("acme-corp"),
+        )
         request = protocol.Request(task=wool_task.to_protobuf(), context=context_pb)
 
         service = WorkerService(backpressure=hook)
@@ -2438,7 +3010,7 @@ class TestWorkerService:
             The dispatch RPC is invoked
         Then:
             The hook should observe the caller-shipped value after
-            the suspension --- the dispatch handler must keep the
+            the suspension — the dispatch handler must keep the
             caller-state Context attached across the await of the
             hook coroutine, not just the synchronous body that
             constructs it
@@ -2465,7 +3037,11 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
         context_pb = protocol.Context(id=uuid4().hex)
-        context_pb.vars[tenant.key] = cloudpickle.dumps("acme-corp")
+        context_pb.vars.add(
+            namespace=tenant.namespace,
+            name=tenant.name,
+            value=cloudpickle.dumps("acme-corp"),
+        )
         request = protocol.Request(task=wool_task.to_protobuf(), context=context_pb)
 
         service = WorkerService(backpressure=hook)
@@ -2834,7 +3410,7 @@ class TestWorkerService:
                     pass
 
     @pytest.mark.asyncio
-    async def test_dispatch_applies_caller_vars_for_coroutine_task(
+    async def test_dispatch_with_caller_vars_for_coroutine_task(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test dispatch applies caller-side vars before running a coroutine.
@@ -2865,10 +3441,17 @@ class TestWorkerService:
             proxy=mock_proxy,
         )
 
-        caller_vars = {var.key: cloudpickle.dumps("caller-side-value")}
         request = protocol.Request(
             task=wool_task.to_protobuf(),
-            context=protocol.Context(vars=caller_vars),
+            context=protocol.Context(
+                vars=[
+                    protocol.ContextVar(
+                        namespace=var.namespace,
+                        name=var.name,
+                        value=cloudpickle.dumps("caller-side-value"),
+                    )
+                ]
+            ),
         )
 
         # Act
@@ -2885,7 +3468,7 @@ class TestWorkerService:
         assert cloudpickle.loads(response.result.dump) == "caller-side-value"
 
     @pytest.mark.asyncio
-    async def test_dispatch_applies_per_frame_caller_vars_for_async_gen(
+    async def test_dispatch_with_per_frame_caller_vars_for_async_gen(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test streaming dispatch applies per-frame vars before each asend.
@@ -2919,7 +3502,15 @@ class TestWorkerService:
 
         initial_request = protocol.Request(
             task=wool_task.to_protobuf(),
-            context=protocol.Context(vars={var.key: cloudpickle.dumps("first")}),
+            context=protocol.Context(
+                vars=[
+                    protocol.ContextVar(
+                        namespace=var.namespace,
+                        name=var.name,
+                        value=cloudpickle.dumps("first"),
+                    )
+                ]
+            ),
         )
 
         # Act
@@ -2936,7 +3527,13 @@ class TestWorkerService:
                     protocol.Request(
                         next=protocol.Void(),
                         context=protocol.Context(
-                            vars={var.key: cloudpickle.dumps(frame_value)},
+                            vars=[
+                                protocol.ContextVar(
+                                    namespace=var.namespace,
+                                    name=var.name,
+                                    value=cloudpickle.dumps(frame_value),
+                                )
+                            ],
                         ),
                     )
                 )
@@ -2952,7 +3549,7 @@ class TestWorkerService:
         assert results == ["first", "second", "third"]
 
     @pytest.mark.asyncio
-    async def test_stop_logs_warning_when_aclose_interrupted_on_teardown(
+    async def test_stop_when_aclose_interrupted_on_teardown(
         self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache
     ):
         """Test service shutdown logs a warning when generator aclose is interrupted.
@@ -3049,7 +3646,7 @@ class TestWorkerService:
             target_logger.setLevel(prior_level)
 
     @pytest.mark.asyncio
-    async def test_dispatch_applies_passthrough_loads_for_streaming_self_dispatch(
+    async def test_dispatch_with_passthrough_loads_for_streaming_self_dispatch(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test streaming self-dispatch applies PassthroughSerializer.loads for vars.
@@ -3089,7 +3686,15 @@ class TestWorkerService:
 
         initial_request = protocol.Request(
             task=wool_task.to_protobuf(serializer=serializer),
-            context=protocol.Context(vars={var.key: serializer.dumps("alpha")}),
+            context=protocol.Context(
+                vars=[
+                    protocol.ContextVar(
+                        namespace=var.namespace,
+                        name=var.name,
+                        value=serializer.dumps("alpha"),
+                    )
+                ]
+            ),
         )
 
         # Act
@@ -3106,7 +3711,13 @@ class TestWorkerService:
                     protocol.Request(
                         next=protocol.Void(),
                         context=protocol.Context(
-                            vars={var.key: serializer.dumps(frame_value)},
+                            vars=[
+                                protocol.ContextVar(
+                                    namespace=var.namespace,
+                                    name=var.name,
+                                    value=serializer.dumps(frame_value),
+                                )
+                            ],
                         ),
                     )
                 )

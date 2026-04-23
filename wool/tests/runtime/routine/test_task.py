@@ -1,5 +1,4 @@
 import asyncio
-import logging
 from typing import Callable
 from uuid import uuid4
 
@@ -15,7 +14,6 @@ from wool.runtime.context import RuntimeContext
 from wool.runtime.context import dispatch_timeout
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
-from wool.runtime.routine.task import WorkerProxyLike
 from wool.runtime.routine.task import current_task
 from wool.runtime.routine.task import do_dispatch
 from wool.runtime.serializer import PassthroughSerializer
@@ -330,60 +328,37 @@ class TestTask:
         # Assert
         assert task.caller is None
 
-    def test___post_init___captures_runtime_context(self, sample_task):
-        """Test post-init captures RuntimeContext with dispatch_timeout.
+    def test___post_init___without_explicit_context(self, sample_async_callable):
+        """Test post-init auto-captures the caller's RuntimeContext.
 
         Given:
-            A RuntimeContext with dispatch_timeout=5.0 is active
+            A dispatch_timeout set in the caller's context and a Task
+            constructed without an explicit runtime_context argument.
         When:
-            A Task is created
+            The Task is constructed.
         Then:
-            It should capture a RuntimeContext with dispatch_timeout=5.0
-            in its context field
+            ``task.runtime_context`` is a RuntimeContext that, when
+            entered in a fresh scope, restores the caller's
+            dispatch_timeout.
         """
-        # Arrange & act
-        with RuntimeContext(dispatch_timeout=5.0):
-            task = sample_task()
+        # Arrange
+        outer_token = dispatch_timeout.set(1.25)
+        try:
+            # Act
+            task = Task(
+                id=uuid4(),
+                callable=sample_async_callable,
+                args=(),
+                kwargs={},
+                proxy=_PicklableProxy(),
+            )
+        finally:
+            dispatch_timeout.reset(outer_token)
 
         # Assert
-        assert task.context is not None
-        assert task.context.to_protobuf().dispatch_timeout == 5.0
-
-    def test___post_init___captures_default_runtime_context(self, sample_task):
-        """Test post-init captures default RuntimeContext when none is active.
-
-        Given:
-            No RuntimeContext is active (default None)
-        When:
-            A Task is created
-        Then:
-            It should capture a RuntimeContext with dispatch_timeout=None
-        """
-        # Act
-        task = sample_task()
-
-        # Assert
-        assert task.context is not None
-        assert not task.context.to_protobuf().HasField("dispatch_timeout")
-
-    def test___post_init___captures_innermost_runtime_context(self, sample_task):
-        """Test post-init captures the innermost nested RuntimeContext.
-
-        Given:
-            Nested RuntimeContexts with outer=10.0 and inner=5.0
-        When:
-            A Task is created inside the inner context
-        Then:
-            It should capture dispatch_timeout=5.0 from the innermost
-            context
-        """
-        # Arrange & act
-        with RuntimeContext(dispatch_timeout=10.0):
-            with RuntimeContext(dispatch_timeout=5.0):
-                task = sample_task()
-
-        # Assert
-        assert task.context.to_protobuf().dispatch_timeout == 5.0
+        assert task.runtime_context is not None
+        with task.runtime_context:
+            assert dispatch_timeout.get() == 1.25
 
     @pytest.mark.asyncio
     async def test___enter___with_coroutine_callable(self, sample_task):
@@ -724,6 +699,123 @@ class TestTask:
         assert task.timeout == 0
         assert task.tag is None
 
+    @pytest.mark.asyncio
+    async def test_from_protobuf_with_runtime_context(
+        self, sample_async_callable, picklable_proxy
+    ):
+        """Test from_protobuf reads the RuntimeContext submessage.
+
+        Given:
+            A protobuf Task carrying an optional RuntimeContext
+            submessage with a dispatch_timeout value.
+        When:
+            ``from_protobuf`` is called.
+        Then:
+            The reconstructed Task's ``context`` attribute is a
+            RuntimeContext whose dispatch_timeout reflects the wire
+            value.
+        """
+        # Arrange
+        task_msg = protocol.Task(
+            version=protocol.__version__,
+            id=str(uuid4()),
+            callable=cloudpickle.dumps(sample_async_callable),
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            caller="",
+            proxy=cloudpickle.dumps(picklable_proxy),
+            proxy_id=str(picklable_proxy.id),
+            timeout=0,
+            tag="",
+            runtime_context=protocol.RuntimeContext(dispatch_timeout=12.5),
+        )
+
+        # Act
+        task = Task.from_protobuf(task_msg)
+
+        # Assert
+        assert task.runtime_context is not None
+        with task.runtime_context:
+            assert dispatch_timeout.get() == 12.5
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_dispatch_timeout_on_coroutine(
+        self, mock_worker_proxy_cache
+    ):
+        """Test coroutine dispatch applies context dispatch_timeout.
+
+        Given:
+            A coroutine Task with a RuntimeContext carrying
+            ``dispatch_timeout=7.5`` and the process-wide
+            dispatch_timeout ContextVar at its default.
+        When:
+            ``task.dispatch()`` completes.
+        Then:
+            The coroutine reads the applied dispatch_timeout value of
+            ``7.5`` from :py:data:`wool.runtime.context.dispatch_timeout`.
+        """
+        # Arrange
+        captured: list[float | None] = []
+
+        async def capture_timeout():
+            captured.append(dispatch_timeout.get())
+
+        task = Task(
+            id=uuid4(),
+            callable=capture_timeout,
+            args=(),
+            kwargs={},
+            proxy=_PicklableProxy(),
+            runtime_context=RuntimeContext(dispatch_timeout=7.5),
+        )
+
+        # Act
+        await task.dispatch()
+
+        # Assert
+        assert captured == [7.5]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_dispatch_timeout_on_async_generator(
+        self, mock_worker_proxy_cache
+    ):
+        """Test async-gen dispatch applies context dispatch_timeout each iteration.
+
+        Given:
+            An async-generator Task with a RuntimeContext carrying
+            ``dispatch_timeout=3.0`` yielding twice, and the
+            process-wide dispatch_timeout ContextVar at its default.
+        When:
+            ``task.dispatch()`` is iterated to completion.
+        Then:
+            Each iteration's captured value is ``3.0``, confirming the
+            context is entered on every frame.
+        """
+        # Arrange
+        captured: list[float | None] = []
+
+        async def capture_timeout_stream():
+            captured.append(dispatch_timeout.get())
+            yield 1
+            captured.append(dispatch_timeout.get())
+            yield 2
+
+        task = Task(
+            id=uuid4(),
+            callable=capture_timeout_stream,
+            args=(),
+            kwargs={},
+            proxy=_PicklableProxy(),
+            runtime_context=RuntimeContext(dispatch_timeout=3.0),
+        )
+
+        # Act
+        async for _ in task.dispatch():
+            pass
+
+        # Assert
+        assert captured == [3.0, 3.0]
+
     def test_to_protobuf_all_fields(self, sample_async_callable, picklable_proxy):
         """Test to_protobuf serializes all fields correctly.
 
@@ -826,139 +918,6 @@ class TestTask:
 
         # Assert
         assert task_msg.version == protocol.__version__
-
-    def test_to_protobuf_includes_runtime_context(
-        self, sample_async_callable, picklable_proxy
-    ):
-        """Test to_protobuf includes RuntimeContext submessage.
-
-        Given:
-            A Task with a RuntimeContext carrying dispatch_timeout=7.5
-        When:
-            to_protobuf() is called
-        Then:
-            It should include the RuntimeContext submessage with
-            dispatch_timeout
-        """
-        # Arrange
-        with RuntimeContext(dispatch_timeout=7.5):
-            task = Task(
-                id=uuid4(),
-                callable=sample_async_callable,
-                args=(),
-                kwargs={},
-                proxy=picklable_proxy,
-            )
-
-        # Act
-        task_msg = task.to_protobuf()
-
-        # Assert
-        assert task_msg.HasField("context")
-        assert task_msg.context.dispatch_timeout == 7.5
-
-    def test_from_protobuf_restores_runtime_context(
-        self, sample_async_callable, picklable_proxy
-    ):
-        """Test from_protobuf restores RuntimeContext from submessage.
-
-        Given:
-            A protobuf Task with a RuntimeContext submessage
-            (dispatch_timeout=12.0)
-        When:
-            Task.from_protobuf() is called
-        Then:
-            It should reconstruct the Task with a RuntimeContext
-            carrying dispatch_timeout=12.0
-        """
-        # Arrange
-        task_msg = protocol.Task(
-            version="0.1.0",
-            id=str(uuid4()),
-            callable=cloudpickle.dumps(sample_async_callable),
-            args=cloudpickle.dumps(()),
-            kwargs=cloudpickle.dumps({}),
-            caller="",
-            proxy=cloudpickle.dumps(picklable_proxy),
-            proxy_id=str(picklable_proxy.id),
-            timeout=0,
-            tag="",
-            context=protocol.RuntimeContext(dispatch_timeout=12.0),
-        )
-
-        # Act
-        task = Task.from_protobuf(task_msg)
-
-        # Assert
-        assert task.context is not None
-        with task.context:
-            assert dispatch_timeout.get() == 12.0
-
-    def test_from_protobuf_without_context_backward_compat(
-        self, sample_async_callable, picklable_proxy
-    ):
-        """Test from_protobuf falls back to default context.
-
-        Given:
-            A protobuf Task with no RuntimeContext submessage
-            (older client)
-        When:
-            Task.from_protobuf() is called
-        Then:
-            It should fall back to default context
-            (dispatch_timeout=None)
-        """
-        # Arrange
-        task_msg = protocol.Task(
-            version="0.1.0",
-            id=str(uuid4()),
-            callable=cloudpickle.dumps(sample_async_callable),
-            args=cloudpickle.dumps(()),
-            kwargs=cloudpickle.dumps({}),
-            caller="",
-            proxy=cloudpickle.dumps(picklable_proxy),
-            proxy_id=str(picklable_proxy.id),
-            timeout=0,
-            tag="",
-        )
-
-        # Act
-        task = Task.from_protobuf(task_msg)
-
-        # Assert
-        assert task.context is not None
-        with task.context:
-            assert dispatch_timeout.get() is None
-
-    def test_to_protobuf_from_protobuf_preserves_runtime_context(
-        self, sample_async_callable, picklable_proxy
-    ):
-        """Test protobuf roundtrip preserves RuntimeContext.
-
-        Given:
-            A Task created with dispatch_timeout=6.0 in context
-        When:
-            Serialized via to_protobuf() then deserialized via
-            from_protobuf()
-        Then:
-            It should preserve the RuntimeContext through the roundtrip
-        """
-        # Arrange
-        with RuntimeContext(dispatch_timeout=6.0):
-            original = Task(
-                id=uuid4(),
-                callable=sample_async_callable,
-                args=(),
-                kwargs={},
-                proxy=picklable_proxy,
-            )
-
-        # Act
-        restored = Task.from_protobuf(original.to_protobuf())
-
-        # Assert
-        with restored.context:
-            assert dispatch_timeout.get() == 6.0
 
     @settings(
         max_examples=50,
@@ -1343,148 +1302,6 @@ class TestTask:
         # Assert
         assert results == []
 
-    @pytest.mark.asyncio
-    async def test_dispatch_restores_runtime_context_for_coroutine(
-        self,
-        sample_task,
-        mock_worker_proxy_cache,
-    ):
-        """Test dispatch restores RuntimeContext for coroutine callable.
-
-        Given:
-            A Task with context carrying dispatch_timeout=9.0
-            dispatched as a coroutine
-        When:
-            The callable reads dispatch_timeout.get()
-        Then:
-            It should observe dispatch_timeout=9.0 in the ContextVar
-        """
-        # Arrange
-        observed_timeout = None
-
-        async def test_callable():
-            nonlocal observed_timeout
-            observed_timeout = dispatch_timeout.get()
-            return "done"
-
-        with RuntimeContext(dispatch_timeout=9.0):
-            task = sample_task(callable=test_callable)
-
-        # Act
-        result = await task.dispatch()
-
-        # Assert
-        assert result == "done"
-        assert observed_timeout == 9.0
-
-    @pytest.mark.asyncio
-    async def test_dispatch_restores_runtime_context_for_async_generator(
-        self,
-        sample_task,
-        mock_worker_proxy_cache,
-    ):
-        """Test dispatch restores RuntimeContext for async generator callable.
-
-        Given:
-            A Task with context carrying dispatch_timeout=4.5
-            dispatched as an async generator
-        When:
-            The async generator reads dispatch_timeout.get() on
-            each yield
-        Then:
-            It should observe dispatch_timeout=4.5 on every iteration
-        """
-        # Arrange
-        observed_timeouts = []
-
-        async def test_generator():
-            for i in range(3):
-                observed_timeouts.append(dispatch_timeout.get())
-                yield i
-
-        with RuntimeContext(dispatch_timeout=4.5):
-            task = sample_task(callable=test_generator)
-
-        # Act
-        results = []
-        async for value in task.dispatch():
-            results.append(value)
-
-        # Assert
-        assert results == [0, 1, 2]
-        assert all(t == 4.5 for t in observed_timeouts)
-
-    @pytest.mark.asyncio
-    async def test_dispatch_sequential_task_isolation(
-        self,
-        sample_task,
-        mock_worker_proxy_cache,
-    ):
-        """Test sequential tasks do not leak dispatch_timeout.
-
-        Given:
-            Two Tasks with dispatch_timeout=3.0 and 7.0 dispatched
-            sequentially
-        When:
-            Each callable reads dispatch_timeout.get()
-        Then:
-            Each should observe its own dispatch_timeout without
-            cross-contamination
-        """
-        # Arrange
-        observed = []
-
-        async def capture_timeout():
-            observed.append(dispatch_timeout.get())
-            return "done"
-
-        with RuntimeContext(dispatch_timeout=3.0):
-            task1 = sample_task(callable=capture_timeout)
-        with RuntimeContext(dispatch_timeout=7.0):
-            task2 = sample_task(callable=capture_timeout)
-
-        # Act
-        await task1.dispatch()
-        await task2.dispatch()
-
-        # Assert
-        assert observed[0] == 3.0
-        assert observed[1] == 7.0
-
-    @pytest.mark.asyncio
-    async def test_dispatch_restores_none_runtime_context(
-        self,
-        sample_task,
-        mock_worker_proxy_cache,
-    ):
-        """Test dispatch restores None dispatch_timeout.
-
-        Given:
-            A Task with context carrying dispatch_timeout=None
-            dispatched as a coroutine
-        When:
-            The callable reads dispatch_timeout.get()
-        Then:
-            It should observe dispatch_timeout=None
-        """
-        # Arrange
-        sentinel = object()
-        observed_timeout = sentinel
-
-        async def test_callable():
-            nonlocal observed_timeout
-            observed_timeout = dispatch_timeout.get()
-            return "done"
-
-        task = sample_task(callable=test_callable)
-
-        # Act
-        await task.dispatch()
-
-        # Assert
-        assert observed_timeout is not sentinel
-        assert observed_timeout is None
-
     def test_to_protobuf_without_serializer(
         self, sample_async_callable, picklable_proxy
     ):
@@ -1777,6 +1594,155 @@ class TestTask:
         assert deserialized_task.tag == original_task.tag
 
 
+class TestRuntimeContext:
+    """Tests for :py:class:`RuntimeContext`."""
+
+    def test___enter___and___exit___apply_inner_and_restore_outer_dispatch_timeout(self):
+        """Test RuntimeContext sets and restores dispatch_timeout.
+
+        Given:
+            An outer dispatch_timeout value.
+        When:
+            A RuntimeContext block with a different dispatch_timeout
+            is entered and exited.
+        Then:
+            Inside the block the stdlib ContextVar reflects the inner
+            value; after exit the outer value is restored.
+        """
+        # Arrange
+        outer_token = dispatch_timeout.set(2.0)
+        try:
+            # Act & Assert
+            with RuntimeContext(dispatch_timeout=7.0):
+                assert dispatch_timeout.get() == 7.0
+            assert dispatch_timeout.get() == 2.0
+        finally:
+            dispatch_timeout.reset(outer_token)
+
+    def test___enter___when_dispatch_timeout_unset(self):
+        """Test an empty RuntimeContext does not touch dispatch_timeout.
+
+        Given:
+            A dispatch_timeout value set outside the block.
+        When:
+            A RuntimeContext with no dispatch_timeout argument is
+            entered.
+        Then:
+            The stdlib ContextVar value is unchanged inside and after.
+        """
+        # Arrange
+        outer_token = dispatch_timeout.set(5.0)
+        try:
+            # Act & Assert
+            with RuntimeContext():
+                assert dispatch_timeout.get() == 5.0
+            assert dispatch_timeout.get() == 5.0
+        finally:
+            dispatch_timeout.reset(outer_token)
+
+    def test_get_current_with_dispatch_timeout_set(self):
+        """Test get_current snapshots the current dispatch_timeout.
+
+        Given:
+            A dispatch_timeout value set in the current context.
+        When:
+            ``RuntimeContext.get_current()`` is called.
+        Then:
+            Entering the returned context inside a fresh scope
+            restores the captured value.
+        """
+        # Arrange
+        outer_token = dispatch_timeout.set(4.0)
+        try:
+            # Act
+            captured = RuntimeContext.get_current()
+        finally:
+            dispatch_timeout.reset(outer_token)
+
+        # Assert
+        with captured:
+            assert dispatch_timeout.get() == 4.0
+
+    def test_to_protobuf_with_dispatch_timeout_set(self):
+        """Test to_protobuf serializes dispatch_timeout on the wire.
+
+        Given:
+            A RuntimeContext with a dispatch_timeout value.
+        When:
+            ``to_protobuf`` is called.
+        Then:
+            The protobuf message's ``dispatch_timeout`` field is set
+            and ``HasField`` returns True.
+        """
+        # Act
+        pb = RuntimeContext(dispatch_timeout=6.0).to_protobuf()
+
+        # Assert
+        assert pb.HasField("dispatch_timeout")
+        assert pb.dispatch_timeout == 6.0
+
+    def test_to_protobuf_when_dispatch_timeout_unset(self):
+        """Test to_protobuf falls back to the current var when unset.
+
+        Given:
+            A RuntimeContext constructed without ``dispatch_timeout``
+            and an outer context with the var set.
+        When:
+            ``to_protobuf`` is called.
+        Then:
+            The serialized ``dispatch_timeout`` equals the currently-
+            set value on the stdlib ContextVar.
+        """
+        # Arrange
+        outer_token = dispatch_timeout.set(9.25)
+        try:
+            # Act
+            pb = RuntimeContext().to_protobuf()
+        finally:
+            dispatch_timeout.reset(outer_token)
+
+        # Assert
+        assert pb.HasField("dispatch_timeout")
+        assert pb.dispatch_timeout == 9.25
+
+    def test_to_protobuf_without_value(self):
+        """Test to_protobuf omits dispatch_timeout when it is None.
+
+        Given:
+            A RuntimeContext constructed with ``dispatch_timeout=None``.
+        When:
+            ``to_protobuf`` is called.
+        Then:
+            The protobuf message omits the ``dispatch_timeout`` field.
+        """
+        # Act
+        pb = RuntimeContext(dispatch_timeout=None).to_protobuf()
+
+        # Assert
+        assert not pb.HasField("dispatch_timeout")
+
+    def test_from_protobuf_roundtrip(self):
+        """Test from_protobuf reconstructs a usable RuntimeContext.
+
+        Given:
+            A protobuf RuntimeContext with a dispatch_timeout.
+        When:
+            ``from_protobuf`` is called and the result is entered.
+        Then:
+            The stdlib dispatch_timeout ContextVar reflects the wire
+            value inside the block.
+        """
+        # Arrange
+        pb = protocol.RuntimeContext(dispatch_timeout=8.5)
+
+        # Act
+        rc = RuntimeContext.from_protobuf(pb)
+
+        # Assert
+        with rc:
+            assert dispatch_timeout.get() == 8.5
+
+
 class TestPassthroughSerializer:
     """Tests for :py:class:`PassthroughSerializer`."""
 
@@ -1947,125 +1913,6 @@ class TestPassthroughSerializer:
 
         # Assert
         assert result is obj
-
-    def test_loads_prunes_keys_from_serializer_storage(self):
-        """Test PassthroughSerializer.loads drops the consumed key
-        from the per-instance keep-alive set so a long-running
-        dump/load cycle does not accumulate keep-alive entries.
-
-        Given:
-            A PassthroughSerializer with one value already dumped
-            (the keep-alive set holds one entry to keep the
-            ``_passthrough_store`` weak entry alive)
-        When:
-            ``loads`` consumes that value
-        Then:
-            The keep-alive set should return to empty --- prune-at-
-            loads bounds the keep-alive footprint to the in-flight
-            dump-but-not-yet-loaded count, not the total dumps over
-            the serializer's lifetime
-        """
-        # Arrange
-        serializer = PassthroughSerializer()
-        data = serializer.dumps("temporary")
-        assert len(serializer._keys) == 1
-
-        # Act
-        serializer.loads(data)
-
-        # Assert
-        assert len(serializer._keys) == 0
-
-    def test_streaming_dump_load_cycle_keeps_keys_bounded(self):
-        """Test repeated dump/load cycles on a single
-        PassthroughSerializer keep the keep-alive set bounded by
-        in-flight count, not total cycles.
-
-        Given:
-            A PassthroughSerializer driven through many dump/load
-            iterations of one value at a time --- the streaming
-            self-dispatch usage pattern
-        When:
-            100 dump + load cycles run sequentially
-        Then:
-            The keep-alive set length should stay at 0 between
-            cycles and after the loop --- the regression guard
-            against unbounded growth flagged for the
-            long-streaming-dispatch case
-        """
-        # Arrange
-        serializer = PassthroughSerializer()
-
-        # Act
-        for i in range(100):
-            data = serializer.dumps(f"value_{i}")
-            assert len(serializer._keys) == 1
-            result = serializer.loads(data)
-            assert result == f"value_{i}"
-            assert len(serializer._keys) == 0
-
-        # Assert
-        assert len(serializer._keys) == 0
-
-    @pytest.mark.asyncio
-    async def test_pool_shares_instance_for_same_task_id(self):
-        """Test the per-task-id PassthroughSerializer pool returns
-        the same instance for overlapping acquisitions sharing a key.
-
-        Given:
-            The module-level _passthrough_pool ResourcePool keyed by
-            task id, and two overlapping acquisitions for the same
-            task id (modeling caller-side and worker-side
-            self-dispatch acquiring the serializer for one dispatch)
-        When:
-            Both acquisitions run concurrently
-        Then:
-            The two acquired serializers should be the same Python
-            object --- caller and worker sides share one instance
-            per dispatch so prune-at-loads on either side bounds the
-            shared _keys
-        """
-        # Arrange
-        from wool.runtime.serializer import _passthrough_pool
-
-        task_id = uuid4()
-
-        # Act
-        async with _passthrough_pool.get(task_id) as caller_side:
-            async with _passthrough_pool.get(task_id) as worker_side:
-                # Assert
-                assert caller_side is worker_side
-
-    @pytest.mark.asyncio
-    async def test_pool_evicts_entry_when_refcount_drops_to_zero(self):
-        """Test the per-task-id pool evicts a serializer entry once
-        all acquisitions for that task id are released.
-
-        Given:
-            The module-level _passthrough_pool with one acquired
-            entry for some task id
-        When:
-            The acquisition releases and the cleanup task runs
-        Then:
-            ``pool.stats.total_entries`` should drop to its
-            pre-acquisition baseline --- error-path keep-alive
-            entries are not retained beyond dispatch lifetime
-        """
-        # Arrange
-        from wool.runtime.serializer import _passthrough_pool
-
-        task_id = uuid4()
-        baseline = _passthrough_pool.stats.total_entries
-
-        # Act
-        async with _passthrough_pool.get(task_id):
-            assert _passthrough_pool.stats.total_entries == baseline + 1
-
-        # Allow the cleanup task to run.
-        await asyncio.sleep(0)
-
-        # Assert
-        assert _passthrough_pool.stats.total_entries == baseline
 
 
 class TestTaskException:
