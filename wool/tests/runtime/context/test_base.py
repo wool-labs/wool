@@ -18,7 +18,7 @@ from wool.runtime.context import attached
 from wool.runtime.context import copy_context
 from wool.runtime.context import current_context
 from wool.runtime.context import dispatch_timeout
-from wool.runtime.routine.task import Serializer
+from wool.runtime.serializer import Serializer
 
 dumps = wool.__serializer__.dumps
 loads = cloudpickle.loads
