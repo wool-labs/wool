@@ -158,10 +158,8 @@ class _DispatchStream(Generic[_T]):
             self._running = False
 
     async def _read_next(self) -> _T:
-        """Read the next response from the stream without writing.
-
-        Used by :meth:`asend` and :meth:`athrow` which have already
-        written their own request to the stream.
+        """Read the next response from the stream without writing —
+        for paths that have already written their own request.
 
         Applies the response's :class:`Context` into the caller's
         current :class:`Context` — var mutations and consumed-token

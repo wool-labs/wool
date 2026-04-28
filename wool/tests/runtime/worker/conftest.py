@@ -504,9 +504,7 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata)
     mock_discovery_service.inject_worker_added(worker1)
     mock_discovery_service.inject_worker_added(worker2)
 
-    # Create proxy (note: actual WorkerProxy may need different initialization)
-    # This is a placeholder - adjust based on actual WorkerProxy constructor
-    proxy = MagicMock()  # TODO: Replace with actual WorkerProxy when implementing tests
+    proxy = MagicMock()
     proxy.workers = [worker1, worker2]
 
     yield proxy
