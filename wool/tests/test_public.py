@@ -30,7 +30,7 @@ def test_public_api_completeness():
         It should match the expected public interface exactly
     """
     # Arrange
-    expected_public_api = [
+    expected_public_api = {
         "RpcError",
         "TransientRpcError",
         "UnexpectedResponse",
@@ -75,10 +75,10 @@ def test_public_api_completeness():
         "PredicateFunction",
         "WorkerMetadata",
         "Factory",
-    ]
+    }
 
     # Act
-    actual_public_api = wool.__all__
+    actual_public_api = set(wool.__all__)
 
     # Assert
     assert actual_public_api == expected_public_api

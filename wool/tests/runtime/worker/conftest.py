@@ -138,11 +138,6 @@ def _make_worker_metadata(*tags: str) -> WorkerMetadata:
     )
 
 
-# ============================================================================
-# Mock Fixtures for WorkerPool and WorkerProxy Testing
-# ============================================================================
-
-
 class MockWorker:
     """Mock worker implementing WorkerLike protocol for testing.
 
@@ -333,11 +328,6 @@ def mock_discovery_service():
     return MockDiscoveryService()
 
 
-# ============================================================================
-# Additional Mock Fixtures for test_worker_pool.py Integration Tests
-# ============================================================================
-
-
 @pytest.fixture
 def mock_shared_memory(mocker: MockerFixture):
     """Mock SharedMemory for isolation from multiprocessing resources."""
@@ -520,11 +510,6 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata)
     proxy.workers = [worker1, worker2]
 
     yield proxy
-
-
-# ============================================================================
-# Credential Fixtures for Authentication Tests
-# ============================================================================
 
 
 def _generate_test_certificates():
