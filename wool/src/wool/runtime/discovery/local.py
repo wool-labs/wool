@@ -23,6 +23,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from wool.protocol import WorkerMetadata as WorkerMetadataProtobuf
+from wool.runtime.cache import ReferenceCountedCache
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryEventType
@@ -30,7 +31,6 @@ from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
 from wool.runtime.discovery.pool import SubscriberMeta
-from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
 
@@ -339,7 +339,7 @@ class LocalDiscovery(Discovery):
         _block_size: int
         _cleanups: dict[str, Callable]
         _namespace: Final[str]
-        _shared_memory_pool: ResourcePool[SharedMemory]
+        _shared_memory_pool: ReferenceCountedCache[SharedMemory]
 
         def __init__(self, namespace: str, *, block_size: int = 512):
             if block_size < 0:
@@ -347,7 +347,7 @@ class LocalDiscovery(Discovery):
             self._namespace = namespace
             self._block_size = block_size
             self._cleanups = {}
-            self._shared_memory_pool = ResourcePool(
+            self._shared_memory_pool = ReferenceCountedCache(
                 factory=self._shared_memory_factory,
                 finalizer=self._shared_memory_finalizer,
                 ttl=0,

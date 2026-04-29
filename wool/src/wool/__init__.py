@@ -5,6 +5,7 @@ from typing import Final
 
 from tblib import pickling_support
 
+from wool.runtime.cache import ReferenceCountedCache
 from wool.runtime.context import RuntimeContext
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
@@ -19,7 +20,6 @@ from wool.runtime.loadbalancer.base import LoadBalancerContextLike
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Serializer
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
@@ -51,8 +51,8 @@ except PackageNotFoundError:
 
 __proxy__: Final[ContextVar[WorkerProxy | None]] = ContextVar("__proxy__", default=None)
 
-__proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar(
-    "__proxy_pool__", default=None
+__proxy_pool__: Final[ContextVar[ReferenceCountedCache[WorkerProxy] | None]] = (
+    ContextVar("__proxy_pool__", default=None)
 )
 
 __worker_metadata__: WorkerMetadata | None = None

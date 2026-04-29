@@ -5,7 +5,7 @@ import debugpy
 import pytest
 
 import wool
-from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.cache import ReferenceCountedCache
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ def pytest_addoption(parser):
 
 @pytest.fixture
 def mock_worker_proxy_cache(mocker):
-    mock_pool = mocker.MagicMock(spec=ResourcePool)
+    mock_pool = mocker.MagicMock(spec=ReferenceCountedCache)
     mock_proxy = mocker.MagicMock()  # This will be returned by the context manager
     mock_pool.acquire.return_value.__aenter__ = mocker.AsyncMock(return_value=mock_proxy)
     mock_pool.acquire.return_value.__aexit__ = mocker.AsyncMock(return_value=False)

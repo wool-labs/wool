@@ -762,7 +762,8 @@ class TestWorkerProcess:
 
         mock_resource_pool = mocker.MagicMock()
         mock_resource_pool_class = mocker.patch(
-            "wool.runtime.worker.process.ResourcePool", return_value=mock_resource_pool
+            "wool.runtime.worker.process.ReferenceCountedCache",
+            return_value=mock_resource_pool,
         )
 
         mock_server = mocker.MagicMock()
@@ -821,7 +822,7 @@ class TestWorkerProcess:
         process = WorkerProcess(host="0.0.0.0", port=8080)
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=8080)
@@ -872,7 +873,7 @@ class TestWorkerProcess:
         )
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -921,7 +922,7 @@ class TestWorkerProcess:
         process = WorkerProcess(extra={"key": "value"})
 
         mocker.patch.object(process_module.wool, "__proxy_pool__")
-        mocker.patch.object(process_module, "ResourcePool")
+        mocker.patch.object(process_module, "ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -969,7 +970,7 @@ class TestWorkerProcess:
         process = WorkerProcess()
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -1012,7 +1013,7 @@ class TestWorkerProcess:
         process = WorkerProcess(shutdown_grace_period=45.0)
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -1465,7 +1466,7 @@ class TestWorkerProcess:
         process = WorkerProcess()
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -1525,7 +1526,7 @@ class TestWorkerProcess:
         process = WorkerProcess(options=opts)
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -1588,7 +1589,7 @@ class TestWorkerProcess:
         process = WorkerProcess(options=opts)
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -1637,7 +1638,7 @@ class TestWorkerProcess:
         process = WorkerProcess()
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -1691,7 +1692,7 @@ class TestWorkerProcess:
         process = WorkerProcess(options=opts)
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -1737,7 +1738,7 @@ class TestWorkerProcess:
         process = WorkerProcess()
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -1790,7 +1791,7 @@ class TestWorkerProcess:
         process = WorkerProcess(options=opts)
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch("wool.runtime.worker.process.ResourcePool")
+        mocker.patch("wool.runtime.worker.process.ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
@@ -1847,7 +1848,7 @@ class TestWorkerProcess:
         captured_current = []
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch.object(process_module, "ResourcePool")
+        mocker.patch.object(process_module, "ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_secure_port = mocker.MagicMock(return_value=50051)
@@ -1892,7 +1893,7 @@ class TestWorkerProcess:
         captured_current = []
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch.object(process_module, "ResourcePool")
+        mocker.patch.object(process_module, "ReferenceCountedCache")
 
         mock_server = mocker.MagicMock()
         mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)

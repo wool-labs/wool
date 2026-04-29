@@ -23,7 +23,7 @@ import grpc.aio
 
 import wool
 from wool import protocol
-from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.cache import ReferenceCountedCache
 from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerOptions
@@ -223,7 +223,7 @@ class WorkerProcess(Process):
         logger.info(f"Worker process starting on {self._host}:{self._port}")
 
         wool.__proxy_pool__.set(
-            ResourcePool(
+            ReferenceCountedCache(
                 factory=_proxy_factory,
                 finalizer=_proxy_finalizer,
                 ttl=self._proxy_pool_ttl,
@@ -413,14 +413,14 @@ def _sigint_handler(loop, service, signum, frame):
 
 
 async def _proxy_factory(proxy: WorkerProxy):
-    """Factory function for WorkerProxy instances in ResourcePool.
+    """Factory function for WorkerProxy instances in ReferenceCountedCache.
 
     Calls ``enter()`` on the proxy.  Lazy proxies defer actual
     startup until first dispatch; non-lazy proxies start eagerly.
     The proxy object itself is used as the cache key.
 
     :param proxy:
-        The WorkerProxy instance (passed as key from ResourcePool).
+        The WorkerProxy instance (passed as key from ReferenceCountedCache).
     :returns:
         The entered WorkerProxy instance.
     """
@@ -429,10 +429,10 @@ async def _proxy_factory(proxy: WorkerProxy):
 
 
 async def _proxy_finalizer(proxy: WorkerProxy):
-    """Finalizer function for WorkerProxy instances in ResourcePool.
+    """Finalizer function for WorkerProxy instances in ReferenceCountedCache.
 
     Exits the proxy context when it's being cleaned up from the
-    resource pool.  Lazy proxies that were never started are handled
+    cache.  Lazy proxies that were never started are handled
     gracefully by the proxy's own exit method.
 
     :param proxy:

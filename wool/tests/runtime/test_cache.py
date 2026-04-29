@@ -10,9 +10,9 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies
 
-import wool.runtime.resourcepool as rp
-from wool.runtime.resourcepool import Resource
-from wool.runtime.resourcepool import ResourcePool
+import wool.runtime.cache as cache_module
+from wool.runtime.cache import Reference
+from wool.runtime.cache import ReferenceCountedCache
 
 # Global tracking for factory and finalizer calls using function names as keys
 call_tracker = defaultdict(lambda: {"factory_calls": [], "finalizer_calls": []})
@@ -195,13 +195,17 @@ def mock_finalizer():
 @pytest.fixture
 def resource_pool_with_ttl(mock_resource_factory, mock_finalizer):
     """Create a resource pool configured for TTL testing."""
-    return ResourcePool(factory=mock_resource_factory, finalizer=mock_finalizer, ttl=0.1)
+    return ReferenceCountedCache(
+        factory=mock_resource_factory, finalizer=mock_finalizer, ttl=0.1
+    )
 
 
 @pytest.fixture
 def resource_pool_immediate_cleanup(mock_resource_factory, mock_finalizer):
     """Create a resource pool with TTL=0 for immediate cleanup testing."""
-    return ResourcePool(factory=mock_resource_factory, finalizer=mock_finalizer, ttl=0)
+    return ReferenceCountedCache(
+        factory=mock_resource_factory, finalizer=mock_finalizer, ttl=0
+    )
 
 
 @pytest.fixture
@@ -219,11 +223,11 @@ def counting_factory():
     return CountingFactory()
 
 
-class TestResourcePool:
+class TestReferenceCountedCache:
     @staticmethod
     @strategies.composite
     def setup(draw, *, max_key_count=5):
-        """Generate a ResourcePool with varied initial resource states.
+        """Generate a ReferenceCountedCache with varied initial resource states.
 
         Creates a pool with 0-max_key_count resources using the public API
         to create realistic pool states for property-based testing.
@@ -234,11 +238,11 @@ class TestResourcePool:
             Maximum number of keys to create resources for.
         :returns:
             An async function that when called returns a tuple of
-            (ResourcePool, factory, list of resources, list of keys).
+            (ReferenceCountedCache, factory, list of resources, list of keys).
         """
         factory = draw(factory_functions())
         finalizer = draw(finalizer_functions())
-        pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=0)
+        pool = ReferenceCountedCache(factory=factory, finalizer=finalizer, ttl=0)
         created_resources = []
         keys = []
 
@@ -263,15 +267,15 @@ class TestResourcePool:
 
     @pytest.mark.asyncio
     @given(setup=setup())
-    async def test_get_returns_resource_instance(self, setup):
-        """Test that get returns a Resource instance.
+    async def test_get_returns_reference_instance(self, setup):
+        """Test that get returns a Reference instance.
 
         Given:
             A pool with various initial resource states
         When:
             get() is called with a test key
         Then:
-            Should return a Resource instance
+            Should return a Reference instance
         """
         # Arrange
         pool, _, _, _ = await setup()
@@ -280,10 +284,12 @@ class TestResourcePool:
         resource_acquisition = pool.get("test-key")
 
         # Assert
-        assert isinstance(resource_acquisition, Resource)
+        assert isinstance(resource_acquisition, Reference)
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
+    @pytest.mark.dependency(
+        "TestReferenceCountedCache::test_get_returns_reference_instance"
+    )
     async def test_release_decrements_reference_counts(self):
         """Test releasing resources decrements reference counts properly.
 
@@ -296,7 +302,7 @@ class TestResourcePool:
         """
         # Arrange - Create pool with TTL to keep resources after context exit
         mock_factory = Mock()
-        pool = ResourcePool(factory=mock_factory, ttl=60)
+        pool = ReferenceCountedCache(factory=mock_factory, ttl=60)
 
         # Create some test resources
         test_keys = ["key1", "key2", "key3"]
@@ -323,7 +329,9 @@ class TestResourcePool:
         assert pool.stats.referenced_entries == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_release_decrements_reference_counts")
+    @pytest.mark.dependency(
+        "TestReferenceCountedCache::test_release_decrements_reference_counts"
+    )
     async def test_release_nonexistent_key_raises_error(self, counting_factory):
         """Test releasing nonexistent key raises KeyError.
 
@@ -335,7 +343,7 @@ class TestResourcePool:
             Should exit without affecting existing resources
         """
         # Arrange
-        pool = ResourcePool(factory=counting_factory, ttl=1.0)
+        pool = ReferenceCountedCache(factory=counting_factory, ttl=1.0)
 
         # Create some resources to establish initial state
         keys = ["key1", "key2"]
@@ -355,7 +363,9 @@ class TestResourcePool:
         assert pool.stats.referenced_entries == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_release_decrements_reference_counts")
+    @pytest.mark.dependency(
+        "TestReferenceCountedCache::test_release_decrements_reference_counts"
+    )
     async def test_release_zero_reference_count_raises_error(self):
         """Test releasing key with zero ref count raises ValueError.
 
@@ -372,7 +382,9 @@ class TestResourcePool:
         # so the resource stays in cache after release
         mock_factory = Mock()
         mock_finalizer = AsyncMock()
-        ttl_pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
+        ttl_pool = ReferenceCountedCache(
+            factory=mock_factory, finalizer=mock_finalizer, ttl=60
+        )
 
         unique_key = "test-zero-ref-count"
         mock_resource = Mock()
@@ -392,7 +404,9 @@ class TestResourcePool:
             await ttl_pool.release(unique_key)
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
+    @pytest.mark.dependency(
+        "TestReferenceCountedCache::test_get_returns_reference_instance"
+    )
     async def test_clear_finalizes_all_resources(self):
         """Test clearing the pool calls finalizer on all resources.
 
@@ -406,7 +420,9 @@ class TestResourcePool:
         # Arrange - Create pool with TTL to keep resources after context exit
         mock_factory = Mock()
         mock_finalizer = AsyncMock()
-        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
+        pool = ReferenceCountedCache(
+            factory=mock_factory, finalizer=mock_finalizer, ttl=60
+        )
 
         # Create some resources
         test_resources = []
@@ -431,7 +447,9 @@ class TestResourcePool:
         assert mock_finalizer.call_count == 3
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
+    @pytest.mark.dependency(
+        "TestReferenceCountedCache::test_get_returns_reference_instance"
+    )
     async def test_clear_key_removes_specific_resource(self, mock_finalizer):
         """Test clearing a specific key from the pool.
 
@@ -444,7 +462,9 @@ class TestResourcePool:
         """
         # Arrange
         mock_factory = Mock()
-        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
+        pool = ReferenceCountedCache(
+            factory=mock_factory, finalizer=mock_finalizer, ttl=60
+        )
 
         # Create multiple resources
         mock_resource1 = Mock()
@@ -490,7 +510,9 @@ class TestResourcePool:
         # Arrange
         mock_factory = Mock()
         mock_finalizer = AsyncMock()
-        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
+        pool = ReferenceCountedCache(
+            factory=mock_factory, finalizer=mock_finalizer, ttl=60
+        )
 
         # Create one resource
         mock_resource = Mock()
@@ -513,7 +535,9 @@ class TestResourcePool:
         mock_finalizer.assert_not_called()
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
+    @pytest.mark.dependency(
+        "TestReferenceCountedCache::test_get_returns_reference_instance"
+    )
     async def test_ttl_cleanup_schedules_resource_removal(self):
         """Test TTL-based cleanup schedules and executes properly.
 
@@ -527,7 +551,9 @@ class TestResourcePool:
         # Arrange
         mock_factory = Mock()
         mock_finalizer = AsyncMock()
-        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=0.1)
+        pool = ReferenceCountedCache(
+            factory=mock_factory, finalizer=mock_finalizer, ttl=0.1
+        )
 
         mock_resource = Mock()
         mock_factory.return_value = mock_resource
@@ -541,7 +567,7 @@ class TestResourcePool:
             # Wait for the test to signal that sleep should complete
             await sleep_event.wait()
 
-        with patch.object(rp.asyncio, "sleep", side_effect=mock_sleep):
+        with patch.object(cache_module.asyncio, "sleep", side_effect=mock_sleep):
             # Act
             # Acquire and immediately release
             async with pool.get(key) as resource:
@@ -573,7 +599,9 @@ class TestResourcePool:
         mock_finalizer.assert_called_once_with(mock_resource)
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
+    @pytest.mark.dependency(
+        "TestReferenceCountedCache::test_get_returns_reference_instance"
+    )
     async def test_ttl_cleanup_cancelled_on_reacquire(self):
         """Test TTL cleanup is cancelled when resource is reacquired.
 
@@ -587,7 +615,9 @@ class TestResourcePool:
         # Arrange
         mock_factory = Mock()
         mock_finalizer = AsyncMock()
-        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=0.1)
+        pool = ReferenceCountedCache(
+            factory=mock_factory, finalizer=mock_finalizer, ttl=0.1
+        )
 
         mock_resource = Mock()
         mock_factory.return_value = mock_resource
@@ -619,7 +649,9 @@ class TestResourcePool:
         assert pool.stats.referenced_entries == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
+    @pytest.mark.dependency(
+        "TestReferenceCountedCache::test_get_returns_reference_instance"
+    )
     async def test_stats_returns_accurate_counts(self):
         """Test stats method returns accurate cache statistics.
 
@@ -634,7 +666,9 @@ class TestResourcePool:
         # Arrange
         mock_factory = Mock()
         mock_finalizer = AsyncMock()
-        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=0.1)
+        pool = ReferenceCountedCache(
+            factory=mock_factory, finalizer=mock_finalizer, ttl=0.1
+        )
 
         # Start with empty pool
         stats = pool.stats
@@ -656,12 +690,14 @@ class TestResourcePool:
                     assert stats.pending_cleanup == 0  # None scheduled yet
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
+    @pytest.mark.dependency(
+        "TestReferenceCountedCache::test_get_returns_reference_instance"
+    )
     async def test_async_context_manager_clears_resources(self):
-        """Test ResourcePool as async context manager clears all on exit.
+        """Test ReferenceCountedCache as async context manager clears all on exit.
 
         Given:
-            A ResourcePool with resources
+            A ReferenceCountedCache with resources
         When:
             Used as async context manager and then exited
         Then:
@@ -672,7 +708,9 @@ class TestResourcePool:
         mock_finalizer = AsyncMock()
 
         # Act & assert
-        async with ResourcePool(factory=mock_factory, finalizer=mock_finalizer) as pool:
+        async with ReferenceCountedCache(
+            factory=mock_factory, finalizer=mock_finalizer
+        ) as pool:
             mock_resource = Mock()
             mock_factory.return_value = mock_resource
 
@@ -718,7 +756,9 @@ class TestResourcePool:
 
             mock_finalizer = Mock(side_effect=mock_finalizer_func)
 
-            pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=ttl)
+            pool = ReferenceCountedCache(
+                factory=mock_factory, finalizer=mock_finalizer, ttl=ttl
+            )
 
             async with pool.get("test-key"):
                 pass
@@ -770,7 +810,7 @@ class TestResourcePool:
         async def failing_finalizer(_):
             raise ValueError("Finalizer failed")
 
-        pool = ResourcePool(factory=mock_factory, finalizer=failing_finalizer)
+        pool = ReferenceCountedCache(factory=mock_factory, finalizer=failing_finalizer)
 
         mock_resource = Mock()
         mock_factory.return_value = mock_resource
@@ -798,7 +838,7 @@ class TestResourcePool:
         """
         # Arrange
         mock_factory = Mock(return_value=Mock())
-        pool = ResourcePool(factory=mock_factory, ttl=0)
+        pool = ReferenceCountedCache(factory=mock_factory, ttl=0)
 
         # Create one resource first
         async with pool.get("valid-key"):
@@ -821,7 +861,7 @@ class TestResourcePool:
             Resource pool should maintain consistency and not leak resources
         """
         # Arrange
-        pool = ResourcePool(factory=counting_factory, ttl=0.1)
+        pool = ReferenceCountedCache(factory=counting_factory, ttl=0.1)
 
         # Act
         async def acquire_release_worker():
@@ -888,7 +928,7 @@ class TestResourcePool:
         mock_factory = Mock()
         mock_resource = Mock()
         mock_factory.return_value = mock_resource
-        pool = ResourcePool(factory=mock_factory, ttl=0)
+        pool = ReferenceCountedCache(factory=mock_factory, ttl=0)
 
         # Act & assert
         # None should be treated as a valid key
@@ -899,15 +939,15 @@ class TestResourcePool:
         assert pool.stats.total_entries == 0
 
 
-class TestResource:
-    """Test suite for the Resource class."""
+class TestReference:
+    """Test suite for the Reference class."""
 
     @pytest.mark.asyncio
     async def test_context_manager_auto_releases(self):
-        """Test Resource as async context manager.
+        """Test Reference as async context manager.
 
         Given:
-            A Resource instance from a pool
+            A Reference instance from a pool
         When:
             Used as async context manager
         Then:
@@ -919,10 +959,10 @@ class TestResource:
         mock_resource.name = "context-resource"
         mock_factory.return_value = mock_resource
 
-        pool = ResourcePool(factory=mock_factory, ttl=0)
+        pool = ReferenceCountedCache(factory=mock_factory, ttl=0)
 
         # Act & assert
-        # Use Resource as context manager
+        # Use Reference as context manager
         async with pool.get("test-key") as resource:
             assert resource is mock_resource
             assert pool.stats.total_entries == 1
@@ -932,11 +972,11 @@ class TestResource:
         assert pool.stats.total_entries == 0
 
     @pytest.mark.asyncio
-    async def test_resource_has_no_manual_release_method(self):
-        """Test Resource has no manual release method.
+    async def test_reference_has_no_manual_release_method(self):
+        """Test Reference has no manual release method.
 
         Given:
-            A Resource instance
+            A Reference instance
         When:
             Checking for release method
         Then:
@@ -947,7 +987,7 @@ class TestResource:
         mock_resource = Mock()
         mock_factory.return_value = mock_resource
 
-        pool = ResourcePool(factory=mock_factory, ttl=0)
+        pool = ReferenceCountedCache(factory=mock_factory, ttl=0)
 
         resource_acquisition = pool.get("test-key")
 
@@ -956,11 +996,11 @@ class TestResource:
         assert not hasattr(resource_acquisition, "release")
 
     @pytest.mark.asyncio
-    async def test_resource_lifecycle_with_ttl(self):
-        """Test Resource lifecycle with TTL keeps resource in cache.
+    async def test_reference_lifecycle_with_ttl(self):
+        """Test Reference lifecycle with TTL keeps resource in cache.
 
         Given:
-            A Resource instance with TTL pool
+            A Reference instance with TTL pool
         When:
             Used as context manager
         Then:
@@ -971,7 +1011,9 @@ class TestResource:
         mock_resource = Mock()
         mock_factory.return_value = mock_resource
 
-        pool = ResourcePool(factory=mock_factory, ttl=60)  # Use TTL to keep resource
+        pool = ReferenceCountedCache(
+            factory=mock_factory, ttl=60
+        )  # Use TTL to keep resource
 
         resource_acquisition = pool.get("test-key")
 
@@ -986,10 +1028,10 @@ class TestResource:
 
     @pytest.mark.asyncio
     async def test_context_manager_only_usage_handles_lifecycle(self):
-        """Test using Resource only as context manager.
+        """Test using Reference only as context manager.
 
         Given:
-            A Resource instance
+            A Reference instance
         When:
             Used only as context manager
         Then:
@@ -1000,7 +1042,7 @@ class TestResource:
         mock_resource = Mock()
         mock_factory.return_value = mock_resource
 
-        pool = ResourcePool(factory=mock_factory, ttl=0)
+        pool = ReferenceCountedCache(factory=mock_factory, ttl=0)
 
         # Act & assert
         # Use only as context manager
@@ -1013,10 +1055,10 @@ class TestResource:
 
     @pytest.mark.asyncio
     async def test_acquire_twice(self):
-        """Test that re-acquiring the same Resource instance raises error.
+        """Test that re-acquiring the same Reference instance raises error.
 
         Given:
-            A Resource that has been used as context manager once
+            A Reference that has been used as context manager once
         When:
             Attempting to use it as context manager again
         Then:
@@ -1026,7 +1068,7 @@ class TestResource:
         mock_resource = Mock()
         mock_factory.return_value = mock_resource
 
-        pool = ResourcePool(factory=mock_factory, ttl=0)
+        pool = ReferenceCountedCache(factory=mock_factory, ttl=0)
         resource_acquisition = pool.get("test-key")
 
         # First use as context manager
@@ -1039,11 +1081,11 @@ class TestResource:
                 pass
 
     @pytest.mark.asyncio
-    async def test_resource_context_acquire_exception(self):
-        """Test Resource context manager handles acquire exceptions properly.
+    async def test_reference_context_acquire_exception(self):
+        """Test Reference context manager handles acquire exceptions properly.
 
         Given:
-            A Resource instance from a pool that fails during acquire
+            A Reference instance from a pool that fails during acquire
         When:
             Entering the context manager
         Then:
@@ -1053,9 +1095,9 @@ class TestResource:
         mock_pool = AsyncMock()
         mock_pool.acquire.side_effect = RuntimeError("Acquire failed")
 
-        from wool.runtime.resourcepool import Resource
+        from wool.runtime.cache import Reference
 
-        resource = Resource(pool=mock_pool, key="test-key")
+        resource = Reference(pool=mock_pool, key="test-key")
 
         # Act & assert
         with pytest.raises(RuntimeError, match="Acquire failed"):
@@ -1066,21 +1108,21 @@ class TestResource:
         assert resource._acquired is False
 
     @pytest.mark.asyncio
-    async def test_resource_context_release_not_acquired(self):
-        """Test Resource release when not acquired raises RuntimeError.
+    async def test_reference_context_release_not_acquired(self):
+        """Test Reference release when not acquired raises RuntimeError.
 
         Given:
-            A Resource instance that was never acquired
+            A Reference instance that was never acquired
         When:
             Attempting to exit context without entering properly
         Then:
-            Should raise RuntimeError indicating resource was not acquired
+            Should raise RuntimeError indicating reference was not acquired
         """
         # Arrange
         mock_pool = AsyncMock()
-        from wool.runtime.resourcepool import Resource
+        from wool.runtime.cache import Reference
 
-        resource = Resource(pool=mock_pool, key="test-key")
+        resource = Reference(pool=mock_pool, key="test-key")
 
         # Act & assert - manually call __aexit__ without calling __aenter__
         with pytest.raises(
@@ -1089,24 +1131,24 @@ class TestResource:
             await resource.__aexit__(None, None, None)
 
     @pytest.mark.asyncio
-    async def test_resource_context_release_already_released(self):
-        """Test Resource release when already released raises RuntimeError.
+    async def test_reference_context_release_already_released(self):
+        """Test Reference release when already released raises RuntimeError.
 
         Given:
-            A Resource instance that was already released
+            A Reference instance that was already released
         When:
             Attempting to exit context again after normal usage
         Then:
-            Should raise RuntimeError indicating resource was already released
+            Should raise RuntimeError indicating reference was already released
         """
         # Arrange
         mock_pool = AsyncMock()
         mock_resource = Mock()
         mock_pool.acquire.return_value = mock_resource
 
-        from wool.runtime.resourcepool import Resource
+        from wool.runtime.cache import Reference
 
-        resource = Resource(pool=mock_pool, key="test-key")
+        resource = Reference(pool=mock_pool, key="test-key")
 
         # Use normally once (which sets _released = True)
         async with resource:
