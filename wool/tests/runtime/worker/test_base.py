@@ -248,30 +248,32 @@ class TestWorkerOptions:
         assert opts.http2_min_recv_ping_interval_without_data_ms == 20000
 
     def test___init___with_keepalive_time_below_min_ping_interval(self):
-        """Test WorkerOptions raises ValueError when channel.keepalive_time_ms < http2_min_recv_ping_interval_without_data_ms.
+        """Test WorkerOptions raises when keepalive_time_ms < min_ping_interval.
 
         Given:
-            A ChannelOptions with keepalive_time_ms=5000 and http2_min_recv_ping_interval_without_data_ms=10000
+            A ChannelOptions with keepalive_time_ms=5000 and
+            http2_min_recv_ping_interval_without_data_ms=10000
         When:
             WorkerOptions is instantiated
         Then:
             It should raise ValueError
         """
         # Act & assert
-        with pytest.raises(
-            ValueError,
-            match="keepalive_time_ms must be >= http2_min_recv_ping_interval_without_data_ms",
-        ):
+        match = (
+            "keepalive_time_ms must be >= http2_min_recv_ping_interval_without_data_ms"
+        )
+        with pytest.raises(ValueError, match=match):
             WorkerOptions(
                 channel=ChannelOptions(keepalive_time_ms=5000),
                 http2_min_recv_ping_interval_without_data_ms=10000,
             )
 
     def test___init___with_keepalive_time_equal_to_min_ping_interval(self):
-        """Test WorkerOptions accepts channel.keepalive_time_ms equal to http2_min_recv_ping_interval_without_data_ms.
+        """Test WorkerOptions accepts keepalive_time_ms == min_ping_interval.
 
         Given:
-            A ChannelOptions with keepalive_time_ms=10000 and http2_min_recv_ping_interval_without_data_ms=10000
+            A ChannelOptions with keepalive_time_ms=10000 and
+            http2_min_recv_ping_interval_without_data_ms=10000
         When:
             WorkerOptions is instantiated
         Then:
@@ -288,10 +290,11 @@ class TestWorkerOptions:
         assert opts.http2_min_recv_ping_interval_without_data_ms == 10000
 
     def test___init___with_keepalive_time_above_min_ping_interval(self):
-        """Test WorkerOptions accepts channel.keepalive_time_ms above http2_min_recv_ping_interval_without_data_ms.
+        """Test WorkerOptions accepts keepalive_time_ms > min_ping_interval.
 
         Given:
-            A ChannelOptions with keepalive_time_ms=20000 and http2_min_recv_ping_interval_without_data_ms=10000
+            A ChannelOptions with keepalive_time_ms=20000 and
+            http2_min_recv_ping_interval_without_data_ms=10000
         When:
             WorkerOptions is instantiated
         Then:
@@ -315,11 +318,13 @@ class TestWorkerOptions:
         """Test WorkerOptions validation invariant across arbitrary values.
 
         Given:
-            Arbitrary positive keepalive_time_ms and http2_min_recv_ping_interval_without_data_ms
+            Arbitrary positive keepalive_time_ms and
+            http2_min_recv_ping_interval_without_data_ms
         When:
             WorkerOptions is instantiated
         Then:
-            It should raise ValueError iff keepalive_time_ms < http2_min_recv_ping_interval_without_data_ms
+            It should raise ValueError iff keepalive_time_ms <
+            http2_min_recv_ping_interval_without_data_ms
         """
         # Act & assert
         if keepalive_time_ms < min_ping_interval:
