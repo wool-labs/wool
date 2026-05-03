@@ -1,5 +1,4 @@
 import asyncio
-from asyncio import TimeoutError
 from uuid import uuid4
 
 import pytest
@@ -27,8 +26,14 @@ def dispatch_side_effects(
 ):
     """Generate behavior sequence for a single task dispatch.
 
-    Generates a list of failure side effects. Failure modes may be any of
-    Exception, RpcError, TransientRpcError, or TimeoutError.
+    Generates a list of failure side effects drawn from the
+    load-balancer's worker-health exception contract: only
+    :class:`RpcError` and its transient subclass
+    :class:`TransientRpcError` (the LB's documented catch surface).
+    Exceptions outside this contract — e.g. raw :class:`Exception`,
+    :class:`BaseExceptionGroup`, or local :class:`asyncio.TimeoutError`
+    — propagate past the LB to the caller and are exercised
+    separately.
 
     :param draw:
         Hypothesis draw function
@@ -45,10 +50,10 @@ def dispatch_side_effects(
         List of side effects (exceptions)
     """
     if include_transient:
-        error_types = [Exception(), RpcError(), TransientRpcError(), TimeoutError()]
+        error_types = [RpcError(), TransientRpcError()]
     else:
         # Only non-transient errors - workers will be removed after these
-        error_types = [Exception(), RpcError(), TimeoutError()]
+        error_types = [RpcError()]
 
     return draw(
         st.lists(
@@ -598,7 +603,7 @@ class TestRoundRobinLoadBalancer:
 
             if i == 0:
                 mock_connection.dispatch = mocker.AsyncMock(
-                    side_effect=Exception("fatal error")
+                    side_effect=RpcError(details="fatal error")
                 )
             else:
                 mock_connection.dispatch = mocker.AsyncMock(return_value="success")
@@ -625,6 +630,65 @@ class TestRoundRobinLoadBalancer:
         # Assert
         assert result == "success"
         assert len(ctx.workers) == 1
+
+    @pytest.mark.asyncio
+    async def test_dispatch_propagates_non_rpc_error_without_worker_removal(
+        self,
+        mocker: MockerFixture,
+    ):
+        """Test exceptions outside the RpcError contract bubble to the caller.
+
+        Given:
+            A load balancer with one worker whose dispatch raises a
+            non-:class:`RpcError` exception (modelling e.g. a strict-
+            mode :class:`BaseExceptionGroup` of
+            :class:`wool.ContextDecodeWarning` peers from
+            :meth:`Context.to_protobuf`, or a programming-error
+            :class:`ValueError`).
+        When:
+            ``await lb.dispatch(...)`` is called.
+        Then:
+            The exception should propagate unwrapped to the caller and
+            the worker should remain in the context — the LB's
+            worker-health contract treats only :class:`RpcError`
+            instances as worker-health concerns, so a fault that has
+            nothing to do with worker health does not evict the pool.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+
+        encode_failure = BaseExceptionGroup(
+            "wool context encode failed",
+            [ValueError("synthetic encode failure for ContextVar 'tenant_id'")],
+        )
+        mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
+        mock_connection.dispatch = mocker.AsyncMock(side_effect=encode_failure)
+        metadata = WorkerMetadata(
+            uid=uuid4(),
+            address="localhost:50051",
+            pid=1000,
+            version="1.0.0",
+        )
+        ctx.add_worker(metadata, mock_connection)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(
+            id=uuid4(),
+            callable=routine,
+            args=(),
+            kwargs={},
+            proxy=mock_proxy,
+        )
+
+        # Act & assert
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await lb.dispatch(task, context=ctx)
+        assert exc_info.value is encode_failure
+        assert len(ctx.workers) == 1, "Non-RpcError must not trigger worker eviction"
 
     @pytest.mark.asyncio
     async def test_dispatch_with_overflow_tasks(

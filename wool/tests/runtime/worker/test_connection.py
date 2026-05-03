@@ -421,7 +421,10 @@ class TestWorkerConnection:
         When:
             A task is dispatched, but exceeds the dispatch timeout
         Then:
-            It should raise TimeoutError and cancel the call
+            It should raise TransientRpcError with code DEADLINE_EXCEEDED
+            (local timeout is wrapped to align with the load-balancer
+            contract — same handling as a server-side gRPC deadline)
+            and cancel the call
         """
         # Arrange
         ack = protocol.Response(ack=protocol.Ack())
@@ -438,9 +441,10 @@ class TestWorkerConnection:
         )
 
         # Act & assert
-        with pytest.raises(TimeoutError):
+        with pytest.raises(TransientRpcError) as exc_info:
             async for _ in await connection.dispatch(sample_task, timeout=0.001):
                 pass
+        assert exc_info.value.code is grpc.StatusCode.DEADLINE_EXCEEDED
 
         mock_call.cancel.assert_called()
 
@@ -456,7 +460,9 @@ class TestWorkerConnection:
             All concurrency slots are occupied and another task is dispatched
             with a timeout
         Then:
-            It should raise TimeoutError while waiting for an available slot
+            It should raise TransientRpcError with code DEADLINE_EXCEEDED
+            while waiting for an available slot — local timeouts are
+            wrapped to align with the load-balancer contract
         """
         # Arrange
         responses = (
@@ -486,9 +492,10 @@ class TestWorkerConnection:
 
         try:
             # Act & assert
-            with pytest.raises(TimeoutError):
+            with pytest.raises(TransientRpcError) as exc_info:
                 async for _ in await connection.dispatch(sample_task, timeout=0.01):
                     pass
+            assert exc_info.value.code is grpc.StatusCode.DEADLINE_EXCEEDED
 
             assert mock_stub.dispatch.call_count == 1
         finally:

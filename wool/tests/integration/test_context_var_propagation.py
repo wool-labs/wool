@@ -2082,6 +2082,65 @@ class TestContextDecodeWarningAcrossWorkers:
 
         await retry_grpc_internal(body)
 
+    @pytest.mark.asyncio
+    async def test_unpicklable_var_value_under_strict_mode_raises_group(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test caller-side strict mode aggregates encode failures into a group.
+
+        Given:
+            A caller that sets a wool.ContextVar to an unpicklable
+            value, with ``warnings.simplefilter("error",
+            category=wool.ContextDecodeWarning)`` active for the
+            duration of the dispatch attempt.
+        When:
+            The caller dispatches a routine — Task.to_protobuf
+            invokes Context.to_protobuf which discovers the
+            unencodable var.
+        Then:
+            ``Context.to_protobuf`` should raise a
+            ``BaseExceptionGroup`` whose peers are
+            ``wool.ContextDecodeWarning`` instances naming the
+            offending var, and the dispatch must NOT leave the
+            caller — strict mode promotes the warning before the
+            wire frame is constructed, and the load balancer's
+            worker-health contract treats only ``RpcError`` as a
+            health concern, so the group propagates unwrapped to the
+            caller rather than triggering worker eviction and a
+            ``NoWorkersAvailable`` fallback.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = _default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                import socket
+
+                unpicklable = socket.socket()
+                try:
+                    region_token = routines.REGION.set(unpicklable)  # pyright: ignore[reportArgumentType]
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter(
+                                "error", category=wool.ContextDecodeWarning
+                            )
+                            with pytest.raises(BaseExceptionGroup) as exc_info:
+                                await routines.read_tenant_id_only()
+                    finally:
+                        routines.REGION.reset(region_token)
+                finally:
+                    unpicklable.close()
+            peers = exc_info.value.exceptions
+            assert all(isinstance(p, wool.ContextDecodeWarning) for p in peers), (
+                f"Expected only ContextDecodeWarning peers, got {peers!r}"
+            )
+            assert any("region" in str(p) for p in peers), (
+                f"Expected the offending var to be named in a peer; "
+                f"got {[str(p) for p in peers]!r}"
+            )
+
+        await retry_grpc_internal(body)
+
 
 @pytest.mark.integration
 class TestWoolCopyContextWithDispatch:

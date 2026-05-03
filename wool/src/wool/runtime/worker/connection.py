@@ -481,15 +481,25 @@ class WorkerConnection:
             An async iterator that yields task results from the worker.
         :raises TransientRpcError:
             If the worker returns a transient RPC error (UNAVAILABLE,
-            DEADLINE_EXCEEDED, or RESOURCE_EXHAUSTED).
+            DEADLINE_EXCEEDED, or RESOURCE_EXHAUSTED) or the local
+            dispatch-phase timeout fires (also classified as
+            DEADLINE_EXCEEDED).
         :raises RpcError:
             If the worker returns a non-transient RPC error.
         :raises UnexpectedResponse:
             If the worker doesn't acknowledge the task.
-        :raises TimeoutError:
-            If the timeout is exceeded during dispatch phase.
         :raises ValueError:
             If the timeout value is not positive.
+
+        Encode-side failures (e.g. a strict-mode
+        :class:`BaseExceptionGroup` of
+        :class:`wool.ContextDecodeWarning` peers raised by
+        :meth:`Context.to_protobuf` when an unpicklable
+        :class:`wool.ContextVar` value is set) propagate unwrapped:
+        the load-balancer contract treats only :class:`RpcError`
+        instances as worker-health concerns, so a caller-side encode
+        failure surfaces directly to the caller rather than evicting
+        workers.
         """
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
@@ -526,6 +536,17 @@ class WorkerConnection:
                     raise TransientRpcError(code, details) from error
                 else:
                     raise RpcError(code, details) from error
+            except asyncio.TimeoutError as error:
+                # Local dispatch-phase timeout is the same semantic as
+                # gRPC DEADLINE_EXCEEDED — request took too long. Wrap
+                # so the load-balancer contract only needs to know
+                # about :class:`RpcError`. Worker isn't presumed
+                # unhealthy; transient-class makes the LB skip without
+                # eviction.
+                raise TransientRpcError(
+                    grpc.StatusCode.DEADLINE_EXCEEDED,
+                    "Local dispatch-phase timeout exceeded",
+                ) from error
 
             stream = self._execute(call, task, key, serializer)
             await stream.__anext__()  # Prime: _execute acquires its own ref
