@@ -107,7 +107,56 @@ class LoadBalancerLike(Protocol):
         *,
         context: LoadBalancerContextLike,
         timeout: float | None = None,
-    ) -> AsyncGenerator: ...
+    ) -> AsyncGenerator:
+        """Dispatch *task* through *context*'s workers and yield
+        per-step results.
+
+        Implementations rotate through ``context.workers`` per their
+        policy, invoking each worker's
+        :py:meth:`WorkerConnection.dispatch` and yielding the
+        streamed responses until the routine completes or the pool
+        is exhausted.
+
+        :param task:
+            The :py:class:`Task` to dispatch.
+        :param context:
+            The :py:class:`LoadBalancerContextLike` whose
+            ``workers`` map names eligible candidates and through
+            which ``remove_worker`` evicts unhealthy peers.
+        :param timeout:
+            Per-attempt timeout in seconds against a single worker.
+            ``None`` (default) means no per-attempt bound.
+        :returns:
+            An async iterator yielding per-step worker responses.
+            The iterator is awaitable (``await balancer.dispatch(...)``)
+            then iterable (``async for response in iterator``); the
+            iterator's lifecycle spans the full routine, not a single
+            worker attempt.
+        :raises NoWorkersAvailable:
+            When the pool is exhausted — either empty on entry or
+            fully evicted across one rotation cycle without a
+            successful dispatch.
+
+        **Worker-health contract.** Implementations MUST honor the
+        classification documented on
+        :py:class:`wool.runtime.worker.connection.RpcError`:
+
+        - :py:class:`TransientRpcError` MUST cause the
+          implementation to try a different worker for this call
+          while leaving the failing worker in the pool — "skip
+          without eviction".
+        - Non-transient :py:class:`RpcError` MUST trigger
+          ``context.remove_worker(metadata)`` so the failing worker
+          is no longer offered to future dispatches — "evict".
+        - Any other exception class (including
+          :py:class:`BaseException` subclasses such as
+          :py:class:`asyncio.CancelledError`) MUST propagate to the
+          caller without mutating the pool. Catching
+          :py:class:`Exception` *or* :py:class:`BaseException`
+          indiscriminately will silently evict workers on every
+          caller-side bug or mid-dispatch cancellation.
+        """
+        ...
 
 
 class LoadBalancerContext:
