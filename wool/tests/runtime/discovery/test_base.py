@@ -343,7 +343,8 @@ class TestWorkerMetadata:
         """Test round-trip conversion preserves WorkerMetadata data.
 
         Given:
-            A WorkerMetadata instance with arbitrary field values including optional ChannelOptions drawn from the full domain
+            A WorkerMetadata instance with arbitrary field values
+            including optional ChannelOptions drawn from the full domain
         When:
             Converting to protobuf and back to WorkerMetadata
         Then:

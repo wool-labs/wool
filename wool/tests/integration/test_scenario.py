@@ -3,6 +3,7 @@
 import pytest
 
 from .conftest import BackpressureMode
+from .conftest import ContextVarPattern
 from .conftest import CredentialType
 from .conftest import DiscoveryFactory
 from .conftest import LazyMode
@@ -15,6 +16,7 @@ from .conftest import TimeoutKind
 from .conftest import WorkerOptionsKind
 
 
+@pytest.mark.integration
 class TestScenario:
     def test___or___with_disjoint_fields(self):
         """Test merging two partial scenarios with disjoint fields.
@@ -104,7 +106,7 @@ class TestScenario:
         """Test that a fully populated scenario reports complete.
 
         Given:
-            A scenario with all 10 dimensions set.
+            A scenario with all 13 dimensions set.
         When:
             ``is_complete`` is checked.
         Then:
@@ -122,6 +124,9 @@ class TestScenario:
             binding=RoutineBinding.MODULE_FUNCTION,
             lazy=LazyMode.LAZY,
             backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
         )
 
         # Act & assert
@@ -167,4 +172,62 @@ class TestScenario:
         result = str(scenario)
 
         # Assert
-        assert result == "COROUTINE-DEFAULT-_-_-_-_-_-_-_-_"
+        assert result == "COROUTINE-DEFAULT-_-_-_-_-_-_-_-_-_-_-_"
+
+    def test___str___with_empty_scenario(self):
+        """Test string representation when no dimensions are set.
+
+        Given:
+            A scenario with every dimension left at the default None.
+        When:
+            Converted to string.
+        Then:
+            The result should be an underscore per dimension joined
+            by dashes --- every field renders as the unset marker.
+        """
+        # Arrange
+        scenario = Scenario()
+
+        # Act
+        result = str(scenario)
+
+        # Assert
+        assert result == "-".join(["_"] * 13)
+
+    def test___str___with_all_fields_set(self):
+        """Test string representation when every dimension is set.
+
+        Given:
+            A scenario populated with one concrete enum member per
+            dimension.
+        When:
+            Converted to string.
+        Then:
+            The result should carry each member's ``name`` joined by
+            dashes, in field order, with no underscores remaining.
+        """
+        # Arrange
+        scenario = Scenario(
+            shape=RoutineShape.COROUTINE,
+            pool_mode=PoolMode.DEFAULT,
+            discovery=DiscoveryFactory.LOCAL_DIRECT,
+            lb=LbFactory.CLASS_REF,
+            credential=CredentialType.INSECURE,
+            options=WorkerOptionsKind.DEFAULT,
+            timeout=TimeoutKind.NONE,
+            binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.EAGER,
+            backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.ROUND_TRIP,
+            ctx_var_2=ContextVarPattern.LOCAL_RESET,
+            ctx_var_3=ContextVarPattern.PER_YIELD,
+        )
+
+        # Act
+        result = str(scenario)
+
+        # Assert
+        assert result == (
+            "COROUTINE-DEFAULT-LOCAL_DIRECT-CLASS_REF-INSECURE-DEFAULT-"
+            "NONE-MODULE_FUNCTION-EAGER-NONE-ROUND_TRIP-LOCAL_RESET-PER_YIELD"
+        )

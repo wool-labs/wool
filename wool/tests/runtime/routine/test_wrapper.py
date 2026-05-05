@@ -20,18 +20,10 @@ async def foo(x, y):
     return x + y
 
 
-assert foo.__qualname__ == "foo"
-assert foo.__module__ == "runtime.routine.test_wrapper"
-
-
 @routine
 async def bar():
     """Test function with no arguments."""
     return "async_result"
-
-
-assert bar.__qualname__ == "bar"
-assert bar.__module__ == "runtime.routine.test_wrapper"
 
 
 @routine
@@ -39,10 +31,6 @@ async def foo_gen(x):
     """Async generator test function."""
     for i in range(x):
         yield i
-
-
-assert foo_gen.__qualname__ == "foo_gen"
-assert foo_gen.__module__ == "runtime.routine.test_wrapper"
 
 
 @routine
@@ -111,17 +99,11 @@ class Foo:
         """Instance method."""
         return x * 2
 
-    assert foo.__qualname__ == "Foo.foo"
-    assert foo.__module__ == "runtime.routine.test_wrapper"
-
     @classmethod
     @routine
     async def bar(cls, x):
         """Class method."""
         return x * 3
-
-    assert bar.__qualname__ == "Foo.bar"
-    assert bar.__module__ == "runtime.routine.test_wrapper"
 
     @staticmethod
     @routine
@@ -129,17 +111,11 @@ class Foo:
         """Static method."""
         return x * 4
 
-    assert baz.__qualname__ == "Foo.baz"
-    assert baz.__module__ == "runtime.routine.test_wrapper"
-
     @routine
     async def foo_gen(self, x):
         """Async generator instance method."""
         for i in range(x):
             yield i * 2
-
-    assert foo_gen.__qualname__ == "Foo.foo_gen"
-    assert foo_gen.__module__ == "runtime.routine.test_wrapper"
 
     @classmethod
     @routine
@@ -148,9 +124,6 @@ class Foo:
         for i in range(x):
             yield i * 3
 
-    assert bar_gen.__qualname__ == "Foo.bar_gen"
-    assert bar_gen.__module__ == "runtime.routine.test_wrapper"
-
     @staticmethod
     @routine
     async def baz_gen(x):
@@ -158,8 +131,71 @@ class Foo:
         for i in range(x):
             yield i * 4
 
-    assert baz_gen.__qualname__ == "Foo.baz_gen"
-    assert baz_gen.__module__ == "runtime.routine.test_wrapper"
+
+@pytest.mark.parametrize(
+    "obj, expected_qualname",
+    [
+        (foo, "foo"),
+        (bar, "bar"),
+        (foo_gen, "foo_gen"),
+        (Foo.foo, "Foo.foo"),
+        (Foo.bar, "Foo.bar"),
+        (Foo.baz, "Foo.baz"),
+        (Foo.foo_gen, "Foo.foo_gen"),
+        (Foo.bar_gen, "Foo.bar_gen"),
+        (Foo.baz_gen, "Foo.baz_gen"),
+    ],
+)
+def test_routine_preserves_qualname_and_module(obj, expected_qualname):
+    """Test the @routine decorator preserves __qualname__ and __module__.
+
+    Given:
+        A function or method decorated with @routine — module-level,
+        instance, class, or static.
+    When:
+        The routine's __qualname__ and __module__ attributes are read.
+    Then:
+        They should reflect the original undecorated definition's
+        scope and module path, so logging, tracebacks, and pickling
+        by qualified name resolve to the wrapped routine.
+    """
+    # Act & assert
+    assert obj.__qualname__ == expected_qualname
+    assert obj.__module__ == "runtime.routine.test_wrapper"
+
+
+def test_routine_with_unavailable_source(
+    mocker: MockerFixture,
+):
+    """Test @routine when ``inspect.getsourcelines`` raises ``OSError``.
+
+    Given:
+        A coroutine function whose source is unavailable to
+        :func:`inspect.getsourcelines` — modeled by patching the
+        wrapper module's reference to raise ``OSError``.
+    When:
+        The :func:`routine` decorator wraps the function.
+    Then:
+        It should return a callable wrapper without re-raising the
+        ``OSError``.
+    """
+    # Arrange
+    from wool.runtime.routine import wrapper as wrapper_module
+
+    mocker.patch.object(
+        wrapper_module,
+        "getsourcelines",
+        side_effect=OSError("source not available"),
+    )
+
+    async def no_source():
+        return "ok"
+
+    # Act
+    wrapped = routine(no_source)
+
+    # Assert
+    assert callable(wrapped)
 
 
 @settings(

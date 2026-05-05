@@ -17,7 +17,7 @@ message Task {
     bytes args = 8;
     bytes kwargs = 9;
     int32 timeout = 10;
-    optional RuntimeContext context = 11;
+    optional RuntimeContext runtime_context = 11;
     optional bytes serializer = 12;
 }
 
@@ -29,6 +29,45 @@ message TaskEnvelope {
     string id = 2;
     string caller = 3;
     string tag = 4;
+}
+
+// Wire shape for a single wool.ContextVar within a Context
+// snapshot. Mirrors the in-memory wool.ContextVar identity
+// ((namespace, name) pair) and carries the var's per-snapshot
+// state: an optional cloudpickled value and the hex-encoded ids
+// of any wool.Tokens this var has minted that were subsequently
+// consumed by wool.ContextVar.reset in the enclosing Context's
+// logical chain.
+message ContextVar {
+    // Namespace component of the ContextVar identity.
+    string namespace = 1;
+    // Name component of the ContextVar identity.
+    string name = 2;
+    // Cloudpickled value. Unset when the var has no current
+    // value in this snapshot (e.g. it was reset to no prior
+    // value but a consumed token still needs to propagate).
+    optional bytes value = 3;
+    // Hex-encoded ids of wool.Tokens minted by this var that
+    // have been consumed by wool.ContextVar.reset in this
+    // logical chain. Rides forward- and back-propagation so
+    // receivers (a) see consumed tokens as used and cannot
+    // double-reset and (b) pop the corresponding var from
+    // their local Context, completing the reset signal.
+    repeated string consumed_tokens = 4;
+}
+
+// wool.Context wire shape. Rides on every Request and Response
+// frame to carry the caller's wool.ContextVar snapshot and the
+// wool.Context id that scopes the logical execution chain.
+message Context {
+    // wool.Context id as hex string. Stable across sequential
+    // awaits inside the same asyncio task; fresh on
+    // asyncio.create_task boundaries. Empty for root dispatches
+    // that will start a new context on the receiver.
+    string id = 1;
+    // ContextVar entries — each one carries identity, optional
+    // value, and any consumed-token ids for that var.
+    repeated ContextVar vars = 2;
 }
 
 message Message {
@@ -57,6 +96,10 @@ message Request {
         Message send = 3;
         Message throw = 4;
     }
+    // Caller's wool.Context snapshot. Propagates the caller's
+    // state to the worker on task frames, and forward-propagates
+    // caller mutations to the worker on streaming frames.
+    Context context = 5;
 }
 
 message Response {
@@ -66,6 +109,9 @@ message Response {
         Message result = 3;
         Message exception = 4;
     }
+    // Worker's post-yield/post-return wool.Context snapshot,
+    // back-propagated to the caller.
+    Context context = 5;
 }
 
 message StopRequest {

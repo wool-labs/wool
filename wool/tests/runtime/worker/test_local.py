@@ -325,10 +325,6 @@ class TestLocalWorker:
             It should correctly parse host and port
         """
         # Arrange
-        from types import MappingProxyType
-
-        from wool.runtime.worker.metadata import WorkerMetadata
-
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "0.0.0.0:8080"
         mock_process.metadata = _make_metadata(address="0.0.0.0:8080", pid=99999)

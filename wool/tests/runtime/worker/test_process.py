@@ -1092,7 +1092,8 @@ class TestWorkerProcess:
         When:
             Process is started and server is configured
         Then:
-            Only add_secure_port is called with credentials, add_insecure_port is not called
+            Only add_secure_port is called with credentials,
+            add_insecure_port is not called
         """
         # Arrange
         mocker.patch.object(process_module, "_HAS_UDS", False)

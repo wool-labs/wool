@@ -9,3 +9,5 @@ omit =
 [report]
 show_missing = true
 precision = 2
+exclude_also =
+    assert_never\(

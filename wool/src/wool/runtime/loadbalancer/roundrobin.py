@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import Final
 
+from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 
 from .base import LoadBalancerContextLike
@@ -29,6 +30,19 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
     errors skip to the next worker while non-transient errors remove
     the worker from the context. One full cycle is attempted per
     dispatch call.
+
+    **Worker-health exception contract:** the load balancer treats
+    :class:`~wool.runtime.worker.connection.RpcError` (and its
+    transient subclass
+    :class:`~wool.runtime.worker.connection.TransientRpcError`) as
+    worker-health concerns. Other exceptions raised by
+    :meth:`WorkerConnection.dispatch` — e.g. a strict-mode
+    :class:`BaseExceptionGroup` of
+    :class:`wool.ContextDecodeWarning` peers from a caller-side
+    encode failure, or a programming-error
+    :class:`ValueError` — propagate to the caller unwrapped, so a
+    fault that has nothing to do with worker health does not evict
+    workers from the pool.
     """
 
     _index: Final[dict[LoadBalancerContextLike, int]]
@@ -90,7 +104,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                 except TransientRpcError:
                     self._index[context] = self._index[context] + 1
                     continue
-                except Exception:
+                except RpcError:
                     context.remove_worker(metadata)
                     if metadata.uid == checkpoint:
                         checkpoint = None

@@ -2488,7 +2488,7 @@ class TestWorkerProxy:
         )
 
         async with proxy:
-            pickled_data = wool.__serializer__.dumps(proxy)
+            wool.__serializer__.dumps(proxy)
 
         # Act — unpickle inside a WorkerCredentials context with
         # static workers so we can observe the security filter
