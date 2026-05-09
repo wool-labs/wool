@@ -19,6 +19,7 @@ from .conftest import DiscoveryFactory
 from .conftest import LazyMode
 from .conftest import LbFactory
 from .conftest import PoolMode
+from .conftest import QuorumMode
 from .conftest import RoutineBinding
 from .conftest import RoutineShape
 from .conftest import Scenario
@@ -62,6 +63,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act
@@ -104,6 +106,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act
@@ -146,6 +149,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act
@@ -188,6 +192,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act
@@ -232,6 +237,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act
@@ -274,6 +280,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act
@@ -317,6 +324,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act
@@ -359,6 +367,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act
@@ -404,6 +413,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act
@@ -447,6 +457,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act
@@ -490,6 +501,7 @@ class TestPoolComposition:
                 ctx_var_1=ContextVarPattern.NONE,
                 ctx_var_2=ContextVarPattern.NONE,
                 ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
             )
 
             # Act

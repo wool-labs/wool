@@ -17,6 +17,7 @@ from .conftest import DiscoveryFactory
 from .conftest import LazyMode
 from .conftest import LbFactory
 from .conftest import PoolMode
+from .conftest import QuorumMode
 from .conftest import RoutineBinding
 from .conftest import RoutineShape
 from .conftest import Scenario
@@ -87,6 +88,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         ContextVarPattern.NONE,
         ContextVarPattern.NONE,
         ContextVarPattern.NONE,
+        QuorumMode.DEFAULT,
     )
 )
 @example(
@@ -104,6 +106,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         ContextVarPattern.NONE,
         ContextVarPattern.NONE,
         ContextVarPattern.NONE,
+        QuorumMode.DEFAULT,
     )
 )
 @example(
@@ -121,6 +124,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
         ContextVarPattern.NONE,
         ContextVarPattern.NONE,
         ContextVarPattern.NONE,
+        QuorumMode.DEFAULT,
     )
 )
 @given(scenario=scenarios_strategy())

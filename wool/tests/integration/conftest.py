@@ -118,6 +118,11 @@ class LazyMode(Enum):
     EAGER = auto()
 
 
+class QuorumMode(Enum):
+    DEFAULT = auto()
+    ABOVE_DEFAULT = auto()
+
+
 def _sync_accept_hook(ctx):
     """Sync backpressure hook that accepts all tasks."""
     return False
@@ -149,6 +154,7 @@ class Scenario:
     ctx_var_1: ContextVarPattern | None = None
     ctx_var_2: ContextVarPattern | None = None
     ctx_var_3: ContextVarPattern | None = None
+    quorum: QuorumMode | None = None
 
     def __or__(self, other: Scenario) -> Scenario:
         """Merge two partial scenarios. Right side wins on ``None`` fields.
@@ -169,7 +175,7 @@ class Scenario:
 
     @property
     def is_complete(self) -> bool:
-        """True when all 13 dimensions are set."""
+        """True when all 14 dimensions are set."""
         return all(getattr(self, f.name) is not None for f in fields(self))
 
     def __str__(self) -> str:
@@ -315,16 +321,22 @@ async def build_pool_from_scenario(scenario, credentials_map):
         case _:
             bp_hook = None
 
+    match scenario.quorum:
+        case QuorumMode.ABOVE_DEFAULT:
+            quorum = 2
+        case _:
+            quorum = 1
+
     try:
         try:
             if scenario.pool_mode is PoolMode.DURABLE:
                 async with _durable_pool_context(
-                    lb, creds, options, lazy, backpressure=bp_hook
+                    lb, creds, options, lazy, quorum, backpressure=bp_hook
                 ) as pool:
                     yield pool
             elif scenario.pool_mode is PoolMode.DURABLE_SHARED:
                 async with _durable_shared_pool_context(
-                    lb, creds, options, lazy, backpressure=bp_hook
+                    lb, creds, options, lazy, quorum, backpressure=bp_hook
                 ) as pool:
                     yield pool
             elif scenario.pool_mode is PoolMode.DURABLE_JOINED:
@@ -334,6 +346,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
                     creds,
                     options,
                     lazy,
+                    quorum,
                     backpressure=bp_hook,
                 ) as pool:
                     yield pool
@@ -345,6 +358,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
                         LocalWorker, options=options, backpressure=bp_hook
                     ),
                     "lazy": lazy,
+                    "quorum": quorum,
                 }
                 match scenario.pool_mode:
                     case PoolMode.DEFAULT:
@@ -392,7 +406,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
 
 
 @asynccontextmanager
-async def _durable_pool_context(lb, creds, options, lazy, *, backpressure=None):
+async def _durable_pool_context(lb, creds, options, lazy, quorum, *, backpressure=None):
     """Manually start a worker, register it, then create a DURABLE pool.
 
     DURABLE pools don't spawn workers — they only discover external
@@ -418,6 +432,7 @@ async def _durable_pool_context(lb, creds, options, lazy, *, backpressure=None):
                         loadbalancer=lb,
                         credentials=creds,
                         lazy=lazy,
+                        quorum=quorum,
                     )
                     async with pool:
                         yield pool
@@ -428,7 +443,9 @@ async def _durable_pool_context(lb, creds, options, lazy, *, backpressure=None):
 
 
 @asynccontextmanager
-async def _durable_shared_pool_context(lb, creds, options, lazy, *, backpressure=None):
+async def _durable_shared_pool_context(
+    lb, creds, options, lazy, quorum, *, backpressure=None
+):
     """Create two pools sharing the same LocalDiscovery subscriber.
 
     Exercises ``SubscriberMeta`` singleton caching and
@@ -454,12 +471,14 @@ async def _durable_shared_pool_context(lb, creds, options, lazy, *, backpressure
                         loadbalancer=lb,
                         credentials=creds,
                         lazy=lazy,
+                        quorum=quorum,
                     )
                     pool_b = WorkerPool(
                         discovery=shared,
                         loadbalancer=lb,
                         credentials=creds,
                         lazy=lazy,
+                        quorum=quorum,
                     )
                     async with pool_a:
                         async with pool_b:
@@ -510,7 +529,7 @@ def _resolve_joiner(namespace, factory):
 
 @asynccontextmanager
 async def _durable_joined_pool_context(
-    discovery_factory, lb, creds, options, lazy, *, backpressure=None
+    discovery_factory, lb, creds, options, lazy, quorum, *, backpressure=None
 ):
     """Create a DURABLE pool that joins an externally owned namespace.
 
@@ -537,6 +556,7 @@ async def _durable_joined_pool_context(
                         loadbalancer=lb,
                         credentials=creds,
                         lazy=lazy,
+                        quorum=quorum,
                     )
                     async with pool:
                         yield pool
@@ -930,6 +950,9 @@ def _pairwise_filter(row):
     - D11/D12/D13 (ctx_var_1/2/3): DOWNSTREAM_OVERWRITE,
       DOWNSTREAM_RESET, UPSTREAM_RESET only valid with NESTED_* shapes;
       PER_YIELD only valid with ASYNC_GEN_* shapes
+    - D14 (quorum) ABOVE_DEFAULT (quorum=2) requires PoolMode.EPHEMERAL —
+      every other pool mode in the builder produces only one worker, so
+      quorum=2 would block forever.
     """
     if len(row) > 2:
         pool_mode = row[1]
@@ -983,6 +1006,11 @@ def _pairwise_filter(row):
                 and pattern is not ContextVarPattern.NONE
             ):
                 return False
+    if len(row) > 13:
+        quorum = row[13]
+        pool_mode = row[1]
+        if quorum is QuorumMode.ABOVE_DEFAULT and pool_mode is not PoolMode.EPHEMERAL:
+            return False
     return True
 
 
@@ -1001,6 +1029,7 @@ PAIRWISE_SCENARIOS = [
         ctx_var_1=row[10],
         ctx_var_2=row[11],
         ctx_var_3=row[12],
+        quorum=row[13],
     )
     for row in AllPairs(
         [
@@ -1017,6 +1046,7 @@ PAIRWISE_SCENARIOS = [
             list(ContextVarPattern),
             list(ContextVarPattern),
             list(ContextVarPattern),
+            list(QuorumMode),
         ],
         filter_func=_pairwise_filter,
     )
@@ -1097,6 +1127,13 @@ def scenarios_strategy(draw):
     ctx_var_2 = _draw_ctx_var_pattern(draw)
     ctx_var_3 = _draw_ctx_var_pattern(draw)
 
+    if pool_mode is PoolMode.EPHEMERAL:
+        quorum = draw(st.sampled_from(QuorumMode))
+    else:
+        quorum = draw(
+            st.sampled_from([m for m in QuorumMode if m is not QuorumMode.ABOVE_DEFAULT])
+        )
+
     return Scenario(
         shape=shape,
         pool_mode=pool_mode,
@@ -1111,6 +1148,7 @@ def scenarios_strategy(draw):
         ctx_var_1=ctx_var_1,
         ctx_var_2=ctx_var_2,
         ctx_var_3=ctx_var_3,
+        quorum=quorum,
     )
 
 

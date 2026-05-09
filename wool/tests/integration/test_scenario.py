@@ -9,6 +9,7 @@ from .conftest import DiscoveryFactory
 from .conftest import LazyMode
 from .conftest import LbFactory
 from .conftest import PoolMode
+from .conftest import QuorumMode
 from .conftest import RoutineBinding
 from .conftest import RoutineShape
 from .conftest import Scenario
@@ -106,7 +107,7 @@ class TestScenario:
         """Test that a fully populated scenario reports complete.
 
         Given:
-            A scenario with all 13 dimensions set.
+            A scenario with all 14 dimensions set.
         When:
             ``is_complete`` is checked.
         Then:
@@ -127,6 +128,7 @@ class TestScenario:
             ctx_var_1=ContextVarPattern.NONE,
             ctx_var_2=ContextVarPattern.NONE,
             ctx_var_3=ContextVarPattern.NONE,
+            quorum=QuorumMode.DEFAULT,
         )
 
         # Act & assert
@@ -172,7 +174,7 @@ class TestScenario:
         result = str(scenario)
 
         # Assert
-        assert result == "COROUTINE-DEFAULT-_-_-_-_-_-_-_-_-_-_-_"
+        assert result == "COROUTINE-DEFAULT-_-_-_-_-_-_-_-_-_-_-_-_"
 
     def test___str___with_empty_scenario(self):
         """Test string representation when no dimensions are set.
@@ -192,7 +194,7 @@ class TestScenario:
         result = str(scenario)
 
         # Assert
-        assert result == "-".join(["_"] * 13)
+        assert result == "-".join(["_"] * 14)
 
     def test___str___with_all_fields_set(self):
         """Test string representation when every dimension is set.
@@ -221,6 +223,7 @@ class TestScenario:
             ctx_var_1=ContextVarPattern.ROUND_TRIP,
             ctx_var_2=ContextVarPattern.LOCAL_RESET,
             ctx_var_3=ContextVarPattern.PER_YIELD,
+            quorum=QuorumMode.DEFAULT,
         )
 
         # Act
@@ -229,5 +232,5 @@ class TestScenario:
         # Assert
         assert result == (
             "COROUTINE-DEFAULT-LOCAL_DIRECT-CLASS_REF-INSECURE-DEFAULT-"
-            "NONE-MODULE_FUNCTION-EAGER-NONE-ROUND_TRIP-LOCAL_RESET-PER_YIELD"
+            "NONE-MODULE_FUNCTION-EAGER-NONE-ROUND_TRIP-LOCAL_RESET-PER_YIELD-DEFAULT"
         )
