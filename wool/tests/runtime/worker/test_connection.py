@@ -29,6 +29,15 @@ from wool.runtime.worker.connection import WorkerConnection
 from .conftest import PicklableMock
 
 
+class MyAppError(Exception):
+    """Custom user exception subclass defined at module scope.
+
+    Defined here (not inside a test) so cloudpickle can resolve the
+    class on deserialization in tests that round-trip user-defined
+    exception types through Nack.exception payloads.
+    """
+
+
 @pytest.fixture
 def sample_task(mocker: MockerFixture):
     """Provides a mock :class:`Task` for testing.
@@ -506,6 +515,101 @@ class TestWorkerConnection:
                 pass
 
     @pytest.mark.asyncio
+    async def test_dispatch_releases_semaphore_when_execute_setup_fails(
+        self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
+    ):
+        """Test :meth:`WorkerConnection.dispatch` releases the
+        channel semaphore when :meth:`_execute`'s pool re-acquire
+        fails before reaching the streaming body's ``finally``.
+
+        Regression test for A7. :meth:`_dispatch` acquires
+        ``channel.semaphore`` (line 581) and on success leaves it
+        held; the release lives in :meth:`_execute`'s body's
+        ``finally`` clause. That ``finally`` is inside the
+        ``try`` that begins after :meth:`_execute`'s
+        ``AsyncExitStack`` setup — so a failure during the
+        ``async with`` block's pool re-acquire (line 656,
+        ``await stack.enter_async_context(_channel_pool.get(...))``)
+        bypasses the ``finally`` and leaks the semaphore.
+        Post-fix the release is registered on the exit stack
+        before any await, so the unwind releases the semaphore
+        regardless of where setup failed.
+
+        Given:
+            A connection with ``max_concurrent_streams=1`` and a
+            mocked gRPC stack so the dispatch handshake completes
+            successfully, plus a patch on
+            :data:`_channel_pool.get` that succeeds on the first
+            call (dispatch handshake at line 523) and raises on
+            the second call (:meth:`_execute`'s re-acquire at
+            line 656).
+        When:
+            :meth:`WorkerConnection.dispatch` is invoked.
+        Then:
+            It should propagate the simulated failure AND
+            release the channel's semaphore — pre-fix the
+            semaphore leaked because the bypassed ``finally``
+            never ran.
+        """
+        from contextlib import asynccontextmanager
+
+        from wool.runtime.worker import connection as connection_module
+
+        # Mock the gRPC stack so the dispatch handshake succeeds.
+        responses = (protocol.Response(ack=protocol.Ack()),)
+        mock_call = mock_grpc_call(async_stream(responses))
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        # max_concurrent_streams=1 so a leaked permit is
+        # observable as a permanently-locked semaphore.
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=1)
+        )
+
+        # Patch ``_channel_pool.get`` to fail on the second call.
+        # The first call (dispatch handshake) goes through the
+        # real pool so the channel — and its semaphore — are
+        # available to the test's post-condition assertion.
+        original_get = connection_module._channel_pool.get
+        call_count = 0
+
+        @asynccontextmanager
+        async def _flaky_get(key):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                async with original_get(key) as channel:
+                    yield channel
+            else:
+                raise RuntimeError("simulated _execute re-acquire failure")
+
+        mocker.patch.object(
+            connection_module._channel_pool, "get", side_effect=_flaky_get
+        )
+
+        # Act
+        with pytest.raises(RuntimeError, match="simulated _execute"):
+            await connection.dispatch(sample_task)
+
+        # Assert
+        # Read the cached channel directly (bypasses the patched
+        # `get`) and inspect its semaphore. With
+        # ``max_concurrent_streams=1`` a held permit means
+        # ``locked() is True``; a released permit means
+        # ``locked() is False``.
+        entry = connection_module._channel_pool._cache.get(connection._key)
+        assert entry is not None, "channel should be cached after dispatch handshake"
+        channel = entry.obj
+        assert not channel.semaphore.locked(), (
+            "channel.semaphore must be released after dispatch failure; "
+            "pre-fix it leaked because _execute's body's `finally` was "
+            "bypassed when the AsyncExitStack setup failed before "
+            "reaching the inner try block"
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "cancel_raises",
         [False, True],
@@ -622,7 +726,86 @@ class TestWorkerConnection:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        mock_call.cancel.assert_called_once()
+        # The gRPC call must be cancelled. Both ``_read_next``'s
+        # except-BaseException cleanup and ``_execute``'s outer
+        # aclose path call ``call.cancel()`` — gRPC's cancel is
+        # idempotent, so 1+ calls is correct.
+        assert mock_call.cancel.called
+
+    @pytest.mark.asyncio
+    async def test_dispatch_stream_read_next_cancels_call_on_cancellation(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test :meth:`_DispatchStream._read_next` cancels the
+        underlying gRPC call when the awaiting task is cancelled
+        mid-read.
+
+        Regression test for A5. Pre-fix, ``_read_next`` used
+        ``except Exception`` which does NOT catch
+        :class:`asyncio.CancelledError` (a :class:`BaseException`
+        in 3.8+) — so cancellation mid-read bypassed
+        ``self._call.cancel()``. The cleanup happened via
+        ``_execute``'s outer handler, but the asymmetry with
+        ``_dispatch``'s broader catch was a latent footgun.
+        Post-fix, ``_read_next`` uses ``except BaseException`` so
+        any abnormal exit (cancellation, KeyboardInterrupt,
+        SystemExit) cleans up the gRPC call before re-raising,
+        matching stdlib resource-cleanup semantics.
+
+        This test isolates ``_read_next``'s behavior by
+        constructing a :class:`_DispatchStream` directly (bypassing
+        ``_execute``'s outer handler) and asserting cancel is
+        called when ``CancelledError`` fires mid-read.
+
+        Given:
+            A :class:`_DispatchStream` whose underlying gRPC call
+            blocks on read.
+        When:
+            The awaiting task is cancelled mid-``_read_next``.
+        Then:
+            ``self._call.cancel()`` is called before the
+            :class:`asyncio.CancelledError` propagates — pre-fix
+            cancel was skipped because ``except Exception`` does
+            not match :class:`asyncio.CancelledError`.
+        """
+        from wool.runtime.worker.connection import _DispatchStream
+
+        # Arrange — a gRPC iter that never completes, simulating
+        # a stuck read.
+        read_started = asyncio.Event()
+
+        async def _stuck_iter():
+            read_started.set()
+            await asyncio.sleep(60)
+            yield protocol.Response()  # never reached
+
+        mock_call = mock_grpc_call(async_stream([asyncio.sleep(60)]))
+        # Override __aiter__ with the stuck iterator.
+        stuck = _stuck_iter()
+        mock_call.__aiter__ = lambda _: stuck
+
+        stream = _DispatchStream(mock_call, sample_task)
+
+        async def consume():
+            await stream._read_next()
+
+        task = asyncio.create_task(consume())
+        await read_started.wait()
+        task.cancel()
+
+        # Act + Assert
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Pre-fix: mock_call.cancel.called == False (because
+        # except Exception did not match CancelledError, so the
+        # cleanup was skipped). Post-fix: cancel is called.
+        assert mock_call.cancel.called, (
+            "_read_next must cancel the underlying gRPC call when "
+            "its await is interrupted by CancelledError; pre-fix "
+            "the `except Exception` did not match CancelledError "
+            "and cleanup was bypassed"
+        )
 
     @pytest.mark.asyncio
     async def test_close_idempotent(self, mocker: MockerFixture):
@@ -872,6 +1055,353 @@ class TestWorkerConnection:
         with pytest.raises(RpcError, match="Task rejected by worker"):
             async for _ in await connection.dispatch(sample_task):
                 pass
+
+    @pytest.mark.asyncio
+    async def test_dispatch_nack_with_exception_reraises_original_class(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch re-raises the worker's exception class on Nack.
+
+        Given:
+            A worker that responds with a Nack whose exception field
+            carries a cloudpickle dump of ValueError("bad task id") and
+            reason="ValueError: bad task id"
+        When:
+            dispatch(task) is awaited and consumed via async iteration
+        Then:
+            It should raise ValueError with message "bad task id" (the
+            original class, not RpcError); mock_call.cancel is invoked
+        """
+        # Arrange
+        responses = (
+            protocol.Response(
+                nack=protocol.Nack(
+                    reason="ValueError: bad task id",
+                    exception=protocol.Message(
+                        dump=cloudpickle.dumps(ValueError("bad task id"))
+                    ),
+                )
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert
+        with pytest.raises(ValueError, match="bad task id"):
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        mock_call.cancel.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_nack_with_exception_preserves_subclass_identity(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch preserves the exact subclass of the worker exception.
+
+        Given:
+            A Nack whose exception field carries a cloudpickle dump of a
+            custom user exception subclass MyAppError defined at module
+            scope
+        When:
+            dispatch(task) is awaited and consumed
+        Then:
+            It should raise an exception whose type is MyAppError
+            (preserving subclass identity)
+        """
+        # Arrange
+        responses = (
+            protocol.Response(
+                nack=protocol.Nack(
+                    reason="MyAppError: app failure",
+                    exception=protocol.Message(
+                        dump=cloudpickle.dumps(MyAppError("app failure"))
+                    ),
+                )
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        with pytest.raises(MyAppError) as excinfo:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        # Assert
+        assert type(excinfo.value) is MyAppError
+
+    @pytest.mark.asyncio
+    async def test_dispatch_nack_with_exception_suppresses_implicit_chaining(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch suppresses chaining when re-raising the worker exception.
+
+        Given:
+            A Nack whose exception field carries a cloudpickle dump of
+            RuntimeError("boom")
+        When:
+            dispatch(task) is awaited and consumed inside
+            pytest.raises(RuntimeError)
+        Then:
+            It should raise an exception whose __cause__ is None and
+            whose __context__ is not a pickle/cloudpickle deserialization
+            frame
+        """
+        # Arrange
+        responses = (
+            protocol.Response(
+                nack=protocol.Nack(
+                    reason="RuntimeError: boom",
+                    exception=protocol.Message(
+                        dump=cloudpickle.dumps(RuntimeError("boom"))
+                    ),
+                )
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        with pytest.raises(RuntimeError) as excinfo:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        # Assert
+        assert excinfo.value.__cause__ is None
+        context = excinfo.value.__context__
+        if context is not None:
+            ctx_module = type(context).__module__
+            assert "pickle" not in ctx_module
+            assert "cloudpickle" not in ctx_module
+
+    @pytest.mark.asyncio
+    async def test_dispatch_nack_with_unpicklable_exception_falls_back_to_rpc_error(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch falls back to RpcError when the Nack dump is malformed.
+
+        Given:
+            A Nack whose exception.dump is the byte string b"not a valid
+            pickle" and reason="ImportError: missing"
+        When:
+            dispatch(task) is awaited and consumed
+        Then:
+            It should raise RpcError whose details contains "Task
+            rejected by worker: ImportError: missing"
+        """
+        # Arrange
+        responses = (
+            protocol.Response(
+                nack=protocol.Nack(
+                    reason="ImportError: missing",
+                    exception=protocol.Message(dump=b"not a valid pickle"),
+                )
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert
+        with pytest.raises(
+            RpcError, match="Task rejected by worker: ImportError: missing"
+        ):
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_dispatch_nack_with_non_exception_payload_falls_back_to_rpc_error(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch falls back to RpcError when the Nack dump is not an exception.
+
+        Given:
+            A Nack whose exception field carries a cloudpickle dump of a
+            non-BaseException value (the string "not an exception") and
+            reason="ValueError: oops"
+        When:
+            dispatch(task) is awaited and consumed
+        Then:
+            It should raise RpcError with details "Task rejected by
+            worker: ValueError: oops"
+        """
+        # Arrange
+        responses = (
+            protocol.Response(
+                nack=protocol.Nack(
+                    reason="ValueError: oops",
+                    exception=protocol.Message(
+                        dump=cloudpickle.dumps("not an exception")
+                    ),
+                )
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert
+        with pytest.raises(RpcError, match="Task rejected by worker: ValueError: oops"):
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_dispatch_nack_with_base_exception_falls_back_to_rpc_error(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch degrades non-Exception BaseException Nacks to RpcError.
+
+        Given:
+            A Nack whose exception field carries a cloudpickle dump of
+            KeyboardInterrupt() (a BaseException that is not an
+            Exception)
+        When:
+            dispatch(task) is awaited and consumed
+        Then:
+            It should raise RpcError carrying the Nack reason rather than
+            re-raise the BaseException, since Rejected.original is
+            Exception-typed by contract and a worker shipping a
+            non-Exception BaseException would be smuggling cancel/interrupt
+            signals across the wire.
+        """
+        # Arrange
+        responses = (
+            protocol.Response(
+                nack=protocol.Nack(
+                    reason="KeyboardInterrupt: ",
+                    exception=protocol.Message(
+                        dump=cloudpickle.dumps(KeyboardInterrupt())
+                    ),
+                )
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert
+        with pytest.raises(RpcError, match="KeyboardInterrupt"):
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+    @pytest.mark.asyncio
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @given(
+        exc_type=st.sampled_from(
+            (
+                ValueError,
+                RuntimeError,
+                TypeError,
+                KeyError,
+                LookupError,
+                OSError,
+                ArithmeticError,
+            )
+        ),
+        message=st.text(
+            alphabet=st.characters(min_codepoint=32, max_codepoint=126),
+            max_size=64,
+        ),
+    )
+    async def test_dispatch_nack_with_arbitrary_exception_roundtrips(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+        exc_type,
+        message,
+    ):
+        """Test dispatch round-trips arbitrary exception classes via Nack.
+
+        Given:
+            A Hypothesis-generated instance of one of (ValueError,
+            RuntimeError, TypeError, KeyError, LookupError, OSError,
+            ArithmeticError) paired with arbitrary printable text
+            messages, dumped via cloudpickle.dumps and shipped as a
+            Nack.exception
+        When:
+            dispatch(task) is awaited and consumed
+        Then:
+            The exception raised has the same type and str() as the
+            generated exception
+        """
+        # Arrange
+        generated_exc = exc_type(message)
+        responses = (
+            protocol.Response(
+                nack=protocol.Nack(
+                    reason=f"{exc_type.__name__}: {message}",
+                    exception=protocol.Message(dump=cloudpickle.dumps(generated_exc)),
+                )
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        try:
+            with pytest.raises(BaseException) as excinfo:
+                async for _ in await connection.dispatch(sample_task):
+                    pass
+
+            # Assert
+            assert type(excinfo.value) is type(generated_exc)
+            assert str(excinfo.value) == str(generated_exc)
+        finally:
+            # Hypothesis re-runs the test body per example while the
+            # module-level channel pool persists across iterations; the
+            # autouse cleanup fires only at function teardown. Close
+            # the connection to drop the cached channel so the next
+            # example sees the freshly patched stub.
+            await connection.close()
 
     @pytest.mark.asyncio
     async def test_dispatch_with_secure_channel(

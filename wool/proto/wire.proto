@@ -79,9 +79,20 @@ message Ack {
     string version = 1;
 }
 
+// Negative acknowledgment: the worker rejected the task at parse
+// phase, before any Ack. Always emitted alone (no preceding Ack,
+// no following frames).
 message Nack {
-    // Negative acknowledgment indicating the task was rejected
+    // Human-readable diagnostic. Always set. Carries the original
+    // exception's class and message for parse-phase rejections, or
+    // a plain description for envelope-level rejections (e.g.,
+    // version mismatch).
     string reason = 1;
+    // Dumped original exception, encoded with the same serializer
+    // as Response.exception. Set on parse-phase rejections so the
+    // client re-raises the actual failure class; unset for
+    // envelope-level rejections where no typed cause exists.
+    optional Message exception = 2;
 }
 
 service Worker {

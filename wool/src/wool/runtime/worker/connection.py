@@ -137,7 +137,17 @@ class _DispatchStream(Generic[_T]):
         :raises UnexpectedResponse:
             If the response is neither a result nor an exception.
         :raises Exception:
-            Any exception raised by the task execution is re-raised.
+            The worker-side routine's exception, re-raised in its
+            original class. The class is narrowed to
+            :class:`Exception`: a worker that ships a
+            non-:class:`Exception` :class:`BaseException`
+            (e.g., :class:`KeyboardInterrupt`,
+            :class:`SystemExit`, or a user-defined
+            :class:`BaseException` subclass) is degraded to
+            :class:`RpcError` so cancel/interrupt signals cannot
+            be smuggled across the wire and trip caller-side
+            cancellation semantics. Caller-side gRPC cancellation
+            arrives via a different path, not via this exception.
         """
         if self._closed:  # pragma: no cover
             raise StopAsyncIteration
@@ -197,18 +207,57 @@ class _DispatchStream(Generic[_T]):
                 return result
             elif response.HasField("exception"):
                 worker_exc = self._serializer.loads(response.exception.dump)
-                if decode_failures:
-                    raise BaseExceptionGroup(
-                        "response context decode failed alongside worker exception",
-                        [worker_exc, *decode_failures],
+                # See ``__anext__``'s ``:raises Exception:`` for the
+                # narrowing contract.
+                if not isinstance(worker_exc, Exception):
+                    worker_exc = RpcError(
+                        code=None,
+                        details=(
+                            "Worker shipped a non-Exception payload in "
+                            f"Response.exception: {type(worker_exc).__name__}"
+                        ),
                     )
+                if decode_failures:
+                    # Attach decode failures to the worker exception
+                    # rather than wrap both in a
+                    # :class:`BaseExceptionGroup`. Mirrors the
+                    # worker's encode-side handling
+                    # (:mod:`wool.runtime.worker.service`), so the
+                    # caller's existing ``except`` against the
+                    # routine's exception class keeps matching —
+                    # users don't have to migrate to ``except*``.
+                    try:
+                        for w in decode_failures:
+                            worker_exc.add_note(f"wool context warning: {w}")
+                    except (AttributeError, TypeError):
+                        pass
+                    try:
+                        setattr(
+                            worker_exc,
+                            "__wool_context_warnings__",
+                            decode_failures,
+                        )
+                    except AttributeError:
+                        pass
                 raise worker_exc
             else:
                 raise UnexpectedResponse(
                     f"Expected 'result' or 'exception' response, "
                     f"received '{response.WhichOneof('payload')}'"
                 )
-        except Exception:
+        except BaseException:
+            # Cancel the underlying gRPC call on any abnormal exit
+            # — including ``asyncio.CancelledError`` (a
+            # ``BaseException`` subclass), so cancellation
+            # propagates without leaking the in-flight call.
+            # Mirrors stdlib ``await agen.__anext__()`` cleanup
+            # semantics: any non-normal-return exit triggers
+            # resource cleanup before re-raising.
+            #
+            # The inner cancel-swallow is ``Exception``, not
+            # ``BaseException``: this is cleanup-during-cleanup,
+            # so a ``KeyboardInterrupt`` mid-cancel should
+            # propagate rather than be silently dropped.
             try:
                 self._call.cancel()
             except Exception:
@@ -328,11 +377,36 @@ class UnexpectedResponse(Exception):
 
 # public
 class RpcError(Exception):
-    """Raised when a gRPC call to a worker fails with a non-transient error.
+    """Raised when a gRPC call to a worker fails with a non-transient
+    error.
 
-    Non-transient errors indicate persistent issues with the worker that
-    are unlikely to be resolved by retrying (e.g., invalid arguments,
-    unimplemented methods, permission denied).
+    Non-transient errors indicate persistent issues with the worker
+    that are unlikely to be resolved by retrying (e.g., invalid
+    arguments, unimplemented methods, permission denied,
+    server-side bugs, version skew).
+
+    **Worker-health exception contract.** Load-balancer strategies
+    treat exception classes from :meth:`WorkerConnection.dispatch`
+    as a three-way classification:
+
+    - :class:`TransientRpcError` — worker is hiccupping
+      (``UNAVAILABLE`` / ``DEADLINE_EXCEEDED`` /
+      ``RESOURCE_EXHAUSTED``); the strategy should **skip** to
+      the next worker without eviction. The worker may recover.
+    - :class:`RpcError` (non-transient) — worker is unhealthy
+      (``INTERNAL``, ``FAILED_PRECONDITION``, malformed Nack
+      dump, version skew, etc.); the strategy should **evict**.
+      Today's binary policy is "evict on first occurrence";
+      health-aware forgiveness (N-strikes) is a follow-up.
+    - Any other class — caller-fault (parse-phase failures
+      re-raised as the original exception type, caller-side
+      encode failures, programming bugs); the strategy
+      **propagates** to the caller without touching the pool.
+
+    Strategy authors implementing :class:`LoadBalancerLike` MUST
+    honor this contract: a strategy that catches :class:`Exception`
+    indiscriminately will silently evict workers on every
+    caller-side bug, wiping the pool over time.
     """
 
     def __init__(
@@ -375,6 +449,15 @@ class WorkerConnection:
     holds its own reference, then releases the dispatch-scope reference.
     The channel stays alive until the caller finishes consuming the
     result stream.
+
+    **Cleanup semantics on cancellation.** Every code path that owns
+    an in-flight gRPC call wraps its body in
+    ``try / except BaseException`` so that ``asyncio.CancelledError``
+    (a :class:`BaseException` subclass, not :class:`Exception`) still
+    triggers ``call.cancel()`` before re-raising. The cancel itself
+    is swallowed at :class:`Exception` (not :class:`BaseException`) —
+    cleanup-during-cleanup should let ``KeyboardInterrupt`` propagate
+    rather than silently drop a process-level signal.
 
     **Usage:**
 
@@ -464,12 +547,16 @@ class WorkerConnection:
           :class:`BaseExceptionGroup` raises in place of the return —
           strict mode loses the primary value but every decode
           failure surfaces, not just the first.
-        * On an exception frame, the worker exception is bundled as
-          a peer alongside the decode failures in a
-          :class:`BaseExceptionGroup` so both signals reach the
-          caller (``except*`` splits them). Under the default filter
-          the per-entry warnings emit once during decode and the
-          worker exception raises unwrapped.
+        * On an exception frame, decode failures are attached to
+          the worker exception via PEP 678 ``__notes__`` (visible
+          in tracebacks) and a ``__wool_context_warnings__``
+          attribute (programmatic access), mirroring the worker's
+          encode-side handling. The worker exception class is
+          preserved so the caller's existing
+          ``except RoutineError`` continues to catch without
+          migration to ``except*``. Under the default filter the
+          per-entry warnings emit once during decode and the worker
+          exception raises unwrapped.
 
         :param task:
             The :class:`Task` instance to dispatch to the worker.
@@ -485,11 +572,20 @@ class WorkerConnection:
             dispatch-phase timeout fires (also classified as
             DEADLINE_EXCEEDED).
         :raises RpcError:
-            If the worker returns a non-transient RPC error.
+            If the worker returns a non-transient RPC error or
+            rejects with a Nack whose dumped exception cannot be
+            deserialized (malformed-dump fallback).
         :raises UnexpectedResponse:
             If the worker doesn't acknowledge the task.
         :raises ValueError:
             If the timeout value is not positive.
+
+        If the worker rejects the task during the parse phase due
+        to a malformed task payload, the original exception class
+        is deserialized from the Nack and re-raised so the caller
+        observes the actual failure class rather than an opaque
+        protocol error. A malformed Nack payload falls back to
+        :class:`RpcError`.
 
         Encode-side failures (e.g. a strict-mode
         :class:`BaseExceptionGroup` of
@@ -548,7 +644,7 @@ class WorkerConnection:
                     "Local dispatch-phase timeout exceeded",
                 ) from error
 
-            stream = self._execute(call, task, key, serializer)
+            stream = self._execute(call, task, key, channel, serializer)
             await stream.__anext__()  # Prime: _execute acquires its own ref
 
         return cast(AsyncGenerator[protocol.Message, None], stream)
@@ -591,6 +687,50 @@ class WorkerConnection:
                     await call.write(request)
                     response = await anext(aiter(call))
                     if response.HasField("nack"):
+                        # Workers attach a dumped exception payload
+                        # to Nack when the rejection originates from
+                        # parse-phase decode failures (malformed
+                        # task id, unpicklable serializer hint,
+                        # strict-mode ContextDecodeWarning,
+                        # cloudpickle errors on the task callable,
+                        # ImportError on a missing module on the
+                        # worker). Deserialize and re-raise so the
+                        # caller observes the actual failure class
+                        # rather than an opaque RpcError. Plain
+                        # Nacks (e.g., version mismatch) carry only
+                        # a reason string and surface as
+                        # :class:`RpcError`. A malformed dump (raises
+                        # on ``loads`` or deserializes to a non-
+                        # :class:`Exception`) also falls back to
+                        # :class:`RpcError(reason)` — the worker
+                        # writes a typed ``reason``
+                        # (``f"{type(original).__name__}: {original}"``)
+                        # for parse-phase Nacks specifically so this
+                        # fallback path still carries the failure
+                        # class name and message.
+                        if response.nack.HasField("exception"):
+                            nack_serializer = (
+                                serializer
+                                if serializer is not None
+                                else wool.__serializer__
+                            )
+                            try:
+                                raised = nack_serializer.loads(
+                                    response.nack.exception.dump
+                                )
+                            except Exception:
+                                raised = None
+                            # Narrowed to ``Exception`` to match
+                            # ``Rejected.original``'s typed contract
+                            # (worker constructs ``Rejected`` only
+                            # from ``except Exception``). A worker
+                            # that ships a non-``Exception``
+                            # ``BaseException`` would be a worker
+                            # bug; degrade to ``RpcError(reason)``
+                            # rather than smuggle cancel/interrupt
+                            # signals across the wire.
+                            if isinstance(raised, Exception):
+                                raise raised from None
                         raise RpcError(
                             details=f"Task rejected by worker: {response.nack.reason}"
                         )
@@ -599,13 +739,22 @@ class WorkerConnection:
                             f"Expected 'ack' response, "
                             f"received '{response.WhichOneof('payload')}'"
                         )
-                except (Exception, asyncio.CancelledError):
+                except BaseException:
+                    # Cancel the in-flight gRPC call on any abnormal
+                    # exit, so a caller-side ``CancelledError`` (a
+                    # ``BaseException`` subclass) propagates without
+                    # leaking the call. The inner cancel-swallow is
+                    # narrow to ``Exception``: this is cleanup-during-
+                    # cleanup, so a ``KeyboardInterrupt`` mid-cancel
+                    # should propagate rather than be silently
+                    # dropped. Mirrors the same pattern in
+                    # :meth:`_DispatchStream._read_next`.
                     try:
                         call.cancel()
                     except Exception:
                         pass
                     raise
-            except (Exception, asyncio.CancelledError):
+            except BaseException:
                 channel.semaphore.release()
                 raise
         return call
@@ -615,9 +764,38 @@ class WorkerConnection:
         call: _DispatchCall,
         task: Task,
         key: _PoolKey,
+        channel: _Channel,
         serializer: PassthroughSerializer | None = None,
     ) -> AsyncGenerator[protocol.Message | None, None]:
         async with AsyncExitStack() as stack:
+            # Pair the channel-semaphore release with the streaming
+            # generator's lifetime. :meth:`_dispatch` acquired the
+            # permit on success; :meth:`_execute` owns the release
+            # from here. Registering before any await means the
+            # callback fires whether setup succeeds, fails during
+            # the pool re-acquires below, or unwinds on aclose
+            # without ever reaching the priming yield.
+            stack.callback(channel.semaphore.release)
+
+            # Pair the in-flight gRPC call's cancellation with the
+            # same stack. ``_dispatch`` handed us a primed ``call``;
+            # if either pool re-acquire below raises before
+            # :class:`_DispatchStream` wraps the call (the
+            # post-priming try/except handles every wrap-or-later
+            # path), the call would otherwise be orphaned and rely
+            # on garbage collection. The cancel is a no-op once the
+            # stream takes ownership and naturally finalizes the
+            # call on aclose. Swallow ``Exception`` (not
+            # ``BaseException``) so a buggy stub's ``cancel()``
+            # does not replace whatever exception is unwinding the
+            # stack; cleanup-during-cleanup.
+            def _safe_cancel() -> None:
+                try:
+                    call.cancel()
+                except Exception:
+                    pass
+
+            stack.callback(_safe_cancel)
             if serializer is not None:
                 # Re-pin the per-task passthrough serializer for the
                 # streaming generator's lifetime. The dispatch() caller
@@ -625,36 +803,39 @@ class WorkerConnection:
                 # when the stack exits, mirroring the channel-pool
                 # pattern.
                 await stack.enter_async_context(_passthrough_pool.get(task.id))
-            channel = await stack.enter_async_context(_channel_pool.get(key))
+            await stack.enter_async_context(_channel_pool.get(key))
+            # Priming yield. By this point both pool refs (channel,
+            # plus passthrough when applicable) are pinned to this
+            # generator's :class:`AsyncExitStack`. ``dispatch()``'s
+            # caller resumes from its ``await stream.__anext__()``
+            # and can safely exit its own dispatch-scope ExitStack:
+            # the long-lived refs now live here, not there.
+            yield
+            stream = _DispatchStream(call, task, serializer=serializer)
             try:
-                # Priming yield. By this point both pool refs (channel,
-                # plus passthrough when applicable) are pinned to this
-                # generator's :class:`AsyncExitStack`. ``dispatch()``'s
-                # caller resumes from its ``await stream.__anext__()``
-                # and can safely exit its own dispatch-scope ExitStack:
-                # the long-lived refs now live here, not there.
-                yield
-                stream = _DispatchStream(call, task, serializer=serializer)
-                try:
-                    sent = None
-                    result = await anext(stream)
-                    while True:
-                        try:
-                            sent = yield result
-                        except GeneratorExit:
-                            await stream.aclose()
-                            return
-                        except BaseException as exc:
-                            result = await stream.athrow(type(exc), exc)
-                        else:
-                            result = await stream.asend(sent)
-                except StopAsyncIteration:
-                    return
-                except (Exception, asyncio.CancelledError):
+                sent = None
+                result = await anext(stream)
+                while True:
                     try:
+                        sent = yield result
+                    except GeneratorExit:
                         await stream.aclose()
-                    except Exception:  # pragma: no cover
-                        pass
-                    raise
-            finally:
-                channel.semaphore.release()
+                        return
+                    except BaseException as exc:
+                        result = await stream.athrow(type(exc), exc)
+                    else:
+                        result = await stream.asend(sent)
+            except StopAsyncIteration:
+                return
+            except BaseException:
+                # Cancel the in-flight gRPC call on any abnormal exit
+                # — including ``asyncio.CancelledError`` (a
+                # ``BaseException`` subclass) — so cancellation
+                # propagates without leaking the call. The inner
+                # swallow is narrow to ``Exception`` so a
+                # ``KeyboardInterrupt`` mid-cleanup still propagates.
+                try:
+                    await stream.aclose()
+                except Exception:  # pragma: no cover
+                    pass
+                raise
