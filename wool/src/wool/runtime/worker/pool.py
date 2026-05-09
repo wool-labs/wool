@@ -18,12 +18,19 @@ from typing_extensions import deprecated
 from wool.runtime.context import install_task_factory
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
+from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.typing import Factory
+from wool.runtime.typing import Undefined
+from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.local import LocalWorker
+from wool.runtime.worker.proxy import DEFAULT_LAZY
+from wool.runtime.worker.proxy import DEFAULT_QUORUM
+from wool.runtime.worker.proxy import DEFAULT_QUORUM_TIMEOUT
+from wool.runtime.worker.proxy import IneffectiveQuorumTimeoutWarning
 from wool.runtime.worker.proxy import LoadBalancerLike
 from wool.runtime.worker.proxy import RoundRobinLoadBalancer
 from wool.runtime.worker.proxy import WorkerProxy
@@ -138,6 +145,15 @@ class WorkerPool:
         async with WorkerPool(discovery=custom_discovery):
             result = await task()
 
+    **Quorum gate:**
+
+    .. code-block:: python
+
+        # Spawn 4 workers, block on context entry until all 4 are
+        # admitted, and time out after 30s if not.
+        async with WorkerPool(spawn=4, quorum=4, quorum_timeout=30, lazy=False):
+            result = await task()
+
     :param tags:
         Capability tags for spawned workers.
     :param spawn:
@@ -151,14 +167,42 @@ class WorkerPool:
         ``lease`` for external pools. Defaults to ``None`` (unbounded).
     :param worker:
         Worker factory callable. Defaults to :class:`LocalWorker`.
-    :param loadbalancer:
-        Load balancer instance, factory, or context manager.
     :param discovery:
         Discovery service instance, factory, or context manager.
+    :param loadbalancer:
+        Load balancer instance, factory, or context manager.
     :param credentials:
         Optional channel credentials for TLS/mTLS connections to workers.
+    :param quorum:
+        Minimum number of workers that must be discovered before the proxy
+        considers itself ready. Defaults to ``1`` — block until at least
+        one worker is admitted, preserving the pre-quorum implicit-wait
+        behaviour. Pass a larger integer to require more workers, or
+        ``None``/``0`` to disable the gate entirely (``dispatch`` may
+        then raise immediately if no workers have been discovered yet).
+        When ``lazy=True`` (default), the quorum wait is deferred to the
+        first dispatch; with ``lazy=False`` it blocks at context entry.
+    :param quorum_timeout:
+        Seconds to wait for ``quorum`` workers to be discovered before
+        raising :class:`asyncio.TimeoutError`. Only meaningful when
+        ``quorum`` is a positive integer; supplying it with
+        ``quorum=None`` or ``quorum=0`` records the value but never
+        consults it, accompanied by an
+        :class:`~wool.runtime.worker.proxy.IneffectiveQuorumTimeoutWarning`.
+        Defaults to ``60``; pass ``None`` to wait indefinitely. On
+        timeout the pool instance becomes unusable (single-use
+        semantics); construct a new pool to retry.
+    :param lazy:
+        When ``True`` (default), defer discovery setup and the quorum
+        wait to the first :meth:`WorkerProxy.dispatch`.  When ``False``,
+        eagerly enter the underlying proxy at ``__aenter__`` time and
+        run the quorum wait there.
     :raises ValueError:
         If configuration is invalid or CPU count unavailable.
+    :raises asyncio.TimeoutError:
+        If the quorum wait does not complete within ``quorum_timeout``
+        — raised by the underlying :class:`WorkerProxy` at context
+        entry (``lazy=False``) or first dispatch (``lazy=True``).
 
     .. caution::
 
@@ -182,7 +226,9 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
-        lazy: bool = True,
+        quorum: int | None = DEFAULT_QUORUM,
+        quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
+        lazy: bool = DEFAULT_LAZY,
     ):
         """
         Create an ephemeral pool of workers, spawning the specified
@@ -200,10 +246,12 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
-        lazy: bool = True,
+        quorum: int | None = DEFAULT_QUORUM,
+        quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
+        lazy: bool = DEFAULT_LAZY,
     ):
         """
-        Connect to an existing pool of workers discovered by the
+        Connect to an external pool of workers discovered by the
         specified discovery protocol.
         """
         ...
@@ -220,7 +268,9 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
-        lazy: bool = True,
+        quorum: int | None = DEFAULT_QUORUM,
+        quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
+        lazy: bool = DEFAULT_LAZY,
     ):
         """
         Create a hybrid pool that spawns local workers and discovers
@@ -241,7 +291,9 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
-        lazy: bool = True,
+        quorum: int | None = DEFAULT_QUORUM,
+        quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
+        lazy: bool = DEFAULT_LAZY,
     ): ...
 
     @overload
@@ -257,7 +309,9 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
-        lazy: bool = True,
+        quorum: int | None = DEFAULT_QUORUM,
+        quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
+        lazy: bool = DEFAULT_LAZY,
     ): ...
 
     def __init__(
@@ -272,7 +326,9 @@ class WorkerPool:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | None = None,
-        lazy: bool = True,
+        quorum: int | None = DEFAULT_QUORUM,
+        quorum_timeout: float | None | UndefinedType = Undefined,
+        lazy: bool = DEFAULT_LAZY,
     ):
         self._workers = {}
         self._credentials = credentials
@@ -294,10 +350,28 @@ class WorkerPool:
         if lease is not None and lease < 0:
             raise ValueError("Lease must be non-negative")
 
+        # Warn when `quorum_timeout` is supplied alongside a falsy `quorum`;
+        # the value is recorded but never consulted.  The warning is
+        # emitted at the pool layer because `_make_proxy` elides
+        # `quorum_timeout` when forwarding to the proxy in those cases,
+        # so WorkerProxy never sees that the pool's user supplied one.
+        # Other quorum/quorum_timeout validations are delegated to
+        # WorkerProxy.
+        if quorum_timeout is Undefined:
+            quorum_timeout = DEFAULT_QUORUM_TIMEOUT
+        elif not quorum:
+            warnings.warn(
+                "'quorum_timeout' has no effect when 'quorum' is None or 0; "
+                "the value is recorded but never consulted",
+                IneffectiveQuorumTimeoutWarning,
+                stacklevel=2,
+            )
+
         match (spawn, discovery):
             case (spawn, discovery) if spawn is not None and discovery is not None:
                 spawn = _resolve_spawn(spawn)
                 max_workers = spawn + lease if lease is not None else None
+                self._validate_quorum(quorum, max_workers)
 
                 @asynccontextmanager
                 async def create_proxy():
@@ -314,11 +388,12 @@ class WorkerPool:
                             factory=worker,
                             publisher=discovery_svc.publisher,
                         ):
-                            async with WorkerProxy(
+                            async with self._make_proxy(
                                 discovery=discovery_svc.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
-                                credentials=self._credentials,
                                 lease=max_workers,
+                                quorum=quorum,
+                                quorum_timeout=quorum_timeout,
                                 lazy=self._lazy,
                             ):
                                 yield
@@ -328,6 +403,7 @@ class WorkerPool:
             case (spawn, None) if spawn is not None:
                 spawn = _resolve_spawn(spawn)
                 max_workers = spawn + lease if lease is not None else None
+                self._validate_quorum(quorum, max_workers)
 
                 namespace = f"pool-{uuid.uuid4().hex}"
 
@@ -340,11 +416,12 @@ class WorkerPool:
                             factory=worker,
                             publisher=discovery.publisher,
                         ):
-                            async with WorkerProxy(
+                            async with self._make_proxy(
                                 discovery=discovery.subscribe(_predicate(tags)),
                                 loadbalancer=loadbalancer,
-                                credentials=self._credentials,
                                 lease=max_workers,
+                                quorum=quorum,
+                                quorum_timeout=quorum_timeout,
                                 lazy=self._lazy,
                             ):
                                 yield
@@ -359,11 +436,12 @@ class WorkerPool:
                     if not isinstance(discovery_svc, DiscoveryLike):
                         raise ValueError
                     try:
-                        async with WorkerProxy(
+                        async with self._make_proxy(
                             discovery=discovery_svc.subscriber,
                             loadbalancer=loadbalancer,
-                            credentials=self._credentials,
                             lease=lease,
+                            quorum=quorum,
+                            quorum_timeout=quorum_timeout,
                             lazy=self._lazy,
                         ):
                             yield
@@ -373,6 +451,7 @@ class WorkerPool:
             case (None, None):
                 spawn = _resolve_spawn(0)
                 max_workers = spawn + lease if lease is not None else None
+                self._validate_quorum(quorum, max_workers)
 
                 namespace = f"pool-{uuid.uuid4().hex}"
 
@@ -385,11 +464,12 @@ class WorkerPool:
                             factory=worker,
                             publisher=discovery.publisher,
                         ):
-                            async with WorkerProxy(
+                            async with self._make_proxy(
                                 discovery=discovery.subscriber,
-                                loadbalancer=loadbalancer,
-                                credentials=self._credentials,
                                 lease=max_workers,
+                                loadbalancer=loadbalancer,
+                                quorum=quorum,
+                                quorum_timeout=quorum_timeout,
                                 lazy=self._lazy,
                             ):
                                 yield
@@ -398,6 +478,19 @@ class WorkerPool:
                 raise RuntimeError
 
         self._proxy_factory = create_proxy
+
+    @staticmethod
+    def _validate_quorum(quorum: int | None, max_workers: int | None) -> None:
+        """Reject a quorum that exceeds the pool's bounded capacity.
+
+        No-op when either side is ``None`` (an unset quorum or an
+        unbounded ``max_workers``).
+        """
+        if max_workers is not None and quorum is not None and quorum > max_workers:
+            raise ValueError(
+                f"Quorum ({quorum}) cannot exceed pool capacity "
+                f"({max_workers}) — the quorum would never be satisfied"
+            )
 
     @noreentry
     async def __aenter__(self) -> WorkerPool:
@@ -467,6 +560,43 @@ class WorkerPool:
             return LocalWorker(*tags, credentials=credentials)
 
         return factory
+
+    def _make_proxy(
+        self,
+        *,
+        discovery: DiscoverySubscriberLike,
+        loadbalancer: LoadBalancerLike | Factory[LoadBalancerLike],
+        lease: int | None,
+        quorum: int | None,
+        quorum_timeout: float | None,
+        lazy: bool,
+    ) -> WorkerProxy:
+        """Construct a :class:`WorkerProxy` for this pool's discovery.
+
+        Selects :class:`WorkerProxy`'s typed overload via narrowing:
+        when ``quorum`` is truthy, forwards both ``quorum`` and
+        ``quorum_timeout``; otherwise normalizes ``quorum=0`` and
+        ``quorum=None`` to literal ``None`` (which the pool's user
+        contract documents as equivalent) and drops ``quorum_timeout``.
+        """
+        if quorum:
+            return WorkerProxy(
+                discovery=discovery,
+                loadbalancer=loadbalancer,
+                credentials=self._credentials,
+                lease=lease,
+                quorum=quorum,
+                quorum_timeout=quorum_timeout,
+                lazy=lazy,
+            )
+        return WorkerProxy(
+            discovery=discovery,
+            loadbalancer=loadbalancer,
+            credentials=self._credentials,
+            lease=lease,
+            quorum=None,
+            lazy=lazy,
+        )
 
     async def _enter_context(self, factory):
         ctx = None
