@@ -1,112 +1,33 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
+import pickle
 import threading
-from contextlib import AsyncExitStack
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from dataclasses import field
-from inspect import isasyncgen
-from inspect import isasyncgenfunction
 from inspect import isawaitable
-from inspect import iscoroutinefunction
-from typing import Any
-from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Awaitable
-from typing import Final
-from typing import Literal
 from typing import Protocol
-from typing import assert_never
-from typing import cast
 from typing import runtime_checkable
-from uuid import UUID
 
 from grpc import StatusCode
+from grpc.aio import AbortError
 from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
-from wool.runtime.context import Context
 from wool.runtime.context import attached
 from wool.runtime.context import install_task_factory
+from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
-from wool.runtime.routine.task import _unpickle_serializer
-from wool.runtime.routine.task import do_dispatch
-from wool.runtime.serializer import PassthroughSerializer
 from wool.runtime.serializer import Serializer
-from wool.runtime.serializer import _passthrough_pool
+from wool.runtime.worker.session import DispatchSession
+from wool.runtime.worker.session import Rejected
 
 _log = logging.getLogger(__name__)
-
-# Sentinel to mark end of async generator stream
-_STREAM_END: Final = object()
-
-
-@dataclass
-class _WorkerOutcome:
-    """Result of a worker-loop task execution.
-
-    Always carries the post-run :class:`protocol.Context` so the
-    handler can ship caller-visible mutations on the Response
-    regardless of whether the routine returned normally or raised.
-    """
-
-    result: Any = None
-    exception: BaseException | None = None
-    context: protocol.Context = field(default_factory=protocol.Context)
-
-
-def _response_from_outcome(
-    outcome: _WorkerOutcome,
-    serializer: Serializer,
-) -> protocol.Response:
-    """Build a :class:`protocol.Response` frame from a worker outcome.
-
-    Picks the ``exception`` or ``result`` oneof based on which field
-    is set, serializes the payload, and attaches the worker's context
-    (ID + var snapshot) on the response.
-    """
-    if outcome.exception is not None:
-        return protocol.Response(
-            exception=protocol.Message(dump=serializer.dumps(outcome.exception)),
-            context=outcome.context,
-        )
-    return protocol.Response(
-        result=protocol.Message(dump=serializer.dumps(outcome.result)),
-        context=outcome.context,
-    )
-
-
-def _merge_exceptions(
-    primary: BaseException,
-    secondary: BaseException,
-) -> BaseExceptionGroup:
-    """Merge *primary* and *secondary* into a single
-    :class:`BaseExceptionGroup`, flattening either side when it is
-    already a group so callers see one flat peer structure.
-
-    When *primary* is a :class:`BaseExceptionGroup`, peers are
-    appended via :meth:`BaseExceptionGroup.derive`, preserving the
-    original group's message and metadata. When *primary* is not a
-    group, the returned group is labelled
-    ``"wool dispatch primary signal with ancillary failure"`` — a
-    fixed string covering every site that hits this helper today.
-    """
-    secondary_peers = (
-        list(secondary.exceptions)
-        if isinstance(secondary, BaseExceptionGroup)
-        else [secondary]
-    )
-    if isinstance(primary, BaseExceptionGroup):
-        return primary.derive([*primary.exceptions, *secondary_peers])
-    return BaseExceptionGroup(
-        "wool dispatch primary signal with ancillary failure",
-        [primary, *secondary_peers],
-    )
 
 
 def _safely_serialize_exception(
@@ -114,49 +35,73 @@ def _safely_serialize_exception(
     exc: BaseException,
 ) -> bytes:
     """Serialize *exc*, falling back to a synthesized
-    :class:`RuntimeError` if dumping the original raises.
+    :class:`RuntimeError` if *exc* contains un-picklable state.
 
-    Prevents unpicklable exception state from converting a
+    Prevents un-picklable exception state from converting a
     wool-class failure on the wire into a generic gRPC stream
-    error on the caller side.
+    error on the caller side. The negotiated serializer is
+    always either :class:`PassthroughSerializer` (which can
+    never fail — it stashes by reference and returns a token)
+    or :class:`CloudpickleSerializer` (which fails on
+    un-picklable input via :class:`pickle.PickleError`,
+    :class:`TypeError` for un-picklable C types,
+    :class:`AttributeError` for un-picklable local closures, or
+    :class:`RecursionError` for deeply self-referential graphs).
+    The fallback synthesizes a stdlib :class:`RuntimeError` —
+    always picklable — so the second ``dumps`` call cannot fail
+    for either serializer; no further tier of defense is
+    warranted, and exceptions outside the un-picklable-input
+    set propagate as real bugs in the serializer.
     """
     try:
         return serializer.dumps(exc)
-    except Exception:
+    except (pickle.PickleError, TypeError, AttributeError, RecursionError):
         return serializer.dumps(RuntimeError(f"{type(exc).__name__}: {exc!s}"))
 
 
-def _outcome_from(
-    *,
-    value: Any = None,
-    routine_exc: BaseException | None,
-    context: Context,
-    serializer: Serializer,
-) -> _WorkerOutcome:
-    """Build a :class:`_WorkerOutcome` for a routine step, including
-    the post-step context snapshot.
+def _attach_strict_mode_warnings(exc: BaseException, encode_exc: BaseException) -> None:
+    """Attach strict-mode :class:`wool.ContextDecodeWarning` peers to a
+    routine exception.
 
-    Centralizes the primary-signal preservation contract — the
-    result-or-exception fork plus snapshot bundling — so each step
-    builds an outcome the same way regardless of dispatch shape. When
-    encoding fails alongside a *routine_exc* in flight, the two are
-    merged via :func:`_merge_exceptions` so the snapshot never
-    preempts or demotes the primary signal. Encode failures alone
-    (no routine exception) become the outcome's exception with an
-    empty context patch. Either way the failure does not escape this
-    function, so callers can rely on every code path producing a
-    :class:`_WorkerOutcome`.
+    When strict mode promotes :class:`wool.ContextDecodeWarning` to an
+    exception, the post-run snapshot encode (``session.context.to_protobuf``)
+    raises a :class:`BaseExceptionGroup` of warning peers. Attach the peers
+    to *exc* via PEP 678 ``__notes__`` (visible in tracebacks) and a
+    ``__wool_context_warnings__`` attribute (programmatic access). The
+    routine exception's type is preserved, so the caller's existing
+    ``except RoutineError:`` clause continues to catch — no migration to
+    ``except*`` or ``except ExceptionGroup`` required.
+
+    Both attachment paths are best-effort. ``add_note`` may raise on a
+    subclass with an overridden ``__setattr__`` or an unusual C-level
+    storage policy; ``setattr`` may raise ``AttributeError`` on frozen
+    dataclass exceptions or slotted layouts without ``__dict__``. Either
+    is swallowed so the routine's primary signal still ships — the
+    warnings simply will not ride on a type that rejects them.
+
+    Lifted out of the dispatch handler's terminal-exception clause as a
+    flat sync helper so coverage tooling on Python 3.11 (``sys.settrace``)
+    can track it; the deeply nested original lived inside an async
+    generator's nested except arm and was opaque to pre-PEP-669 tracing.
+
+    :param exc:
+        The routine's primary exception, annotated in place.
+    :param encode_exc:
+        The encode-time failure carrying the warning peers.
     """
+    if isinstance(encode_exc, BaseExceptionGroup):
+        context_warnings: list[BaseException] = list(encode_exc.exceptions)
+    else:
+        context_warnings = [encode_exc]
     try:
-        wire_context = context.to_protobuf(serializer=serializer)
-    except Exception as context_exc:
-        if routine_exc is not None:
-            merged = _merge_exceptions(routine_exc, context_exc)
-            return _WorkerOutcome(exception=merged, context=protocol.Context())
-        return _WorkerOutcome(exception=context_exc, context=protocol.Context())
-    if routine_exc is not None:
-        return _WorkerOutcome(exception=routine_exc, context=wire_context)
-    return _WorkerOutcome(result=value, context=wire_context)
+        for w in context_warnings:
+            exc.add_note(f"wool context warning: {w}")
+    except (AttributeError, TypeError):
+        pass
+    try:
+        setattr(exc, "__wool_context_warnings__", context_warnings)
+    except AttributeError:
+        pass
 
 
 # public
@@ -219,23 +164,6 @@ class BackpressureLike(Protocol):
         ...
 
 
-class _Task:
-    def __init__(self, task: asyncio.Task):
-        self._work = task
-
-    async def cancel(self):
-        self._work.cancel()
-        await self._work
-
-
-class _AsyncGen:
-    def __init__(self, task: AsyncGenerator):
-        self._work = task
-
-    async def cancel(self):
-        await self._work.aclose()
-
-
 class _ReadOnlyEvent:
     """A read-only wrapper around :class:`asyncio.Event`.
 
@@ -279,18 +207,28 @@ class WorkerService(protocol.WorkerServicer):
         tasks unconditionally.
     """
 
-    _docket: set[_Task | _AsyncGen]
+    _docket: set[DispatchSession]
     _stopped: asyncio.Event
     _stopping: asyncio.Event
-    _task_completed: asyncio.Event
     _loop_pool: ResourcePool[tuple[asyncio.AbstractEventLoop, threading.Thread]]
 
     def __init__(self, *, backpressure: BackpressureLike | None = None):
         self._stopped = asyncio.Event()
         self._stopping = asyncio.Event()
-        self._task_completed = asyncio.Event()
         self._docket = set()
         self._backpressure = backpressure
+        # Budget for the loop-teardown join, set by :meth:`_stop`
+        # from the StopRequest's ``timeout``. ``0`` means "do not
+        # synchronously wait" (worker thread closes its own loop
+        # after ``run_forever`` returns; ``daemon=True`` reaps it
+        # at process exit if not joined); positive bounds the
+        # wait; ``None`` means "wait indefinitely" — caller asked
+        # for unlimited graceful shutdown via a negative or
+        # missing StopRequest timeout. The default below is
+        # ``None`` only because the loop pool's finalizer
+        # schedules its own ``loop.stop()``, so an unbounded join
+        # still returns once ``run_forever`` exits.
+        self._stop_timeout: float | None = None
         self._loop_pool = ResourcePool(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
@@ -358,13 +296,58 @@ class WorkerService(protocol.WorkerServicer):
         raised after the routine starts surface through the
         existing routine-exception machinery.
 
+        **Wire-protocol invariant.** A ``Nack`` is only emitted
+        pre-Ack; once an ``Ack`` has been yielded, all further
+        terminal signals ride on ``Response.exception``. The dispatch
+        FSM is ``Ack? (Result* (Exception | ε)) | Nack``. Code that
+        emits a Nack after an Ack would violate the caller-side
+        consumer contract in :class:`WorkerConnection`.
+
         :param request_iterator:
             The incoming bidirectional request stream.
         :param context:
             The :class:`grpc.aio.ServicerContext` for this request.
         :yields:
-            First yields an Ack Response when task processing begins,
-            then yields Response(s) containing the task result(s).
+            One of four terminal shapes per dispatch.
+
+            **Parse-failure path** — a single ``Response`` whose
+            ``nack`` payload carries the parse-time failure (with
+            ``exception`` set to the dumped original cause). No
+            preceding ``Ack``. Triggered by malformed task id,
+            unpicklable serializer hint, strict-mode
+            :class:`wool.ContextDecodeWarning`, cloudpickle errors
+            on the task callable, ImportError on a missing module,
+            or non-async callable.
+
+            **Routine-success path** — an ``Ack`` Response, then
+            one (coroutine) or many (async-generator) ``result``
+            Responses, then stream end.
+
+            **Routine-failure path** — an ``Ack`` Response,
+            optionally followed by zero or more ``result``
+            Responses, then a single terminal ``exception``
+            Response carrying the dumped routine / handler-level
+            failure plus a ``context`` snapshot.
+
+            **Routine-failure-with-encode-failure variant** — same
+            as the routine-failure path except the terminal
+            ``Response`` drops the ``context`` field. The post-run
+            snapshot itself failed to serialize (strict-mode
+            :class:`wool.ContextDecodeWarning`); the encode peers
+            are attached to the routine exception via PEP 678
+            ``__notes__`` and a ``__wool_context_warnings__``
+            attribute, so the caller-visible exception class is
+            preserved.
+
+            **Operator pre-emption.** A worker-side graceful
+            shutdown cancels in-flight dispatches and the underlying
+            ``CancelledError`` ships unchanged on the routine-failure
+            path. Callers observe ``CancelledError`` from
+            ``await routine()`` regardless of whether the cancel
+            was caller-initiated, routine-self-raised, or operator-
+            initiated — mirroring stdlib's ``await task`` semantics
+            where ``task.cancel()`` from any source produces the
+            same observable.
 
         """
         if self._stopping.is_set():
@@ -372,149 +355,281 @@ class WorkerService(protocol.WorkerServicer):
                 StatusCode.UNAVAILABLE, "Worker service is shutting down"
             )
 
-        request = await anext(aiter(request_iterator))
+        async with self._loop_pool.get("worker") as (loop, _):
+            # Instantiate before ``async with`` so a ``Rejected`` raised
+            # from :meth:`DispatchSession.__aenter__` (parse-phase failure)
+            # leaves ``session`` bound for the ``except Rejected`` arm's
+            # access to ``session.serializer`` (initialized to the default
+            # cloudpickle in :meth:`__init__`, replaced with the negotiated
+            # serializer only on successful parse).
+            session = DispatchSession(request_iterator, loop)
 
-        # Resolve the handler's serializer once. Self-dispatch
-        # acquires a per-task PassthroughSerializer from the
-        # process-wide pool; the caller side acquires the same
-        # instance from the same key, so prune-at-loads on either
-        # side bounds the shared keep-alive set. The pool's
-        # reference-counted cleanup evicts the entry when both sides
-        # release, so error-path keep-alive entries are not retained
-        # across dispatch boundaries.
-        task_id = UUID(request.task.id)
-        is_passthrough = False
-        if request.task.HasField("serializer"):
-            sniff = _unpickle_serializer(request.task.serializer)
-            is_passthrough = isinstance(sniff, PassthroughSerializer)
+            # Register a deterministic cancellation propagation hook
+            # via the gRPC context's ``add_done_callback``. Necessary
+            # because async-generator-task cancellation propagation
+            # through ``await response_queue.get()`` is unreliable on
+            # Python 3.11 + Linux: the gRPC framework's cancellation
+            # of the handler task does not always wake the handler's
+            # suspension at the response queue, leaving the routine
+            # to run to natural completion after the caller has gone
+            # away. The done callback fires from gRPC's internal
+            # thread when the RPC reaches a terminal state; on a
+            # client-side cancellation it fires with
+            # ``context.cancelled()`` == True, and we schedule
+            # :meth:`DispatchSession.cancel` on the main loop via
+            # ``call_soon_threadsafe`` so the routine task is
+            # cancelled cross-loop on the same path
+            # ``WorkerService._cancel`` uses for graceful shutdown.
+            # ``DispatchSession.cancel`` is idempotent, so the
+            # dispatch handler's own except-clause cancel is a no-op
+            # if this callback raced ahead. Avoids the watcher-task
+            # pattern (a polling background task) because awaiting a
+            # cancelled task in the dispatch generator's finally
+            # block deadlocks under Python 3.11's async-generator
+            # cancellation handling on Linux.
+            main_loop = asyncio.get_running_loop()
 
-        async with AsyncExitStack() as stack:
-            serializer: Serializer
-            if is_passthrough:
-                serializer = await stack.enter_async_context(
-                    _passthrough_pool.get(task_id)
-                )
-            else:
-                serializer = wool.__serializer__
-
-            # Build the caller-state Context first, then briefly
-            # install it as the active scope so any pickled
-            # wool.ContextVar/Token in the task's args/kwargs
-            # reconstitutes against worker_context rather than lazily
-            # registering a Context on the dispatch handler. The
-            # attach is detached before the worker task is created,
-            # so the handler scope does not retain ownership of a
-            # Context the worker loop will later mutate.
-            #
-            # Context decode is best-effort: a decode failure does
-            # not preempt the dispatch. The task still runs, with a
-            # fresh empty Context as fallback, and a
-            # ContextDecodeWarning surfaces the inconsistency.
-            try:
+            def _propagate_cancel_on_done(ctx) -> None:
+                if not ctx.cancelled():
+                    return
                 try:
-                    worker_context = Context.from_protobuf(
-                        request.context, serializer=serializer
+                    main_loop.call_soon_threadsafe(
+                        lambda: main_loop.create_task(session.cancel())
                     )
-                except BaseExceptionGroup as eg:
-                    raise BaseExceptionGroup(
-                        "request context decode failed",
-                        list(eg.exceptions),
-                    ) from None
+                except RuntimeError:
+                    # Main loop already closed (graceful shutdown
+                    # raced us). Nothing to propagate to; the
+                    # session's resources are torn down by the
+                    # surrounding context-manager unwind.
+                    pass
 
-                with attached(worker_context, guarded=False):
-                    wool_task = Task.from_protobuf(request.task)
-            except Exception as e:
-                # Wool-layer decode failures (strict-mode
-                # ContextDecodeWarning, cloudpickle errors on the
-                # task callable, ImportError on a missing module on
-                # the worker) ride the response-frame exception
-                # channel. The protobuf parsed cleanly, so the wire
-                # envelope is acknowledged; the cloudpickle layer
-                # then surfaces the failure to the caller as the
-                # actual exception class — the same shape a failed
-                # nested dispatch would take.
-                yield protocol.Response(ack=protocol.Ack(version=protocol.__version__))
+            # grpc.aio's :meth:`ServicerContext.add_done_callback` is
+            # typed in typeshed as
+            # ``Callable[[_DoneCallback[_TRequest, _TResponse]], None]``
+            # where ``_DoneCallback`` is a generic callable *class*.
+            # A plain function does not satisfy that nominal class
+            # type, but the runtime call accepts any callable — see
+            # grpcio's implementation, which only calls the object
+            # with a single ``ctx`` argument. The ignore documents
+            # the discrepancy between the stub's nominal type and
+            # the structural runtime contract.
+            context.add_done_callback(_propagate_cancel_on_done)  # pyright: ignore[reportArgumentType]
+
+            try:
+                async with session:
+                    if self._backpressure is not None:
+                        backpressure = self._backpressure
+                        # ``guarded=False`` — the dispatch task is not
+                        # running the routine itself, only reading
+                        # caller-shipped wool.ContextVar values for the
+                        # hook. The single-task ownership of
+                        # ``session.context`` belongs to the worker
+                        # task scheduled lazily on the first
+                        # ``__aiter__`` call below; entering the
+                        # guard here would race that scheduling
+                        # under ``Context._lock``.
+                        try:
+                            with attached(session.context, guarded=False):
+                                decision = backpressure(
+                                    BackpressureContext(
+                                        active_task_count=len(self._docket),
+                                        task=session.task,
+                                    )
+                                )
+                                if isawaitable(decision):
+                                    decision = await decision
+                        except Exception:
+                            # User-supplied backpressure hook crashed.
+                            # Log so the operator notices, then abort
+                            # with INTERNAL so the caller-side maps
+                            # to RpcError and the load-balancer takes
+                            # over rotation. Treating a hook bug as
+                            # eviction-worthy is intentional under
+                            # today's binary LB policy; health-aware
+                            # forgiveness (N-strikes) is a follow-up.
+                            _log.exception("Backpressure hook raised; aborting dispatch")
+                            await context.abort(
+                                StatusCode.INTERNAL,
+                                "Backpressure hook raised",
+                            )
+                        if decision:
+                            await context.abort(
+                                StatusCode.RESOURCE_EXHAUSTED,
+                                "Task rejected by backpressure hook",
+                            )
+
+                    async with self._tracked(session, context):
+                        yield protocol.Response(
+                            ack=protocol.Ack(version=protocol.__version__)
+                        )
+                        try:
+                            async for response in session:
+                                yield response.to_protobuf(serializer=session.serializer)
+                        except (Exception, asyncio.CancelledError) as e:
+                            # Cancel the session before drain on the
+                            # error path so a routine suspended
+                            # inside an ``await`` observes
+                            # ``CancelledError`` instead of running
+                            # to natural completion after the caller
+                            # has gone away. The success path skips
+                            # cancel — the worker has already exited
+                            # and closed the response stream, and a
+                            # spurious cancel here would race the
+                            # drain's own cancellation handling.
+                            #
+                            # Swallow cancel-time failures. Re-raising
+                            # them inside this except would replace
+                            # ``e``, demoting the routine's primary
+                            # signal to ``__context__`` and shipping
+                            # the cancel failure to the caller.
+                            try:
+                                await session.cancel()
+                            except BaseException:
+                                pass
+                            # All worker-side and main-side failures
+                            # land here: routine exceptions raised in
+                            # :func:`_step` propagate through the
+                            # response queue and out of
+                            # :meth:`DispatchSession.__aiter__` raw;
+                            # pre-stream worker setup failures surface
+                            # via :meth:`_ResponseQueue.get` raising on
+                            # close; mid-stream context-decode /
+                            # update failures escape :func:`_step` the
+                            # same way; handler-level failures (e.g.
+                            # ``response.to_protobuf`` raising) raise
+                            # directly here; gRPC stream cancellation
+                            # raises ``CancelledError`` mid-iteration.
+                            # Drain the worker before snapshotting
+                            # ``session.context``: worker-failure
+                            # paths arrive with the worker already
+                            # finalized (so drain is a no-op), but
+                            # cancellation and main-loop handler-
+                            # level failures leave the worker mid-
+                            # ``_step``, racing the snapshot's read
+                            # of ``_data`` against the worker's
+                            # ``work_ctx.update`` /
+                            # ``work_ctx.to_protobuf`` writes.
+                            # :meth:`DispatchSession.drain` is
+                            # idempotent — :meth:`__aexit__` will
+                            # call it again on the way out. On the
+                            # external-cancellation path drain may
+                            # re-raise ``CancelledError`` before
+                            # the snapshot can be built; the gRPC
+                            # stream is being torn down anyway, so
+                            # losing the terminal Response is
+                            # acceptable — the caller has no
+                            # consumer left.
+                            await session.drain()
+                            # Unwrap PEP 525's auto-conversion for
+                            # coroutine routines so the caller's
+                            # ``await routine()`` surfaces the
+                            # original :class:`StopAsyncIteration`
+                            # raw — matching stdlib coroutine
+                            # semantics. The wrap happens in
+                            # :meth:`DispatchSession._iterate` (the
+                            # asyncgen transport layer): when a
+                            # coroutine raises StopAsyncIteration,
+                            # _ResponseQueue.get re-raises it inside
+                            # _iterate's body, and PEP 525 converts
+                            # it to ``RuntimeError("async generator
+                            # raised StopAsyncIteration")`` with the
+                            # original SAI on ``__cause__``.
+                            # Streaming routines keep the
+                            # RuntimeError shape — that already
+                            # matches stdlib ``async for x in
+                            # agen()`` semantics.
+                            if (
+                                not session.streaming
+                                and isinstance(e, RuntimeError)
+                                and isinstance(e.__cause__, StopAsyncIteration)
+                            ):
+                                e = e.__cause__
+                            try:
+                                wire_context = session.context.to_protobuf(
+                                    serializer=session.serializer
+                                )
+                            except Exception as encode_exc:
+                                # Strict-mode-only path: attach the
+                                # encoded ``ContextDecodeWarning``
+                                # peers to ``e`` so the caller's
+                                # ``except RoutineError`` clause keeps
+                                # matching. See
+                                # :func:`_attach_strict_mode_warnings`
+                                # for the attachment contract and
+                                # rationale. Drops the post-run
+                                # ``context`` field on the wire (the
+                                # snapshot itself failed); peers ride
+                                # on the routine exception via PEP 678
+                                # ``__notes__`` and
+                                # ``__wool_context_warnings__``.
+                                _attach_strict_mode_warnings(e, encode_exc)
+                                yield protocol.Response(
+                                    exception=protocol.Message(
+                                        dump=_safely_serialize_exception(
+                                            session.serializer, e
+                                        )
+                                    ),
+                                )
+                            else:
+                                yield protocol.Response(
+                                    exception=protocol.Message(
+                                        dump=_safely_serialize_exception(
+                                            session.serializer, e
+                                        )
+                                    ),
+                                    context=wire_context,
+                                )
+            except Rejected as e:
+                # Parse-phase failure (malformed task id, unpicklable
+                # serializer hint, strict-mode ContextDecodeWarning,
+                # cloudpickle errors on the task callable, ImportError
+                # on a missing module on the worker, non-async
+                # callable). Reported via Nack so the client
+                # deserializes the dumped exception and re-raises it
+                # as the actual failure class rather than an opaque
+                # RpcError. The dump uses ``session.serializer`` —
+                # the negotiated serializer if parse got past
+                # serializer setup, falling back to
+                # ``wool.__serializer__`` (cloudpickle) for
+                # early-fail paths. Same path as ``Response.exception``
+                # post-Ack — symmetry on the wire.
+                #
+                # The reason carries the original class + str() so
+                # callers that hit the malformed-dump fallback in
+                # :meth:`WorkerConnection._dispatch` (e.g.,
+                # serializer-mismatch on early-fail self-dispatch)
+                # still see a typed diagnostic rather than a generic
+                # rejection string.
                 yield protocol.Response(
-                    exception=protocol.Message(
-                        dump=_safely_serialize_exception(serializer, e)
+                    nack=protocol.Nack(
+                        reason=f"{type(e.original).__name__}: {e.original}",
+                        exception=protocol.Message(
+                            dump=_safely_serialize_exception(
+                                session.serializer, e.original
+                            )
+                        ),
                     ),
                 )
                 return
-
-            if self._backpressure is not None:
-                backpressure = self._backpressure
-                with attached(worker_context):
-                    decision = backpressure(
-                        BackpressureContext(
-                            active_task_count=len(self._docket),
-                            task=wool_task,
-                        )
-                    )
-                    if isawaitable(decision):
-                        decision = await decision
-                if decision:
-                    await context.abort(
-                        StatusCode.RESOURCE_EXHAUSTED,
-                        "Task rejected by backpressure hook",
-                    )
-
-            with self._tracker(
-                wool_task,
-                request_iterator,
-                worker_context,
-                serializer=serializer,
-            ) as task:
-                ack = protocol.Ack(version=protocol.__version__)
-                yield protocol.Response(ack=ack)
-                try:
-                    if isasyncgen(task):
-                        try:
-                            async for outcome in task:
-                                yield _response_from_outcome(outcome, serializer)
-                                if outcome.exception is not None:
-                                    return
-                        finally:
-                            # Close the streaming generator on every
-                            # exit path so its own ``finally`` drains
-                            # the worker-loop task before control
-                            # returns. Without this the generator is
-                            # abandoned mid-yield on the early-return
-                            # and exception paths, leaving the worker
-                            # free to mutate ``worker_context`` while the
-                            # fallback branch below snapshots it.
-                            await task.aclose()
-                    elif isinstance(task, asyncio.Task):
-                        outcome: _WorkerOutcome = await task
-                        yield _response_from_outcome(outcome, serializer)
-                except (Exception, asyncio.CancelledError) as e:
-                    # Handler-level failure or cancellation. Routine
-                    # exceptions never reach this branch — they are
-                    # reified into outcome frames upstream by
-                    # ``_outcome_from``, which also absorbs
-                    # snapshot-encode failures into the same outcome.
-                    # ``worker_context`` is safe to read here: the worker-
-                    # loop task has finished mutating it before
-                    # control reaches this except clause.
-                    try:
-                        wire_context = worker_context.to_protobuf(serializer=serializer)
-                    except Exception as encode_exc:
-                        # Handler-level exception coincided with a
-                        # snapshot encode failure; merge them as
-                        # peers and ship the group through the
-                        # exception channel with no context patch.
-                        merged = _merge_exceptions(e, encode_exc)
-                        yield protocol.Response(
-                            exception=protocol.Message(
-                                dump=_safely_serialize_exception(serializer, merged)
-                            ),
-                        )
-                    else:
-                        yield protocol.Response(
-                            exception=protocol.Message(
-                                dump=_safely_serialize_exception(serializer, e)
-                            ),
-                            context=wire_context,
-                        )
+            except AbortError:
+                # Intentional ``context.abort(...)`` calls inside the
+                # try block (backpressure rejection, hook-crash) raise
+                # ``AbortError`` which subclasses ``Exception``. Let
+                # them propagate so the gRPC framework reports the
+                # operator-chosen status code; do NOT mis-log them as
+                # an unexpected server-side bug.
+                raise
+            except Exception:
+                # Unexpected server-side bug (dispatch handler crash,
+                # library error, or any other failure that escapes
+                # the routine-failure and parse-failure paths above).
+                # Log so the operator notices, then abort with
+                # INTERNAL so the caller-side maps to RpcError and
+                # the load balancer takes over rotation. Today's
+                # binary LB policy evicts on first RpcError; health-
+                # aware forgiveness (N-strikes) is a follow-up.
+                _log.exception("Unexpected dispatch handler error")
+                await context.abort(StatusCode.INTERNAL, "Internal server error")
 
     async def stop(
         self,
@@ -545,6 +660,14 @@ class WorkerService(protocol.WorkerServicer):
     ) -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
         """Create a new event loop running on a dedicated daemon thread.
 
+        The thread target wraps :meth:`asyncio.AbstractEventLoop.run_forever`
+        in a ``try/finally`` that calls :meth:`asyncio.AbstractEventLoop.close`
+        once ``run_forever`` returns. Closing the loop from the worker
+        thread (rather than the caller's thread inside
+        :meth:`_destroy_worker_loop`) eliminates the race that produced
+        ``RuntimeError("Cannot close a running event loop")`` when a
+        caller-side close raced the still-active ``run_forever``.
+
         :param key:
             The :class:`ResourcePool` cache key (unused).
         :returns:
@@ -552,18 +675,37 @@ class WorkerService(protocol.WorkerServicer):
         """
         loop = asyncio.new_event_loop()
         install_task_factory(loop)
-        thread = threading.Thread(target=loop.run_forever, daemon=True)
+
+        def _run_then_close():
+            try:
+                loop.run_forever()
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=_run_then_close, daemon=True)
         thread.start()
         return loop, thread
 
-    @staticmethod
     def _destroy_worker_loop(
+        self,
         loop_thread: tuple[asyncio.AbstractEventLoop, threading.Thread],
     ) -> None:
-        """Stop the worker event loop and join its thread.
+        """Schedule worker-loop shutdown and optionally join the thread.
 
-        Cancels all pending tasks on the worker loop before stopping,
-        ensuring cleanup code runs in each task's own context.
+        Cancels all pending tasks on the worker loop and signals the
+        loop to stop. The loop is closed by the worker thread itself
+        (see :meth:`_create_worker_loop`'s ``_run_then_close`` target),
+        not from this caller's thread — eliminating the close-while-
+        running race.
+
+        Joins the worker thread for up to :attr:`_stop_timeout`
+        seconds (set by :meth:`_stop` from the StopRequest's
+        ``timeout``). ``timeout=0`` means "do not wait"; positive
+        values bound the synchronous wait; ``None`` means "wait
+        indefinitely" (caller asked for unlimited graceful shutdown).
+        If the join times out, the daemon thread is reaped at
+        process exit — the loop will still close itself once
+        ``run_forever`` returns.
 
         :param loop_thread:
             A tuple of the event loop and the thread running it.
@@ -578,480 +720,87 @@ class WorkerService(protocol.WorkerServicer):
             await asyncio.gather(*tasks, return_exceptions=True)
             loop.stop()
 
-        loop.call_soon_threadsafe(lambda: loop.create_task(_shutdown()))
-        thread.join(timeout=5)
-        loop.close()
-
-    async def _run_on_worker(
-        self,
-        work_task: Task,
-        worker_context: Context,
-        serializer: Serializer,
-    ) -> _WorkerOutcome:
-        """Run a task on the shared worker event loop.
-
-        :param work_task:
-            The :class:`Task` instance to execute.
-        :param worker_context:
-            The dispatch handler's local :class:`~wool.runtime.context.Context`,
-            passed by reference. The worker-loop task is the
-            exclusive mutator for the duration of the routine, so
-            the done-callback's snapshot reflects the post-run state
-            for the response frame.
-        :param serializer:
-            Negotiated serializer for response var snapshots.
-        """
-        future: concurrent.futures.Future = concurrent.futures.Future()
-        worker_task = None
-
-        async with self._loop_pool.get("worker") as (worker_loop, _):
-
-            def _schedule():
-                nonlocal worker_task
-                task = worker_loop.create_task(
-                    work_task._run(),
-                    context=worker_context,  # pyright: ignore[reportArgumentType]
-                )
-                worker_task = task
-
-                def _done(t: asyncio.Task):
-                    if future.done():
-                        return
-                    if t.cancelled():
-                        future.cancel()
-                        return
-                    try:
-                        routine_exc = t.exception()
-                        outcome = _outcome_from(
-                            value=t.result() if routine_exc is None else None,
-                            routine_exc=routine_exc,
-                            context=worker_context,
-                            serializer=serializer,
-                        )
-                        future.set_result(outcome)
-                    except BaseException as e:  # pragma: no cover
-                        # Defensive outer guard: any unanticipated
-                        # escape from the body above still resolves
-                        # ``future`` so the dispatch handler does
-                        # not hang on ``wrap_future``.
-                        if not future.done():
-                            future.set_exception(e)
-
-                task.add_done_callback(_done)
-
-            worker_loop.call_soon_threadsafe(_schedule)
-
-            try:
-                return await asyncio.wrap_future(future)
-            except asyncio.CancelledError:
-                if worker_task is not None:
-                    worker_loop.call_soon_threadsafe(worker_task.cancel)
-                    # Wait for the worker task to unwind before letting
-                    # CancelledError bubble up. This guarantees that by
-                    # the time the dispatch handler's fallback path
-                    # reads worker_context._data, the worker loop is no
-                    # longer mutating it — no cross-loop race on the
-                    # dict iterator. Swallow any outcome from this
-                    # follow-up await; the worker's result is not used
-                    # on the cancellation path.
-                    try:
-                        await asyncio.wrap_future(future)
-                    except (Exception, asyncio.CancelledError):
-                        pass
-                raise
-
-    async def _stream_from_worker(
-        self,
-        work_task: Task,
-        request_iterator: AsyncIterator[protocol.Request],
-        worker_context: Context,
-        serializer: Serializer,
-    ):
-        """Run a streaming task on the shared worker event loop.
-
-        Offloads async generator execution to a dedicated worker event
-        loop. Client requests (``next``, ``send``, ``throw``) are read
-        from *request_iterator* on the main loop, forwarded to the
-        worker loop via a queue, and the resulting values are returned
-        to the main loop for yielding.
-
-        Each frame is surfaced as a :class:`_WorkerOutcome`. Success
-        frames carry ``result`` and ``context``; an exception raised
-        by the routine yields a terminal frame with ``exception`` and
-        ``context`` populated — the caller is responsible for
-        emitting the error Response and terminating the stream. The
-        generator does not raise routine errors itself so the
-        worker-side context snapshot taken at the mutation point is
-        never dropped.
-
-        :param work_task:
-            The :class:`Task` instance containing an async
-            generator.
-        :param request_iterator:
-            The incoming bidirectional request stream for reading
-            client-driven iteration commands.
-        :param worker_context:
-            The dispatch handler's local :class:`~wool.runtime.context.Context`,
-            passed by reference. Main never scopes it against its own
-            task after the backpressure hook returns, so the
-            worker-loop task is the exclusive mutator for the
-            generator's lifetime. Every per-frame snapshot reflects
-            its live state.
-        :param serializer:
-            Negotiated serializer for response var snapshots and
-            Message bodies.
-        :yields:
-            :class:`_WorkerOutcome` frames — one per successful
-            routine yield, plus one terminal error frame if the
-            routine raises.
-        """
-        main_loop = asyncio.get_running_loop()
-        request_queue: asyncio.Queue = asyncio.Queue()
-        result_queue: asyncio.Queue = asyncio.Queue()
-        worker_done: concurrent.futures.Future = concurrent.futures.Future()
-
-        async with self._loop_pool.get("worker") as (worker_loop, _):
-
-            async def worker_dispatch():
-                proxy_pool = wool.__proxy_pool__.get()
-                proxy_context_manager = (
-                    proxy_pool.get(work_task.proxy) if proxy_pool else None
-                )
-                proxy = (
-                    await proxy_context_manager.__aenter__()
-                    if proxy_context_manager
-                    else None
-                )
-                try:
-                    token = wool.__proxy__.set(proxy) if proxy else None
-                    try:
-                        assert work_task.runtime_context is not None
-                        with work_task.runtime_context, work_task:
-                            # RuntimeContext restores dispatch_timeout from the
-                            # wire; Task.__enter__ sets _current_task for
-                            # nested dispatch. Both __enter__ calls run once
-                            # here but the generator below is driven across
-                            # many ``command`` loop iterations — dispatch_timeout
-                            # and _current_task therefore remain set for the
-                            # full generator lifespan, matching the coroutine
-                            # path's single-enter contract via ``Task._run``.
-                            gen = work_task.callable(*work_task.args, **work_task.kwargs)
-
-                            try:
-                                while True:
-                                    command = await request_queue.get()
-                                    if command is _STREAM_END:
-                                        break
-                                    action, payload, caller_wire_context = cast(
-                                        tuple[
-                                            Literal["next", "send", "throw"],
-                                            Any,
-                                            protocol.Context,
-                                        ],
-                                        command,
-                                    )
-                                    # Outer guard: every exit from this
-                                    # iteration body must push to result_queue
-                                    # so the main loop's await never hangs on
-                                    # a silently-failed worker task.
-                                    try:
-                                        try:
-                                            incoming_context = Context.from_protobuf(
-                                                caller_wire_context,
-                                                serializer=serializer,
-                                            )
-                                        except BaseExceptionGroup as eg:
-                                            raise BaseExceptionGroup(
-                                                "mid-stream request context "
-                                                "decode failed",
-                                                list(eg.exceptions),
-                                            ) from None
-                                        if incoming_context.has_state():
-                                            worker_context.update(incoming_context)
-                                        try:
-                                            with do_dispatch(False):
-                                                match action:
-                                                    case "next":
-                                                        value = await gen.asend(None)
-                                                    case "send":
-                                                        value = await gen.asend(payload)
-                                                    case "throw":
-                                                        value = await gen.athrow(
-                                                            type(payload), payload
-                                                        )
-                                                    case _:  # pragma: no cover
-                                                        assert_never(action)
-                                            routine_exc: BaseException | None = None
-                                        except StopAsyncIteration:
-                                            main_loop.call_soon_threadsafe(
-                                                result_queue.put_nowait, _STREAM_END
-                                            )
-                                            return
-                                        except BaseException as e:
-                                            routine_exc = e
-                                            value = None
-                                        outcome = _outcome_from(
-                                            value=value,
-                                            routine_exc=routine_exc,
-                                            context=worker_context,
-                                            serializer=serializer,
-                                        )
-                                        main_loop.call_soon_threadsafe(
-                                            result_queue.put_nowait, outcome
-                                        )
-                                        if routine_exc is not None:
-                                            return
-                                    except BaseException as e:
-                                        # Anything escaping the iteration
-                                        # body's except clauses (e.g.
-                                        # Context.update raising) still
-                                        # surfaces as a terminal error frame.
-                                        _log.warning(
-                                            "Aborting streaming dispatch on "
-                                            "unhandled error: %s",
-                                            e,
-                                        )
-                                        outcome = _outcome_from(
-                                            routine_exc=e,
-                                            context=worker_context,
-                                            serializer=serializer,
-                                        )
-                                        main_loop.call_soon_threadsafe(
-                                            result_queue.put_nowait, outcome
-                                        )
-                                        return
-                            finally:
-                                try:
-                                    await gen.aclose()
-                                except (asyncio.CancelledError, GeneratorExit):
-                                    # During shutdown the aclose() may be
-                                    # cancelled or exit before the generator
-                                    # finishes its own teardown. Log and
-                                    # swallow so cleanup continues.
-                                    _log.warning(
-                                        "wool routine generator interrupted during "
-                                        "aclose on teardown",
-                                        exc_info=True,
-                                    )
-                    finally:
-                        if token is not None:
-                            wool.__proxy__.reset(token)
-                finally:
-                    if proxy_context_manager is not None:
-                        await proxy_context_manager.__aexit__(None, None, None)
-
-            def _start_worker():
-                task = worker_loop.create_task(
-                    worker_dispatch(),
-                    context=worker_context,  # pyright: ignore[reportArgumentType]
-                )
-
-                def _on_done(t: asyncio.Task):
-                    if not worker_done.done():
-                        if t.cancelled():
-                            worker_done.cancel()
-                        else:
-                            exc = t.exception()
-                            if exc is not None:
-                                worker_done.set_exception(exc)
-                            else:
-                                worker_done.set_result(None)
-                    # Wake any pending ``result_queue.get()`` so the
-                    # main loop can observe worker termination — the
-                    # happy path arrives via the outcome already
-                    # pushed; the setup-failure path needs this nudge
-                    # to escape an otherwise-indefinite await on an
-                    # outcome that will never arrive.
-                    main_loop.call_soon_threadsafe(result_queue.put_nowait, _STREAM_END)
-
-                task.add_done_callback(_on_done)
-
-            worker_loop.call_soon_threadsafe(_start_worker)
-
-            streamed_outcome = False
-            try:
-                async for request in request_iterator:
-                    caller_wire_context = request.context
-                    try:
-                        match request.WhichOneof("payload"):
-                            case "next":
-                                worker_loop.call_soon_threadsafe(
-                                    request_queue.put_nowait,
-                                    ("next", None, caller_wire_context),
-                                )
-                            case "send":
-                                # Decode under ``attached(worker_context)`` so any
-                                # pickled ``wool.ContextVar``/``Token`` in the
-                                # payload reconstitutes against ``worker_context``
-                                # rather than lazily registering a Context on
-                                # the dispatch handler's transient task.
-                                # Mirrors the initial-frame discipline at
-                                # ``Task.from_protobuf`` above. Decode plumbing
-                                # — opt out of the single-task guard since the
-                                # worker task already holds it on ``worker_context``.
-                                with attached(worker_context, guarded=False):
-                                    value = serializer.loads(request.send.dump)
-                                worker_loop.call_soon_threadsafe(
-                                    request_queue.put_nowait,
-                                    ("send", value, caller_wire_context),
-                                )
-                            case "throw":
-                                with attached(worker_context, guarded=False):
-                                    exc = serializer.loads(request.throw.dump)
-                                worker_loop.call_soon_threadsafe(
-                                    request_queue.put_nowait,
-                                    ("throw", exc, caller_wire_context),
-                                )
-                            case (
-                                _
-                            ):  # pragma: no cover — defensive default for proto oneof
-                                continue
-                    except Exception as e:  # pragma: no cover
-                        # Defensive guard for a mid-stream send/throw
-                        # decode failure: the wool-layer cloudpickle
-                        # decode of the payload failed. Ship via
-                        # the response-frame exception channel so the
-                        # caller observes the actual decode exception
-                        # rather than a generic gRPC error; the outer
-                        # ``finally`` pushes ``_STREAM_END`` to tear
-                        # down ``worker_dispatch``.
-                        try:
-                            snapshot = worker_context.to_protobuf(serializer=serializer)
-                        except Exception as encode_exc:
-                            merged = _merge_exceptions(e, encode_exc)
-                            yield protocol.Response(
-                                exception=protocol.Message(
-                                    dump=serializer.dumps(merged)
-                                ),
-                            )
-                        else:
-                            yield protocol.Response(
-                                exception=protocol.Message(dump=serializer.dumps(e)),
-                                context=snapshot,
-                            )
-                        return
-
-                    result = await result_queue.get()
-
-                    if result is _STREAM_END:
-                        break
-                    # Worker loop puts ``_WorkerOutcome`` on the queue
-                    # directly (built via ``_outcome_from``). A terminal
-                    # error frame rides back as the outcome's exception
-                    # field; the dispatch handler reads it from the
-                    # yielded outcome and short-circuits the stream,
-                    # so this generator does not need its own check.
-                    yield result
-                    streamed_outcome = True
-            finally:
-                worker_loop.call_soon_threadsafe(request_queue.put_nowait, _STREAM_END)
-                # Wait for ``worker_dispatch`` to consume ``_STREAM_END``
-                # and finish unwinding (user generator's ``aclose`` plus
-                # proxy cleanup) before this generator returns. After
-                # this await, no worker-loop task is mutating
-                # ``worker_context``, so the dispatch handler's fallback path
-                # can snapshot it without racing a cross-loop writer.
-                # Mirrors the coroutine path's drain in ``_run_on_worker``.
-                try:
-                    await asyncio.wrap_future(worker_done)
-                except asyncio.CancelledError:
-                    pass
-                except Exception as worker_exc:
-                    if streamed_outcome:
-                        # Teardown failure after the primary signal
-                        # already reached the caller; surface only as
-                        # a log to avoid double-framing the gRPC
-                        # stream with a trailing exception frame.
-                        _log.warning(
-                            "wool worker teardown failed after streaming completion",
-                            exc_info=worker_exc,
-                        )
-                    else:
-                        # Worker raised before any outcome was
-                        # streamed (e.g., proxy/runtime-context setup
-                        # raised pre-loop). Surface as a terminal
-                        # ``_WorkerOutcome`` so the dispatch handler
-                        # ships it through the exception channel and
-                        # the caller observes the actual failure
-                        # rather than a hang.
-                        yield _outcome_from(
-                            routine_exc=worker_exc,
-                            context=worker_context,
-                            serializer=serializer,
-                        )
-
-    @contextmanager
-    def _tracker(
-        self,
-        work_task: Task,
-        request_iterator: AsyncIterator[protocol.Request],
-        worker_context: Context,
-        serializer: Serializer,
-    ):
-        """Context manager for tracking running tasks.
-
-        Manages the lifecycle of a task execution, adding it to the
-        active tasks set. Ensures proper cleanup when the task
-        completes or fails.
-
-        :param work_task:
-            The :class:`Task` instance to execute and track.
-        :param request_iterator:
-            The incoming bidirectional request stream.
-        :param worker_context:
-            The dispatch handler's local :class:`~wool.runtime.context.Context`,
-            passed by reference. Since main does not scope it against
-            its own task after backpressure, the worker-loop task is
-            the exclusive mutator — no cross-loop race.
-        :param serializer:
-            Negotiated serializer for var snapshots and Message
-            bodies. Cloudpickle for cross-process dispatch;
-            :class:`PassthroughSerializer` for self-dispatch.
-        :yields:
-            The :class:`asyncio.Task` or async generator for the
-            Wool task.
-
-        """
-        if iscoroutinefunction(work_task.callable):
-            task = asyncio.create_task(
-                self._run_on_worker(work_task, worker_context, serializer)
-            )
-            watcher = _Task(task)
-        elif isasyncgenfunction(work_task.callable):
-            task = self._stream_from_worker(
-                work_task, request_iterator, worker_context, serializer
-            )
-            watcher = _AsyncGen(task)
-        else:
-            raise ValueError("Expected coroutine function or async generator function")
-
-        self._docket.add(watcher)
         try:
-            yield task
+            loop.call_soon_threadsafe(lambda: loop.create_task(_shutdown()))
+        except RuntimeError:
+            # Loop is already closed (e.g., this finalizer was
+            # invoked twice, or some external party closed it).
+            # Nothing to schedule; the thread has already exited
+            # via the ``_run_then_close`` finally clause.
+            return
+
+        timeout = self._stop_timeout
+        if timeout is None or timeout > 0:
+            thread.join(timeout=timeout)
+
+    @asynccontextmanager
+    async def _tracked(
+        self,
+        session: DispatchSession,
+        context: ServicerContext,
+    ) -> AsyncIterator[None]:
+        """Add *session* to :attr:`_docket` for the duration of the
+        yield, removing it on exit.
+
+        The docket is the registry of in-flight
+        :class:`DispatchSession` instances that :meth:`_stop`
+        pre-empts on graceful shutdown. The CM scope mirrors the
+        dispatch handler's iteration scope, so an in-flight
+        dispatch is always either tracked or already finalized.
+
+        Re-checks :attr:`_stopping` on entry to close the
+        check-to-register window in :meth:`dispatch` — a concurrent
+        :meth:`_stop` between the entry gate and docket registration
+        would otherwise admit a session that :meth:`_preempt` never
+        sees, leaving it to be torn down indirectly by loop-pool
+        teardown rather than the explicit cancel path.
+        """
+        if self._stopping.is_set():
+            await session.cancel()
+            await context.abort(
+                StatusCode.UNAVAILABLE, "Worker service is shutting down"
+            )
+        self._docket.add(session)
+        try:
+            yield
         finally:
-            self._docket.discard(watcher)
+            self._docket.discard(session)
 
     async def _stop(self, *, timeout: float | None = 0) -> None:
         if timeout is not None and timeout < 0:
             timeout = None
+        # Stash the StopRequest's timeout for the loop-teardown
+        # finalizer (read by :meth:`_destroy_worker_loop`) before
+        # any ``await`` so it is always set when ``_loop_pool.clear``
+        # later invokes the finalizer. ``timeout=0`` (the default)
+        # → don't synchronously join; positive → bound the join;
+        # ``None`` (caller sent negative or omitted) → wait
+        # indefinitely.
+        self._stop_timeout = timeout
         self._stopping.set()
-        await self._await_or_cancel(timeout=timeout)
+        await self._preempt(timeout=timeout)
         try:
             if proxy_pool := wool.__proxy_pool__.get():
                 await proxy_pool.clear()
-            from wool.runtime.discovery import __subscriber_pool__
-
             if subscriber_pool := __subscriber_pool__.get():
                 await subscriber_pool.clear()
         finally:
             await self._loop_pool.clear()
             self._stopped.set()
 
-    async def _await_or_cancel(self, *, timeout: float | None = 0) -> None:
+    async def _preempt(self, *, timeout: float | None = 0) -> None:
         """Drain or cancel in-flight tasks in the docket.
 
-        Waits for running tasks to complete or cancels them depending
-        on the timeout value.
+        The service-wide pre-emption entry point. Waits for running
+        tasks to complete or cancels them depending on the timeout
+        value. Calls :meth:`DispatchSession.cancel` on each session
+        in the docket when forced cancellation is required, which
+        propagates :class:`asyncio.CancelledError` to the routine.
+        The caller observes ``CancelledError`` from
+        ``await routine()``, matching stdlib's ``task.cancel()``
+        semantics — operator pre-emption is indistinguishable from
+        caller-side cancel or routine-self-raised cancel on the
+        wire.
 
         :param timeout:
             Maximum time to wait for tasks to complete. If 0 (default),
@@ -1065,21 +814,15 @@ class WorkerService(protocol.WorkerServicer):
             to cancel all remaining tasks immediately.
         """
         if self._docket and timeout == 0:
-            await self._cancel()
+            await asyncio.gather(
+                *(s.cancel() for s in self._docket), return_exceptions=True
+            )
         elif self._docket:
             try:
                 await asyncio.wait_for(self._await(), timeout=timeout)
             except asyncio.TimeoutError:
-                return await self._await_or_cancel(timeout=0)
+                return await self._preempt(timeout=0)
 
     async def _await(self):
         while self._docket:
             await asyncio.sleep(0)
-
-    async def _cancel(self):
-        """Cancel all tracked tasks in the docket.
-
-        Cancels every entry in :attr:`_docket` and waits for them to
-        finish, handling cancellation exceptions gracefully.
-        """
-        await asyncio.gather(*(w.cancel() for w in self._docket), return_exceptions=True)

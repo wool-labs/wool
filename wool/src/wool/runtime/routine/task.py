@@ -5,13 +5,16 @@ import functools
 import logging
 import traceback
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from inspect import isasyncgen
 from inspect import isasyncgenfunction
 from inspect import iscoroutinefunction
 from types import TracebackType
 from typing import AsyncGenerator
+from typing import AsyncIterator
 from typing import ContextManager
 from typing import Coroutine
 from typing import Dict
@@ -317,75 +320,56 @@ class Task(Generic[W]):
             task_msg.serializer = _pickle_serializer(serializer)
         return task_msg
 
-    def dispatch(self) -> W:
-        if isasyncgenfunction(self.callable):
-            return cast(W, self._stream())
-        elif iscoroutinefunction(self.callable):
-            return cast(W, self._run())
-        else:
-            raise ValueError("Expected routine to be coroutine or async generator")
-
     async def _run(self):
-        """
-        Execute the task's callable with its arguments in proxy context.
-
-        :returns:
-            The result of executing the callable.
-        :raises RuntimeError:
-            If no proxy pool is available for task execution.
-        """
+        """Execute the task's callable in proxy context."""
         assert iscoroutinefunction(self.callable), "Expected coroutine function"
-        proxy_pool = wool.__proxy_pool__.get()
-        if not proxy_pool:
-            raise RuntimeError("No proxy pool available for task execution")
-        async with proxy_pool.get(self.proxy) as proxy:
-            # Set the proxy in context variable for nested task dispatch
-            token = wool.__proxy__.set(proxy)
-            try:
-                assert self.runtime_context is not None
-                with self.runtime_context:
-                    with self:
-                        with do_dispatch(False):
-                            await asyncio.sleep(0)
-                            return await self.callable(*self.args, **self.kwargs)
-            finally:
-                wool.__proxy__.reset(token)
+        async with _scoped(self) as routine:
+            await asyncio.sleep(0)
+            return await cast(Coroutine, routine)
 
     async def _stream(self):
-        """
-        Stream the task's async generator callable in proxy context.
-
-        :returns:
-            An async generator that yields values from the callable.
-        :raises RuntimeError:
-            If no proxy pool is available for task execution.
-        """
+        """Stream the task's async generator callable in proxy context."""
         assert isasyncgenfunction(self.callable), "Expected async generator function"
-        proxy_pool = wool.__proxy_pool__.get()
-        if not proxy_pool:
-            raise RuntimeError("No proxy pool available for task execution")
-        async with proxy_pool.get(self.proxy) as proxy:
+        async with _scoped(self) as routine:
             await asyncio.sleep(0)
-            gen = self.callable(*self.args, **self.kwargs)
-            try:
-                while True:
-                    # Set the proxy in context variable for nested task dispatch
-                    token = wool.__proxy__.set(proxy)
-                    try:
-                        assert self.runtime_context is not None
-                        with self.runtime_context:
-                            with self:
-                                with do_dispatch(False):
-                                    try:
-                                        result = await anext(gen)
-                                    except StopAsyncIteration:
-                                        break
-                    finally:
-                        wool.__proxy__.reset(token)
+            async for value in cast(AsyncGenerator, routine):
+                yield value
 
-                    yield result
-            finally:
-                await gen.aclose()
+
+@asynccontextmanager
+async def _scoped(task: Task) -> AsyncIterator[Coroutine | AsyncGenerator]:
+    """Establish the wool-task execution scope around *task*'s routine.
+
+    Acquires a proxy from :data:`wool.__proxy_pool__`, binds
+    :data:`wool.__proxy__` for nested dispatch, and enters
+    ``with task.runtime_context, task, do_dispatch(False):`` once
+    around the caller's iteration. The routine (:class:`Coroutine` or
+    :class:`AsyncGenerator`) is built inside the scope and yielded
+    ready for stepping; on exit, async generators are ``aclose``'d
+    and coroutines are ``close``'d.
+
+    The :data:`wool.__proxy_pool__` context variable must be
+    initialized before entering this scope; entering without a
+    configured pool raises :class:`RuntimeError`.
+    """
+    proxy_pool = wool.__proxy_pool__.get()
+    if proxy_pool is None:
+        raise RuntimeError("wool.__proxy_pool__ is not initialized")
+    assert task.runtime_context is not None
+    async with proxy_pool.get(task.proxy) as proxy:
+        token = wool.__proxy__.set(proxy)
+        try:
+            with task.runtime_context, task, do_dispatch(False):
+                routine = task.callable(*task.args, **task.kwargs)
+                try:
+                    yield routine
+                finally:
+                    if isasyncgen(routine):
+                        await routine.aclose()
+                    else:
+                        routine.close()
+        finally:
+            wool.__proxy__.reset(token)
 
 
 # public
