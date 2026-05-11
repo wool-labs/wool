@@ -39,6 +39,52 @@ class MyAppError(Exception):
     """
 
 
+class _StrictRejectingException(Exception):
+    """Module-level exception that rejects every best-effort write
+    the dispatch handler's strict-mode side channels attempt.
+
+    Defined at module scope so cloudpickle can resolve the class on
+    deserialization when this exception ships across the wire on
+    :class:`protocol.Response`'s ``exception`` field.
+
+    ``add_note`` raises :class:`AttributeError` so the PEP 678 note
+    path inside :meth:`WorkerConnection._read_next`'s exception arm
+    hits the ``except (AttributeError, TypeError)`` swallow.
+
+    Arbitrary attribute writes — including
+    ``__wool_context_warnings__`` — raise :class:`AttributeError` so
+    the programmatic side-channel write hits the ``except
+    AttributeError`` swallow. The ``args``/``__cause__``/
+    ``__context__``/``__traceback__``/``__suppress_context__``/
+    ``__notes__`` slots are explicitly allowed so the standard
+    ``BaseException`` machinery (and cloudpickle's restore via
+    ``__setstate__``) keeps working.
+    """
+
+    _ALLOWED = frozenset(
+        {
+            "args",
+            "__cause__",
+            "__context__",
+            "__traceback__",
+            "__suppress_context__",
+            "__notes__",
+        }
+    )
+
+    def __setattr__(self, name, value):
+        if name in self._ALLOWED:
+            object.__setattr__(self, name, value)
+        else:
+            raise AttributeError(
+                f"{type(self).__name__!r} object does not accept "
+                f"arbitrary attribute writes: {name!r}"
+            )
+
+    def add_note(self, _note):
+        raise AttributeError(f"{type(self).__name__!r} object does not accept add_note")
+
+
 @pytest.fixture
 def sample_task(mocker: MockerFixture):
     """Provides a mock :class:`Task` for testing.
@@ -1011,42 +1057,6 @@ class TestWorkerConnection:
         assert results == ["test_result"]
 
     @pytest.mark.asyncio
-    async def test_dispatch_nack_raises_rpc_error(
-        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
-    ):
-        """Test dispatch raises RpcError on Nack response.
-
-        Given:
-            A mock worker returning Nack with version mismatch reason
-        When:
-            dispatch() is called
-        Then:
-            It should raise RpcError with the rejection reason.
-        """
-        # Arrange
-        responses = (
-            protocol.Response(
-                nack=protocol.Nack(
-                    reason="Incompatible version: client=2.0.0, worker=1.0.0"
-                )
-            ),
-        )
-        mock_call = mock_grpc_call(async_stream(responses))
-
-        mock_stub = mocker.MagicMock()
-        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
-        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
-
-        connection = WorkerConnection(
-            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
-        )
-
-        # Act & assert
-        with pytest.raises(RpcError, match="Task rejected by worker"):
-            async for _ in await connection.dispatch(sample_task):
-                pass
-
-    @pytest.mark.asyncio
     async def test_dispatch_nack_with_exception_reraises_original_class(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
@@ -1054,8 +1064,7 @@ class TestWorkerConnection:
 
         Given:
             A worker that responds with a Nack whose exception field
-            carries a cloudpickle dump of ValueError("bad task id") and
-            reason="ValueError: bad task id"
+            carries a cloudpickle dump of ValueError("bad task id")
         When:
             dispatch(task) is awaited and consumed via async iteration
         Then:
@@ -1066,7 +1075,6 @@ class TestWorkerConnection:
         responses = (
             protocol.Response(
                 nack=protocol.Nack(
-                    reason="ValueError: bad task id",
                     exception=protocol.Message(
                         dump=cloudpickle.dumps(ValueError("bad task id"))
                     ),
@@ -1110,7 +1118,6 @@ class TestWorkerConnection:
         responses = (
             protocol.Response(
                 nack=protocol.Nack(
-                    reason="MyAppError: app failure",
                     exception=protocol.Message(
                         dump=cloudpickle.dumps(MyAppError("app failure"))
                     ),
@@ -1156,7 +1163,6 @@ class TestWorkerConnection:
         responses = (
             protocol.Response(
                 nack=protocol.Nack(
-                    reason="RuntimeError: boom",
                     exception=protocol.Message(
                         dump=cloudpickle.dumps(RuntimeError("boom"))
                     ),
@@ -1194,18 +1200,17 @@ class TestWorkerConnection:
 
         Given:
             A Nack whose exception.dump is the byte string b"not a valid
-            pickle" and reason="ImportError: missing"
+            pickle"
         When:
             dispatch(task) is awaited and consumed
         Then:
-            It should raise RpcError whose details contains "Task
-            rejected by worker: ImportError: missing"
+            It should raise RpcError whose details flag the malformed
+            payload
         """
         # Arrange
         responses = (
             protocol.Response(
                 nack=protocol.Nack(
-                    reason="ImportError: missing",
                     exception=protocol.Message(dump=b"not a valid pickle"),
                 )
             ),
@@ -1221,9 +1226,7 @@ class TestWorkerConnection:
         )
 
         # Act & assert
-        with pytest.raises(
-            RpcError, match="Task rejected by worker: ImportError: missing"
-        ):
+        with pytest.raises(RpcError, match="malformed Nack payload"):
             async for _ in await connection.dispatch(sample_task):
                 pass
 
@@ -1235,19 +1238,17 @@ class TestWorkerConnection:
 
         Given:
             A Nack whose exception field carries a cloudpickle dump of a
-            non-BaseException value (the string "not an exception") and
-            reason="ValueError: oops"
+            non-BaseException value (the string "not an exception")
         When:
             dispatch(task) is awaited and consumed
         Then:
-            It should raise RpcError with details "Task rejected by
-            worker: ValueError: oops"
+            It should raise RpcError with details flagging the malformed
+            payload
         """
         # Arrange
         responses = (
             protocol.Response(
                 nack=protocol.Nack(
-                    reason="ValueError: oops",
                     exception=protocol.Message(
                         dump=cloudpickle.dumps("not an exception")
                     ),
@@ -1265,7 +1266,7 @@ class TestWorkerConnection:
         )
 
         # Act & assert
-        with pytest.raises(RpcError, match="Task rejected by worker: ValueError: oops"):
+        with pytest.raises(RpcError, match="malformed Nack payload"):
             async for _ in await connection.dispatch(sample_task):
                 pass
 
@@ -1282,17 +1283,16 @@ class TestWorkerConnection:
         When:
             dispatch(task) is awaited and consumed
         Then:
-            It should raise RpcError carrying the Nack reason rather than
-            re-raise the BaseException, since Rejected.original is
-            Exception-typed by contract and a worker shipping a
-            non-Exception BaseException would be smuggling cancel/interrupt
-            signals across the wire.
+            It should raise RpcError rather than re-raise the
+            BaseException, since Rejected.original is Exception-typed
+            by contract and a worker shipping a non-Exception
+            BaseException would be smuggling cancel/interrupt signals
+            across the wire.
         """
         # Arrange
         responses = (
             protocol.Response(
                 nack=protocol.Nack(
-                    reason="KeyboardInterrupt: ",
                     exception=protocol.Message(
                         dump=cloudpickle.dumps(KeyboardInterrupt())
                     ),
@@ -1310,7 +1310,7 @@ class TestWorkerConnection:
         )
 
         # Act & assert
-        with pytest.raises(RpcError, match="KeyboardInterrupt"):
+        with pytest.raises(RpcError, match="malformed Nack payload"):
             async for _ in await connection.dispatch(sample_task):
                 pass
 
@@ -1326,6 +1326,15 @@ class TestWorkerConnection:
                 LookupError,
                 OSError,
                 ArithmeticError,
+                # PR #205 explicitly names ``ImportError`` and
+                # ``ContextDecodeWarning`` as parse-phase rejection
+                # classes that ride the Nack-with-exception channel
+                # (unloadable callable / strict-mode context decode).
+                # Both must round-trip class+message intact so the
+                # caller's ``except ImportError`` / ``except
+                # ContextDecodeWarning`` keeps matching.
+                ImportError,
+                ContextDecodeWarning,
             )
         ),
         message=st.text(
@@ -1362,7 +1371,6 @@ class TestWorkerConnection:
         responses = (
             protocol.Response(
                 nack=protocol.Nack(
-                    reason=f"{exc_type.__name__}: {message}",
                     exception=protocol.Message(dump=cloudpickle.dumps(generated_exc)),
                 )
             ),
@@ -2692,6 +2700,10 @@ class TestWorkerConnection:
         # ``CancelledError`` must NOT be degraded to
         # ``UnexpectedResponse`` / ``RpcError`` — those would
         # silently break stdlib's cancellation-chaining contract.
+        # Pin the EXACT class (not just isinstance) so a regression
+        # that wraps the cancellation in a private subclass is also
+        # caught — asyncio internals are sensitive to identity here.
+        assert type(exc_info.value) is asyncio.CancelledError
         assert not isinstance(exc_info.value, UnexpectedResponse)
         assert not isinstance(exc_info.value, RpcError)
 

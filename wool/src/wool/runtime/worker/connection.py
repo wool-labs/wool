@@ -135,19 +135,39 @@ class _DispatchStream(Generic[_T]):
         :raises RuntimeError:
             If another iteration is already in progress.
         :raises UnexpectedResponse:
-            If the response is neither a result nor an exception.
+            If the response payload is unrecognised (neither a
+            result nor an exception), if a result or exception
+            dump cannot be deserialised (e.g. cloudpickle version
+            skew, missing class on the caller's path, truncated
+            bytes, etc.), or if the worker ships a non-:class:`Exception`
+            :class:`BaseException` payload other than
+            :class:`asyncio.CancelledError` (e.g. :class:`KeyboardInterrupt`,
+            :class:`SystemExit`, user-defined :class:`BaseException`
+            subclasses, etc.).
+        :raises asyncio.CancelledError:
+            When the worker-side routine raises
+            :class:`asyncio.CancelledError` from its body (or is
+            externally cancelled and propagates the
+            ``CancelledError`` out). Mirrors stdlib's ``await task``
+            semantics where ``raise CancelledError`` from the
+            awaitee is indistinguishable from
+            ``task.cancel()`` — both transition the task to
+            ``CANCELLED`` and the caller's ``await`` raises
+            ``CancelledError``.
         :raises Exception:
             The worker-side routine's exception, re-raised in its
             original class. The class is narrowed to
-            :class:`Exception`: a worker that ships a
-            non-:class:`Exception` :class:`BaseException`
-            (e.g., :class:`KeyboardInterrupt`,
-            :class:`SystemExit`, or a user-defined
-            :class:`BaseException` subclass) is degraded to
-            :class:`RpcError` so cancel/interrupt signals cannot
-            be smuggled across the wire and trip caller-side
-            cancellation semantics. Caller-side gRPC cancellation
-            arrives via a different path, not via this exception.
+            :class:`Exception` for non-:class:`CancelledError`
+            :class:`BaseException` subclasses (:class:`KeyboardInterrupt`,
+            :class:`SystemExit`, or user-defined :class:`BaseException`
+            subclasses): these are degraded to
+            :class:`UnexpectedResponse` so process-level signals
+            cannot be smuggled across the wire and trip caller-side
+            signal handlers. :class:`UnexpectedResponse` is not a
+            :class:`RpcError` subclass, so the load balancer treats
+            it as a caller-fault and does not evict the worker.
+            Caller-side gRPC cancellation arrives via a different
+            path, not via this exception.
         """
         if self._closed:  # pragma: no cover
             raise StopAsyncIteration
@@ -198,7 +218,20 @@ class _DispatchStream(Generic[_T]):
                 if incoming_context.has_state():
                     context.current_context().update(incoming_context)
             if response.HasField("result"):
-                result = self._serializer.loads(response.result.dump)
+                try:
+                    result = self._serializer.loads(response.result.dump)
+                except Exception as exc:
+                    # Degrade malformed result payloads to
+                    # :class:`UnexpectedResponse` so callers can
+                    # ``except UnexpectedResponse`` uniformly while
+                    # the original pickle/import failure remains on
+                    # ``__cause__`` for diagnostic chains. Load
+                    # balancer treats this as caller-fault and does
+                    # not evict the worker (typically a version
+                    # skew on a shared result class).
+                    raise UnexpectedResponse(
+                        "Worker shipped a malformed result payload"
+                    ) from exc
                 if decode_failures:
                     raise BaseExceptionGroup(
                         "response context decode failed",
@@ -206,16 +239,49 @@ class _DispatchStream(Generic[_T]):
                     )
                 return result
             elif response.HasField("exception"):
-                worker_exc = self._serializer.loads(response.exception.dump)
-                # See ``__anext__``'s ``:raises Exception:`` for the
-                # narrowing contract.
-                if not isinstance(worker_exc, Exception):
-                    worker_exc = RpcError(
-                        code=None,
-                        details=(
-                            "Worker shipped a non-Exception payload in "
-                            f"Response.exception: {type(worker_exc).__name__}"
-                        ),
+                # Degrade malformed exception payloads (cloudpickle
+                # version skew, missing class on the caller's path,
+                # truncated bytes, worker-side serializer bug) to
+                # :class:`UnexpectedResponse` so the load balancer
+                # treats it as a caller-fault and does not evict the
+                # worker for what is typically a version-skew issue.
+                # Mirrors the non-Exception payload degradation
+                # below; the parse-phase Nack path keeps its
+                # :class:`RpcError` fallback because worker-side
+                # parse rejection has different worker-health
+                # semantics than a routine-time decode mismatch.
+                try:
+                    worker_exc = self._serializer.loads(response.exception.dump)
+                except Exception as exc:
+                    # Preserve the original pickle/import failure
+                    # via manual ``__cause__`` chaining — we assign
+                    # ``worker_exc`` and continue into the
+                    # narrowing + note-attachment block below, so
+                    # ``raise X from Y`` syntax isn't applicable
+                    # here. The later ``raise worker_exc`` honors
+                    # the manually-set ``__cause__`` identically to
+                    # ``raise X from Y``.
+                    worker_exc = UnexpectedResponse(
+                        "Worker shipped a malformed exception payload"
+                    )
+                    worker_exc.__cause__ = exc
+                    worker_exc.__suppress_context__ = True
+                # See ``__anext__``'s ``:raises Exception:`` /
+                # ``:raises asyncio.CancelledError:`` for the
+                # narrowing contract. ``CancelledError`` is allowed
+                # to propagate raw to mirror stdlib's ``await
+                # task`` semantics where a routine that self-raises
+                # ``CancelledError`` is indistinguishable from one
+                # that was externally cancelled. Other non-Exception
+                # ``BaseException`` subclasses are degraded to
+                # :class:`UnexpectedResponse` (not :class:`RpcError`)
+                # so process-level signals cannot be smuggled and
+                # the load balancer does not evict the worker for a
+                # routine-level fault.
+                if not isinstance(worker_exc, (Exception, asyncio.CancelledError)):
+                    worker_exc = UnexpectedResponse(
+                        "Worker shipped a non-Exception payload in "
+                        f"Response.exception: {type(worker_exc).__name__}"
                     )
                 if decode_failures:
                     # Attach decode failures to the worker exception
@@ -666,9 +732,10 @@ class WorkerConnection:
         its exit stack so any failure here triggers the registered
         cleanup callbacks during unwind.
 
-        On a typed nack (parse-phase worker rejection), re-raises
-        the worker's original exception unchanged. On a plain nack
-        or malformed dump, raises :class:`RpcError`.
+        On a Nack (parse-phase worker rejection), re-raises the
+        worker's original exception unchanged. On a malformed
+        Nack payload (loads raises, or yields a non-Exception),
+        falls back to :class:`RpcError`.
         """
         request = protocol.Request(
             task=wire_task,
@@ -677,41 +744,31 @@ class WorkerConnection:
         await call.write(request)
         response = await anext(aiter(call))
         if response.HasField("nack"):
-            # Workers attach a dumped exception payload to Nack
-            # when the rejection originates from parse-phase decode
-            # failures (malformed task id, unpicklable serializer
-            # hint, strict-mode ContextDecodeWarning, cloudpickle
-            # errors on the task callable, ImportError on a missing
-            # module on the worker). Deserialize and re-raise so
-            # the caller observes the actual failure class rather
-            # than an opaque RpcError. Plain Nacks (e.g., version
-            # mismatch) carry only a reason string and surface as
-            # :class:`RpcError`. A malformed dump (raises on
-            # ``loads`` or deserializes to a non-:class:`Exception`)
-            # also falls back to :class:`RpcError(reason)` — the
-            # worker writes a typed ``reason``
-            # (``f"{type(original).__name__}: {original}"``) for
-            # parse-phase Nacks specifically so this fallback path
-            # still carries the failure class name and message.
-            if response.nack.HasField("exception"):
-                nack_serializer = (
-                    serializer if serializer is not None else wool.__serializer__
-                )
-                try:
-                    raised = nack_serializer.loads(response.nack.exception.dump)
-                except Exception:
-                    raised = None
-                # Narrowed to ``Exception`` to match
-                # ``Rejected.original``'s typed contract (worker
-                # constructs ``Rejected`` only from
-                # ``except Exception``). A worker that ships a
-                # non-``Exception`` ``BaseException`` would be a
-                # worker bug; degrade to ``RpcError(reason)``
-                # rather than smuggle cancel/interrupt signals
-                # across the wire.
-                if isinstance(raised, Exception):
-                    raise raised from None
-            raise RpcError(details=f"Task rejected by worker: {response.nack.reason}")
+            # Every Nack carries a typed parse-phase exception.
+            # Deserialize and re-raise so the caller observes the
+            # actual failure class rather than an opaque RpcError.
+            # Envelope-level rejections (e.g., protocol-version
+            # mismatch) ride gRPC status codes, not Nack — those
+            # land in :meth:`dispatch`'s ``except grpc.RpcError``
+            # arm instead.
+            nack_serializer = (
+                serializer if serializer is not None else wool.__serializer__
+            )
+            try:
+                raised = nack_serializer.loads(response.nack.exception.dump)
+            except Exception:
+                raised = None
+            # Narrowed to ``Exception`` to match
+            # ``Rejected.original``'s typed contract (worker
+            # constructs ``Rejected`` only from
+            # ``except Exception``). A worker that ships a
+            # non-``Exception`` ``BaseException`` would be a worker
+            # bug; degrade to :class:`RpcError` rather than smuggle
+            # cancel/interrupt signals across the wire. A malformed
+            # dump (loads raises) lands here too.
+            if isinstance(raised, Exception):
+                raise raised from None
+            raise RpcError(details="Task rejected by worker (malformed Nack payload)")
         if not response.HasField("ack"):
             raise UnexpectedResponse(
                 f"Expected 'ack' response, received '{response.WhichOneof('payload')}'"

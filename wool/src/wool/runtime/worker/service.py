@@ -580,29 +580,18 @@ class WorkerService(protocol.WorkerServicer):
                                     context=wire_context,
                                 )
             except Rejected as e:
-                # Parse-phase failure (malformed task id, unpicklable
-                # serializer hint, strict-mode ContextDecodeWarning,
-                # cloudpickle errors on the task callable, ImportError
-                # on a missing module on the worker, non-async
-                # callable). Reported via Nack so the client
-                # deserializes the dumped exception and re-raises it
-                # as the actual failure class rather than an opaque
-                # RpcError. The dump uses ``session.serializer`` —
-                # the negotiated serializer if parse got past
-                # serializer setup, falling back to
-                # ``wool.__serializer__`` (cloudpickle) for
-                # early-fail paths. Same path as ``Response.exception``
-                # post-Ack — symmetry on the wire.
-                #
-                # The reason carries the original class + str() so
-                # callers that hit the malformed-dump fallback in
-                # :meth:`WorkerConnection._dispatch` (e.g.,
-                # serializer-mismatch on early-fail self-dispatch)
-                # still see a typed diagnostic rather than a generic
-                # rejection string.
+                # Parse-phase failure (malformed task payload).
+                # Reported via Nack so the client deserializes the
+                # dumped exception and re-raises it as the actual
+                # failure class rather than an opaque RpcError. The
+                # dump uses ``session.serializer`` — the negotiated
+                # serializer if parse got past serializer setup,
+                # falling back to ``wool.__serializer__``
+                # (cloudpickle) for early-fail paths. Same path as
+                # ``Response.exception`` post-Ack — symmetry on the
+                # wire.
                 yield protocol.Response(
                     nack=protocol.Nack(
-                        reason=f"{type(e.original).__name__}: {e.original}",
                         exception=protocol.Message(
                             dump=_safely_serialize_exception(
                                 session.serializer, e.original

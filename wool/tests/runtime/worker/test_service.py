@@ -2638,8 +2638,8 @@ class TestWorkerService:
         When:
             A task with empty version field is dispatched
         Then:
-            The worker responds with a Nack citing unparseable
-            version.
+            The worker aborts the stream with FAILED_PRECONDITION
+            citing unparseable version.
         """
 
         # Arrange
@@ -2659,17 +2659,16 @@ class TestWorkerService:
         request = protocol.Request(task=wool_task.to_protobuf())
         request.task.ClearField("version")
 
-        # Act
+        # Act & assert
         async with grpc_aio_stub() as stub:
             stream = stub.dispatch()
             await stream.write(request)
             await stream.done_writing()
-            responses = [r async for r in stream]
-
-        # Assert
-        assert len(responses) == 1
-        assert responses[0].HasField("nack")
-        assert "Unparseable version" in responses[0].nack.reason
+            with pytest.raises(grpc.aio.AioRpcError) as excinfo:
+                async for _ in stream:
+                    pass
+        assert excinfo.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        assert "Unparseable version" in (excinfo.value.details() or "")
 
     @settings(
         max_examples=20,
@@ -2689,7 +2688,7 @@ class TestWorkerService:
         local_major,
         client_major,
     ):
-        """Test dispatch yields Nack for incompatible major version.
+        """Test dispatch aborts with FAILED_PRECONDITION for incompatible major version.
 
         Given:
             Two semver-like version strings with different major
@@ -2698,8 +2697,8 @@ class TestWorkerService:
             A task is dispatched with the client version through the
             version interceptor
         Then:
-            The dispatch yields a Nack with a reason citing
-            incompatible, empty, or unparseable version.
+            The worker aborts the stream with FAILED_PRECONDITION
+            citing incompatible version.
         """
         assume(local_major != client_major)
 
@@ -2723,17 +2722,16 @@ class TestWorkerService:
         # Override version field to simulate incompatible client
         request.task.version = f"{client_major}.0.0"
 
-        # Act
+        # Act & assert
         async with grpc_aio_stub() as stub:
             stream = stub.dispatch()
             await stream.write(request)
             await stream.done_writing()
-            responses = [r async for r in stream]
-
-        # Assert
-        assert len(responses) == 1
-        assert responses[0].HasField("nack")
-        assert "Incompatible version" in responses[0].nack.reason
+            with pytest.raises(grpc.aio.AioRpcError) as excinfo:
+                async for _ in stream:
+                    pass
+        assert excinfo.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        assert "Incompatible version" in (excinfo.value.details() or "")
 
     @settings(
         max_examples=20,
@@ -2755,7 +2753,7 @@ class TestWorkerService:
         local_minor,
         client_minor,
     ):
-        """Test dispatch yields Nack when client is newer than worker.
+        """Test dispatch aborts with FAILED_PRECONDITION when client is newer than worker.
 
         Given:
             A worker with version X.a.0 and a client with version
@@ -2763,8 +2761,8 @@ class TestWorkerService:
         When:
             A task is dispatched through the version interceptor
         Then:
-            The dispatch yields a Nack with a reason citing
-            incompatible version.
+            The worker aborts the stream with FAILED_PRECONDITION
+            citing incompatible version.
         """
         assume(client_minor > local_minor)
 
@@ -2787,17 +2785,16 @@ class TestWorkerService:
         request = protocol.Request(task=wool_task.to_protobuf())
         request.task.version = f"{major}.{client_minor}.0"
 
-        # Act
+        # Act & assert
         async with grpc_aio_stub() as stub:
             stream = stub.dispatch()
             await stream.write(request)
             await stream.done_writing()
-            responses = [r async for r in stream]
-
-        # Assert
-        assert len(responses) == 1
-        assert responses[0].HasField("nack")
-        assert "Incompatible version" in responses[0].nack.reason
+            with pytest.raises(grpc.aio.AioRpcError) as excinfo:
+                async for _ in stream:
+                    pass
+        assert excinfo.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        assert "Incompatible version" in (excinfo.value.details() or "")
 
     @pytest.mark.asyncio
     async def test_dispatch_with_unparseable_client_version(
@@ -2810,8 +2807,8 @@ class TestWorkerService:
         When:
             A task with unparseable version string is dispatched
         Then:
-            The worker responds with a Nack citing unparseable
-            version.
+            The worker aborts the stream with FAILED_PRECONDITION
+            citing unparseable version.
         """
 
         # Arrange
@@ -2831,17 +2828,16 @@ class TestWorkerService:
         request = protocol.Request(task=wool_task.to_protobuf())
         request.task.version = "not-a-version"
 
-        # Act
+        # Act & assert
         async with grpc_aio_stub() as stub:
             stream = stub.dispatch()
             await stream.write(request)
             await stream.done_writing()
-            responses = [r async for r in stream]
-
-        # Assert
-        assert len(responses) == 1
-        assert responses[0].HasField("nack")
-        assert "Unparseable version" in responses[0].nack.reason
+            with pytest.raises(grpc.aio.AioRpcError) as excinfo:
+                async for _ in stream:
+                    pass
+        assert excinfo.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        assert "Unparseable version" in (excinfo.value.details() or "")
 
     @pytest.mark.asyncio
     async def test_dispatch_async_generator_with_send(

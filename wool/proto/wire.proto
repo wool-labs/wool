@@ -79,20 +79,21 @@ message Ack {
     string version = 1;
 }
 
-// Negative acknowledgment: the worker rejected the task at parse
-// phase, before any Ack. Always emitted alone (no preceding Ack,
-// no following frames).
+// Negative acknowledgment: the worker rejected the task during the
+// parse phase, before any Ack. Always emitted alone (no preceding
+// Ack, no following frames). Carries the original parse-phase
+// exception so the client re-raises the actual failure class.
+// Envelope-level rejections (e.g., protocol-version mismatch) ride
+// gRPC status codes (FAILED_PRECONDITION) instead.
 message Nack {
-    // Human-readable diagnostic. Always set. Carries the original
-    // exception's class and message for parse-phase rejections, or
-    // a plain description for envelope-level rejections (e.g.,
-    // version mismatch).
-    string reason = 1;
-    // Dumped original exception, encoded with the same serializer
-    // as Response.exception. Set on parse-phase rejections so the
-    // client re-raises the actual failure class; unset for
-    // envelope-level rejections where no typed cause exists.
-    optional Message exception = 2;
+    // Dumped original exception. Encoded with the worker's
+    // negotiated serializer when negotiation completed before
+    // the rejection; falls back to wool.__serializer__
+    // (cloudpickle) for early-fail paths where the rejection
+    // fires before serializer setup. Caller side falls back to
+    // RpcError on a deserialization mismatch. Same dump format
+    // as Response.exception.
+    optional Message exception = 1;
 }
 
 service Worker {
