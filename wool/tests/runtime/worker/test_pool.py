@@ -25,6 +25,7 @@ from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import WorkerPool
+from wool.runtime.worker.proxy import IneffectiveQuorumTimeoutWarning
 
 
 def _make_worker_metadata(*tags: str) -> WorkerMetadata:
@@ -1996,7 +1997,7 @@ class TestWorkerPool:
         """Test zero lease with discovery-only pool is rejected.
 
         Given:
-            A discovery service and lease of 0 with no spawn
+            A discovery service and lease of 0
         When:
             WorkerPool is instantiated
         Then:
@@ -2069,7 +2070,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
     ):
-        """Test ephemeral mode forwards lease to WorkerProxy.
+        """Test ephemeral mode forwards spawn + lease to WorkerProxy.
 
         Given:
             A WorkerPool with spawn=2 and lease=4 without discovery
@@ -2135,7 +2136,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
     ):
-        """Test no lease forwards lease=None to WorkerProxy.
+        """Test ephemeral pool with no lease forwards lease=None.
 
         Given:
             A WorkerPool with plain int spawn and no lease
@@ -2233,3 +2234,490 @@ class TestWorkerPool:
             match="Lease must be non-negative",
         ):
             WorkerPool(spawn=1, lease=lease)
+
+    # ------------------------------------------------------------------
+    # Quorum tests
+    # ------------------------------------------------------------------
+
+    def test___init___with_quorum(self):
+        """Test instantiation with spawn and quorum.
+
+        Given:
+            A spawn of 4 and quorum of 2
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, quorum=2)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_zero_quorum(self):
+        """Test zero quorum is accepted.
+
+        Given:
+            A spawn of 4 and quorum of 0
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, quorum=0)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_quorum_timeout_without_quorum_warns(self):
+        """Test quorum_timeout supplied without a positive quorum emits a warning.
+
+        Given:
+            spawn=2, quorum=None, and quorum_timeout=30
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should emit an IneffectiveQuorumTimeoutWarning; users
+            who want strict behaviour can elevate the category to error
+            via warnings.filterwarnings
+        """
+        # Act & assert
+        with pytest.warns(
+            IneffectiveQuorumTimeoutWarning,
+            match="'quorum_timeout' has no effect when 'quorum' is None or 0",
+        ):
+            WorkerPool(spawn=2, quorum=None, quorum_timeout=30)
+
+    @pytest.mark.asyncio
+    async def test___aenter___with_negative_quorum_raises(
+        self, mock_shared_memory, mock_local_worker
+    ):
+        """Test negative quorum is rejected at context entry.
+
+        Given:
+            A spawn of 4 and quorum of -1
+        When:
+            The WorkerPool context is entered
+        Then:
+            It should raise ValueError from the underlying WorkerProxy
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Quorum must be a non-negative integer"):
+            async with WorkerPool(spawn=4, quorum=-1):
+                pass
+
+    def test___init___with_quorum_exceeding_capacity(self):
+        """Test quorum exceeding pool capacity is rejected.
+
+        Given:
+            A spawn of 2, lease of 2, and quorum of 5
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match=r"Quorum.*cannot exceed pool capacity"):
+            WorkerPool(spawn=2, lease=2, quorum=5)
+
+    def test___init___with_quorum_equal_to_capacity(self):
+        """Test quorum equal to pool capacity is accepted.
+
+        Given:
+            A spawn of 4, lease of 3, and quorum of 7
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, lease=3, quorum=7)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_quorum_satisfied_by_spawn_alone(self):
+        """Test quorum satisfiable by spawn alone with lease=0 is accepted.
+
+        Given:
+            A spawn of 4, lease of 0, and quorum of 3
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, lease=0, quorum=3)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    @pytest.mark.asyncio
+    async def test___aenter___with_quorum_exceeding_lease_discovery_only(
+        self, mock_discovery_service_for_pool
+    ):
+        """Test quorum exceeding lease in discovery-only pool is rejected.
+
+        Given:
+            A discovery service, lease of 2, and quorum of 3
+        When:
+            The WorkerPool context is entered
+        Then:
+            It should raise ValueError from the underlying WorkerProxy
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match=r"Quorum.*cannot exceed lease"):
+            async with WorkerPool(
+                discovery=mock_discovery_service_for_pool, lease=2, quorum=3
+            ):
+                pass
+
+    def test___init___ephemeral_rejects_quorum_above_capacity(self):
+        """Test ephemeral pool rejects quorum exceeding spawn + lease.
+
+        Given:
+            A spawn of 2, lease of 2, no discovery, and quorum of 10
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError, since ephemeral capacity is
+            bounded by spawn + lease
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match=r"Quorum.*cannot exceed pool capacity"):
+            WorkerPool(spawn=2, lease=2, quorum=10)
+
+    def test___init___with_unbounded_lease_and_quorum_above_spawn(self):
+        """Test unbounded lease accepts quorum exceeding spawn.
+
+        Given:
+            A spawn of 2, no lease (unbounded), and quorum of 10
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully (the quorum
+            reachability check is deferred to runtime via
+            quorum_timeout)
+        """
+        # Act
+        pool = WorkerPool(spawn=2, quorum=10)
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___hybrid_mode_rejects_quorum_above_capacity(
+        self, mocker: MockerFixture
+    ):
+        """Test hybrid pool rejects quorum exceeding spawn + lease.
+
+        Given:
+            A discovery service with spawn=2, lease=2, and quorum=10
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError, since hybrid capacity is
+            spawn + lease
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act & assert
+        with pytest.raises(ValueError, match=r"Quorum.*cannot exceed pool capacity"):
+            WorkerPool(spawn=2, discovery=mock_discovery, lease=2, quorum=10)
+
+    @pytest.mark.asyncio
+    async def test___aenter___with_non_positive_quorum_timeout_raises(
+        self, mock_shared_memory, mock_local_worker
+    ):
+        """Test non-positive quorum_timeout is rejected at context entry.
+
+        Given:
+            A spawn of 2, quorum of 1, and quorum_timeout of 0
+        When:
+            The WorkerPool context is entered
+        Then:
+            It should raise ValueError from the underlying WorkerProxy
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Quorum timeout must be positive"):
+            async with WorkerPool(spawn=2, quorum=1, quorum_timeout=0):
+                pass
+
+    def test___init___default_mode_with_quorum_above_cpu_count(self):
+        """Test default-mode pool rejects quorum exceeding resolved capacity.
+
+        Given:
+            A default-mode pool (no spawn, no discovery) with a quorum
+            exceeding os.cpu_count()
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError matching "Quorum cannot exceed
+            pool capacity"
+        """
+        import os
+
+        # Arrange — pick a quorum guaranteed to exceed any plausible CPU count
+        cpu_count = os.cpu_count() or 1
+        excessive_quorum = cpu_count + 100
+
+        # Act & assert
+        with pytest.raises(ValueError, match=r"Quorum.*cannot exceed pool capacity"):
+            WorkerPool(lease=0, quorum=excessive_quorum)
+
+    @pytest.mark.asyncio
+    async def test___aenter___forwards_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test quorum is forwarded to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and quorum=2
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=2 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2, quorum=2):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 2
+
+    @pytest.mark.asyncio
+    async def test___aenter___forwards_default_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test default quorum is forwarded to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and no explicit quorum
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=1 to WorkerProxy (preserves
+            pre-quorum implicit-wait semantics)
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 1
+
+    @pytest.mark.asyncio
+    async def test___aenter___forwards_quorum_none(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test explicit quorum=None forwards quorum=None to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and explicit quorum=None
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=None to WorkerProxy without
+            forwarding quorum_timeout
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2, quorum=None):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] is None
+        assert "quorum_timeout" not in proxy_kwargs
+
+    @pytest.mark.asyncio
+    async def test___aenter___forwards_quorum_zero(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test quorum=0 normalizes to quorum=None when forwarded to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and quorum=0
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=None to WorkerProxy without forwarding
+            quorum_timeout — quorum=0 is documented as equivalent to
+            None and normalized at the boundary to satisfy WorkerProxy's
+            typed overload contract
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2, quorum=0):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] is None
+        assert "quorum_timeout" not in proxy_kwargs
+
+    @pytest.mark.asyncio
+    async def test___aenter___durable_mode_forwards_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test durable mode forwards quorum to WorkerProxy.
+
+        Given:
+            A WorkerPool with discovery and quorum=3
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=3 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+        discovery_service = mock_discovery_service_for_pool
+
+        # Act
+        async with WorkerPool(discovery=discovery_service, quorum=3):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 3
+
+    @pytest.mark.asyncio
+    async def test___aenter___hybrid_mode_forwards_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_discovery_service_for_pool,
+    ):
+        """Test hybrid mode forwards quorum to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2, discovery, and quorum=3
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=3 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+        discovery_service = mock_discovery_service_for_pool
+
+        # Act
+        async with WorkerPool(spawn=2, discovery=discovery_service, quorum=3):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 3
+
+    @given(quorum=st.integers(min_value=-100, max_value=-1))
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @pytest.mark.asyncio
+    async def test___aenter___rejects_negative_quorum_pbt(
+        self, quorum, mock_shared_memory, mock_local_worker
+    ):
+        """Test negative quorum values are rejected at context entry.
+
+        Given:
+            Any negative quorum value
+        When:
+            The WorkerPool context is entered
+        Then:
+            It should raise ValueError from the underlying WorkerProxy
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Quorum must be a non-negative integer",
+        ):
+            async with WorkerPool(spawn=1, quorum=quorum):
+                pass
+
+    @given(
+        spawn=st.integers(min_value=1, max_value=20),
+        lease=st.integers(min_value=0, max_value=20),
+        quorum=st.integers(min_value=0, max_value=40),
+    )
+    def test___init___accepts_quorum_within_capacity_pbt(self, spawn, lease, quorum):
+        """Test any quorum within the pool capacity is accepted.
+
+        Given:
+            Any spawn in [1, 20], lease in [0, 20], and quorum in
+            [0, spawn + lease]
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Hypothesis explores the full grid; skip combinations that the
+        # validator legitimately rejects (quorum > spawn + lease).
+        if quorum > spawn + lease:
+            return
+
+        # Act
+        pool = WorkerPool(spawn=spawn, lease=lease, quorum=quorum)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
