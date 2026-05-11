@@ -196,6 +196,14 @@ class Scenario:
     ctx_var_2: ContextVarPattern | None = None
     ctx_var_3: ContextVarPattern | None = None
     quorum: QuorumMode | None = None
+    # NOTE: ``serializer`` and ``strict_warnings`` are listed in
+    # ``_OPTIONAL_DIMENSIONS`` and serve as documentation
+    # annotations on test IDs — they do not drive
+    # ``build_pool_from_scenario`` behavior today. Tests that vary
+    # along these axes set them explicitly so the pytest ID
+    # reflects the negotiation under exercise. See F9 in the test
+    # review (tracking issue) for the planned spy that turns these
+    # into actively-pinned invariants.
     serializer: SerializerKind | None = None
     strict_warnings: StrictWarnings | None = None
 
@@ -218,12 +226,13 @@ class Scenario:
 
     @property
     def is_complete(self) -> bool:
-        """True when all 14 core dimensions are set.
+        """True when all required (non-optional) dimensions are set.
 
-        Optional documentation fields (``serializer``, ``strict_warnings``)
-        are excluded from the completeness check — they describe
-        observable annotations on a scenario rather than required
-        configuration. Pairwise rows generate with them at ``None``.
+        Optional documentation fields listed in ``_OPTIONAL_DIMENSIONS``
+        (``serializer``, ``strict_warnings``) are excluded from the
+        completeness check — they describe observable annotations on a
+        scenario rather than required configuration. Pairwise rows
+        generate with them at ``None``.
         """
         return all(
             getattr(self, f.name) is not None
@@ -981,8 +990,6 @@ def _select_routine(shape, binding):
             return routines.Routines.static_gen
 
         case (RoutineShape.ASYNC_GEN_ANEXT_SINGLE, RoutineBinding.MODULE_FUNCTION):
-            return routines.gen_range_one_yield
-        case (RoutineShape.ASYNC_GEN_ANEXT_SINGLE, _):
             return routines.gen_range_one_yield
 
         case (RoutineShape.ASYNC_GEN_ASEND, RoutineBinding.MODULE_FUNCTION):

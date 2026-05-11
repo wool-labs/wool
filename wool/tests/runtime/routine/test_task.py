@@ -16,7 +16,6 @@ from wool.runtime.context import dispatch_timeout
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
 from wool.runtime.routine.task import _scoped
-from wool.runtime.routine.task import _unpickle_serializer
 from wool.runtime.routine.task import current_task
 from wool.runtime.routine.task import do_dispatch
 from wool.runtime.serializer import PassthroughSerializer
@@ -2221,56 +2220,6 @@ class TestScoped:
 
         # Assert — the first yielded value made it through
         assert results == [1]
-
-
-class TestUnpickleSerializer:
-    """Tests for :func:`wool.runtime.routine.task._unpickle_serializer`."""
-
-    def test_unpickle_serializer_with_passthrough_dump(self):
-        """Test _unpickle_serializer reconstructs a PassthroughSerializer.
-
-        Given:
-            Bytes produced by ``wool.__serializer__.dumps`` of a
-            ``PassthroughSerializer`` instance.
-        When:
-            ``_unpickle_serializer(data)`` is called.
-        Then:
-            It should return a ``PassthroughSerializer`` instance.
-        """
-        # Arrange
-        _unpickle_serializer.cache_clear()
-        original = PassthroughSerializer()
-        data = wool.__serializer__.dumps(original)
-
-        # Act
-        restored = _unpickle_serializer(data)
-
-        # Assert
-        assert isinstance(restored, PassthroughSerializer)
-
-    def test_unpickle_serializer_caches_repeated_calls(self):
-        """Test _unpickle_serializer returns the same instance on cache hit.
-
-        Given:
-            The same data bytes produced by
-            ``wool.__serializer__.dumps(PassthroughSerializer())``.
-        When:
-            ``_unpickle_serializer(data)`` is called twice with the
-            same bytes.
-        Then:
-            It should return the same instance both times (LRU
-            cache hit, observable via identity).
-        """
-        # Arrange
-        _unpickle_serializer.cache_clear()
-        data = wool.__serializer__.dumps(PassthroughSerializer())
-
-        # Act
-        first = _unpickle_serializer(data)
-        second = _unpickle_serializer(data)
-
-        # Assert
-        assert first is second
 
 
 class TestRuntimeContext:
