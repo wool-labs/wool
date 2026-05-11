@@ -25,6 +25,7 @@ from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.connection import clear_channel_pool
 
 from .conftest import PicklableMock
 
@@ -2592,3 +2593,367 @@ class TestWorkerConnection:
         assert (var.namespace, var.name) in emitted
         # Passthrough tokens are exactly 16 bytes (UUID bytes)
         assert len(emitted[(var.namespace, var.name)]) == 16
+
+    @pytest.mark.asyncio
+    async def test_dispatch_response_exception_with_non_exception_payload_falls_back_to_unexpected_response(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch wraps a non-Exception ``Response.exception``
+        payload as an :class:`UnexpectedResponse` so the load
+        balancer does not evict the worker for a routine-level fault.
+
+        Given:
+            A :class:`protocol.Response` whose ``exception`` field
+            carries a cloudpickle dump of a non-Exception value
+            (a bare string)
+        When:
+            ``dispatch(task)`` is awaited and the result iterator is
+            consumed
+        Then:
+            It should raise :class:`UnexpectedResponse` (not
+            :class:`RpcError`) whose details name the malformed
+            payload type. :class:`UnexpectedResponse` is not a
+            :class:`RpcError` subclass, so the load-balancer
+            classification treats it as a caller-fault and does
+            not evict the worker.
+        """
+        # Arrange
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                exception=protocol.Message(
+                    dump=cloudpickle.dumps("not an exception"),
+                )
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert
+        with pytest.raises(
+            UnexpectedResponse, match="non-Exception payload"
+        ) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        # Belt-and-suspenders: the worker-eviction contract is
+        # carried by ``RpcError``; a routine-level fault must not
+        # surface as an ``RpcError`` subclass.
+        assert not isinstance(exc_info.value, RpcError)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_response_exception_with_cancelled_error_propagates_as_cancelled_error(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch propagates a worker-side
+        :class:`asyncio.CancelledError` raw rather than degrading it.
+
+        Mirrors stdlib's ``await task`` semantics where a coroutine
+        that self-raises :class:`asyncio.CancelledError` is
+        indistinguishable from one that was externally cancelled —
+        both transition the task to ``CANCELLED`` and the caller's
+        ``await`` raises :class:`asyncio.CancelledError`. Wool's
+        wire ships ``CancelledError`` on the ``Response.exception``
+        frame; the caller must re-raise the same class so user code
+        can ``except asyncio.CancelledError`` (and allow the
+        cancellation to chain through the caller's own task as
+        asyncio expects).
+
+        Given:
+            A :class:`protocol.Response` whose ``exception`` field
+            carries a cloudpickle dump of
+            :class:`asyncio.CancelledError`
+        When:
+            ``dispatch(task)`` is awaited and the result iterator is
+            consumed
+        Then:
+            The caller's ``await`` should raise
+            :class:`asyncio.CancelledError` raw — not
+            :class:`UnexpectedResponse`, not :class:`RpcError`.
+        """
+        # Arrange
+        cancellation = asyncio.CancelledError("worker self-raised cancel")
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                exception=protocol.Message(dump=cloudpickle.dumps(cancellation)),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        # ``CancelledError`` must NOT be degraded to
+        # ``UnexpectedResponse`` / ``RpcError`` — those would
+        # silently break stdlib's cancellation-chaining contract.
+        assert not isinstance(exc_info.value, UnexpectedResponse)
+        assert not isinstance(exc_info.value, RpcError)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_response_exception_with_decode_failures_swallows_note_write_rejection(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test the strict-mode note/attribute write attempts are
+        swallowed for slotted exception classes that reject them.
+
+        Given:
+            A :class:`Response` whose ``exception`` payload is a
+            ``_StrictRejectingException`` (rejects ``add_note`` with
+            :class:`AttributeError` and arbitrary attribute writes
+            including ``__wool_context_warnings__`` with
+            :class:`AttributeError`) AND whose ``context`` decode
+            raises a :class:`BaseExceptionGroup` of
+            :class:`ContextDecodeWarning` peers (strict-mode
+            promotion)
+        When:
+            ``dispatch(task)`` is awaited and the result iterator is
+            consumed
+        Then:
+            It should raise the ``_StrictRejectingException``
+            unchanged — the failed note/attribute writes are
+            swallowed under ``except (AttributeError, TypeError)``
+            and ``except AttributeError`` respectively, so the
+            routine's primary signal still ships.
+        """
+        from wool.runtime.context import Context
+
+        # Arrange — patch Context.from_protobuf to raise the
+        # strict-mode decode group on each call. The exception arm
+        # in _read_next gets ``decode_failures`` populated and then
+        # tries to attach them via add_note and a sidecar attribute.
+        peer = ContextDecodeWarning("var-1 unencodable")
+
+        def encode_with_strict_failure(cls, *args, **kwargs):
+            raise BaseExceptionGroup("strict-mode encode group", [peer])
+
+        mocker.patch.object(
+            Context,
+            "from_protobuf",
+            classmethod(encode_with_strict_failure),
+        )
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                exception=protocol.Message(
+                    dump=cloudpickle.dumps(_StrictRejectingException("primary signal")),
+                )
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert — the routine's primary signal type is
+        # preserved; no stray AttributeError leaks from the
+        # swallowed note/attribute writes.
+        with pytest.raises(_StrictRejectingException) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        assert "primary signal" in str(exc_info.value)
+        # The sidecar attribute was never set because the class
+        # rejects arbitrary writes — the swallow is the assertion.
+        assert not hasattr(exc_info.value, "__wool_context_warnings__")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_response_result_with_malformed_payload_falls_back_to_unexpected_response(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch wraps a malformed ``Response.result`` payload
+        as :class:`UnexpectedResponse` so the load balancer does not
+        evict the worker for what is typically caller-side version
+        skew on a shared result class.
+
+        Given:
+            A :class:`protocol.Response` whose ``result`` field
+            carries bytes that cannot be deserialized
+            (b"not a valid pickle stream")
+        When:
+            ``dispatch(task)`` is awaited and the result iterator is
+            consumed
+        Then:
+            It should raise :class:`UnexpectedResponse` whose
+            message names the malformed result payload, chained
+            from the underlying deserialization error via
+            ``__cause__``; :class:`UnexpectedResponse` is not an
+            :class:`RpcError` subclass so the load-balancer
+            classification treats it as a caller-fault and does
+            not evict the worker.
+        """
+        # Arrange
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                result=protocol.Message(dump=b"not a valid pickle stream"),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert
+        with pytest.raises(
+            UnexpectedResponse, match="malformed result payload"
+        ) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        # Belt-and-suspenders: the worker-eviction contract is
+        # carried by ``RpcError``; a malformed-result degradation
+        # must not surface as an ``RpcError`` subclass.
+        assert not isinstance(exc_info.value, RpcError)
+        # The underlying deserialization error is preserved on
+        # ``__cause__`` for diagnostic chains.
+        assert exc_info.value.__cause__ is not None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_response_exception_with_malformed_payload_falls_back_to_unexpected_response(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch wraps a malformed ``Response.exception``
+        payload as :class:`UnexpectedResponse` so the load balancer
+        does not evict the worker for what is typically caller-side
+        version skew on a shared exception class.
+
+        Given:
+            A :class:`protocol.Response` whose ``exception`` field
+            carries bytes that cannot be deserialized
+            (b"not a valid pickle stream")
+        When:
+            ``dispatch(task)`` is awaited and the result iterator is
+            consumed
+        Then:
+            It should raise :class:`UnexpectedResponse` whose
+            message names the malformed exception payload, with the
+            underlying deserialization error preserved on
+            ``__cause__`` and ``__suppress_context__`` set so the
+            implicit context chain is suppressed.
+            :class:`UnexpectedResponse` is not an :class:`RpcError`
+            subclass so the load-balancer classification treats it
+            as a caller-fault and does not evict the worker.
+        """
+        # Arrange
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                exception=protocol.Message(dump=b"not a valid pickle stream"),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act & assert
+        with pytest.raises(
+            UnexpectedResponse, match="malformed exception payload"
+        ) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        # Belt-and-suspenders: a routine-time decode mismatch must
+        # not surface as an ``RpcError`` subclass.
+        assert not isinstance(exc_info.value, RpcError)
+        # Manual ``__cause__`` chaining preserves the original
+        # pickle/import failure for diagnostics; the implicit
+        # context chain is suppressed via ``__suppress_context__``.
+        assert exc_info.value.__cause__ is not None
+        assert exc_info.value.__suppress_context__ is True
+
+
+@pytest.mark.asyncio
+async def test_clear_channel_pool_tears_down_cached_channels(
+    mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+):
+    """Test :func:`clear_channel_pool` closes every cached gRPC
+    channel in the module-wide pool.
+
+    Given:
+        A populated module-wide channel pool — a successful
+        dispatch through a :class:`WorkerConnection` has primed the
+        cache for a particular key.
+    When:
+        :func:`clear_channel_pool` is awaited.
+    Then:
+        It should invoke the cached channel's ``close()`` method
+        so the cached entry is torn down and subsequent dispatches
+        would build a fresh channel.
+    """
+    # Arrange
+    mock_channel = mocker.AsyncMock()
+    mocker.patch.object(grpc.aio, "insecure_channel", return_value=mock_channel)
+
+    responses = (
+        protocol.Response(ack=protocol.Ack()),
+        protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+    )
+    mock_call = mock_grpc_call(async_stream(responses))
+
+    mock_stub = mocker.MagicMock()
+    mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+    mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+    connection = WorkerConnection(
+        "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+    )
+
+    async for _ in await connection.dispatch(sample_task):
+        pass
+
+    # Act
+    await clear_channel_pool()
+
+    # Assert
+    mock_channel.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_clear_channel_pool_with_empty_pool_returns_without_raising():
+    """Test :func:`clear_channel_pool` is a no-op when the pool is
+    empty.
+
+    Given:
+        A module-wide channel pool with no cached entries (the
+        autouse ``_clear_channel_pool`` fixture clears the pool
+        between tests, so this test starts from an empty pool).
+    When:
+        :func:`clear_channel_pool` is awaited.
+    Then:
+        It should return without raising — clearing an empty pool
+        is a legitimate operation and must not surface a
+        ``KeyError`` or similar.
+    """
+    # Act & assert — must not raise
+    await clear_channel_pool()
