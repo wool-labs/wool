@@ -13,6 +13,7 @@ from typing import Any
 from typing import Callable
 from typing import Coroutine
 from typing import Final
+from typing import Generator
 from typing import ItemsView
 from typing import Iterator
 from typing import KeysView
@@ -20,6 +21,7 @@ from typing import NoReturn
 from typing import SupportsIndex
 from typing import TypeVar
 from typing import ValuesView
+from typing import cast
 from uuid import UUID
 from uuid import uuid4
 
@@ -754,11 +756,20 @@ def install_task_factory(
 
     def wool_factory(
         loop: asyncio.AbstractEventLoop,
-        coro: Coroutine[Any, Any, Any],
+        coro: Coroutine[Any, Any, Any] | Generator[Any, None, Any],
         *,
         context: Context | contextvars.Context | None = None,
         **kwargs: Any,
     ) -> asyncio.Task[Any]:
+        # Widen to ``Coroutine | Generator`` to satisfy typeshed's
+        # ``_CoroutineLike[_T]`` contravariant parameter — the
+        # ``Generator`` arm exists for pre-3.8 generator-coroutines
+        # and is unreachable from asyncio's modern create_task path,
+        # but the static type must accept it for ``wool_factory`` to
+        # be a valid ``_TaskFactory``. Narrow back to ``Coroutine``
+        # for the body, which uses ``Coroutine``-only operations
+        # (await semantics, ``_wool_scoped`` wrapping).
+        coro = cast(Coroutine[Any, Any, Any], coro)
         if isinstance(context, Context):
             # Explicit wool.Context: hide it from asyncio (which would
             # call ctx.run(step_fn) per step and fragment _guard's
