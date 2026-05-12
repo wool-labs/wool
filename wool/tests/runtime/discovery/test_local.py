@@ -995,6 +995,27 @@ class TestLocalDiscoverySubscriber:
     """
 
     @pytest.mark.asyncio
+    async def test___aiter___with_negative_poll_interval(self, namespace):
+        """Test iteration rejects negative poll_interval.
+
+        Given:
+            A subscriber constructed with a negative ``poll_interval``
+            (the metaclass defers ``__init__`` until the resource pool
+            factory fires on first iteration)
+        When:
+            The caller starts iterating the subscriber
+        Then:
+            It should raise :class:`ValueError` naming the bad value.
+        """
+        # Arrange
+        with LocalDiscovery(namespace):
+            subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=-0.1)
+
+            # Act & assert
+            with pytest.raises(ValueError, match=r"positive poll interval.*-0\.1"):
+                await anext(aiter(subscriber))
+
+    @pytest.mark.asyncio
     async def test___aiter___discovers_added_worker(self, namespace, metadata):
         """Test async for yields worker-added event.
 
