@@ -34,8 +34,8 @@ def _safely_serialize_exception(
     serializer: Serializer,
     exc: BaseException,
 ) -> bytes:
-    """Serialize *exc*, falling back to a synthesized
-    :class:`RuntimeError` if *exc* contains un-picklable state.
+    """Serialize *exc*, preserving the exception class when the
+    original instance carries un-picklable state.
 
     Prevents un-picklable exception state from converting a
     wool-class failure on the wire into a generic gRPC stream
@@ -47,16 +47,61 @@ def _safely_serialize_exception(
     :class:`TypeError` for un-picklable C types,
     :class:`AttributeError` for un-picklable local closures, or
     :class:`RecursionError` for deeply self-referential graphs).
-    The fallback synthesizes a stdlib :class:`RuntimeError` —
-    always picklable — so the second ``dumps`` call cannot fail
-    for either serializer; no further tier of defense is
-    warranted, and exceptions outside the un-picklable-input
-    set propagate as real bugs in the serializer.
+
+    **Type-preserving fallback.** Stdlib exception pickling
+    round-trips ``(type, args, __dict__)``, dropping
+    :attr:`__traceback__`, :attr:`__cause__`, :attr:`__context__`,
+    and :attr:`__suppress_context__` — those four are not part of
+    the exception's identity. :attr:`__notes__` and other
+    ``__dict__`` attributes (including the wool-private
+    ``__wool_context_warnings__`` set by the dispatch handler when
+    strict-mode :class:`wool.ContextDecodeWarning` peers fire on
+    snapshot encode) survive the round-trip. When a routine-level
+    exception accumulates state that drags an un-picklable C-level
+    object into the graph (e.g. a worker-thread frame on
+    :attr:`__traceback__` reachable via :attr:`__cause__`), the
+    first ``dumps`` raises but the exception's *class* and *args*
+    are still picklable on their own. Reconstruct a clean instance
+    and reship — the caller's ``except RoutineError`` still
+    matches, mirroring the stdlib pickle contract for exceptions.
+    Side-channel attachments (notes, ``__wool_context_warnings__``)
+    are lost on the reconstructed instance because the fallback
+    builds a fresh ``cls(*exc.args)``; the wire-survival guarantee
+    holds only on the primary path.
+
+    If even ``cls(*exc.args)`` cannot be constructed or pickled
+    (constructor side effects, unpicklable args), demote to a
+    stdlib :class:`RuntimeError` carrying the original class
+    name and message — always picklable, so the third ``dumps``
+    cannot fail.
     """
     try:
         return serializer.dumps(exc)
     except (pickle.PickleError, TypeError, AttributeError, RecursionError):
-        return serializer.dumps(RuntimeError(f"{type(exc).__name__}: {exc!s}"))
+        pass
+    try:
+        cls = type(exc)
+        clean = cls(*exc.args)
+        return serializer.dumps(clean)
+    except Exception:
+        # Honor the docstring's "third dumps cannot fail" promise:
+        # any reconstruction failure (over-eager ``__init__``
+        # validation, custom ``__new__``, un-picklable args, etc.)
+        # — not just the narrow pickle/type/recursion set — must
+        # fall through to the always-picklable ``RuntimeError``
+        # demotion. ``KeyboardInterrupt``/``SystemExit`` still
+        # propagate since they are ``BaseException``-only.
+        cls_name = type(exc).__name__
+        # Guard the f-string. ``__str__`` is user-overridable and
+        # can raise (touches per-instance state, delegates to a
+        # buggy ``__repr__``, etc.). The bare class name is a
+        # string attribute lookup and cannot raise — last resort
+        # so the safety net always succeeds.
+        try:
+            message = f"{cls_name}: {exc!s}"
+        except Exception:
+            message = cls_name
+        return serializer.dumps(RuntimeError(message))
 
 
 def _attach_strict_mode_warnings(exc: BaseException, encode_exc: BaseException) -> None:

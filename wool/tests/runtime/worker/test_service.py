@@ -1,4 +1,5 @@
 import asyncio
+import pickle
 import threading
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -2258,12 +2259,13 @@ class TestWorkerService:
             frames via ``WorkerService.dispatch``
         Then:
             Every yielded value equals the caller-supplied
-            ``dispatch_timeout`` — confirming that
-            ``_stream_from_worker`` enters ``work_task.runtime_context`` for
-            the lifetime of the generator. Regression guard for #176,
-            where the prior code dropped the context after the first
-            ``__enter__`` and left ``dispatch_timeout`` at its default
-            on subsequent frames.
+            ``dispatch_timeout`` — confirming that the unified
+            :class:`DispatchSession` driver enters
+            ``work_task.runtime_context`` once for the lifetime of
+            the generator. Regression guard for #176, where the
+            pre-#187 ``_stream_from_worker`` code path dropped the
+            context after the first ``__enter__`` and left
+            ``dispatch_timeout`` at its default on subsequent frames.
         """
         # Arrange
         from wool.runtime.context import RuntimeContext
@@ -4652,14 +4654,24 @@ class TestWorkerService:
         :class:`ContextDecodeWarning` to the routine's exception via
         ``__notes__`` and ``__wool_context_warnings__``.
 
+        Implementation note: the routine itself returns ``"ok"``, but
+        :meth:`Context.to_protobuf` is patched to raise on every
+        call. The per-step encode (which runs inside ``_step`` to
+        build the success :class:`_Response`) therefore raises the
+        warning, which routes through ``DispatchSession`` and surfaces
+        in :meth:`WorkerService.dispatch`'s terminal-exception clause
+        — the same code path that attaches strict-mode warnings as
+        ``__notes__`` / ``__wool_context_warnings__`` on the
+        exception before serializing it back to the caller.
+
         Given:
-            A coroutine routine that succeeds AND
-            :meth:`Context.to_protobuf` patched to raise a single bare
-            :class:`ContextDecodeWarning` (not a group)
+            A coroutine routine AND :meth:`Context.to_protobuf` patched
+            to raise a single bare :class:`ContextDecodeWarning` (not
+            a group) on every call
         When:
             The dispatch RPC ships its terminal-exception Response
         Then:
-            It should ship the routine's exception with ``__notes__``
+            It should ship an exception payload with ``__notes__``
             containing the single warning and
             ``__wool_context_warnings__`` of length 1.
         """
@@ -4954,8 +4966,6 @@ class TestWorkerService:
 
         drain_spy = mocker.spy(DispatchSession, "drain")
 
-        original_to_protobuf = handler_module._Response.to_protobuf
-
         def failing_to_protobuf(self, *, serializer):
             raise RuntimeError("synthetic dump failure")
 
@@ -4981,16 +4991,6 @@ class TestWorkerService:
             f"handler.drain() before snapshotting handler.context "
             f"(plus __aexit__'s call); observed {drain_spy.call_count} "
             f"call(s)."
-        )
-
-        # Restore so trailing teardown does not raise inside
-        # mocker's revert.
-        mocker.stop(
-            mocker.patch.object(
-                handler_module._Response,
-                "to_protobuf",
-                original_to_protobuf,
-            )
         )
 
     @pytest.mark.asyncio
