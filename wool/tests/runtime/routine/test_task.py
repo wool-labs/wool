@@ -1,5 +1,8 @@
 import asyncio
+from typing import AsyncGenerator
 from typing import Callable
+from typing import Coroutine
+from typing import cast
 from uuid import uuid4
 
 import cloudpickle
@@ -15,9 +18,9 @@ from wool.runtime.context import RuntimeContext
 from wool.runtime.context import dispatch_timeout
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
-from wool.runtime.routine.task import _scoped
 from wool.runtime.routine.task import current_task
 from wool.runtime.routine.task import do_dispatch
+from wool.runtime.routine.task import routine_scope
 from wool.runtime.serializer import PassthroughSerializer
 from wool.runtime.serializer import Serializer
 
@@ -199,7 +202,8 @@ async def test_current_task_inside_task_context(sample_task, mock_worker_proxy_c
     task = sample_task(callable=test_callable)
 
     # Act
-    result = await task._run()
+    async with routine_scope(task) as routine:
+        result = await cast(Coroutine, routine)
 
     # Assert
     assert result == task
@@ -371,26 +375,28 @@ class TestTask:
         When:
             The task is used as a context manager.
         Then:
-            It should return a callable from ``__enter__``.
+            It should bind :data:`_current_task` to *self* for the
+            duration of the ``with`` block.
         """
         # Arrange
         task = sample_task()
 
         # Act
-        with task as run_method:
+        with task:
             # Assert
-            assert callable(run_method)
+            assert current_task() is task
 
     @pytest.mark.asyncio
     async def test___enter___with_async_generator(self, sample_task):
-        """Test __enter__ returns a callable for generator tasks.
+        """Test __enter__ binds ``_current_task`` for an async-gen task.
 
         Given:
             A :py:class:`Task` with an async generator callable.
         When:
             The task is used as a context manager.
         Then:
-            It should return a callable from ``__enter__``.
+            It should bind :data:`_current_task` to *self* for the
+            duration of the ``with`` block.
         """
 
         # Arrange
@@ -400,36 +406,9 @@ class TestTask:
         task = sample_task(callable=test_generator)
 
         # Act
-        with task as run_method:
+        with task:
             # Assert
-            assert callable(run_method)
-
-    @pytest.mark.asyncio
-    async def test___enter___with_invalid_callable(self, sample_task):
-        """Test __enter__ raises ValueError for non-async callable.
-
-        Given:
-            A :py:class:`Task` with neither a coroutine nor an
-            async generator callable.
-        When:
-            The task is used as a context manager.
-        Then:
-            It should raise ``ValueError``.
-        """
-
-        # Arrange
-        def not_async():
-            return "not async"
-
-        task = sample_task(callable=not_async)
-
-        # Act & assert
-        with pytest.raises(
-            ValueError,
-            match="Expected coroutine function or async generator function",
-        ):
-            with task:
-                pass
+            assert current_task() is task
 
     @pytest.mark.asyncio
     async def test___exit___without_exception(self, sample_task):
@@ -607,8 +586,9 @@ class TestTask:
 
         # Act
         results = []
-        async for value in task._stream():
-            results.append(value)
+        async with routine_scope(task) as routine:
+            async for value in cast(AsyncGenerator, routine):
+                results.append(value)
 
         # Assert
         assert len(results) == value_count
@@ -772,7 +752,8 @@ class TestTask:
         )
 
         # Act
-        await task._run()
+        async with routine_scope(task) as routine:
+            await cast(Coroutine, routine)
 
         # Assert
         assert captured == [7.5]
@@ -812,8 +793,9 @@ class TestTask:
         )
 
         # Act
-        async for _ in task._stream():
-            pass
+        async with routine_scope(task) as routine:
+            async for _ in cast(AsyncGenerator, routine):
+                pass
 
         # Assert
         assert captured == [3.0, 3.0]
@@ -993,7 +975,8 @@ class TestTask:
         )
 
         # Act
-        result = await task._run()
+        async with routine_scope(task) as routine:
+            result = await cast(Coroutine, routine)
 
         # Assert
         assert result == 8
@@ -1007,7 +990,7 @@ class TestTask:
         When:
             ``dispatch()`` is called.
         Then:
-            It should raise ``RuntimeError`` from :func:`_scoped`'s
+            It should raise ``RuntimeError`` from :func:`routine_scope`'s
             single-source-of-truth precondition (callers no longer
             duplicate the check at their entry points).
         """
@@ -1019,7 +1002,8 @@ class TestTask:
             RuntimeError,
             match="wool.__proxy_pool__ is not initialized",
         ):
-            await task._run()
+            async with routine_scope(task) as routine:
+                await cast(Coroutine, routine)
 
     def test_to_protobuf_with_unpicklable_callable_fails(self, picklable_proxy):
         """Test to_protobuf fails with an unpicklable callable.
@@ -1081,8 +1065,9 @@ class TestTask:
 
         # Act
         results = []
-        async for value in task._stream():
-            results.append(value)
+        async with routine_scope(task) as routine:
+            async for value in cast(AsyncGenerator, routine):
+                results.append(value)
 
         # Assert
         assert results == ["value_0", "value_1", "value_2"]
@@ -1111,24 +1096,27 @@ class TestTask:
         task = sample_task(callable=test_coroutine)
 
         # Act
-        result = await task._run()
+        async with routine_scope(task) as routine:
+            result = await cast(Coroutine, routine)
 
         # Assert
         assert result == "coroutine_result"
 
     @pytest.mark.asyncio
-    async def test_enter_with_invalid_callable_raises_error(
+    async def test_routine_scope_with_invalid_callable(
         self,
         sample_task,
+        mock_worker_proxy_cache,
     ):
-        """Test entering a Task raises ValueError for non-async callable.
+        """Test routine_scope raises ValueError for a non-async callable.
 
         Given:
-            A :py:class:`Task` with a non-async callable.
+            A :py:class:`Task` whose callable is neither a coroutine
+            function nor an async generator function.
         When:
-            The Task is entered via ``with task:``.
+            :func:`routine_scope` is entered for the task.
         Then:
-            It should raise ``ValueError``.
+            It should raise :class:`ValueError`.
         """
 
         # Arrange
@@ -1142,7 +1130,7 @@ class TestTask:
             ValueError,
             match="Expected coroutine function or async generator function",
         ):
-            with task:
+            async with routine_scope(task):
                 pass
 
     @pytest.mark.asyncio
@@ -1158,7 +1146,7 @@ class TestTask:
         When:
             ``dispatch()`` is called.
         Then:
-            It should raise ``RuntimeError`` from :func:`_scoped`'s
+            It should raise ``RuntimeError`` from :func:`routine_scope`'s
             single-source-of-truth precondition.
         """
 
@@ -1173,8 +1161,9 @@ class TestTask:
             RuntimeError,
             match="wool.__proxy_pool__ is not initialized",
         ):
-            async for _ in task._stream():
-                pass
+            async with routine_scope(task) as routine:
+                async for _ in cast(AsyncGenerator, routine):
+                    pass
 
     @pytest.mark.asyncio
     async def test_dispatch_async_generator_raises_during_iteration(
@@ -1203,8 +1192,9 @@ class TestTask:
         # Act & assert
         results = []
         with pytest.raises(ValueError, match="Generator error"):
-            async for value in task._stream():
-                results.append(value)
+            async with routine_scope(task) as routine:
+                async for value in cast(AsyncGenerator, routine):
+                    results.append(value)
 
         # Verify we got the first value before the exception
         assert results == ["first"]
@@ -1234,10 +1224,11 @@ class TestTask:
 
         # Act
         results = []
-        async for value in task._stream():
-            results.append(value)
-            if len(results) >= 2:
-                break
+        async with routine_scope(task) as routine:
+            async for value in cast(AsyncGenerator, routine):
+                results.append(value)
+                if len(results) >= 2:
+                    break
 
         # Assert
         assert results == ["value_0", "value_1"]
@@ -1269,8 +1260,9 @@ class TestTask:
 
         # Act
         results = []
-        async for value in task._stream():
-            results.append(value)
+        async with routine_scope(task) as routine:
+            async for value in cast(AsyncGenerator, routine):
+                results.append(value)
 
         # Assert
         assert results == [0, 10, 20, 30, 40]
@@ -1302,8 +1294,9 @@ class TestTask:
 
         # Act
         results = []
-        async for value in task._stream():
-            results.append(value)
+        async with routine_scope(task) as routine:
+            async for value in cast(AsyncGenerator, routine):
+                results.append(value)
 
         # Assert
         assert results == []
@@ -1600,14 +1593,14 @@ class TestTask:
         assert deserialized_task.tag == original_task.tag
 
 
-class TestScoped:
-    """Tests for :func:`wool.runtime.routine.task.scoped`."""
+class TestRoutineScope:
+    """Tests for :func:`wool.runtime.routine.task.routine_scope`."""
 
     @pytest.mark.asyncio
-    async def test_scoped_with_null_runtime_context_asserts(
+    async def test_routine_scope_with_null_runtime_context_asserts(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test :func:`_scoped` asserts a non-None runtime context.
+        """Test :func:`routine_scope` asserts a non-None runtime context.
 
         ``Task.__post_init__`` always seeds ``runtime_context`` from
         ``RuntimeContext.get_current()``; a Task that bypasses
@@ -1620,7 +1613,7 @@ class TestScoped:
             A Task whose ``runtime_context`` has been cleared after
             construction (bypassing ``__post_init__``)
         When:
-            :func:`_scoped` is entered
+            :func:`routine_scope` is entered
         Then:
             It should raise :class:`AssertionError`.
         """
@@ -1634,18 +1627,18 @@ class TestScoped:
 
         # Act & assert
         with pytest.raises(AssertionError):
-            async with _scoped(task):
+            async with routine_scope(task):
                 pass
 
     @pytest.mark.asyncio
-    async def test_scoped_without_proxy_pool(self, sample_task):
-        """Test scoped raises when wool.__proxy_pool__ is unset.
+    async def test_routine_scope_without_proxy_pool(self, sample_task):
+        """Test routine_scope raises when wool.__proxy_pool__ is unset.
 
         Given:
             ``wool.__proxy_pool__`` has no value set in the current
             context and a Task with a coroutine callable.
         When:
-            ``_scoped(task)`` is entered via ``async with``.
+            ``routine_scope(task)`` is entered via ``async with``.
         Then:
             It should raise ``RuntimeError`` whose message starts
             with "wool.__proxy_pool__ is not initialized".
@@ -1657,20 +1650,20 @@ class TestScoped:
         with pytest.raises(
             RuntimeError, match=r"^wool\.__proxy_pool__ is not initialized"
         ):
-            async with _scoped(task):
+            async with routine_scope(task):
                 pass
 
     @pytest.mark.asyncio
-    async def test_scoped_with_coroutine_callable(
+    async def test_routine_scope_with_coroutine_callable(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped yields an awaitable coroutine for coroutine tasks.
+        """Test routine_scope yields an awaitable coroutine for coroutine tasks.
 
         Given:
             A Task whose callable is a coroutine function returning
             a sentinel and an active proxy pool.
         When:
-            ``_scoped(task)`` is entered and the yielded routine is
+            ``routine_scope(task)`` is entered and the yielded routine is
             awaited.
         Then:
             It should yield a coroutine object that resolves to the
@@ -1684,24 +1677,24 @@ class TestScoped:
         task = sample_task(callable=coro_callable)
 
         # Act
-        async with _scoped(task) as routine:
+        async with routine_scope(task) as routine:
             assert asyncio.iscoroutine(routine)
-            result = await routine
+            result = await cast(Coroutine, routine)
 
         # Assert
         assert result == "coro_result"
 
     @pytest.mark.asyncio
-    async def test_scoped_with_async_generator_callable(
+    async def test_routine_scope_with_async_generator_callable(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped yields an iterable async generator for stream tasks.
+        """Test routine_scope yields an iterable async generator for stream tasks.
 
         Given:
             A Task whose callable is an async-generator function that
             yields three values, plus an active proxy pool.
         When:
-            ``_scoped(task)`` is entered and the yielded routine is
+            ``routine_scope(task)`` is entered and the yielded routine is
             iterated.
         Then:
             It should yield an async generator producing the three
@@ -1718,24 +1711,24 @@ class TestScoped:
 
         # Act
         results = []
-        async with _scoped(task) as routine:
-            async for value in routine:
+        async with routine_scope(task) as routine:
+            async for value in cast(AsyncGenerator, routine):
                 results.append(value)
 
         # Assert
         assert results == [1, 2, 3]
 
     @pytest.mark.asyncio
-    async def test_scoped_establishes_task_scope(
+    async def test_routine_scope_establishes_task_scope(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped binds current_task and disables dispatch routing.
+        """Test routine_scope binds current_task and disables dispatch routing.
 
         Given:
             A Task whose callable records ``current_task()`` and
             ``do_dispatch()`` inside the scope.
         When:
-            The routine runs inside ``_scoped()``.
+            The routine runs inside ``routine_scope()``.
         Then:
             It should observe ``current_task()`` is the task and
             ``do_dispatch()`` is False inside; both should return to
@@ -1753,8 +1746,8 @@ class TestScoped:
         outer_dispatch_before = do_dispatch()
 
         # Act
-        async with _scoped(task) as routine:
-            await routine
+        async with routine_scope(task) as routine:
+            await cast(Coroutine, routine)
 
         # Assert
         assert observed["task"] is task
@@ -1763,16 +1756,16 @@ class TestScoped:
         assert do_dispatch() is outer_dispatch_before
 
     @pytest.mark.asyncio
-    async def test_scoped_resets_proxy_token_on_exit(
+    async def test_routine_scope_resets_proxy_token_on_exit(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped restores wool.__proxy__ on exit.
+        """Test routine_scope restores wool.__proxy__ on exit.
 
         Given:
             A Task whose callable records ``wool.__proxy__`` inside
             the scope; ``wool.__proxy__`` defaults to None outside.
         When:
-            The routine runs inside ``_scoped()`` and the CM is
+            The routine runs inside ``routine_scope()`` and the CM is
             exited.
         Then:
             It should bind a non-None proxy inside the scope and
@@ -1789,8 +1782,8 @@ class TestScoped:
         outer_proxy_before = wool.__proxy__.get()
 
         # Act
-        async with _scoped(task) as routine:
-            await routine
+        async with routine_scope(task) as routine:
+            await cast(Coroutine, routine)
 
         # Assert
         assert observed["proxy"] is not None
@@ -1798,17 +1791,17 @@ class TestScoped:
         assert wool.__proxy__.get() is None
 
     @pytest.mark.asyncio
-    async def test_scoped_applies_runtime_context(
+    async def test_routine_scope_applies_runtime_context(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped applies the Task's RuntimeContext.
+        """Test routine_scope applies the Task's RuntimeContext.
 
         Given:
             A Task with ``runtime_context=RuntimeContext(
             dispatch_timeout=4.5)`` and a coroutine that records
             the active dispatch_timeout value.
         When:
-            The routine runs inside ``_scoped()``.
+            The routine runs inside ``routine_scope()``.
         Then:
             It should observe ``dispatch_timeout == 4.5`` inside the
             scope.
@@ -1825,24 +1818,24 @@ class TestScoped:
         )
 
         # Act
-        async with _scoped(task) as routine:
-            await routine
+        async with routine_scope(task) as routine:
+            await cast(Coroutine, routine)
 
         # Assert
         assert observed["dispatch_timeout"] == 4.5
 
     @pytest.mark.asyncio
-    async def test_scoped_aclose_unconsumed_async_gen(
+    async def test_routine_scope_aclose_unconsumed_async_gen(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped acloses an async generator never iterated.
+        """Test routine_scope acloses an async generator never iterated.
 
         Given:
             A Task whose callable is an async generator that yields
-            once; the caller exits ``_scoped()`` without iterating any
+            once; the caller exits ``routine_scope()`` without iterating any
             value.
         When:
-            ``async with _scoped(task) as routine: pass`` runs (no
+            ``async with routine_scope(task) as routine: pass`` runs (no
             iteration).
         Then:
             It should aclose the routine on exit (the generator's
@@ -1856,23 +1849,23 @@ class TestScoped:
         task = sample_task(callable=gen_callable)
 
         # Act
-        async with _scoped(task) as routine:
+        async with routine_scope(task) as routine:
             captured_routine = routine
 
         # Assert — ag_frame is None after the generator has been closed
         assert captured_routine.ag_frame is None
 
     @pytest.mark.asyncio
-    async def test_scoped_swallows_generator_exit_during_aclose(
+    async def test_routine_scope_swallows_generator_exit_during_aclose(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped exits cleanly when the routine reacts to GeneratorExit.
+        """Test routine_scope exits cleanly when the routine reacts to GeneratorExit.
 
         Given:
             An async-generator routine whose body catches and
             re-raises ``GeneratorExit`` on cleanup.
         When:
-            The caller exits ``_scoped()`` after iterating once.
+            The caller exits ``routine_scope()`` after iterating once.
         Then:
             It should swallow the GeneratorExit and exit the CM
             cleanly without surfacing an exception to the caller.
@@ -1890,23 +1883,23 @@ class TestScoped:
 
         # Act — exit scoped after one iteration.  No exception
         # should escape the ``async with`` block on teardown.
-        async with _scoped(task) as routine:
-            await routine.__aiter__().__anext__()
+        async with routine_scope(task) as routine:
+            await cast(Coroutine, routine).__aiter__().__anext__()
 
         # Assert — control reached this point without raising; the
         # routine's GeneratorExit handling did not preempt teardown.
         assert routine.ag_frame is None
 
     @pytest.mark.asyncio
-    async def test_scoped_propagates_internal_cancelled_during_aclose(
+    async def test_routine_scope_propagates_internal_cancelled_during_aclose(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped propagates routine-internal CancelledError on aclose.
+        """Test routine_scope propagates routine-internal CancelledError on aclose.
 
         Wool matches stdlib ``await agen.aclose()`` semantics:
         when a routine catches :class:`GeneratorExit` and raises
         :class:`asyncio.CancelledError` during its cleanup, the
-        exception propagates from :func:`_scoped`'s exit handler
+        exception propagates from :func:`routine_scope`'s exit handler
         unchanged. Paired stdlib parity test
         :meth:`test_stdlib_aclose_propagates_internal_cancelled`
         pins the stdlib behavior so a future stdlib change
@@ -1918,7 +1911,7 @@ class TestScoped:
             while the awaiting task's ``cancelling()`` count is 0
             (no external cancel pending).
         When:
-            The caller exits ``_scoped()`` after iterating once.
+            The caller exits ``routine_scope()`` after iterating once.
         Then:
             It should propagate the routine's
             :class:`asyncio.CancelledError` out of the
@@ -1940,51 +1933,15 @@ class TestScoped:
 
         # Act + Assert
         with pytest.raises(asyncio.CancelledError):
-            async with _scoped(task) as routine:
+            async with routine_scope(task) as routine:
                 it = routine.__aiter__()
                 await it.__anext__()
 
     @pytest.mark.asyncio
-    async def test_stdlib_aclose_propagates_internal_cancelled(self):
-        """Stdlib parity test for routine-internal CancelledError
-        raised during ``aclose``.
-
-        Pins stdlib ``await agen.aclose()`` behavior so that any
-        future change in CPython's async-generator close protocol
-        signals (via this test breaking first) that
-        :meth:`test_scoped_propagates_internal_cancelled_during_aclose`
-        and :func:`_scoped`'s contract may need to be revisited to
-        keep parity.
-
-        Given:
-            A direct ``asyncio`` async generator that raises
-            :class:`asyncio.CancelledError` during aclose unwind
-            while the awaiting task's ``cancelling()`` count is 0.
-        When:
-            ``await agen.aclose()`` is invoked after one
-            iteration.
-        Then:
-            It should raise :class:`asyncio.CancelledError`.
-        """
-
-        async def naughty_gen():
-            try:
-                yield 1
-                yield 2
-            except GeneratorExit:
-                raise asyncio.CancelledError()
-
-        agen = naughty_gen()
-        await agen.__anext__()
-
-        with pytest.raises(asyncio.CancelledError):
-            await agen.aclose()
-
-    @pytest.mark.asyncio
-    async def test_scoped_propagates_external_cancellation_during_aclose(
+    async def test_routine_scope_propagates_external_cancellation_during_aclose(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped re-raises CancelledError when externally cancelled.
+        """Test routine_scope re-raises CancelledError when externally cancelled.
 
         Given:
             An async-generator routine that raises
@@ -2009,7 +1966,7 @@ class TestScoped:
                 # Mark the awaiting task as being externally
                 # cancelled, then raise CancelledError.  This puts
                 # the awaiting task's cancelling() count above 0
-                # so _scoped() must re-raise rather than swallow.
+                # so routine_scope() must re-raise rather than swallow.
                 current = asyncio.current_task()
                 assert current is not None
                 current.cancel()
@@ -2018,8 +1975,8 @@ class TestScoped:
         task = sample_task(callable=naughty_gen)
 
         async def body():
-            async with _scoped(task) as routine:
-                await routine.__aiter__().__anext__()
+            async with routine_scope(task) as routine:
+                await cast(Coroutine, routine).__aiter__().__anext__()
 
         # Wrap body() in its own asyncio.Task so the simulated
         # cancellation lands on that task and the test task can
@@ -2031,10 +1988,10 @@ class TestScoped:
             await wrapped
 
     @pytest.mark.asyncio
-    async def test_scoped_propagates_runtime_error_when_routine_yields_during_ge(
+    async def test_routine_scope_propagates_runtime_error_when_routine_yields_during_ge(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped propagates the synthesized RuntimeError when
+        """Test routine_scope propagates the synthesized RuntimeError when
         a routine yields during ``GeneratorExit`` handling.
 
         Wool matches stdlib ``await agen.aclose()`` semantics:
@@ -2051,7 +2008,7 @@ class TestScoped:
             :class:`GeneratorExit` and yields a value (protocol
             violation).
         When:
-            The caller exits ``_scoped()`` after iterating once.
+            The caller exits ``routine_scope()`` after iterating once.
         Then:
             It should propagate
             ``RuntimeError("async generator ignored
@@ -2069,58 +2026,21 @@ class TestScoped:
 
         # Act + Assert
         with pytest.raises(RuntimeError, match="ignored GeneratorExit"):
-            async with _scoped(task) as routine:
+            async with routine_scope(task) as routine:
                 it = routine.__aiter__()
                 await it.__anext__()
 
     @pytest.mark.asyncio
-    async def test_stdlib_aclose_raises_runtime_error_when_yielding_during_ge(self):
-        """Stdlib parity test for routine yielding during
-        ``GeneratorExit`` handling.
-
-        Pins stdlib ``await agen.aclose()`` behavior so that any
-        future change in CPython's async-generator close protocol
-        signals (via this test breaking first) that
-        :meth:`test_scoped_propagates_runtime_error_when_routine_yields_during_ge`
-        and :func:`_scoped`'s contract may need to be revisited to
-        keep parity.
-
-        Given:
-            A direct ``asyncio`` async generator that catches
-            :class:`GeneratorExit` and yields a value.
-        When:
-            ``await agen.aclose()`` is invoked after one
-            iteration.
-        Then:
-            It should raise
-            ``RuntimeError("async generator ignored
-            GeneratorExit")``.
-        """
-
-        async def yielding_gen():
-            try:
-                yield 1
-                yield 2
-            except GeneratorExit:
-                yield "rude"
-
-        agen = yielding_gen()
-        await agen.__anext__()
-
-        with pytest.raises(RuntimeError, match="ignored GeneratorExit"):
-            await agen.aclose()
-
-    @pytest.mark.asyncio
-    async def test_scoped_with_coroutine_does_not_aclose(
+    async def test_routine_scope_with_coroutine_does_not_aclose(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped does not invoke aclose teardown for coroutines.
+        """Test routine_scope does not invoke aclose teardown for coroutines.
 
         Given:
             A Task whose callable is a coroutine that records normal
             completion (no GeneratorExit raised in cleanup).
         When:
-            ``_scoped()`` exits cleanly after awaiting the coroutine.
+            ``routine_scope()`` exits cleanly after awaiting the coroutine.
         Then:
             It should not invoke any async-generator aclose path —
             coroutines bypass the teardown branch and complete
@@ -2142,8 +2062,8 @@ class TestScoped:
         task = sample_task(callable=coro_callable)
 
         # Act
-        async with _scoped(task) as routine:
-            result = await routine
+        async with routine_scope(task) as routine:
+            result = await cast(Coroutine, routine)
 
         # Assert
         assert result == "done"
@@ -2151,16 +2071,16 @@ class TestScoped:
         assert events == ["enter", "finally"]
 
     @pytest.mark.asyncio
-    async def test_scoped_propagates_caller_body_exception(
+    async def test_routine_scope_propagates_caller_body_exception(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped propagates exceptions raised in the caller body.
+        """Test routine_scope propagates exceptions raised in the caller body.
 
         Given:
             A coroutine Task and a caller body that raises
             ``ValueError("boom")`` inside the ``async with`` block.
         When:
-            The exception escapes the ``async with _scoped(task):``
+            The exception escapes the ``async with routine_scope(task):``
             block.
         Then:
             It should propagate ``ValueError("boom")`` to the caller.
@@ -2174,10 +2094,10 @@ class TestScoped:
 
         # Act & assert
         with pytest.raises(ValueError, match="boom"):
-            async with _scoped(task) as routine:
+            async with routine_scope(task) as routine:
                 # Drain the coroutine to avoid an "unawaited
                 # coroutine" warning, then raise from the body.
-                await routine
+                await cast(Coroutine, routine)
                 raise ValueError("boom")
 
         # Assert — the proxy pool's __aexit__ was invoked. With
@@ -2190,16 +2110,16 @@ class TestScoped:
         assert aexit_mock.await_count >= 1
 
     @pytest.mark.asyncio
-    async def test_scoped_propagates_routine_exception_transparently(
+    async def test_routine_scope_propagates_routine_exception_transparently(
         self, sample_task, mock_worker_proxy_cache
     ):
-        """Test scoped propagates routine-raised exceptions unchanged.
+        """Test routine_scope propagates routine-raised exceptions unchanged.
 
         Given:
             An async-generator routine that yields a value and then
             raises ``RuntimeError`` on the next iteration.
         When:
-            The caller iterates ``_scoped()`` past the first value.
+            The caller iterates ``routine_scope()`` past the first value.
         Then:
             It should propagate the routine's exception unchanged.
         """
@@ -2214,8 +2134,8 @@ class TestScoped:
         # Act & assert
         results: list[int] = []
         with pytest.raises(RuntimeError, match="routine-failure"):
-            async with _scoped(task) as routine:
-                async for value in routine:
+            async with routine_scope(task) as routine:
+                async for value in cast(AsyncGenerator, routine):
                     results.append(value)
 
         # Assert — the first yielded value made it through

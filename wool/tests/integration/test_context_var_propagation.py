@@ -7,8 +7,9 @@ routines.py and populating its wool.ContextVar registry), and the
 routine observes the propagated value. They complement the in-process
 unit tests in tests/runtime/test_context.py by exercising the real
 serialization and subprocess boundary, and they serve as the
-regression guard for the _stream_from_worker async-generator fix
-introduced with issue #154.
+regression guard for the unified-driver async-generator fix
+originally introduced with issue #154 and carried forward into the
+collapsed :class:`DispatchSession` by issue #187.
 """
 
 import asyncio
@@ -76,8 +77,8 @@ class TestContextVarPropagation:
             The caller iterates the generator to completion
         Then:
             Every yielded value should equal the caller's propagated
-            value — guards against regression in the
-            _stream_from_worker async-gen context restoration
+            value — guards against regression in the unified driver's
+            async-gen per-yield context restoration
         """
 
         # Arrange, act, & assert
@@ -1853,7 +1854,7 @@ class TestExplicitWoolContextBindingAcrossWorkers:
             One task should complete successfully and the other
             should raise RuntimeError because at most one task may
             run inside a given wool.Context at a time — the wool
-            task factory's _wool_scoped first-task-wins guard fires
+            task factory's _context_scope first-task-wins guard fires
             before the second task acquires _guard
         """
 
@@ -1909,7 +1910,7 @@ class TestExplicitWoolContextBindingAcrossWorkers:
                     and "was never awaited" in str(w.message)
                 ]
                 assert leaked == [], (
-                    "Guard-rejected coroutine must be closed by _wool_scoped, "
+                    "Guard-rejected coroutine must be closed by _context_scope, "
                     f"not leaked at GC; saw: {[str(w.message) for w in leaked]}"
                 )
 

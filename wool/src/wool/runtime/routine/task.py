@@ -14,7 +14,6 @@ from inspect import isasyncgenfunction
 from inspect import iscoroutinefunction
 from types import TracebackType
 from typing import AsyncGenerator
-from typing import AsyncIterator
 from typing import ContextManager
 from typing import Coroutine
 from typing import Dict
@@ -24,7 +23,6 @@ from typing import SupportsInt
 from typing import Tuple
 from typing import TypeAlias
 from typing import TypeVar
-from typing import cast
 from typing import overload
 from typing import runtime_checkable
 from uuid import UUID
@@ -183,20 +181,16 @@ class Task(Generic[W]):
         if self.runtime_context is None:
             self.runtime_context = RuntimeContext.get_current()
 
-    def __enter__(self) -> Callable[[], Coroutine | AsyncGenerator]:
-        """Enter the task context for execution.
+    def __enter__(self) -> Task:
+        """Enter the task context.
 
-        :returns:
-            The task's run method as a callable coroutine.
+        Bind this task to the current context. On exit, re-binds
+        the calling task and records any propagating exception
+        on :attr:`exception` for wire transport.
         """
         logging.debug(f"Entering {self.__class__.__name__} with ID {self.id}")
         self._task_token = _current_task.set(self)
-        if iscoroutinefunction(self.callable):
-            return self._run
-        elif isasyncgenfunction(self.callable):
-            return self._stream
-        else:
-            raise ValueError("Expected coroutine function or async generator function")
+        return self
 
     def __exit__(
         self,
@@ -204,10 +198,11 @@ class Task(Generic[W]):
         exception_value: BaseException | None,
         exception_traceback: TracebackType | None,
     ):
-        """Exit the task context and handle any exceptions.
+        """Exit the task context and capture exception state.
 
-        Captures exception information for later processing and allows
-        exceptions to propagate normally for proper error handling.
+        Re-binds the calling task, if any, to the current context
+        and records any propagating exception on :attr:`exception`
+        for wire transport.
 
         :param exception_type:
             Type of exception that occurred, if any.
@@ -231,7 +226,6 @@ class Task(Generic[W]):
                 ],
             )
         _current_task.reset(self._task_token)
-        # Return False to allow exceptions to propagate
         return False
 
     @classmethod
@@ -276,12 +270,6 @@ class Task(Generic[W]):
     def to_protobuf(self, serializer: Serializer | None = None) -> protocol.Task:
         """Serialize this Task to a protobuf message.
 
-        The serializer itself is pickled via :func:`_pickle_serializer`
-        which uses an LRU cache keyed on the serializer instance.
-        :class:`PassthroughSerializer` instances all hash and compare
-        equal, so repeated calls hit the cache and avoid redundant
-        pickling.
-
         :param serializer:
             Optional serializer for the callable and its arguments.  When
             ``None`` (the default), :data:`wool.__serializer__` is used
@@ -320,57 +308,6 @@ class Task(Generic[W]):
             task_msg.serializer = _pickle_serializer(serializer)
         return task_msg
 
-    async def _run(self):
-        """Execute the task's callable in proxy context."""
-        assert iscoroutinefunction(self.callable), "Expected coroutine function"
-        async with _scoped(self) as routine:
-            await asyncio.sleep(0)
-            return await cast(Coroutine, routine)
-
-    async def _stream(self):
-        """Stream the task's async generator callable in proxy context."""
-        assert isasyncgenfunction(self.callable), "Expected async generator function"
-        async with _scoped(self) as routine:
-            await asyncio.sleep(0)
-            async for value in cast(AsyncGenerator, routine):
-                yield value
-
-
-@asynccontextmanager
-async def _scoped(task: Task) -> AsyncIterator[Coroutine | AsyncGenerator]:
-    """Establish the wool-task execution scope around *task*'s routine.
-
-    Acquires a proxy from :data:`wool.__proxy_pool__`, binds
-    :data:`wool.__proxy__` for nested dispatch, and enters
-    ``with task.runtime_context, task, do_dispatch(False):`` once
-    around the caller's iteration. The routine (:class:`Coroutine` or
-    :class:`AsyncGenerator`) is built inside the scope and yielded
-    ready for stepping; on exit, async generators are ``aclose``'d
-    and coroutines are ``close``'d.
-
-    The :data:`wool.__proxy_pool__` context variable must be
-    initialized before entering this scope; entering without a
-    configured pool raises :class:`RuntimeError`.
-    """
-    proxy_pool = wool.__proxy_pool__.get()
-    if proxy_pool is None:
-        raise RuntimeError("wool.__proxy_pool__ is not initialized")
-    assert task.runtime_context is not None
-    async with proxy_pool.get(task.proxy) as proxy:
-        token = wool.__proxy__.set(proxy)
-        try:
-            with task.runtime_context, task, do_dispatch(False):
-                routine = task.callable(*task.args, **task.kwargs)
-                try:
-                    yield routine
-                finally:
-                    if isasyncgen(routine):
-                        await routine.aclose()
-                    else:
-                        routine.close()
-        finally:
-            wool.__proxy__.reset(token)
-
 
 # public
 @dataclass
@@ -404,3 +341,61 @@ def current_task() -> Task | None:
         The current task or None if no task is active.
     """
     return _current_task.get()
+
+
+@asynccontextmanager
+async def routine_scope(task: Task) -> AsyncGenerator[Coroutine | AsyncGenerator]:
+    """Establish the execution scope around *task*'s Wool routine.
+
+    Validates that ``task.callable`` is either a coroutine
+    function or an async generator function, acquires a proxy
+    from :data:`wool.__proxy_pool__`, binds :data:`wool.__proxy__`
+    for nested dispatch, and yields the routine ready for iteration.
+    On exit, close the callable as needed.
+
+    .. warning::
+
+       The :data:`wool.__proxy_pool__` context variable must be
+       initialized before entering this scope; entering without a
+       configured pool raises :class:`RuntimeError`.
+
+    :param task:
+        The :class:`Task` whose routine is to be executed. Its
+        ``callable`` must be an async function or async generator
+        function; its ``runtime_context`` must be populated (the
+        caller-side constructor seeds it via
+        :meth:`Task.__post_init__`).
+    :yields:
+        The constructed routine — a :class:`Coroutine` for async
+        functions or an :class:`AsyncGenerator` for async generator
+        functions. The caller drives it via ``await routine`` or
+        ``routine.asend``/``athrow``/``aclose``; the scope handles
+        teardown on exit.
+    :raises ValueError:
+        If ``task.callable`` is neither a coroutine function nor
+        an async generator function.
+    :raises RuntimeError:
+        If :data:`wool.__proxy_pool__` is not initialized at scope
+        entry.
+    """
+    if not (iscoroutinefunction(task.callable) or isasyncgenfunction(task.callable)):
+        raise ValueError("Expected coroutine function or async generator function")
+    proxy_pool = wool.__proxy_pool__.get()
+    if proxy_pool is None:
+        raise RuntimeError("wool.__proxy_pool__ is not initialized")
+    assert task.runtime_context is not None
+    async with proxy_pool.get(task.proxy) as proxy:
+        token = wool.__proxy__.set(proxy)
+        try:
+            with task.runtime_context, task, do_dispatch(False):
+                routine = task.callable(*task.args, **task.kwargs)
+                try:
+                    await asyncio.sleep(0)
+                    yield routine
+                finally:
+                    if isasyncgen(routine):
+                        await routine.aclose()
+                    else:
+                        routine.close()
+        finally:
+            wool.__proxy__.reset(token)

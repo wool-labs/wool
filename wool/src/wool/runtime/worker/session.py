@@ -38,8 +38,8 @@ from wool import protocol
 from wool.runtime.context import Context
 from wool.runtime.context import attached
 from wool.runtime.routine.task import Task
-from wool.runtime.routine.task import _scoped
 from wool.runtime.routine.task import _unpickle_serializer
+from wool.runtime.routine.task import routine_scope
 from wool.runtime.serializer import PassthroughSerializer
 from wool.runtime.serializer import Serializer
 from wool.runtime.serializer import _passthrough_pool
@@ -418,7 +418,7 @@ class DispatchSession:
       first call and drives the request/response loop on the main
       loop. Sets up cross-loop :class:`_RequestQueue` /
       :class:`_ResponseQueue` and submits a worker-loop task that
-      enters :func:`_scoped` for the parsed task and drives the
+      enters :func:`routine_scope` for the parsed task and drives the
       routine through :func:`_step`. The
       :class:`concurrent.futures.Future` held by the response
       queue surfaces pre-stream worker failures so they propagate
@@ -439,7 +439,7 @@ class DispatchSession:
       routine-time failures already shipped via the
       terminal-exception clause, so logging here would
       double-surface the same signal. Post-iteration teardown
-      failures (``_scoped``'s cleanup raising after a clean run)
+      failures (``routine_scope``'s cleanup raising after a clean run)
       currently fall into the same swallow; restoring an
       operator-visible log for that specific case is a
       follow-up.
@@ -631,7 +631,7 @@ class DispatchSession:
         and other pre-iteration decisions run before any worker
         task acquires the routine's :class:`Context` guard —
         otherwise a main-loop ``attached(self.context)`` would race
-        the worker's ``_wool_scoped`` ``_guard()`` and spuriously
+        the worker's ``_context_scope`` ``_guard()`` and spuriously
         raise on every dispatch with a backpressure hook.
 
         Short-circuits when :meth:`cancel` was called before the
@@ -657,7 +657,7 @@ class DispatchSession:
         def _start():
             async def _run():
                 try:
-                    async with _scoped(work_task) as routine:
+                    async with routine_scope(work_task) as routine:
                         while (request := await request_queue.get()) is not None:
                             try:
                                 response = await _step(
@@ -688,7 +688,7 @@ class DispatchSession:
                     # Stop the producer side immediately on any
                     # ``_run`` exit, including mid-frame routine
                     # exceptions that unwind past the ``async with
-                    # _scoped`` block. Pre-fix, the producer's
+                    # routine_scope`` block. Pre-fix, the producer's
                     # ``_iterate`` kept queueing frames until its
                     # own ``finally`` (or external teardown via
                     # :meth:`drain`) closed the queue, leaving a
@@ -773,7 +773,7 @@ class DispatchSession:
         failures already propagated out of ``__aiter__`` and
         shipped via the dispatch handler's terminal-exception
         clause, so this log line is largely a defensive surface
-        for post-iteration teardown failures (``_scoped``'s
+        for post-iteration teardown failures (``routine_scope``'s
         cleanup raising after the routine completed cleanly) —
         without it those regress silently. Re-shipping the
         exception is not viable: the dispatch handler has

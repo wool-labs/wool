@@ -3306,15 +3306,16 @@ class TestWorkerService:
             The dispatch RPC is invoked
         Then:
             It should reply with a terminal exception Response
-            carrying the assertion failure raised by
-            :func:`scoped` — proxy-less execution is broken by
-            construction (no nested-dispatch capability) and the
-            handler surfaces the precondition violation rather
-            than silently running without a proxy.
+            carrying the :class:`RuntimeError` raised by
+            :func:`routine_scope`'s precondition check —
+            proxy-less execution is broken by construction (no
+            nested-dispatch capability) and the handler surfaces
+            the precondition violation rather than silently
+            running without a proxy.
         """
 
         # Arrange — routine that would observe proxy state if it
-        # ran; the assertion fires before the routine starts.
+        # ran; the precondition fires before the routine starts.
         async def capturing_generator():
             yield {"has_proxy": wool.__proxy__.get() is not None}
 
@@ -4491,10 +4492,10 @@ class TestWorkerService:
         cleanly when the routine raises CancelledError during
         ``aclose`` on a natural-end iteration.
 
-        :func:`scoped` propagates aclose-time exceptions (matching
-        stdlib ``await agen.aclose()`` semantics — see the unit
-        tests in ``tests/runtime/routine/test_task.py`` for direct
-        coverage). For natural-end iteration, the consumer's
+        :func:`routine_scope` propagates aclose-time exceptions
+        (matching stdlib ``await agen.aclose()`` semantics — see
+        the unit tests in ``tests/runtime/routine/test_task.py``
+        for direct coverage). For natural-end iteration, the consumer's
         ``_iterate`` has already returned by the time the worker
         runs aclose, and :meth:`drain` swallows the worker-side
         :class:`asyncio.CancelledError` when the dispatch task
@@ -4555,8 +4556,9 @@ class TestWorkerService:
 
         # Assert — clean stream end. The worker-side
         # CancelledError raised by aclose propagates out of
-        # scoped (verified by unit tests on scoped) but drain
-        # swallows it on the natural-end path.
+        # routine_scope (verified by unit tests on
+        # routine_scope) but drain swallows it on the
+        # natural-end path.
         assert remaining == []
 
     @pytest.mark.asyncio
