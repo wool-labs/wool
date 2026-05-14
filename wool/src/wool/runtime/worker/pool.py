@@ -38,6 +38,19 @@ from wool.utilities.noreentry import noreentry
 
 
 # public
+class IneffectiveLeaseWarning(UserWarning):
+    """Emitted when ``lease`` is supplied to a :class:`WorkerPool` that
+    has no ``discovery`` service configured.
+
+    The pool's worker count is bounded by ``spawn`` alone in those
+    modes — ``lease`` is recorded but never consulted, so the supplied
+    value has no effect at runtime.  Users who want strict behaviour
+    can elevate the category to an error via
+    :func:`warnings.filterwarnings`.
+    """
+
+
+# public
 class WorkerPool:
     """Orchestrates distributed workers for task execution.
 
@@ -164,7 +177,10 @@ class WorkerPool:
     :param lease:
         Maximum number of additionally discovered workers to admit to the pool.
         The total pool capacity is ``spawn + lease`` when both are set, or just
-        ``lease`` for external pools. Defaults to ``None`` (unbounded).
+        ``lease`` for external pools. Defaults to ``None`` (unbounded). Only
+        meaningful when a ``discovery`` service is configured; supplying
+        ``lease`` without ``discovery`` records the value but never consults
+        it, accompanied by an :class:`IneffectiveLeaseWarning`.
     :param worker:
         Worker factory callable. Defaults to :class:`LocalWorker`.
     :param discovery:
@@ -219,7 +235,6 @@ class WorkerPool:
         self,
         *tags: str,
         spawn: int = 0,
-        lease: int | None = None,
         worker: WorkerFactory = LocalWorker,
         discovery: None = None,
         loadbalancer: (
@@ -284,7 +299,6 @@ class WorkerPool:
         self,
         *tags: str,
         size: int,
-        lease: int | None = None,
         worker: WorkerFactory = LocalWorker,
         discovery: None = None,
         loadbalancer: (
@@ -401,8 +415,15 @@ class WorkerPool:
                         await self._exit_context(discovery_ctx)
 
             case (spawn, None) if spawn is not None:
+                if lease is not None:
+                    warnings.warn(
+                        "'lease' has no effect when no 'discovery' service is "
+                        "configured; the value is recorded but never consulted",
+                        IneffectiveLeaseWarning,
+                        stacklevel=2,
+                    )
                 spawn = _resolve_spawn(spawn)
-                max_workers = spawn + lease if lease is not None else None
+                max_workers = None
                 self._validate_quorum(quorum, max_workers)
 
                 namespace = f"pool-{uuid.uuid4().hex}"
@@ -449,8 +470,15 @@ class WorkerPool:
                         await self._exit_context(discovery_ctx)
 
             case (None, None):
+                if lease is not None:
+                    warnings.warn(
+                        "'lease' has no effect when no 'discovery' service is "
+                        "configured; the value is recorded but never consulted",
+                        IneffectiveLeaseWarning,
+                        stacklevel=2,
+                    )
                 spawn = _resolve_spawn(0)
-                max_workers = spawn + lease if lease is not None else None
+                max_workers = None
                 self._validate_quorum(quorum, max_workers)
 
                 namespace = f"pool-{uuid.uuid4().hex}"
