@@ -439,6 +439,64 @@ async def self_cancel_coroutine():
 
 
 @wool.routine
+async def add_then_schedule_cleanup(a: int, b: int, sentinel_path: str) -> int:
+    """Coroutine that returns the sum and schedules an orphaned cleanup
+    task on the worker loop from its ``finally`` clause.
+
+    Models the fire-and-forget cleanup pattern behind issue #202: a
+    routine whose ``finally`` schedules further work on the worker
+    loop. The scheduled task (:func:`_drain_probe_first_gen`) outlives
+    the dispatch and is left for worker-loop teardown to drain.
+
+    :param a:
+        First addend.
+    :param b:
+        Second addend.
+    :param sentinel_path:
+        Filesystem path threaded through the cleanup chain; the
+        deepest generation writes to it so the caller can verify the
+        teardown drain reached every generation.
+    :returns:
+        The sum ``a + b``.
+    """
+    try:
+        return a + b
+    finally:
+        asyncio.get_running_loop().create_task(_drain_probe_first_gen(sentinel_path))
+
+
+async def _drain_probe_first_gen(sentinel_path: str) -> None:
+    """First-generation orphan task scheduled by
+    :func:`add_then_schedule_cleanup`.
+
+    Awaits indefinitely until worker-loop teardown cancels it, then
+    schedules the second generation from its own ``finally`` clause —
+    the generation a single-pass shutdown drain never observes.
+    """
+    try:
+        await asyncio.Event().wait()
+    finally:
+        asyncio.get_running_loop().create_task(_drain_probe_second_gen(sentinel_path))
+
+
+async def _drain_probe_second_gen(sentinel_path: str) -> None:
+    """Second-generation orphan task scheduled by
+    :func:`_drain_probe_first_gen`.
+
+    Writes ``"drained"`` to *sentinel_path* from its ``finally``
+    clause. The file appears only if the worker-loop teardown drain
+    cancels and awaits this generation; a single-pass drain leaves it
+    pending and unstarted, so the absence of the file flags the
+    issue #202 regression.
+    """
+    try:
+        await asyncio.Event().wait()
+    finally:
+        with open(sentinel_path, "w") as f:
+            f.write("drained")
+
+
+@wool.routine
 @context_pattern_aware
 async def nested_add(a: int, b: int) -> int:
     """Coroutine that dispatches to ``add``, triggering nested dispatch."""
