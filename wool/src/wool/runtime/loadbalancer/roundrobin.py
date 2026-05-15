@@ -101,10 +101,20 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
 
                 try:
                     stream = await connection.dispatch(task, timeout=timeout)
-                except TransientRpcError:
+                except TransientRpcError as exc:
+                    logger.debug(
+                        "Skipping worker %s on transient error: %s",
+                        metadata.uid,
+                        exc,
+                    )
                     self._index[context] = self._index[context] + 1
                     continue
-                except RpcError:
+                except RpcError as exc:
+                    logger.warning(
+                        "Evicting worker %s after non-transient RPC error: %s",
+                        metadata.uid,
+                        exc,
+                    )
                     context.remove_worker(metadata)
                     if metadata.uid == checkpoint:
                         checkpoint = None

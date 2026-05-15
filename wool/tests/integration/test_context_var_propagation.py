@@ -7,8 +7,9 @@ routines.py and populating its wool.ContextVar registry), and the
 routine observes the propagated value. They complement the in-process
 unit tests in tests/runtime/test_context.py by exercising the real
 serialization and subprocess boundary, and they serve as the
-regression guard for the _stream_from_worker async-generator fix
-introduced with issue #154.
+regression guard for the unified-driver async-generator fix
+originally introduced with issue #154 and carried forward into the
+collapsed :class:`DispatchSession` by issue #187.
 """
 
 import asyncio
@@ -23,44 +24,11 @@ from wool.runtime.context import dispatch_timeout
 
 from . import _collision_fixtures
 from . import routines
-from .conftest import BackpressureMode
 from .conftest import ContextVarPattern
-from .conftest import CredentialType
-from .conftest import DiscoveryFactory
-from .conftest import LazyMode
-from .conftest import LbFactory
 from .conftest import PoolMode
-from .conftest import QuorumMode
-from .conftest import RoutineBinding
 from .conftest import RoutineShape
-from .conftest import Scenario
-from .conftest import TimeoutKind
-from .conftest import WorkerOptionsKind
 from .conftest import build_pool_from_scenario
-
-
-def _default_scenario(
-    *,
-    shape: RoutineShape = RoutineShape.COROUTINE,
-    pool_mode: PoolMode = PoolMode.DEFAULT,
-    lazy: LazyMode = LazyMode.LAZY,
-) -> Scenario:
-    return Scenario(
-        shape=shape,
-        pool_mode=pool_mode,
-        discovery=DiscoveryFactory.NONE,
-        lb=LbFactory.CLASS_REF,
-        credential=CredentialType.INSECURE,
-        options=WorkerOptionsKind.DEFAULT,
-        timeout=TimeoutKind.NONE,
-        binding=RoutineBinding.MODULE_FUNCTION,
-        lazy=lazy,
-        backpressure=BackpressureMode.NONE,
-        ctx_var_1=ContextVarPattern.NONE,
-        ctx_var_2=ContextVarPattern.NONE,
-        ctx_var_3=ContextVarPattern.NONE,
-        quorum=QuorumMode.DEFAULT,
-    )
+from .conftest import default_scenario
 
 
 @pytest.mark.integration
@@ -84,7 +52,7 @@ class TestContextVarPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("acme-corp")
                 try:
@@ -109,13 +77,13 @@ class TestContextVarPropagation:
             The caller iterates the generator to completion
         Then:
             Every yielded value should equal the caller's propagated
-            value — guards against regression in the
-            _stream_from_worker async-gen context restoration
+            value — guards against regression in the unified driver's
+            async-gen per-yield context restoration
         """
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(
+            scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ANEXT,
                 pool_mode=PoolMode.EPHEMERAL,
             )
@@ -156,7 +124,7 @@ class TestContextVarPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(shape=RoutineShape.NESTED_COROUTINE)
+            scenario = default_scenario(shape=RoutineShape.NESTED_COROUTINE)
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("nested-tenant")
                 try:
@@ -187,7 +155,7 @@ class TestContextVarPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("caller-value")
                 try:
@@ -218,7 +186,7 @@ class TestContextVarPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("caller-value")
                 try:
@@ -251,7 +219,7 @@ class TestContextVarPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
             unset_marker = "UNSET"
 
             async def dispatch_with(value: str) -> str:
@@ -292,7 +260,7 @@ class TestContextVarPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 result = await routines.get_tenant_id()
             assert result == "unknown"
@@ -317,7 +285,7 @@ class TestContextVarPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 tenant_token = routines.TENANT_ID.set("globex")
                 region_token = routines.REGION.set("us-west-2")
@@ -351,7 +319,7 @@ class TestContextVarPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(
+            scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ANEXT,
                 pool_mode=PoolMode.EPHEMERAL,
             )
@@ -392,7 +360,7 @@ class TestContextVarPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(
+            scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ANEXT,
                 pool_mode=PoolMode.EPHEMERAL,
             )
@@ -427,7 +395,7 @@ class TestContextVarPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(
+            scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ANEXT,
             )
             caller_snapshots: list[str] = []
@@ -473,7 +441,7 @@ class TestContextVarPropagation:
 
         # Act & assert
         async def body():
-            scenario = _default_scenario(
+            scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ANEXT,
             )
 
@@ -532,7 +500,7 @@ class TestStdlibEquivalence:
 
         # Act & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 # — stdlib path —
                 stdlib_var.set("caller-value")
@@ -579,7 +547,7 @@ class TestWoolContextAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 caller_id = wool.current_context().id
                 observed_hex = await routines.return_current_context_id_hex()
@@ -607,7 +575,7 @@ class TestWoolContextAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
 
             async with build_pool_from_scenario(scenario, credentials_map):
                 parent_id = wool.current_context().id
@@ -648,7 +616,7 @@ class TestWoolContextAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 seed = wool.Context()
                 seed.run(lambda: routines.TENANT_ID.set("seed-value"))
@@ -681,7 +649,7 @@ class TestTokenAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("caller-value")
                 try:
@@ -717,7 +685,7 @@ class TestTokenAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("caller-value")
                 try:
@@ -754,7 +722,7 @@ class TestTokenAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("X")
                 # Worker consumes the Token via var.reset(token).
@@ -794,7 +762,7 @@ class TestTokenAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(shape=RoutineShape.ASYNC_GEN_ANEXT)
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ANEXT)
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("X")
                 async for _ in routines.accept_token_and_reset_on_yield(token):
@@ -832,7 +800,7 @@ class TestTokenAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("X")
                 routines.TENANT_ID.reset(token)  # caller consumes first
@@ -863,7 +831,7 @@ class TestTokenAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = await routines.mint_tenant_token("W")
                 routines.TENANT_ID.reset(token)  # consume once locally
@@ -898,7 +866,7 @@ class TestTokenAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = await routines.mint_tenant_token("W")
                 routines.TENANT_ID.reset(token)
@@ -929,7 +897,7 @@ class TestExceptionPathBackPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("caller-original")
                 try:
@@ -960,7 +928,7 @@ class TestExceptionPathBackPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(
+            scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ANEXT,
                 pool_mode=PoolMode.EPHEMERAL,
             )
@@ -1006,7 +974,7 @@ class TestAsyncioForkOnWorker:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 child_value, parent_value = await routines.spawn_and_mutate_tenant_id()
             assert child_value == "child"
@@ -1032,7 +1000,7 @@ class TestAsyncioForkOnWorker:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 child_value = await routines.parent_sets_child_reads()
             assert child_value == "parent-set"
@@ -1059,7 +1027,7 @@ class TestAsyncioForkOnWorker:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 (
                     a_value,
@@ -1097,7 +1065,7 @@ class TestStubPromotionAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("stub-promotion-value")
                 try:
@@ -1133,7 +1101,7 @@ class TestStubPromotionAcrossWorkers:
             # DEFAULT pool is size=1 so both dispatches land on the
             # same worker process; the second construction under the
             # already-registered key triggers the collision.
-            scenario = _default_scenario(pool_mode=PoolMode.DEFAULT)
+            scenario = default_scenario(pool_mode=PoolMode.DEFAULT)
             async with build_pool_from_scenario(scenario, credentials_map):
                 # First dispatch registers the key on the worker.
                 first = await _collision_fixtures.sibling_a()
@@ -1172,7 +1140,7 @@ class TestForwardPropagationMidStream:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(shape=RoutineShape.ASYNC_GEN_ANEXT)
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ANEXT)
             async with build_pool_from_scenario(scenario, credentials_map):
                 gen = routines.stream_tenant_id_echo(3)
                 try:
@@ -1212,7 +1180,7 @@ class TestForwardPropagationMidStream:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(shape=RoutineShape.ASYNC_GEN_ASEND)
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ASEND)
             async with build_pool_from_scenario(scenario, credentials_map):
                 gen = routines.echo_tenant_id_on_send(3)
                 try:
@@ -1253,7 +1221,7 @@ class TestForwardPropagationMidStream:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(shape=RoutineShape.ASYNC_GEN_ATHROW)
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ATHROW)
             async with build_pool_from_scenario(scenario, credentials_map):
                 gen = routines.read_on_athrow()
                 try:
@@ -1297,7 +1265,7 @@ class TestForwardPropagationMidStream:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(
+            scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ANEXT,
                 pool_mode=PoolMode.EPHEMERAL,
             )
@@ -1359,7 +1327,7 @@ class TestForwardPropagationMidStream:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(shape=RoutineShape.ASYNC_GEN_ASEND)
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ASEND)
             async with build_pool_from_scenario(scenario, credentials_map):
                 gen = routines.echo_tenant_id_on_send(2)
                 try:
@@ -1420,7 +1388,7 @@ class TestUnregisteredKeyBehavior:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 unreg_token = _UNREGISTERED_ONLY.set("caller-only-value")
                 tenant_token = routines.TENANT_ID.set("visible-on-worker")
@@ -1457,7 +1425,7 @@ class TestUnregisteredKeyBehavior:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
             async with build_pool_from_scenario(scenario, credentials_map):
                 unreg_token = _UNREGISTERED_ONLY.set("late-declared-value")
                 try:
@@ -1495,7 +1463,7 @@ class TestCallerSideTaskFactoryFork:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("parent-caller-value")
                 try:
@@ -1532,7 +1500,7 @@ class TestCallerSideTaskFactoryFork:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("parent-original")
                 try:
@@ -1579,7 +1547,7 @@ class TestSequentialDispatchIsolation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 # First dispatch: worker mutates to "mutated_on_worker"
                 token1 = routines.TENANT_ID.set("first-dispatch-value")
@@ -1625,7 +1593,7 @@ class TestSelfDispatchStreamingVarMutation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(
+            scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ANEXT,
                 pool_mode=PoolMode.DEFAULT,
             )
@@ -1673,7 +1641,7 @@ class TestDurablePoolContextPropagation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(pool_mode=PoolMode.DURABLE)
+            scenario = default_scenario(pool_mode=PoolMode.DURABLE)
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("durable-tenant")
                 try:
@@ -1726,7 +1694,7 @@ class TestMergedWireShapeEndToEnd:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("X")
                 routines.TENANT_ID.reset(token)
@@ -1767,7 +1735,7 @@ class TestMergedWireShapeEndToEnd:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("X")
                 routines.TENANT_ID.reset(token)
@@ -1810,7 +1778,7 @@ class TestMergedWireShapeEndToEnd:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = routines.TENANT_ID.set("X")
                 routines.TENANT_ID.reset(token)
@@ -1852,7 +1820,7 @@ class TestExplicitWoolContextBindingAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 outer_token = routines.TENANT_ID.set("outer-caller-value")
                 try:
@@ -1886,13 +1854,13 @@ class TestExplicitWoolContextBindingAcrossWorkers:
             One task should complete successfully and the other
             should raise RuntimeError because at most one task may
             run inside a given wool.Context at a time — the wool
-            task factory's _wool_scoped first-task-wins guard fires
+            task factory's _context_scope first-task-wins guard fires
             before the second task acquires _guard
         """
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
             async with build_pool_from_scenario(scenario, credentials_map):
                 shared_ctx = wool.Context()
                 shared_ctx.run(lambda: routines.TENANT_ID.set("shared-context-value"))
@@ -1942,7 +1910,7 @@ class TestExplicitWoolContextBindingAcrossWorkers:
                     and "was never awaited" in str(w.message)
                 ]
                 assert leaked == [], (
-                    "Guard-rejected coroutine must be closed by _wool_scoped, "
+                    "Guard-rejected coroutine must be closed by _context_scope, "
                     f"not leaked at GC; saw: {[str(w.message) for w in leaked]}"
                 )
 
@@ -1978,7 +1946,7 @@ class TestRuntimeContextDispatchTimeoutAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 with wool.RuntimeContext(dispatch_timeout=12.5):
                     observed = await routines.read_dispatch_timeout()
@@ -2007,7 +1975,7 @@ class TestRuntimeContextDispatchTimeoutAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = dispatch_timeout.set(7.25)
                 try:
@@ -2044,7 +2012,7 @@ class TestContextDecodeWarningAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 tenant_token = routines.TENANT_ID.set("survives-encode")
                 # Local lambdas are not picklable across processes
@@ -2114,7 +2082,7 @@ class TestContextDecodeWarningAcrossWorkers:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 import socket
 
@@ -2168,7 +2136,7 @@ class TestWoolCopyContextWithDispatch:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 outer_token = routines.TENANT_ID.set("outer-original")
                 try:
@@ -2205,7 +2173,7 @@ class TestWoolCopyContextWithDispatch:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario()
+            scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 outer_id = wool.current_context().id
                 forked = wool.copy_context()
@@ -2243,7 +2211,7 @@ class TestNestedDispatchMidChainMutation:
 
         # Arrange, act, & assert
         async def body():
-            scenario = _default_scenario(
+            scenario = default_scenario(
                 shape=RoutineShape.NESTED_COROUTINE,
                 pool_mode=PoolMode.EPHEMERAL,
             )

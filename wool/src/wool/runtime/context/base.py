@@ -13,6 +13,7 @@ from typing import Any
 from typing import Callable
 from typing import Coroutine
 from typing import Final
+from typing import Generator
 from typing import ItemsView
 from typing import Iterator
 from typing import KeysView
@@ -20,6 +21,7 @@ from typing import NoReturn
 from typing import SupportsIndex
 from typing import TypeVar
 from typing import ValuesView
+from typing import cast
 from uuid import UUID
 from uuid import uuid4
 
@@ -230,12 +232,12 @@ class Context:
     # migrates from this map into :attr:`_used_tokens`.
     _external_used_tokens: dict[UUID, tuple[str, str]]
     # Weakref to the asyncio task currently scoped via
-    # :func:`_wool_scoped`. Set on factory-routed task entry and
+    # :func:`_context_scope`. Set on factory-routed task entry and
     # cleared on exit, giving "first task wins for the routine's
     # lifetime" semantics — a second factory-routed task targeting
     # the same Context while the first is still active raises before
     # acquiring :meth:`_guard`. ``None`` outside of a
-    # :func:`_wool_scoped` block, or for sync-only callers.
+    # :func:`_context_scope` block, or for sync-only callers.
     _bound_task: weakref.ref[asyncio.Task[Any]] | None
 
     def __init__(self) -> None:
@@ -754,20 +756,29 @@ def install_task_factory(
 
     def wool_factory(
         loop: asyncio.AbstractEventLoop,
-        coro: Coroutine[Any, Any, Any],
+        coro: Coroutine[Any, Any, Any] | Generator[Any, None, Any],
         *,
         context: Context | contextvars.Context | None = None,
         **kwargs: Any,
     ) -> asyncio.Task[Any]:
+        # Widen to ``Coroutine | Generator`` to satisfy typeshed's
+        # ``_CoroutineLike[_T]`` contravariant parameter — the
+        # ``Generator`` arm exists for pre-3.8 generator-coroutines
+        # and is unreachable from asyncio's modern create_task path,
+        # but the static type must accept it for ``wool_factory`` to
+        # be a valid ``_TaskFactory``. Narrow back to ``Coroutine``
+        # for the body, which uses ``Coroutine``-only operations
+        # (await semantics, ``_context_scope`` wrapping).
+        coro = cast(Coroutine[Any, Any, Any], coro)
         if isinstance(context, Context):
             # Explicit wool.Context: hide it from asyncio (which would
             # call ctx.run(step_fn) per step and fragment _guard's
             # held-across-awaits semantics into per-step entries) and
             # instead wrap the coroutine so the guard + attach span
-            # the whole routine. ``_wool_scoped`` installs the
+            # the whole routine. ``_context_scope`` installs the
             # :class:`Context` in the registry under the new task's
             # identity for the routine's lifetime.
-            task = inner(loop, _wool_scoped(context, coro), **kwargs)
+            task = inner(loop, _context_scope(context, coro), **kwargs)
             _register(task, context)  # pyright: ignore[reportArgumentType]
             return task  # pyright: ignore[reportReturnType]
         # No wool.Context: forward stdlib ``context=`` if supplied
@@ -868,7 +879,7 @@ def _register(task: asyncio.Task[Any], ctx: Context) -> None:
         context_registry[task] = ctx
 
 
-async def _wool_scoped(ctx: Context, coro: Coroutine[Any, Any, T]) -> T:
+async def _context_scope(ctx: Context, coro: Coroutine[Any, Any, T]) -> T:
     """Run *coro* with *ctx* attached, the single-task guard held,
     and the Context's ``_bound_task`` slot pinned to the current
     task for the coroutine's lifetime.

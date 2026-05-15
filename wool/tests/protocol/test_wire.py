@@ -210,18 +210,45 @@ class TestMessageConstruction:
         ack = protocol.Ack(version="1.0.0")
         assert ack.version == "1.0.0"
 
-    def test_nack_with_reason(self):
-        """Test Nack message carries a reason string.
+    def test_nack_with_exception(self):
+        """Test Nack message carries a dumped exception payload.
 
         Given:
-            A rejection reason.
+            A serialized parse-phase exception payload.
         When:
-            A Nack message is constructed.
+            A Nack message is constructed and round-tripped through
+            ``SerializeToString`` / ``ParseFromString``.
         Then:
-            The reason field should be set.
+            The exception field should be present and carry the dump
+            bytes after wire-format roundtrip.
         """
-        nack = protocol.Nack(reason="version mismatch")
-        assert nack.reason == "version mismatch"
+        nack = protocol.Nack(exception=protocol.Message(dump=b"pickled-exc"))
+        assert nack.HasField("exception") is True
+        assert nack.exception.dump == b"pickled-exc"
+
+        parsed = protocol.Nack()
+        parsed.ParseFromString(nack.SerializeToString())
+        assert parsed.HasField("exception") is True
+        assert parsed.exception.dump == b"pickled-exc"
+
+    def test_nack_without_exception(self):
+        """Test Nack message constructed without an exception payload.
+
+        Given:
+            No exception payload supplied.
+        When:
+            A Nack message is constructed and round-tripped through
+            ``SerializeToString`` / ``ParseFromString``.
+        Then:
+            ``HasField('exception')`` should report False before and
+            after the wire-format roundtrip.
+        """
+        nack = protocol.Nack()
+        assert nack.HasField("exception") is False
+
+        parsed = protocol.Nack()
+        parsed.ParseFromString(nack.SerializeToString())
+        assert parsed.HasField("exception") is False
 
 
 class TestOneofBehavior:
@@ -302,7 +329,9 @@ class TestOneofBehavior:
         Then:
             It should return 'nack'.
         """
-        resp = protocol.Response(nack=protocol.Nack(reason="denied"))
+        resp = protocol.Response(
+            nack=protocol.Nack(exception=protocol.Message(dump=b"exc"))
+        )
         assert resp.WhichOneof("payload") == "nack"
 
     def test_response_result_oneof(self):

@@ -9,14 +9,23 @@ from wool.runtime.worker.proxy import parse_version
 
 
 class VersionInterceptor(grpc.aio.ServerInterceptor):
-    """gRPC server interceptor for wire protocol version checking.
+    """Server-side guard for wire protocol version compatibility.
 
-    Intercepts the ``dispatch`` RPC to extract the client version from
-    field 1 of the raw request bytes using
-    :class:`~wool.protocol.TaskEnvelope`.  A client is accepted
-    when its protocol version is less than or equal to the local
-    worker version within the same major version.  Requests with
-    empty, missing, or unparseable version fields are rejected.
+    Inspects the first request on every ``dispatch`` stream and
+    accepts the client when its protocol version is less than or
+    equal to the worker's within the same major. Empty, missing,
+    unparseable, and incompatible versions are rejected with a
+    gRPC ``FAILED_PRECONDITION`` abort before the dispatch handler
+    runs. Callers observe the rejection as a non-transient
+    :class:`RpcError` on their first read from the stream — the
+    load balancer treats it as worker-health-affecting and evicts
+    the peer.
+
+    Version handshake is transport-level. Parse-phase application
+    failures (unpicklable task callable, malformed task id) ride
+    the in-band Nack channel instead; the two paths are
+    deliberately distinct so callers can distinguish "this peer
+    speaks the wrong protocol" from "this task is malformed".
     """
 
     async def intercept_service(self, continuation, handler_call_details):
@@ -29,51 +38,54 @@ class VersionInterceptor(grpc.aio.ServerInterceptor):
         assert original_handler is not None
         assert original_deserializer is not None
 
-        async def version_checked_handler(request_iterator, context):
+        async def version_checked_handler(
+            request_iterator,
+            context: grpc.aio.ServicerContext,
+        ):
             # Read the first raw request to extract the version envelope
             first_bytes = await anext(aiter(request_iterator))
 
             # The first Request message wraps a Task; parse the Task
-            # envelope from the nested task bytes.
-            request_msg = protocol.Request()
-            request_msg.ParseFromString(first_bytes)
-            task_bytes = request_msg.task.SerializeToString()
-
+            # envelope from the nested task bytes. Wrap the outer
+            # ``Request.ParseFromString`` together with the envelope
+            # parse so malformed wire bytes (truncated, garbage, or
+            # mis-shaped by a buggy client) abort with the deliberate
+            # ``FAILED_PRECONDITION`` rather than leaking out as
+            # ``UNKNOWN`` from an unhandled ``protobuf.DecodeError``.
             envelope = protocol.TaskEnvelope()
             try:
+                request_msg = protocol.Request()
+                request_msg.ParseFromString(first_bytes)
+                task_bytes = request_msg.task.SerializeToString()
                 envelope.ParseFromString(task_bytes)
             except Exception:
-                yield protocol.Response(
-                    nack=protocol.Nack(reason="Failed to parse version envelope")
+                await context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "Failed to parse version envelope",
                 )
-                return
 
             client_version = parse_version(envelope.version)
             local_version = parse_version(protocol.__version__)
 
             if client_version is None or local_version is None:
-                yield protocol.Response(
-                    nack=protocol.Nack(
-                        reason=(
-                            f"Unparseable version: "
-                            f"client={envelope.version!r}, "
-                            f"worker={protocol.__version__!r}"
-                        )
-                    )
+                await context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    (
+                        f"Unparseable version: "
+                        f"client={envelope.version!r}, "
+                        f"worker={protocol.__version__!r}"
+                    ),
                 )
-                return
 
             if not is_version_compatible(client_version, local_version):
-                yield protocol.Response(
-                    nack=protocol.Nack(
-                        reason=(
-                            f"Incompatible version: "
-                            f"client={envelope.version}, "
-                            f"worker={protocol.__version__}"
-                        )
-                    )
+                await context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    (
+                        f"Incompatible version: "
+                        f"client={envelope.version}, "
+                        f"worker={protocol.__version__}"
+                    ),
                 )
-                return
 
             # Re-assemble a chained iterator: yield the deserialized
             # first request, then the rest of the stream.

@@ -108,6 +108,7 @@ known-first-party = ["wool"]
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
+pythonVersion = "3.11"
 include = ["src"]
 exclude = [
     "**/__pycache__",
