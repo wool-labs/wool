@@ -844,6 +844,135 @@ class TestWorkerConnection:
         assert mock_call.cancel.called
 
     @pytest.mark.asyncio
+    async def test_dispatch_cancelled_during_teardown_releases_channel_ref(
+        self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
+    ):
+        """Test external cancellation during teardown releases the
+        pooled channel reference.
+
+        Given:
+            A dispatched task whose result stream runs to exhaustion
+            into teardown, with the process-wide channel pool's lock
+            held so the release callback suspends, and the consuming
+            task cancelled while parked in that suspended release.
+        When:
+            The lock is released and the cancelled task is awaited.
+        Then:
+            It should leave the channel pool with zero referenced
+            entries — the dispatch-scope reference is released
+            despite the caller's pending cancellation.
+        """
+        # Arrange
+        from wool.runtime.worker import connection as connection_module
+
+        # Contend the pool lock on a fresh instance so it does not
+        # bind the process-global lock to this test's event loop.
+        mocker.patch.object(connection_module._channel_pool, "_lock", asyncio.Lock())
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        stream = await connection.dispatch(sample_task)
+        pool = connection_module._channel_pool
+
+        # Act
+        await pool._lock.acquire()
+        lock_released = False
+        try:
+
+            async def consume():
+                async for _ in stream:
+                    pass
+
+            task = asyncio.ensure_future(consume())
+            for _ in range(5):
+                await asyncio.sleep(0)
+            task.cancel()
+            pool._lock.release()
+            lock_released = True
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            if not lock_released:
+                pool._lock.release()
+
+        # Assert
+        assert pool.stats.referenced_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_dispatch_response_exception_with_cancelled_error_releases_channel_ref(
+        self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
+    ):
+        """Test a worker-side CancelledError releases the pooled
+        channel reference during teardown.
+
+        Given:
+            A dispatched task whose worker ships an
+            ``asyncio.CancelledError`` on the response exception
+            frame — which bumps the caller's pending-cancel state —
+            with the process-wide channel pool's lock held so the
+            release callback suspends.
+        When:
+            The lock is released and the consuming task is awaited.
+        Then:
+            It should leave the channel pool with zero referenced
+            entries — the dispatch-scope reference is released
+            despite the worker-induced pending cancellation.
+        """
+        # Arrange
+        from wool.runtime.worker import connection as connection_module
+
+        # Contend the pool lock on a fresh instance so it does not
+        # bind the process-global lock to this test's event loop.
+        mocker.patch.object(connection_module._channel_pool, "_lock", asyncio.Lock())
+        cancellation = asyncio.CancelledError("worker self-raised cancel")
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                exception=protocol.Message(dump=cloudpickle.dumps(cancellation)),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        stream = await connection.dispatch(sample_task)
+        pool = connection_module._channel_pool
+
+        # Act
+        await pool._lock.acquire()
+        lock_released = False
+        try:
+
+            async def consume():
+                async for _ in stream:
+                    pass
+
+            task = asyncio.ensure_future(consume())
+            for _ in range(5):
+                await asyncio.sleep(0)
+            pool._lock.release()
+            lock_released = True
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            if not lock_released:
+                pool._lock.release()
+
+        # Assert
+        assert pool.stats.referenced_entries == 0
+
+    @pytest.mark.asyncio
     async def test_close_idempotent(self, mocker: MockerFixture):
         """Test closing a connection is idempotent.
 

@@ -388,6 +388,64 @@ class TestDispatchSession:
         assert _passthrough_pool.stats.referenced_entries == baseline
 
     @pytest.mark.asyncio
+    async def test___aexit___releases_passthrough_pool_ref_under_cancellation(
+        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
+    ):
+        """Test __aexit__ releases the passthrough-pool entry when the
+        session is cancelled mid-teardown.
+
+        Given:
+            A passthrough self-dispatch session whose teardown release
+            suspends on a held pool lock, with the session task
+            cancelled while parked in that suspended release.
+        When:
+            The lock is released and the cancelled session task is
+            awaited.
+        Then:
+            It should return the passthrough pool to its pre-dispatch
+            referenced-entry count — no leaked reference.
+        """
+        # Arrange
+        # Contend the pool lock on a fresh instance so it does not
+        # bind the process-global lock to this test's event loop.
+        mocker.patch.object(_passthrough_pool, "_lock", asyncio.Lock())
+        baseline = _passthrough_pool.stats.referenced_entries
+        serializer = PassthroughSerializer()
+        task = _make_task(_coro_returning_default)
+        stream = _stream(_request_for(task, serializer=serializer))
+        entered = asyncio.Event()
+        proceed = asyncio.Event()
+
+        async def run_session():
+            async with DispatchSession(stream, worker_loop):
+                entered.set()
+                # Hold inside the context until the test has grabbed
+                # the pool lock, so __aexit__'s teardown release
+                # suspends on it.
+                await proceed.wait()
+
+        # Act
+        session_task = asyncio.ensure_future(run_session())
+        await entered.wait()
+        await _passthrough_pool._lock.acquire()
+        lock_released = False
+        try:
+            proceed.set()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            session_task.cancel()
+            _passthrough_pool._lock.release()
+            lock_released = True
+            with pytest.raises(asyncio.CancelledError):
+                await session_task
+        finally:
+            if not lock_released:
+                _passthrough_pool._lock.release()
+
+        # Assert
+        assert _passthrough_pool.stats.referenced_entries == baseline
+
+    @pytest.mark.asyncio
     async def test___aenter___with_sync_callable_task(
         self, worker_loop, mock_worker_proxy_cache
     ):

@@ -43,6 +43,7 @@ from wool.runtime.routine.task import routine_scope
 from wool.runtime.serializer import PassthroughSerializer
 from wool.runtime.serializer import Serializer
 from wool.runtime.serializer import _passthrough_pool
+from wool.runtime.worker.connection import _complete_teardown
 
 __all__ = ["DispatchSession", "Rejected"]
 
@@ -522,7 +523,7 @@ class DispatchSession:
         not be silently dropped during cleanup.
         """
         try:
-            await self._stack.aclose()
+            await _complete_teardown(self._stack.aclose())
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
@@ -828,7 +829,12 @@ class DispatchSession:
                 )
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return await self._stack.__aexit__(exc_type, exc_val, exc_tb)
+        # Shield the stack unwind from caller cancellation so the
+        # pooled passthrough-serializer release runs to completion —
+        # see :func:`_complete_teardown`. The registered managers
+        # never suppress, so discarding the suppression return value
+        # (always falsy here) is behaviour-preserving.
+        await _complete_teardown(self._stack.aclose())
 
     def __aiter__(self) -> AsyncIterator[_Response]:
         if self._iterator is None:

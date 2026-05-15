@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from typing import Any
 from typing import AsyncGenerator
+from typing import Coroutine
 from typing import Final
 from typing import Generic
 from typing import TypeAlias
@@ -26,6 +29,8 @@ _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.
 _PoolKey: TypeAlias = tuple[str, grpc.ChannelCredentials | None, ChannelOptions]
 
 _T = TypeVar("_T")
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -95,6 +100,79 @@ async def clear_channel_pool() -> None:
     UDS targets.
     """
     await _channel_pool.clear()
+
+
+_TEARDOWN_TIMEOUT: Final = 60.0
+
+
+async def _complete_teardown(teardown: Coroutine[Any, Any, None]) -> None:
+    """Drive *teardown* to completion, immune to caller cancellation.
+
+    Resource teardown registered on an :class:`AsyncExitStack`
+    awaits its release callbacks. When the caller task carries a
+    pending cancellation — externally via ``task.cancel()`` or after
+    a worker-side ``CancelledError`` bumped ``cancelling()`` in
+    :meth:`_DispatchStream._read_next` — asyncio would pre-empt the
+    next suspending teardown ``await`` and skip the remaining
+    callbacks, leaking a pooled resource reference.
+
+    Running *teardown* as a shielded child task gives it an
+    independent cancellation state, so its ``await`` boundaries run
+    uninterrupted. A cancellation observed while waiting is deferred
+    and re-raised once teardown finishes, so the caller still
+    observes the cancel.
+
+    A teardown-side exception other than ``CancelledError`` propagates
+    and supersedes a deferred cancel, mirroring ``finally`` precedence.
+    ``KeyboardInterrupt`` and ``SystemExit`` are captured off the child
+    task — where they would otherwise escape straight to the event-loop
+    runner via ``Task.__step`` — and re-raised in the caller's context.
+    If teardown does not finish within :data:`_TEARDOWN_TIMEOUT` the
+    caller is unblocked and the shielded task is left running detached
+    so the release still completes.
+    """
+    interrupt: KeyboardInterrupt | SystemExit | None = None
+
+    async def _run() -> None:
+        # Capture process-level signals here, inside the child task's
+        # own frame: a ``KeyboardInterrupt``/``SystemExit`` raised by a
+        # task escapes to the event-loop runner rather than to the
+        # awaiter, so it must not be left to propagate out of the task.
+        nonlocal interrupt
+        try:
+            await teardown
+        except (KeyboardInterrupt, SystemExit) as exc:
+            interrupt = exc
+
+    task = asyncio.ensure_future(_run())
+    deferred: asyncio.CancelledError | None = None
+    while True:
+        try:
+            async with asyncio.timeout(_TEARDOWN_TIMEOUT):
+                await asyncio.shield(task)
+        except TimeoutError:
+            # Teardown is wedged — only reachable under pathological
+            # pool-lock contention. Stop blocking the caller; the
+            # shielded task keeps running so the release still
+            # completes, just not synchronously.
+            _log.warning(
+                "Routine teardown exceeded %.0fs; pooled-resource "
+                "release deferred to a detached task.",
+                _TEARDOWN_TIMEOUT,
+            )
+            break
+        except asyncio.CancelledError as exc:
+            if not task.done():
+                # Caller cancelled mid-teardown — keep the shielded
+                # task running and re-await it on the next iteration.
+                deferred = exc
+                continue
+            raise
+        break
+    if interrupt is not None:
+        raise interrupt
+    if deferred is not None:
+        raise deferred
 
 
 class _DispatchStream(Generic[_T]):
@@ -811,8 +889,15 @@ class WorkerConnection:
         exit path — setup failure, priming-yield ``GeneratorExit``,
         mid-stream exception, natural end of stream — unwinds the
         stack and releases every resource exactly once.
+
+        The stack unwind is driven through :func:`_complete_teardown`
+        so the release callbacks run to completion even when the
+        caller task is mid-cancellation — otherwise a pending
+        ``CancelledError`` could pre-empt ``AsyncExitStack.__aexit__``
+        and leak a pooled channel reference.
         """
-        async with AsyncExitStack() as stack:
+        stack = AsyncExitStack()
+        try:
             if use_passthrough:
                 # Pin the per-task passthrough serializer for the
                 # streaming generator's lifetime. Self-dispatch
@@ -886,3 +971,12 @@ class WorkerConnection:
             # uncaught; the AsyncExitStack's ``_safe_cancel``
             # callback fires on unwind to cancel the in-flight
             # gRPC call.
+        finally:
+            # Shield the stack unwind from caller cancellation so
+            # every pooled-resource release callback runs — see
+            # :func:`_complete_teardown`. ``aclose()`` drives each
+            # registered ``__aexit__`` with no exception info; that
+            # is equivalent to the implicit ``async with`` exit only
+            # because every context manager on this stack is
+            # exception-agnostic.
+            await _complete_teardown(stack.aclose())
