@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 import uuid
@@ -35,6 +36,8 @@ from wool.runtime.worker.proxy import LoadBalancerLike
 from wool.runtime.worker.proxy import RoundRobinLoadBalancer
 from wool.runtime.worker.proxy import WorkerProxy
 from wool.utilities.noreentry import noreentry
+
+logger = logging.getLogger(__name__)
 
 
 # public
@@ -208,13 +211,24 @@ class WorkerPool:
         Defaults to ``60``; pass ``None`` to wait indefinitely. On
         timeout the pool instance becomes unusable (single-use
         semantics); construct a new pool to retry.
+    :param shutdown_timeout:
+        Maximum number of seconds to wait for spawned workers to stop
+        during pool teardown. The bound applies as a single deadline to
+        the full teardown sequence: each worker's ``stop()`` receives
+        ``shutdown_timeout`` as its per-worker bound, the gather waits
+        for whatever time remains, and publisher cleanup gets whatever
+        is left. When the deadline elapses, abandoned worker UIDs are
+        logged via ``logging.warning`` and teardown proceeds. ``None``
+        disables the bound and restores the legacy unbounded wait.
+        Must be positive when provided. Defaults to ``60.0``.
     :param lazy:
         When ``True`` (default), defer discovery setup and the quorum
         wait to the first :meth:`WorkerProxy.dispatch`.  When ``False``,
         eagerly enter the underlying proxy at ``__aenter__`` time and
         run the quorum wait there.
     :raises ValueError:
-        If configuration is invalid or CPU count unavailable.
+        If configuration is invalid, CPU count unavailable, or
+        ``shutdown_timeout`` is not positive.
     :raises asyncio.TimeoutError:
         If the quorum wait does not complete within ``quorum_timeout``
         — raised by the underlying :class:`WorkerProxy` at context
@@ -243,6 +257,7 @@ class WorkerPool:
         credentials: WorkerCredentials | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
+        shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ):
         """
@@ -263,6 +278,7 @@ class WorkerPool:
         credentials: WorkerCredentials | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
+        shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ):
         """
@@ -285,6 +301,7 @@ class WorkerPool:
         credentials: WorkerCredentials | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
+        shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ):
         """
@@ -307,6 +324,7 @@ class WorkerPool:
         credentials: WorkerCredentials | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
+        shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ): ...
 
@@ -325,6 +343,7 @@ class WorkerPool:
         credentials: WorkerCredentials | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
+        shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ): ...
 
@@ -342,6 +361,7 @@ class WorkerPool:
         credentials: WorkerCredentials | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None | UndefinedType = Undefined,
+        shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ):
         self._workers = {}
@@ -380,6 +400,10 @@ class WorkerPool:
                 IneffectiveQuorumTimeoutWarning,
                 stacklevel=2,
             )
+
+        if shutdown_timeout is not None and shutdown_timeout <= 0:
+            raise ValueError("Shutdown timeout must be positive")
+        self._shutdown_timeout = shutdown_timeout
 
         match (spawn, discovery):
             case (spawn, discovery) if spawn is not None and discovery is not None:
@@ -567,7 +591,7 @@ class WorkerPool:
 
             async def stop(worker):
                 await publisher.publish("worker-dropped", worker.metadata)
-                await worker.stop()
+                await worker.stop(timeout=self._shutdown_timeout)
 
             task = asyncio.create_task(start(worker))
             tasks.append(task)
@@ -579,9 +603,55 @@ class WorkerPool:
                 raise ExceptionGroup("worker spawn failures", errors)
             yield [w.metadata for w in self._workers if w.metadata]
         finally:
-            tasks = [asyncio.create_task(stop) for stop in self._workers.values()]
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await self._exit_context(publisher_ctx)
+            loop = asyncio.get_running_loop()
+            deadline = (
+                None
+                if self._shutdown_timeout is None
+                else loop.time() + self._shutdown_timeout
+            )
+
+            def remaining() -> float | None:
+                if deadline is None:
+                    return None
+                return max(0.0, deadline - loop.time())
+
+            if self._workers:
+                worker_by_task = {
+                    asyncio.create_task(coro): worker
+                    for worker, coro in self._workers.items()
+                }
+                done, pending = await asyncio.wait(worker_by_task, timeout=remaining())
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*done, *pending, return_exceptions=True)
+                abandoned_tasks = set(pending)
+                for task in done:
+                    if not task.cancelled() and isinstance(
+                        task.exception(), TimeoutError
+                    ):
+                        abandoned_tasks.add(task)
+                if abandoned_tasks:
+                    abandoned_uids = sorted(
+                        str(worker_by_task[task].uid) for task in abandoned_tasks
+                    )
+                    logger.warning(
+                        "WorkerPool shutdown abandoned %d worker(s) "
+                        "that did not stop within %ss: %s",
+                        len(abandoned_uids),
+                        self._shutdown_timeout,
+                        abandoned_uids,
+                        extra={"abandoned_worker_uids": abandoned_uids},
+                    )
+
+            try:
+                await asyncio.wait_for(
+                    self._exit_context(publisher_ctx), timeout=remaining()
+                )
+            except TimeoutError:
+                logger.warning(
+                    "WorkerPool publisher cleanup did not complete within %ss",
+                    self._shutdown_timeout,
+                )
 
     def _default_worker_factory(self):
         def factory(*tags, credentials=None):

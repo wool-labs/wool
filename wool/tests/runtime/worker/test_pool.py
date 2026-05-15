@@ -6,6 +6,7 @@ subprocess overhead and ensure deterministic behavior.
 """
 
 import asyncio
+import logging
 import time
 import uuid
 from contextlib import contextmanager
@@ -124,6 +125,66 @@ class TestWorkerPool:
         # Act & assert
         with pytest.raises(ValueError, match="Spawn must be non-negative"):
             WorkerPool(spawn=invalid_spawn)
+
+    def test___init___accepts_positive_shutdown_timeout(self):
+        """Test pool constructs with a positive shutdown_timeout.
+
+        Given:
+            A positive shutdown_timeout value
+        When:
+            WorkerPool is initialized
+        Then:
+            It should construct a valid pool
+        """
+        # Act
+        pool = WorkerPool(spawn=1, shutdown_timeout=5.0)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___accepts_none_shutdown_timeout(self):
+        """Test pool constructs with shutdown_timeout=None.
+
+        Given:
+            Shutdown_timeout explicitly set to None to opt out of bounding
+        When:
+            WorkerPool is initialized
+        Then:
+            It should construct a valid pool
+        """
+        # Act
+        pool = WorkerPool(spawn=1, shutdown_timeout=None)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___rejects_zero_shutdown_timeout(self):
+        """Test zero shutdown_timeout raises ValueError.
+
+        Given:
+            A shutdown_timeout of 0
+        When:
+            WorkerPool is initialized
+        Then:
+            It should raise ValueError indicating the timeout must be positive
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Shutdown timeout must be positive"):
+            WorkerPool(spawn=1, shutdown_timeout=0)
+
+    def test___init___rejects_negative_shutdown_timeout(self):
+        """Test negative shutdown_timeout raises ValueError.
+
+        Given:
+            A negative shutdown_timeout value
+        When:
+            WorkerPool is initialized
+        Then:
+            It should raise ValueError indicating the timeout must be positive
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Shutdown timeout must be positive"):
+            WorkerPool(spawn=1, shutdown_timeout=-1.0)
 
     def test___init___size_emits_deprecation_warning(self):
         """Test deprecated size parameter emits DeprecationWarning.
@@ -739,6 +800,218 @@ class TestWorkerPool:
         except OSError:
             # Expected - cleanup error propagates as it should
             pass
+
+    @pytest.mark.asyncio
+    async def test___aexit___bounds_teardown_when_worker_stop_hangs(
+        self, mocker: MockerFixture
+    ):
+        """Test pool teardown returns within the configured shutdown bound.
+
+        Given:
+            A WorkerPool whose worker has a stop() that never returns
+        When:
+            The async-with block exits
+        Then:
+            It should complete within a small multiple of shutdown_timeout
+        """
+
+        # Arrange
+        def hanging_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+
+            async def hang(*, timeout=None):
+                await asyncio.sleep(60)
+
+            worker.stop = hang
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        shutdown_timeout = 0.2
+
+        # Act
+        start = time.monotonic()
+        async with WorkerPool(
+            worker=hanging_factory,
+            spawn=1,
+            shutdown_timeout=shutdown_timeout,
+        ):
+            pass
+        elapsed = time.monotonic() - start
+
+        # Assert
+        assert elapsed < shutdown_timeout * 5
+
+    @pytest.mark.asyncio
+    async def test___aexit___logs_warning_when_workers_abandoned(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test pool logs a warning naming the abandoned worker count.
+
+        Given:
+            A WorkerPool whose worker has a stop() that never returns
+        When:
+            The async-with block exits and the shutdown bound elapses
+        Then:
+            It should emit a logger.warning identifying the abandoned count
+        """
+
+        # Arrange
+        def hanging_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+
+            async def hang(*, timeout=None):
+                await asyncio.sleep(60)
+
+            worker.stop = hang
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        with caplog.at_level(logging.WARNING, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=hanging_factory,
+                spawn=1,
+                shutdown_timeout=0.2,
+            ):
+                pass
+
+        # Assert
+        assert any(
+            "abandoned 1 worker" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test___aexit___cancels_pending_stops_after_timeout(
+        self, mocker: MockerFixture
+    ):
+        """Test pending stop coroutines receive CancelledError on timeout.
+
+        Given:
+            A WorkerPool whose worker has a stop() that never returns
+        When:
+            The async-with block exits and the shutdown bound elapses
+        Then:
+            It should cancel the pending stop coroutine
+        """
+        # Arrange
+        cancelled = asyncio.Event()
+
+        def hanging_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+
+            async def hang(*, timeout=None):
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+            worker.stop = hang
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            worker=hanging_factory,
+            spawn=1,
+            shutdown_timeout=0.2,
+        ):
+            pass
+        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+
+        # Assert
+        assert cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test___aexit___completes_normally_when_workers_stop_within_timeout(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test pool teardown emits no warning when workers stop in time.
+
+        Given:
+            A WorkerPool whose workers stop quickly
+        When:
+            The async-with block exits with shutdown_timeout configured
+        Then:
+            It should complete without an abandonment warning
+        """
+
+        # Arrange
+        def fast_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        with caplog.at_level(logging.WARNING, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=fast_factory,
+                spawn=2,
+                shutdown_timeout=1.0,
+            ):
+                pass
+
+        # Assert
+        assert not any(
+            "abandoned" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test___aexit___does_not_block_other_cleanup_when_one_worker_hangs(
+        self, mocker: MockerFixture
+    ):
+        """Test fast worker still stops when a sibling worker's stop hangs.
+
+        Given:
+            A WorkerPool with one hanging worker and one fast worker
+        When:
+            The async-with block exits and the shutdown bound elapses
+        Then:
+            It should call stop on the fast worker and complete within bound
+        """
+        # Arrange
+        fast_stop = mocker.AsyncMock()
+        workers_built: list = []
+
+        def mixed_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            if not workers_built:
+
+                async def hang(*, timeout=None):
+                    await asyncio.sleep(60)
+
+                worker.stop = hang
+            else:
+                worker.stop = fast_stop
+            workers_built.append(worker)
+            return worker
+
+        shutdown_timeout = 0.2
+
+        # Act
+        start = time.monotonic()
+        async with WorkerPool(
+            worker=mixed_factory,
+            spawn=2,
+            shutdown_timeout=shutdown_timeout,
+        ):
+            pass
+        elapsed = time.monotonic() - start
+
+        # Assert
+        fast_stop.assert_awaited_once()
+        assert elapsed < shutdown_timeout * 5
 
     @pytest.mark.asyncio
     async def test___aenter___default_case_covers_shared_memory_creation(
