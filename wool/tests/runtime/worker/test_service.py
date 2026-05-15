@@ -104,6 +104,56 @@ _stop_cancellation_observed: threading.Event | None = None
 # suspended in its long sleep.
 _stop_routine_started: threading.Event | None = None
 
+# Cross-loop side-channel for the issue #202 worker-loop drain test
+# (``test_stop_with_orphaned_cleanup_chain``). The second-generation
+# cleanup task runs on the worker loop and sets this
+# :class:`threading.Event`; the test asserts on it from the main loop.
+# The probe routine schedules a two-generation cleanup chain whose
+# second generation is observed only when worker-loop teardown drains
+# every generation, not just the first.
+_drain_cleanup_observed: threading.Event | None = None
+
+
+async def _drain_probe_routine():
+    """Routine that schedules an orphaned cleanup chain on the worker
+    loop from its ``finally`` clause.
+
+    Models the issue #202 teardown scenario: the ``finally`` schedules
+    a first-generation cleanup task that, once cancelled by worker-loop
+    teardown, schedules a second generation. A single-pass drain never
+    observes that second generation.
+    """
+    try:
+        return "drain-probe-done"
+    finally:
+        asyncio.get_running_loop().create_task(_drain_probe_first_gen())
+
+
+async def _drain_probe_first_gen():
+    """First-generation orphan scheduled by :func:`_drain_probe_routine`.
+
+    Awaits indefinitely until worker-loop teardown cancels it, then
+    schedules the second generation from its own ``finally`` clause.
+    """
+    try:
+        await asyncio.Event().wait()
+    finally:
+        asyncio.get_running_loop().create_task(_drain_probe_second_gen())
+
+
+async def _drain_probe_second_gen():
+    """Second-generation orphan scheduled by :func:`_drain_probe_first_gen`.
+
+    Sets :data:`_drain_cleanup_observed` from its ``finally`` clause.
+    The event is set only when worker-loop teardown drains every
+    generation, not just the first.
+    """
+    try:
+        await asyncio.Event().wait()
+    finally:
+        if _drain_cleanup_observed is not None:
+            _drain_cleanup_observed.set()
+
 
 class _AttributeRejectingRoutineError(Exception):
     """Module-level exception class for the A4 regression test.
@@ -2181,6 +2231,53 @@ class TestWorkerService:
             stop_result = await asyncio.wait_for(stop_task, 5)
             assert isinstance(stop_result, protocol.Void)
             assert service.stopped.is_set()
+
+    @pytest.mark.asyncio
+    async def test_stop_with_orphaned_cleanup_chain(
+        self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache
+    ):
+        """Test :class:`WorkerService` stop drains every generation of
+        orphaned worker-loop tasks.
+
+        Given:
+            A dispatched routine whose finally clause schedules an
+            orphaned cleanup task that, when cancelled during teardown,
+            schedules a further cleanup task
+        When:
+            The stop RPC tears down the worker loop
+        Then:
+            It should drain every generation, so the second-generation
+            cleanup task runs its finally clause
+        """
+        global _drain_cleanup_observed
+
+        # Arrange
+        _drain_cleanup_observed = threading.Event()
+        try:
+            mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+            wool_task = Task(
+                id=uuid4(),
+                callable=_drain_probe_routine,
+                args=(),
+                kwargs={},
+                proxy=mock_proxy,
+            )
+            request = protocol.Request(task=wool_task.to_protobuf())
+
+            # Act
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(request)
+                await stream.done_writing()
+                ack, response = [r async for r in stream]
+                assert ack.HasField("ack")
+                assert response.HasField("result")
+                await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 5)
+
+            # Assert
+            assert _drain_cleanup_observed.wait(timeout=5)
+        finally:
+            _drain_cleanup_observed = None
 
     @pytest.mark.asyncio
     async def test_dispatch_async_generator_task(
