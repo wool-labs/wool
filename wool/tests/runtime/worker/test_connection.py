@@ -2693,10 +2693,22 @@ class TestWorkerConnection:
             "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
         )
 
-        # Act & assert
-        with pytest.raises(asyncio.CancelledError) as exc_info:
+        # Run the cancellable consumption in an inner task so the
+        # dispatch path's ``current_task().cancel()`` lands on the
+        # inner task and not the test's outer task. On Python 3.11
+        # ``Task.uncancel()`` does not clear ``_must_cancel`` (only
+        # the count), so the scheduled next-cycle ``CancelledError``
+        # cannot be suppressed by the awaiter — wrapping isolates
+        # it cleanly across 3.11/3.12/3.13.
+        async def body():
             async for _ in await connection.dispatch(sample_task):
                 pass
+
+        wrapped = asyncio.ensure_future(body())
+
+        # Act & assert
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await wrapped
         # ``CancelledError`` must NOT be degraded to
         # ``UnexpectedResponse`` / ``RpcError`` — those would
         # silently break stdlib's cancellation-chaining contract.
@@ -2706,6 +2718,145 @@ class TestWorkerConnection:
         assert type(exc_info.value) is asyncio.CancelledError
         assert not isinstance(exc_info.value, UnexpectedResponse)
         assert not isinstance(exc_info.value, RpcError)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_response_exception_with_cancelled_error_increments_caller_cancelling(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch increments current_task().cancelling() on
+        a worker-side CancelledError.
+
+        Mirrors stdlib's local-cancel state shape: a caller catching
+        :class:`asyncio.CancelledError` from a wool routine must
+        observe ``current_task().cancelling() > 0`` — the same shape
+        it would see for a local cancel — so idiomatic
+        ``if cancelling() > 0: raise`` re-raise gates and
+        ``current_task().uncancel()`` absorbers behave identically
+        regardless of whether the cancel originated locally or on
+        the worker. ``uncancel()`` must also decrement the count
+        back to zero per asyncio's documented contract.
+
+        Given:
+            A :class:`protocol.Response` whose ``exception`` field
+            carries a cloudpickle dump of
+            :class:`asyncio.CancelledError`
+        When:
+            ``dispatch(task)`` is awaited and the result iterator is
+            consumed, and the resulting ``CancelledError`` is caught
+        Then:
+            It should observe ``current_task().cancelling() > 0``
+            synchronously with the catch, and ``uncancel()`` should
+            decrement the count back to ``0``.
+        """
+        # Arrange
+        cancellation = asyncio.CancelledError("worker self-raised cancel")
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                exception=protocol.Message(dump=cloudpickle.dumps(cancellation)),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        observed: dict[str, int | None] = {
+            "cancelling": None,
+            "post_uncancel": None,
+        }
+
+        # Run the cancellable consumption in an inner task so the
+        # observations happen on a task we control. On Python 3.11
+        # ``Task.uncancel()`` only decrements the counter without
+        # clearing ``_must_cancel`` — the inner task therefore
+        # finalises as cancelled even though ``body()`` returned a
+        # value. The outer ``await wrapped`` consumes that
+        # cancellation, isolating the test runner's task.
+        async def body():
+            try:
+                async for _ in await connection.dispatch(sample_task):
+                    pass
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                assert current is not None
+                observed["cancelling"] = current.cancelling()
+                observed["post_uncancel"] = current.uncancel()
+
+        wrapped = asyncio.ensure_future(body())
+
+        # Act
+        try:
+            await wrapped
+        except asyncio.CancelledError:
+            # On Python 3.11 the scheduled cancel still fires after
+            # body() returns; on 3.12+ uncancel() suppresses it.
+            # Either outcome is fine — we assert on the observations
+            # captured inside the except arm.
+            pass
+
+        # Assert
+        assert observed["cancelling"] is not None and observed["cancelling"] > 0
+        assert observed["post_uncancel"] == 0
+
+    @pytest.mark.asyncio
+    async def test_dispatch_response_exception_with_cancelled_error_propagates_to_task_cancelled_state(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test re-raising a worker-side CancelledError ends the
+        surrounding task in the CANCELLED state.
+
+        Closes the loop with stdlib parity: a task that observes
+        :class:`asyncio.CancelledError` and re-raises (without
+        ``uncancel``) must end as cancelled — same as a
+        locally-cancelled task. The ``cancelling()`` bump on the
+        caller is what lets asyncio transition the task to
+        ``CANCELLED`` on re-raise.
+
+        Given:
+            A :class:`protocol.Response` whose ``exception`` field
+            carries a cloudpickle dump of
+            :class:`asyncio.CancelledError`, awaited inside a
+            wrapping :class:`asyncio.Task`
+        When:
+            The wrapping task observes ``CancelledError`` and
+            re-raises without calling ``uncancel()``
+        Then:
+            It should end with ``task.cancelled() == True``.
+        """
+        # Arrange
+        cancellation = asyncio.CancelledError("worker self-raised cancel")
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                exception=protocol.Message(dump=cloudpickle.dumps(cancellation)),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        async def body():
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        wrapped = asyncio.ensure_future(body())
+
+        # Act & assert
+        with pytest.raises(asyncio.CancelledError):
+            await wrapped
+        assert wrapped.cancelled()
 
     @pytest.mark.asyncio
     async def test_dispatch_response_exception_with_decode_failures_swallows_note_write_rejection(

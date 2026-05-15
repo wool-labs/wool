@@ -153,7 +153,12 @@ class _DispatchStream(Generic[_T]):
             awaitee is indistinguishable from
             ``task.cancel()`` — both transition the task to
             ``CANCELLED`` and the caller's ``await`` raises
-            ``CancelledError``.
+            ``CancelledError``. The caller task's ``cancelling()``
+            count is incremented synchronously with the raise,
+            mirroring stdlib's local-cancel state shape so that
+            ``if cancelling() > 0: raise`` re-raise gates and
+            ``current_task().uncancel()`` absorbers behave
+            identically for worker-side and local cancels.
         :raises Exception:
             The worker-side routine's exception, re-raised in its
             original class. The class is narrowed to
@@ -305,6 +310,22 @@ class _DispatchStream(Generic[_T]):
                         )
                     except AttributeError:
                         pass
+                # Mirror stdlib's local-cancel state shape: bump
+                # ``current_task().cancelling()`` synchronously and
+                # forward the worker's cancel message so idiomatic
+                # ``except CancelledError`` patterns
+                # (``if cancelling() > 0: raise`` re-raise gates,
+                # ``current_task().uncancel()`` absorbers) and any
+                # caller that introspects task state behave
+                # identically for worker-side and local cancels. The
+                # next-cycle ``CancelledError`` that ``Task.cancel()``
+                # schedules is suppressed by ``uncancel()`` per
+                # asyncio's contract.
+                if isinstance(worker_exc, asyncio.CancelledError):
+                    current = asyncio.current_task()
+                    if current is not None:
+                        cancel_msg = worker_exc.args[0] if worker_exc.args else None
+                        current.cancel(cancel_msg)
                 raise worker_exc
             else:
                 raise UnexpectedResponse(
