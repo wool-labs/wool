@@ -84,6 +84,18 @@ async def _controllable_task():
 # CancelledError; the test asserts on it from the main loop.
 _a1_cancellation_observed: threading.Event | None = None
 
+# Side-channel for the A1 regression test to confirm the worker
+# routine is actually running before the test cancels the stream.
+# The dispatch ``ack`` only confirms the handler reached its
+# ``yield ack`` — the worker task is scheduled lazily on the
+# handler's first ``async for`` iteration. Cancelling before the
+# routine starts races :meth:`DispatchSession._schedule_worker`,
+# which short-circuits on ``_cancelled`` and never dispatches the
+# routine, leaving nothing for the cancellation to interrupt. The
+# routine sets this event as its first statement; the test waits
+# for it before cancelling.
+_a1_routine_started: threading.Event | None = None
+
 # Cross-loop side-channel for the stop+cancel regression tests
 # (``test_stop_and_cancel`` and ``test_stop_and_cancel_streaming_routine``).
 # The routine on the worker loop signals via this :class:`threading.Event`
@@ -198,10 +210,14 @@ async def _a1_long_routine():
     """Module-level routine for the A1 regression test.
 
     Defined at module level so cloudpickle can serialize the
-    callable for dispatch. Sleeps long enough that the test will
-    have given up; signals the global event if interrupted by
-    :class:`asyncio.CancelledError`.
+    callable for dispatch. Signals :data:`_a1_routine_started` as
+    its first statement so the test can wait for the routine to be
+    running before cancelling. Sleeps long enough that the test
+    will have given up; signals :data:`_a1_cancellation_observed`
+    if interrupted by :class:`asyncio.CancelledError`.
     """
+    if _a1_routine_started is not None:
+        _a1_routine_started.set()
     try:
         await asyncio.sleep(30)
     except asyncio.CancelledError:
@@ -2019,8 +2035,9 @@ class TestWorkerService:
             out because :meth:`cancel` left the worker driver
             task running.
         """
-        global _a1_cancellation_observed
+        global _a1_cancellation_observed, _a1_routine_started
         _a1_cancellation_observed = threading.Event()
+        _a1_routine_started = threading.Event()
         try:
             mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
             wool_task = Task(
@@ -2038,6 +2055,27 @@ class TestWorkerService:
                 await stream.write(request)
                 ack = await anext(aiter(stream))
                 assert ack.HasField("ack")
+
+                # Barrier: wait until the worker routine is actually
+                # running before cancelling. The ``ack`` only
+                # confirms the dispatch handler reached its
+                # ``yield ack``; the worker task is scheduled lazily
+                # on the handler's first ``async for`` iteration.
+                # Cancelling before the routine starts races
+                # :meth:`DispatchSession._schedule_worker`, which
+                # short-circuits on ``_cancelled`` and never
+                # dispatches the routine — leaving nothing for the
+                # cancellation to interrupt and failing this test
+                # spuriously. Off-loop wait, mirroring
+                # ``_stop_routine_started``.
+                loop = asyncio.get_running_loop()
+                started = await loop.run_in_executor(
+                    None, _a1_routine_started.wait, 10.0
+                )
+                assert started, (
+                    "Worker routine did not start within 10s — "
+                    "cannot test cancellation propagation"
+                )
 
                 # Client-side cancel — simulates a caller that
                 # has given up (network drop, deadline, explicit
@@ -2066,7 +2104,6 @@ class TestWorkerService:
                 # absorb that variability while still failing fast
                 # if the chain is actually broken (regression would
                 # see the routine sleep the full 30s).
-                loop = asyncio.get_running_loop()
                 observed = await loop.run_in_executor(
                     None, _a1_cancellation_observed.wait, 10.0
                 )
@@ -2082,6 +2119,7 @@ class TestWorkerService:
             )
         finally:
             _a1_cancellation_observed = None
+            _a1_routine_started = None
 
     @pytest.mark.asyncio
     async def test_stop_timeout_then_cancel(
