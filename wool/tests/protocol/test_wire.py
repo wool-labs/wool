@@ -4,10 +4,12 @@ from wool import protocol
 
 EXPECTED_MESSAGE_EXPORTS = [
     "Ack",
+    "Context",
     "Message",
     "Nack",
     "Request",
     "Response",
+    "RuntimeContext",
     "StopRequest",
     "Task",
     "TaskEnvelope",
@@ -89,6 +91,67 @@ class TestMessageConstruction:
         assert task.kwargs == b"kwargs-bytes"
         assert task.timeout == 30
 
+    def test_context_fields(self):
+        """Test Context message field round-trip.
+
+        Given:
+            An id hex string and a list of ContextVar entries.
+        When:
+            A Context message is constructed.
+        Then:
+            Both fields round-trip correctly and each ContextVar
+            entry preserves its namespace, name, value, and
+            consumed_tokens.
+        """
+        # Arrange, act, & assert
+        ctx = protocol.Context(
+            id="abc",
+            vars=[
+                protocol.ContextVar(
+                    namespace="ns",
+                    name="key",
+                    value=b"value",
+                    consumed_tokens=["abc123"],
+                )
+            ],
+        )
+        assert ctx.id == "abc"
+        assert len(ctx.vars) == 1
+        entry = ctx.vars[0]
+        assert (entry.namespace, entry.name) == ("ns", "key")
+        assert entry.value == b"value"
+        assert list(entry.consumed_tokens) == ["abc123"]
+
+    def test_runtime_context_fields_with_dispatch_timeout(self):
+        """Test RuntimeContext exposes dispatch_timeout when supplied.
+
+        Given:
+            A float value for ``dispatch_timeout``.
+        When:
+            A RuntimeContext is constructed with that value.
+        Then:
+            The field round-trips and ``HasField`` reports it as
+            present.
+        """
+        # Arrange, act, & assert
+        msg = protocol.RuntimeContext(dispatch_timeout=5.5)
+        assert msg.dispatch_timeout == 5.5
+        assert msg.HasField("dispatch_timeout") is True
+
+    def test_runtime_context_fields_without_dispatch_timeout(self):
+        """Test RuntimeContext reports dispatch_timeout absent by default.
+
+        Given:
+            No arguments passed to the RuntimeContext constructor.
+        When:
+            A RuntimeContext is constructed.
+        Then:
+            ``HasField`` reports the optional field as absent.
+        """
+        # Arrange, act, & assert
+        msg = protocol.RuntimeContext()
+        assert msg.HasField("dispatch_timeout") is False
+
     def test_task_envelope_fields(self):
         """Test TaskEnvelope message is a strict subset of Task.
 
@@ -147,18 +210,45 @@ class TestMessageConstruction:
         ack = protocol.Ack(version="1.0.0")
         assert ack.version == "1.0.0"
 
-    def test_nack_with_reason(self):
-        """Test Nack message carries a reason string.
+    def test_nack_with_exception(self):
+        """Test Nack message carries a dumped exception payload.
 
         Given:
-            A rejection reason.
+            A serialized parse-phase exception payload.
         When:
-            A Nack message is constructed.
+            A Nack message is constructed and round-tripped through
+            ``SerializeToString`` / ``ParseFromString``.
         Then:
-            The reason field should be set.
+            The exception field should be present and carry the dump
+            bytes after wire-format roundtrip.
         """
-        nack = protocol.Nack(reason="version mismatch")
-        assert nack.reason == "version mismatch"
+        nack = protocol.Nack(exception=protocol.Message(dump=b"pickled-exc"))
+        assert nack.HasField("exception") is True
+        assert nack.exception.dump == b"pickled-exc"
+
+        parsed = protocol.Nack()
+        parsed.ParseFromString(nack.SerializeToString())
+        assert parsed.HasField("exception") is True
+        assert parsed.exception.dump == b"pickled-exc"
+
+    def test_nack_without_exception(self):
+        """Test Nack message constructed without an exception payload.
+
+        Given:
+            No exception payload supplied.
+        When:
+            A Nack message is constructed and round-tripped through
+            ``SerializeToString`` / ``ParseFromString``.
+        Then:
+            ``HasField('exception')`` should report False before and
+            after the wire-format roundtrip.
+        """
+        nack = protocol.Nack()
+        assert nack.HasField("exception") is False
+
+        parsed = protocol.Nack()
+        parsed.ParseFromString(nack.SerializeToString())
+        assert parsed.HasField("exception") is False
 
 
 class TestOneofBehavior:
@@ -239,7 +329,9 @@ class TestOneofBehavior:
         Then:
             It should return 'nack'.
         """
-        resp = protocol.Response(nack=protocol.Nack(reason="denied"))
+        resp = protocol.Response(
+            nack=protocol.Nack(exception=protocol.Message(dump=b"exc"))
+        )
         assert resp.WhichOneof("payload") == "nack"
 
     def test_response_result_oneof(self):

@@ -30,7 +30,7 @@ from cryptography.x509.oid import NameOID
 from hypothesis import strategies as st
 
 import wool
-from wool.runtime.context import RuntimeContext
+from wool.runtime.context import dispatch_timeout
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.worker.auth import WorkerCredentials
@@ -40,16 +40,19 @@ from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
+from .routines import ContextVarPattern
 
 
 class RoutineShape(Enum):
     COROUTINE = auto()
     ASYNC_GEN_ANEXT = auto()
+    ASYNC_GEN_ANEXT_SINGLE = auto()
     ASYNC_GEN_ASEND = auto()
     ASYNC_GEN_ATHROW = auto()
     ASYNC_GEN_ACLOSE = auto()
     NESTED_COROUTINE = auto()
     NESTED_ASYNC_GEN = auto()
+    NESTED_ASYNC_GEN_READBACK = auto()
 
 
 class PoolMode(Enum):
@@ -95,7 +98,7 @@ class WorkerOptionsKind(Enum):
 
 class TimeoutKind(Enum):
     NONE = auto()
-    VIA_RUNTIME_CONTEXT = auto()
+    VIA_DISPATCH_TIMEOUT_VAR = auto()
 
 
 class RoutineBinding(Enum):
@@ -114,6 +117,51 @@ class BackpressureMode(Enum):
 class LazyMode(Enum):
     LAZY = auto()
     EAGER = auto()
+
+
+class QuorumMode(Enum):
+    DEFAULT = auto()
+    ABOVE_DEFAULT = auto()
+
+
+class SerializerKind(Enum):
+    """Documents the negotiated serializer for a dispatch.
+
+    ``PASSTHROUGH`` is structurally selected for self-dispatch (the
+    caller's worker process matches the dispatch target — DEFAULT and
+    NESTED_DEFAULT_IN_EPHEMERAL pool modes); ``CLOUDPICKLE`` is selected
+    for cross-process dispatch (EPHEMERAL and similar pool modes that
+    spawn dedicated subprocess workers). The choice is automatic and
+    follows from the pool mode — this dimension is a documentation
+    annotation that pins the structural relationship in test scenarios
+    that explicitly enumerate the unified-driver happy paths.
+    """
+
+    PASSTHROUGH = auto()
+    CLOUDPICKLE = auto()
+
+
+class StrictWarnings(Enum):
+    """Documents whether warnings are promoted to errors during dispatch.
+
+    ``OFF`` leaves the ambient warning filter untouched. ``ALL_DECODABLE``
+    promotes :class:`wool.ContextDecodeWarning` to an error for the
+    duration of the dispatch and ships caller vars whose values can be
+    cleanly decoded on the worker — under strict mode the dispatch is
+    expected to complete without raising, proving the happy-path
+    propagation pipeline is silent on the warning channel.
+    """
+
+    OFF = auto()
+    ALL_DECODABLE = auto()
+
+
+# Optional Scenario dimensions — defaulted to ``None`` and excluded
+# from :attr:`Scenario.is_complete` so the existing pairwise covering
+# array (which leaves them unset) remains valid. They are populated
+# only on explicitly-enumerated scenarios (e.g.
+# ``test_unified_driver``) to document observable annotations.
+_OPTIONAL_DIMENSIONS: frozenset[str] = frozenset({"serializer", "strict_warnings"})
 
 
 def _sync_accept_hook(ctx):
@@ -144,6 +192,20 @@ class Scenario:
     binding: RoutineBinding | None = None
     lazy: LazyMode | None = None
     backpressure: BackpressureMode | None = None
+    ctx_var_1: ContextVarPattern | None = None
+    ctx_var_2: ContextVarPattern | None = None
+    ctx_var_3: ContextVarPattern | None = None
+    quorum: QuorumMode | None = None
+    # NOTE: ``serializer`` and ``strict_warnings`` are listed in
+    # ``_OPTIONAL_DIMENSIONS`` and serve as documentation
+    # annotations on test IDs — they do not drive
+    # ``build_pool_from_scenario`` behavior today. Tests that vary
+    # along these axes set them explicitly so the pytest ID
+    # reflects the negotiation under exercise. See F9 in the test
+    # review (tracking issue) for the planned spy that turns these
+    # into actively-pinned invariants.
+    serializer: SerializerKind | None = None
+    strict_warnings: StrictWarnings | None = None
 
     def __or__(self, other: Scenario) -> Scenario:
         """Merge two partial scenarios. Right side wins on ``None`` fields.
@@ -164,8 +226,19 @@ class Scenario:
 
     @property
     def is_complete(self) -> bool:
-        """True when all 10 dimensions are set."""
-        return all(getattr(self, f.name) is not None for f in fields(self))
+        """True when all required (non-optional) dimensions are set.
+
+        Optional documentation fields listed in ``_OPTIONAL_DIMENSIONS``
+        (``serializer``, ``strict_warnings``) are excluded from the
+        completeness check — they describe observable annotations on a
+        scenario rather than required configuration. Pairwise rows
+        generate with them at ``None``.
+        """
+        return all(
+            getattr(self, f.name) is not None
+            for f in fields(self)
+            if f.name not in _OPTIONAL_DIMENSIONS
+        )
 
     def __str__(self) -> str:
         parts = []
@@ -173,9 +246,54 @@ class Scenario:
             val = getattr(self, f.name)
             if val is not None:
                 parts.append(val.name)
+            elif f.name in _OPTIONAL_DIMENSIONS:
+                # Optional dimensions are omitted from the ID when
+                # unset so existing pairwise IDs remain stable.
+                continue
             else:
                 parts.append("_")
         return "-".join(parts)
+
+
+def default_scenario(
+    *,
+    shape: RoutineShape = RoutineShape.COROUTINE,
+    pool_mode: PoolMode = PoolMode.DEFAULT,
+    binding: RoutineBinding = RoutineBinding.MODULE_FUNCTION,
+    backpressure: BackpressureMode = BackpressureMode.NONE,
+    lazy: LazyMode = LazyMode.LAZY,
+    ctx_var_1: ContextVarPattern = ContextVarPattern.NONE,
+    ctx_var_2: ContextVarPattern = ContextVarPattern.NONE,
+    ctx_var_3: ContextVarPattern = ContextVarPattern.NONE,
+    quorum: QuorumMode = QuorumMode.DEFAULT,
+    serializer: SerializerKind | None = None,
+    strict_warnings: StrictWarnings | None = None,
+) -> Scenario:
+    """Build a fully-populated :class:`Scenario` with sensible defaults.
+
+    Used by happy-path integration tests that want to vary only one or two
+    dimensions while leaving the rest at their canonical values. Optional
+    documentation fields (``serializer``, ``strict_warnings``) default to
+    ``None`` so they remain absent from the pytest ID unless explicitly set.
+    """
+    return Scenario(
+        shape=shape,
+        pool_mode=pool_mode,
+        discovery=DiscoveryFactory.NONE,
+        lb=LbFactory.CLASS_REF,
+        credential=CredentialType.INSECURE,
+        options=WorkerOptionsKind.DEFAULT,
+        timeout=TimeoutKind.NONE,
+        binding=binding,
+        lazy=lazy,
+        backpressure=backpressure,
+        ctx_var_1=ctx_var_1,
+        ctx_var_2=ctx_var_2,
+        ctx_var_3=ctx_var_3,
+        quorum=quorum,
+        serializer=serializer,
+        strict_warnings=strict_warnings,
+    )
 
 
 class _DirectDiscovery:
@@ -208,7 +326,13 @@ async def build_pool_from_scenario(scenario, credentials_map):
     Resolves each dimension to its concrete runtime value and yields the
     entered pool context.
     """
-    assert scenario.is_complete
+    missing = [
+        f.name
+        for f in fields(scenario)
+        if f.name not in _OPTIONAL_DIMENSIONS and getattr(scenario, f.name) is None
+    ]
+    if missing:
+        raise ValueError(f"Scenario incomplete; missing required dimensions: {missing}")
 
     creds = credentials_map[scenario.credential]
 
@@ -296,9 +420,9 @@ async def build_pool_from_scenario(scenario, credentials_map):
 
                 discovery_obj = _lan_async_cm()
 
-    runtime_ctx = None
-    if scenario.timeout is TimeoutKind.VIA_RUNTIME_CONTEXT:
-        runtime_ctx = RuntimeContext(dispatch_timeout=30.0)
+    dispatch_timeout_token = None
+    if scenario.timeout is TimeoutKind.VIA_DISPATCH_TIMEOUT_VAR:
+        dispatch_timeout_token = dispatch_timeout.set(30.0)
 
     lazy = scenario.lazy is LazyMode.LAZY
 
@@ -310,19 +434,22 @@ async def build_pool_from_scenario(scenario, credentials_map):
         case _:
             bp_hook = None
 
-    try:
-        if runtime_ctx is not None:
-            runtime_ctx.__enter__()
+    match scenario.quorum:
+        case QuorumMode.ABOVE_DEFAULT:
+            quorum = 2
+        case _:
+            quorum = 1
 
+    try:
         try:
             if scenario.pool_mode is PoolMode.DURABLE:
                 async with _durable_pool_context(
-                    lb, creds, options, lazy, backpressure=bp_hook
+                    lb, creds, options, lazy, quorum, backpressure=bp_hook
                 ) as pool:
                     yield pool
             elif scenario.pool_mode is PoolMode.DURABLE_SHARED:
                 async with _durable_shared_pool_context(
-                    lb, creds, options, lazy, backpressure=bp_hook
+                    lb, creds, options, lazy, quorum, backpressure=bp_hook
                 ) as pool:
                     yield pool
             elif scenario.pool_mode is PoolMode.DURABLE_JOINED:
@@ -332,6 +459,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
                     creds,
                     options,
                     lazy,
+                    quorum,
                     backpressure=bp_hook,
                 ) as pool:
                     yield pool
@@ -343,6 +471,7 @@ async def build_pool_from_scenario(scenario, credentials_map):
                         LocalWorker, options=options, backpressure=bp_hook
                     ),
                     "lazy": lazy,
+                    "quorum": quorum,
                 }
                 match scenario.pool_mode:
                     case PoolMode.DEFAULT:
@@ -382,15 +511,15 @@ async def build_pool_from_scenario(scenario, credentials_map):
                     else:
                         yield pool
         finally:
-            if runtime_ctx is not None:
-                runtime_ctx.__exit__(None, None, None)
+            if dispatch_timeout_token is not None:
+                dispatch_timeout.reset(dispatch_timeout_token)
     finally:
         if _local_cm is not None:
             _local_cm.__exit__(None, None, None)
 
 
 @asynccontextmanager
-async def _durable_pool_context(lb, creds, options, lazy, *, backpressure=None):
+async def _durable_pool_context(lb, creds, options, lazy, quorum, *, backpressure=None):
     """Manually start a worker, register it, then create a DURABLE pool.
 
     DURABLE pools don't spawn workers — they only discover external
@@ -416,6 +545,7 @@ async def _durable_pool_context(lb, creds, options, lazy, *, backpressure=None):
                         loadbalancer=lb,
                         credentials=creds,
                         lazy=lazy,
+                        quorum=quorum,
                     )
                     async with pool:
                         yield pool
@@ -426,7 +556,9 @@ async def _durable_pool_context(lb, creds, options, lazy, *, backpressure=None):
 
 
 @asynccontextmanager
-async def _durable_shared_pool_context(lb, creds, options, lazy, *, backpressure=None):
+async def _durable_shared_pool_context(
+    lb, creds, options, lazy, quorum, *, backpressure=None
+):
     """Create two pools sharing the same LocalDiscovery subscriber.
 
     Exercises ``SubscriberMeta`` singleton caching and
@@ -452,12 +584,14 @@ async def _durable_shared_pool_context(lb, creds, options, lazy, *, backpressure
                         loadbalancer=lb,
                         credentials=creds,
                         lazy=lazy,
+                        quorum=quorum,
                     )
                     pool_b = WorkerPool(
                         discovery=shared,
                         loadbalancer=lb,
                         credentials=creds,
                         lazy=lazy,
+                        quorum=quorum,
                     )
                     async with pool_a:
                         async with pool_b:
@@ -508,7 +642,7 @@ def _resolve_joiner(namespace, factory):
 
 @asynccontextmanager
 async def _durable_joined_pool_context(
-    discovery_factory, lb, creds, options, lazy, *, backpressure=None
+    discovery_factory, lb, creds, options, lazy, quorum, *, backpressure=None
 ):
     """Create a DURABLE pool that joins an externally owned namespace.
 
@@ -535,6 +669,7 @@ async def _durable_joined_pool_context(
                         loadbalancer=lb,
                         credentials=creds,
                         lazy=lazy,
+                        quorum=quorum,
                     )
                     async with pool:
                         yield pool
@@ -548,80 +683,289 @@ async def _durable_joined_pool_context(
         await worker.stop()
 
 
+_VAR_NAMES = ("tenant_id", "region", "trace_id")
+_CALLER_VARS = {
+    "tenant_id": routines.TENANT_ID,
+    "region": routines.REGION,
+    "trace_id": routines.TRACE_ID,
+}
+
+
+def _build_patterns_dict(scenario):
+    """Build a patterns dict from the scenario's ctx_var fields.
+
+    Maps var names to ContextVarPattern members for non-NONE
+    patterns. Returns an empty dict when all three patterns are
+    NONE.
+    """
+    result: dict[str, ContextVarPattern] = {}
+    for idx, var_name in enumerate(_VAR_NAMES):
+        pattern = getattr(scenario, f"ctx_var_{idx + 1}")
+        if pattern is not None and pattern is not ContextVarPattern.NONE:
+            result[var_name] = pattern
+    return result
+
+
+def _setup_caller_vars(patterns):
+    """Set caller-side initial values for patterns that need them.
+
+    Returns a dict of {var_name: token} for cleanup, and a dict of
+    {var_name: initial_value} for later assertion.
+    """
+    tokens = {}
+    initial_values = {}
+    for var_name, pattern in patterns.items():
+        var = _CALLER_VARS[var_name]
+        if pattern is not ContextVarPattern.NONE:
+            initial = f"caller-initial-{var_name}"
+            tokens[var_name] = var.set(initial)
+            initial_values[var_name] = initial
+    return tokens, initial_values
+
+
+def _assert_caller_vars(patterns, initial_values, *, shape=None):
+    """Assert caller-side var state after dispatch completes.
+
+    Nested patterns (DOWNSTREAM_OVERWRITE, DOWNSTREAM_RESET,
+    UPSTREAM_RESET) assert the outer worker's final state, which is
+    what the caller observes via back-propagation. The inner worker's
+    mutations do not reach the outer worker's copied context because
+    the nested dispatch crosses event loop boundaries; only the outer
+    worker's own writes are captured in its snapshot.
+
+    For NESTED_ASYNC_GEN shapes, the async generator's final context
+    snapshot is sent with the last yield, not after exhaustion.
+    Post-teardown mutations (UPSTREAM_RESET) are not visible to the
+    caller because there is no subsequent yield to carry them. For
+    DOWNSTREAM_OVERWRITE and DOWNSTREAM_RESET the outer worker's
+    ``_pre_nested_setup`` runs before the first inner yield, so those
+    values ARE captured in per-yield snapshots.
+    """
+    is_nested_gen = shape is RoutineShape.NESTED_ASYNC_GEN
+    for var_name, pattern in patterns.items():
+        var = _CALLER_VARS[var_name]
+        match pattern:
+            case ContextVarPattern.ROUND_TRIP:
+                assert var.get() == f"worker-mutated-{var_name}", (
+                    f"ROUND_TRIP: expected caller {var_name} to reflect "
+                    f"worker mutation, got {var.get()!r}"
+                )
+            case ContextVarPattern.LOCAL_RESET:
+                assert var.get() == initial_values[var_name], (
+                    f"LOCAL_RESET: expected caller {var_name} to be "
+                    f"unchanged at {initial_values[var_name]!r}, "
+                    f"got {var.get()!r}"
+                )
+            case ContextVarPattern.DOWNSTREAM_OVERWRITE:
+                # Under stdlib-mirror semantics, wool routines run in
+                # the caller's stdlib Context — outer sets, inner
+                # overwrites in the same Context, and back-prop
+                # carries the final state (inner's overwrite) to the
+                # caller. Matches `await coro()` semantics.
+                assert var.get() == f"inner-overwrite-{var_name}", (
+                    f"DOWNSTREAM_OVERWRITE: expected inner-overwrite value, "
+                    f"got {var.get()!r}"
+                )
+            case ContextVarPattern.DOWNSTREAM_RESET:
+                # Outer sets and passes token; inner resets using the
+                # token, restoring the pre-outer value. Caller sees
+                # its own initial value.
+                assert var.get() == initial_values[var_name], (
+                    f"DOWNSTREAM_RESET: expected caller's initial value "
+                    f"{initial_values[var_name]!r}, got {var.get()!r}"
+                )
+            case ContextVarPattern.UPSTREAM_RESET:
+                if is_nested_gen:
+                    # Async gen: inner sets "inner-set-" before
+                    # yielding; that value is captured in a
+                    # per-yield snapshot and back-propagated to the
+                    # caller. _post_nested_teardown runs after the
+                    # gen exhausts — no subsequent yield carries
+                    # its mutation — so the caller's final visible
+                    # state is inner's set.
+                    assert var.get() == f"inner-set-{var_name}", (
+                        f"UPSTREAM_RESET (async gen): expected "
+                        f"inner-set value, got {var.get()!r}"
+                    )
+                else:
+                    # Coroutine: inner sets, then _post_nested_teardown
+                    # overwrites with outer-reset before the response
+                    # snapshot ships.
+                    assert var.get() == f"outer-reset-{var_name}", (
+                        f"UPSTREAM_RESET: expected outer-reset value, got {var.get()!r}"
+                    )
+            case ContextVarPattern.PER_YIELD:
+                # After iteration, caller should see the last
+                # step value back-propagated.
+                pass  # validated inline during iteration
+
+
+def _cleanup_caller_vars(tokens):
+    """Reset caller-side vars using saved tokens."""
+    for var_name, token in tokens.items():
+        _CALLER_VARS[var_name].reset(token)
+
+
 async def invoke_routine(scenario):
     """Invoke the appropriate routine for the given scenario and return results."""
     binding = scenario.binding
     shape = scenario.shape
 
-    obj = routines.Routines() if binding is not RoutineBinding.MODULE_FUNCTION else None
+    patterns = _build_patterns_dict(scenario)
 
-    routine = _select_routine(shape, binding)
+    # Set up TEST_PATTERNS so the worker decorator picks them up.
+    patterns_token = None
+    caller_tokens = {}
+    initial_values = {}
+    if patterns:
+        patterns_token = routines.TEST_PATTERNS.set(patterns)
+        caller_tokens, initial_values = _setup_caller_vars(patterns)
 
-    match shape:
-        case RoutineShape.COROUTINE:
-            if binding is RoutineBinding.INSTANCE_METHOD:
-                result = await routine(obj, 1, 2)
-            else:
-                result = await routine(1, 2)
-            assert result == 3
-            return result
+    try:
+        obj = (
+            routines.Routines()
+            if binding is not RoutineBinding.MODULE_FUNCTION
+            else None
+        )
 
-        case RoutineShape.ASYNC_GEN_ANEXT:
-            collected = []
-            if binding is RoutineBinding.INSTANCE_METHOD:
-                gen = routine(obj, 3)
-            else:
-                gen = routine(3)
-            async for item in gen:
-                collected.append(item)
-            assert collected == [0, 1, 2]
-            return collected
+        routine = _select_routine(shape, binding)
 
-        case RoutineShape.ASYNC_GEN_ASEND:
-            if binding is RoutineBinding.INSTANCE_METHOD:
-                gen = routine(obj, 2)
-            else:
-                gen = routine(2)
-            first = await gen.__anext__()
-            assert first == "ready"
-            echoed = await gen.asend(42)
-            assert echoed == 42
-            await gen.aclose()
-            return echoed
+        match shape:
+            case RoutineShape.COROUTINE:
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    result = await routine(obj, 1, 2)
+                else:
+                    result = await routine(1, 2)
+                assert result == 3
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return result
 
-        case RoutineShape.ASYNC_GEN_ATHROW:
-            if binding is RoutineBinding.INSTANCE_METHOD:
-                gen = routine(obj, 10)
-            else:
-                gen = routine(10)
-            first = await gen.__anext__()
-            assert first == 10
-            reset = await gen.athrow(ValueError)
-            assert reset == 0
-            await gen.aclose()
-            return reset
+            case RoutineShape.ASYNC_GEN_ANEXT:
+                collected = []
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    gen = routine(obj, 3)
+                else:
+                    gen = routine(3)
+                step = 0
+                async for item in gen:
+                    collected.append(item)
+                    if patterns:
+                        per_yield = {
+                            k: v
+                            for k, v in patterns.items()
+                            if v is ContextVarPattern.PER_YIELD
+                        }
+                        for var_name in per_yield:
+                            var = _CALLER_VARS[var_name]
+                            assert var.get() == f"step-{step}", (
+                                f"PER_YIELD step {step}: expected "
+                                f"'step-{step}', got {var.get()!r}"
+                            )
+                    step += 1
+                assert collected == [0, 1, 2]
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return collected
 
-        case RoutineShape.ASYNC_GEN_ACLOSE:
-            if binding is RoutineBinding.INSTANCE_METHOD:
-                gen = routine(obj)
-            else:
+            case RoutineShape.ASYNC_GEN_ANEXT_SINGLE:
+                collected = []
                 gen = routine()
-            first = await gen.__anext__()
-            assert first == "alive"
-            await gen.aclose()
-            return first
+                async for item in gen:
+                    collected.append(item)
+                assert collected == [0]
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return collected
 
-        case RoutineShape.NESTED_COROUTINE:
-            result = await routines.nested_add(1, 2)
-            assert result == 3
-            return result
+            case RoutineShape.ASYNC_GEN_ASEND:
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    gen = routine(obj, 2)
+                else:
+                    gen = routine(2)
+                first = await gen.__anext__()
+                assert first == "ready"
+                echoed = await gen.asend(42)
+                assert echoed == 42
+                await gen.aclose()
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return echoed
 
-        case RoutineShape.NESTED_ASYNC_GEN:
-            collected = []
-            async for item in routines.nested_gen(3):
-                collected.append(item)
-            assert collected == [0, 1, 2]
-            return collected
+            case RoutineShape.ASYNC_GEN_ATHROW:
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    gen = routine(obj, 10)
+                else:
+                    gen = routine(10)
+                first = await gen.__anext__()
+                assert first == 10
+                reset = await gen.athrow(ValueError)
+                assert reset == 0
+                await gen.aclose()
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return reset
+
+            case RoutineShape.ASYNC_GEN_ACLOSE:
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    gen = routine(obj)
+                else:
+                    gen = routine()
+                first = await gen.__anext__()
+                assert first == "alive"
+                await gen.aclose()
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return first
+
+            case RoutineShape.NESTED_COROUTINE:
+                result = await routines.nested_add(1, 2)
+                assert result == 3
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return result
+
+            case RoutineShape.NESTED_ASYNC_GEN:
+                collected = []
+                step = 0
+                async for item in routines.nested_gen(3):
+                    collected.append(item)
+                    if patterns:
+                        per_yield = {
+                            k: v
+                            for k, v in patterns.items()
+                            if v is ContextVarPattern.PER_YIELD
+                        }
+                        for var_name in per_yield:
+                            var = _CALLER_VARS[var_name]
+                            assert var.get() == f"step-{step}", (
+                                f"PER_YIELD step {step}: expected "
+                                f"'step-{step}', got {var.get()!r}"
+                            )
+                    step += 1
+                assert collected == [0, 1, 2]
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return collected
+
+            case RoutineShape.NESTED_ASYNC_GEN_READBACK:
+                # Streaming routine that, on each iteration, mutates
+                # ``TENANT_ID`` to a per-step value and nested-dispatches
+                # ``get_tenant_id`` to read it back. Locks in the second
+                # consequence of the #176 fix: ``_current_task`` and
+                # ``wool.Context`` remain active across the generator's
+                # lifespan, so nested dispatches from inside a streaming
+                # routine carry the streaming task as caller.
+                collected = [
+                    value async for value in routines.streaming_nested_get_tenant_id(3)
+                ]
+                assert collected == ["step-0", "step-1", "step-2"]
+                return collected
+    finally:
+        if caller_tokens:
+            _cleanup_caller_vars(caller_tokens)
+        if patterns_token is not None:
+            routines.TEST_PATTERNS.reset(patterns_token)
 
 
 def _select_routine(shape, binding):
@@ -644,6 +988,9 @@ def _select_routine(shape, binding):
             return routines.Routines.class_gen
         case (RoutineShape.ASYNC_GEN_ANEXT, RoutineBinding.STATICMETHOD):
             return routines.Routines.static_gen
+
+        case (RoutineShape.ASYNC_GEN_ANEXT_SINGLE, RoutineBinding.MODULE_FUNCTION):
+            return routines.gen_range_one_yield
 
         case (RoutineShape.ASYNC_GEN_ASEND, RoutineBinding.MODULE_FUNCTION):
             return routines.echo_send
@@ -670,6 +1017,8 @@ def _select_routine(shape, binding):
             return routines.nested_add
         case (RoutineShape.NESTED_ASYNC_GEN, _):
             return routines.nested_gen
+        case (RoutineShape.NESTED_ASYNC_GEN_READBACK, _):
+            return routines.streaming_nested_get_tenant_id
 
         case _:
             raise ValueError(f"Unsupported shape/binding: {shape}, {binding}")
@@ -683,6 +1032,21 @@ _ASEND_ATHROW_ACLOSE = (
 _NESTED_SHAPES = (
     RoutineShape.NESTED_COROUTINE,
     RoutineShape.NESTED_ASYNC_GEN,
+    RoutineShape.NESTED_ASYNC_GEN_READBACK,
+)
+_ASYNC_GEN_SHAPES = (
+    RoutineShape.ASYNC_GEN_ANEXT,
+    RoutineShape.ASYNC_GEN_ANEXT_SINGLE,
+    RoutineShape.ASYNC_GEN_ASEND,
+    RoutineShape.ASYNC_GEN_ATHROW,
+    RoutineShape.ASYNC_GEN_ACLOSE,
+    RoutineShape.NESTED_ASYNC_GEN,
+    RoutineShape.NESTED_ASYNC_GEN_READBACK,
+)
+_NESTED_ONLY_PATTERNS = (
+    ContextVarPattern.DOWNSTREAM_OVERWRITE,
+    ContextVarPattern.DOWNSTREAM_RESET,
+    ContextVarPattern.UPSTREAM_RESET,
 )
 
 
@@ -703,13 +1067,19 @@ def _pairwise_filter(row):
     - D3 must be a LOCAL_* variant when D2 is DURABLE_JOINED
       (LanDiscovery does not support namespacing)
     - D4 must not be ASYNC_CM (pre-called async CM instances are not
-      picklable inside WorkerProxy.__reduce__; documented limitation,
+      picklable inside WorkerProxy.__wool_reduce__; documented limitation,
       see #61)
     - D8 must be MODULE_FUNCTION or INSTANCE_METHOD when D1 is ASEND,
       ATHROW, or ACLOSE (no classmethod/staticmethod routines defined
       for these shapes)
     - D8 must be MODULE_FUNCTION when D1 is NESTED_* (nested dispatch
       always uses module-level routines)
+    - D11/D12/D13 (ctx_var_1/2/3): DOWNSTREAM_OVERWRITE,
+      DOWNSTREAM_RESET, UPSTREAM_RESET only valid with NESTED_* shapes;
+      PER_YIELD only valid with ASYNC_GEN_* shapes
+    - D14 (quorum) ABOVE_DEFAULT (quorum=2) requires PoolMode.EPHEMERAL —
+      every other pool mode in the builder produces only one worker, so
+      quorum=2 would block forever.
     """
     if len(row) > 2:
         pool_mode = row[1]
@@ -746,6 +1116,37 @@ def _pairwise_filter(row):
             return False
         if shape in _NESTED_SHAPES and binding is not RoutineBinding.MODULE_FUNCTION:
             return False
+        # ASYNC_GEN_ANEXT_SINGLE is only defined as a module-level
+        # routine (no class/instance/static variants); pin the
+        # binding so pairwise generation does not invent
+        # combinations that ``_select_routine`` cannot resolve.
+        if (
+            shape is RoutineShape.ASYNC_GEN_ANEXT_SINGLE
+            and binding is not RoutineBinding.MODULE_FUNCTION
+        ):
+            return False
+    # Context var pattern constraints (indices 10, 11, 12)
+    shape = row[0]
+    for idx in (10, 11, 12):
+        if len(row) > idx:
+            pattern = row[idx]
+            if pattern in _NESTED_ONLY_PATTERNS and shape not in _NESTED_SHAPES:
+                return False
+            if pattern is ContextVarPattern.PER_YIELD and shape not in _ASYNC_GEN_SHAPES:
+                return False
+            # NESTED_ASYNC_GEN_READBACK's routine self-mutates
+            # ``TENANT_ID`` per iteration; combining with framework-
+            # driven patterns over the same caller vars would conflict.
+            if (
+                shape is RoutineShape.NESTED_ASYNC_GEN_READBACK
+                and pattern is not ContextVarPattern.NONE
+            ):
+                return False
+    if len(row) > 13:
+        quorum = row[13]
+        pool_mode = row[1]
+        if quorum is QuorumMode.ABOVE_DEFAULT and pool_mode is not PoolMode.EPHEMERAL:
+            return False
     return True
 
 
@@ -761,6 +1162,10 @@ PAIRWISE_SCENARIOS = [
         binding=row[7],
         lazy=row[8],
         backpressure=row[9],
+        ctx_var_1=row[10],
+        ctx_var_2=row[11],
+        ctx_var_3=row[12],
+        quorum=row[13],
     )
     for row in AllPairs(
         [
@@ -774,6 +1179,10 @@ PAIRWISE_SCENARIOS = [
             list(RoutineBinding),
             list(LazyMode),
             list(BackpressureMode),
+            list(ContextVarPattern),
+            list(ContextVarPattern),
+            list(ContextVarPattern),
+            list(QuorumMode),
         ],
         filter_func=_pairwise_filter,
     )
@@ -813,13 +1222,17 @@ def scenarios_strategy(draw):
         discovery = draw(st.sampled_from(DiscoveryFactory))
 
     # ASYNC_CM lb excluded: pre-called CM instances are not picklable
-    # inside WorkerProxy.__reduce__ (documented limitation, see #61)
+    # inside WorkerProxy.__wool_reduce__ (documented limitation, see #61)
     lb = draw(st.sampled_from([f for f in LbFactory if f is not LbFactory.ASYNC_CM]))
     credential = draw(st.sampled_from(CredentialType))
     options = draw(st.sampled_from(WorkerOptionsKind))
     timeout = draw(st.sampled_from(TimeoutKind))
 
     if shape in _NESTED_SHAPES:
+        binding = RoutineBinding.MODULE_FUNCTION
+    elif shape is RoutineShape.ASYNC_GEN_ANEXT_SINGLE:
+        # Only a module-level routine exists for the single-yield
+        # shape; mirrors the constraint encoded in ``_pairwise_filter``.
         binding = RoutineBinding.MODULE_FUNCTION
     elif shape in _ASEND_ATHROW_ACLOSE:
         binding = draw(
@@ -836,6 +1249,31 @@ def scenarios_strategy(draw):
     lazy = draw(st.sampled_from(LazyMode))
     backpressure = draw(st.sampled_from(BackpressureMode))
 
+    def _draw_ctx_var_pattern(draw):
+        # NESTED_ASYNC_GEN_READBACK's routine self-mutates TENANT_ID
+        # per iteration; combining with framework-driven patterns over
+        # the same caller vars would conflict. Mirrors the exclusion
+        # in ``_pairwise_filter``.
+        if shape is RoutineShape.NESTED_ASYNC_GEN_READBACK:
+            return ContextVarPattern.NONE
+        valid = list(ContextVarPattern)
+        if shape not in _NESTED_SHAPES:
+            valid = [p for p in valid if p not in _NESTED_ONLY_PATTERNS]
+        if shape not in _ASYNC_GEN_SHAPES:
+            valid = [p for p in valid if p is not ContextVarPattern.PER_YIELD]
+        return draw(st.sampled_from(valid))
+
+    ctx_var_1 = _draw_ctx_var_pattern(draw)
+    ctx_var_2 = _draw_ctx_var_pattern(draw)
+    ctx_var_3 = _draw_ctx_var_pattern(draw)
+
+    if pool_mode is PoolMode.EPHEMERAL:
+        quorum = draw(st.sampled_from(QuorumMode))
+    else:
+        quorum = draw(
+            st.sampled_from([m for m in QuorumMode if m is not QuorumMode.ABOVE_DEFAULT])
+        )
+
     return Scenario(
         shape=shape,
         pool_mode=pool_mode,
@@ -847,6 +1285,10 @@ def scenarios_strategy(draw):
         binding=binding,
         lazy=lazy,
         backpressure=backpressure,
+        ctx_var_1=ctx_var_1,
+        ctx_var_2=ctx_var_2,
+        ctx_var_3=ctx_var_3,
+        quorum=quorum,
     )
 
 
@@ -936,21 +1378,19 @@ async def _clear_channel_pool():
     yield
     import wool.runtime.worker.connection as _conn
 
-    await _conn._channel_pool.clear()
+    await _conn.clear_channel_pool()
 
 
-@pytest.fixture(autouse=True)
-def _clear_proxy_context():
-    """Reset proxy context vars between tests."""
-    from wool.runtime.discovery import __subscriber_pool__
-
-    proxy_token = wool.__proxy__.set(None)
-    pool_token = wool.__proxy_pool__.set(None)
-    sub_token = __subscriber_pool__.set(None)
-    yield
-    wool.__proxy__.reset(proxy_token)
-    wool.__proxy_pool__.reset(pool_token)
-    __subscriber_pool__.reset(sub_token)
+# Integration tests rely on pytest-asyncio's Task-per-test scoping
+# for ContextVar isolation: each async test runs inside an
+# asyncio.Task whose ``contextvars.Context`` is a copy, so
+# wool.ContextVar mutations stay scoped to that copy and don't leak
+# to the next test. Sync integration helpers run in the pytest main
+# Context — if they ever mutate routine-level vars, add an explicit
+# per-test teardown at that site rather than reviving a global
+# autouse cleanup. (The previous sync ``_clear_proxy_context``
+# autouse fixture mutated the pytest main Context, which async test
+# tasks never observe; it was load-bearing in appearance only.)
 
 
 @pytest.fixture
@@ -973,7 +1413,14 @@ def retry_grpc_internal():
         for attempt in range(_GRPC_INTERNAL_RETRIES + 1):
             try:
                 return await body()
-            except BaseException as exc:
+            except Exception as exc:
+                # Narrow to ``Exception`` — gRPC ``RpcError`` is an
+                # ``Exception`` subclass, and signals
+                # (``KeyboardInterrupt``, ``SystemExit``,
+                # ``CancelledError``) must propagate untouched. The
+                # prior ``except BaseException`` could swallow a
+                # mid-retry ``CancelledError`` arriving during
+                # backoff sleep.
                 if not _is_grpc_internal(exc):
                     raise
                 if attempt < _GRPC_INTERNAL_RETRIES:

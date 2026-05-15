@@ -20,7 +20,8 @@ Spawn a general-purpose subagent with the following brief:
 >
 > 1. Read the project instructions in `CLAUDE.md`.
 > 2. Read and execute the complete workflow defined in `llms/skills/audit.md`.
-> 3. Follow every step faithfully. When a step requires user approval (e.g., remediation decision), surface it to the user and wait for their response.
-> 4. When done, return the full verification report including the pass/fail verdicts and overall compliance status.
+> 3. Follow every step faithfully. Pay special attention to the `## Invariants` section — these are non-negotiable safety constraints. When a step requires user approval (e.g., remediation decision), surface it to the user and wait for their response.
+> 4. The checklist MUST be exhaustive — extract every MUST, MUST NOT, SHALL, SHALL NOT, REQUIRED, and RECOMMENDED statement from the skill definition, including those in the `## Invariants` section. A partial checklist that omits normative requirements is itself a compliance failure.
+> 5. When done, return the full verification report including the pass/fail verdicts and overall compliance status.
 
 When the subagent returns, relay its summary to the user verbatim. Do not repeat work or add commentary.

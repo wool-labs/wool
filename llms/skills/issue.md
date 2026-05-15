@@ -17,9 +17,16 @@ Create a well-structured GitHub issue, either from a prepared `.issue.md` file o
 
 This skill is part of the development workflow pipeline: `/issue` → `/implement` → `/test` → `/commit` → `/pr`. This skill is the **first** stage. The implement, test, and commit steps are iterative — they can be invoked multiple times for a given issue.
 
+## Invariants
+
+- MUST NOT push the issue to GitHub until the user explicitly approves the draft.
+- MUST use a heredoc for the `gh issue create` body to avoid shell escaping issues.
+- MUST NOT add the `--assignee` flag -- issues are not auto-assigned at creation.
+- MUST use the knowledge graph (`llms/skills/understand-chat.md`) for context gathering when `.understand-anything/knowledge-graph.json` exists.
+
 ## Workflow
 
-### TL;DR
+### Checklist
 
 1. Determine the source
 2. Resolve target repository

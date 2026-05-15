@@ -21,9 +21,17 @@ This skill transforms a messy working tree into a clean sequence of atomic, well
 
 This skill is part of the development workflow pipeline: `/issue` → `/implement` → `/test` → `/commit` → `/pr`. This skill is the **fourth** stage. The implement, test, and commit steps are iterative — they can be invoked multiple times for a given issue.
 
+## Invariants
+
+- MUST create a staging branch before making any commits -- never commit directly to the working branch.
+- MUST NOT merge the staging branch back without explicit user approval.
+- MUST verify staged diff with `git diff --cached` before every commit.
+- MUST NOT include untracked files without asking the user first.
+- MUST check whether the current repo is a fork via `gh repo view --json isFork,parent` and resolve the target repo before any git operations.
+
 ## Workflow
 
-### TL;DR
+### Checklist
 
 1. Verify git state
 2. Create a staging branch
@@ -39,9 +47,12 @@ This skill is part of the development workflow pipeline: `/issue` → `/implemen
 ```bash
 git status
 git diff HEAD
+gh repo view --json isFork,parent
 ```
 
 If the working tree is clean (nothing to commit), tell the user and stop.
+
+If `isFork` is `true`, note the upstream repo — this context is useful for ensuring commit footers and branch references align with the upstream issue tracker. No `--repo` flags are needed for commit operations (they are local), but awareness of the fork relationship prevents mistakes in commit messages that reference issues or PRs.
 
 Untracked files SHOULD be checked for new source files, config files, etc. The user MUST be asked before including untracked files unless their inclusion is obvious. Build artifacts, cache directories, and anything in .gitignore MUST be ignored.
 

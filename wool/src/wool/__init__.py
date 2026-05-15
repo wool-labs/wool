@@ -1,11 +1,20 @@
-from contextvars import ContextVar
+import contextvars
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
 from typing import Final
 
 from tblib import pickling_support
 
+from wool.runtime.context import Context
+from wool.runtime.context import ContextAlreadyBound
+from wool.runtime.context import ContextDecodeWarning
+from wool.runtime.context import ContextVar
+from wool.runtime.context import ContextVarCollision
 from wool.runtime.context import RuntimeContext
+from wool.runtime.context import Token
+from wool.runtime.context import copy_context
+from wool.runtime.context import create_task
+from wool.runtime.context import current_context
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryEventType
@@ -20,11 +29,12 @@ from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.routine.task import Serializer
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
 from wool.runtime.routine.task import current_task
 from wool.runtime.routine.wrapper import routine
+from wool.runtime.serializer import CloudpickleSerializer
+from wool.runtime.serializer import Serializer
 from wool.runtime.typing import Factory
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import Worker
@@ -49,64 +59,69 @@ try:
 except PackageNotFoundError:
     __version__ = "unknown"
 
-__proxy__: Final[ContextVar[WorkerProxy | None]] = ContextVar("__proxy__", default=None)
+__serializer__: Final[Serializer] = CloudpickleSerializer()
 
-__proxy_pool__: Final[ContextVar[ResourcePool[WorkerProxy] | None]] = ContextVar(
-    "__proxy_pool__", default=None
+__proxy__: Final[contextvars.ContextVar[WorkerProxy | None]] = contextvars.ContextVar(
+    "__proxy__", default=None
+)
+
+__proxy_pool__: Final[contextvars.ContextVar[ResourcePool[WorkerProxy] | None]] = (
+    contextvars.ContextVar("__proxy_pool__", default=None)
 )
 
 __worker_metadata__: WorkerMetadata | None = None
 
 __worker_uds_address__: str | None = None
 
-__worker_service__: Final[ContextVar[WorkerService | None]] = ContextVar(
-    "__worker_service__", default=None
+__worker_service__: Final[contextvars.ContextVar[WorkerService | None]] = (
+    contextvars.ContextVar("__worker_service__", default=None)
 )
 
 __all__ = [
-    # Connection
-    "RpcError",
-    "TransientRpcError",
-    "UnexpectedResponse",
-    "WorkerConnection",
-    # Context
-    "RuntimeContext",
-    # Load balancing
-    "LoadBalancerContextLike",
-    "LoadBalancerLike",
-    "NoWorkersAvailable",
-    "RoundRobinLoadBalancer",
-    # Routines
-    "Serializer",
-    "Task",
-    "TaskException",
-    "current_task",
-    "routine",
-    # Backpressure
     "BackpressureContext",
     "BackpressureLike",
-    # Workers
-    "LocalWorker",
-    "Worker",
-    "WorkerCredentials",
-    "WorkerFactory",
-    "WorkerLike",
-    "WorkerPool",
-    "WorkerProxy",
-    "WorkerService",
-    # Discovery
+    "Context",
+    "ContextAlreadyBound",
+    "ContextDecodeWarning",
+    "ContextVar",
+    "ContextVarCollision",
     "Discovery",
     "DiscoveryEvent",
     "DiscoveryEventType",
     "DiscoveryLike",
     "DiscoveryPublisherLike",
     "DiscoverySubscriberLike",
-    "LanDiscovery",
-    "LocalDiscovery",
-    "PredicateFunction",
-    "WorkerMetadata",
-    # Typing
     "Factory",
+    "LanDiscovery",
+    "LoadBalancerContextLike",
+    "LoadBalancerLike",
+    "LocalDiscovery",
+    "LocalWorker",
+    "NoWorkersAvailable",
+    "PredicateFunction",
+    "RoundRobinLoadBalancer",
+    "RpcError",
+    "RuntimeContext",
+    "Serializer",
+    "Task",
+    "TaskException",
+    "Token",
+    "TransientRpcError",
+    "UnexpectedResponse",
+    "Worker",
+    "WorkerConnection",
+    "WorkerCredentials",
+    "WorkerFactory",
+    "WorkerLike",
+    "WorkerMetadata",
+    "WorkerPool",
+    "WorkerProxy",
+    "WorkerService",
+    "copy_context",
+    "create_task",
+    "current_context",
+    "current_task",
+    "routine",
 ]
 
 for symbol in __all__:
@@ -117,11 +132,3 @@ for symbol in __all__:
             attribute.__module__ = __name__
     except AttributeError:
         continue
-
-# for plugin in entry_points(group="wool_cli_plugins"):
-#     try:
-#         plugin.load()
-#         logging.info(f"Loaded CLI plugin {plugin.name}")
-#     except Exception as e:
-#         logging.error(f"Failed to load CLI plugin {plugin.name}: {e}")
-#         raise

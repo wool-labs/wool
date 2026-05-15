@@ -1,7 +1,7 @@
 import datetime
-import pickle
 from dataclasses import FrozenInstanceError
 
+import cloudpickle
 import grpc
 import pytest
 from cryptography import x509
@@ -16,9 +16,6 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool.runtime.worker.auth import WorkerCredentials
-
-# Module-level certificate storage for test reuse
-_test_certs = None
 
 
 def _generate_test_certificates():
@@ -91,10 +88,7 @@ def test_certificates():
     Returns:
         Tuple of (private_key_pem, certificate_pem, ca_cert_pem)
     """
-    global _test_certs
-    if _test_certs is None:
-        _test_certs = _generate_test_certificates()
-    return _test_certs
+    return _generate_test_certificates()
 
 
 @pytest.fixture
@@ -540,8 +534,8 @@ class TestWorkerCredentials:
         assert isinstance(server2, grpc.ServerCredentials)
         assert isinstance(client1, grpc.ChannelCredentials)
         assert isinstance(client2, grpc.ChannelCredentials)
-        assert type(server1) == type(server2)
-        assert type(client1) == type(client2)
+        assert type(server1) is type(server2)
+        assert type(client1) is type(client2)
 
     @given(mutual=st.booleans())
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
@@ -564,7 +558,7 @@ class TestWorkerCredentials:
         )
 
         # Act
-        restored = pickle.loads(pickle.dumps(creds))
+        restored = cloudpickle.loads(cloudpickle.dumps(creds))
 
         # Assert
         assert restored == creds

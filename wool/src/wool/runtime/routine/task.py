@@ -4,15 +4,15 @@ import asyncio
 import functools
 import logging
 import traceback
-import weakref
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from inspect import isasyncgen
 from inspect import isasyncgenfunction
 from inspect import iscoroutinefunction
 from types import TracebackType
-from typing import Any
 from typing import AsyncGenerator
 from typing import ContextManager
 from typing import Coroutine
@@ -23,17 +23,17 @@ from typing import SupportsInt
 from typing import Tuple
 from typing import TypeAlias
 from typing import TypeVar
-from typing import cast
 from typing import overload
 from typing import runtime_checkable
 from uuid import UUID
-from uuid import uuid4
 
 import cloudpickle
 
 import wool
 from wool import protocol
 from wool.runtime.context import RuntimeContext
+from wool.runtime.serializer import PassthroughSerializer
+from wool.runtime.serializer import Serializer
 
 Args = Tuple
 Kwargs = Dict
@@ -42,86 +42,18 @@ Routine: TypeAlias = Coroutine | AsyncGenerator
 W = TypeVar("W", bound=Routine)
 
 
-# public
-@runtime_checkable
-class Serializer(Protocol):
-    """Protocol for pluggable serialization of Task payload fields."""
-
-    def dumps(self, obj: Any) -> bytes: ...
-
-    def loads(self, data: bytes) -> Any: ...
-
-
-class _PassthroughKey:
-    """Weak-referenceable key for the passthrough store."""
-
-    __slots__ = ("__weakref__", "token")
-
-    def __init__(self, token: UUID | None = None):
-        self.token = token if token is not None else uuid4()
-
-    def __hash__(self):
-        return hash(self.token)
-
-    def __eq__(self, other):
-        if not isinstance(other, _PassthroughKey):
-            return super().__eq__(other)
-        return self.token == other.token
-
-
-class PassthroughSerializer:
-    """In-process serializer that avoids pickling entirely.
-
-    Each instance acts as a scope guard for one dispatch.
-    ``dumps`` creates a weakly-referenceable key, stores the object
-    in a module-level :class:`~weakref.WeakKeyDictionary`, and
-    retains a strong reference to the key on ``self``.  When the
-    serializer goes out of scope the keys are garbage-collected and
-    the weak-dict entries are removed automatically.
-
-    ``loads`` is static — it reconstructs the key from the bytes
-    token in the protobuf message and pops the entry from the store.
-
-    All instances hash and compare equal so that
-    ``_pickle_serializer``'s LRU cache hits on every call.
-    """
-
-    def __init__(self):
-        self._keys: list[_PassthroughKey] = []
-
-    def __hash__(self):
-        return hash(PassthroughSerializer)
-
-    def __eq__(self, other):
-        # Required by _pickle_serializer's lru_cache: all instances
-        # share the same hash, so __eq__ must confirm the match for
-        # the cache to hit instead of treating each instance as a
-        # separate key.
-        return isinstance(other, PassthroughSerializer)
-
-    def __reduce__(self):
-        return (PassthroughSerializer, ())
-
-    def dumps(self, obj: Any) -> bytes:
-        key = _PassthroughKey()
-        self._keys.append(key)
-        _passthrough_store[key] = obj
-        return key.token.bytes
-
-    @staticmethod
-    def loads(data: bytes) -> Any:
-        key = _PassthroughKey(UUID(bytes=data))
-        return _passthrough_store.pop(key)
-
-
-_passthrough_store: weakref.WeakKeyDictionary[_PassthroughKey, Any] = (
-    weakref.WeakKeyDictionary()
-)
-
-
 @functools.lru_cache(maxsize=8)
-def _pickle_serializer(s: Serializer) -> bytes:
-    return cloudpickle.dumps(s)
+def _pickle_serializer(serializer: Serializer) -> bytes:
+    """Pickle a :class:`Serializer` instance for transport on the wire.
+
+    Cached via :func:`functools.lru_cache` keyed on the serializer
+    instance.  :class:`PassthroughSerializer` and
+    :class:`CloudpickleSerializer` deliberately collapse all instances to
+    one cache slot via ``__hash__`` and ``__eq__``; user implementations
+    that hash uniquely will fill the cache one entry per instance and
+    evict in LRU order.
+    """
+    return wool.__serializer__.dumps(serializer)
 
 
 @functools.lru_cache(maxsize=8)
@@ -150,6 +82,16 @@ def do_dispatch(flag: bool, /) -> ContextManager[None]: ...
 
 
 def do_dispatch(flag: bool | None = None, /) -> bool | ContextManager[None]:
+    """Read or scope the dispatch-routing flag.
+
+    Called with no argument, returns the current flag value. Called
+    with a *flag* argument, returns a context manager that sets the
+    flag for the duration of its ``with`` block and restores the
+    prior value on exit. The flag governs whether the surrounding
+    ``@routine`` invocation routes through the worker pool (``True``,
+    the default) or runs locally (``False``); ``with do_dispatch(False):``
+    is the standard way to opt a nested call out of dispatch.
+    """
     if flag is None:
         return _do_dispatch.get()
     else:
@@ -176,8 +118,7 @@ class WorkerProxyLike(Protocol):
 # public
 @dataclass
 class Task(Generic[W]):
-    """
-    Represents a distributed task to be executed in the worker pool.
+    """Represents a distributed task to be executed in the worker pool.
 
     Each task encapsulates a function call along with its arguments and
     execution context. Tasks are created when decorated functions are
@@ -193,25 +134,23 @@ class Task(Generic[W]):
     :param kwargs:
         Keyword arguments for the function.
     :param proxy:
-        Proxy object for task dispatch and routing (satisfies WorkerProxyLike).
+        Proxy object for task dispatch and routing (satisfies
+        :class:`WorkerProxyLike`).
     :param timeout:
         Task timeout in seconds (0 means no timeout).
     :param caller:
         UUID of the calling task if this is a nested task.
     :param exception:
         Exception information if task execution failed.
-    :param filename:
-        Source filename where the task was defined.
-    :param function:
-        Name of the function being executed.
-    :param line_no:
-        Line number where the task was defined.
     :param tag:
-        Optional descriptive tag for the task.
-    :param context:
-        RuntimeContext snapshot captured at task creation time.
-        Propagated over the wire so workers can restore the caller's
-        runtime settings (e.g. dispatch_timeout) before execution.
+        Descriptive label identifying the call site, formatted as
+        ``module.qualname:lineno`` by the ``@routine`` wrapper.
+    :param runtime_context:
+        Snapshot of the active :class:`RuntimeContext` at construction
+        time, captured by :meth:`__post_init__` if not supplied. Ships
+        with the dispatch frame so the worker side can restore wire
+        defaults (notably ``dispatch_timeout``) for the routine's
+        execution.
     """
 
     id: UUID
@@ -222,18 +161,16 @@ class Task(Generic[W]):
     timeout: Timeout = 0
     caller: UUID | None = None
     exception: TaskException | None = None
-    filename: str | None = None
-    function: str | None = None
-    line_no: int | None = None
     tag: str | None = None
-    context: RuntimeContext | None = None
+    runtime_context: RuntimeContext | None = None
 
-    def __post_init__(self, **kwargs):
-        """
-        Initialize the task and set up caller tracking.
+    def __post_init__(self):
+        """Validate the proxy, capture the calling task's id, and seed
+        a :class:`RuntimeContext` snapshot if one was not supplied.
 
-        :param kwargs:
-            Additional keyword arguments (unused).
+        The runtime-context seed lets a Task built outside an active
+        :class:`RuntimeContext` scope still ship the wire defaults
+        when it dispatches.
         """
         if not isinstance(self.proxy, WorkerProxyLike):
             raise TypeError(
@@ -241,24 +178,19 @@ class Task(Generic[W]):
             )
         if caller := _current_task.get():
             self.caller = caller.id
-        if self.context is None:
-            self.context = RuntimeContext.get_current()
+        if self.runtime_context is None:
+            self.runtime_context = RuntimeContext.get_current()
 
-    def __enter__(self) -> Callable[[], Coroutine | AsyncGenerator]:
-        """
-        Enter the task context for execution.
+    def __enter__(self) -> Task:
+        """Enter the task context.
 
-        :returns:
-            The task's run method as a callable coroutine.
+        Bind this task to the current context. On exit, re-binds
+        the calling task and records any propagating exception
+        on :attr:`exception` for wire transport.
         """
         logging.debug(f"Entering {self.__class__.__name__} with ID {self.id}")
         self._task_token = _current_task.set(self)
-        if iscoroutinefunction(self.callable):
-            return self._run
-        elif isasyncgenfunction(self.callable):
-            return self._stream
-        else:
-            raise ValueError("Expected coroutine function or async generator function")
+        return self
 
     def __exit__(
         self,
@@ -266,10 +198,11 @@ class Task(Generic[W]):
         exception_value: BaseException | None,
         exception_traceback: TracebackType | None,
     ):
-        """Exit the task context and handle any exceptions.
+        """Exit the task context and capture exception state.
 
-        Captures exception information for later processing and allows
-        exceptions to propagate normally for proper error handling.
+        Re-binds the calling task, if any, to the current context
+        and records any propagating exception on :attr:`exception`
+        for wire transport.
 
         :param exception_type:
             Type of exception that occurred, if any.
@@ -293,71 +226,68 @@ class Task(Generic[W]):
                 ],
             )
         _current_task.reset(self._task_token)
-        # Return False to allow exceptions to propagate
         return False
 
     @classmethod
     def from_protobuf(cls, task: protocol.Task) -> Task:
         """Deserialize a Task from a protobuf message.
 
-        .. note::
-            The payload's serializer is unpickled and cached for subsequent calls.
+        When the protobuf carries a ``serializer`` field, it is unpickled
+        and cached for subsequent calls; the resulting :class:`Serializer`
+        deserializes the payload fields.  When the field is unset (the
+        default emitted by :meth:`to_protobuf` for the no-serializer case),
+        :func:`cloudpickle.loads` is used directly — payloads produced by
+        :class:`~wool.runtime.serializer.CloudpickleSerializer` are
+        standard reduce tuples that stock unpickling executes natively.
 
         :param task:
-            A protobuf ``Task`` message.
+            A :class:`protocol.Task` message.
         :returns:
             A :class:`Task` instance with all fields restored.
         """
-        context = (
-            RuntimeContext.from_protobuf(task.context)
-            if task.HasField("context")
-            else None
-        )
         if task.HasField("serializer"):
             s = _unpickle_serializer(task.serializer)
             loads = s.loads
-            if isinstance(s, PassthroughSerializer):
-                proxy_loads = s.loads
-            else:
-                proxy_loads = cloudpickle.loads
         else:
             loads = cloudpickle.loads
-            proxy_loads = cloudpickle.loads
+        runtime_context = (
+            RuntimeContext.from_protobuf(task.runtime_context)
+            if task.HasField("runtime_context")
+            else None
+        )
         return cls(
             id=UUID(task.id),
             callable=loads(task.callable),
             args=loads(task.args),
             kwargs=loads(task.kwargs),
             caller=UUID(task.caller) if task.caller else None,
-            proxy=proxy_loads(task.proxy),
+            proxy=loads(task.proxy),
             timeout=task.timeout if task.timeout else 0,
             tag=task.tag if task.tag else None,
-            context=context,
+            runtime_context=runtime_context,
         )
 
     def to_protobuf(self, serializer: Serializer | None = None) -> protocol.Task:
         """Serialize this Task to a protobuf message.
 
-        The serializer itself is pickled via :func:`_pickle_serializer`
-        which uses an LRU cache keyed on the serializer instance.
-        :class:`PassthroughSerializer` instances all hash and compare
-        equal, so repeated calls hit the cache and avoid redundant
-        pickling.
-
         :param serializer:
-            Optional serializer for the callable and its arguments. When ``None`` (the
-            default), ``cloudpickle`` is used and the protobuf ``serializer`` field is
-            left unset. When provided, the serializer is pickled into the ``serializer``
-            field so that :meth:`from_protobuf` can use it on the receiving side.
-
-            .. note::
-                If specified, the serializer is pickled and cached for subsequent calls.
+            Optional serializer for the callable and its arguments.  When
+            ``None`` (the default), :data:`wool.__serializer__` is used
+            and the protobuf ``serializer`` field is left unset.  When
+            provided, the serializer is pickled into the ``serializer``
+            field so that :meth:`from_protobuf` can use it on the
+            receiving side.  The proxy is always pickled with
+            :data:`wool.__serializer__` unless ``serializer`` is a
+            :class:`PassthroughSerializer`, in which case the proxy uses
+            the same serializer as the rest of the payload.
         :returns:
-            A protobuf ``Task`` message.
+            A :class:`protocol.Task` message.
         """
-        dumps = serializer.dumps if serializer is not None else cloudpickle.dumps
+        dumps = serializer.dumps if serializer is not None else wool.__serializer__.dumps
         proxy_dumps = (
-            dumps if isinstance(serializer, PassthroughSerializer) else cloudpickle.dumps
+            dumps
+            if isinstance(serializer, PassthroughSerializer)
+            else wool.__serializer__.dumps
         )
         task_msg = protocol.Task(
             version=protocol.__version__,
@@ -370,88 +300,19 @@ class Task(Generic[W]):
             proxy_id=str(self.proxy.id),
             timeout=int(self.timeout) if self.timeout else 0,
             tag=self.tag if self.tag else "",
-            context=self.context.to_protobuf() if self.context else None,
+            runtime_context=(
+                self.runtime_context.to_protobuf() if self.runtime_context else None
+            ),
         )
         if serializer is not None:
             task_msg.serializer = _pickle_serializer(serializer)
         return task_msg
 
-    def dispatch(self) -> W:
-        if isasyncgenfunction(self.callable):
-            return cast(W, self._stream())
-        elif iscoroutinefunction(self.callable):
-            return cast(W, self._run())
-        else:
-            raise ValueError("Expected routine to be coroutine or async generator")
-
-    async def _run(self):
-        """
-        Execute the task's callable with its arguments in proxy context.
-
-        :returns:
-            The result of executing the callable.
-        :raises RuntimeError:
-            If no proxy pool is available for task execution.
-        """
-        assert iscoroutinefunction(self.callable), "Expected coroutine function"
-        proxy_pool = wool.__proxy_pool__.get()
-        if not proxy_pool:
-            raise RuntimeError("No proxy pool available for task execution")
-        async with proxy_pool.get(self.proxy) as proxy:
-            # Set the proxy in context variable for nested task dispatch
-            token = wool.__proxy__.set(proxy)
-            try:
-                assert self.context is not None
-                with self.context:
-                    with self:
-                        with do_dispatch(False):
-                            await asyncio.sleep(0)
-                            return await self.callable(*self.args, **self.kwargs)
-            finally:
-                wool.__proxy__.reset(token)
-
-    async def _stream(self):
-        """
-        Execute the task's callable with its arguments in proxy context.
-
-        :returns:
-            An async generator that yields values from the callable.
-        :raises RuntimeError:
-            If no proxy pool is available for task execution.
-        """
-        assert isasyncgenfunction(self.callable), "Expected async generator function"
-        proxy_pool = wool.__proxy_pool__.get()
-        if not proxy_pool:
-            raise RuntimeError("No proxy pool available for task execution")
-        async with proxy_pool.get(self.proxy) as proxy:
-            await asyncio.sleep(0)
-            gen = self.callable(*self.args, **self.kwargs)
-            try:
-                while True:
-                    # Set the proxy in context variable for nested task dispatch
-                    token = wool.__proxy__.set(proxy)
-                    try:
-                        assert self.context is not None
-                        with self.context:
-                            with self:
-                                with do_dispatch(False):
-                                    try:
-                                        result = await anext(gen)
-                                    except StopAsyncIteration:
-                                        break
-                    finally:
-                        wool.__proxy__.reset(token)
-
-                    yield result
-            finally:
-                await gen.aclose()
-
 
 # public
 @dataclass
 class TaskException:
-    """
-    Represents an exception that occurred during distributed task execution.
+    """Represents an exception that occurred during distributed task execution.
 
     Captures exception information from remote task execution for proper
     error reporting and debugging. The exception details are serialized
@@ -480,3 +341,61 @@ def current_task() -> Task | None:
         The current task or None if no task is active.
     """
     return _current_task.get()
+
+
+@asynccontextmanager
+async def routine_scope(task: Task) -> AsyncGenerator[Coroutine | AsyncGenerator]:
+    """Establish the execution scope around *task*'s Wool routine.
+
+    Validates that ``task.callable`` is either a coroutine
+    function or an async generator function, acquires a proxy
+    from :data:`wool.__proxy_pool__`, binds :data:`wool.__proxy__`
+    for nested dispatch, and yields the routine ready for iteration.
+    On exit, close the callable as needed.
+
+    .. warning::
+
+       The :data:`wool.__proxy_pool__` context variable must be
+       initialized before entering this scope; entering without a
+       configured pool raises :class:`RuntimeError`.
+
+    :param task:
+        The :class:`Task` whose routine is to be executed. Its
+        ``callable`` must be an async function or async generator
+        function; its ``runtime_context`` must be populated (the
+        caller-side constructor seeds it via
+        :meth:`Task.__post_init__`).
+    :yields:
+        The constructed routine — a :class:`Coroutine` for async
+        functions or an :class:`AsyncGenerator` for async generator
+        functions. The caller drives it via ``await routine`` or
+        ``routine.asend``/``athrow``/``aclose``; the scope handles
+        teardown on exit.
+    :raises ValueError:
+        If ``task.callable`` is neither a coroutine function nor
+        an async generator function.
+    :raises RuntimeError:
+        If :data:`wool.__proxy_pool__` is not initialized at scope
+        entry.
+    """
+    if not (iscoroutinefunction(task.callable) or isasyncgenfunction(task.callable)):
+        raise ValueError("Expected coroutine function or async generator function")
+    proxy_pool = wool.__proxy_pool__.get()
+    if proxy_pool is None:
+        raise RuntimeError("wool.__proxy_pool__ is not initialized")
+    assert task.runtime_context is not None
+    async with proxy_pool.get(task.proxy) as proxy:
+        token = wool.__proxy__.set(proxy)
+        try:
+            with task.runtime_context, task, do_dispatch(False):
+                routine = task.callable(*task.args, **task.kwargs)
+                try:
+                    await asyncio.sleep(0)
+                    yield routine
+                finally:
+                    if isasyncgen(routine):
+                        await routine.aclose()
+                    else:
+                        routine.close()
+        finally:
+            wool.__proxy__.reset(token)

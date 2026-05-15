@@ -103,6 +103,135 @@ Task serialization has two layers. [cloudpickle](https://github.com/cloudpipe/cl
 
 [Protocol Buffers](https://protobuf.dev/) provides the wire format. Scalar task metadata (id, caller, tag, timeout) maps directly to protobuf fields, while Python-specific objects are nested as cloudpickle byte blobs. The protobuf definitions in the `proto/` directory define the gRPC wire protocol for task dispatch, acknowledgment, and result streaming between workers.
 
+## Context propagation
+
+Python's `contextvars.ContextVar` cannot be pickled — it's a C extension type that explicitly blocks serialization — so ambient state has no built-in way to cross process boundaries. `wool.ContextVar` solves this by mirroring the stdlib API (`get`, `set`, `reset`) and adding automatic propagation across the dispatch chain.
+
+```python
+import asyncio
+
+import wool
+
+tenant_id: wool.ContextVar[str] = wool.ContextVar("tenant_id", default="unknown")
+
+
+@wool.routine
+async def handle_request() -> str:
+    return tenant_id.get()
+
+
+async def main():
+    async with wool.WorkerPool(spawn=2):
+        token = tenant_id.set("acme-corp")
+        try:
+            result = await handle_request()
+            print(result)  # "acme-corp" — propagated to the worker
+        finally:
+            tenant_id.reset(token)
+
+
+asyncio.run(main())
+```
+
+Two construction modes are supported:
+
+- `wool.ContextVar("name")` — no default; `get()` raises `LookupError` until a value is set.
+- `wool.ContextVar("name", default=...)` — `get()` returns the default when the variable has no value in the current context.
+
+`set()` returns a `Token` whose `reset()` restores the prior value (or the default if none was set), mirroring the stdlib `contextvars` API. Tokens are single-use across the logical chain — see Limitations below for the cross-task and cross-process scoping rules.
+
+Each var's namespace is inferred from the top-level package of the calling frame, producing a `"<namespace>:<name>"` key that is stable across every process in the cluster. Library authors constructing vars from shared factory code should pass `namespace=` explicitly to avoid collisions with application-scope vars under the same package.
+
+### How propagation works
+
+At dispatch time, Wool snapshots only the vars that have been explicitly `set()` in the current `wool.Context` — default-only values are not shipped. The snapshot is assembled in O(k) time by iterating the per-Context data dict (which contains only explicitly-set vars), not the full process-wide registry. It rides every dispatch frame as a `Context` protobuf message carrying a `map<string, bytes>` keyed by each var's `"<namespace>:<name>"`, alongside the active `wool.Context` id that identifies the logical chain.
+
+`wool.ContextVar.__reduce__` embeds the var's current value directly in the reduce tuple, so when a `wool.ContextVar` appears anywhere in a pickled object graph its value travels with it. References across a task's args, kwargs, and ContextVar snapshot all land on the same local instance on the receiver. Unpickling goes through a strict construction path: if no var is yet registered under the key, a "stub" instance is registered through an internal back-door that bypasses the duplicate-key check, and the var's value is applied from the wire; when the worker's module-scope constructor later runs, it promotes the stub in place, preserving any wire state and reference identity.
+
+On the worker, each task is activated in its own `wool.Context` carrying the caller's chain id and the caller's propagated values, distinct from any concurrent task's `wool.Context` on the same worker. When the worker returns (or yields), the final var state is attached to the gRPC response and applied on the caller side, so worker-side mutations flow back automatically. For async generators, the caller also attaches its current context to each iteration request, enabling bidirectional state exchange between caller and worker at every yield/next boundary.
+
+### Isolation
+
+Each dispatched task runs inside its own `wool.Context`, carrying the caller's chain id and the caller's propagated values. Concurrent tasks on the same worker with different values for the same variable never interfere — each sees only its own propagated state. Worker-side mutations (via `set()`) are back-propagated to the caller when the task returns or yields, but they do not leak to other concurrent tasks: each dispatch activates its own `wool.Context` on the worker, and `asyncio.create_task` children fork a copy of the parent's `wool.Context` on creation (mirroring `contextvars.copy_context()` semantics), so concurrent execution paths do not share a mutable `wool.Context` and bidirectional value propagation stays coherent under the transparent-dispatch model.
+
+### Decode failure semantics
+
+Context propagation is **ancillary state** in wool's wire protocol — a separate channel from the routine's primary signal (its return value or raised exception). When a wire context fails to decode (cross-version pickle skew, custom class missing on the receiver, on-wire corruption of a single var value), wool never preempts the primary signal to surface the ancillary failure. The routine's outcome is delivered, and the failure is reported via Python's standard `warnings` mechanism with a `wool.ContextDecodeWarning` so callers can decide how to respond.
+
+Three modes are available, and they compose with the standard Python warnings system rather than wool-specific API:
+
+| Mode | How to enable | Behavior |
+| ---- | ------------- | -------- |
+| Lenient (default) | _no opt-in_ | Decode failure emits `wool.ContextDecodeWarning`; primary signal returned. Caller-side exception frames also receive the failure on `__notes__`. |
+| Inspect | `warnings.catch_warnings(record=True)` | Decode failure captured into a list; primary signal returned. Standard pattern for "best effort with audit trail". |
+| Strict | `warnings.filterwarnings("error", category=wool.ContextDecodeWarning)` | Decode failure raises (the warning is promoted to an exception); primary signal lost. |
+
+The lenient default keeps wool useful for callers that treat tracing-style state as advisory. Strict mode is for callers whose correctness depends on context state and prefer to fail fast. Inspect mode is the right choice when you want both the primary signal and visibility into ancillary failures:
+
+```python
+import warnings
+import wool
+
+with warnings.catch_warnings(record=True) as captured:
+    warnings.simplefilter("always", category=wool.ContextDecodeWarning)
+    result = await some_routine()  # always returns
+    decode_failures = [w for w in captured if issubclass(w.category, wool.ContextDecodeWarning)]
+if decode_failures:
+    log.warning("context propagation degraded for %d frame(s)", len(decode_failures))
+```
+
+The same semantics apply on both sides of the wire: the worker emits `ContextDecodeWarning` when a request context fails to decode (and runs the routine with a fresh empty context as fallback), and the caller emits `ContextDecodeWarning` when a response context fails to decode (and delivers the result anyway). On the caller side, an exception-frame decode failure additionally rides on the routine's exception via `__notes__` so the failure surfaces in tracebacks. On the worker side, a snapshot encode failure that coincides with a routine exception rides similarly on the routine exception via `__notes__`. There is no `ExceptionGroup` chaining and no wrapper-exception API to learn — just a standard warning class and standard `try/except` around primary signals.
+
+#### Worker-side strict mode
+
+Strict mode applies symmetrically on the worker side via Python's standard `PYTHONWARNINGS` environment variable, which `multiprocessing` propagates to spawned worker subprocesses by default:
+
+```bash
+export PYTHONWARNINGS="error::wool.ContextDecodeWarning"
+python my_app.py
+```
+
+Or programmatically before constructing the pool:
+
+```python
+import os
+os.environ["PYTHONWARNINGS"] = "error::wool.ContextDecodeWarning"
+
+import wool
+
+async with wool.WorkerPool():
+    ...   # workers spawned now promote the warning to an exception
+```
+
+When the worker promotes the warning to an exception, wool ships it back through the routine-exception channel, so the caller catches the exact same `wool.ContextDecodeWarning` class — symmetric with caller-side strict mode. No `RpcError` to special-case, no out-of-band wire metadata.
+
+### Binding a `wool.Context` to a task
+
+The canonical way to bind a `wool.Context` to a freshly-spawned `asyncio.Task` is `wool.create_task` (typed shim) or `asyncio.create_task` (or `loop.create_task`) directly with `context=wool_ctx`:
+
+```python
+ctx = wool.copy_context()
+task = wool.create_task(some_coro(), context=ctx)
+# Equivalent at runtime:
+task = asyncio.create_task(some_coro(), context=ctx)  # type: ignore[arg-type]
+```
+
+Both forms route through Wool's task factory, which self-installs on the running loop the first time any Wool API is touched (or on demand via `wool.install_task_factory(loop)`). The factory wraps the coroutine so the `wool.Context`'s single-task guard is held continuously across awaits — any concurrent attempt to bind a second task to the same `wool.Context` raises `RuntimeError` immediately when that task starts running. `wool.create_task` exists purely as a typing shim: stdlib's `context=` kwarg is typed for `contextvars.Context` and `wool.Context` cannot subclass it (the C type disallows subclassing), so the Wool helper hides the cast.
+
+When `context=` is omitted, the factory forks `wool.copy_context()` from the parent task and binds the fresh chain id to the child. This is the default `asyncio.create_task(coro)` path and matches stdlib's `contextvars.copy_context()` semantics with wool's chain-id contract layered on top.
+
+### Backpressure hooks
+
+`BackpressureLike` hooks run after the caller's propagated `wool.ContextVar` snapshot is applied to the worker's context, so a hook can read caller-provided values (e.g., a tenant id) to make admission decisions without the caller having to plumb them through the `BackpressureContext` explicitly.
+
+### Limitations
+
+- **Values must be _cloudpicklable_.** A `TypeError` naming the offending variable is raised at dispatch time if serialization fails.
+- **Only explicitly set values propagate.** A variable that has never been `set()` (only has a class-level default) is not included in the snapshot — the worker falls through to its own default.
+- **Receivers must eventually declare the var.** Until the worker imports the module that constructs the var, the wire-shipped value is held on a stub pinned to the receiver `wool.Context`; a later `wool.ContextVar(...)` declaration promotes the stub and the propagated value applies transparently. If the worker never declares the var, the stub is collected with its receiver `wool.Context` and the value is dropped.
+- **Tokens are scoped to their originating `wool.Context`.** A `Token` minted inside a task cannot be reset from outside that `wool.Context` — including after crossing an `asyncio.create_task` fork boundary, since child tasks receive fresh `wool.Context` ids. Reset the token in the same logical chain that produced it, or use `var.set(...)` to install a new value without relying on the token.
+- **Wire keys are tied to the top-level package name.** Renaming the top-level package (e.g., `myapp` → `myapp_v2`) changes every var's wire key, so a rolling deploy that has callers and workers on different top-level names will silently drop propagated values on the mismatched side. Keep the top-level package name stable across rolling deploys, or bridge the transition with explicit `namespace=` overrides. Moving a module deeper within the same top-level package is safe — the key is the package root, not the full module path.
+
 ## Worker pools
 
 `WorkerPool` is the main entry point for running routines. It orchestrates worker subprocess lifecycles, discovery, and load-balanced dispatch. The pool supports four configurations depending on which arguments are provided:
@@ -156,7 +285,7 @@ async with wool.WorkerPool(discovery=wool.LanDiscovery(), lease=10):
     result = await my_routine()
 ```
 
-`lazy` controls whether the pool's internal `WorkerProxy` defers startup until the first task is dispatched. Defaults to `True`. The pool propagates this flag to every `WorkerProxy` it constructs, and each task serializes the proxy (including the flag) so that workers receiving the task inherit the same laziness setting. With `lazy=True`, worker subprocesses that never invoke nested `@wool.routine` calls avoid the cost of discovery subscription and sentinel setup entirely. Set `lazy=False` to start proxies eagerly — useful when you want connections established before the first dispatch.
+`lazy` controls whether the pool's internal `WorkerProxy` defers startup until the first task is dispatched. Defaults to `True`. The pool propagates this flag to every `WorkerProxy` it constructs, and each task serializes the proxy (including the flag) so that workers receiving the task inherit the same laziness setting. With `lazy=True`, worker subprocesses that never invoke nested `@wool.routine` calls avoid the cost of discovery subscription and worker-sentinel task setup entirely. Set `lazy=False` to start proxies eagerly — useful when you want connections established before the first dispatch.
 
 ```python
 # Eager proxy startup — connections established before first dispatch
@@ -281,7 +410,19 @@ If a TLS handshake fails (e.g., incompatible, invalid, or expired certificates),
 
 ## Error handling
 
-Two error paths exist. When a routine raises an exception, the worker serializes the original exception with cloudpickle, sends it back over the gRPC stream, and the caller deserializes and re-raises it — preserving the original type and traceback. When dispatch itself fails (worker unavailable, protocol mismatch, etc.), the load balancer classifies the gRPC error as transient or non-transient, tries the next worker, and raises `NoWorkersAvailable` if it exhausts the full cycle.
+A dispatch crosses two processes and several stages on each side; failures can originate at any of them. The caller's observable depends on **which phase** failed and **whether the source was wool-internal or user code**. The contract is summarized below and detailed phase by phase.
+
+| Phase | Wool-internal failure → caller sees | User-code failure → caller sees | Load balancer action |
+| ----- | ----------------------------------- | ------------------------------- | -------------------- |
+| Caller-side request encoding | n/a (no transport involved yet) | Original `Exception` (unwrapped) | None — no worker contacted |
+| gRPC handshake | `TransientRpcError` (transient codes) or `RpcError` (non-transient, incl. `FAILED_PRECONDITION` for version mismatch) | n/a | Skip on transient; evict on non-transient |
+| Worker-side request decoding | `Rejected.original` re-raised on the caller (typed) | Strict-mode `wool.ContextDecodeWarning` re-raised on the caller | None — typed re-raise |
+| Routine execution | n/a | Original routine exception (type and traceback preserved); ancillary warnings on `__notes__` | None |
+| Worker-side response encoding | Routine exception with `__notes__` (strict-mode context encode) | n/a | None |
+| Caller-side response decoding | `UnexpectedResponse` (malformed payload, missing class, version skew) | n/a | None — caller-fault, worker is healthy |
+| Post-execution teardown | Swallowed (the wire is already closed) | n/a | n/a |
+
+In every case the caller sees a single exception — wool does not wrap routine failures in `ExceptionGroup` or any wool-specific wrapper class. Ancillary signals (context decode failures, snapshot encode failures coincident with a routine exception) attach to the primary exception via PEP 678 `__notes__` and a `__wool_context_warnings__` attribute, so existing `except RoutineError:` clauses keep matching.
 
 ```python
 try:
@@ -290,13 +431,77 @@ except ValueError as e:
     print(f"Task failed: {e}")
 ```
 
-### Task exception transmission
+### Caller-side request encoding
 
-The worker executes the task inside a context manager that captures any raised exception as a `TaskException` (storing the exception type and formatted traceback). The exception object is then serialized with cloudpickle into a gRPC response. This serialization is facilitated by [tbpickle](https://github.com/wool-labs/tbpickle), which makes stack frames picklable — without it, cloudpickle cannot serialize exception tracebacks. On the caller side, `WorkerConnection` deserializes the exception and re-raises it, so the caller receives the original exception as if it were raised locally.
+Before dispatch, the caller's `WorkerConnection` serializes the routine callable, args, kwargs, and the serialized `WorkerProxy` into a protobuf via `cloudpickle`. A failure here is a user-code bug (a routine argument that closes over an unpicklable object, a circular reference, etc.) and is **not a worker-health concern**. The original exception propagates unwrapped to the caller and the load balancer takes no action; no worker was contacted.
 
-### Version compatibility
+### gRPC handshake
 
-A `VersionInterceptor` on each worker intercepts incoming dispatch RPCs and validates the client's protocol version against the worker's version. If versions are incompatible or unparseable, the worker responds with a `Nack` (negative acknowledgment) containing a reason string. The `WorkerConnection` converts a `Nack` into a non-transient error, causing the load balancer to evict the worker.
+The handshake opens the bidirectional stream, writes the task frame, and reads the first response. Failures classify by gRPC status code:
+
+- **Transient** (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`) — surfaces as `TransientRpcError`. The load balancer skips to the next worker. `NoWorkersAvailable` is raised if a full cycle of all workers is exhausted without success.
+- **Non-transient** (everything else, including `FAILED_PRECONDITION` for protocol-version mismatch and `INTERNAL` for handler-side bugs) — surfaces as `RpcError`. The load balancer evicts the worker from its context.
+
+Version compatibility is checked by `VersionInterceptor` **before** the dispatch handler runs. A mismatch aborts the RPC with `FAILED_PRECONDITION`; the caller observes `RpcError(FAILED_PRECONDITION)` like any other handshake rejection. (The `Nack` frame retains its in-stream role only for parse-phase rejections — see the next section.)
+
+### Worker-side request decoding
+
+`DispatchSession.__aenter__` is the worker's parse phase: it reads the first request frame, materializes the negotiated serializer (`cloudpickle` cross-process, `PassthroughSerializer` for self-dispatch), decodes the caller's `wool.Context` snapshot, rebuilds the `wool.Task`, and validates that the callable is an async function or async generator.
+
+Failures here wrap in `Rejected` and surface via a `Nack` frame whose `exception` payload carries the original failure (cloudpickle-dumped). The caller deserializes and re-raises, so the user observes the **actual failure class**, not an opaque RPC error:
+
+- Malformed task id, unpicklable serializer hint, cloudpickle errors on the routine callable, ImportError on a missing module, non-async callable → original `Exception` re-raised on the caller.
+- Strict-mode promoted `wool.ContextDecodeWarning` (operator set `warnings.filterwarnings("error", category=wool.ContextDecodeWarning)` in the worker subprocess) → the warning ships through the same Nack-with-exception path and re-raises on the caller as `wool.ContextDecodeWarning`. The default lenient mode emits the warning and runs the routine against a fresh empty context (see Context propagation > Decode failure semantics).
+
+Parse-phase rejections reflect a user-code or version-skew issue, not a worker-health issue. The load balancer does not evict the worker.
+
+### Routine execution
+
+The worker drives one `_step` per request frame inside `routine_scope` (the worker-loop task that owns the routine's `wool.Context` guard). Three terminal shapes are possible:
+
+- **Clean completion** — the routine returns (coroutine) or raises `StopAsyncIteration` (async generator), and the response stream ends.
+- **Routine exception** — the worker serializes the original exception with `cloudpickle` (using [tbpickle](https://github.com/wool-labs/tbpickle) to make stack frames picklable) and ships it on a terminal `Response.exception` frame. The caller deserializes and re-raises, **preserving the original type and traceback**. The user's `except RoutineError:` clause matches as written; the load balancer takes no action.
+- **Operator pre-emption** — graceful shutdown cancels in-flight dispatches; the underlying `CancelledError` ships through the routine-exception channel. See _Cancellation_ below.
+
+If the routine raises an exception that drags an unpicklable object into its graph (e.g., a C-level frame reachable via `__traceback__`/`__cause__`), the worker's `_safely_serialize_exception` falls back to reconstructing the exception cleanly via `cls(*exc.args)` — **preserving the exception class** so the user's `except RoutineError:` clause still matches. Only if even the clean reconstruction fails to pickle does the fallback demote to a stdlib `RuntimeError`.
+
+### Worker-side response encoding
+
+After each successful step, the dispatch handler builds a `protocol.Response`: it dumps the result via the negotiated serializer and attaches the post-step `wool.Context` snapshot.
+
+- **Result dump fails** (un-picklable yielded value) — the failure surfaces as a handler-side exception during response encoding. The dispatch handler drains the worker, snapshots `session.context`, and ships a terminal `Response.exception` carrying the encode failure. Caller observes the dump exception; no worker eviction.
+- **Strict-mode context encode failure during a routine exception** — `session.context.to_protobuf` raised a `BaseExceptionGroup` of `wool.ContextDecodeWarning` peers during the terminal-exception path. The handler attaches the warnings to the routine's exception via PEP 678 `__notes__` and a `__wool_context_warnings__` attribute, so the **routine exception's type is preserved**. The terminal response drops the `context` field. The caller's `except RoutineError:` clause still matches; the warnings remain visible in the traceback and accessible programmatically.
+
+`DispatchSession.__aexit__` registers `drain` on its exit stack precisely because of this path: a result-dump failure mid-stream leaves the worker still running, and drain must complete before `session.context.to_protobuf` snapshots state for the terminal frame — otherwise the snapshot races the worker's `_step` writing the same context.
+
+### Caller-side response decoding
+
+The caller's `DispatchStream` parses each response frame in turn. Malformed payloads — typically caused by version skew on a shared result class, a missing class on the caller's `sys.path`, or truncated bytes — degrade to `UnexpectedResponse` with the original pickle/import failure on `__cause__`. The load balancer treats this as caller-fault: the worker is healthy, the wire frame is valid, only the caller cannot reconstruct the payload. No eviction.
+
+A worker that ships a non-`Exception` `BaseException` payload (other than `CancelledError`, which propagates raw to honor stdlib `await task` semantics) is degraded to `UnexpectedResponse`. This is a worker-bug guard: process-level signals like `KeyboardInterrupt` and `SystemExit` cannot be smuggled across the wire.
+
+### Post-execution teardown
+
+`DispatchSession.__aexit__` calls `drain` (close the request queue, await the worker driver) before unwinding the exit stack. Worker exceptions surfacing during drain are swallowed silently: pre-stream and routine-time failures already shipped via the terminal-exception clause, and the wire is closed by the time `__aexit__` runs — a re-raise here cannot reach the caller.
+
+A worker-loop teardown driven by the service's `stop` RPC respects the timeout argument; see the worker README's _Shutdown timeout_ section.
+
+### Backpressure hooks
+
+A `BackpressureLike` hook runs on the dispatch handler after request decoding succeeds and before the routine is scheduled. Two failure modes:
+
+- **Hook returned `True`** (admission rejected) — handler aborts with `RESOURCE_EXHAUSTED`. Caller observes `TransientRpcError(RESOURCE_EXHAUSTED)`; the load balancer skips to the next worker.
+- **Hook raised** — handler logs the failure and aborts with `INTERNAL`. Caller observes `RpcError(INTERNAL)`; the load balancer evicts the worker. Treating a hook bug as eviction-worthy is intentional under today's binary load-balancer policy — a crashing hook on a worker is a worker-health concern from the pool's perspective. Health-aware forgiveness (e.g., N-strikes before eviction) is a future enhancement.
+
+### Cancellation
+
+Cancellation reaches the dispatch via three routes; all three resolve to the same observable on the caller:
+
+- **Caller cancels its `await routine()`** — the caller's `WorkerConnection` cancels the gRPC call on the way out; the worker observes the stream tear-down, the dispatch handler invokes `DispatchSession.cancel`, the worker task is cancelled on its own loop, and any routine suspended inside an `await` receives `CancelledError`.
+- **Routine self-raises `CancelledError`** — the cancellation ships through the routine-exception channel unchanged.
+- **Operator preempts** (worker graceful shutdown) — `WorkerService._cancel` calls `DispatchSession.cancel` on every in-flight dispatch; same effect as caller-initiated.
+
+In all three cases the caller's `await routine()` raises `asyncio.CancelledError`, matching stdlib's `await task` semantics where `task.cancel()` from any source produces the same observable.
 
 ## Architecture
 
@@ -359,45 +564,53 @@ sequenceDiagram
 
         Client ->> Routine: invoke wool routine
         activate Client
-        Routine ->> Routine: create task
+        Routine ->> Routine: create task, serialize via cloudpickle
         Routine ->> Loadbalancer: route task
-        Loadbalancer ->> Loadbalancer: serialize task to protobuf
 
-        loop Until success or all workers exhausted
+        loop Until handshake resolves or all workers exhausted
             Loadbalancer ->> Loadbalancer: select next worker
-            Loadbalancer ->> Worker: dispatch via gRPC
-            alt Success
-                Worker -->> Loadbalancer: ack
+            Loadbalancer ->> Worker: open stream, write task frame
+            Worker ->> Worker: VersionInterceptor; DispatchSession.__aenter__ (parse)
+            alt Ack
+                Worker -->> Loadbalancer: Ack
                 Loadbalancer ->> Loadbalancer: break
-            else Transient error
-                Loadbalancer ->> Loadbalancer: continue
-            else Non-transient error
-                Loadbalancer ->> Loadbalancer: remove worker, continue
+            else Nack with cloudpickled parse-failure exception
+                Worker -->> Loadbalancer: Nack
+                Loadbalancer ->> Loadbalancer: deserialize, re-raise (no eviction)
+                Loadbalancer -->> Routine: typed exception
+                Routine -->> Client: re-raise
+            else Transient gRPC error (UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED)
+                Loadbalancer ->> Loadbalancer: skip, continue
+            else Non-transient gRPC error (incl. FAILED_PRECONDITION on version mismatch)
+                Loadbalancer ->> Loadbalancer: evict worker, continue
             end
         end
-        opt All workers exhausted without success
+        opt All workers exhausted
             Loadbalancer -->> Client: raise NoWorkersAvailable
         end
 
-        Worker ->> Worker: deserialize task, execute callable, serialize result(s)
+        Worker ->> Worker: DispatchSession.__aiter__ schedules worker driver lazily
+        Worker ->> Worker: routine_scope enters; routine runs under wool.Context
 
-        alt Coroutine
-            Worker -->> Routine: serialized result
-            Routine ->> Routine: deserialize result
+        alt Coroutine (single synthesized "next" request)
+            Worker ->> Worker: _step advances coroutine, serializes result + context
+            Worker -->> Routine: Response.result + context
+            Routine ->> Routine: deserialize, apply back-propagated context
             Routine -->> Client: return result
-        else Async generator (bidirectional)
+        else Async generator (one step per client iteration command)
             loop Each iteration
                 Client ->> Routine: next / send / throw
-                Routine ->> Worker: iteration request [gRPC write]
-                Worker ->> Worker: advance generator
-                Worker -->> Routine: serialized result [gRPC read]
-                Routine ->> Routine: deserialize result
+                Routine ->> Worker: iteration request frame
+                Worker ->> Worker: _step advances generator
+                Worker -->> Routine: Response.result + context
+                Routine ->> Routine: deserialize, apply back-propagated context
                 Routine -->> Client: yield result
             end
-        else Exception
-            Worker -->> Routine: serialized exception
-            Routine ->> Routine: deserialize exception
-            Routine -->> Client: re-raise exception
+        else Routine or encoding exception
+            Worker ->> Worker: drain worker, snapshot session.context
+            Worker -->> Routine: terminal Response.exception (cloudpickled, may include __notes__)
+            Routine ->> Routine: deserialize exception (preserves type and traceback)
+            Routine -->> Client: re-raise
         end
         deactivate Client
     end

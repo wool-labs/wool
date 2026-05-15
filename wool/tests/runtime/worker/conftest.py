@@ -1,13 +1,27 @@
 import asyncio
 import datetime
+import threading
 import uuid
 from types import MappingProxyType
 from typing import Any
 from unittest.mock import MagicMock
 
-import grpc
 import pytest
 import pytest_asyncio
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+from pytest_mock import MockerFixture
+
+import wool.runtime.worker.pool as wp
+from tests.helpers import scoped_context
+from wool.runtime.context import install_task_factory
+from wool.runtime.discovery.base import DiscoveryEvent
+from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.metadata import WorkerMetadata
 
 
 class PicklableMock(MagicMock):
@@ -21,18 +35,18 @@ class PicklableMock(MagicMock):
         return (MagicMock, (self._spec_class,))
 
 
-from cryptography import x509
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
-from pytest_mock import MockerFixture
+@pytest.fixture(autouse=True)
+def _isolate_wool_context():
+    """Install a fresh wool.Context for the duration of the test.
 
-import wool.runtime.worker.pool as wp
-from wool.runtime.discovery.base import DiscoveryEvent
-from wool.runtime.worker.auth import WorkerCredentials
-from wool.runtime.worker.metadata import WorkerMetadata
+    Each test runs under its own scoped Context so var values set in
+    one test do not leak into subsequent tests via the per-task data
+    map. The process-wide var_registry is not reset; tests SHOULD
+    use unique key namespaces (e.g. via uuid suffix) to avoid
+    cross-test collisions on shared keys.
+    """
+    with scoped_context():
+        yield
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -45,7 +59,7 @@ async def _clear_channel_pool():
     yield
     import wool.runtime.worker.connection as _conn
 
-    await _conn._channel_pool.clear()
+    await _conn.clear_channel_pool()
 
 
 @pytest.fixture(autouse=True)
@@ -83,6 +97,27 @@ def _clear_worker_context():
     wool.__worker_metadata__ = None
     wool.__worker_uds_address__ = None
     wool.__worker_service__.reset(svc_token)
+
+
+@pytest.fixture
+def worker_loop():
+    """Spin up a real worker loop on a daemon thread.
+
+    The wool task factory is installed so :func:`routine_scope` can run
+    on a separate loop. Used by DispatchSession unit tests and any
+    other test that needs to cross-loop coordinate.
+    """
+    loop = asyncio.new_event_loop()
+    install_task_factory(loop)
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        yield loop
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        if not loop.is_closed():
+            loop.close()
 
 
 @pytest.fixture
@@ -124,11 +159,6 @@ def _make_worker_metadata(*tags: str) -> WorkerMetadata:
         tags=frozenset(tags),
         extra=MappingProxyType({}),
     )
-
-
-# ============================================================================
-# Mock Fixtures for WorkerPool and WorkerProxy Testing
-# ============================================================================
 
 
 class MockWorker:
@@ -321,11 +351,6 @@ def mock_discovery_service():
     return MockDiscoveryService()
 
 
-# ============================================================================
-# Additional Mock Fixtures for test_worker_pool.py Integration Tests
-# ============================================================================
-
-
 @pytest.fixture
 def mock_shared_memory(mocker: MockerFixture):
     """Mock SharedMemory for isolation from multiprocessing resources."""
@@ -480,7 +505,6 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata)
     Yields:
         WorkerProxy instance with 2 pre-configured mock workers
     """
-    from wool.runtime.worker.proxy import WorkerProxy
 
     # Inject 2 mock workers into discovery
     worker1 = WorkerMetadata(
@@ -503,17 +527,10 @@ async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata)
     mock_discovery_service.inject_worker_added(worker1)
     mock_discovery_service.inject_worker_added(worker2)
 
-    # Create proxy (note: actual WorkerProxy may need different initialization)
-    # This is a placeholder - adjust based on actual WorkerProxy constructor
-    proxy = MagicMock()  # TODO: Replace with actual WorkerProxy when implementing tests
+    proxy = MagicMock()
     proxy.workers = [worker1, worker2]
 
     yield proxy
-
-
-# ============================================================================
-# Credential Fixtures for Authentication Tests
-# ============================================================================
 
 
 def _generate_test_certificates():

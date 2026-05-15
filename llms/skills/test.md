@@ -18,6 +18,14 @@ Analyze code changes associated with an issue, evaluate existing test coverage, 
 
 This skill is part of the development workflow pipeline: `/issue` → `/implement` → `/test` → `/commit` → `/pr`. This skill is the **third** stage. The implement, test, and commit steps are iterative — they can be invoked multiple times for a given issue.
 
+## Invariants
+
+- MUST NOT create branches -- the test skill operates on an existing branch created by the implement skill.
+- MUST enter plan mode and receive user approval before writing any test files.
+- MUST read existing test files and account for current coverage before planning new tests.
+- MUST NOT write test specifications to disk -- the test plan is an internal planning artifact only.
+- MUST use the knowledge graph (`llms/skills/understand-chat.md`) for context gathering when `.understand-anything/knowledge-graph.json` exists.
+
 ## Arguments
 
 An issue number MUST be provided as the sole argument (e.g., `/test 103`).
@@ -32,7 +40,7 @@ An issue number MUST be provided as the sole argument (e.g., `/test 103`).
 
 ## Workflow
 
-### TL;DR
+### Checklist
 
 1. Resolve issue, PR, and branch
 2. Gather knowledge graph context

@@ -21,7 +21,7 @@ Spawn a general-purpose subagent with the following brief:
 >
 > 1. Read the project instructions in `CLAUDE.md`.
 > 2. Read and execute the complete workflow defined in `llms/skills/implement.md`.
-> 3. Follow every step faithfully. When a step requires user approval (e.g., plan approval), surface it to the user and wait for their response.
+> 3. Follow every step faithfully. Pay special attention to the `## Invariants` section — these are non-negotiable safety constraints. When a step requires user approval (e.g., plan approval), surface it to the user and wait for their response.
 > 4. When done, return a structured summary: what was accomplished, key artifacts (branch names, PR URLs, commit SHAs, etc.), and the next pipeline step prompt from the skill definition.
 
 When the subagent returns, relay its summary to the user verbatim. Do not repeat work or add commentary.

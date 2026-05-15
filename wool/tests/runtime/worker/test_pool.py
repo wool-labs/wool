@@ -6,6 +6,7 @@ subprocess overhead and ensure deterministic behavior.
 """
 
 import asyncio
+import logging
 import time
 import uuid
 from contextlib import contextmanager
@@ -24,7 +25,9 @@ from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
+from wool.runtime.worker.pool import IneffectiveLeaseWarning
 from wool.runtime.worker.pool import WorkerPool
+from wool.runtime.worker.proxy import IneffectiveQuorumTimeoutWarning
 
 
 def _make_worker_metadata(*tags: str) -> WorkerMetadata:
@@ -122,6 +125,66 @@ class TestWorkerPool:
         # Act & assert
         with pytest.raises(ValueError, match="Spawn must be non-negative"):
             WorkerPool(spawn=invalid_spawn)
+
+    def test___init___accepts_positive_shutdown_timeout(self):
+        """Test pool constructs with a positive shutdown_timeout.
+
+        Given:
+            A positive shutdown_timeout value
+        When:
+            WorkerPool is initialized
+        Then:
+            It should construct a valid pool
+        """
+        # Act
+        pool = WorkerPool(spawn=1, shutdown_timeout=5.0)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___accepts_none_shutdown_timeout(self):
+        """Test pool constructs with shutdown_timeout=None.
+
+        Given:
+            Shutdown_timeout explicitly set to None to opt out of bounding
+        When:
+            WorkerPool is initialized
+        Then:
+            It should construct a valid pool
+        """
+        # Act
+        pool = WorkerPool(spawn=1, shutdown_timeout=None)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___rejects_zero_shutdown_timeout(self):
+        """Test zero shutdown_timeout raises ValueError.
+
+        Given:
+            A shutdown_timeout of 0
+        When:
+            WorkerPool is initialized
+        Then:
+            It should raise ValueError indicating the timeout must be positive
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Shutdown timeout must be positive"):
+            WorkerPool(spawn=1, shutdown_timeout=0)
+
+    def test___init___rejects_negative_shutdown_timeout(self):
+        """Test negative shutdown_timeout raises ValueError.
+
+        Given:
+            A negative shutdown_timeout value
+        When:
+            WorkerPool is initialized
+        Then:
+            It should raise ValueError indicating the timeout must be positive
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Shutdown timeout must be positive"):
+            WorkerPool(spawn=1, shutdown_timeout=-1.0)
 
     def test___init___size_emits_deprecation_warning(self):
         """Test deprecated size parameter emits DeprecationWarning.
@@ -245,19 +308,26 @@ class TestWorkerPool:
         # Assert
         assert isinstance(pool, WorkerPool)
 
-    def test___init___size_with_lease(self):
-        """Test deprecated size combined with lease.
+    def test___init___size_with_lease_warns(self):
+        """Test deprecated size combined with lease without discovery.
 
         Given:
-            The deprecated 'size' parameter with value 4 and lease of 8
+            The deprecated 'size' parameter with value 4 and lease of 8,
+            and no discovery service
         When:
             WorkerPool is initialized
         Then:
-            It should emit a DeprecationWarning and create a valid pool
+            It should emit a DeprecationWarning for 'size' and an
+            IneffectiveLeaseWarning for 'lease', and still create the
+            pool successfully — 'lease' is recorded but never consulted
         """
         # Act
         with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
-            pool = WorkerPool(size=4, lease=8)
+            with pytest.warns(
+                IneffectiveLeaseWarning,
+                match="'lease' has no effect when no 'discovery' service",
+            ):
+                pool = WorkerPool(size=4, lease=8)  # type: ignore[call-overload]
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -730,6 +800,218 @@ class TestWorkerPool:
         except OSError:
             # Expected - cleanup error propagates as it should
             pass
+
+    @pytest.mark.asyncio
+    async def test___aexit___bounds_teardown_when_worker_stop_hangs(
+        self, mocker: MockerFixture
+    ):
+        """Test pool teardown returns within the configured shutdown bound.
+
+        Given:
+            A WorkerPool whose worker has a stop() that never returns
+        When:
+            The async-with block exits
+        Then:
+            It should complete within a small multiple of shutdown_timeout
+        """
+
+        # Arrange
+        def hanging_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+
+            async def hang(*, timeout=None):
+                await asyncio.sleep(60)
+
+            worker.stop = hang
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        shutdown_timeout = 0.2
+
+        # Act
+        start = time.monotonic()
+        async with WorkerPool(
+            worker=hanging_factory,
+            spawn=1,
+            shutdown_timeout=shutdown_timeout,
+        ):
+            pass
+        elapsed = time.monotonic() - start
+
+        # Assert
+        assert elapsed < shutdown_timeout * 5
+
+    @pytest.mark.asyncio
+    async def test___aexit___logs_warning_when_workers_abandoned(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test pool logs a warning naming the abandoned worker count.
+
+        Given:
+            A WorkerPool whose worker has a stop() that never returns
+        When:
+            The async-with block exits and the shutdown bound elapses
+        Then:
+            It should emit a logger.warning identifying the abandoned count
+        """
+
+        # Arrange
+        def hanging_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+
+            async def hang(*, timeout=None):
+                await asyncio.sleep(60)
+
+            worker.stop = hang
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        with caplog.at_level(logging.WARNING, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=hanging_factory,
+                spawn=1,
+                shutdown_timeout=0.2,
+            ):
+                pass
+
+        # Assert
+        assert any(
+            "abandoned 1 worker" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test___aexit___cancels_pending_stops_after_timeout(
+        self, mocker: MockerFixture
+    ):
+        """Test pending stop coroutines receive CancelledError on timeout.
+
+        Given:
+            A WorkerPool whose worker has a stop() that never returns
+        When:
+            The async-with block exits and the shutdown bound elapses
+        Then:
+            It should cancel the pending stop coroutine
+        """
+        # Arrange
+        cancelled = asyncio.Event()
+
+        def hanging_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+
+            async def hang(*, timeout=None):
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+            worker.stop = hang
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            worker=hanging_factory,
+            spawn=1,
+            shutdown_timeout=0.2,
+        ):
+            pass
+        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+
+        # Assert
+        assert cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test___aexit___completes_normally_when_workers_stop_within_timeout(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test pool teardown emits no warning when workers stop in time.
+
+        Given:
+            A WorkerPool whose workers stop quickly
+        When:
+            The async-with block exits with shutdown_timeout configured
+        Then:
+            It should complete without an abandonment warning
+        """
+
+        # Arrange
+        def fast_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        with caplog.at_level(logging.WARNING, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=fast_factory,
+                spawn=2,
+                shutdown_timeout=1.0,
+            ):
+                pass
+
+        # Assert
+        assert not any(
+            "abandoned" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test___aexit___does_not_block_other_cleanup_when_one_worker_hangs(
+        self, mocker: MockerFixture
+    ):
+        """Test fast worker still stops when a sibling worker's stop hangs.
+
+        Given:
+            A WorkerPool with one hanging worker and one fast worker
+        When:
+            The async-with block exits and the shutdown bound elapses
+        Then:
+            It should call stop on the fast worker and complete within bound
+        """
+        # Arrange
+        fast_stop = mocker.AsyncMock()
+        workers_built: list = []
+
+        def mixed_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            if not workers_built:
+
+                async def hang(*, timeout=None):
+                    await asyncio.sleep(60)
+
+                worker.stop = hang
+            else:
+                worker.stop = fast_stop
+            workers_built.append(worker)
+            return worker
+
+        shutdown_timeout = 0.2
+
+        # Act
+        start = time.monotonic()
+        async with WorkerPool(
+            worker=mixed_factory,
+            spawn=2,
+            shutdown_timeout=shutdown_timeout,
+        ):
+            pass
+        elapsed = time.monotonic() - start
+
+        # Assert
+        fast_stop.assert_awaited_once()
+        assert elapsed < shutdown_timeout * 5
 
     @pytest.mark.asyncio
     async def test___aenter___default_case_covers_shared_memory_creation(
@@ -1941,31 +2223,60 @@ class TestWorkerPool:
         _, proxy_kwargs = mock_proxy_cls.call_args
         assert "options" not in proxy_kwargs
 
-    def test___init___with_lease(self):
-        """Test instantiation with spawn and lease.
+    def test___init___spawn_only_with_lease_warns(self):
+        """Test spawn-only pool warns when lease is supplied.
 
         Given:
-            A spawn of 4 and lease of 8
+            A spawn of 4, a lease of 8, and no discovery service
         When:
             WorkerPool is instantiated
         Then:
-            It should create the pool successfully
+            It should emit an IneffectiveLeaseWarning and still create
+            the pool successfully — 'lease' is recorded but never
+            consulted without a discovery service
         """
         # Act
-        pool = WorkerPool(spawn=4, lease=8)
+        with pytest.warns(
+            IneffectiveLeaseWarning,
+            match="'lease' has no effect when no 'discovery' service",
+        ):
+            pool = WorkerPool(spawn=4, lease=8)  # type: ignore[call-overload]
 
         # Assert
         assert isinstance(pool, WorkerPool)
 
-    def test___init___with_lease_and_no_spawn(self, mocker: MockerFixture):
-        """Test lease without spawn in durable mode.
+    def test___init___default_mode_with_lease_warns(self):
+        """Test default-mode pool warns when lease is supplied.
+
+        Given:
+            A lease of 4 with no explicit spawn and no discovery
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should emit an IneffectiveLeaseWarning and still create
+            the pool successfully — default mode also spawns only
+            locally and 'lease' has no effect
+        """
+        # Act
+        with pytest.warns(
+            IneffectiveLeaseWarning,
+            match="'lease' has no effect when no 'discovery' service",
+        ):
+            pool = WorkerPool(lease=4)  # type: ignore[call-overload]
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___discovery_only_with_lease_accepts(self, mocker: MockerFixture):
+        """Test discovery-only pool accepts lease.
 
         Given:
             A discovery service and lease of 8 with no spawn specified
         When:
             WorkerPool is instantiated
         Then:
-            It should create the pool successfully
+            It should create the pool successfully — 'lease' is valid
+            in discovery-only mode
         """
         # Arrange
         mock_discovery = mocker.MagicMock()
@@ -1976,18 +2287,44 @@ class TestWorkerPool:
         # Assert
         assert isinstance(pool, WorkerPool)
 
-    def test___init___with_zero_lease_and_spawn(self):
-        """Test zero lease with spawn is accepted.
+    def test___init___hybrid_mode_with_lease_accepts(self, mocker: MockerFixture):
+        """Test hybrid pool accepts lease.
 
         Given:
-            A spawn of 4 and lease of 0
+            A spawn of 4, a discovery service, and lease of 8
         When:
             WorkerPool is instantiated
         Then:
-            It should create the pool successfully
+            It should create the pool successfully — 'lease' is valid
+            in hybrid mode (spawn + discovery)
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act
+        pool = WorkerPool(spawn=4, lease=8, discovery=mock_discovery)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___spawn_only_with_zero_lease_warns(self):
+        """Test spawn-only pool warns when zero lease is supplied.
+
+        Given:
+            A spawn of 4 and lease of 0, with no discovery
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should emit an IneffectiveLeaseWarning and still create
+            the pool — any non-None lease without discovery has no
+            effect, including lease=0
         """
         # Act
-        pool = WorkerPool(spawn=4, lease=0)
+        with pytest.warns(
+            IneffectiveLeaseWarning,
+            match="'lease' has no effect when no 'discovery' service",
+        ):
+            pool = WorkerPool(spawn=4, lease=0)  # type: ignore[call-overload]
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -1996,7 +2333,7 @@ class TestWorkerPool:
         """Test zero lease with discovery-only pool is rejected.
 
         Given:
-            A discovery service and lease of 0 with no spawn
+            A discovery service and lease of 0
         When:
             WorkerPool is instantiated
         Then:
@@ -2024,7 +2361,7 @@ class TestWorkerPool:
         """
         # Act & assert
         with pytest.raises(ValueError, match="Lease must be non-negative"):
-            WorkerPool(spawn=4, lease=-1)
+            WorkerPool(spawn=4, lease=-1)  # type: ignore[call-overload]
 
     @pytest.mark.asyncio
     async def test___aenter___hybrid_mode_forwards_lease(
@@ -2054,39 +2391,6 @@ class TestWorkerPool:
 
         # Act
         async with WorkerPool(spawn=2, lease=4, discovery=discovery_service):
-            pass
-
-        # Assert
-        mock_proxy_cls.assert_called_once()
-        _, proxy_kwargs = mock_proxy_cls.call_args
-        assert proxy_kwargs["lease"] == 6  # spawn(2) + lease(4)
-
-    @pytest.mark.asyncio
-    async def test___aenter___ephemeral_mode_forwards_lease(
-        self,
-        mocker: MockerFixture,
-        mock_shared_memory,
-        mock_worker_proxy,
-        mock_local_worker,
-    ):
-        """Test ephemeral mode forwards lease to WorkerProxy.
-
-        Given:
-            A WorkerPool with spawn=2 and lease=4 without discovery
-        When:
-            The pool context is entered
-        Then:
-            It should pass lease=6 (spawn + lease) to WorkerProxy
-        """
-        # Arrange
-        import wool.runtime.worker.pool as wp
-
-        mock_proxy_cls = mocker.patch.object(
-            wp, "WorkerProxy", return_value=mock_worker_proxy
-        )
-
-        # Act
-        async with WorkerPool(spawn=2, lease=4):
             pass
 
         # Assert
@@ -2135,7 +2439,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_local_worker,
     ):
-        """Test no lease forwards lease=None to WorkerProxy.
+        """Test ephemeral pool with no lease forwards lease=None.
 
         Given:
             A WorkerPool with plain int spawn and no lease
@@ -2160,58 +2464,26 @@ class TestWorkerPool:
         _, proxy_kwargs = mock_proxy_cls.call_args
         assert proxy_kwargs["lease"] is None
 
-    @pytest.mark.asyncio
-    async def test___aenter___default_mode_forwards_lease(
-        self,
-        mocker: MockerFixture,
-        mock_shared_memory,
-        mock_worker_proxy,
-        mock_local_worker,
-    ):
-        """Test default mode forwards spawn + lease to WorkerProxy.
+    @given(lease=st.integers(min_value=0, max_value=20))
+    def test___init___warns_on_lease_without_discovery_pbt(self, lease):
+        """Test any non-negative lease without discovery emits a warning.
 
         Given:
-            A WorkerPool with no explicit spawn or discovery and lease=4
-        When:
-            The pool context is entered
-        Then:
-            It should pass lease=cpu_count + 4 to WorkerProxy
-        """
-        # Arrange
-        import os
-
-        import wool.runtime.worker.pool as wp
-
-        mocker.patch.object(os, "cpu_count", return_value=2)
-        mock_proxy_cls = mocker.patch.object(
-            wp, "WorkerProxy", return_value=mock_worker_proxy
-        )
-
-        # Act
-        async with WorkerPool(lease=4):
-            pass
-
-        # Assert
-        mock_proxy_cls.assert_called_once()
-        _, proxy_kwargs = mock_proxy_cls.call_args
-        assert proxy_kwargs["lease"] == 6  # cpu_count(2) + lease(4)
-
-    @given(
-        spawn=st.integers(min_value=1, max_value=20),
-        lease=st.integers(min_value=0, max_value=20),
-    )
-    def test___init___accepts_valid_spawn_and_lease(self, spawn, lease):
-        """Test valid spawn and lease combinations are accepted.
-
-        Given:
-            Any positive spawn and any non-negative lease
+            A positive spawn and any non-negative lease, with no
+            discovery service
         When:
             WorkerPool is instantiated
         Then:
-            It should create pool successfully
+            It should emit an IneffectiveLeaseWarning for every drawn
+            lease and still create the pool — 'lease' is recorded but
+            never consulted
         """
         # Act
-        pool = WorkerPool(spawn=spawn, lease=lease)
+        with pytest.warns(
+            IneffectiveLeaseWarning,
+            match="'lease' has no effect when no 'discovery' service",
+        ):
+            pool = WorkerPool(spawn=1, lease=lease)  # type: ignore[call-overload]
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -2232,4 +2504,474 @@ class TestWorkerPool:
             ValueError,
             match="Lease must be non-negative",
         ):
-            WorkerPool(spawn=1, lease=lease)
+            WorkerPool(spawn=1, lease=lease)  # type: ignore[call-overload]
+
+    # ------------------------------------------------------------------
+    # Quorum tests
+    # ------------------------------------------------------------------
+
+    def test___init___with_quorum(self):
+        """Test instantiation with spawn and quorum.
+
+        Given:
+            A spawn of 4 and quorum of 2
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, quorum=2)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_zero_quorum(self):
+        """Test zero quorum is accepted.
+
+        Given:
+            A spawn of 4 and quorum of 0
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Act
+        pool = WorkerPool(spawn=4, quorum=0)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_quorum_timeout_without_quorum_warns(self):
+        """Test quorum_timeout supplied without a positive quorum emits a warning.
+
+        Given:
+            spawn=2, quorum=None, and quorum_timeout=30
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should emit an IneffectiveQuorumTimeoutWarning; users
+            who want strict behaviour can elevate the category to error
+            via warnings.filterwarnings
+        """
+        # Act & assert
+        with pytest.warns(
+            IneffectiveQuorumTimeoutWarning,
+            match="'quorum_timeout' has no effect when 'quorum' is None or 0",
+        ):
+            WorkerPool(spawn=2, quorum=None, quorum_timeout=30)
+
+    @pytest.mark.asyncio
+    async def test___aenter___with_negative_quorum_raises(
+        self, mock_shared_memory, mock_local_worker
+    ):
+        """Test negative quorum is rejected at context entry.
+
+        Given:
+            A spawn of 4 and quorum of -1
+        When:
+            The WorkerPool context is entered
+        Then:
+            It should raise ValueError from the underlying WorkerProxy
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Quorum must be a non-negative integer"):
+            async with WorkerPool(spawn=4, quorum=-1):
+                pass
+
+    def test___init___with_quorum_exceeding_capacity(self, mocker: MockerFixture):
+        """Test quorum exceeding pool capacity is rejected.
+
+        Given:
+            A spawn of 2, lease of 2, a discovery service, and quorum
+            of 5
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act & assert
+        with pytest.raises(ValueError, match=r"Quorum.*cannot exceed pool capacity"):
+            WorkerPool(spawn=2, discovery=mock_discovery, lease=2, quorum=5)
+
+    def test___init___with_quorum_equal_to_capacity(self, mocker: MockerFixture):
+        """Test quorum equal to pool capacity is accepted.
+
+        Given:
+            A spawn of 4, lease of 3, a discovery service, and quorum
+            of 7
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act
+        pool = WorkerPool(spawn=4, discovery=mock_discovery, lease=3, quorum=7)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_quorum_satisfied_by_spawn_alone(self, mocker: MockerFixture):
+        """Test quorum satisfiable by spawn alone with lease=0 is accepted.
+
+        Given:
+            A spawn of 4, lease of 0, a discovery service, and quorum
+            of 3
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act
+        pool = WorkerPool(spawn=4, discovery=mock_discovery, lease=0, quorum=3)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    @pytest.mark.asyncio
+    async def test___aenter___with_quorum_exceeding_lease_discovery_only(
+        self, mock_discovery_service_for_pool
+    ):
+        """Test quorum exceeding lease in discovery-only pool is rejected.
+
+        Given:
+            A discovery service, lease of 2, and quorum of 3
+        When:
+            The WorkerPool context is entered
+        Then:
+            It should raise ValueError from the underlying WorkerProxy
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match=r"Quorum.*cannot exceed lease"):
+            async with WorkerPool(
+                discovery=mock_discovery_service_for_pool, lease=2, quorum=3
+            ):
+                pass
+
+    def test___init___with_unbounded_lease_and_quorum_above_spawn(self):
+        """Test unbounded lease accepts quorum exceeding spawn.
+
+        Given:
+            A spawn of 2, no lease (unbounded), and quorum of 10
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully (the quorum
+            reachability check is deferred to runtime via
+            quorum_timeout)
+        """
+        # Act
+        pool = WorkerPool(spawn=2, quorum=10)
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___hybrid_mode_rejects_quorum_above_capacity(
+        self, mocker: MockerFixture
+    ):
+        """Test hybrid pool rejects quorum exceeding spawn + lease.
+
+        Given:
+            A discovery service with spawn=2, lease=2, and quorum=10
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should raise ValueError, since hybrid capacity is
+            spawn + lease
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act & assert
+        with pytest.raises(ValueError, match=r"Quorum.*cannot exceed pool capacity"):
+            WorkerPool(spawn=2, discovery=mock_discovery, lease=2, quorum=10)
+
+    @pytest.mark.asyncio
+    async def test___aenter___with_non_positive_quorum_timeout_raises(
+        self, mock_shared_memory, mock_local_worker
+    ):
+        """Test non-positive quorum_timeout is rejected at context entry.
+
+        Given:
+            A spawn of 2, quorum of 1, and quorum_timeout of 0
+        When:
+            The WorkerPool context is entered
+        Then:
+            It should raise ValueError from the underlying WorkerProxy
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Quorum timeout must be positive"):
+            async with WorkerPool(spawn=2, quorum=1, quorum_timeout=0):
+                pass
+
+    @pytest.mark.asyncio
+    async def test___aenter___forwards_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test quorum is forwarded to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and quorum=2
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=2 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2, quorum=2):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 2
+
+    @pytest.mark.asyncio
+    async def test___aenter___forwards_default_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test default quorum is forwarded to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and no explicit quorum
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=1 to WorkerProxy (preserves
+            pre-quorum implicit-wait semantics)
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 1
+
+    @pytest.mark.asyncio
+    async def test___aenter___forwards_quorum_none(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test explicit quorum=None forwards quorum=None to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and explicit quorum=None
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=None to WorkerProxy without
+            forwarding quorum_timeout
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2, quorum=None):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] is None
+        assert "quorum_timeout" not in proxy_kwargs
+
+    @pytest.mark.asyncio
+    async def test___aenter___forwards_quorum_zero(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test quorum=0 normalizes to quorum=None when forwarded to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2 and quorum=0
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=None to WorkerProxy without forwarding
+            quorum_timeout — quorum=0 is documented as equivalent to
+            None and normalized at the boundary to satisfy WorkerProxy's
+            typed overload contract
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(spawn=2, quorum=0):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] is None
+        assert "quorum_timeout" not in proxy_kwargs
+
+    @pytest.mark.asyncio
+    async def test___aenter___durable_mode_forwards_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test durable mode forwards quorum to WorkerProxy.
+
+        Given:
+            A WorkerPool with discovery and quorum=3
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=3 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+        discovery_service = mock_discovery_service_for_pool
+
+        # Act
+        async with WorkerPool(discovery=discovery_service, quorum=3):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 3
+
+    @pytest.mark.asyncio
+    async def test___aenter___hybrid_mode_forwards_quorum(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_discovery_service_for_pool,
+    ):
+        """Test hybrid mode forwards quorum to WorkerProxy.
+
+        Given:
+            A WorkerPool with spawn=2, discovery, and quorum=3
+        When:
+            The pool context is entered
+        Then:
+            It should pass quorum=3 to WorkerProxy
+        """
+        # Arrange
+        import wool.runtime.worker.pool as wp
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+        discovery_service = mock_discovery_service_for_pool
+
+        # Act
+        async with WorkerPool(spawn=2, discovery=discovery_service, quorum=3):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["quorum"] == 3
+
+    @given(quorum=st.integers(min_value=-100, max_value=-1))
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @pytest.mark.asyncio
+    async def test___aenter___rejects_negative_quorum_pbt(
+        self, quorum, mock_shared_memory, mock_local_worker
+    ):
+        """Test negative quorum values are rejected at context entry.
+
+        Given:
+            Any negative quorum value
+        When:
+            The WorkerPool context is entered
+        Then:
+            It should raise ValueError from the underlying WorkerProxy
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError,
+            match="Quorum must be a non-negative integer",
+        ):
+            async with WorkerPool(spawn=1, quorum=quorum):
+                pass
+
+    @given(
+        spawn=st.integers(min_value=1, max_value=20),
+        lease=st.integers(min_value=0, max_value=20),
+        quorum=st.integers(min_value=0, max_value=40),
+    )
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test___init___accepts_quorum_within_capacity_pbt(
+        self, spawn, lease, quorum, mocker: MockerFixture
+    ):
+        """Test any quorum within the pool capacity is accepted.
+
+        Given:
+            Any spawn in [1, 20], lease in [0, 20], a discovery
+            service, and quorum in [0, spawn + lease]
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should create the pool successfully
+        """
+        # Hypothesis explores the full grid; skip combinations that the
+        # validator legitimately rejects (quorum > spawn + lease).
+        if quorum > spawn + lease:
+            return
+
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act
+        pool = WorkerPool(
+            spawn=spawn, discovery=mock_discovery, lease=lease, quorum=quorum
+        )
+
+        # Assert
+        assert isinstance(pool, WorkerPool)

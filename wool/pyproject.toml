@@ -84,12 +84,14 @@ path = "../build-hooks/metadata.py"
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--cov --cov-config=.coveragerc"
+pythonpath = ["."]
 markers = [
     "integration: end-to-end integration tests against real WorkerPool",
 ]
 
 [tool.ruff]
 line-length = 89
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
@@ -106,6 +108,7 @@ known-first-party = ["wool"]
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
+pythonVersion = "3.11"
 include = ["src"]
 exclude = [
     "**/__pycache__",

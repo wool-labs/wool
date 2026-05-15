@@ -30,21 +30,30 @@ def test_public_api_completeness():
         It should match the expected public interface exactly
     """
     # Arrange
-    expected_public_api = [
+    expected_public_api = {
         "RpcError",
         "TransientRpcError",
         "UnexpectedResponse",
         "WorkerConnection",
+        "Context",
+        "ContextAlreadyBound",
+        "ContextDecodeWarning",
+        "ContextVar",
+        "ContextVarCollision",
         "RuntimeContext",
+        "Token",
+        "copy_context",
+        "create_task",
+        "current_context",
         "LoadBalancerContextLike",
         "LoadBalancerLike",
         "NoWorkersAvailable",
         "RoundRobinLoadBalancer",
-        "Serializer",
         "Task",
         "TaskException",
         "current_task",
         "routine",
+        "Serializer",
         "BackpressureContext",
         "BackpressureLike",
         "LocalWorker",
@@ -66,10 +75,38 @@ def test_public_api_completeness():
         "PredicateFunction",
         "WorkerMetadata",
         "Factory",
-    ]
+    }
 
     # Act
-    actual_public_api = wool.__all__
+    actual_public_api = set(wool.__all__)
 
     # Assert
     assert actual_public_api == expected_public_api
+
+
+def test_serializer_singleton_identity():
+    """Test wool.__serializer__ is a stable module-level singleton.
+
+    Given:
+        The wool package.
+    When:
+        wool.__serializer__ is accessed twice.
+    Then:
+        Each access should return the same instance.
+    """
+    # Arrange, act, & assert
+    assert wool.__serializer__ is wool.__serializer__
+
+
+def test_serializer_singleton_with_serializer_protocol():
+    """Test wool.__serializer__ satisfies the wool.Serializer protocol.
+
+    Given:
+        The wool.__serializer__ singleton and the wool.Serializer protocol.
+    When:
+        isinstance is evaluated against the runtime-checkable protocol.
+    Then:
+        It should return True.
+    """
+    # Arrange, act, & assert
+    assert isinstance(wool.__serializer__, wool.Serializer)
