@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from inspect import isawaitable
 from typing import AsyncIterator
 from typing import Awaitable
+from typing import Final
 from typing import Protocol
 from typing import runtime_checkable
 
@@ -28,6 +29,13 @@ from wool.runtime.worker.session import DispatchSession
 from wool.runtime.worker.session import Rejected
 
 _log = logging.getLogger(__name__)
+
+_DRAIN_TIMEOUT: Final[float] = 5.0
+"""Wall-clock timeout in seconds for the multi-generation task drain
+in :meth:`WorkerService._destroy_worker_loop`. Generous enough for a
+normal chain of ``finally``-scheduled cleanup tasks to unwind, short
+enough not to stall worker-loop teardown; past this timeout the drain
+gives up, with the daemon-thread reap as the backstop."""
 
 
 def _safely_serialize_exception(
@@ -726,11 +734,20 @@ class WorkerService(protocol.WorkerServicer):
     ) -> None:
         """Schedule worker-loop shutdown and optionally join the thread.
 
-        Cancels all pending tasks on the worker loop and signals the
-        loop to stop. The loop is closed by the worker thread itself
-        (see :meth:`_create_worker_loop`'s ``_run_then_close`` target),
-        not from this caller's thread — eliminating the close-while-
-        running race.
+        Drains successive generations of pending tasks on the
+        worker loop, then signals the loop to stop. A cancelled
+        task's ``finally`` clause can schedule a second generation
+        of tasks (e.g. follow-up cleanup, fire-and-forget logging,
+        further cancellations, etc.); the drain cancels and awaits
+        successive generations until none remain or
+        :data:`_DRAIN_TIMEOUT` elapses, so the loop closes without
+        leaking ``Task was destroyed but it is pending!`` warnings.
+        If a routine schedules cleanup-of-cleanup past the budget,
+        the drain stops anyway and the daemon-thread reap remains
+        the backstop. The loop is closed by the worker
+        thread itself (see :meth:`_create_worker_loop`'s
+        ``_run_then_close`` target), not from this caller's thread —
+        eliminating the close-while-running race.
 
         Joins the worker thread for up to :attr:`_stop_timeout`
         seconds (set by :meth:`_stop` from the StopRequest's
@@ -748,11 +765,36 @@ class WorkerService(protocol.WorkerServicer):
 
         async def _shutdown():
             current = asyncio.current_task()
-            tasks = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            loop.stop()
+            deadline = loop.time() + _DRAIN_TIMEOUT
+            leaked: list[asyncio.Task] = []
+            try:
+                while True:
+                    pending = [
+                        task for task in asyncio.all_tasks() if task is not current
+                    ]
+                    if not pending:
+                        break
+                    for task in pending:
+                        task.cancel()
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        leaked = pending
+                        break
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending, return_exceptions=True),
+                            timeout=remaining,
+                        )
+                    except TimeoutError:
+                        leaked = pending
+                        break
+                if leaked:
+                    _log.warning(
+                        f"Worker-loop teardown drain timed out after "
+                        f"{_DRAIN_TIMEOUT}s; {len(leaked)} task(s) still pending."
+                    )
+            finally:
+                loop.stop()
 
         try:
             loop.call_soon_threadsafe(lambda: loop.create_task(_shutdown()))
