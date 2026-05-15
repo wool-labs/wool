@@ -24,6 +24,7 @@ from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
+from wool.runtime.worker.pool import IneffectiveLeaseWarning
 from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.proxy import IneffectiveQuorumTimeoutWarning
 
@@ -246,19 +247,26 @@ class TestWorkerPool:
         # Assert
         assert isinstance(pool, WorkerPool)
 
-    def test___init___size_with_lease(self):
-        """Test deprecated size combined with lease.
+    def test___init___size_with_lease_warns(self):
+        """Test deprecated size combined with lease without discovery.
 
         Given:
-            The deprecated 'size' parameter with value 4 and lease of 8
+            The deprecated 'size' parameter with value 4 and lease of 8,
+            and no discovery service
         When:
             WorkerPool is initialized
         Then:
-            It should emit a DeprecationWarning and create a valid pool
+            It should emit a DeprecationWarning for 'size' and an
+            IneffectiveLeaseWarning for 'lease', and still create the
+            pool successfully — 'lease' is recorded but never consulted
         """
         # Act
         with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
-            pool = WorkerPool(size=4, lease=8)
+            with pytest.warns(
+                IneffectiveLeaseWarning,
+                match="'lease' has no effect when no 'discovery' service",
+            ):
+                pool = WorkerPool(size=4, lease=8)  # type: ignore[call-overload]
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -1942,31 +1950,60 @@ class TestWorkerPool:
         _, proxy_kwargs = mock_proxy_cls.call_args
         assert "options" not in proxy_kwargs
 
-    def test___init___with_lease(self):
-        """Test instantiation with spawn and lease.
+    def test___init___spawn_only_with_lease_warns(self):
+        """Test spawn-only pool warns when lease is supplied.
 
         Given:
-            A spawn of 4 and lease of 8
+            A spawn of 4, a lease of 8, and no discovery service
         When:
             WorkerPool is instantiated
         Then:
-            It should create the pool successfully
+            It should emit an IneffectiveLeaseWarning and still create
+            the pool successfully — 'lease' is recorded but never
+            consulted without a discovery service
         """
         # Act
-        pool = WorkerPool(spawn=4, lease=8)
+        with pytest.warns(
+            IneffectiveLeaseWarning,
+            match="'lease' has no effect when no 'discovery' service",
+        ):
+            pool = WorkerPool(spawn=4, lease=8)  # type: ignore[call-overload]
 
         # Assert
         assert isinstance(pool, WorkerPool)
 
-    def test___init___with_lease_and_no_spawn(self, mocker: MockerFixture):
-        """Test lease without spawn in durable mode.
+    def test___init___default_mode_with_lease_warns(self):
+        """Test default-mode pool warns when lease is supplied.
+
+        Given:
+            A lease of 4 with no explicit spawn and no discovery
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should emit an IneffectiveLeaseWarning and still create
+            the pool successfully — default mode also spawns only
+            locally and 'lease' has no effect
+        """
+        # Act
+        with pytest.warns(
+            IneffectiveLeaseWarning,
+            match="'lease' has no effect when no 'discovery' service",
+        ):
+            pool = WorkerPool(lease=4)  # type: ignore[call-overload]
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___discovery_only_with_lease_accepts(self, mocker: MockerFixture):
+        """Test discovery-only pool accepts lease.
 
         Given:
             A discovery service and lease of 8 with no spawn specified
         When:
             WorkerPool is instantiated
         Then:
-            It should create the pool successfully
+            It should create the pool successfully — 'lease' is valid
+            in discovery-only mode
         """
         # Arrange
         mock_discovery = mocker.MagicMock()
@@ -1977,18 +2014,44 @@ class TestWorkerPool:
         # Assert
         assert isinstance(pool, WorkerPool)
 
-    def test___init___with_zero_lease_and_spawn(self):
-        """Test zero lease with spawn is accepted.
+    def test___init___hybrid_mode_with_lease_accepts(self, mocker: MockerFixture):
+        """Test hybrid pool accepts lease.
 
         Given:
-            A spawn of 4 and lease of 0
+            A spawn of 4, a discovery service, and lease of 8
         When:
             WorkerPool is instantiated
         Then:
-            It should create the pool successfully
+            It should create the pool successfully — 'lease' is valid
+            in hybrid mode (spawn + discovery)
+        """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
+        # Act
+        pool = WorkerPool(spawn=4, lease=8, discovery=mock_discovery)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___spawn_only_with_zero_lease_warns(self):
+        """Test spawn-only pool warns when zero lease is supplied.
+
+        Given:
+            A spawn of 4 and lease of 0, with no discovery
+        When:
+            WorkerPool is instantiated
+        Then:
+            It should emit an IneffectiveLeaseWarning and still create
+            the pool — any non-None lease without discovery has no
+            effect, including lease=0
         """
         # Act
-        pool = WorkerPool(spawn=4, lease=0)
+        with pytest.warns(
+            IneffectiveLeaseWarning,
+            match="'lease' has no effect when no 'discovery' service",
+        ):
+            pool = WorkerPool(spawn=4, lease=0)  # type: ignore[call-overload]
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -2025,7 +2088,7 @@ class TestWorkerPool:
         """
         # Act & assert
         with pytest.raises(ValueError, match="Lease must be non-negative"):
-            WorkerPool(spawn=4, lease=-1)
+            WorkerPool(spawn=4, lease=-1)  # type: ignore[call-overload]
 
     @pytest.mark.asyncio
     async def test___aenter___hybrid_mode_forwards_lease(
@@ -2055,39 +2118,6 @@ class TestWorkerPool:
 
         # Act
         async with WorkerPool(spawn=2, lease=4, discovery=discovery_service):
-            pass
-
-        # Assert
-        mock_proxy_cls.assert_called_once()
-        _, proxy_kwargs = mock_proxy_cls.call_args
-        assert proxy_kwargs["lease"] == 6  # spawn(2) + lease(4)
-
-    @pytest.mark.asyncio
-    async def test___aenter___ephemeral_mode_forwards_lease(
-        self,
-        mocker: MockerFixture,
-        mock_shared_memory,
-        mock_worker_proxy,
-        mock_local_worker,
-    ):
-        """Test ephemeral mode forwards spawn + lease to WorkerProxy.
-
-        Given:
-            A WorkerPool with spawn=2 and lease=4 without discovery
-        When:
-            The pool context is entered
-        Then:
-            It should pass lease=6 (spawn + lease) to WorkerProxy
-        """
-        # Arrange
-        import wool.runtime.worker.pool as wp
-
-        mock_proxy_cls = mocker.patch.object(
-            wp, "WorkerProxy", return_value=mock_worker_proxy
-        )
-
-        # Act
-        async with WorkerPool(spawn=2, lease=4):
             pass
 
         # Assert
@@ -2161,58 +2191,26 @@ class TestWorkerPool:
         _, proxy_kwargs = mock_proxy_cls.call_args
         assert proxy_kwargs["lease"] is None
 
-    @pytest.mark.asyncio
-    async def test___aenter___default_mode_forwards_lease(
-        self,
-        mocker: MockerFixture,
-        mock_shared_memory,
-        mock_worker_proxy,
-        mock_local_worker,
-    ):
-        """Test default mode forwards spawn + lease to WorkerProxy.
+    @given(lease=st.integers(min_value=0, max_value=20))
+    def test___init___warns_on_lease_without_discovery_pbt(self, lease):
+        """Test any non-negative lease without discovery emits a warning.
 
         Given:
-            A WorkerPool with no explicit spawn or discovery and lease=4
-        When:
-            The pool context is entered
-        Then:
-            It should pass lease=cpu_count + 4 to WorkerProxy
-        """
-        # Arrange
-        import os
-
-        import wool.runtime.worker.pool as wp
-
-        mocker.patch.object(os, "cpu_count", return_value=2)
-        mock_proxy_cls = mocker.patch.object(
-            wp, "WorkerProxy", return_value=mock_worker_proxy
-        )
-
-        # Act
-        async with WorkerPool(lease=4):
-            pass
-
-        # Assert
-        mock_proxy_cls.assert_called_once()
-        _, proxy_kwargs = mock_proxy_cls.call_args
-        assert proxy_kwargs["lease"] == 6  # cpu_count(2) + lease(4)
-
-    @given(
-        spawn=st.integers(min_value=1, max_value=20),
-        lease=st.integers(min_value=0, max_value=20),
-    )
-    def test___init___accepts_valid_spawn_and_lease(self, spawn, lease):
-        """Test valid spawn and lease combinations are accepted.
-
-        Given:
-            Any positive spawn and any non-negative lease
+            A positive spawn and any non-negative lease, with no
+            discovery service
         When:
             WorkerPool is instantiated
         Then:
-            It should create pool successfully
+            It should emit an IneffectiveLeaseWarning for every drawn
+            lease and still create the pool — 'lease' is recorded but
+            never consulted
         """
         # Act
-        pool = WorkerPool(spawn=spawn, lease=lease)
+        with pytest.warns(
+            IneffectiveLeaseWarning,
+            match="'lease' has no effect when no 'discovery' service",
+        ):
+            pool = WorkerPool(spawn=1, lease=lease)  # type: ignore[call-overload]
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -2233,7 +2231,7 @@ class TestWorkerPool:
             ValueError,
             match="Lease must be non-negative",
         ):
-            WorkerPool(spawn=1, lease=lease)
+            WorkerPool(spawn=1, lease=lease)  # type: ignore[call-overload]
 
     # ------------------------------------------------------------------
     # Quorum tests
@@ -2308,48 +2306,60 @@ class TestWorkerPool:
             async with WorkerPool(spawn=4, quorum=-1):
                 pass
 
-    def test___init___with_quorum_exceeding_capacity(self):
+    def test___init___with_quorum_exceeding_capacity(self, mocker: MockerFixture):
         """Test quorum exceeding pool capacity is rejected.
 
         Given:
-            A spawn of 2, lease of 2, and quorum of 5
+            A spawn of 2, lease of 2, a discovery service, and quorum
+            of 5
         When:
             WorkerPool is instantiated
         Then:
             It should raise ValueError
         """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
         # Act & assert
         with pytest.raises(ValueError, match=r"Quorum.*cannot exceed pool capacity"):
-            WorkerPool(spawn=2, lease=2, quorum=5)
+            WorkerPool(spawn=2, discovery=mock_discovery, lease=2, quorum=5)
 
-    def test___init___with_quorum_equal_to_capacity(self):
+    def test___init___with_quorum_equal_to_capacity(self, mocker: MockerFixture):
         """Test quorum equal to pool capacity is accepted.
 
         Given:
-            A spawn of 4, lease of 3, and quorum of 7
+            A spawn of 4, lease of 3, a discovery service, and quorum
+            of 7
         When:
             WorkerPool is instantiated
         Then:
             It should create the pool successfully
         """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
         # Act
-        pool = WorkerPool(spawn=4, lease=3, quorum=7)
+        pool = WorkerPool(spawn=4, discovery=mock_discovery, lease=3, quorum=7)
 
         # Assert
         assert isinstance(pool, WorkerPool)
 
-    def test___init___with_quorum_satisfied_by_spawn_alone(self):
+    def test___init___with_quorum_satisfied_by_spawn_alone(self, mocker: MockerFixture):
         """Test quorum satisfiable by spawn alone with lease=0 is accepted.
 
         Given:
-            A spawn of 4, lease of 0, and quorum of 3
+            A spawn of 4, lease of 0, a discovery service, and quorum
+            of 3
         When:
             WorkerPool is instantiated
         Then:
             It should create the pool successfully
         """
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
         # Act
-        pool = WorkerPool(spawn=4, lease=0, quorum=3)
+        pool = WorkerPool(spawn=4, discovery=mock_discovery, lease=0, quorum=3)
 
         # Assert
         assert isinstance(pool, WorkerPool)
@@ -2373,21 +2383,6 @@ class TestWorkerPool:
                 discovery=mock_discovery_service_for_pool, lease=2, quorum=3
             ):
                 pass
-
-    def test___init___ephemeral_rejects_quorum_above_capacity(self):
-        """Test ephemeral pool rejects quorum exceeding spawn + lease.
-
-        Given:
-            A spawn of 2, lease of 2, no discovery, and quorum of 10
-        When:
-            WorkerPool is instantiated
-        Then:
-            It should raise ValueError, since ephemeral capacity is
-            bounded by spawn + lease
-        """
-        # Act & assert
-        with pytest.raises(ValueError, match=r"Quorum.*cannot exceed pool capacity"):
-            WorkerPool(spawn=2, lease=2, quorum=10)
 
     def test___init___with_unbounded_lease_and_quorum_above_spawn(self):
         """Test unbounded lease accepts quorum exceeding spawn.
@@ -2442,28 +2437,6 @@ class TestWorkerPool:
         with pytest.raises(ValueError, match="Quorum timeout must be positive"):
             async with WorkerPool(spawn=2, quorum=1, quorum_timeout=0):
                 pass
-
-    def test___init___default_mode_with_quorum_above_cpu_count(self):
-        """Test default-mode pool rejects quorum exceeding resolved capacity.
-
-        Given:
-            A default-mode pool (no spawn, no discovery) with a quorum
-            exceeding os.cpu_count()
-        When:
-            WorkerPool is instantiated
-        Then:
-            It should raise ValueError matching "Quorum cannot exceed
-            pool capacity"
-        """
-        import os
-
-        # Arrange — pick a quorum guaranteed to exceed any plausible CPU count
-        cpu_count = os.cpu_count() or 1
-        excessive_quorum = cpu_count + 100
-
-        # Act & assert
-        with pytest.raises(ValueError, match=r"Quorum.*cannot exceed pool capacity"):
-            WorkerPool(lease=0, quorum=excessive_quorum)
 
     @pytest.mark.asyncio
     async def test___aenter___forwards_quorum(
@@ -2700,12 +2673,15 @@ class TestWorkerPool:
         lease=st.integers(min_value=0, max_value=20),
         quorum=st.integers(min_value=0, max_value=40),
     )
-    def test___init___accepts_quorum_within_capacity_pbt(self, spawn, lease, quorum):
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test___init___accepts_quorum_within_capacity_pbt(
+        self, spawn, lease, quorum, mocker: MockerFixture
+    ):
         """Test any quorum within the pool capacity is accepted.
 
         Given:
-            Any spawn in [1, 20], lease in [0, 20], and quorum in
-            [0, spawn + lease]
+            Any spawn in [1, 20], lease in [0, 20], a discovery
+            service, and quorum in [0, spawn + lease]
         When:
             WorkerPool is instantiated
         Then:
@@ -2716,8 +2692,13 @@ class TestWorkerPool:
         if quorum > spawn + lease:
             return
 
+        # Arrange
+        mock_discovery = mocker.MagicMock()
+
         # Act
-        pool = WorkerPool(spawn=spawn, lease=lease, quorum=quorum)
+        pool = WorkerPool(
+            spawn=spawn, discovery=mock_discovery, lease=lease, quorum=quorum
+        )
 
         # Assert
         assert isinstance(pool, WorkerPool)
