@@ -734,3 +734,69 @@ class TestUnifiedDriverShape:
                 assert not isinstance(exc_info.value, UnexpectedResponse)
 
         await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_async_gen_caller_cancel_midstream_releases_channel_pool_ref(
+        self, credentials_map, retry_grpc_internal, tmp_path
+    ):
+        """Test caller cancellation mid-stream releases the pooled
+        channel reference.
+
+        Given:
+            An async-generator routine yielding ``"alive"`` forever
+            inside a ``try/finally``, dispatched through an
+            EPHEMERAL pool (cross-process worker) and consumed by a
+            task that is cancelled while awaiting a value.
+        When:
+            The caller task is cancelled mid-stream and awaited.
+        Then:
+            It should raise :class:`asyncio.CancelledError`, run the
+            worker-side ``finally``, and return the caller's channel
+            pool to its pre-dispatch referenced-entry count — no
+            leaked reference.
+        """
+
+        async def body():
+            # Arrange
+            from wool.runtime.worker import connection
+
+            scenario = default_scenario(
+                shape=RoutineShape.ASYNC_GEN_ACLOSE,
+                pool_mode=PoolMode.EPHEMERAL,
+            )
+            sentinel = tmp_path / "cleanup_reason.txt"
+
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                baseline = connection._channel_pool.stats.referenced_entries
+                collected = []
+                started = asyncio.Event()
+
+                async def consume():
+                    gen = routines.cancellable_gen(str(sentinel))
+                    collected.append(await gen.__anext__())
+                    started.set()
+                    # Park awaiting the next value — the caller
+                    # cancels the task here, mid-stream.
+                    collected.append(await gen.__anext__())
+
+                task = asyncio.create_task(consume())
+                await asyncio.wait_for(started.wait(), timeout=15)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+                # Poll up to 15s for the worker's ``finally`` to
+                # write the sentinel — it runs after the gRPC stream
+                # tears down and tolerates CI load.
+                for _ in range(150):
+                    if sentinel.exists() and sentinel.read_text() == "cleaned_up":
+                        break
+                    await asyncio.sleep(0.1)
+
+                # Assert
+                assert collected == ["alive"]
+                assert sentinel.read_text() == "cleaned_up"
+                assert connection._channel_pool.stats.referenced_entries == baseline
+
+        await retry_grpc_internal(body)
