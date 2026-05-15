@@ -306,6 +306,19 @@ async def gen_range(n: int):
 
 @wool.routine
 @context_pattern_aware
+async def gen_range_one_yield():
+    """Async generator that yields exactly one value, then exhausts.
+
+    Single-yield variant of :func:`gen_range` for the unified-driver
+    happy-path tests. The driver's iteration loop must serve the
+    first ``__anext__`` with a value and the second ``__anext__``
+    with ``StopAsyncIteration``, exiting cleanly.
+    """
+    yield 0
+
+
+@wool.routine
+@context_pattern_aware
 async def echo_send(n: int):
     """Async generator with asend support.
 
@@ -342,6 +355,87 @@ async def closeable_gen():
     """
     while True:
         yield "alive"
+
+
+@wool.routine
+@context_pattern_aware
+async def cancellable_sleep(sentinel_path: str, duration: float = 30.0):
+    """Coroutine that sleeps for *duration* and records its termination
+    reason at *sentinel_path*.
+
+    Used by integration tests that pin cross-process cancellation
+    propagation. The routine writes a ``"started"`` marker immediately
+    before suspending on :func:`asyncio.sleep` so a caller can poll for
+    suspension instead of guessing a fixed delay; on
+    :class:`asyncio.CancelledError` the marker is overwritten with
+    ``"cancelled"``, on natural sleep completion it is overwritten with
+    ``"completed"``.
+
+    :param sentinel_path:
+        Filesystem path the routine writes its termination reason
+        to. The caller polls this file after cancelling to verify
+        the worker-side routine actually unwound rather than being
+        orphaned.
+    :param duration:
+        Sleep duration in seconds. Should comfortably exceed the
+        caller's cancel-then-await window.
+    """
+    try:
+        with open(sentinel_path, "w") as f:
+            f.write("started")
+        await asyncio.sleep(duration)
+    except asyncio.CancelledError:
+        with open(sentinel_path, "w") as f:
+            f.write("cancelled")
+        raise
+    else:
+        with open(sentinel_path, "w") as f:
+            f.write("completed")
+
+
+@wool.routine
+@context_pattern_aware
+async def cancellable_gen(sentinel_path: str):
+    """Async generator that yields ``"alive"`` forever and records its
+    cleanup reason at *sentinel_path*.
+
+    Companion to :func:`cancellable_sleep` for the async-generator
+    cancellation paths. Writes ``"cleaned_up"`` to the sentinel file
+    when the generator is closed (caller ``aclose`` or ``break`` out
+    of ``async for`` routed through gRPC) — exiting the
+    ``try/finally`` block, regardless of whether the exit was driven
+    by :class:`GeneratorExit` (aclose) or :class:`asyncio.CancelledError`
+    (caller task cancel).
+
+    :param sentinel_path:
+        Filesystem path the generator writes ``"cleaned_up"`` to on
+        teardown. The caller polls this file after closing to verify
+        the worker-side routine ran its ``finally`` block.
+    """
+    try:
+        while True:
+            yield "alive"
+    finally:
+        with open(sentinel_path, "w") as f:
+            f.write("cleaned_up")
+
+
+@wool.routine
+@context_pattern_aware
+async def self_cancel_coroutine():
+    """Coroutine that raises :class:`asyncio.CancelledError` from its
+    body without being externally cancelled.
+
+    Mirrors stdlib's ``await task`` semantics where a coroutine that
+    self-raises :class:`asyncio.CancelledError` is indistinguishable
+    from one that was externally cancelled — both transition the
+    task to ``CANCELLED`` and the caller's ``await`` raises
+    :class:`asyncio.CancelledError`. Wool's wire must preserve this
+    contract; the caller's ``await`` on this routine should raise
+    :class:`asyncio.CancelledError` raw, not :class:`RpcError` or
+    :class:`UnexpectedResponse`.
+    """
+    raise asyncio.CancelledError("self-raised from routine body")
 
 
 @wool.routine
@@ -452,7 +546,9 @@ async def stream_tenant_id(count: int):
     A sleep(0) between yields forces the generator to suspend, so each
     subsequent read happens in the restored worker context rather than
     returning a cached value from a single frame. Used as the
-    regression guard for the _stream_from_worker async-generator fix.
+    regression guard for the unified-driver async-generator fix
+    (issue #187 collapsed the pre-existing ``_stream_from_worker``
+    into :class:`DispatchSession`).
     """
     for _ in range(count):
         yield TENANT_ID.get()

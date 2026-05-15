@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import threading
 import uuid
 from types import MappingProxyType
 from typing import Any
@@ -17,6 +18,7 @@ from pytest_mock import MockerFixture
 
 import wool.runtime.worker.pool as wp
 from tests.helpers import scoped_context
+from wool.runtime.context import install_task_factory
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -95,6 +97,27 @@ def _clear_worker_context():
     wool.__worker_metadata__ = None
     wool.__worker_uds_address__ = None
     wool.__worker_service__.reset(svc_token)
+
+
+@pytest.fixture
+def worker_loop():
+    """Spin up a real worker loop on a daemon thread.
+
+    The wool task factory is installed so :func:`routine_scope` can run
+    on a separate loop. Used by DispatchSession unit tests and any
+    other test that needs to cross-loop coordinate.
+    """
+    loop = asyncio.new_event_loop()
+    install_task_factory(loop)
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        yield loop
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        if not loop.is_closed():
+            loop.close()
 
 
 @pytest.fixture
