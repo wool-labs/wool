@@ -130,14 +130,15 @@ def _pre_nested_setup(patterns):
 def _post_nested_teardown(patterns):
     """Clean up after a nested dispatch returns (outer worker side).
 
-    For UPSTREAM_RESET the outer worker resets the var that the inner
-    worker set, using a token captured before the nested call.
+    For UPSTREAM_RESET the outer worker overwrites the var that the
+    inner worker set with a sentinel value, signalling that the outer
+    worker has completed its post-nested teardown step.
     """
     for var_name, pattern in patterns.items():
         var = _resolve_var(var_name)
         if pattern is ContextVarPattern.UPSTREAM_RESET:
             # The inner worker set this var; the outer worker now
-            # resets it back to whatever it was before.
+            # overwrites it with a sentinel to mark teardown.
             var.set(f"outer-reset-{var_name}")
 
 
@@ -631,7 +632,7 @@ async def streaming_nested_get_tenant_id(count: int):
 
     Mutates TENANT_ID to a per-iteration value, dispatches
     ``get_tenant_id`` (nested), and yields the observed value.
-    Verifies that the ``_current_task`` and ``wool.Context`` set by
+    Verifies that the ``_current_task`` and chain snapshot set by
     the worker for the streaming routine remain active across the
     generator's lifespan — without that, the nested dispatch cannot
     find the caller's task and the propagation chain breaks.
@@ -701,14 +702,20 @@ async def mutate_on_each_yield(count: int):
 
 
 @wool.routine
-async def return_current_context_id_hex() -> str:
-    """Coroutine that returns ``wool.current_context().id.hex`` from the worker.
+async def return_current_chain_id_hex() -> str:
+    """Coroutine that returns the worker-side snapshot ``chain_id`` hex.
 
-    Used to verify that the caller's context id propagates through a
-    dispatch boundary — the worker should observe the same id as the
-    caller captured pre-dispatch.
+    Used to verify that a dispatch boundary correctly arms the worker
+    on the caller's chain. The worker installs the caller's decoded
+    snapshot via ``install_snapshot``, so its ``chain_id`` equals the
+    caller's (or the child's, when dispatched from an asyncio child
+    task that has forked the chain).
     """
-    return wool.current_context().id.hex
+    from wool.runtime.context import current_snapshot
+
+    snapshot = current_snapshot()
+    assert snapshot is not None
+    return snapshot.chain_id.hex
 
 
 @wool.routine
@@ -928,7 +935,7 @@ async def declare_and_read_unregistered_key(
 
     Exercises the stub-promotion path: the wire frame creates a stub
     in the registry with the caller's value applied to the active
-    Context; the in-routine ``ContextVar(name, namespace=...)`` call
+    snapshot; the in-routine ``ContextVar(name, namespace=...)`` call
     finds the stub and promotes it in place, preserving the
     wire-applied value on the new authoritative declaration.
     """

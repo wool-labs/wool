@@ -42,7 +42,7 @@ COLLIDING_KEY = re.escape(repr((_COLLISION_KEY_NAMESPACE, _COLLISION_KEY_NAME)))
 
 # Strong-ref pin dict, populated on the worker side so constructed
 # ContextVar instances outlive their routine's return and remain in
-# :attr:`wool.ContextVar._registry` (a WeakValueDictionary) when the
+# the process-wide var_registry (a WeakValueDictionary) when the
 # sibling routine runs.
 _PINS: dict[str, wool.ContextVar] = {}
 

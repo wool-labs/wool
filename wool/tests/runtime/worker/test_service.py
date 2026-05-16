@@ -1,5 +1,4 @@
 import asyncio
-import pickle
 import threading
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -19,7 +18,6 @@ import wool
 from wool import protocol
 from wool.protocol import WorkerStub
 from wool.protocol import add_WorkerServicer_to_server
-from wool.runtime.context import install_task_factory
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
 from wool.runtime.worker.interceptor import VersionInterceptor
@@ -830,7 +828,7 @@ class TestWorkerService:
             An async-generator routine that, between yields, sets a
             :class:`wool.ContextVar` to a value whose ``__reduce__``
             raises — the wool back-prop snapshot
-            (``Context.to_protobuf``) on the next iteration cannot
+            (``encode_snapshot``) on the next iteration cannot
             serialize the var
         When:
             The caller drives the generator past the unpicklable
@@ -905,7 +903,7 @@ class TestWorkerService:
             A coroutine routine that sets a :class:`wool.ContextVar`
             to a value whose ``__reduce__`` raises before
             returning — the wool back-prop snapshot
-            (``Context.to_protobuf``) in the done-callback cannot
+            (``encode_snapshot``) in the done-callback cannot
             serialize the post-run state
         When:
             The caller dispatches the routine
@@ -1277,7 +1275,7 @@ class TestWorkerService:
         Given:
             An async-generator dispatch where the second ``next``
             frame carries a state-bearing context, but
-            ``Context.update`` is patched to raise on invocation —
+            ``merge_snapshot`` is patched to raise on invocation —
             the unprotected merge that would otherwise strand the
             worker task
         When:
@@ -1291,7 +1289,7 @@ class TestWorkerService:
             still pushed to the result queue
         """
         # Arrange
-        from wool.runtime.context import Context
+        from wool.runtime.worker import session as session_module
 
         async def streamer():
             for i in range(5):
@@ -1317,8 +1315,8 @@ class TestWorkerService:
         bad_next = protocol.Request(next=protocol.Void(), context=bad_ctx)
 
         mocker.patch.object(
-            Context,
-            "update",
+            session_module,
+            "merge_snapshot",
             side_effect=RuntimeError("synthetic update failure"),
         )
 
@@ -2890,7 +2888,7 @@ class TestWorkerService:
         local_minor,
         client_minor,
     ):
-        """Test dispatch aborts with FAILED_PRECONDITION when client is newer than worker.
+        """Test dispatch aborts with FAILED_PRECONDITION on newer client.
 
         Given:
             A worker with version X.a.0 and a client with version
@@ -4194,8 +4192,8 @@ class TestWorkerService:
 
         Regression test for the user-facing contract pinned by
         F11's redesign. Pre-redesign, when a routine failed AND
-        ``handler.context.to_protobuf`` raised (only possible
-        when the operator promoted :class:`ContextDecodeWarning`
+        the post-run snapshot encode raised (only possible when
+        the operator promoted :class:`ContextDecodeWarning`
         to an exception via
         ``warnings.filterwarnings("error",
         category=ContextDecodeWarning)``), :func:`merge_exceptions`
@@ -4211,8 +4209,8 @@ class TestWorkerService:
 
         Given:
             A coroutine routine that raises a custom exception,
-            and ``handler.context.to_protobuf`` patched to raise
-            a :class:`BaseExceptionGroup` of synthetic
+            and the terminal :func:`encode_snapshot` patched to
+            raise a :class:`BaseExceptionGroup` of synthetic
             :class:`ContextDecodeWarning` peers (simulating
             strict-mode encode failure)
         When:
@@ -4224,8 +4222,8 @@ class TestWorkerService:
             attached as ``__notes__`` and
             ``__wool_context_warnings__``.
         """
-        from wool.runtime.context import Context
         from wool.runtime.context import ContextDecodeWarning
+        from wool.runtime.worker import service as service_module
 
         class _RoutineFailure(Exception):
             pass
@@ -4233,9 +4231,9 @@ class TestWorkerService:
         async def failing_task():
             raise _RoutineFailure("primary signal")
 
-        original_to_protobuf = Context.to_protobuf
+        original_encode = service_module.encode_snapshot
 
-        def encode_with_strict_failure(self, *args, **kwargs):
+        def encode_with_strict_failure(*args, **kwargs):
             raise BaseExceptionGroup(
                 "strict-mode context encode failure",
                 [
@@ -4244,7 +4242,9 @@ class TestWorkerService:
                 ],
             )
 
-        mocker.patch.object(Context, "to_protobuf", encode_with_strict_failure)
+        mocker.patch.object(
+            service_module, "encode_snapshot", encode_with_strict_failure
+        )
 
         mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
         wool_task = Task(
@@ -4264,8 +4264,8 @@ class TestWorkerService:
             responses = [r async for r in stream]
 
         # Restore so the gRPC fixture's teardown does not
-        # explode on Context.to_protobuf calls during cleanup.
-        mocker.patch.object(Context, "to_protobuf", original_to_protobuf)
+        # explode on encode_snapshot calls during cleanup.
+        mocker.patch.object(service_module, "encode_snapshot", original_encode)
 
         # Assert
         ack, terminal = responses
@@ -4792,17 +4792,17 @@ class TestWorkerService:
         ``__notes__`` and ``__wool_context_warnings__``.
 
         Implementation note: the routine itself returns ``"ok"``, but
-        :meth:`Context.to_protobuf` is patched to raise on every
-        call. The per-step encode (which runs inside ``_step`` to
-        build the success :class:`_Response`) therefore raises the
-        warning, which routes through ``DispatchSession`` and surfaces
-        in :meth:`WorkerService.dispatch`'s terminal-exception clause
-        — the same code path that attaches strict-mode warnings as
+        :func:`encode_snapshot` is patched to raise on every call. The
+        per-step encode (which runs inside ``_step`` to build the
+        success :class:`_Response`) therefore raises the warning,
+        which routes through ``DispatchSession`` and surfaces in
+        :meth:`WorkerService.dispatch`'s terminal-exception clause —
+        the same code path that attaches strict-mode warnings as
         ``__notes__`` / ``__wool_context_warnings__`` on the
         exception before serializing it back to the caller.
 
         Given:
-            A coroutine routine AND :meth:`Context.to_protobuf` patched
+            A coroutine routine AND :func:`encode_snapshot` patched
             to raise a single bare :class:`ContextDecodeWarning` (not
             a group) on every call
         When:
@@ -4812,20 +4812,30 @@ class TestWorkerService:
             containing the single warning and
             ``__wool_context_warnings__`` of length 1.
         """
-        from wool.runtime.context import Context
         from wool.runtime.context import ContextDecodeWarning
+        from wool.runtime.worker import service as service_module
+        from wool.runtime.worker import session as session_module
 
         # Arrange
         async def succeeding_task():
             return "ok"
 
-        original_to_protobuf = Context.to_protobuf
+        original_session_encode = session_module.encode_snapshot
+        original_service_encode = service_module.encode_snapshot
         single_warning = ContextDecodeWarning("single bare peer")
 
-        def encode_with_single_failure(self, *args, **kwargs):
+        def encode_with_single_failure(*args, **kwargs):
             raise single_warning
 
-        mocker.patch.object(Context, "to_protobuf", encode_with_single_failure)
+        # Patch both the per-step encode (session) and the terminal-
+        # exception encode (service) so the dispatch handler reaches
+        # the strict-mode attach path.
+        mocker.patch.object(
+            session_module, "encode_snapshot", encode_with_single_failure
+        )
+        mocker.patch.object(
+            service_module, "encode_snapshot", encode_with_single_failure
+        )
 
         mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
         wool_task = Task(
@@ -4845,8 +4855,9 @@ class TestWorkerService:
             responses = [r async for r in stream]
 
         # Restore so the gRPC fixture's teardown does not explode on
-        # subsequent Context.to_protobuf calls during cleanup.
-        mocker.patch.object(Context, "to_protobuf", original_to_protobuf)
+        # subsequent encode_snapshot calls during cleanup.
+        mocker.patch.object(session_module, "encode_snapshot", original_session_encode)
+        mocker.patch.object(service_module, "encode_snapshot", original_service_encode)
 
         # Assert
         ack, terminal = responses
@@ -4872,7 +4883,7 @@ class TestWorkerService:
 
         Given:
             An async-generator routine that raises a custom exception
-            mid-stream AND :meth:`Context.to_protobuf` patched to
+            mid-stream AND :func:`encode_snapshot` patched to
             raise a :class:`BaseExceptionGroup` of two
             :class:`ContextDecodeWarning` peers
         When:
@@ -4883,8 +4894,9 @@ class TestWorkerService:
             both warnings on ``__notes__`` and
             ``__wool_context_warnings__`` of length 2.
         """
-        from wool.runtime.context import Context
         from wool.runtime.context import ContextDecodeWarning
+        from wool.runtime.worker import service as service_module
+        from wool.runtime.worker import session as session_module
 
         # Arrange
         class _RoutineFailure(Exception):
@@ -4894,17 +4906,18 @@ class TestWorkerService:
             yield "first"
             raise _RoutineFailure("mid-stream signal")
 
-        original_to_protobuf = Context.to_protobuf
+        original_session_encode = session_module.encode_snapshot
+        original_service_encode = service_module.encode_snapshot
         # Let the first per-yield encode succeed so the streamer
         # delivers ``"first"`` over the wire; subsequent invocations
         # (including the dispatch handler's terminal-exception
         # snapshot) raise the strict-mode encode group.
         call_count = {"n": 0}
 
-        def encode_with_strict_failure(self, *args, **kwargs):
+        def encode_with_strict_failure(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return original_to_protobuf(self, *args, **kwargs)
+                return original_session_encode(*args, **kwargs)
             raise BaseExceptionGroup(
                 "strict-mode encode failure",
                 [
@@ -4913,7 +4926,15 @@ class TestWorkerService:
                 ],
             )
 
-        mocker.patch.object(Context, "to_protobuf", encode_with_strict_failure)
+        # Patch both the per-step encode (session) and the terminal-
+        # exception encode (service) so the dispatch handler reaches
+        # the strict-mode attach path.
+        mocker.patch.object(
+            session_module, "encode_snapshot", encode_with_strict_failure
+        )
+        mocker.patch.object(
+            service_module, "encode_snapshot", encode_with_strict_failure
+        )
 
         mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
         wool_task = Task(
@@ -4943,8 +4964,9 @@ class TestWorkerService:
             remaining = [r async for r in stream]
 
         # Restore so the gRPC fixture's teardown does not explode on
-        # subsequent Context.to_protobuf calls during cleanup.
-        mocker.patch.object(Context, "to_protobuf", original_to_protobuf)
+        # subsequent encode_snapshot calls during cleanup.
+        mocker.patch.object(session_module, "encode_snapshot", original_session_encode)
+        mocker.patch.object(service_module, "encode_snapshot", original_service_encode)
 
         # Assert
         terminals = [r for r in remaining if r.HasField("exception")]
@@ -5125,7 +5147,7 @@ class TestWorkerService:
         assert terminal.HasField("exception")
         assert drain_spy.call_count >= 2, (
             f"Expected dispatch's terminal-exception clause to call "
-            f"handler.drain() before snapshotting handler.context "
+            f"handler.drain() before snapshotting handler.snapshot "
             f"(plus __aexit__'s call); observed {drain_spy.call_count} "
             f"call(s)."
         )
