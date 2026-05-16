@@ -19,8 +19,9 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
-from wool.runtime.context import attached
+from wool.runtime.context import encode_snapshot
 from wool.runtime.context import install_task_factory
+from wool.runtime.context import with_snapshot
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
@@ -117,7 +118,7 @@ def _attach_strict_mode_warnings(exc: BaseException, encode_exc: BaseException) 
     routine exception.
 
     When strict mode promotes :class:`wool.ContextDecodeWarning` to an
-    exception, the post-run snapshot encode (``session.context.to_protobuf``)
+    exception, the post-run snapshot encode (``encode_snapshot``)
     raises a :class:`BaseExceptionGroup` of warning peers. Attach the peers
     to *exc* via PEP 678 ``__notes__`` (visible in tracebacks) and a
     ``__wool_context_warnings__`` attribute (programmatic access). The
@@ -188,12 +189,12 @@ class BackpressureLike(Protocol):
 
     Pass ``None`` (the default) to accept all tasks unconditionally.
 
-    The hook runs after the caller's wire-shipped ContextVar snapshot
-    is applied to the handler's context, so a hook that reads a
-    :class:`wool.ContextVar` (e.g., a tenant id) observes the caller's
-    value for that dispatch. This enables tenant- or request-scoped
-    admission decisions without plumbing values through the
-    :class:`BackpressureContext` explicitly.
+    The hook runs inside a ``with_snapshot`` scope that installs the
+    caller's wire-decoded :class:`wool.ContextVar` snapshot, so a hook
+    that reads a :class:`wool.ContextVar` (e.g., a tenant id) observes
+    the caller's value for that dispatch. This enables tenant- or
+    request-scoped admission decisions without plumbing values through
+    the :class:`BackpressureContext` explicitly.
 
     Both sync and async implementations are supported::
 
@@ -327,10 +328,12 @@ class WorkerService(protocol.WorkerServicer):
         in strict mode. Both modes emit a
         :class:`wool.ContextDecodeWarning` for each failure.
 
-        *Non-strict mode (default).* The routine still runs — with a
-        fresh empty context as fallback when initial-frame
-        deserialization fails — and the back-propagated snapshot is
-        replaced with an empty context when post-run serialization
+        *Non-strict mode (default).* The routine still runs — when
+        initial-frame deserialization fails, each unreadable entry is
+        dropped with a warning and the routine runs under whatever
+        partial snapshot decoded (an entirely unreadable frame leaves
+        the worker context unarmed) — and the back-propagated snapshot
+        is replaced with an empty context when post-run serialization
         fails. A snapshot serialization failure that coincides with
         a routine exception rides back as peers in a
         :class:`BaseExceptionGroup` (extending an existing group
@@ -472,17 +475,17 @@ class WorkerService(protocol.WorkerServicer):
                 async with session:
                     if self._backpressure is not None:
                         backpressure = self._backpressure
-                        # ``guarded=False`` — the dispatch task is not
-                        # running the routine itself, only reading
-                        # caller-shipped wool.ContextVar values for the
-                        # hook. The single-task ownership of
-                        # ``session.context`` belongs to the worker
-                        # task scheduled lazily on the first
-                        # ``__aiter__`` call below; entering the
-                        # guard here would race that scheduling
-                        # under ``Context._lock``.
+                        # The dispatch task is not running the
+                        # routine itself, only reading caller-shipped
+                        # wool.ContextVar values for the hook. The
+                        # work snapshot is decoded on this (main-loop)
+                        # thread, so the hook reads it on its owning
+                        # thread; the worker task scheduled lazily on
+                        # the first ``__aiter__`` call below re-stamps
+                        # the snapshot onto its own thread before
+                        # running the routine.
                         try:
-                            with attached(session.context, guarded=False):
+                            with with_snapshot(session.snapshot):
                                 decision = backpressure(
                                     BackpressureContext(
                                         active_task_count=len(self._docket),
@@ -552,16 +555,16 @@ class WorkerService(protocol.WorkerServicer):
                             # ``response.to_protobuf`` raising) raise
                             # directly here; gRPC stream cancellation
                             # raises ``CancelledError`` mid-iteration.
-                            # Drain the worker before snapshotting
-                            # ``session.context``: worker-failure
+                            # Drain the worker before reading
+                            # ``session.snapshot``: worker-failure
                             # paths arrive with the worker already
                             # finalized (so drain is a no-op), but
                             # cancellation and main-loop handler-
                             # level failures leave the worker mid-
-                            # ``_step``, racing the snapshot's read
-                            # of ``_data`` against the worker's
-                            # ``work_ctx.update`` /
-                            # ``work_ctx.to_protobuf`` writes.
+                            # ``_step``, racing the encode's read of
+                            # ``session.snapshot`` against the
+                            # worker's ``merge_snapshot`` /
+                            # post-step publish writes.
                             # :meth:`DispatchSession.drain` is
                             # idempotent — :meth:`__aexit__` will
                             # call it again on the way out. On the
@@ -598,8 +601,9 @@ class WorkerService(protocol.WorkerServicer):
                             ):
                                 e = e.__cause__
                             try:
-                                wire_context = session.context.to_protobuf(
-                                    serializer=session.serializer
+                                wire_context = encode_snapshot(
+                                    session.snapshot,
+                                    serializer=session.serializer,
                                 )
                             except Exception as encode_exc:
                                 # Strict-mode-only path: attach the

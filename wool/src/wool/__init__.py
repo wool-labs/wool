@@ -5,16 +5,14 @@ from typing import Final
 
 from tblib import pickling_support
 
-from wool.runtime.context import Context
-from wool.runtime.context import ContextAlreadyBound
+from wool.runtime.context import ConcurrentChainEntry
 from wool.runtime.context import ContextDecodeWarning
 from wool.runtime.context import ContextVar
 from wool.runtime.context import ContextVarCollision
 from wool.runtime.context import RuntimeContext
 from wool.runtime.context import Token
-from wool.runtime.context import copy_context
-from wool.runtime.context import create_task
-from wool.runtime.context import current_context
+from wool.runtime.context import install_task_factory
+from wool.runtime.context import to_thread
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryEventType
@@ -80,8 +78,7 @@ __worker_service__: Final[contextvars.ContextVar[WorkerService | None]] = (
 __all__ = [
     "BackpressureContext",
     "BackpressureLike",
-    "Context",
-    "ContextAlreadyBound",
+    "ConcurrentChainEntry",
     "ContextDecodeWarning",
     "ContextVar",
     "ContextVarCollision",
@@ -117,11 +114,10 @@ __all__ = [
     "WorkerPool",
     "WorkerProxy",
     "WorkerService",
-    "copy_context",
-    "create_task",
-    "current_context",
     "current_task",
+    "install_task_factory",
     "routine",
+    "to_thread",
 ]
 
 for symbol in __all__:
