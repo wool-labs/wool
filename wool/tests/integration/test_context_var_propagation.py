@@ -1,7 +1,7 @@
 """Integration tests for wool.ContextVar cross-worker propagation.
 
 These tests drive the full dispatch wire path — caller sets a wool
-ContextVar, Task.to_protobuf serializes it, gRPC carries it to a real
+ContextVar, encode_snapshot serializes it, gRPC carries it to a real
 worker subprocess, the worker unpickles the callable (importing
 routines.py and populating its wool.ContextVar registry), and the
 routine observes the propagated value. They complement the in-process
@@ -19,12 +19,11 @@ import warnings
 import pytest
 
 import wool
-from wool.runtime.context import attached
+from wool.runtime.context import current_snapshot
 from wool.runtime.context import dispatch_timeout
 
 from . import _collision_fixtures
 from . import routines
-from .conftest import ContextVarPattern
 from .conftest import PoolMode
 from .conftest import RoutineShape
 from .conftest import build_pool_from_scenario
@@ -471,7 +470,7 @@ class TestContextVarPropagation:
 @pytest.mark.integration
 class TestStdlibEquivalence:
     @pytest.mark.asyncio
-    async def test_coroutine_mutation_matches_stdlib(
+    async def test_coroutine_mutation_diverges_from_stdlib(
         self, credentials_map, retry_grpc_internal
     ):
         """Test coroutine back-propagation diverges from stdlib copy-on-write.
@@ -529,64 +528,79 @@ class TestStdlibEquivalence:
 @pytest.mark.integration
 class TestWoolContextAcrossWorkers:
     @pytest.mark.asyncio
-    async def test_caller_context_id_propagates_to_worker(
+    async def test_caller_chain_id_propagates_to_worker(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test worker observes the caller's wool.Context id.
+        """Test the worker observes the same chain id as the caller.
 
         Given:
-            A caller that captures ``current_context().id`` before a
-            dispatch and a routine that returns
-            ``current_context().id.hex`` from inside the worker
+            A caller that arms its context by setting a wool.ContextVar
+            and a routine that returns the worker-side snapshot
+            chain id hex.
         When:
-            The caller dispatches the routine
+            The caller dispatches the routine.
         Then:
-            It should return the same id hex as the caller's
-            captured id hex
+            It should return the caller's own chain id hex —
+            confirming the worker is armed on the caller's chain via
+            install_snapshot.
         """
 
-        # Arrange, act, & assert
         async def body():
             scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
-                caller_id = wool.current_context().id
-                observed_hex = await routines.return_current_context_id_hex()
-            assert observed_hex == caller_id.hex
+                # Arrange
+                routines.TENANT_ID.set("armed")
+                caller = current_snapshot()
+                assert caller is not None
+
+                # Act
+                observed_hex = await routines.return_current_chain_id_hex()
+
+            # Assert
+            assert observed_hex == caller.chain_id.hex
 
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_asyncio_child_task_forks_context_id(
+    async def test_asyncio_child_task_forks_chain_id(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test asyncio child task dispatches fork a fresh context id.
+        """Test an asyncio child task runs on a freshly forked chain id.
 
         Given:
-            A caller that enters an asyncio child task via
-            ``create_task`` and captures ``current_context().id``
-            inside the child before dispatch
+            An armed caller that enters an asyncio child task via
+            ``create_task`` and captures the parent and child chain
+            ids.
         When:
-            The child dispatches a routine that returns its own
-            observed context id
+            The child dispatches a routine.
         Then:
-            The routine should observe a different id from the
-            parent's id (stdlib fork parity)
+            It should observe the child's forked chain id on the
+            worker — the child's chain differs from the parent's
+            (stdlib copy-on-fork parity) and the worker arms on the
+            child's chain.
         """
 
-        # Arrange, act, & assert
         async def body():
             scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
 
             async with build_pool_from_scenario(scenario, credentials_map):
-                parent_id = wool.current_context().id
+                # Arrange
+                routines.TENANT_ID.set("armed")
+                parent = current_snapshot()
+                assert parent is not None
+                parent_id = parent.chain_id
 
                 async def _child():
-                    child_id = wool.current_context().id
-                    observed_hex = await routines.return_current_context_id_hex()
-                    return child_id, observed_hex
+                    child = current_snapshot()
+                    assert child is not None
+
+                    # Act
+                    observed_hex = await routines.return_current_chain_id_hex()
+                    return child.chain_id, observed_hex
 
                 child_id, observed_hex = await asyncio.create_task(_child())
 
+            # Assert
             assert child_id != parent_id
             assert observed_hex == child_id.hex
 
@@ -596,33 +610,40 @@ class TestWoolContextAcrossWorkers:
     async def test_seeded_context_dispatch_propagates_var_bindings(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test a Context pre-populated with var bindings ships those
-        bindings to the worker when the dispatch runs under it.
+        """Test var bindings seeded in a copied context ship to the worker.
 
         Given:
-            A freshly-constructed ``wool.Context`` (distinct from the
-            implicit current Context) populated with a TENANT_ID
-            binding via ``Context.run``, and a routine that returns
-            the var's observed value
+            A caller that seeds a TENANT_ID binding then copies the
+            live context with ``contextvars.copy_context``, and a
+            routine that returns the var's observed value.
         When:
-            The caller invokes the dispatch inside a
-            ``with attached(seed):`` block
+            The caller invokes the dispatch inside the copied
+            context's ``run``.
         Then:
-            The routine should return the seed value — the wire
-            snapshot picks up the seeded binding from the active
-            Context regardless of whether that Context was the
-            implicit current one or an explicitly constructed peer
+            It should return the seed value — the wire snapshot picks
+            up the seeded binding from the copied context's run.
         """
 
-        # Arrange, act, & assert
         async def body():
             scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
-                seed = wool.Context()
-                seed.run(lambda: routines.TENANT_ID.set("seed-value"))
+                # Arrange
+                token = routines.TENANT_ID.set("seed-value")
+                try:
+                    forked = contextvars.copy_context()
+                finally:
+                    routines.TENANT_ID.reset(token)
 
-                with attached(seed):
-                    result = await routines.get_tenant_id()
+                # Act
+                # forked.run() activates the copied context only long
+                # enough for ensure_future to schedule the dispatch, so
+                # the routine's wire snapshot is encoded from the seeded
+                # context; the await then completes outside run().
+                result = await forked.run(
+                    lambda: asyncio.ensure_future(routines.get_tenant_id())
+                )
+
+            # Assert
             assert result == "seed-value"
 
         await retry_grpc_internal(body)
@@ -663,6 +684,42 @@ class TestTokenAcrossWorkers:
             # Post-reset read on the worker restores pre-set Undefined,
             # which surfaces as the var's constructor default.
             assert worker_read == "unknown"
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_worker_reset_back_propagates_remove_signal_to_caller(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a worker-side reset back-propagates the remove signal to the caller.
+
+        Given:
+            A caller that sets TENANT_ID to a value and dispatches a
+            routine that resets it via the caller-minted Token on the
+            worker.
+        When:
+            The dispatch returns and the caller reads TENANT_ID via
+            get() with no argument.
+        Then:
+            It should return the constructor default "unknown" —
+            the merge remove-signal from the worker's reset
+            back-propagated and removed the binding from the caller's
+            snapshot, so only the constructor default remains.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                # Arrange
+                token = routines.TENANT_ID.set("caller-value")
+
+                # Act
+                await routines.accept_token_and_reset(token)
+
+                # Assert — back-propagation removed the binding; the
+                # constructor default surfaces from get() with no arg.
+                assert routines.TENANT_ID.get() == "unknown"
 
         await retry_grpc_internal(body)
 
@@ -810,23 +867,22 @@ class TestTokenAcrossWorkers:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_worker_minted_token_is_reusable_on_caller_then_rejects_reuse(
+    async def test_worker_minted_token_rejects_reset_on_caller_chain(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test a worker-minted Token round-trips and stays single-use.
+        """Test a worker-minted Token cannot be reset on the caller's chain.
 
         Given:
-            A routine that mints a Token via TENANT_ID.set(...) on
-            the worker and returns it to the caller, followed by
-            the caller consuming that Token locally via
-            TENANT_ID.reset(token)
+            A routine that mints a Token via TENANT_ID.set(...) on the
+            worker and returns it to the caller — the worker armed a
+            fresh chain, so the Token's chain id is the worker's.
         When:
-            The caller invokes TENANT_ID.reset(token) a second time
+            The caller invokes TENANT_ID.reset(token) locally.
         Then:
-            The second reset should raise RuntimeError — the
-            Token is logically single-use regardless of which side
-            minted it, and the identity round-trip back from the
-            worker must preserve that contract
+            It should raise ValueError naming the different chain —
+            under the snapshot model a worker-minted Token belongs to
+            the worker's chain and the caller's merge is one-way data,
+            not a chain handoff.
         """
 
         # Arrange, act, & assert
@@ -834,44 +890,36 @@ class TestTokenAcrossWorkers:
             scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
                 token = await routines.mint_tenant_token("W")
-                routines.TENANT_ID.reset(token)  # consume once locally
-                with pytest.raises(RuntimeError, match="already been used"):
+                with pytest.raises(ValueError, match="different chain"):
                     routines.TENANT_ID.reset(token)
 
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_worker_reset_of_worker_minted_then_caller_consumed_token_raises(
+    async def test_worker_minted_value_back_propagates_to_caller(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test forward-prop rejects worker reset of a worker-minted consumed Token.
+        """Test a worker-minted variable value back-propagates to the caller.
 
         Given:
-            A worker that mints a Token and returns it to the
-            caller; the caller consumes the Token locally via
-            TENANT_ID.reset(token); and a second routine dispatch
-            that passes the same (now-consumed) Token to a worker
-            that attempts TENANT_ID.reset(token)
+            A routine that mints a Token via TENANT_ID.set("W") on the
+            worker and returns it to the caller.
         When:
-            The second dispatch runs — forward-propagation carries
-            the caller's consumed-token state into the second
-            worker's scoped Context before the routine body executes
+            The caller reads TENANT_ID after the dispatch returns.
         Then:
-            The second worker's var.reset(token) should raise
-            RuntimeError and the exception should surface to the
-            caller's await, mirroring the caller-minted-Token case
-            for a Token that originated on the worker instead of on
-            the caller
+            The caller should observe "W" — the worker's snapshot
+            mutation rides the response wire and merges into the
+            caller's snapshot even though the Token itself stays
+            bound to the worker's chain.
         """
 
         # Arrange, act, & assert
         async def body():
             scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
-                token = await routines.mint_tenant_token("W")
-                routines.TENANT_ID.reset(token)
-                with pytest.raises(RuntimeError, match="already been used"):
-                    await routines.accept_token_and_reset(token)
+                await routines.mint_tenant_token("W")
+                observed = routines.TENANT_ID.get()
+            assert observed == "W"
 
         await retry_grpc_internal(body)
 
@@ -1797,127 +1845,76 @@ class TestMergedWireShapeEndToEnd:
 
 
 @pytest.mark.integration
-class TestExplicitWoolContextBindingAcrossWorkers:
+class TestForkedChildTaskDispatchAcrossWorkers:
     @pytest.mark.asyncio
-    async def test_explicit_wool_context_binding_propagates_var_to_worker(
+    async def test_child_task_dispatch_inherits_caller_var(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test wool.create_task with an explicit wool.Context binds and dispatches.
+        """Test a child task dispatch inherits the caller's wool.ContextVar value.
 
         Given:
-            A pre-populated wool.Context seeded with a TENANT_ID
-            value via Context.run, a child task created with
-            wool.create_task(coro, context=ctx), and a routine that
-            reads TENANT_ID on the worker
+            An armed caller that sets TENANT_ID and a child task
+            created with asyncio.create_task that dispatches a routine
+            reading TENANT_ID on the worker.
         When:
-            The child task awaits the dispatched routine
+            The child task awaits the dispatched routine.
         Then:
-            The routine should observe the explicitly bound
-            wool.Context's TENANT_ID value, proving the wool task
-            factory routes the explicit Context across the wire
-            independently of the caller's implicit current Context
+            The routine should observe the caller's value — the wool
+            task factory forks the parent snapshot onto the child,
+            carrying its variable bindings.
         """
 
         # Arrange, act, & assert
         async def body():
             scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
-                outer_token = routines.TENANT_ID.set("outer-caller-value")
+                token = routines.TENANT_ID.set("caller-value")
                 try:
-                    bound_ctx = wool.Context()
-                    bound_ctx.run(lambda: routines.TENANT_ID.set("explicit-bound-value"))
 
                     async def _child():
                         return await routines.get_tenant_id()
 
-                    task = wool.create_task(_child(), context=bound_ctx)
-                    result = await task
+                    result = await asyncio.create_task(_child())
                 finally:
-                    routines.TENANT_ID.reset(outer_token)
-            assert result == "explicit-bound-value"
+                    routines.TENANT_ID.reset(token)
+            assert result == "caller-value"
 
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_concurrent_dispatch_under_same_wool_context_raises(
+    async def test_concurrent_child_dispatches_are_isolated(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test two concurrent tasks bound to the same wool.Context fail.
+        """Test two concurrent child-task dispatches stay isolated.
 
         Given:
-            A single wool.Context and two child tasks each created
-            via wool.create_task(coro, context=same_ctx) that await
-            a remote routine
+            An armed caller and two child tasks created via
+            asyncio.create_task, each setting TENANT_ID to a distinct
+            value before dispatching a routine that reads it.
         When:
-            Both tasks are gathered concurrently
+            Both tasks are gathered concurrently.
         Then:
-            One task should complete successfully and the other
-            should raise RuntimeError because at most one task may
-            run inside a given wool.Context at a time — the wool
-            task factory's _context_scope first-task-wins guard fires
-            before the second task acquires _guard
+            Each routine should observe its own task's value — the
+            task factory forks each child onto a fresh chain so
+            mutations do not cross between siblings.
         """
 
         # Arrange, act, & assert
         async def body():
             scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
             async with build_pool_from_scenario(scenario, credentials_map):
-                shared_ctx = wool.Context()
-                shared_ctx.run(lambda: routines.TENANT_ID.set("shared-context-value"))
+                routines.TENANT_ID.set("caller-value")
 
-                async def _slow_dispatch():
-                    # An ``asyncio.sleep(0)`` lets the scheduler park
-                    # the first task before the second is created, so
-                    # both create_task calls execute while the first
-                    # is still mid-dispatch and the second hits the
-                    # first-task-wins guard.
+                async def _dispatch(value: str) -> str:
+                    routines.TENANT_ID.set(value)
                     await asyncio.sleep(0)
                     return await routines.get_tenant_id()
 
-                first_coro = _slow_dispatch()
-                second_coro = _slow_dispatch()
-                first = wool.create_task(first_coro, context=shared_ctx)
-                with warnings.catch_warnings(record=True) as captured:
-                    warnings.simplefilter("always", category=RuntimeWarning)
-                    try:
-                        second = wool.create_task(second_coro, context=shared_ctx)
-                    except RuntimeError as exc:
-                        # First-task-wins guard fired synchronously inside
-                        # the factory before the second task was even
-                        # scheduled. Close the unawaited coroutine and
-                        # await the first to get its successful result.
-                        second_coro.close()
-                        successes = [await first]
-                        failures = [exc]
-                    else:
-                        outcomes = await asyncio.gather(
-                            first, second, return_exceptions=True
-                        )
-                        successes = [
-                            o for o in outcomes if not isinstance(o, BaseException)
-                        ]
-                        failures = [o for o in outcomes if isinstance(o, BaseException)]
-                    # Force collection in this frame so any "coroutine
-                    # was never awaited" warning surfaces inside the
-                    # catch_warnings scope rather than at teardown.
-                    import gc
+                first = asyncio.create_task(_dispatch("tenant-a"))
+                second = asyncio.create_task(_dispatch("tenant-b"))
+                results = await asyncio.gather(first, second)
 
-                    gc.collect()
-                leaked = [
-                    w
-                    for w in captured
-                    if issubclass(w.category, RuntimeWarning)
-                    and "was never awaited" in str(w.message)
-                ]
-                assert leaked == [], (
-                    "Guard-rejected coroutine must be closed by _context_scope, "
-                    f"not leaked at GC; saw: {[str(w.message) for w in leaked]}"
-                )
-
-            assert len(failures) == 1
-            assert isinstance(failures[0], RuntimeError)
-            assert "first-task-wins" in str(failures[0])
-            assert successes == ["shared-context-value"]
+            assert results == ["tenant-a", "tenant-b"]
 
         await retry_grpc_internal(body)
 
@@ -2064,12 +2061,10 @@ class TestContextDecodeWarningAcrossWorkers:
             category=wool.ContextDecodeWarning)`` active for the
             duration of the dispatch attempt.
         When:
-            The caller dispatches a routine — Task.to_protobuf
-            invokes Context.to_protobuf which discovers the
-            unencodable var.
+            The caller dispatches a routine — encode_snapshot
+            discovers the unencodable var.
         Then:
-            ``Context.to_protobuf`` should raise a
-            ``BaseExceptionGroup`` whose peers are
+            It should raise a ``BaseExceptionGroup`` whose peers are
             ``wool.ContextDecodeWarning`` instances naming the
             offending var, and the dispatch must NOT leave the
             caller — strict mode promotes the warning before the
@@ -2113,75 +2108,70 @@ class TestContextDecodeWarningAcrossWorkers:
 
 
 @pytest.mark.integration
-class TestWoolCopyContextWithDispatch:
+class TestStdlibCopyContextWithDispatch:
     @pytest.mark.asyncio
-    async def test_wool_copy_context_seeded_value_propagates_under_attach(
+    async def test_copy_context_seeded_value_propagates_to_worker(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test wool.copy_context.run sets a value the dispatch ships.
+        """Test a value seeded inside a copied stdlib context ships to the worker.
 
         Given:
-            A caller that calls ``wool.copy_context()`` to fork the
-            current wool.Context, runs a setter inside the forked
-            Context to seed a TENANT_ID value, and dispatches the
-            routine while ``attached`` to the forked Context
+            A caller that seeds a TENANT_ID value, copies the live
+            context with ``contextvars.copy_context``, and dispatches
+            the routine inside the copy's ``run``.
         When:
-            The dispatched routine reads TENANT_ID
+            The dispatched routine reads TENANT_ID.
         Then:
-            The routine should return the seeded value, not the
-            outer caller's value, proving the forked copy is the
-            active source of truth and ships its bindings to the
-            worker independently of the implicit current Context
+            The routine should return the seeded value — the wool
+            snapshot rides in a stdlib contextvars.ContextVar and
+            copies with stdlib semantics.
         """
 
         # Arrange, act, & assert
         async def body():
             scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
-                outer_token = routines.TENANT_ID.set("outer-original")
-                try:
-                    forked = wool.copy_context()
-                    forked.run(lambda: routines.TENANT_ID.set("forked-seed"))
+                routines.TENANT_ID.set("forked-seed")
 
-                    with attached(forked):
-                        result = await routines.get_tenant_id()
-                finally:
-                    routines.TENANT_ID.reset(outer_token)
+                forked = contextvars.copy_context()
+                # forked.run() activates the copied context only long
+                # enough for ensure_future to schedule the dispatch, so
+                # the routine's wire snapshot is encoded from the seeded
+                # context; the await then completes outside run().
+                result = await forked.run(
+                    lambda: asyncio.ensure_future(routines.get_tenant_id())
+                )
             assert result == "forked-seed"
 
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_wool_copy_context_has_distinct_id_from_source(
+    async def test_copy_context_mutation_does_not_leak_back(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test wool.copy_context produces a fresh logical chain id.
+        """Test a mutation inside a copied stdlib context does not leak back.
 
         Given:
-            A caller that captures ``wool.current_context().id`` then
-            calls ``wool.copy_context()`` and dispatches a routine
-            that returns the worker-side ``current_context().id.hex``
-            inside the forked Context
+            An armed caller and a copied stdlib context in which a
+            setter rebinds TENANT_ID to a new value.
         When:
-            The dispatch runs under ``with attached(forked):``
+            The setter runs inside the copied context's ``run``.
         Then:
-            The worker-observed id should equal the forked Context's
-            id and differ from the outer caller's captured id —
-            ``copy_context`` mints a fresh chain id rather than
-            reusing the source's
+            The caller's own context should still observe its original
+            value — stdlib copy-on-write semantics.
         """
 
         # Arrange, act, & assert
         async def body():
             scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
-                outer_id = wool.current_context().id
-                forked = wool.copy_context()
+                routines.TENANT_ID.set("outer-original")
 
-                with attached(forked):
-                    observed_hex = await routines.return_current_context_id_hex()
-            assert observed_hex == forked.id.hex
-            assert forked.id != outer_id
+                forked = contextvars.copy_context()
+                forked.run(lambda: routines.TENANT_ID.set("forked-only"))
+
+                result = await routines.get_tenant_id()
+            assert result == "outer-original"
 
         await retry_grpc_internal(body)
 

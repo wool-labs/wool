@@ -1,22 +1,32 @@
 import contextvars
+import copy
 import gc
+import pickle
 import uuid
 
 import cloudpickle
 import pytest
+from hypothesis import HealthCheck
 from hypothesis import given
+from hypothesis import settings
 from hypothesis import strategies as st
 
 import wool
 from tests.helpers import scoped_context
-from wool.runtime.context import Context
+from wool import protocol
 from wool.runtime.context import ContextVar
 from wool.runtime.context import ContextVarCollision
 from wool.runtime.context import Token
-from wool.runtime.context import current_context
+from wool.runtime.context import current_snapshot
+from wool.runtime.context import decode_snapshot
 
 dumps = wool.__serializer__.dumps
 loads = cloudpickle.loads
+
+
+def _unique(stem: str) -> str:
+    """Return a process-unique variable name to avoid registry collisions."""
+    return f"{stem}_{uuid.uuid4().hex}"
 
 
 class TestContextVar:
@@ -24,17 +34,18 @@ class TestContextVar:
         """Test ContextVar initialization with a name and no default.
 
         Given:
-            A name string
+            A name string.
         When:
-            ContextVar is instantiated with the name
+            ContextVar is instantiated with the name.
         Then:
-            It should expose the name and raise LookupError on get() with no value set
+            It should expose the name and raise LookupError on get()
+            with no value set.
         """
         # Act
-        var = ContextVar("init_nameonly")
+        var = ContextVar(_unique("init_nameonly"))
 
         # Assert
-        assert var.name == "init_nameonly"
+        assert var.name.startswith("init_nameonly")
         with pytest.raises(LookupError):
             var.get()
 
@@ -42,14 +53,14 @@ class TestContextVar:
         """Test ContextVar initialization with a default value.
 
         Given:
-            A name string and a default value
+            A name string and a default value.
         When:
-            ContextVar is instantiated with both
+            ContextVar is instantiated with both.
         Then:
-            get() should return the default when no value is set
+            get() should return the default when no value is set.
         """
         # Arrange
-        var = ContextVar("init_withdefault", default=42)
+        var = ContextVar(_unique("init_withdefault"), default=42)
 
         # Act & assert
         assert var.get() == 42
@@ -58,38 +69,57 @@ class TestContextVar:
         """Test ContextVar infers namespace from the caller's top-level package.
 
         Given:
-            A ContextVar constructed from this test module
+            A ContextVar constructed from this test module.
         When:
-            No explicit namespace is provided
+            No explicit namespace is provided.
         Then:
-            The namespace should be the top-level package of ``__name__``
+            The namespace should be the top-level package of __name__.
         """
         # Arrange
         expected_ns = __name__.partition(".")[0]
 
         # Act
-        var = ContextVar("inferred")
+        var = ContextVar(_unique("inferred"))
 
         # Assert
         assert var.namespace == expected_ns
-        assert var.name == "inferred"
 
     def test___init___accepts_explicit_namespace(self):
         """Test ContextVar uses an explicit namespace when provided.
 
         Given:
-            A ContextVar constructed with namespace='myapp'
+            A ContextVar constructed with an explicit namespace.
         When:
-            No implicit inference is needed
+            No implicit inference is needed.
         Then:
-            The key should combine the explicit namespace with the name
+            The key should combine the explicit namespace with the name.
         """
         # Act
-        var = ContextVar("explicit", namespace="myapp")
+        var = ContextVar("explicit", namespace=_unique("ns"))
 
         # Assert
-        assert var.namespace == "myapp"
+        assert var.namespace.startswith("ns")
         assert var.name == "explicit"
+
+    def test___init___with_a_registered_key(self):
+        """Test re-declaring an already-registered key raises ContextVarCollision.
+
+        Given:
+            A ContextVar already registered under a key.
+        When:
+            ContextVar is invoked again with the identical key.
+        Then:
+            It should raise ContextVarCollision — keys must be unique
+            within a namespace.
+        """
+        # Arrange
+        namespace = _unique("dup_same")
+        first = ContextVar("v", namespace=namespace, default=1)
+
+        # Act & assert
+        with pytest.raises(ContextVarCollision):
+            ContextVar("v", namespace=namespace, default=1)
+        assert first.name == "v"
 
     @given(
         name=st.text(
@@ -100,35 +130,31 @@ class TestContextVar:
         default_a=st.one_of(st.integers(), st.text(), st.booleans()),
         default_b=st.one_of(st.integers(), st.text(), st.booleans()),
     )
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test___init___with_duplicate_key(self, name, default_a, default_b):
         """Test duplicate-key construction raises regardless of default match.
 
         Given:
-            Any non-empty name and pair of default values
+            Any non-empty name and pair of default values.
         When:
-            A ContextVar is constructed, then a second with the identical key
+            A ContextVar is constructed, then a second with the
+            identical key.
         Then:
-            The second construction raises ContextVarCollision whether or
-            not the two defaults are equal
+            The second construction raises ContextVarCollision whether
+            or not the two defaults are equal — distinct declarations
+            of the same key collide.
         """
         # A unique namespace per example guarantees the registry slot
-        # is free without needing teardown between Hypothesis examples
-        # (which share a single test-function invocation). The
-        # collision still fires within the example because both
-        # ContextVar calls use the same namespace + name.
+        # is free without needing teardown between Hypothesis examples.
         namespace = f"test_duplicate_{uuid.uuid4().hex}"
 
         # The registry holds vars weakly, so we hold ``first`` for the
-        # duration of the second construction; without that pin the
-        # weakref would drop before the second call and no collision
-        # would fire.
+        # duration of the second construction.
         first = ContextVar(name, namespace=namespace, default=default_a)
 
         with pytest.raises(ContextVarCollision):
             ContextVar(name, namespace=namespace, default=default_b)
 
-        # Hold ``first`` to the end so the collision actually had
-        # something to collide with.
         assert first.namespace == namespace
         assert first.name == name
 
@@ -136,33 +162,69 @@ class TestContextVar:
         """Test duplicate names across different namespaces are allowed.
 
         Given:
-            A ContextVar 'shared' in namespace 'lib_a'
+            A ContextVar in one namespace.
         When:
-            A second ContextVar 'shared' is constructed in namespace 'lib_b'
+            A second ContextVar with the same name is constructed in a
+            different namespace.
         Then:
-            Both should register without collision
+            Both should register without collision.
         """
+        # Arrange
+        ns_a = _unique("lib_a")
+        ns_b = _unique("lib_b")
+
         # Act
-        a = ContextVar("shared", namespace="lib_a")
-        b = ContextVar("shared", namespace="lib_b")
+        a = ContextVar("shared", namespace=ns_a)
+        b = ContextVar("shared", namespace=ns_b)
 
         # Assert
         assert a is not b
-        assert (a.namespace, a.name) == ("lib_a", "shared")
-        assert (b.namespace, b.name) == ("lib_b", "shared")
+        assert (a.namespace, a.name) == (ns_a, "shared")
+        assert (b.namespace, b.name) == (ns_b, "shared")
 
-    def test_get_with_explicit_default_fallback(self):
+    def test___init___stub_promotion_with_default(self):
+        """Test ContextVar.__new__ promotes a stub and seeds the supplied default.
+
+        Given:
+            A wire-decoded snapshot that creates a default-less stub for
+            a key, then a ContextVar construction for the same key with
+            an explicit default.
+        When:
+            ContextVar is constructed with default="promoted" for the
+            stub's key.
+        Then:
+            get() should return "promoted" — the stub is promoted in
+            place and the supplied default is adopted.
+        """
+        # Arrange
+        var_namespace = uuid.uuid4().hex
+        pb = protocol.Context(id=uuid.uuid4().hex)
+        pb.vars.add(
+            namespace=var_namespace,
+            name="stub_promote",
+            value=dumps("wire-value"),
+        )
+        # Decoding seeds a default-less stub for the key.
+        _decoded = decode_snapshot(pb)  # noqa: F841
+
+        # Act
+        var = ContextVar("stub_promote", namespace=var_namespace, default="promoted")
+
+        # Assert
+        assert var.get() == "promoted"
+
+    def test_get_with_an_explicit_default_on_an_unset_var(self):
         """Test ContextVar.get returns the supplied fallback when unset.
 
         Given:
-            A ContextVar with no class-level default and no value set
+            A ContextVar with no constructor default and no value set.
         When:
-            get() is called with a fallback argument
+            get() is called with a fallback argument.
         Then:
-            It should return the fallback argument
+            It should return the fallback argument.
         """
         # Arrange
-        var = ContextVar("no_default")
+        var = ContextVar(_unique("no_default"))
 
         # Act
         value = var.get("fallback")
@@ -170,231 +232,389 @@ class TestContextVar:
         # Assert
         assert value == "fallback"
 
-    def test_set_token_when_reset_from_first_set(self):
+    def test_get_prefers_explicit_default_over_constructor_default(self):
+        """Test ContextVar.get prefers a supplied fallback over the constructor default.
+
+        Given:
+            A ContextVar with a constructor default and no value set.
+        When:
+            get() is called with a different fallback argument.
+        Then:
+            It should return the supplied fallback, not the constructor
+            default.
+        """
+        # Arrange
+        var = ContextVar(_unique("get_priority"), default="ctor")
+
+        # Act & assert
+        assert var.get("explicit") == "explicit"
+
+    def test_get_with_a_constructor_default_and_no_value(self):
+        """Test ContextVar.get returns the constructor default when unset.
+
+        Given:
+            A ContextVar with a constructor default, no value set, and
+            no fallback argument.
+        When:
+            get() is called.
+        Then:
+            It should return the constructor default — the middle rung
+            of the get fallback ladder, between a supplied fallback and
+            LookupError.
+        """
+        # Arrange
+        var = ContextVar(_unique("ctor_default"), default="ctor")
+
+        # Act & assert
+        assert var.get() == "ctor"
+
+    def test_get_with_a_supplied_none_default(self):
+        """Test ContextVar.get returns None when None is supplied as the default.
+
+        Given:
+            A ContextVar with no constructor default and no value set.
+        When:
+            get(None) is called.
+        Then:
+            It should return None, not raise LookupError — get
+            distinguishes a supplied None default from no default
+            supplied, mirroring contextvars.ContextVar.get.
+        """
+        # Arrange
+        var = ContextVar(_unique("supplied_none"))
+
+        # Act & assert
+        assert var.get(None) is None
+
+    def test_get_with_a_constructor_none_default(self):
+        """Test ContextVar.get returns None when the constructor default is None.
+
+        Given:
+            A ContextVar constructed with default=None and no value set.
+        When:
+            get() is called with no fallback argument.
+        Then:
+            It should return None, not raise LookupError — a constructor
+            default of None is a real default, mirroring
+            contextvars.ContextVar.
+        """
+        # Arrange
+        var = ContextVar(_unique("ctor_none"), default=None)
+
+        # Act & assert
+        assert var.get() is None
+
+    def test_get_returns_set_value(self):
+        """Test ContextVar.get returns the value installed by set.
+
+        Given:
+            A ContextVar with a value set in the active context.
+        When:
+            get() is called.
+        Then:
+            It should return the set value.
+        """
+        # Arrange
+        var = ContextVar(_unique("get_set"))
+
+        # Act
+        with scoped_context():
+            var.set("value")
+
+            # Assert
+            assert var.get() == "value"
+
+    def test_get_with_armed_context_and_unset_var_returns_supplied_default(self):
+        """Test ContextVar.get on an armed context falls back for an unset var.
+
+        Given:
+            A context armed by setting one ContextVar, and a second
+            ContextVar that has never been set.
+        When:
+            get(default) is called on the second var.
+        Then:
+            It should return the supplied default without raising.
+        """
+        # Arrange
+        armed_var = ContextVar(_unique("arm_trigger"))
+        unset_var = ContextVar(_unique("unset_in_armed"), default="ctor_default")
+        no_default_var = ContextVar(_unique("no_default_in_armed"))
+
+        # Act & assert
+        with scoped_context():
+            armed_var.set("arms-it")
+            assert unset_var.get("supplied") == "supplied"
+            with pytest.raises(LookupError):
+                no_default_var.get()
+
+    def test_set_arms_an_unarmed_context(self):
+        """Test the first set arms the context with a snapshot.
+
+        Given:
+            A fresh, unarmed context where current_snapshot is None.
+        When:
+            ContextVar.set is called for the first time.
+        Then:
+            current_snapshot should return a Snapshot.
+        """
+        # Arrange
+        var = ContextVar(_unique("set_arms"))
+        with scoped_context():
+            assert current_snapshot() is None
+
+            # Act
+            var.set("x")
+
+            # Assert
+            assert current_snapshot() is not None
+
+    def test_set_returns_token(self):
+        """Test ContextVar.set returns a Token.
+
+        Given:
+            A ContextVar in an armed context.
+        When:
+            set is called.
+        Then:
+            It should return a Token instance.
+        """
+        # Arrange
+        var = ContextVar(_unique("set_token"))
+
+        # Act
+        with scoped_context():
+            token = var.set("x")
+
+            # Assert
+            assert isinstance(token, Token)
+
+    def test_set_rebuilds_the_snapshot_on_each_call(self):
+        """Test each set rebuilds a new immutable snapshot.
+
+        Given:
+            A wool.ContextVar set once on an armed context.
+        When:
+            set is called a second time.
+        Then:
+            It should install a snapshot distinct by identity from the
+            first — set rebuilds the immutable snapshot rather than
+            mutating it in place.
+        """
+        # Arrange
+        var = ContextVar(_unique("set_cow"))
+
+        # Act
+        with scoped_context():
+            var.set("first")
+            first_snapshot = current_snapshot()
+            var.set("second")
+            second_snapshot = current_snapshot()
+
+            # Assert
+            assert first_snapshot is not None
+            assert second_snapshot is not None
+            assert second_snapshot is not first_snapshot
+
+    def test_reset_with_first_set_token(self):
         """Test the first set's Token restores the var to its default on reset.
 
         Given:
             A ContextVar with a constructor default and a single set
-            that captures a Token
+            that captures a Token.
         When:
-            reset(token) is called
+            reset(token) is called.
         Then:
-            var.get() should return the constructor default
+            var.get() should return the constructor default.
         """
         # Arrange
-        var = ContextVar("restore_default", default="initial")
-        token = var.set("x")
+        var = ContextVar(_unique("restore_default"), default="initial")
 
         # Act
-        var.reset(token)
+        with scoped_context():
+            token = var.set("x")
+            var.reset(token)
 
-        # Assert
-        assert var.get() == "initial"
+            # Assert
+            assert var.get() == "initial"
 
-    def test_set_token_restores_outer_value_when_reset_from_nested_set(self):
+    def test_reset_with_nested_set_token(self):
         """Test a nested set's Token restores the outer set's value on reset.
 
         Given:
             A ContextVar set to "outer" and then set again to "inner"
-            capturing the inner Token
+            capturing the inner Token.
         When:
-            reset(inner_token) is called
+            reset(inner_token) is called.
         Then:
             var.get() should return "outer" — Tokens stack, each
-            restoring only the value replaced by its own set
+            restoring only the value replaced by its own set.
         """
         # Arrange
-        var = ContextVar("restore_outer", default="d")
-        var.set("outer")
-        inner_token = var.set("inner")
+        var = ContextVar(_unique("restore_outer"), default="d")
 
         # Act
-        var.reset(inner_token)
+        with scoped_context():
+            var.set("outer")
+            inner_token = var.set("inner")
+            var.reset(inner_token)
 
-        # Assert
-        assert var.get() == "outer"
+            # Assert
+            assert var.get() == "outer"
 
     def test_reset_with_used_token(self):
         """Test ContextVar.reset raises on a token already consumed.
 
         Given:
-            A ContextVar and a Token that has already been used
+            A ContextVar and a Token that has already been used.
         When:
-            reset() is called with the same token again
+            reset() is called with the same token again.
         Then:
-            It should raise RuntimeError
+            It should raise RuntimeError naming the used token.
         """
         # Arrange
-        var = ContextVar("once", default=0)
-        token = var.set(1)
-        var.reset(token)
+        var = ContextVar(_unique("once"), default=0)
 
         # Act & assert
-        with pytest.raises(RuntimeError):
+        with scoped_context():
+            token = var.set(1)
             var.reset(token)
+            with pytest.raises(RuntimeError, match="Token has already been used"):
+                var.reset(token)
 
     def test_reset_with_token_for_different_var(self):
         """Test ContextVar.reset rejects tokens minted by a different var.
 
         Given:
-            Two distinct ContextVar instances, each with a set value
+            Two distinct ContextVar instances, each with a set value.
         When:
-            reset() is called on one with the other's token
+            reset() is called on one with the other's token.
         Then:
-            It should raise ValueError
+            It should raise ValueError naming the different ContextVar.
         """
         # Arrange
-        a = ContextVar("reset_a", default=0)
-        b = ContextVar("reset_b", default=0)
-        token = a.set(1)
-
-        # Act & assert
-        with pytest.raises(ValueError):
-            b.reset(token)
-
-    def test_reset_restores_old_value_in_different_context_scope(self):
-        """Test reset restores old_value when invoked in a different Context scope.
-
-        Given:
-            A ContextVar set twice in the original Context, then a
-            different wool.Context scope entered via Context.run
-        When:
-            reset(token) is invoked inside the scoped Context
-        Then:
-            The var should revert to the value captured in the token
-        """
-        # Arrange
-        var = ContextVar("reset_fallback", default="initial")
-        var.set("first")
-        token = var.set("second")
-        seeded = contextvars.copy_context()
-
-        def body():
-            var.set("outer-most")
-            var.reset(token)
-            return var.get()
-
-        # Act
-        result = seeded.run(body)
-
-        # Assert
-        assert result == "first"
-
-    def test_reset_with_token_from_different_in_process_context(self):
-        """Test reset rejects a token minted in a different in-process Context.
-
-        Given:
-            A ContextVar and a Token minted by var.set(...) inside
-            ctx_a.run(...) — the token still holds its in-memory
-            Context reference (distinct from the cross-process
-            scenario covered elsewhere, which tests the UUID fallback
-            after pickling)
-        When:
-            var.reset(token) is called inside ctx_b.run(...) where
-            ctx_b is a different wool.Context in the same process
-        Then:
-            ValueError is raised with a message naming the different
-            wool.Context — the in-process identity check fires, not
-            the UUID fallback
-        """
-        # Arrange
-        var = ContextVar("inprocess_reset", default="d")
-        ctx_a = Context()
-        ctx_b = Context()
-        captured: list[Token] = []
-
-        def inside_a():
-            captured.append(var.set("a_value"))
-
-        ctx_a.run(inside_a)
-        token = captured[0]
-
-        def inside_b():
-            var.reset(token)
-
-        # Act & assert
-        with pytest.raises(ValueError, match="different wool.Context"):
-            ctx_b.run(inside_b)
-
-    def test_reset_with_reconstituted_token_when_chain_id_differs(self):
-        """Test reset raises ValueError for a reconstituted Token whose
-        originating chain id does not match the current Context.
-
-        Given:
-            A ContextVar, a Token minted in Context A and pickled,
-            the original Token then released and garbage-collected
-            so the process-wide token registry's weak entry drops,
-            and a fresh scoped_context(B) block whose id differs
-            from A
-        When:
-            The pickled bytes are loaded (producing a reconstituted
-            Token with _context=None and _context_id=A) and
-            var.reset(restored) is called under Context B
-        Then:
-            ValueError is raised with a message naming the different
-            wool.Context — the UUID fallback check on the
-            reconstituted branch fires because object-identity
-            comparison isn't available
-        """
-        # Arrange
-        var = ContextVar("reconstituted_chain_mismatch", default="d")
-        pickled: bytes
-
-        def mint_and_release() -> bytes:
-            with scoped_context():
-                token = var.set("x")
-                return wool.__serializer__.dumps(token)
-
-        pickled = mint_and_release()
-        gc.collect()
+        a = ContextVar(_unique("reset_a"), default=0)
+        b = ContextVar(_unique("reset_b"), default=0)
 
         # Act & assert
         with scoped_context():
-            restored = cloudpickle.loads(pickled)
-            with pytest.raises(ValueError, match="different wool.Context"):
-                var.reset(restored)
+            token = a.set(1)
+            with pytest.raises(
+                ValueError, match="Token was created by a different ContextVar"
+            ):
+                b.reset(token)
 
-    def test_reset_restores_unset_in_different_context_scope(self):
+    def test_reset_with_token_from_different_chain(self):
+        """Test ContextVar.reset rejects a token minted in a different chain.
+
+        Given:
+            A ContextVar and a Token minted in one armed context,
+            then a separate armed context (a fresh chain).
+        When:
+            reset(token) is called under the second chain.
+        Then:
+            It should raise ValueError naming the different chain.
+        """
+        # Arrange
+        var = ContextVar(_unique("reset_chain"), default="d")
+
+        # Act & assert
+        with scoped_context():
+            token = var.set("a")
+        with scoped_context():
+            var.set("b")
+            with pytest.raises(
+                ValueError, match="Token was created in a different chain"
+            ):
+                var.reset(token)
+
+    @pytest.mark.parametrize(
+        "not_a_token",
+        ["a-string", 42, None],
+        ids=["str", "int", "none"],
+    )
+    def test_reset_with_a_non_token_argument(self, not_a_token):
+        """Test ContextVar.reset rejects an argument that is not a Token.
+
+        Given:
+            An armed ContextVar and an argument that is not a
+            wool.Token — a string, an int, or None.
+        When:
+            reset() is called with that argument.
+        Then:
+            It should raise TypeError naming wool.Token — the type
+            check guards reset before any token-state inspection.
+        """
+        # Arrange
+        var = ContextVar(_unique("reset_not_token"))
+
+        # Act & assert
+        with scoped_context():
+            var.set("x")
+            with pytest.raises(TypeError, match="wool.Token"):
+                var.reset(not_a_token)
+
+    def test_reset_with_a_used_token_for_a_different_var(self):
+        """Test ContextVar.reset reports a used token before a wrong-var token.
+
+        Given:
+            A Token that has already been consumed by a reset on its own
+            ContextVar, passed to reset on a different ContextVar — so
+            the token is BOTH already-used AND created by a different
+            var.
+        When:
+            reset() is called with that token on the other var.
+        Then:
+            It should raise RuntimeError for the used token, not
+            ValueError for the wrong var — the used-token guard is
+            checked first.
+        """
+        # Arrange
+        a = ContextVar(_unique("reset_used_a"), default=0)
+        b = ContextVar(_unique("reset_used_b"), default=0)
+
+        # Act & assert
+        with scoped_context():
+            token = a.set(1)
+            a.reset(token)
+            with pytest.raises(RuntimeError, match="Token has already been used"):
+                b.reset(token)
+
+    def test_reset_restores_unset_state(self):
         """Test reset restores unset state when old_value was MISSING.
 
         Given:
             A previously-unset ContextVar whose set() Token captured
-            MISSING as the old_value, then a different wool.Context
-            scope entered via Context.run
+            MISSING as the old_value.
         When:
-            reset(token) is invoked in the scoped Context
+            reset(token) is invoked.
         Then:
             The var should revert to unset; get(fallback) returns the
-            supplied fallback
+            supplied fallback.
         """
         # Arrange
-        var = ContextVar("reset_unset_fallback")
-        token = var.set("briefly")
-        seeded = contextvars.copy_context()
-
-        def body():
-            var.set("nested")
-            var.reset(token)
-            return var.get("<fallback>")
+        var = ContextVar(_unique("reset_unset"))
 
         # Act
-        result = seeded.run(body)
+        with scoped_context():
+            token = var.set("briefly")
+            var.reset(token)
 
-        # Assert
-        assert result == "<fallback>"
+            # Assert
+            assert var.get("<fallback>") == "<fallback>"
 
     def test_pickle_roundtrip_when_var_registered(self):
-        """Test cloudpickle roundtrips a ContextVar to the same registered instance.
+        """Test the wool serializer roundtrips a ContextVar to the same instance.
 
         Given:
-            A ContextVar registered in the process-wide registry
+            A ContextVar registered in the process-wide registry.
         When:
-            It is pickled and unpickled via dumps / loads
+            It is dumped via the wool serializer and loaded back.
         Then:
-            The unpickled instance should be the same object as the original
+            The unpickled instance should be the same object as the
+            original.
         """
         # Arrange
-        var = ContextVar("shipped")
+        var = ContextVar(_unique("shipped"))
 
         # Act
         restored = loads(dumps(var))
@@ -402,207 +622,89 @@ class TestContextVar:
         # Assert
         assert restored is var
 
-    def test_pickle_roundtrip_when_key_unregistered_on_receiver(self):
-        """Test loads() creates a stub when the var key is not registered.
+    def test_pickle_roundtrip_does_not_write_to_receiver_snapshot(self):
+        """Test the wool serializer roundtrip of a ContextVar carries identity only.
 
         Given:
-            Pickle bytes of a ContextVar whose registry slot has been
-            reclaimed via GC (the var instance was constructed inside
-            a nested Context.run block, pickled while bound to a
-            value, and released on block exit so the
-            WeakValueDictionary entry can drop)
+            A ContextVar set to a specific value in the current context.
         When:
-            loads(pickled) is called inside a fresh Context scope
+            The var is dumped and loaded inside a fresh unarmed context.
         Then:
-            The restored var's key and default match the original,
-            but the receiver's Context contains no entry for the var
-            and get(fallback) returns the fallback — pickle preserves
-            identity only and never writes to the receiver's Context
-        """
-        # Arrange — pickle inside a nested Context.run so the
-        # ephemeral var's strong ref in that Context's data dict
-        # drops with the scope, letting the WeakValueDictionary slot
-        # clear on gc.collect().
-        captured: list[tuple[bytes, tuple[str, str]]] = []
-
-        def pickle_ephemeral():
-            ephemeral = ContextVar(
-                "stub_unknown",
-                namespace="test_stub_create",
-                default="d",
-            )
-            ephemeral.set("sender_value")
-            captured.append((dumps(ephemeral), (ephemeral.namespace, ephemeral.name)))
-
-        Context().run(pickle_ephemeral)
-        gc.collect()
-
-        pickled, original_key = captured[0]
-
-        observed: list[tuple[ContextVar, Context]] = []
-
-        def in_fresh():
-            restored = loads(pickled)
-            observed.append((restored, current_context()))
-
-        # Act
-        Context().run(in_fresh)
-
-        # Assert
-        assert len(observed) == 1
-        restored, receiver_ctx = observed[0]
-        assert (restored.namespace, restored.name) == original_key
-        assert restored.get("fallback") == "fallback"
-        assert restored not in receiver_ctx
-
-    def test_pickle_roundtrip_does_not_write_to_receiver_context(self):
-        """Test pickling a ContextVar does not propagate its value via reduce.
-
-        Given:
-            A ContextVar set to a specific value in the current
-            context
-        When:
-            The var is pickled and unpickled inside a fresh
-            wool.Context
-        Then:
-            The receiver's Context contains no binding for the var
-            and var.get() falls back through the receiver Context's
-            empty data to the constructor default — pickle is a key-
-            only payload; state propagation rides on the wire-context
-            path, not the reduce tuple
+            The receiver's snapshot stays unarmed and var.get falls back
+            to the constructor default — the pickle path is a key-only
+            payload, never a value snapshot.
         """
         # Arrange
-        var = ContextVar("pickle_with_value", default="default_value")
-        var.set("sender_value")
-        pickled = dumps(var)
+        var = ContextVar(_unique("pickle_with_value"), default="default_value")
 
         # Act
-        observed_get: list[object] = []
-        observed_ctx: list[Context] = []
+        with scoped_context():
+            var.set("sender_value")
+            pickled = dumps(var)
 
-        def in_fresh():
+        observed: list[object] = []
+        with scoped_context():
             restored = loads(pickled)
-            observed_get.append(restored.get())
-            observed_ctx.append(current_context())
-
-        Context().run(in_fresh)
+            observed.append(restored.get())
+            observed.append(current_snapshot())
 
         # Assert
-        assert observed_get == ["default_value"]
-        assert var not in observed_ctx[0]
+        assert observed[0] == "default_value"
+        assert observed[1] is None
 
-    def test_pickle_roundtrip_when_var_unset(self):
-        """Test pickling a never-set ContextVar leaves the receiver clean.
+    def test_contextvar_pickle_reload_after_wire_decode_seeds_default(self):
+        """Test loading a cloudpickled ContextVar with a default seeds an existing stub.
 
         Given:
-            A ContextVar that has never been set in the current
-            context
+            A receiver process where a wire protocol.Context carrying a
+            value for a ContextVar key is decoded first — creating a
+            default-less stub — and a cloudpickle dump of a ContextVar
+            for the same key with a non-Undefined default is loaded
+            second, after the originating ContextVar has been released.
         When:
-            The var is pickled and unpickled inside a fresh
-            wool.Context
+            cloudpickle.loads runs over the pickle.
         Then:
-            The receiver's var.get() returns the class-level default
-            and the receiver's Context does not contain the var
+            It should return a ContextVar for that key whose get falls
+            back to the pickled default — the second ingress folded the
+            default into the stub rather than discarding it.
         """
         # Arrange
-        var = ContextVar("pickle_no_value", default="default_value")
-        pickled = dumps(var)
-
-        # Act
-        observed_get: list[object] = []
-        observed_ctx: list[Context] = []
-
-        def in_fresh():
-            restored = loads(pickled)
-            observed_get.append(restored.get())
-            observed_ctx.append(current_context())
-
-        Context().run(in_fresh)
-
-        # Assert
-        assert observed_get == ["default_value"]
-        assert var not in observed_ctx[0]
-
-    def test_later_declaration_after_preloaded_var(self):
-        """Test a later ContextVar declaration promotes a pre-existing stub.
-
-        Given:
-            A stub produced by unpickling an unknown-key pickle —
-            the registry holds a stub after loads()
-        When:
-            ContextVar(name, namespace=ns, default=<v>) is constructed
-            with the same (namespace, name)
-        Then:
-            The declaration returns the same instance as the restored
-            stub (no ContextVarCollision raised), and the declaration's
-            default value is observed via var.get() in a fresh Context
-            distinct from the stub's wire-value receiver Context
-        """
-        # Arrange — pickle inside a nested Context.run, let gc clear
-        # the slot, then unpickle to create a stub.
-        captured: list[bytes] = []
-
-        def pickle_ephemeral():
-            ephemeral = ContextVar(
-                "stub_promoted",
-                namespace="test_stub_promote",
-                default="d",
-            )
-            ephemeral.set("wire_value")
-            captured.append(dumps(ephemeral))
-
-        Context().run(pickle_ephemeral)
-        gc.collect()
-
-        pickled = captured[0]
-
-        # Hold a strong reference to the receiver Context so it
-        # outlives the pickle load, ensuring the later
-        # ContextVar(...) declaration runs against the registry
-        # state the load produced rather than landing on state
-        # already reclaimed by GC.
-        receiver = Context()
-        stub_capture: list[ContextVar] = []
-
-        def in_receiver():
-            stub_capture.append(loads(pickled))
-
-        receiver.run(in_receiver)
-        restored = stub_capture[0]
-
-        # Act — authoritative declaration with a new default.
-        promoted = ContextVar(
-            "stub_promoted",
-            namespace="test_stub_promote",
-            default="auth_default",
+        var_namespace = uuid.uuid4().hex
+        var = ContextVar(
+            "wire_then_pickle", namespace=var_namespace, default="from-pickle"
         )
+        pickled_var = dumps(var)
+        del var
+        gc.collect()
 
-        # Assert — same instance (stub was promoted, not replaced).
-        assert promoted is restored
+        pb = protocol.Context(id=uuid.uuid4().hex)
+        pb.vars.add(
+            namespace=var_namespace,
+            name="wire_then_pickle",
+            value=dumps("from-wire"),
+        )
+        # Bound to keep the decoded snapshot alive so its stub_pins anchor
+        # holds the registered stub through the loads() call below.
+        _decoded = decode_snapshot(pb)  # noqa: F841
 
-        # And the promoted default is observed in a fresh Context
-        # (distinct from the receiver Context that holds wire_value).
-        observed_default: list[object] = []
+        # Act
+        restored_var = loads(pickled_var)
 
-        def in_fresh():
-            observed_default.append(promoted.get())
-
-        Context().run(in_fresh)
-
-        assert observed_default == ["auth_default"]
+        # Assert
+        assert restored_var.get() == "from-pickle"
 
     def test_repr_includes_namespace_and_name(self):
         """Test ContextVar repr includes the namespace and name.
 
         Given:
-            A ContextVar with a name
+            A ContextVar with a name.
         When:
-            repr() is called on it
+            repr() is called on it.
         Then:
-            The repr should include the namespace and the name
+            It should include the namespace and the name.
         """
         # Arrange
-        var = ContextVar("repr_cv")
+        var = ContextVar(_unique("repr_cv"))
 
         # Act
         text = repr(var)
@@ -612,28 +714,20 @@ class TestContextVar:
         assert f"name={var.name!r}" in text
 
     def test_vanilla_pickle_copy_and_deepcopy_are_rejected(self):
-        """Test wool.ContextVar rejects pickle, cloudpickle, copy.copy,
-        and copy.deepcopy.
+        """Test wool.ContextVar rejects pickle, cloudpickle, copy.copy, and deepcopy.
 
         Given:
-            A wool.ContextVar
+            A wool.ContextVar.
         When:
             pickle.dumps, cloudpickle.dumps, copy.copy, and
-            copy.deepcopy are each invoked on it
+            copy.deepcopy are each invoked on it.
         Then:
-            All four raise TypeError. ContextVar identity lives in
-            the process-wide var_registry, and a vanilla restore
-            outside Wool's dispatch path bypasses the stub-promotion
-            and collision-detection that ContextVar._reconstitute
-            relies on — wool.__serializer__ remains the only valid
-            serialization channel.
+            All four raise TypeError — wool.__serializer__ remains the
+            only valid serialization channel.
         """
         # Arrange
-        import copy as _copy
-        import pickle
-
         match = "wool.ContextVar cannot be pickled"
-        var = ContextVar("var_pickle_rejection")
+        var = ContextVar(_unique("var_pickle_rejection"))
 
         # Act & assert
         with pytest.raises(TypeError, match=match):
@@ -641,83 +735,93 @@ class TestContextVar:
         with pytest.raises(TypeError, match=match):
             cloudpickle.dumps(var)
         with pytest.raises(TypeError, match=match):
-            _copy.copy(var)
+            copy.copy(var)
         with pytest.raises(TypeError, match=match):
-            _copy.deepcopy(var)
+            copy.deepcopy(var)
 
+    def test_get_does_not_arm_an_unarmed_context(self):
+        """Test ContextVar.get on an unarmed context leaves it unarmed.
 
-@pytest.mark.asyncio
-async def test_contextvar_pickle_reload_after_wire_decode_seeds_default():
-    """Test loading a cloudpickled :class:`ContextVar` with a default
-    seeds the receiver's stub when an earlier wire decode created it
-    without one.
+        Given:
+            A fresh unarmed context and a ContextVar with a default.
+        When:
+            get() is called.
+        Then:
+            current_snapshot should still be None — a read never arms a
+            context.
+        """
+        # Arrange
+        var = ContextVar(_unique("get_no_arm"), default="d")
 
-    Given:
-        A receiver process where a wire :class:`protocol.Context`
-        carrying a value for a :class:`ContextVar` key is decoded
-        first — creating a default-less stub via
-        :meth:`Context.from_protobuf` — and a cloudpickle dump of a
-        :class:`ContextVar` for the same key with a non-Undefined
-        default is loaded second, after the originating
-        :class:`ContextVar` has been released so the registry no
-        longer holds it.
-    When:
-        :func:`cloudpickle.loads` runs over the pickle.
-    Then:
-        It should return a :class:`ContextVar` for that key whose
-        :meth:`get` falls back to the pickled default — the second
-        ingress folded the default into the stub rather than silently
-        discarding it.
-    """
-    # Arrange
-    from wool import protocol
+        # Act
+        with scoped_context():
+            var.get()
 
-    var_namespace = uuid.uuid4().hex
+            # Assert
+            assert current_snapshot() is None
 
-    var = ContextVar("wire_then_pickle", namespace=var_namespace, default="from-pickle")
-    pickled_var = dumps(var)
-    del var
-    gc.collect()
+    @given(payload=st.text() | st.integers() | st.lists(st.integers()))
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test_set_get_round_trip_with_arbitrary_value(self, payload):
+        """Test set followed by get round-trips an arbitrary value.
 
-    pb = protocol.Context(id=uuid.uuid4().hex)
-    pb.vars.add(
-        namespace=var_namespace,
-        name="wire_then_pickle",
-        value=dumps("from-wire"),
-    )
-    # Bound to keep the wire-side Context alive so its stub anchor
-    # holds the registered stub through the loads() call below.
-    _secondary = Context.from_protobuf(pb)  # noqa: F841
+        Given:
+            Any text, integer, or list-of-integers value.
+        When:
+            The value is set on a ContextVar and read back via get.
+        Then:
+            get should return a value equal to the one set.
+        """
+        # Arrange
+        var = ContextVar(_unique("rt_set_get"))
 
-    # Act
-    restored_var = loads(pickled_var)
+        # Act & assert
+        with scoped_context():
+            var.set(payload)
+            assert var.get() == payload
 
-    # Assert
-    assert restored_var.get() == "from-pickle"
+    def test_set_value_propagates_into_seeded_contextvars_context(self):
+        """Test a set value is visible inside a stdlib Context copied after the set.
+
+        Given:
+            A ContextVar set to a value, then a stdlib contextvars.Context
+            copied from the live context.
+        When:
+            The var is read inside that copied Context via Context.run.
+        Then:
+            It should observe the set value — Wool chain state rides in a
+            stdlib contextvars.ContextVar and copies with stdlib semantics.
+        """
+        # Arrange
+        var = ContextVar(_unique("propagate_seeded"))
+
+        # Act
+        with scoped_context():
+            var.set("seeded")
+            seeded = contextvars.copy_context()
+            observed = seeded.run(var.get)
+
+        # Assert
+        assert observed == "seeded"
 
 
 def test_no_wool_contextvar_constructions_outside_runtime_context():
-    """Test wool source has no ``wool.ContextVar(...)`` constructor
-    calls outside the ``wool.runtime.context`` subpackage.
+    """Test wool source has no wool.ContextVar constructor calls outside the subpackage.
 
     Given:
-        The wool source tree under ``src/wool/``
+        The wool source tree under src/wool/.
     When:
-        Each module is parsed and walked for ``Call`` nodes whose
-        target resolves to ``wool.ContextVar`` (via any import alias
-        — ``wool.ContextVar``, ``from wool import ContextVar``,
-        ``from wool.runtime.context import ContextVar``, or the
-        deeper ``wool.runtime.context.var.ContextVar``)
+        Each module is parsed and walked for Call nodes whose target
+        resolves to wool.ContextVar via any import alias.
     Then:
-        No constructor call is found outside ``wool/runtime/context/``
-        — ``_infer_namespace`` only skips frames within that
-        submodule, so a wool-internal construction beyond it would
-        silently misattribute the var into ``wool``'s namespace
-        rather than the user's package. Adding such a construction
-        without first broadening the inference (or passing
-        ``namespace=`` explicitly) would be a latent footgun this
-        test catches at test time
+        No constructor call is found outside wool/runtime/context/ —
+        _infer_namespace only skips frames within that submodule, so a
+        wool-internal construction beyond it would misattribute the
+        var's namespace.
     """
+    # Architectural guardrail, not a behavior test: this lints the wool
+    # source tree for misplaced wool.ContextVar constructions rather than
+    # exercising ContextVar's own runtime behavior.
     import ast
     import importlib.util
     from pathlib import Path
@@ -740,7 +844,6 @@ def test_no_wool_contextvar_constructions_outside_runtime_context():
     ) -> None:
         func = call.func
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            # ``wool.ContextVar(...)`` style — bare alias resolves to wool.
             if imports.get(func.value.id) == "wool" and func.attr == "ContextVar":
                 offending.append(call.lineno)
         elif isinstance(func, ast.Name) and _resolves_to_contextvar(func.id, imports):
@@ -748,12 +851,6 @@ def test_no_wool_contextvar_constructions_outside_runtime_context():
 
     def _scan(file: Path) -> list[int]:
         tree = ast.parse(file.read_text(), filename=str(file))
-        # Flow-sensitive: walk the top-level body in source order, mutating
-        # the import map as Imports are encountered so that calls earlier
-        # in the file resolve against earlier imports — a later import that
-        # rebinds the same alias (e.g. ``from contextvars import ContextVar``
-        # after a wool import of the same name) does not retroactively mask
-        # an earlier wool construction.
         imports: dict[str, str] = {}
         offending: list[int] = []
         for stmt in tree.body:
@@ -782,8 +879,6 @@ def test_no_wool_contextvar_constructions_outside_runtime_context():
     # Assert
     assert not offenders, (
         "wool.ContextVar constructed outside wool.runtime.context — "
-        "_infer_namespace's skip predicate (`wool.runtime.context.*`) "
-        "would misattribute the namespace. Either pass `namespace=` "
-        "explicitly or broaden the skip predicate before adding such "
-        "a construction:\n" + "\n".join(f"  {f}:{ln}" for f, ln in offenders)
+        "_infer_namespace's skip predicate would misattribute the "
+        "namespace:\n" + "\n".join(f"  {f}:{ln}" for f, ln in offenders)
     )

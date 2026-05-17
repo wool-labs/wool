@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from inspect import isasyncgenfunction
@@ -35,8 +36,14 @@ from uuid import UUID
 
 import wool
 from wool import protocol
-from wool.runtime.context import Context
-from wool.runtime.context import attached
+from wool.runtime.context import Snapshot
+from wool.runtime.context import current_snapshot
+from wool.runtime.context import decode_snapshot
+from wool.runtime.context import encode_snapshot
+from wool.runtime.context import install_snapshot
+from wool.runtime.context import merge_snapshot
+from wool.runtime.context import snapshot_has_state
+from wool.runtime.context.snapshot import _current_owner_ref
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import _unpickle_serializer
 from wool.runtime.routine.task import routine_scope
@@ -115,7 +122,7 @@ class _Request:
         ``next``.
     :param caller_wire_context:
         The caller's :class:`protocol.Context` (to be decoded and
-        merged into the worker's ``work_ctx`` before the step runs).
+        merged into the active work snapshot before the step runs).
     """
 
     action: Literal["next", "send", "throw"]
@@ -127,26 +134,21 @@ class _Request:
         cls,
         request: protocol.Request,
         *,
-        work_ctx: Context,
         serializer: Serializer,
     ) -> _Request:
         """Decode a :class:`protocol.Request` into a request object.
 
         Reads the ``payload`` oneof and decodes ``send``/``throw``
-        bodies via *serializer* under
-        ``attached(work_ctx, guarded=False)`` — so any pickled
-        :class:`wool.ContextVar` / :class:`wool.Token` in the payload
-        reconstitutes against ``work_ctx`` rather than lazily
-        registering a Context on the dispatch handler's transient
-        task. The ``request.context`` field is forwarded as
+        bodies via *serializer*. Any pickled :class:`wool.ContextVar`
+        / :class:`wool.Token` in the payload reconstitutes against the
+        process-wide variable and token registries — pure identity,
+        with no dependence on which snapshot is active. The
+        ``request.context`` field is forwarded as
         ``caller_wire_context`` for the worker-loop side to decode and
-        merge into ``work_ctx`` before the routine step runs.
+        merge into the active snapshot before the routine step runs.
 
         :param request:
             The incoming :class:`protocol.Request`.
-        :param work_ctx:
-            The dispatch handler's :class:`Context`, used as the
-            attach scope for payload decode.
         :param serializer:
             Negotiated serializer for the payload.
         :raises ValueError:
@@ -158,12 +160,10 @@ class _Request:
             case "next":
                 return cls("next", None, request.context)
             case "send":
-                with attached(work_ctx, guarded=False):
-                    value = serializer.loads(request.send.dump)
+                value = serializer.loads(request.send.dump)
                 return cls("send", value, request.context)
             case "throw":
-                with attached(work_ctx, guarded=False):
-                    exc = serializer.loads(request.throw.dump)
+                exc = serializer.loads(request.throw.dump)
                 return cls("throw", exc, request.context)
             case _:  # pragma: no cover — defensive default for proto oneof
                 raise ValueError(
@@ -181,9 +181,9 @@ class _RequestQueue:
     :class:`_Request` via :meth:`_Request.from_protobuf` before
     returning. Decoding on the worker side keeps payload
     deserialization (which may reconstitute pickled
-    :class:`wool.ContextVar` / :class:`wool.Token` instances under
-    ``work_ctx``) inside the same task that owns ``work_ctx`` for
-    the routine's lifetime.
+    :class:`wool.ContextVar` / :class:`wool.Token` instances) inside
+    the worker-loop task that runs the routine under the work
+    snapshot.
 
     Closure: :meth:`close` pushes a sentinel so :meth:`get` returns
     :data:`None` once the producer side is done.
@@ -191,13 +191,11 @@ class _RequestQueue:
 
     def __init__(
         self,
-        work_ctx: Context,
         worker_loop: asyncio.AbstractEventLoop,
         *,
         serializer: Serializer,
     ) -> None:
         self._queue: asyncio.Queue[protocol.Request | _EndOfStream] = asyncio.Queue()
-        self._work_ctx = work_ctx
         self._worker_loop = worker_loop
         self._serializer = serializer
 
@@ -218,9 +216,7 @@ class _RequestQueue:
         item = await self._queue.get()
         if isinstance(item, _EndOfStream):
             return None
-        return _Request.from_protobuf(
-            item, work_ctx=self._work_ctx, serializer=self._serializer
-        )
+        return _Request.from_protobuf(item, serializer=self._serializer)
 
     def close(self) -> None:
         """Signal end of input by pushing the close sentinel.
@@ -315,18 +311,17 @@ async def _step(
     routine: Coroutine | AsyncGenerator,
     streaming: bool,
     request: _Request,
-    work_ctx: Context,
     *,
     serializer: Serializer,
 ) -> _Response:
     """Drive *routine* through one *request* and return the
     corresponding :class:`_Response`.
 
-    Decodes the caller's wire context, merges state into
-    ``work_ctx``, then steps the routine (``await routine`` for
+    Decodes the caller's wire context, merges it into the active
+    work snapshot, then steps the routine (``await routine`` for
     coroutines; ``asend|athrow`` for async-generators). Returns a
     result-bearing :class:`_Response` carrying the post-step
-    snapshot of ``work_ctx``.
+    snapshot.
 
     Most exceptions propagate raw — :class:`StopAsyncIteration`,
     routine-raised exceptions, snapshot encode failures — because
@@ -342,16 +337,14 @@ async def _step(
     ship as a typed response.
     """
     try:
-        incoming = Context.from_protobuf(
-            request.caller_wire_context, serializer=serializer
-        )
+        incoming = decode_snapshot(request.caller_wire_context, serializer=serializer)
     except BaseExceptionGroup as eg:
         raise BaseExceptionGroup(
             "mid-stream request context decode failed",
             list(eg.exceptions),
         ) from eg
-    if incoming.has_state():
-        work_ctx.update(incoming)
+    if snapshot_has_state(incoming):
+        merge_snapshot(incoming)
     if streaming:
         gen = cast(AsyncGenerator, routine)
         match request.action:
@@ -365,12 +358,15 @@ async def _step(
                 assert_never(request.action)
     else:
         value = await cast(Coroutine, routine)
-    return _Response(result=value, context=work_ctx.to_protobuf(serializer=serializer))
+    return _Response(
+        result=value,
+        context=encode_snapshot(current_snapshot(), serializer=serializer),
+    )
 
 
 class Rejected(Exception):
     """Raised by :meth:`DispatchSession.__aenter__` when the dispatch
-    parse phase fails — serializer setup, :class:`wool.Context`
+    parse phase fails — serializer setup, Wool context snapshot
     decode, :class:`wool.Task` rebuild, or routine-type validation.
 
     The dispatch handler catches this and replies with a Nack
@@ -400,20 +396,20 @@ class DispatchSession:
       it: resolves the negotiated serializer (cloudpickle for
       cross-process dispatch, a per-task
       :class:`PassthroughSerializer` from :data:`_passthrough_pool`
-      for self-dispatch), decodes the caller's wool.Context
-      snapshot, rebuilds the wool.Task under
-      ``attached(context, guarded=False)``, and validates the
-      routine type. Failures are wrapped in :class:`Rejected`
-      so the dispatch handler can surface them via
-      Nack-with-exception. A first-request read failure (empty
-      iterator, gRPC error) propagates raw — no parsed payload
-      exists to serialize for the caller.
+      for self-dispatch), decodes the caller's Wool context
+      snapshot, rebuilds the wool.Task, and validates the routine
+      type. Failures are wrapped in :class:`Rejected` so the
+      dispatch handler can surface them via Nack-with-exception. A
+      first-request read failure (empty iterator, gRPC error)
+      propagates raw — no parsed payload exists to serialize for the
+      caller.
 
       The worker-loop driver is **not** scheduled here; that
       happens lazily on the first ``__aiter__`` call so the
       dispatch handler can run pre-iteration decisions
-      (backpressure) against the parsed task and context without
-      contending with the worker for ``Context._guard()``.
+      (backpressure) against the parsed task and snapshot on the
+      main-loop thread before the worker task re-stamps the work
+      snapshot onto its own thread.
 
     - **Iteration** (``__aiter__``) schedules the worker driver on
       first call and drives the request/response loop on the main
@@ -431,7 +427,7 @@ class DispatchSession:
       request. Pre-stream worker failures raise out of
       :meth:`_ResponseQueue.get` and propagate raw — the dispatch
       handler's terminal-exception clause builds the wire response
-      with a snapshot of ``self.context`` and the dumped exception.
+      from ``self.snapshot`` and the dumped exception.
 
     - **Teardown** (``__aexit__``) calls :meth:`drain` (close
       request queue + await ``worker_done``) before unwinding
@@ -455,7 +451,7 @@ class DispatchSession:
       path on shutdown and by the dispatch handler as the on-exit
       cleanup hook. Idempotent.
 
-    Public attributes ``.task``, ``.context``, ``.serializer`` are
+    Public attributes ``.task``, ``.snapshot``, ``.serializer`` are
     populated on enter for use by the dispatch handler (e.g.,
     backpressure).
 
@@ -470,7 +466,7 @@ class DispatchSession:
     """
 
     task: Task
-    context: Context
+    snapshot: Snapshot
     serializer: Serializer
 
     def __init__(
@@ -572,7 +568,7 @@ class DispatchSession:
                 self.serializer = wool.__serializer__
 
             try:
-                self.context = Context.from_protobuf(
+                self.snapshot = decode_snapshot(
                     request.context, serializer=self.serializer
                 )
             except BaseExceptionGroup as eg:
@@ -597,8 +593,7 @@ class DispatchSession:
                     list(eg.exceptions),
                 ) from eg
 
-            with attached(self.context, guarded=False):
-                self.task = Task.from_protobuf(request.task)
+            self.task = Task.from_protobuf(request.task)
 
             if not (
                 iscoroutinefunction(self.task.callable)
@@ -629,11 +624,9 @@ class DispatchSession:
         """Set up the cross-loop request/response queues and
         schedule the worker driver. Called lazily from
         ``__aiter__`` on the first iteration so that backpressure
-        and other pre-iteration decisions run before any worker
-        task acquires the routine's :class:`Context` guard —
-        otherwise a main-loop ``attached(self.context)`` would race
-        the worker's ``_context_scope`` ``_guard()`` and spuriously
-        raise on every dispatch with a backpressure hook.
+        and other pre-iteration decisions run on the main-loop
+        thread, which owns the freshly decoded work snapshot, before
+        the worker task re-stamps that snapshot onto its own thread.
 
         Short-circuits when :meth:`cancel` was called before the
         first :meth:`__aiter__`: the queues stay ``None`` and
@@ -643,21 +636,49 @@ class DispatchSession:
             return
         main_loop = asyncio.get_running_loop()
         worker_done: concurrent.futures.Future = concurrent.futures.Future()
-        request_queue = _RequestQueue(
-            self.context, self._worker_loop, serializer=self.serializer
-        )
+        request_queue = _RequestQueue(self._worker_loop, serializer=self.serializer)
         response_queue = _ResponseQueue(main_loop, worker_done)
         self._request_queue = request_queue
         self._response_queue = response_queue
 
         work_task = self.task
-        work_ctx = self.context
+        work_snapshot = self.snapshot
         serializer = self.serializer
         streaming = self._streaming
 
         def _start():
             async def _run():
                 try:
+                    # Install the decoded work snapshot — but only when
+                    # the caller actually shipped Wool state. An empty
+                    # caller frame decodes to a stateless snapshot;
+                    # installing it would arm the routine's context for
+                    # nothing, so a routine that never touches a
+                    # wool.ContextVar would run armed (guard live)
+                    # rather than as a plain contextvars.Context. Gating
+                    # on ``snapshot_has_state`` keeps the worker honest
+                    # to the armed-gating contract; ``_step``'s
+                    # ``merge_snapshot`` still arms lazily if a later
+                    # mid-stream frame carries state.
+                    #
+                    # When state is present, the snapshot is re-stamped
+                    # so this worker-loop thread and task own the chain
+                    # — it was decoded on the main loop's thread, which
+                    # owned it for the backpressure hook. The routine
+                    # and every ``_step`` run under it. The worker loop
+                    # has Wool's task factory installed, so this
+                    # coroutine is wrapped in ``_forked_scope``; that
+                    # fork is a no-op here because ``_start`` runs in
+                    # the worker loop's unarmed base context. This
+                    # ``install_snapshot`` — not the factory — is what
+                    # arms the task, onto the caller's chain.
+                    if snapshot_has_state(work_snapshot):
+                        install_snapshot(
+                            work_snapshot.evolve(
+                                owner=threading.get_ident(),
+                                owner_task=_current_owner_ref(),
+                            )
+                        )
                     async with routine_scope(work_task) as routine:
                         while (request := await request_queue.get()) is not None:
                             try:
@@ -665,7 +686,6 @@ class DispatchSession:
                                     routine,
                                     streaming,
                                     request,
-                                    work_ctx,
                                     serializer=serializer,
                                 )
                             except StopAsyncIteration:
@@ -686,6 +706,12 @@ class DispatchSession:
                                 break
                     response_queue.close()
                 finally:
+                    # Publish the final work snapshot so the dispatch
+                    # handler's terminal-exception path can encode
+                    # worker-side variable mutations. ``drain``
+                    # synchronizes the read: by the time the handler
+                    # reads ``self.snapshot`` the worker task is done.
+                    self.snapshot = current_snapshot() or work_snapshot
                     # Stop the producer side immediately on any
                     # ``_run`` exit, including mid-frame routine
                     # exceptions that unwind past the ``async with
@@ -697,21 +723,23 @@ class DispatchSession:
                     # worker that had already failed.
                     request_queue.close()
 
+            coro = _run()
             try:
-                task = self._worker_loop.create_task(
-                    _run(),
-                    context=work_ctx,  # pyright: ignore[reportArgumentType]
-                )
+                task = self._worker_loop.create_task(coro)
             except BaseException as e:
                 # Late-loop-closure or task-factory failure:
                 # ``call_soon_threadsafe`` succeeded earlier (loop
                 # was open at scheduling time) but ``create_task``
                 # raises here because the loop has since closed
                 # (or the factory itself rejected the coroutine).
-                # Settle ``worker_done`` so :meth:`drain` does not
-                # await an unresolved future, and close the
+                # ``create_task`` never took ownership of ``coro``,
+                # so close it explicitly — an orphaned coroutine
+                # leaks a "coroutine was never awaited" RuntimeWarning
+                # at GC. Settle ``worker_done`` so :meth:`drain` does
+                # not await an unresolved future, and close the
                 # response queue so any pending
                 # :meth:`_ResponseQueue.get` returns immediately.
+                coro.close()
                 worker_done.set_exception(e)
                 response_queue.close()
                 return
@@ -765,9 +793,9 @@ class DispatchSession:
         """Close the request queue and await the worker driver to
         complete. Idempotent — safe to call multiple times.
 
-        After this returns, ``self.context`` is no longer being
-        mutated by the worker, so the dispatch handler can safely
-        snapshot it for the terminal-exception response.
+        After this returns, ``self.snapshot`` is no longer being
+        updated by the worker, so the dispatch handler can safely
+        encode it for the terminal-exception response.
 
         Worker exceptions raised during the drain are swallowed
         but logged at ``WARNING``: pre-stream and routine-time

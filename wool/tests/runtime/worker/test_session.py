@@ -2,7 +2,7 @@
 
 These tests exercise :class:`Rejected` and :class:`DispatchSession` through
 their public surface (constructor, ``async with``, ``async for``,
-:meth:`drain`, :meth:`cancel`, public attributes ``task``/``context``/
+:meth:`drain`, :meth:`cancel`, public attributes ``task``/``snapshot``/
 ``serializer``). Worker-loop interactions use the
 ``new_event_loop + threading.Thread + install_task_factory`` pattern
 so the handler can drive a real :func:`scoped` routine across loops.
@@ -22,7 +22,7 @@ from tests.runtime.worker.conftest import PicklableMock
 from wool import protocol
 from wool.protocol import WorkerStub
 from wool.protocol import add_WorkerServicer_to_server
-from wool.runtime.context import Context
+from wool.runtime.context import Snapshot
 from wool.runtime.context import install_task_factory
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
@@ -108,6 +108,30 @@ async def _coro_raising_routine_failure():
 
 def _sync_callable():
     return "not_async"
+
+
+# F1 regression — a module-level wool.ContextVar with a default plus a
+# coroutine routine that offloads, via *plain* asyncio.to_thread, a
+# function that reads it. When the routine is dispatched with no caller
+# Wool state, the worker context stays unarmed, so the offload runs as a
+# plain contextvars context and the read returns the default instead of
+# tripping ConcurrentChainEntry. Module-level so the routine and the var
+# are picklable for cloudpickle transport.
+_F1_VAR: wool.ContextVar[str] = wool.ContextVar(
+    "f1_unarmed_worker_var", default="unset-default"
+)
+
+
+def _read_f1_var() -> str:
+    """Read the F1 regression var — runs inside the offload thread."""
+    return _F1_VAR.get()
+
+
+async def _coro_offloads_plain_to_thread():
+    """Coroutine routine that offloads a wool.ContextVar read via
+    plain asyncio.to_thread.
+    """
+    return await asyncio.to_thread(_read_f1_var)
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +274,7 @@ class TestDispatchSession:
             :class:`DispatchSession` is constructed
         Then:
             It should be created without raising and ``task`` /
-            ``context`` / ``serializer`` should be unset before
+            ``snapshot`` / ``serializer`` should be unset before
             ``__aenter__``.
         """
         # Arrange
@@ -262,13 +286,13 @@ class TestDispatchSession:
 
         # Assert
         assert isinstance(handler, DispatchSession)
-        # Class-level annotations declare ``task`` and ``context``;
+        # Class-level annotations declare ``task`` and ``snapshot``;
         # they are only populated on enter so accessing them before
         # enter raises AttributeError.
         with pytest.raises(AttributeError):
             handler.task  # noqa: B018
         with pytest.raises(AttributeError):
-            handler.context  # noqa: B018
+            handler.snapshot  # noqa: B018
         # ``serializer`` is initialized in ``__init__`` to the
         # default cloudpickle so any pre-negotiation parse failure
         # (StopAsyncIteration, malformed task id, bad serializer
@@ -340,7 +364,7 @@ class TestDispatchSession:
         When:
             The handler is entered via ``async with``
         Then:
-            It should populate ``handler.task``, ``handler.context``,
+            It should populate ``handler.task``, ``handler.snapshot``,
             and set ``handler.serializer`` to ``wool.__serializer__``.
         """
         # Arrange
@@ -352,7 +376,7 @@ class TestDispatchSession:
             # Assert
             assert isinstance(handler.task, Task)
             assert handler.task.callable is _coro_returning_default
-            assert isinstance(handler.context, Context)
+            assert isinstance(handler.snapshot, Snapshot)
             assert handler.serializer is wool.__serializer__
 
     @pytest.mark.asyncio
@@ -599,7 +623,7 @@ class TestDispatchSession:
 
         Given:
             A request stream whose first frame is well-formed but
-            :meth:`Context.from_protobuf` raises a
+            :func:`decode_snapshot` raises a
             :class:`BaseExceptionGroup` of :class:`Exception` peers
         When:
             The handler is entered via ``async with``
@@ -612,18 +636,18 @@ class TestDispatchSession:
         task = _make_task(_coro_returning_default)
         stream = _stream(_request_for(task))
 
-        # Patch Context.from_protobuf to raise an Exception-only group.
+        # Patch decode_snapshot to raise an Exception-only group.
         # The constructor downgrades Exception-only groups to
         # ExceptionGroup so the parse-phase ``except Exception`` arm
         # routes it through Rejected.
         peer = ValueError("decode peer")
         eg = BaseExceptionGroup("simulated decode failure", [peer])
-        from wool.runtime.context import base as ctx_base
+        from wool.runtime.worker import session as session_module
 
         mocker.patch.object(
-            ctx_base.Context,
-            "from_protobuf",
-            classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(eg)),
+            session_module,
+            "decode_snapshot",
+            lambda *a, **kw: (_ for _ in ()).throw(eg),
         )
 
         # Act & assert
@@ -649,7 +673,7 @@ class TestDispatchSession:
             A request stream whose first frame triggers a
             :class:`BaseExceptionGroup` containing a non-Exception peer
             (e.g. :class:`asyncio.CancelledError`) from
-            :meth:`Context.from_protobuf`
+            :func:`decode_snapshot`
         When:
             The handler is entered via ``async with``
         Then:
@@ -665,12 +689,12 @@ class TestDispatchSession:
         # the parse-phase ``except Exception`` arm.
         peer = asyncio.CancelledError()
         eg = BaseExceptionGroup("simulated decode failure", [peer])
-        from wool.runtime.context import base as ctx_base
+        from wool.runtime.worker import session as session_module
 
         mocker.patch.object(
-            ctx_base.Context,
-            "from_protobuf",
-            classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(eg)),
+            session_module,
+            "decode_snapshot",
+            lambda *a, **kw: (_ for _ in ()).throw(eg),
         )
 
         # Act & assert
@@ -694,13 +718,16 @@ class TestDispatchSession:
 
         Given:
             A handler past :meth:`__aenter__` with a coroutine routine
-            returning a value
+            returning a value, dispatched with no caller Wool context
+            state
         When:
             The handler is iterated via ``async for``
         Then:
             It should yield exactly one response whose result is the
-            coroutine's return value and whose context carries the
-            post-step :class:`protocol.Context` snapshot.
+            coroutine's return value and whose context is an empty
+            :class:`protocol.Context` — a stateless dispatch leaves the
+            worker context unarmed, so the post-step snapshot carries no
+            chain id.
         """
         # Arrange
         task = _make_task(_coro_returning_default)
@@ -713,14 +740,43 @@ class TestDispatchSession:
         # Assert
         assert len(results) == 1
         assert results[0].result == "coroutine_value"
-        # The unified driver MUST emit a post-step context snapshot on
-        # every successful step (issue #187 motivation: "snapshot-encode
-        # duplicated across both paths"). The presence of an ``id`` on
-        # the response's :class:`protocol.Context` proves a snapshot
-        # was actually populated (a missing snapshot would surface as
-        # the empty default).
+        # The unified driver emits a post-step context on every
+        # successful step. With no caller state shipped, the worker
+        # context stays unarmed (F1: snapshot_has_state gating), so the
+        # encoded context is the empty default — no chain id.
         assert results[0].context is not None
-        assert results[0].context.id
+        assert not results[0].context.id
+
+    @pytest.mark.asyncio
+    async def test___aiter___stateless_dispatch_leaves_worker_context_unarmed(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test a stateless dispatch leaves the worker context unarmed.
+
+        Given:
+            A coroutine routine dispatched with no caller wool.ContextVar
+            state, whose body offloads a wool.ContextVar read through
+            plain asyncio.to_thread
+        When:
+            The handler is iterated via ``async for``
+        Then:
+            It should yield one response whose result is the variable's
+            constructor default — the worker context stayed unarmed
+            (F1: snapshot_has_state gating), so the plain to_thread
+            offload ran as a bare contextvars context and never tripped
+            wool.ConcurrentChainEntry.
+        """
+        # Arrange
+        task = _make_task(_coro_offloads_plain_to_thread)
+        stream = _stream(_request_for(task))
+
+        # Act
+        async with DispatchSession(stream, worker_loop) as handler:
+            results = [r async for r in handler]
+
+        # Assert
+        assert len(results) == 1
+        assert results[0].result == "unset-default"
 
     @pytest.mark.asyncio
     async def test___aiter___with_async_generator_task_yields_per_request(
@@ -1448,7 +1504,7 @@ class TestDispatchSession:
             initial-frame decode failures that share the same peer
             type.
         """
-        from wool.runtime.context import base as ctx_base
+        from wool.runtime.worker import session as session_module
 
         # Arrange — streaming routine that yields per ``next``.
         task = _make_task(_gen_three)
@@ -1462,20 +1518,20 @@ class TestDispatchSession:
         # and the first per-step decode succeed; the third call
         # (second mid-stream decode) raises a
         # ``BaseExceptionGroup`` of Exception-only peers.
-        original = ctx_base.Context.from_protobuf
+        original = session_module.decode_snapshot
         calls = {"n": 0}
         peer = ValueError("decode peer")
 
-        def fake_from_protobuf(cls, proto_ctx, *, serializer):
+        def fake_decode_snapshot(wire, *, serializer=None):
             calls["n"] += 1
             if calls["n"] >= 3:
                 raise BaseExceptionGroup("simulated decode failure", [peer])
-            return original.__func__(cls, proto_ctx, serializer=serializer)
+            return original(wire, serializer=serializer)
 
         mocker.patch.object(
-            ctx_base.Context,
-            "from_protobuf",
-            classmethod(fake_from_protobuf),
+            session_module,
+            "decode_snapshot",
+            fake_decode_snapshot,
         )
 
         # Act — iterate; the second step raises the re-wrapped
@@ -1745,15 +1801,14 @@ class TestDispatchSession:
         :meth:`__aenter__`.
 
         Regression test for the race between dispatch's backpressure
-        hook and the worker for :meth:`Context._guard` ownership.
-        Pre-fix :meth:`__aenter__` scheduled the worker eagerly; with
-        a backpressure hook that yielded the main loop while holding
-        ``attached(handler.context)``, the worker thread would race
-        to acquire the same Context's guard and spuriously raise
-        ``RuntimeError("wool.Context is already running...")``. The
-        invariant tested here — :meth:`__aenter__` is parse-only —
-        guarantees no contention regardless of how long any
-        post-parse main-loop work holds the Context.
+        hook and the worker for chain-snapshot ownership. Pre-fix
+        :meth:`__aenter__` scheduled the worker eagerly; with a
+        backpressure hook that yielded the main loop while reading the
+        decoded snapshot, the worker thread would race to re-stamp the
+        same snapshot's owner. The invariant tested here —
+        :meth:`__aenter__` is parse-only — guarantees no contention
+        regardless of how long any post-parse main-loop work holds the
+        snapshot.
 
         Given:
             A :class:`DispatchSession` constructed around a parsed
@@ -1891,10 +1946,10 @@ class TestDispatchSession:
         terminal-exception clause is reached while the worker is
         still alive. Main-loop handler-level failures (e.g.
         ``response.to_protobuf`` raising on dump) reach the except
-        clause with the worker mid-``_step`` mutating ``work_ctx``.
-        Without an explicit drain before the snapshot,
-        ``handler.context.to_protobuf(...)`` reads ``_data`` while
-        the worker writes it. The fix calls
+        clause with the worker mid-``_step`` mutating the work
+        snapshot. Without an explicit drain before the snapshot read,
+        ``encode_snapshot(handler.snapshot)`` reads the snapshot while
+        the worker rebuilds it. The fix calls
         :meth:`DispatchSession.drain` from dispatch's terminal-
         exception clause; :meth:`__aexit__` also calls drain (via
         its exit stack, idempotent) so the spy observes two calls
@@ -1950,7 +2005,7 @@ class TestDispatchSession:
         assert drain_spy.call_count >= 2, (
             f"Expected dispatch's terminal-exception clause to call "
             f"DispatchSession.drain before snapshotting "
-            f"DispatchSession.context (plus __aexit__'s call); "
+            f"DispatchSession.snapshot (plus __aexit__'s call); "
             f"observed {drain_spy.call_count} call(s)."
         )
 

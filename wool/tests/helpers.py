@@ -1,33 +1,42 @@
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Iterator
-from uuid import UUID
 
-from wool import protocol
-from wool.runtime.context import Context
-from wool.runtime.context import attached
+from wool.runtime.context import current_snapshot
+from wool.runtime.context import install_snapshot
 
 
 @contextmanager
-def scoped_context(id: UUID | None = None) -> Iterator[Context]:
-    """Test helper — install a wool.Context for the duration of the block.
+def scoped_context() -> Generator[None]:
+    """Test helper — run a block under a fresh, unarmed Wool context.
 
-    Mints a fresh chain id by default. Pass *id* to construct a
-    Context with a specific chain id, used by tests that exercise
-    chain-id-dependent semantics (e.g. ContextVar.reset's same-id
-    fallback). The id-bearing path goes through the public
-    ``Context.from_protobuf`` rather than the private
-    ``_reconstitute`` builder, since wool deliberately does not
-    expose an in-process id-only constructor (that would invite
-    duplicate-id Contexts and undercut the single-task-per-Context
-    invariant). On exit the prior scope's Context is restored.
+    Wool chain state rides in one wool-owned stdlib
+    ``contextvars.ContextVar`` as an immutable
+    :class:`~wool.runtime.context.snapshot.Snapshot`. This helper
+    captures whatever snapshot is active, installs ``None`` (the
+    unarmed state — no chain, no guard, behaves as a plain
+    :class:`contextvars.Context`), yields, then reinstalls the
+    captured snapshot on exit.
 
-    Attaches without claiming the single-task guard so tests can
-    invoke ``Context.run`` / ``attached(ctx)`` on the yielded
-    Context themselves.
+    Used by autouse isolation fixtures so a :meth:`wool.ContextVar.set`
+    in one test arms a snapshot that does not leak into the next.
+    The process-wide ``var_registry``/``token_registry`` are not
+    reset; tests SHOULD use unique key namespaces (e.g. via a uuid
+    suffix) to avoid cross-test collisions on shared keys.
     """
-    if id is None:
-        ctx = Context()
-    else:
-        ctx = Context.from_protobuf(protocol.Context(id=id.hex))
-    with attached(ctx, guarded=False):
-        yield ctx
+    saved = current_snapshot()
+    install_snapshot(None)
+    try:
+        yield
+    finally:
+        install_snapshot(saved)
+
+
+def context_is_unarmed() -> bool:
+    """Test helper — return whether the current context carries no Wool snapshot.
+
+    A module-level, picklable function so it can be dispatched to a
+    :class:`~concurrent.futures.ProcessPoolExecutor` worker, where it
+    proves a bare ``run_in_executor`` offload carries no Wool chain
+    into a worker process.
+    """
+    return current_snapshot() is None

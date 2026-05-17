@@ -3013,21 +3013,21 @@ class TestWorkerConnection:
             and ``except AttributeError`` respectively, so the
             routine's primary signal still ships.
         """
-        from wool.runtime.context import Context
+        # Arrange — patch decode_snapshot to raise the strict-mode
+        # decode group on each call. The exception arm in _read_next
+        # gets ``decode_failures`` populated and then tries to attach
+        # them via add_note and a sidecar attribute.
+        from wool.runtime.worker import connection as connection_module
 
-        # Arrange — patch Context.from_protobuf to raise the
-        # strict-mode decode group on each call. The exception arm
-        # in _read_next gets ``decode_failures`` populated and then
-        # tries to attach them via add_note and a sidecar attribute.
-        peer = ContextDecodeWarning("var-1 unencodable")
+        peer = ContextDecodeWarning("var-1 decode failure")
 
-        def encode_with_strict_failure(cls, *args, **kwargs):
-            raise BaseExceptionGroup("strict-mode encode group", [peer])
+        def decode_with_strict_failure(*args, **kwargs):
+            raise BaseExceptionGroup("strict-mode decode group", [peer])
 
         mocker.patch.object(
-            Context,
-            "from_protobuf",
-            classmethod(encode_with_strict_failure),
+            connection_module,
+            "decode_snapshot",
+            decode_with_strict_failure,
         )
 
         responses = (

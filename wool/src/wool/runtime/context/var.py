@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import threading
 from typing import Any
 from typing import Callable
 from typing import Final
@@ -9,11 +10,18 @@ from typing import NoReturn
 from typing import SupportsIndex
 from typing import TypeVar
 from typing import overload
+from uuid import uuid4
 
-from wool.runtime.context.base import current_context
+from wool.runtime.context.factory import ensure_task_factory_installed
+from wool.runtime.context.guard import _resolve_owner_task
+from wool.runtime.context.guard import assert_chain_owner
+from wool.runtime.context.guard import assert_owner_task
 from wool.runtime.context.registry import lock
 from wool.runtime.context.registry import var_registry
-from wool.runtime.context.stub import release_stub
+from wool.runtime.context.snapshot import Snapshot
+from wool.runtime.context.snapshot import _current_owner_ref
+from wool.runtime.context.snapshot import current_snapshot
+from wool.runtime.context.snapshot import install_snapshot
 from wool.runtime.context.stub import resolve_stub
 from wool.runtime.context.token import Token
 from wool.runtime.typing import Undefined
@@ -31,8 +39,16 @@ class ContextVarCollision(Exception):
 
     Keys must be unique within the inferred package namespace. Library
     authors should pass ``namespace=`` explicitly when constructing
-    vars from shared factory code; application code can rely on the
-    implicit package-name inference.
+    variables from shared factory code; application code can rely on
+    the implicit package-name inference.
+
+    Detection is best-effort under garbage collection: the process-wide
+    variable registry holds :class:`ContextVar` instances weakly, so a
+    key frees up once its previous instance is collected and a later
+    construction under that key then succeeds instead of colliding. In
+    practice :class:`ContextVar` instances are module-level singletons
+    held for the process lifetime, so a genuine collision always
+    raises.
     """
 
 
@@ -42,9 +58,14 @@ class ContextVar(Generic[T]):
 
     Mirrors :class:`contextvars.ContextVar` at the surface: construct
     with a name and optional default; call :meth:`get`, :meth:`set`,
-    :meth:`reset`. Unlike :class:`contextvars.ContextVar`, instances
-    pickle across process boundaries and their values propagate through
-    ``@wool.routine`` dispatches.
+    :meth:`reset`. The one surface difference: :meth:`get`,
+    :meth:`set`, and :meth:`reset` additionally raise
+    :class:`wool.ConcurrentChainEntry` when an armed chain is accessed
+    from a thread other than the one that owns it — stdlib
+    :class:`contextvars.ContextVar` never raises it. Unlike
+    :class:`contextvars.ContextVar`, instances pickle across process
+    boundaries and their values propagate through ``@wool.routine``
+    dispatches.
 
     **Identity model** — Every :class:`ContextVar` has a unique
     ``(namespace, name)`` key. The ``name`` is the first positional
@@ -56,20 +77,30 @@ class ContextVar(Generic[T]):
     **Namespace stability** — The inferred namespace is the top-level
     package of the calling frame. This is deliberately coarse so that
     wire keys stay stable when a module is refactored deeper within
-    its package — a rolling deploy that moves
-    ``myapp.auth.tokens`` to ``myapp.auth.credentials.tokens``
-    continues to propagate values between caller and worker. The
-    trade-off is that two subpackages of the same library cannot
-    define distinct vars with the same ``name`` without one of them
-    passing ``namespace=`` explicitly; the construction raises
-    :class:`ContextVarCollision` instead.
+    its package — a rolling deploy that moves ``myapp.auth.tokens``
+    to ``myapp.auth.credentials.tokens`` continues to propagate
+    values between caller and worker. The trade-off is that two
+    subpackages of the same library cannot define distinct variables
+    with the same ``name`` without one of them passing ``namespace=``
+    explicitly; the construction raises :class:`ContextVarCollision`
+    instead.
 
-    **Storage model** — Values are stored in the current
-    :class:`wool.Context` (one per :class:`asyncio.Task`, one per
-    thread for sync code) — separate state from the surrounding
-    :class:`contextvars.Context`. Child tasks fork a copy of the
-    parent's :class:`wool.Context` on creation when Wool's task
-    factory is installed on the running loop.
+    **Storage model** — Values ride in a single immutable
+    :class:`~wool.runtime.context.snapshot.Snapshot` held in one
+    Wool-owned stdlib :class:`contextvars.ContextVar`. Because the
+    snapshot rides in stdlib ``contextvars``, ``wool.ContextVar``
+    values propagate with stdlib visibility across every conformant
+    event loop and every cooperative asyncio scheduling edge — task
+    creation, ``call_soon``/``call_later``/``call_at``,
+    ``add_reader``/``add_writer``/``add_signal_handler``,
+    ``Future.add_done_callback``. The first :meth:`set` on a context
+    *arms* it: a chain UUID is minted and the concurrent-entry guard
+    engages. A context in which no :class:`ContextVar` has been set
+    is unarmed and behaves as a plain :class:`contextvars.Context`.
+
+    Child tasks fork a copy of the parent's snapshot under a fresh
+    chain UUID when Wool's task factory is installed on the running
+    loop.
 
     Values propagated across the wire must be cloudpicklable.
     """
@@ -137,6 +168,8 @@ class ContextVar(Generic[T]):
         * A non-stub registration already exists — :class:`ContextVarCollision`
           raises; keys must be unique within a namespace.
         """
+        if not isinstance(name, str):
+            raise TypeError("context variable name must be a str")
         if namespace is None:
             namespace = _infer_namespace()
         key = (namespace, name)
@@ -147,7 +180,6 @@ class ContextVar(Generic[T]):
                     if default is not Undefined:
                         existing._default = default
                     existing._stub = False
-                    release_stub(key)
                     return existing
                 raise ContextVarCollision(
                     f"wool.ContextVar {key!r} is already registered "
@@ -168,20 +200,22 @@ class ContextVar(Generic[T]):
     ) -> tuple[Callable[..., ContextVar[Any]], tuple[Any, ...]]:
         """Return constructor args for unpickling via Wool's pickler.
 
-        A :class:`ContextVar` is a key for resolving a value from
-        the active :class:`wool.Context`; its pickled state is
-        therefore the key plus the constructor default, never a
-        value snapshot. State propagation rides on the wire-context
-        path (:meth:`Context.to_protobuf` walks the sender's
-        ``_data``; :meth:`Context.from_protobuf` populates the
-        receiver's). The pickle path stays pure-identity so a
-        reconstituted var is a key only — `var.get()` on the
-        receiver resolves through the receiver's :class:`Context`
-        without the unpickle ever writing to it.
+        A :class:`ContextVar` is a key for resolving a value from the
+        active :class:`~wool.runtime.context.snapshot.Snapshot`; its
+        pickled state is therefore the key plus the constructor
+        default, never a value snapshot. State propagation rides on
+        the wire-context path
+        (:func:`~wool.runtime.context.snapshot.encode_snapshot` walks
+        the sender's snapshot;
+        :func:`~wool.runtime.context.snapshot.decode_snapshot`
+        populates the receiver's). The pickle path stays pure-identity
+        so a reconstituted variable is a key only — ``var.get()`` on
+        the receiver resolves through the receiver's snapshot without
+        the unpickle ever writing to it.
 
         ContextVar is guarded against vanilla pickling (see
-        :meth:`__reduce_ex__`); this method is invoked only by
-        Wool's own pickler.
+        :meth:`__reduce_ex__`); this method is invoked only by Wool's
+        own pickler.
         """
         return (
             ContextVar._reconstitute,
@@ -201,8 +235,8 @@ class ContextVar(Generic[T]):
 
         :func:`copy.copy` and :func:`copy.deepcopy` also route
         through ``__reduce_ex__`` and are rejected for the same
-        reason — a registry-bound ContextVar has no meaningful
-        copy semantics.
+        reason — a registry-bound ContextVar has no meaningful copy
+        semantics.
 
         :raises TypeError:
             Always.
@@ -218,8 +252,8 @@ class ContextVar(Generic[T]):
             f" default={self._default!r}" if self._default is not Undefined else ""
         )
         return (
-            f"<wool.ContextVar namespace={self._namespace!r} "
-            f"name={self._name!r}{default_part} at 0x{id(self):x}>"
+            f"<wool.ContextVar name={self._name!r} "
+            f"namespace={self._namespace!r}{default_part} at 0x{id(self):x}>"
         )
 
     @property
@@ -229,7 +263,7 @@ class ContextVar(Generic[T]):
 
     @property
     def namespace(self) -> str:
-        """The namespace this var belongs to."""
+        """The namespace this variable belongs to."""
         return self._namespace
 
     @overload
@@ -243,7 +277,7 @@ class ContextVar(Generic[T]):
     # "default is :data:`None`" (return :data:`None`). The user-facing surface
     # is constrained by the two ``@overload`` declarations above.
     def get(self, *args: T) -> T:
-        """Return the current value in the active :class:`wool.Context`.
+        """Return the current value in the active snapshot.
 
         :param default:
             Optional fallback returned when the variable has no value
@@ -251,43 +285,80 @@ class ContextVar(Generic[T]):
         :returns:
             The current value, the supplied fallback, or the
             constructor default.
+        :raises TypeError:
+            If more than one positional argument is supplied.
         :raises LookupError:
             If the variable has no value, no fallback, and no default.
+        :raises ConcurrentChainEntry:
+            If the active chain is being entered from a thread other
+            than the one that owns it.
         """
-        ctx = current_context()
-        try:
-            return ctx._data[self]
-        except KeyError:
-            if args:
-                return args[0]
-            if self._default is not Undefined:
-                return self._default
-            raise LookupError(self)
+        if len(args) > 1:
+            raise TypeError(f"get expected at most 1 argument, got {len(args)}")
+        snapshot = current_snapshot()
+        assert_chain_owner(snapshot)
+        assert_owner_task(snapshot)
+        if snapshot is not None and self in snapshot.data:
+            return snapshot.data[self]
+        if args:
+            return args[0]
+        if self._default is not Undefined:
+            return self._default
+        raise LookupError(self)
 
     def set(self, value: T) -> Token[T]:
-        """Set the variable's value in the active :class:`wool.Context`.
+        """Set the variable's value in the active snapshot.
+
+        The first :meth:`set` on an unarmed context arms it — mints a
+        fresh chain UUID and installs the first snapshot. Every
+        :meth:`set` rebuilds the immutable snapshot with the new
+        binding and reinstalls it.
 
         :param value:
             The new value.
         :returns:
-            A :class:`Token` usable with :meth:`reset` to restore
-            the previous value.
+            A :class:`Token` usable with :meth:`reset` to restore the
+            previous value.
+        :raises ConcurrentChainEntry:
+            If the active chain is being entered from a thread other
+            than the one that owns it.
         """
-        ctx = current_context()
-        old_value = ctx._data.get(self, Undefined)
-        ctx._data[self] = value
-        return Token(self, old_value, ctx)
+        snapshot = current_snapshot()
+        assert_chain_owner(snapshot)
+        assert_owner_task(snapshot)
+        if snapshot is None:
+            # First set on this context: arm it. Self-install the task
+            # factory so tasks forked after this point inherit the
+            # chain, then mint the chain UUID and stamp the running
+            # task as the chain's owner.
+            ensure_task_factory_installed()
+            snapshot = Snapshot(
+                chain_id=uuid4(),
+                owner=threading.get_ident(),
+                owner_task=_current_owner_ref(),
+            )
+        elif _resolve_owner_task(snapshot) is None:
+            # Adoption: the chain is armed but has no live owner task
+            # (the owner finished, was collected, or the chain was
+            # armed outside any task). The running task adopts
+            # ownership so a later concurrent task entering the same
+            # context still fails loud via assert_owner_task. A live
+            # foreign owner would already have raised above, so
+            # reaching here means the owner is absent — or is the
+            # current task, making the re-stamp a harmless no-op.
+            snapshot = snapshot.evolve(owner_task=_current_owner_ref())
+        old_value = snapshot.data.get(self, Undefined)
+        install_snapshot(snapshot.evolve(data={**snapshot.data, self: value}))
+        return Token(self, old_value, snapshot.chain_id)
 
     def reset(self, token: Token[T]) -> None:
         """Restore the variable to the value it had before *token*.
 
-        Matches :meth:`contextvars.ContextVar.reset` semantics,
-        scoped to the :class:`wool.Context`: the token must have
-        been created in the same :class:`wool.Context` as the one
-        currently active. Same-Context identity is checked by
-        comparing the :class:`wool.Context` UUID — the canonical
-        chain identity that holds across in-process and cross-
-        process boundaries.
+        Matches :meth:`contextvars.ContextVar.reset` semantics: the
+        token must have been minted in the same logical chain as the
+        one currently active. Chain identity is the snapshot
+        ``chain_id`` UUID — the canonical identity that holds across
+        in-process forks and cross-process boundaries.
 
         :param token:
             A token previously returned by :meth:`set`.
@@ -295,29 +366,36 @@ class ContextVar(Generic[T]):
             If the token has already been used.
         :raises ValueError:
             If the token was created by a different
-            :class:`ContextVar` or in a different
-            :class:`wool.Context`.
+            :class:`ContextVar` or in a different chain.
+        :raises ConcurrentChainEntry:
+            If the active chain is being entered from a thread other
+            than the one that owns it.
         """
-        if token._key != self._key:
-            raise ValueError("Token was created by a different ContextVar")
-        ctx = current_context()
-        if token._context_id != ctx._id:
-            raise ValueError("Token was created in a different wool.Context")
+        if not isinstance(token, Token):
+            raise TypeError(
+                f"reset expected an instance of wool.Token, got {type(token).__name__}"
+            )
         if token._used:
             raise RuntimeError("Token has already been used")
+        if token._key != self._key:
+            raise ValueError("Token was created by a different ContextVar")
+        snapshot = current_snapshot()
+        assert_chain_owner(snapshot)
+        assert_owner_task(snapshot)
+        if snapshot is None or token._chain_id != snapshot.chain_id:
+            raise ValueError("Token was created in a different chain")
         token._used = True
-        # Track the live Token via :class:`weakref.WeakSet` so the ID
-        # is reclaimed automatically when the Token is collected. If
-        # this UUID arrived earlier as a wire-supplied external entry
-        # (e.g. propagated from a prior hop before the local Token
-        # materialized), promote it now so emission goes through the
-        # auto-pruning path.
-        ctx._used_tokens.add(token)
-        ctx._external_used_tokens.pop(token._id, None)
+        new_data = dict(snapshot.data)
         if token._old_value is Undefined:
-            ctx._data.pop(self, None)
+            new_data.pop(self, None)
         else:
-            ctx._data[self] = token._old_value
+            new_data[self] = token._old_value
+        install_snapshot(
+            snapshot.evolve(
+                data=new_data,
+                consumed={**snapshot.consumed, token._id: self._key},
+            )
+        )
 
     @classmethod
     def _reconstitute(
@@ -331,15 +409,14 @@ class ContextVar(Generic[T]):
 
         Routes through :func:`resolve_stub` for the lookup-or-stub
         path so the wire-snapshot ingress (via
-        :meth:`Context.from_protobuf`) and the pickle ingress (this
-        method) converge on a single creation site. Pickle restores
-        identity only — the receiver's :class:`Context` is the
-        source of truth for value lookup, populated via the
-        wire-context path rather than as a side-effect of
+        :func:`~wool.runtime.context.snapshot.decode_snapshot`) and
+        the pickle ingress (this method) converge on a single
+        creation site. Pickle restores identity only — the receiver's
+        snapshot is the source of truth for value lookup, populated
+        via the wire-context path rather than as a side-effect of
         unpickling.
         """
-        ctx = current_context()
-        return resolve_stub((namespace, name), ctx, default=default)
+        return resolve_stub((namespace, name), default=default)
 
 
 def _infer_namespace() -> str:

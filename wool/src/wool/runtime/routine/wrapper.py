@@ -114,15 +114,16 @@ def routine(fn: C) -> C:
 
     **Context propagation and decode-failure semantics:**
 
-    Routines run inside their own :class:`wool.Context` on the worker,
-    which receives the caller's :class:`wool.ContextVar` snapshot on
-    dispatch and ships post-run mutations back on the response. Wool
-    treats this propagation as **ancillary state** — separate from the
-    routine's primary signal (its return value or raised exception):
+    Routines run on the worker under the caller's Wool chain: the
+    caller's :class:`wool.ContextVar` snapshot is decoded from the
+    dispatch frame and the routine runs under it, with post-run
+    mutations shipped back on the response. Wool treats this
+    propagation as **ancillary state** — separate from the routine's
+    primary signal (its return value or raised exception):
 
     - **Primary signal preservation.** A failure to decode the wire
-      :class:`wool.Context` (e.g., cross-version pickle skew on a
-      single var value) never preempts the routine's outcome. The
+      context snapshot (e.g., cross-version pickle skew on a single
+      variable value) never preempts the routine's outcome. The
       result is still returned; a routine exception is still raised.
     - **Visibility via warning.** Every ancillary decode failure emits
       a :class:`wool.ContextDecodeWarning` on the side that observed
@@ -139,9 +140,9 @@ def routine(fn: C) -> C:
 
           warnings.filterwarnings("error", category=wool.ContextDecodeWarning)
 
-      In strict mode :meth:`wool.Context.from_protobuf` aggregates
-      the per-entry exceptions into a :class:`BaseExceptionGroup`
-      that the caller observes in place of the primary signal:
+      In strict mode wire-context decode aggregates the per-entry
+      exceptions into a :class:`BaseExceptionGroup` that the caller
+      observes in place of the primary signal:
 
       * Result frames lose the routine's return value — the group
         raises instead.

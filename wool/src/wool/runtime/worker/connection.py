@@ -17,7 +17,11 @@ import grpc.aio
 
 import wool
 from wool import protocol
-from wool.runtime import context
+from wool.runtime.context import current_snapshot
+from wool.runtime.context import decode_snapshot
+from wool.runtime.context import encode_snapshot
+from wool.runtime.context import merge_snapshot
+from wool.runtime.context import snapshot_has_state
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import PassthroughSerializer
@@ -260,9 +264,7 @@ class _DispatchStream(Generic[_T]):
         try:
             request = protocol.Request(
                 next=protocol.Void(),
-                context=context.current_context().to_protobuf(
-                    serializer=self._serializer
-                ),
+                context=encode_snapshot(current_snapshot(), serializer=self._serializer),
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -274,9 +276,9 @@ class _DispatchStream(Generic[_T]):
         """Read the next response from the stream without writing —
         for paths that have already written their own request.
 
-        Applies the response's :class:`Context` into the caller's
-        current :class:`Context` — var mutations and consumed-token
-        state both ride back-propagation.
+        Merges the response's wire context into the caller's active
+        snapshot — variable mutations and consumed-token state both
+        ride back-propagation.
 
         :returns:
             The next task result from the worker.
@@ -285,21 +287,22 @@ class _DispatchStream(Generic[_T]):
             response = await anext(self._iter)
             # Wool treats response context as ancillary state. Per-var
             # decode failures aggregate inside
-            # :meth:`Context.from_protobuf` and surface as a
+            # :func:`~wool.runtime.context.snapshot.decode_snapshot`
+            # and surface as a
             # :class:`BaseExceptionGroup` only under strict mode; on the
             # primary-signal path we bundle them with the worker
             # exception (or the result-bearing response's group) so
             # callers can extract both signals via ``except*``.
             decode_failures: list[BaseException] = []
             try:
-                incoming_context = context.Context.from_protobuf(
+                incoming_snapshot = decode_snapshot(
                     response.context, serializer=self._serializer
                 )
             except BaseExceptionGroup as eg:
                 decode_failures.extend(eg.exceptions)
             else:
-                if incoming_context.has_state():
-                    context.current_context().update(incoming_context)
+                if snapshot_has_state(incoming_snapshot):
+                    merge_snapshot(incoming_snapshot)
             if response.HasField("result"):
                 try:
                     result = self._serializer.loads(response.result.dump)
@@ -473,9 +476,7 @@ class _DispatchStream(Generic[_T]):
         try:
             request = protocol.Request(
                 send=protocol.Message(dump=self._serializer.dumps(value)),
-                context=context.current_context().to_protobuf(
-                    serializer=self._serializer
-                ),
+                context=encode_snapshot(current_snapshot(), serializer=self._serializer),
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -519,9 +520,7 @@ class _DispatchStream(Generic[_T]):
 
             request = protocol.Request(
                 throw=protocol.Message(dump=self._serializer.dumps(exc)),
-                context=context.current_context().to_protobuf(
-                    serializer=self._serializer
-                ),
+                context=encode_snapshot(current_snapshot(), serializer=self._serializer),
             )
             await self._call.write(request)
             result = await self._read_next()
@@ -699,14 +698,14 @@ class WorkerConnection:
         mutations. Wire context is **ancillary state** under wool's
         protocol contract: per-entry decode failures emit
         :class:`wool.ContextDecodeWarning` instances inside
-        :meth:`Context.from_protobuf`. Under the warnings system's
-        default filter these surface once as warnings and decoding
-        returns the partial Context; under a filter that promotes
-        :class:`wool.ContextDecodeWarning` to an error,
-        :meth:`Context.from_protobuf` aggregates the per-entry
-        exceptions into a :class:`BaseExceptionGroup` and raises in
-        place of returning. Caller-side handling after loading the
-        primary signal:
+        :func:`~wool.runtime.context.snapshot.decode_snapshot`. Under
+        the warnings system's default filter these surface once as
+        warnings and decoding returns the partial snapshot; under a
+        filter that promotes :class:`wool.ContextDecodeWarning` to an
+        error, :func:`~wool.runtime.context.snapshot.decode_snapshot`
+        aggregates the per-entry exceptions into a
+        :class:`BaseExceptionGroup` and raises in place of returning.
+        Caller-side handling after loading the primary signal:
 
         * On a result frame, if decoding aggregated, the
           :class:`BaseExceptionGroup` raises in place of the return —
@@ -755,8 +754,9 @@ class WorkerConnection:
         Encode-side failures (e.g. a strict-mode
         :class:`BaseExceptionGroup` of
         :class:`wool.ContextDecodeWarning` peers raised by
-        :meth:`Context.to_protobuf` when an unpicklable
-        :class:`wool.ContextVar` value is set) propagate unwrapped:
+        :func:`~wool.runtime.context.snapshot.encode_snapshot` when
+        an unpicklable :class:`wool.ContextVar` value is set)
+        propagate unwrapped:
         the load-balancer contract treats only :class:`RpcError`
         instances as worker-health concerns, so a caller-side encode
         failure surfaces directly to the caller rather than evicting
@@ -838,7 +838,7 @@ class WorkerConnection:
         """
         request = protocol.Request(
             task=wire_task,
-            context=context.current_context().to_protobuf(serializer=serializer),
+            context=encode_snapshot(current_snapshot(), serializer=serializer),
         )
         await call.write(request)
         response = await anext(aiter(call))

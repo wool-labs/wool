@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import threading
 import weakref
 from typing import TYPE_CHECKING
@@ -11,15 +10,21 @@ from typing import NoReturn
 from typing import SupportsIndex
 from uuid import UUID
 
-from wool.runtime.typing import Undefined
-from wool.runtime.typing import UndefinedType
-
 if TYPE_CHECKING:
-    from wool.runtime.context.base import Context
     from wool.runtime.context.token import Token
     from wool.runtime.context.var import ContextVar
 
 
+# Serializes ``var_registry`` registration so concurrent declarations of
+# the same ``(namespace, name)`` key cannot observe an intermediate
+# state — see :meth:`ContextVar.__new__` and :func:`resolve_stub`. It
+# deliberately does NOT guard ``token_registry``: token registration
+# (:meth:`Token.__init__`) and used-flag promotion are left lock-free
+# because the single-runner-per-chain invariant means only one task
+# ever unpickles or mutates a given token's bytes at a time — see
+# :meth:`Token._reconstitute` for the full rationale. This is sound on
+# GIL builds; a free-threaded build would need the lock extended to the
+# check-then-insert in ``token_registry.setdefault``.
 lock: Final[threading.Lock] = threading.Lock()
 
 
@@ -75,127 +80,3 @@ def _resolve_token_registry() -> _TokenRegistry:
     cloudpickle's by-reference lookup requires a stable qualname.
     """
     return token_registry
-
-
-class _ContextToken:
-    """Restore cookie returned by :meth:`_ContextRegistry.set` and
-    consumed by :meth:`_ContextRegistry.reset` to undo a
-    :class:`Context` installation.
-
-    Mirrors :class:`contextvars.Token` in spirit: opaque to the
-    caller, carrying enough state to return the registry slot to
-    exactly where it was (including the "was-unset" case, which
-    :meth:`_ContextRegistry.reset` pops rather than rewriting to
-    ``None``).
-    """
-
-    __slots__ = ("_key", "_previous", "_used")
-
-    _key: asyncio.Task[Any] | threading.Thread
-    _previous: Context | None
-    _used: bool
-
-    def __init__(
-        self,
-        key: asyncio.Task[Any] | threading.Thread,
-        previous: Context | None,
-    ) -> None:
-        self._key = key
-        self._previous = previous
-        self._used = False
-
-
-class _ContextRegistry(
-    weakref.WeakKeyDictionary["asyncio.Task[Any] | threading.Thread", "Context"]
-):
-    """WeakKey registry of per-scope :class:`Context` bindings.
-
-    Implements the standard :class:`MutableMapping` protocol —
-    ``__getitem__`` raises :class:`KeyError` on miss (no auto-create).
-    Overrides :meth:`get` and :meth:`setdefault` to default the *key*
-    argument to :func:`scope_key` when omitted (or passed as
-    :data:`Undefined`), so callers asking about "the current scope"
-    do not have to spell out the lookup. Adds two wool-specific
-    methods: :meth:`set` returns a :class:`_ContextToken` that
-    captures the previous slot state for later :meth:`reset`
-    restoration.
-
-    Pickles by module-attribute reference under Wool's pickler.
-    Plain :class:`weakref.WeakKeyDictionary` is unpicklable
-    (weakrefs reject pickle), and cloudpickle serializes bound
-    classmethods like :meth:`Token._reconstitute` by walking the
-    function's globals and capturing each name by value. Without
-    the reduce hooks the by-value walk crashes on the registry; with
-    them, the registry reduces to a zero-arg lookup of this module's
-    :data:`context_registry` attribute, keeping the actual contents
-    process-local.
-    """
-
-    def get(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        key: asyncio.Task[Any] | threading.Thread | UndefinedType = Undefined,
-        default: Context | None = None,
-    ) -> Context | None:
-        if key is Undefined:
-            key = scope_key()
-        return super().get(key, default)  # pyright: ignore[reportArgumentType]
-
-    def setdefault(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        key: asyncio.Task[Any] | threading.Thread | UndefinedType = Undefined,
-        default: Context | None = None,
-    ) -> Context | None:
-        if key is Undefined:
-            key = scope_key()
-        return super().setdefault(key, default)  # pyright: ignore[reportArgumentType]
-
-    def set(self, ctx: Context) -> _ContextToken:
-        with lock:
-            key = scope_key()
-            previous = self.get(key)
-            self[key] = ctx
-        return _ContextToken(key, previous)
-
-    def reset(self, token: _ContextToken) -> None:
-        if token._used:
-            raise RuntimeError("token already consumed by reset")
-        token._used = True
-        with lock:
-            if token._previous is None:
-                self.pop(token._key, None)
-            else:
-                self[token._key] = token._previous
-
-    def __wool_reduce__(self) -> tuple[Callable[..., _ContextRegistry], tuple[()]]:
-        return (_resolve_context_registry, ())
-
-    def __reduce_ex__(self, _protocol: SupportsIndex) -> NoReturn:
-        raise TypeError(
-            "_ContextRegistry cannot be pickled via vanilla pickle/cloudpickle; "
-            "it is serialized automatically when dispatched through Wool's "
-            "runtime."
-        )
-
-
-context_registry: Final[_ContextRegistry] = _ContextRegistry()
-
-
-def _resolve_context_registry() -> _ContextRegistry:
-    """Return the process-wide :class:`Context` registry.
-
-    Module-level shim used by :meth:`_ContextRegistry.__wool_reduce__`
-    so cloudpickle's lookup-and-qualname path can pickle the registry
-    reference by name instead of by value. MUST stay at module level;
-    cloudpickle's by-reference lookup requires a stable qualname.
-    """
-    return context_registry
-
-
-def scope_key() -> asyncio.Task[Any] | threading.Thread:
-    """Identify the current execution scope (asyncio task, or
-    thread for sync callers).
-    """
-    try:
-        return asyncio.current_task() or threading.current_thread()
-    except RuntimeError:
-        return threading.current_thread()
