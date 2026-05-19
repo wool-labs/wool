@@ -45,6 +45,30 @@ class _Unguarded:
         return hash(("_Unguarded", self.payload))
 
 
+class _UnhashableSerializer:
+    """Serializer-shaped test double that is unhashable.
+
+    Overrides ``__eq__`` without supplying a compatible ``__hash__``, so
+    Python silently sets ``__hash__`` to ``None`` and the type is
+    unhashable — modelling an implementation that violates the
+    :class:`Serializer` hashability requirement.
+    """
+
+    def __eq__(self, other):
+        return isinstance(other, _UnhashableSerializer)
+
+    def dumps(self, obj):
+        return b""
+
+    def loads(self, data):
+        return None
+
+
+def _module_level_callable(value):
+    """Plain module-level callable used to exercise serializer round-trips."""
+    return value * 3
+
+
 def _arbitrary_payloads():
     """Recursive Hypothesis strategy covering nested cloudpickle-picklable values."""
     primitives = st.one_of(
@@ -163,8 +187,8 @@ class TestCloudpickleSerializer:
             Their hashes and equality are evaluated.
         Then:
             The two CloudpickleSerializer instances should compare equal,
-            share a hash (so the LRU cache deduplicates them), and not
-            compare equal to the other-type object.
+            share a hash (so they are interchangeable as dict keys and set
+            members), and not compare equal to the other-type object.
         """
         # Arrange
         first = CloudpickleSerializer()
@@ -188,6 +212,47 @@ class TestCloudpickleSerializer:
         """
         # Arrange, act, & assert
         assert isinstance(CloudpickleSerializer(), Serializer)
+
+    def test___instancecheck___with_unhashable_serializer(self):
+        """Test an unhashable serializer fails the Serializer protocol check.
+
+        Given:
+            A class implementing ``dumps`` and ``loads`` that overrides
+            ``__eq__`` without a compatible ``__hash__``, so Python sets
+            ``__hash__`` to ``None``.
+        When:
+            isinstance is evaluated against the runtime-checkable Serializer
+            protocol.
+        Then:
+            It should return False — the protocol consults
+            ``hasattr(obj, "__hash__")``, which is False when ``__hash__``
+            is ``None``.
+        """
+        # Arrange
+        instance = _UnhashableSerializer()
+
+        # Act & assert
+        assert not isinstance(instance, Serializer)
+
+    def test_dumps_with_module_level_callable(self):
+        """Test the serializer round-trips a plain module-level callable.
+
+        Given:
+            A CloudpickleSerializer and a plain module-level callable.
+        When:
+            The serializer dumps then loads the callable.
+        Then:
+            The restored callable executes to the same result as the
+            original.
+        """
+        # Arrange
+        serializer = CloudpickleSerializer()
+
+        # Act
+        restored = serializer.loads(serializer.dumps(_module_level_callable))
+
+        # Assert
+        assert restored(7) == _module_level_callable(7)
 
     def test_dumps_with_unguarded_type(self):
         """Test the serializer delegates to cloudpickle for unguarded types.

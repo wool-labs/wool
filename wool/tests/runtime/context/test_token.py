@@ -331,10 +331,9 @@ class TestToken:
             round-trip through cloudpickle.loads back to the same
             Token, while cloudpickle.dumps raises TypeError —
             documenting the worker dispatch handler's contract that
-            non-passthrough fallback MUST go through
-            wool.__serializer__ (whose internal _WoolPickler honors
-            __wool_reduce__) and NOT bare cloudpickle (which trips
-            the __reduce_ex__ guard).
+            payload serialization MUST go through wool.__serializer__
+            (whose internal _WoolPickler honors __wool_reduce__) and
+            NOT bare cloudpickle (which trips the __reduce_ex__ guard).
         """
         # Arrange
         var = ContextVar("wool_serializer_token_round_trip")

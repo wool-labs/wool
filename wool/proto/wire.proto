@@ -18,7 +18,6 @@ message Task {
     bytes kwargs = 9;
     int32 timeout = 10;
     optional RuntimeContext runtime_context = 11;
-    optional bytes serializer = 12;
 }
 
 // Minimal envelope for pre-deserialization metadata extraction.
@@ -86,13 +85,10 @@ message Ack {
 // Envelope-level rejections (e.g., protocol-version mismatch) ride
 // gRPC status codes (FAILED_PRECONDITION) instead.
 message Nack {
-    // Dumped original exception. Encoded with the worker's
-    // negotiated serializer when negotiation completed before
-    // the rejection; falls back to wool.__serializer__
-    // (cloudpickle) for early-fail paths where the rejection
-    // fires before serializer setup. Caller side falls back to
-    // RpcError on a deserialization mismatch. Same dump format
-    // as Response.exception.
+    // Dumped original exception. Encoded with wool.__serializer__
+    // (cloudpickle). Caller side falls back to RpcError on a
+    // deserialization mismatch. Same dump format as
+    // Response.exception.
     optional Message exception = 1;
 }
 

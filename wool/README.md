@@ -446,11 +446,11 @@ Version compatibility is checked by `VersionInterceptor` **before** the dispatch
 
 ### Worker-side request decoding
 
-`DispatchSession.__aenter__` is the worker's parse phase: it reads the first request frame, materializes the negotiated serializer (`cloudpickle` cross-process, `PassthroughSerializer` for self-dispatch), decodes the caller's `wool.Context` snapshot, rebuilds the `wool.Task`, and validates that the callable is an async function or async generator.
+`DispatchSession.__aenter__` is the worker's parse phase: it reads the first request frame, decodes the caller's `wool.Context` snapshot and rebuilds the `wool.Task` (both via `cloudpickle`), and validates that the callable is an async function or async generator.
 
 Failures here wrap in `Rejected` and surface via a `Nack` frame whose `exception` payload carries the original failure (cloudpickle-dumped). The caller deserializes and re-raises, so the user observes the **actual failure class**, not an opaque RPC error:
 
-- Malformed task id, unpicklable serializer hint, cloudpickle errors on the routine callable, ImportError on a missing module, non-async callable → original `Exception` re-raised on the caller.
+- Malformed task id, cloudpickle errors on the routine callable, ImportError on a missing module, non-async callable → original `Exception` re-raised on the caller.
 - Strict-mode promoted `wool.ContextDecodeWarning` (operator set `warnings.filterwarnings("error", category=wool.ContextDecodeWarning)` in the worker subprocess) → the warning ships through the same Nack-with-exception path and re-raises on the caller as `wool.ContextDecodeWarning`. The default lenient mode emits the warning and runs the routine against a fresh empty context (see Context propagation > Decode failure semantics).
 
 Parse-phase rejections reflect a user-code or version-skew issue, not a worker-health issue. The load balancer does not evict the worker.
@@ -467,7 +467,7 @@ If the routine raises an exception that drags an unpicklable object into its gra
 
 ### Worker-side response encoding
 
-After each successful step, the dispatch handler builds a `protocol.Response`: it dumps the result via the negotiated serializer and attaches the post-step `wool.Context` snapshot.
+After each successful step, the dispatch handler builds a `protocol.Response`: it dumps the result via `cloudpickle` and attaches the post-step `wool.Context` snapshot.
 
 - **Result dump fails** (un-picklable yielded value) — the failure surfaces as a handler-side exception during response encoding. The dispatch handler drains the worker, snapshots `session.context`, and ships a terminal `Response.exception` carrying the encode failure. Caller observes the dump exception; no worker eviction.
 - **Strict-mode context encode failure during a routine exception** — `session.context.to_protobuf` raised a `BaseExceptionGroup` of `wool.ContextDecodeWarning` peers during the terminal-exception path. The handler attaches the warnings to the routine's exception via PEP 678 `__notes__` and a `__wool_context_warnings__` attribute, so the **routine exception's type is preserved**. The terminal response drops the `context` field. The caller's `except RoutineError:` clause still matches; the warnings remain visible in the traceback and accessible programmatically.

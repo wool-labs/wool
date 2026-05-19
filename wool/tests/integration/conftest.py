@@ -124,23 +124,6 @@ class QuorumMode(Enum):
     ABOVE_DEFAULT = auto()
 
 
-class SerializerKind(Enum):
-    """Documents the negotiated serializer for a dispatch.
-
-    ``PASSTHROUGH`` is structurally selected for self-dispatch (the
-    caller's worker process matches the dispatch target — DEFAULT and
-    NESTED_DEFAULT_IN_EPHEMERAL pool modes); ``CLOUDPICKLE`` is selected
-    for cross-process dispatch (EPHEMERAL and similar pool modes that
-    spawn dedicated subprocess workers). The choice is automatic and
-    follows from the pool mode — this dimension is a documentation
-    annotation that pins the structural relationship in test scenarios
-    that explicitly enumerate the unified-driver happy paths.
-    """
-
-    PASSTHROUGH = auto()
-    CLOUDPICKLE = auto()
-
-
 class StrictWarnings(Enum):
     """Documents whether warnings are promoted to errors during dispatch.
 
@@ -156,12 +139,12 @@ class StrictWarnings(Enum):
     ALL_DECODABLE = auto()
 
 
-# Optional Scenario dimensions — defaulted to ``None`` and excluded
+# Optional Scenario dimension — defaulted to ``None`` and excluded
 # from :attr:`Scenario.is_complete` so the existing pairwise covering
-# array (which leaves them unset) remains valid. They are populated
-# only on explicitly-enumerated scenarios (e.g.
-# ``test_unified_driver``) to document observable annotations.
-_OPTIONAL_DIMENSIONS: frozenset[str] = frozenset({"serializer", "strict_warnings"})
+# array (which leaves it unset) remains valid. It is populated only
+# on explicitly-enumerated scenarios (e.g. ``test_unified_driver``)
+# to document observable annotations.
+_OPTIONAL_DIMENSIONS: frozenset[str] = frozenset({"strict_warnings"})
 
 
 def _sync_accept_hook(ctx):
@@ -196,15 +179,11 @@ class Scenario:
     ctx_var_2: ContextVarPattern | None = None
     ctx_var_3: ContextVarPattern | None = None
     quorum: QuorumMode | None = None
-    # NOTE: ``serializer`` and ``strict_warnings`` are listed in
-    # ``_OPTIONAL_DIMENSIONS`` and serve as documentation
-    # annotations on test IDs — they do not drive
-    # ``build_pool_from_scenario`` behavior today. Tests that vary
-    # along these axes set them explicitly so the pytest ID
-    # reflects the negotiation under exercise. See F9 in the test
-    # review (tracking issue) for the planned spy that turns these
-    # into actively-pinned invariants.
-    serializer: SerializerKind | None = None
+    # NOTE: ``strict_warnings`` is listed in ``_OPTIONAL_DIMENSIONS``
+    # and serves as a documentation annotation on test IDs — it does
+    # not drive ``build_pool_from_scenario`` behavior today. Tests
+    # that vary along this axis set it explicitly so the pytest ID
+    # reflects the behavior under exercise.
     strict_warnings: StrictWarnings | None = None
 
     def __or__(self, other: Scenario) -> Scenario:
@@ -228,11 +207,11 @@ class Scenario:
     def is_complete(self) -> bool:
         """True when all required (non-optional) dimensions are set.
 
-        Optional documentation fields listed in ``_OPTIONAL_DIMENSIONS``
-        (``serializer``, ``strict_warnings``) are excluded from the
-        completeness check — they describe observable annotations on a
-        scenario rather than required configuration. Pairwise rows
-        generate with them at ``None``.
+        The optional documentation field listed in
+        ``_OPTIONAL_DIMENSIONS`` (``strict_warnings``) is excluded from
+        the completeness check — it describes an observable annotation
+        on a scenario rather than required configuration. Pairwise rows
+        generate with it at ``None``.
         """
         return all(
             getattr(self, f.name) is not None
@@ -266,15 +245,14 @@ def default_scenario(
     ctx_var_2: ContextVarPattern = ContextVarPattern.NONE,
     ctx_var_3: ContextVarPattern = ContextVarPattern.NONE,
     quorum: QuorumMode = QuorumMode.DEFAULT,
-    serializer: SerializerKind | None = None,
     strict_warnings: StrictWarnings | None = None,
 ) -> Scenario:
     """Build a fully-populated :class:`Scenario` with sensible defaults.
 
     Used by happy-path integration tests that want to vary only one or two
-    dimensions while leaving the rest at their canonical values. Optional
-    documentation fields (``serializer``, ``strict_warnings``) default to
-    ``None`` so they remain absent from the pytest ID unless explicitly set.
+    dimensions while leaving the rest at their canonical values. The
+    optional documentation field (``strict_warnings``) defaults to ``None``
+    so it remains absent from the pytest ID unless explicitly set.
     """
     return Scenario(
         shape=shape,
@@ -291,7 +269,6 @@ def default_scenario(
         ctx_var_2=ctx_var_2,
         ctx_var_3=ctx_var_3,
         quorum=quorum,
-        serializer=serializer,
         strict_warnings=strict_warnings,
     )
 

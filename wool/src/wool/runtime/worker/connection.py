@@ -20,9 +20,7 @@ from wool import protocol
 from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
-from wool.runtime.serializer import PassthroughSerializer
 from wool.runtime.serializer import Serializer
-from wool.runtime.serializer import _passthrough_pool
 from wool.runtime.worker.base import ChannelOptions
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
@@ -685,14 +683,6 @@ class WorkerConnection:
         concurrency limits and applies timeout to the dispatch phase only
         (semaphore acquisition and acknowledgment).
 
-        .. note::
-
-           When dispatching to the current worker process (self-dispatch),
-           a :class:`PassthroughSerializer` is used so the four payload
-           fields (callable, args, kwargs, proxy) are stored in-process
-           instead of being serialized.  The request still travels
-           through gRPC so the full streaming protocol is preserved.
-
         **Context decode failures (caller-side).**
         Each response frame may carry a back-propagated wire context
         that needs decoding before the caller can merge worker-side
@@ -768,17 +758,15 @@ class WorkerConnection:
         if (
             metadata := wool.__worker_metadata__
         ) is not None and metadata.address == self._target:
-            use_passthrough = True
             if (uds_address := wool.__worker_uds_address__) is not None:
                 key = (uds_address, None, self._options)
                 self._uds_key = key
             else:
                 key = self._key
         else:
-            use_passthrough = False
             key = self._key
 
-        stream = self._execute(task, key, use_passthrough, timeout)
+        stream = self._execute(task, key, timeout)
         try:
             await stream.__anext__()  # Prime: pins resources + handshake
         except grpc.RpcError as error:
@@ -823,7 +811,6 @@ class WorkerConnection:
         self,
         call: _DispatchCall,
         wire_task: protocol.Task,
-        serializer: PassthroughSerializer | None,
     ) -> None:
         """Send the dispatch request and wait for the worker's
         acknowledgement. Caller is responsible for channel-permit
@@ -838,7 +825,7 @@ class WorkerConnection:
         """
         request = protocol.Request(
             task=wire_task,
-            context=context.current_context().to_protobuf(serializer=serializer),
+            context=context.current_context().to_protobuf(),
         )
         await call.write(request)
         response = await anext(aiter(call))
@@ -850,11 +837,8 @@ class WorkerConnection:
             # mismatch) ride gRPC status codes, not Nack — those
             # land in :meth:`dispatch`'s ``except grpc.RpcError``
             # arm instead.
-            nack_serializer = (
-                serializer if serializer is not None else wool.__serializer__
-            )
             try:
-                raised = nack_serializer.loads(response.nack.exception.dump)
+                raised = wool.__serializer__.loads(response.nack.exception.dump)
             except Exception:
                 raised = None
             # Narrowed to ``Exception`` to match
@@ -877,14 +861,13 @@ class WorkerConnection:
         self,
         task: Task,
         key: _PoolKey,
-        use_passthrough: bool,
         timeout: float | None,
     ) -> AsyncGenerator[protocol.Message | None, None]:
         """Async generator that owns the full dispatch lifecycle.
 
-        Pins the passthrough serializer (self-dispatch only), the
-        channel pool ref, the channel-concurrency permit, and the
-        gRPC call's cancel hook on a single :class:`AsyncExitStack`.
+        Pins the channel pool ref, the channel-concurrency permit,
+        and the gRPC call's cancel hook on a single
+        :class:`AsyncExitStack`.
         Completes the handshake before yielding to the caller; any
         exit path — setup failure, priming-yield ``GeneratorExit``,
         mid-stream exception, natural end of stream — unwinds the
@@ -898,18 +881,8 @@ class WorkerConnection:
         """
         stack = AsyncExitStack()
         try:
-            if use_passthrough:
-                # Pin the per-task passthrough serializer for the
-                # streaming generator's lifetime. Self-dispatch
-                # only — cross-process dispatch uses cloudpickle.
-                serializer = await stack.enter_async_context(
-                    _passthrough_pool.get(task.id)
-                )
-            else:
-                serializer = None
-
             channel = await stack.enter_async_context(_channel_pool.get(key))
-            wire_task = task.to_protobuf(serializer=serializer)
+            wire_task = task.to_protobuf()
 
             # Acquire the concurrency permit and complete the
             # handshake under the dispatch-phase timeout.
@@ -936,14 +909,14 @@ class WorkerConnection:
                         pass
 
                 stack.callback(_safe_cancel)
-                await self._handshake(call, wire_task, serializer)
+                await self._handshake(call, wire_task)
 
             # Priming yield. All resources are pinned on the stack
             # and the worker has acknowledged the task. The
             # caller's ``__anext__`` prime returns here.
             yield
 
-            stream = _DispatchStream(call, task, serializer=serializer)
+            stream = _DispatchStream(call, task)
             try:
                 sent = None
                 result = await anext(stream)

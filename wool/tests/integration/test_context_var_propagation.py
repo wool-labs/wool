@@ -877,6 +877,158 @@ class TestTokenAcrossWorkers:
 
 
 @pytest.mark.integration
+class TestSelfDispatchTokenReset:
+    """Token reset under self-dispatch (DEFAULT pool, single in-process worker).
+
+    Self-dispatch serializes the dispatch payload through cloudpickle
+    exactly like cross-process dispatch, so a routine receives a copy
+    of its arguments and a :class:`wool.Token` reset behaves
+    identically regardless of pool mode. These tests cover
+    caller-minted and worker-minted token resets through a
+    single-worker DEFAULT pool.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reset_with_caller_minted_token_in_self_dispatch(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a self-dispatched routine resets a caller-minted Token without raising.
+
+        Given:
+            A DEFAULT pool (single in-process worker so the dispatch
+            target matches the caller process) and a caller that sets
+            ``TENANT_ID`` and captures the resulting ``wool.Token``.
+        When:
+            The self-dispatched routine calls ``TENANT_ID.reset(token)``
+            on the worker.
+        Then:
+            The reset should not raise :class:`ValueError`, and the
+            token should read as used afterward.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(pool_mode=PoolMode.DEFAULT)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("caller-value")
+                try:
+                    worker_read = await routines.accept_token_and_reset(token)
+                finally:
+                    if not token.used:
+                        routines.TENANT_ID.reset(token)
+            assert worker_read == "unknown"
+            assert token.used is True
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_reset_with_caller_minted_token_matches_cross_process(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test caller-minted Token reset matches self-dispatch and cross-process.
+
+        Given:
+            The same caller-minted-Token-reset scenario run once under
+            a DEFAULT pool (self-dispatch) and once under an EPHEMERAL
+            pool (cross-process workers).
+        When:
+            The self-dispatched routine calls ``TENANT_ID.reset(token)``
+            on the worker in each pool mode.
+        Then:
+            Both runs should produce identical observable results —
+            proving self-dispatch is behaviorally identical to
+            cross-process dispatch.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            observations = []
+            for pool_mode in (PoolMode.DEFAULT, PoolMode.EPHEMERAL):
+                scenario = default_scenario(pool_mode=pool_mode)
+                async with build_pool_from_scenario(scenario, credentials_map):
+                    token = routines.TENANT_ID.set("caller-value")
+                    try:
+                        worker_read = await routines.accept_token_and_reset(token)
+                    finally:
+                        if not token.used:
+                            routines.TENANT_ID.reset(token)
+                    observations.append((worker_read, token.used))
+            assert observations[0] == observations[1]
+            assert observations[0] == ("unknown", True)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_reset_with_worker_minted_token_in_self_dispatch(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a worker-minted Token round-trips and stays single-use in self-dispatch.
+
+        Given:
+            A DEFAULT pool (self-dispatch) and a routine that mints a
+            ``wool.Token`` on the worker via ``TENANT_ID.set`` and
+            returns it to the caller.
+        When:
+            The caller calls ``TENANT_ID.reset(token)`` locally, then
+            calls it a second time.
+        Then:
+            The first local reset should succeed and the second should
+            raise :class:`RuntimeError` — the worker-minted token is
+            single-use across the logical chain even when minted under
+            a self-dispatch.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(pool_mode=PoolMode.DEFAULT)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = await routines.mint_tenant_token("worker-value")
+                routines.TENANT_ID.reset(token)
+                with pytest.raises(RuntimeError, match="already been used"):
+                    routines.TENANT_ID.reset(token)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_reset_with_caller_minted_token_on_async_gen_yield_in_self_dispatch(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a self-dispatched async generator resets a caller-minted Token.
+
+        Given:
+            A DEFAULT pool (self-dispatch) and an async-generator
+            routine that resets a caller-minted ``wool.Token`` between
+            two yields.
+        When:
+            The caller iterates the generator to completion, then
+            calls ``TENANT_ID.reset(token)`` locally.
+        Then:
+            The worker-side reset inside the generator frame should not
+            raise :class:`ValueError`, and the caller's later reset
+            should raise :class:`RuntimeError` because the token was
+            already consumed on the worker.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(
+                shape=RoutineShape.ASYNC_GEN_ANEXT,
+                pool_mode=PoolMode.DEFAULT,
+            )
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("caller-value")
+                collected = [
+                    item
+                    async for item in routines.accept_token_and_reset_on_yield(token)
+                ]
+                assert collected == ["before", "after"]
+                with pytest.raises(RuntimeError, match="already been used"):
+                    routines.TENANT_ID.reset(token)
+
+        await retry_grpc_internal(body)
+
+
+@pytest.mark.integration
 class TestExceptionPathBackPropagation:
     @pytest.mark.asyncio
     async def test_coroutine_exception_back_propagates_worker_mutation(
@@ -1585,10 +1737,10 @@ class TestSelfDispatchStreamingVarMutation:
             The caller mutates TENANT_ID to a distinct value between
             each ``__anext__`` call
         Then:
-            Each yielded value reflects the caller's latest mutation,
-            proving that per-frame forward-propagation through the
-            PassthroughSerializer self-dispatch path applies
-            ``PassthroughSerializer.loads`` for streaming var updates
+            Each yielded value should reflect the caller's latest
+            mutation, proving that per-frame forward-propagation
+            through the self-dispatch path applies streaming var
+            updates via cloudpickle.
         """
 
         # Arrange, act, & assert

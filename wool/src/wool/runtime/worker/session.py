@@ -31,18 +31,14 @@ from typing import Final
 from typing import Literal
 from typing import assert_never
 from typing import cast
-from uuid import UUID
 
 import wool
 from wool import protocol
 from wool.runtime.context import Context
 from wool.runtime.context import attached
 from wool.runtime.routine.task import Task
-from wool.runtime.routine.task import _unpickle_serializer
 from wool.runtime.routine.task import routine_scope
-from wool.runtime.serializer import PassthroughSerializer
 from wool.runtime.serializer import Serializer
-from wool.runtime.serializer import _passthrough_pool
 from wool.runtime.worker.connection import _complete_teardown
 
 __all__ = ["DispatchSession", "Rejected"]
@@ -86,9 +82,7 @@ class _Response:
         post-step context (ID + var snapshot) on the response.
 
         :param serializer:
-            Negotiated serializer for the payload (cloudpickle for
-            cross-process dispatch; :class:`PassthroughSerializer`
-            for self-dispatch).
+            Serializer for the payload (:data:`wool.__serializer__`).
         """
         return protocol.Response(
             result=protocol.Message(dump=serializer.dumps(self.result)),
@@ -148,7 +142,7 @@ class _Request:
             The dispatch handler's :class:`Context`, used as the
             attach scope for payload decode.
         :param serializer:
-            Negotiated serializer for the payload.
+            Serializer for the payload — always :data:`wool.__serializer__`.
         :raises ValueError:
             If the ``payload`` oneof is unset or unknown — the wire
             envelope parsed cleanly but carries no recognizable
@@ -370,15 +364,14 @@ async def _step(
 
 class Rejected(Exception):
     """Raised by :meth:`DispatchSession.__aenter__` when the dispatch
-    parse phase fails — serializer setup, :class:`wool.Context`
-    decode, :class:`wool.Task` rebuild, or routine-type validation.
+    parse phase fails — :class:`wool.Context` decode,
+    :class:`wool.Task` rebuild, or routine-type validation.
 
     The dispatch handler catches this and replies with a Nack
     whose ``exception`` field carries :attr:`original` serialized
-    via the session's own ``serializer`` attribute (the negotiated
-    serializer if it was materialized before the failure, falling
-    back to ``wool.__serializer__`` for early-fail paths). Same
-    path as a routine-time failure's ``Response.exception``.
+    via the session's ``serializer`` attribute (always
+    ``wool.__serializer__``, cloudpickle). Same path as a
+    routine-time failure's ``Response.exception``.
 
     :param original:
         The actual parse-phase exception to ship.
@@ -397,15 +390,11 @@ class DispatchSession:
 
     - **Parse phase** (``__aenter__``) reads the first
       :class:`protocol.Request` off *request_iterator* and parses
-      it: resolves the negotiated serializer (cloudpickle for
-      cross-process dispatch, a per-task
-      :class:`PassthroughSerializer` from :data:`_passthrough_pool`
-      for self-dispatch), decodes the caller's wool.Context
-      snapshot, rebuilds the wool.Task under
-      ``attached(context, guarded=False)``, and validates the
-      routine type. Failures are wrapped in :class:`Rejected`
-      so the dispatch handler can surface them via
-      Nack-with-exception. A first-request read failure (empty
+      it: decodes the caller's wool.Context snapshot, rebuilds the
+      wool.Task under ``attached(context, guarded=False)``, and
+      validates the routine type. Failures are wrapped in
+      :class:`Rejected` so the dispatch handler can surface them
+      via Nack-with-exception. A first-request read failure (empty
       iterator, gRPC error) propagates raw — no parsed payload
       exists to serialize for the caller.
 
@@ -488,13 +477,10 @@ class DispatchSession:
         self._worker_done: concurrent.futures.Future | None = None
         self._worker_task: asyncio.Task | None = None
         self._iterator: AsyncGenerator[_Response, None] | None = None
-        # Default to cloudpickle so any pre-negotiation parse
-        # failure (StopAsyncIteration, malformed task id, bad
-        # serializer hint) still has a sane serializer in scope
-        # for :class:`Rejected` to ship the dumped exception.
-        # ``__aenter__`` overwrites with the negotiated serializer
-        # on successful parse — same path as
-        # ``Response.exception`` post-Ack.
+        # All dispatch serializes through cloudpickle; this one
+        # serializer covers the payload, the context snapshots, and
+        # any :class:`Rejected` dumped exception (including pre-parse
+        # failures such as StopAsyncIteration or a malformed frame).
         self.serializer: Serializer = wool.__serializer__
 
     @property
@@ -559,18 +545,6 @@ class DispatchSession:
                     "first request must carry a Task in its `payload` "
                     f"oneof; observed {request.WhichOneof('payload')!r}"
                 )
-            task_id = UUID(request.task.id)
-            is_passthrough = False
-            if request.task.HasField("serializer"):
-                sniff = _unpickle_serializer(request.task.serializer)
-                is_passthrough = isinstance(sniff, PassthroughSerializer)
-            if is_passthrough:
-                self.serializer = await self._stack.enter_async_context(
-                    _passthrough_pool.get(task_id)
-                )
-            else:
-                self.serializer = wool.__serializer__
-
             try:
                 self.context = Context.from_protobuf(
                     request.context, serializer=self.serializer
@@ -616,12 +590,9 @@ class DispatchSession:
             await self._safe_aclose_stack()
             raise
         # Register drain on the exit stack so it runs as part of the
-        # LIFO unwind. Pushed last so it pops first — the worker is
-        # drained before the passthrough-pool serializer is released.
-        # If drain raises (e.g. a ``CancelledError`` reaching it
-        # during graceful shutdown), the stack still unwinds the
-        # remaining callbacks, so resources entered above are
-        # always released.
+        # LIFO unwind. If drain raises (e.g. a ``CancelledError``
+        # reaching it during graceful shutdown), the stack still
+        # unwinds the remaining callbacks.
         self._stack.push_async_callback(self.drain)
         return self
 
@@ -830,9 +801,9 @@ class DispatchSession:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         # Shield the stack unwind from caller cancellation so the
-        # pooled passthrough-serializer release runs to completion —
-        # see :func:`_complete_teardown`. The registered managers
-        # never suppress, so discarding the suppression return value
+        # registered drain callback runs to completion — see
+        # :func:`_complete_teardown`. The registered managers never
+        # suppress, so discarding the suppression return value
         # (always falsy here) is behaviour-preserving.
         await _complete_teardown(self._stack.aclose())
 
