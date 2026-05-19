@@ -4697,30 +4697,22 @@ class TestWorkerService:
         assert remaining == []
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_passthrough_loads_for_streaming_self_dispatch(
+    async def test_dispatch_streaming_applies_var_updates_per_frame(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test streaming self-dispatch applies PassthroughSerializer.loads for vars.
+        """Test a streaming dispatch applies caller var updates per frame.
 
         Given:
-            An async-generator Task configured with a
-            PassthroughSerializer whose streaming next-frames carry
-            var updates serialized via PassthroughSerializer.dumps
+            An async-generator Task whose streaming next-frames carry
+            cloudpickle-encoded var updates
         When:
-            The stream is iterated with changing vars on each frame
+            The stream is iterated with a changing var on each frame
         Then:
-            Each response reflects the updated value — proving that
-            the worker-side _apply_vars uses PassthroughSerializer.loads
-            rather than cloudpickle.loads for passthrough self-dispatch
-            frames.
+            Each response should reflect the updated value, proving the
+            worker applies the per-frame var updates.
         """
-        from wool.runtime.serializer import PassthroughSerializer
-
         # Arrange
-        var = wool.ContextVar(
-            "passthrough_stream_var", namespace="test_passthrough_stream"
-        )
-        serializer = PassthroughSerializer()
+        var = wool.ContextVar("stream_var", namespace="test_streaming_var_updates")
 
         async def streaming_task():
             while True:
@@ -4736,13 +4728,13 @@ class TestWorkerService:
         )
 
         initial_request = protocol.Request(
-            task=wool_task.to_protobuf(serializer=serializer),
+            task=wool_task.to_protobuf(),
             context=protocol.Context(
                 vars=[
                     protocol.ContextVar(
                         namespace=var.namespace,
                         name=var.name,
-                        value=serializer.dumps("alpha"),
+                        value=cloudpickle.dumps("alpha"),
                     )
                 ]
             ),
@@ -4766,7 +4758,7 @@ class TestWorkerService:
                                 protocol.ContextVar(
                                     namespace=var.namespace,
                                     name=var.name,
-                                    value=serializer.dumps(frame_value),
+                                    value=cloudpickle.dumps(frame_value),
                                 )
                             ],
                         ),
@@ -4774,7 +4766,7 @@ class TestWorkerService:
                 )
                 response = await anext(aiter(stream))
                 assert response.HasField("result")
-                results.append(serializer.loads(response.result.dump))
+                results.append(cloudpickle.loads(response.result.dump))
 
             await stream.done_writing()
             async for _ in stream:

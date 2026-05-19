@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 import traceback
 from collections.abc import Callable
@@ -32,33 +31,12 @@ import cloudpickle
 import wool
 from wool import protocol
 from wool.runtime.context import RuntimeContext
-from wool.runtime.serializer import PassthroughSerializer
-from wool.runtime.serializer import Serializer
 
 Args = Tuple
 Kwargs = Dict
 Timeout = SupportsInt
 Routine: TypeAlias = Coroutine | AsyncGenerator
 W = TypeVar("W", bound=Routine)
-
-
-@functools.lru_cache(maxsize=8)
-def _pickle_serializer(serializer: Serializer) -> bytes:
-    """Pickle a :class:`Serializer` instance for transport on the wire.
-
-    Cached via :func:`functools.lru_cache` keyed on the serializer
-    instance.  :class:`PassthroughSerializer` and
-    :class:`CloudpickleSerializer` deliberately collapse all instances to
-    one cache slot via ``__hash__`` and ``__eq__``; user implementations
-    that hash uniquely will fill the cache one entry per instance and
-    evict in LRU order.
-    """
-    return wool.__serializer__.dumps(serializer)
-
-
-@functools.lru_cache(maxsize=8)
-def _unpickle_serializer(data: bytes) -> Serializer:
-    return cloudpickle.loads(data)
 
 
 _do_dispatch: ContextVar[bool] = ContextVar("_do_dispatch", default=True)
@@ -232,11 +210,8 @@ class Task(Generic[W]):
     def from_protobuf(cls, task: protocol.Task) -> Task:
         """Deserialize a Task from a protobuf message.
 
-        When the protobuf carries a ``serializer`` field, it is unpickled
-        and cached for subsequent calls; the resulting :class:`Serializer`
-        deserializes the payload fields.  When the field is unset (the
-        default emitted by :meth:`to_protobuf` for the no-serializer case),
-        :func:`cloudpickle.loads` is used directly — payloads produced by
+        The payload fields are deserialized with :func:`cloudpickle.loads`
+        — payloads produced by
         :class:`~wool.runtime.serializer.CloudpickleSerializer` are
         standard reduce tuples that stock unpickling executes natively.
 
@@ -245,11 +220,7 @@ class Task(Generic[W]):
         :returns:
             A :class:`Task` instance with all fields restored.
         """
-        if task.HasField("serializer"):
-            s = _unpickle_serializer(task.serializer)
-            loads = s.loads
-        else:
-            loads = cloudpickle.loads
+        loads = cloudpickle.loads
         runtime_context = (
             RuntimeContext.from_protobuf(task.runtime_context)
             if task.HasField("runtime_context")
@@ -267,36 +238,24 @@ class Task(Generic[W]):
             runtime_context=runtime_context,
         )
 
-    def to_protobuf(self, serializer: Serializer | None = None) -> protocol.Task:
+    def to_protobuf(self) -> protocol.Task:
         """Serialize this Task to a protobuf message.
 
-        :param serializer:
-            Optional serializer for the callable and its arguments.  When
-            ``None`` (the default), :data:`wool.__serializer__` is used
-            and the protobuf ``serializer`` field is left unset.  When
-            provided, the serializer is pickled into the ``serializer``
-            field so that :meth:`from_protobuf` can use it on the
-            receiving side.  The proxy is always pickled with
-            :data:`wool.__serializer__` unless ``serializer`` is a
-            :class:`PassthroughSerializer`, in which case the proxy uses
-            the same serializer as the rest of the payload.
+        The callable, arguments, and proxy are serialized with
+        :data:`wool.__serializer__`.
+
         :returns:
             A :class:`protocol.Task` message.
         """
-        dumps = serializer.dumps if serializer is not None else wool.__serializer__.dumps
-        proxy_dumps = (
-            dumps
-            if isinstance(serializer, PassthroughSerializer)
-            else wool.__serializer__.dumps
-        )
-        task_msg = protocol.Task(
+        dumps = wool.__serializer__.dumps
+        return protocol.Task(
             version=protocol.__version__,
             id=str(self.id),
             callable=dumps(self.callable),
             args=dumps(self.args),
             kwargs=dumps(self.kwargs),
             caller=str(self.caller) if self.caller else "",
-            proxy=proxy_dumps(self.proxy),
+            proxy=dumps(self.proxy),
             proxy_id=str(self.proxy.id),
             timeout=int(self.timeout) if self.timeout else 0,
             tag=self.tag if self.tag else "",
@@ -304,9 +263,6 @@ class Task(Generic[W]):
                 self.runtime_context.to_protobuf() if self.runtime_context else None
             ),
         )
-        if serializer is not None:
-            task_msg.serializer = _pickle_serializer(serializer)
-        return task_msg
 
 
 # public

@@ -26,8 +26,6 @@ from wool.runtime.context import Context
 from wool.runtime.context import install_task_factory
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
-from wool.runtime.serializer import PassthroughSerializer
-from wool.runtime.serializer import _passthrough_pool
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
 from wool.runtime.worker.session import DispatchSession
@@ -127,9 +125,9 @@ def _make_task(callable_obj):
     )
 
 
-def _request_for(task: Task, *, serializer=None) -> protocol.Request:
+def _request_for(task: Task) -> protocol.Request:
     """Build a first-frame Request carrying *task*'s protobuf."""
-    return protocol.Request(task=task.to_protobuf(serializer=serializer))
+    return protocol.Request(task=task.to_protobuf())
 
 
 def _next_request() -> protocol.Request:
@@ -269,12 +267,10 @@ class TestDispatchSession:
             handler.task  # noqa: B018
         with pytest.raises(AttributeError):
             handler.context  # noqa: B018
-        # ``serializer`` is initialized in ``__init__`` to the
-        # default cloudpickle so any pre-negotiation parse failure
-        # (StopAsyncIteration, malformed task id, bad serializer
-        # hint) has a sane serializer in scope for ``Rejected`` to
-        # ship the dumped exception. ``__aenter__`` overwrites
-        # with the negotiated serializer on successful parse.
+        # All dispatch serializes through cloudpickle; this one
+        # serializer covers the payload, the context snapshots, and
+        # any ``Rejected`` dumped exception (including pre-parse
+        # failures such as StopAsyncIteration or a malformed frame).
         assert handler.serializer is wool.__serializer__
 
     # -- streaming property ----------------------------------------------
@@ -354,96 +350,6 @@ class TestDispatchSession:
             assert handler.task.callable is _coro_returning_default
             assert isinstance(handler.context, Context)
             assert handler.serializer is wool.__serializer__
-
-    @pytest.mark.asyncio
-    async def test___aenter___with_passthrough_serializer_self_dispatch(
-        self, worker_loop, mock_worker_proxy_cache
-    ):
-        """Test :meth:`__aenter__` acquires/releases a passthrough-pool
-        entry on self-dispatch.
-
-        Given:
-            A request stream whose first frame is a Task encoded with
-            :class:`PassthroughSerializer`
-        When:
-            The handler is entered then exited via ``async with``
-        Then:
-            It should set ``handler.serializer`` to a
-            :class:`PassthroughSerializer` and the pool's
-            ``referenced_entries`` count should return to baseline on
-            exit.
-        """
-        # Arrange
-        baseline = _passthrough_pool.stats.referenced_entries
-        serializer = PassthroughSerializer()
-        task = _make_task(_coro_returning_default)
-        stream = _stream(_request_for(task, serializer=serializer))
-
-        # Act
-        async with DispatchSession(stream, worker_loop) as handler:
-            assert isinstance(handler.serializer, PassthroughSerializer)
-            assert _passthrough_pool.stats.referenced_entries == baseline + 1
-
-        # Assert
-        assert _passthrough_pool.stats.referenced_entries == baseline
-
-    @pytest.mark.asyncio
-    async def test___aexit___releases_passthrough_pool_ref_under_cancellation(
-        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
-    ):
-        """Test __aexit__ releases the passthrough-pool entry when the
-        session is cancelled mid-teardown.
-
-        Given:
-            A passthrough self-dispatch session whose teardown release
-            suspends on a held pool lock, with the session task
-            cancelled while parked in that suspended release.
-        When:
-            The lock is released and the cancelled session task is
-            awaited.
-        Then:
-            It should return the passthrough pool to its pre-dispatch
-            referenced-entry count — no leaked reference.
-        """
-        # Arrange
-        # Contend the pool lock on a fresh instance so it does not
-        # bind the process-global lock to this test's event loop.
-        mocker.patch.object(_passthrough_pool, "_lock", asyncio.Lock())
-        baseline = _passthrough_pool.stats.referenced_entries
-        serializer = PassthroughSerializer()
-        task = _make_task(_coro_returning_default)
-        stream = _stream(_request_for(task, serializer=serializer))
-        entered = asyncio.Event()
-        proceed = asyncio.Event()
-
-        async def run_session():
-            async with DispatchSession(stream, worker_loop):
-                entered.set()
-                # Hold inside the context until the test has grabbed
-                # the pool lock, so __aexit__'s teardown release
-                # suspends on it.
-                await proceed.wait()
-
-        # Act
-        session_task = asyncio.ensure_future(run_session())
-        await entered.wait()
-        await _passthrough_pool._lock.acquire()
-        lock_released = False
-        try:
-            proceed.set()
-            for _ in range(5):
-                await asyncio.sleep(0)
-            session_task.cancel()
-            _passthrough_pool._lock.release()
-            lock_released = True
-            with pytest.raises(asyncio.CancelledError):
-                await session_task
-        finally:
-            if not lock_released:
-                _passthrough_pool._lock.release()
-
-        # Assert
-        assert _passthrough_pool.stats.referenced_entries == baseline
 
     @pytest.mark.asyncio
     async def test___aenter___with_sync_callable_task(
@@ -1134,8 +1040,7 @@ class TestDispatchSession:
             await asyncio.wait_for(handler.drain(), timeout=2.0)
             # Assert — drain returned without raising.
         finally:
-            # Best-effort cleanup of the exit stack so the
-            # passthrough-pool entry (if any) is released.
+            # Best-effort cleanup of the exit stack.
             try:
                 await handler._stack.aclose()
             except Exception:
@@ -1703,15 +1608,12 @@ class TestDispatchSession:
             attribute carries the parse-phase :class:`ValueError`, not
             the simulated aclose failure.
         """
-        # Arrange — non-async callable triggers a ValueError in the
-        # __aenter__ validation step AFTER the passthrough-pool entry
-        # has been pushed onto the stack. Without a passthrough
-        # serializer the entry would be skipped and the test would
-        # pass trivially because the stack would be empty when aclose
-        # runs.
-        serializer = PassthroughSerializer()
+        # Arrange — a non-async callable triggers a ValueError in the
+        # __aenter__ validation step. ``_stack.aclose`` is patched
+        # below to raise, so the cleanup-failure path is exercised
+        # regardless of what the stack contains.
         task = _make_task(_sync_callable)
-        stream = _stream(_request_for(task, serializer=serializer))
+        stream = _stream(_request_for(task))
         handler = DispatchSession(stream, worker_loop)
 
         # Patch ``_stack.aclose`` directly: the underlying
@@ -1952,74 +1854,6 @@ class TestDispatchSession:
             f"DispatchSession.drain before snapshotting "
             f"DispatchSession.context (plus __aexit__'s call); "
             f"observed {drain_spy.call_count} call(s)."
-        )
-
-    @pytest.mark.asyncio
-    async def test___aexit___releases_passthrough_pool_when_drain_raises(
-        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
-    ):
-        """Test :meth:`__aexit__` releases the passthrough-pool entry
-        even when :meth:`drain` raises.
-
-        Regression test for the resource leak in :meth:`__aexit__`'s
-        no-``try/finally`` pattern. Pre-fix, ``await self.drain();
-        _stack.__aexit__(...)`` skipped the stack unwind whenever
-        :meth:`drain` raised — most notably when drain re-raised
-        :class:`asyncio.CancelledError` on the
-        ``current.cancelling() > 0`` path during graceful shutdown.
-        The ``_passthrough_pool.get(task_id)`` entry registered on
-        the self-dispatch path leaked. The fix registers drain as an
-        async exit-stack callback in :meth:`__aenter__` so the
-        unwind always runs, regardless of drain's outcome.
-
-        Given:
-            A :class:`DispatchSession` driving a passthrough self-
-            dispatch, with :meth:`drain` patched to raise
-            :class:`asyncio.CancelledError`
-        When:
-            :meth:`__aenter__` succeeds (acquiring a
-            ``_passthrough_pool`` entry) and :meth:`__aexit__` is
-            invoked
-        Then:
-            It should release the passthrough-pool entry — the
-            pool's ``referenced_entries`` count must return to its
-            baseline despite drain raising.
-        """
-        # Arrange — patching :class:`DispatchSession.drain` is the
-        # SUT-of-this-file's own public method; the substitution
-        # injects the cleanup-time failure mode that the regression
-        # targets (drain re-raise during graceful shutdown). No
-        # cleaner real-boundary trigger exists.
-        baseline = _passthrough_pool.stats.referenced_entries
-        serializer = PassthroughSerializer()
-
-        async def raising_drain(self):
-            raise asyncio.CancelledError("simulated drain re-raise")
-
-        # Patch drain at the class level BEFORE __aenter__ runs so
-        # the fix's ``push_async_callback(self.drain)`` registers
-        # the raising version on the exit stack.
-        mocker.patch.object(DispatchSession, "drain", raising_drain)
-
-        task = _make_task(_coro_returning_default)
-        stream = _stream(_request_for(task, serializer=serializer))
-
-        handler = DispatchSession(stream, worker_loop)
-        await handler.__aenter__()
-
-        assert _passthrough_pool.stats.referenced_entries == baseline + 1, (
-            "__aenter__ should acquire a passthrough-pool entry on self-dispatch"
-        )
-
-        # Act
-        with pytest.raises(asyncio.CancelledError):
-            await handler.__aexit__(None, None, None)
-
-        # Assert
-        assert _passthrough_pool.stats.referenced_entries == baseline, (
-            "DispatchSession.__aexit__ must release the passthrough-"
-            "pool entry even when drain raises — pre-fix, drain's "
-            "re-raise skipped _stack.__aexit__ and leaked the entry"
         )
 
     @pytest.mark.asyncio

@@ -1585,10 +1585,10 @@ class TestSelfDispatchStreamingVarMutation:
             The caller mutates TENANT_ID to a distinct value between
             each ``__anext__`` call
         Then:
-            Each yielded value reflects the caller's latest mutation,
-            proving that per-frame forward-propagation through the
-            PassthroughSerializer self-dispatch path applies
-            ``PassthroughSerializer.loads`` for streaming var updates
+            Each yielded value should reflect the caller's latest
+            mutation, proving that per-frame forward-propagation
+            through the self-dispatch path applies streaming var
+            updates via cloudpickle.
         """
 
         # Arrange, act, & assert

@@ -47,14 +47,12 @@ def _safely_serialize_exception(
 
     Prevents un-picklable exception state from converting a
     wool-class failure on the wire into a generic gRPC stream
-    error on the caller side. The negotiated serializer is
-    always either :class:`PassthroughSerializer` (which can
-    never fail — it stashes by reference and returns a token)
-    or :class:`CloudpickleSerializer` (which fails on
-    un-picklable input via :class:`pickle.PickleError`,
-    :class:`TypeError` for un-picklable C types,
-    :class:`AttributeError` for un-picklable local closures, or
-    :class:`RecursionError` for deeply self-referential graphs).
+    error on the caller side. The serializer is
+    :class:`CloudpickleSerializer`, which fails on un-picklable
+    input via :class:`pickle.PickleError`, :class:`TypeError`
+    for un-picklable C types, :class:`AttributeError` for
+    un-picklable local closures, or :class:`RecursionError` for
+    deeply self-referential graphs.
 
     **Type-preserving fallback.** Stdlib exception pickling
     round-trips ``(type, args, __dict__)``, dropping
@@ -367,10 +365,9 @@ class WorkerService(protocol.WorkerServicer):
             ``nack`` payload carries the parse-time failure (with
             ``exception`` set to the dumped original cause). No
             preceding ``Ack``. Triggered by malformed task id,
-            unpicklable serializer hint, strict-mode
-            :class:`wool.ContextDecodeWarning`, cloudpickle errors
-            on the task callable, ImportError on a missing module,
-            or non-async callable.
+            strict-mode :class:`wool.ContextDecodeWarning`,
+            cloudpickle errors on the task callable, ImportError on
+            a missing module, or non-async callable.
 
             **Routine-success path** — an ``Ack`` Response, then
             one (coroutine) or many (async-generator) ``result``
@@ -412,9 +409,8 @@ class WorkerService(protocol.WorkerServicer):
             # Instantiate before ``async with`` so a ``Rejected`` raised
             # from :meth:`DispatchSession.__aenter__` (parse-phase failure)
             # leaves ``session`` bound for the ``except Rejected`` arm's
-            # access to ``session.serializer`` (initialized to the default
-            # cloudpickle in :meth:`__init__`, replaced with the negotiated
-            # serializer only on successful parse).
+            # access to ``session.serializer`` (always ``wool.__serializer__``,
+            # cloudpickle, set in :meth:`__init__`).
             session = DispatchSession(request_iterator, loop)
 
             # Register a deterministic cancellation propagation hook
@@ -637,10 +633,8 @@ class WorkerService(protocol.WorkerServicer):
                 # Reported via Nack so the client deserializes the
                 # dumped exception and re-raises it as the actual
                 # failure class rather than an opaque RpcError. The
-                # dump uses ``session.serializer`` — the negotiated
-                # serializer if parse got past serializer setup,
-                # falling back to ``wool.__serializer__``
-                # (cloudpickle) for early-fail paths. Same path as
+                # dump uses ``session.serializer`` — always
+                # ``wool.__serializer__`` (cloudpickle). Same path as
                 # ``Response.exception`` post-Ack — symmetry on the
                 # wire.
                 yield protocol.Response(

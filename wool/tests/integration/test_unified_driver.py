@@ -26,7 +26,6 @@ from . import routines
 from .conftest import BackpressureMode
 from .conftest import PoolMode
 from .conftest import RoutineShape
-from .conftest import SerializerKind
 from .conftest import StrictWarnings
 from .conftest import build_pool_from_scenario
 from .conftest import default_scenario
@@ -272,21 +271,21 @@ class TestUnifiedDriverShape:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_coroutine_dispatch_uses_passthrough_serializer_in_self_dispatch(
+    async def test_coroutine_dispatch_uses_cloudpickle_serializer_in_self_dispatch(
         self, credentials_map, retry_grpc_internal
     ):
         """Test self-dispatch through DEFAULT pool round-trips a coroutine.
 
         Given:
             A coroutine routine and a DEFAULT pool (single in-process
-            worker so the dispatch target matches the caller process,
-            structurally selecting the passthrough serializer for the
-            payload).
+            worker so the dispatch target matches the caller process;
+            self-dispatch serializes the payload through cloudpickle,
+            the same path as cross-process dispatch).
         When:
             The caller awaits the routine once.
         Then:
-            The routine result should round-trip through the
-            in-process serialization path without raising.
+            The routine result should round-trip through cloudpickle
+            without raising.
         """
 
         async def body():
@@ -294,7 +293,6 @@ class TestUnifiedDriverShape:
             scenario = default_scenario(
                 shape=RoutineShape.COROUTINE,
                 pool_mode=PoolMode.DEFAULT,
-                serializer=SerializerKind.PASSTHROUGH,
             )
 
             # Act
@@ -329,7 +327,6 @@ class TestUnifiedDriverShape:
             scenario = default_scenario(
                 shape=RoutineShape.COROUTINE,
                 pool_mode=PoolMode.EPHEMERAL,
-                serializer=SerializerKind.CLOUDPICKLE,
             )
 
             # Act
@@ -342,22 +339,21 @@ class TestUnifiedDriverShape:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_async_gen_dispatch_uses_passthrough_serializer_in_self_dispatch(
+    async def test_async_gen_dispatch_uses_cloudpickle_serializer_in_self_dispatch(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test self-dispatch streams an async-generator without re-pickling per frame.
+        """Test self-dispatch streams an async-generator through cloudpickle.
 
         Given:
             An async-generator routine yielding three values and a
-            DEFAULT pool (single in-process worker so the passthrough
-            serializer is structurally selected and held for the
-            generator's lifetime).
+            DEFAULT pool (single in-process worker so the dispatch
+            target matches the caller process; self-dispatch serializes
+            each frame through cloudpickle).
         When:
             The caller iterates the proxy to exhaustion.
         Then:
             All three frames should be observed in order and the
-            iterator should terminate cleanly, proving the
-            in-process serializer remains valid across every step.
+            iterator should terminate cleanly.
         """
 
         async def body():
@@ -365,7 +361,6 @@ class TestUnifiedDriverShape:
             scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ANEXT,
                 pool_mode=PoolMode.DEFAULT,
-                serializer=SerializerKind.PASSTHROUGH,
             )
             collected: list[int] = []
 
