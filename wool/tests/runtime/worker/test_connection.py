@@ -2600,6 +2600,184 @@ class TestWorkerConnection:
         assert len(emitted[(var.namespace, var.name)]) > 16
 
     @pytest.mark.asyncio
+    async def test_dispatch_self_dispatch_initial_request_roundtrips_vars(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test self-dispatch cloudpickle-encodes vars on the initial request.
+
+        Given:
+            A WorkerConnection whose target matches the current
+            worker's address and a ContextVar with a value set
+        When:
+            dispatch() sends the initial task request
+        Then:
+            It should cloudpickle-encode the initial request's context
+            vars so they round-trip back to the original value.
+        """
+        # Arrange
+        target = "localhost:50051"
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address=target,
+            pid=1,
+            version="1.0.0",
+        )
+
+        var = ContextVar("conn_cn1_var", namespace="conn_cn1")
+        var.set("roundtrip_value")
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert — the initial request (first write) carries the var
+        # cloudpickle-encoded; decoding it yields the original value.
+        assert results == ["result"]
+        initial_request = mock_call.write.call_args_list[0][0][0]
+        emitted = {(e.namespace, e.name): e.value for e in initial_request.context.vars}
+        assert (var.namespace, var.name) in emitted
+        assert cloudpickle.loads(emitted[(var.namespace, var.name)]) == "roundtrip_value"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_cross_process_initial_request_encodes_callable(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test cross-process dispatch cloudpickle-encodes the task payload.
+
+        Given:
+            A WorkerConnection whose target does not match any worker
+            (no worker metadata set)
+        When:
+            dispatch() sends the initial task request
+        Then:
+            It should cloudpickle-encode the task payload so the
+            decoded callable is a coroutine function.
+        """
+        # Arrange
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert
+        assert results == ["result"]
+        first_write = mock_call.write.call_args_list[0][0][0]
+        restored_callable = cloudpickle.loads(first_write.task.callable)
+        assert asyncio.iscoroutinefunction(restored_callable)
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        value=st.one_of(
+            st.text(),
+            st.integers(),
+            st.tuples(st.integers(), st.text()),
+            st.dictionaries(st.text(), st.integers()),
+        )
+    )
+    async def test_dispatch_self_dispatch_initial_request_var_roundtrip_property(
+        self,
+        value,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+    ):
+        """Test self-dispatch round-trips arbitrary ContextVar values.
+
+        Given:
+            A self-dispatch WorkerConnection and any picklable
+            ContextVar value drawn from text, ints, tuples, or dicts
+        When:
+            dispatch() writes the initial request and the var is
+            decoded from the emitted protocol.Context
+        Then:
+            It should decode to a value equal to the original.
+        """
+        # Arrange — the channel pool and var_registry are process-wide
+        # and not reset between Hypothesis examples; a uuid-unique
+        # target keeps each example on its own pool key (so a cached
+        # channel from a prior example cannot serve an exhausted mock
+        # stream) and a uuid-unique var name keeps the registry key
+        # collision-free.
+        target = f"localhost-{uuid4().hex}:50051"
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address=target,
+            pid=1,
+            version="1.0.0",
+        )
+
+        var = ContextVar(f"conn_pbt_var_{uuid4().hex}", namespace="conn_pbt")
+        var.set(value)
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("result"))),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(sample_task):
+            results.append(result)
+
+        # Assert
+        assert results == ["result"]
+        initial_request = mock_call.write.call_args_list[0][0][0]
+        emitted = {(e.namespace, e.name): e.value for e in initial_request.context.vars}
+        assert (var.namespace, var.name) in emitted
+        assert cloudpickle.loads(emitted[(var.namespace, var.name)]) == value
+
+    @pytest.mark.asyncio
     async def test_dispatch_response_exception_with_non_exception_payload_falls_back_to_unexpected_response(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):

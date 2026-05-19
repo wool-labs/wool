@@ -1,4 +1,6 @@
+import _thread
 import asyncio
+import pickle
 from typing import AsyncGenerator
 from typing import Callable
 from typing import Coroutine
@@ -41,6 +43,27 @@ def _restore_picklable_proxy(proxy_id):
     proxy = _PicklableProxy()
     proxy.id = proxy_id
     return proxy
+
+
+def _arbitrary_payloads():
+    """Recursive Hypothesis strategy covering nested cloudpickle-picklable values."""
+    primitives = st.one_of(
+        st.none(),
+        st.booleans(),
+        st.text(),
+        st.integers(),
+        st.binary(),
+        st.floats(allow_nan=False),
+    )
+    return st.recursive(
+        primitives,
+        lambda children: st.one_of(
+            st.lists(children),
+            st.tuples(children, children),
+            st.dictionaries(st.text(), children),
+        ),
+        max_leaves=20,
+    )
 
 
 class _GuardedProxy(_PicklableProxy):
@@ -545,6 +568,208 @@ class TestTask:
         assert deserialized_task.timeout == original_task.timeout
         assert deserialized_task.tag == original_task.tag
 
+    def test_to_protobuf_round_trip_produces_distinct_objects(self):
+        """Test the protobuf round-trip returns independent copies.
+
+        Given:
+            A :py:class:`Task` with picklable callable, args, kwargs,
+            and proxy.
+        When:
+            The task is round-tripped via
+            ``Task.from_protobuf(task.to_protobuf())``.
+        Then:
+            The restored ``callable``, ``args``, ``kwargs``, and
+            ``proxy`` are each distinct objects from the originals —
+            cloudpickle round-trips produce copies.
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        proxy = _PicklableProxy()
+        args = (1, "test", [1, 2, 3])
+        kwargs = {"key": "value"}
+        original = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=args,
+            kwargs=kwargs,
+            proxy=proxy,
+        )
+
+        # Act
+        restored = Task.from_protobuf(original.to_protobuf())
+
+        # Assert
+        assert restored.callable is not original.callable
+        assert restored.args is not original.args
+        assert restored.kwargs is not original.kwargs
+        assert restored.proxy is not original.proxy
+
+    def test_to_protobuf_round_trip_copies_mutable_args(self):
+        """Test the protobuf round-trip yields independent mutable args.
+
+        Given:
+            A :py:class:`Task` whose args contain a mutable list.
+        When:
+            The task is round-tripped and the restored arg is
+            mutated.
+        Then:
+            The original arg is unaffected — the round-trip produced
+            an independent copy, not a shared reference.
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        original_list = [1, 2, 3]
+        original = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=(original_list,),
+            kwargs={},
+            proxy=_PicklableProxy(),
+        )
+
+        # Act
+        restored = Task.from_protobuf(original.to_protobuf())
+        restored.args[0].append(4)
+
+        # Assert
+        assert restored.args[0] == [1, 2, 3, 4]
+        assert original_list == [1, 2, 3]
+
+    def test_to_protobuf_with_uncloudpicklable_arg_fails(self, picklable_proxy):
+        """Test to_protobuf raises for a non-cloudpicklable positional arg.
+
+        Given:
+            A :py:class:`Task` whose ``args`` tuple contains a value
+            that cloudpickle cannot serialize (a thread lock).
+        When:
+            ``to_protobuf()`` is called.
+        Then:
+            It should raise a pickling error.
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        task = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=(_thread.allocate_lock(),),
+            kwargs={},
+            proxy=picklable_proxy,
+        )
+
+        # Act & assert
+        with pytest.raises((TypeError, pickle.PicklingError)):
+            task.to_protobuf()
+
+    def test_to_protobuf_with_uncloudpicklable_kwarg_fails(self, picklable_proxy):
+        """Test to_protobuf raises for a non-cloudpicklable keyword arg.
+
+        Given:
+            A :py:class:`Task` whose ``kwargs`` dict contains a value
+            that cloudpickle cannot serialize (a thread lock).
+        When:
+            ``to_protobuf()`` is called.
+        Then:
+            It should raise a pickling error.
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        task = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=(),
+            kwargs={"lock": _thread.allocate_lock()},
+            proxy=picklable_proxy,
+        )
+
+        # Act & assert
+        with pytest.raises((TypeError, pickle.PicklingError)):
+            task.to_protobuf()
+
+    def test_to_protobuf_omits_serializer_field(
+        self, sample_async_callable, picklable_proxy
+    ):
+        """Test to_protobuf produces a message without a serializer field.
+
+        Given:
+            A fully-populated :py:class:`Task`.
+        When:
+            ``to_protobuf()`` is called and the message is inspected.
+        Then:
+            The message has no ``serializer`` field.
+        """
+        # Arrange
+        task = Task(
+            id=uuid4(),
+            callable=sample_async_callable,
+            args=(1, 2),
+            kwargs={"key": "value"},
+            proxy=picklable_proxy,
+            caller=uuid4(),
+            timeout=30,
+            tag="test_tag",
+        )
+
+        # Act
+        task_msg = task.to_protobuf()
+
+        # Assert
+        field_names = [f.name for f in task_msg.DESCRIPTOR.fields]
+        assert "serializer" not in field_names
+        with pytest.raises(ValueError):
+            task_msg.HasField("serializer")
+
+    @settings(max_examples=50, deadline=None)
+    @given(payload=_arbitrary_payloads())
+    def test_to_protobuf_round_trip_copies_arbitrary_payloads(self, payload):
+        """Test the protobuf round-trip copies arbitrary nested payloads.
+
+        Given:
+            Any nested cloudpicklable structure used as a
+            :py:class:`Task`'s ``args`` and ``kwargs``.
+        When:
+            The task is round-tripped via
+            ``Task.from_protobuf(task.to_protobuf())``.
+        Then:
+            The restored ``args`` and ``kwargs`` equal the originals
+            yet are non-identical objects — the copy invariant holds
+            for arbitrary payloads.
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        args = (payload,)
+        kwargs = {"payload": payload}
+        original = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=args,
+            kwargs=kwargs,
+            proxy=_PicklableProxy(),
+        )
+
+        # Act
+        restored = Task.from_protobuf(original.to_protobuf())
+
+        # Assert
+        assert restored.args == original.args
+        assert restored.kwargs == original.kwargs
+        assert restored.args is not original.args
+        assert restored.kwargs is not original.kwargs
+
     @pytest.mark.asyncio
     @settings(
         max_examples=20,
@@ -1015,8 +1240,6 @@ class TestTask:
             ``AttributeError``.
         """
         # Arrange
-        import _thread
-
         unpicklable_obj = _thread.allocate_lock()
 
         async def unpicklable_callable():
@@ -1395,6 +1618,36 @@ class TestTask:
         assert task.id == task_id
         assert task.args == args
         assert task.kwargs == kwargs
+
+    def test_from_protobuf_with_invalid_payload_fails(self, picklable_proxy):
+        """Test from_protobuf raises for a non-cloudpickle payload.
+
+        Given:
+            A :py:class:`protocol.Task` message whose ``callable``
+            field holds bytes that are not a valid cloudpickle
+            payload.
+        When:
+            ``Task.from_protobuf()`` is called.
+        Then:
+            It should raise an unpickling error.
+        """
+        # Arrange
+        task_msg = protocol.Task(
+            version="0.1.0",
+            id=str(uuid4()),
+            callable=b"not-a-pickle",
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            caller="",
+            proxy=cloudpickle.dumps(picklable_proxy),
+            proxy_id=str(picklable_proxy.id),
+            timeout=0,
+            tag="",
+        )
+
+        # Act & assert
+        with pytest.raises((pickle.UnpicklingError, EOFError, ValueError, TypeError)):
+            Task.from_protobuf(task_msg)
 
 
 class TestRoutineScope:

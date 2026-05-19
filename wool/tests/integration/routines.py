@@ -712,6 +712,47 @@ async def return_current_context_id_hex() -> str:
 
 
 @wool.routine
+async def append_to_list(items: list, value) -> list:
+    """Coroutine that appends *value* to *items* in place and returns it.
+
+    Used by the unified-driver argument-copy tests. The worker receives
+    a serialized copy of *items*, so the in-place ``append`` mutates
+    only the worker's copy and the caller's original list object is
+    left unchanged.
+    """
+    items.append(value)
+    return items
+
+
+@wool.routine
+async def append_on_each_yield(items: list, values: list):
+    """Async generator that appends each value in *values* to *items*
+    across successive yields.
+
+    On every iteration it appends the next value in *values* to
+    *items* in place and yields a snapshot of the worker-side list.
+    The caller's original *items* object is unaffected because the
+    worker operates on a serialized copy of the argument.
+    """
+    for value in values:
+        items.append(value)
+        yield list(items)
+        await asyncio.sleep(0)
+
+
+@wool.routine
+async def touch_argument(argument):
+    """Coroutine that returns its single argument unchanged.
+
+    A trivial single-argument routine used by the unpicklable-argument
+    dispatch tests — the routine body never runs when the argument
+    cannot be serialized, since the failure happens at the dispatch
+    serialization boundary.
+    """
+    return argument
+
+
+@wool.routine
 async def accept_token_and_reset(token: wool.Token) -> str:
     """Coroutine that calls ``var.reset(token)`` on the worker and returns var.get().
 

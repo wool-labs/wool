@@ -352,6 +352,37 @@ class TestDispatchSession:
             assert handler.serializer is wool.__serializer__
 
     @pytest.mark.asyncio
+    async def test___aenter___with_async_generator_task_and_cloudpickle(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test :meth:`__aenter__` populates public attrs for a
+        cloudpickle-encoded async-generator task.
+
+        Given:
+            A request stream whose first frame is a valid
+            async-generator :class:`Task` serialized via
+            ``to_protobuf()`` with no wire ``serializer`` field
+        When:
+            The handler is entered via ``async with``
+        Then:
+            It should populate ``handler.task`` and ``handler.context``,
+            set ``handler.serializer`` to ``wool.__serializer__``, and
+            mark ``handler.streaming`` as ``True``.
+        """
+        # Arrange
+        task = _make_task(_gen_default_two)
+        stream = _stream(_request_for(task))
+
+        # Act
+        async with DispatchSession(stream, worker_loop) as handler:
+            # Assert
+            assert isinstance(handler.task, Task)
+            assert handler.task.callable is _gen_default_two
+            assert isinstance(handler.context, Context)
+            assert handler.serializer is wool.__serializer__
+            assert handler.streaming is True
+
+    @pytest.mark.asyncio
     async def test___aenter___with_sync_callable_task(
         self, worker_loop, mock_worker_proxy_cache
     ):
@@ -850,6 +881,139 @@ class TestDispatchSession:
         # Assert
         assert len(captured) == 1
         assert isinstance(captured[0], _CustomRoutineError)
+
+    @pytest.mark.asyncio
+    async def test___aexit___with_drain_raising_cancelled_error(
+        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
+    ):
+        """Test :meth:`__aexit__` unwinds the exit stack even when the
+        registered :meth:`drain` callback raises ``CancelledError``.
+
+        Given:
+            A :class:`DispatchSession` whose :meth:`drain` is patched
+            to raise :class:`asyncio.CancelledError`
+        When:
+            :meth:`__aenter__` succeeds and the ``async with`` block
+            exits
+        Then:
+            It should surface :class:`asyncio.CancelledError` out of
+            :meth:`__aexit__` while still invoking the registered
+            :meth:`drain` callback — the exit-stack unwind finishes
+            without hanging or raising a different error.
+        """
+        # Arrange — patching :class:`DispatchSession.drain` is the
+        # SUT-of-this-file's own public method; the substitution
+        # injects the cleanup-time re-raise that the exit-stack
+        # registration must tolerate. No cleaner real-boundary
+        # trigger exists. The flag records that the registered
+        # callback actually ran during the unwind.
+        drain_ran = False
+
+        async def raising_drain(self):
+            nonlocal drain_ran
+            drain_ran = True
+            raise asyncio.CancelledError("simulated drain re-raise")
+
+        mocker.patch.object(DispatchSession, "drain", raising_drain)
+
+        task = _make_task(_coro_returning_default)
+        stream = _stream(_request_for(task))
+
+        handler = DispatchSession(stream, worker_loop)
+        await handler.__aenter__()
+
+        # Act & assert — the unwind runs the registered drain
+        # callback and surfaces its CancelledError; the bounded
+        # wait_for proves the unwind completed rather than hung.
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(handler.__aexit__(None, None, None), timeout=5.0)
+
+        assert drain_ran, (
+            "__aexit__ must run the drain callback registered on the "
+            "exit stack even though it raises CancelledError"
+        )
+
+    @pytest.mark.asyncio
+    async def test___aexit___with_caller_cancelled_mid_teardown(
+        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
+    ):
+        """Test :meth:`__aexit__` runs the registered :meth:`drain`
+        callback to completion when the caller task is cancelled
+        mid-teardown.
+
+        Given:
+            A :class:`DispatchSession` past :meth:`__aenter__` driving
+            a long-running routine, awaited inside a task that is
+            cancelled while suspended in the ``async with`` block exit
+        When:
+            The caller task is cancelled mid-:meth:`__aexit__`
+        Then:
+            It should run the registered :meth:`drain` callback to
+            completion (shielded unwind) before
+            :class:`asyncio.CancelledError` propagates.
+        """
+        # Arrange — patching :class:`DispatchSession.drain` is the
+        # SUT-of-this-file's own public method; the substitution
+        # parks the teardown on a controllable suspension so the
+        # caller task can be cancelled while the exit-stack unwind
+        # is in flight, then delegates to the real drain so the
+        # long-running worker routine is genuinely torn down.
+        original_drain = DispatchSession.drain
+        drain_entered = asyncio.Event()
+        drain_completed = False
+        proceed = asyncio.Event()
+
+        task = _make_task(_slow_gen)
+        stream = _stream(_request_for(task), _next_request())
+
+        async def parked_drain(self):
+            nonlocal drain_completed
+            drain_entered.set()
+            await proceed.wait()
+            # Cancel the still-running worker routine, then run the
+            # real drain so the callback completes for real.
+            await self.cancel()
+            await original_drain(self)
+            drain_completed = True
+
+        mocker.patch.object(DispatchSession, "drain", parked_drain)
+
+        observed: list[BaseException] = []
+
+        async def caller():
+            handler = DispatchSession(stream, worker_loop)
+            await handler.__aenter__()
+            # Kick the worker so a real routine is in flight, then
+            # exit — __aexit__'s shielded unwind suspends inside the
+            # parked drain callback.
+            aiter(handler)
+            try:
+                await handler.__aexit__(None, None, None)
+            except BaseException as e:
+                observed.append(e)
+                raise
+
+        # Act
+        caller_task = asyncio.ensure_future(caller())
+        await drain_entered.wait()
+        caller_task.cancel()
+        # Let the cancellation register against the shielded unwind.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # Release the parked drain so the shielded callback finishes.
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await caller_task
+
+        # Assert — the registered drain callback ran to completion
+        # despite the mid-teardown cancel, and CancelledError still
+        # propagated to the caller.
+        assert drain_completed, (
+            "the shielded exit-stack unwind must run the registered "
+            "drain callback to completion even when the caller task "
+            "is cancelled mid-teardown"
+        )
+        assert any(isinstance(e, asyncio.CancelledError) for e in observed)
 
     # -- drain ------------------------------------------------------------
 
