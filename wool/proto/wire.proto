@@ -32,27 +32,17 @@ message TaskEnvelope {
 
 // Wire shape for a single wool.ContextVar within a Context
 // snapshot. Mirrors the in-memory wool.ContextVar identity
-// ((namespace, name) pair) and carries the var's per-snapshot
-// state: an optional cloudpickled value and the hex-encoded ids
-// of any wool.Tokens this var has minted that were subsequently
-// consumed by wool.ContextVar.reset in the enclosing Context's
-// logical chain.
+// and carries the var's per-snapshot state: an optional 
+// cloudpickled value. An absent value signals a reset-to-
+// no-prior-value on the sender's chain.
 message ContextVar {
     // Namespace component of the ContextVar identity.
     string namespace = 1;
     // Name component of the ContextVar identity.
     string name = 2;
-    // Cloudpickled value. Unset when the var has no current
-    // value in this snapshot (e.g. it was reset to no prior
-    // value but a consumed token still needs to propagate).
+    // Cloudpickled value. Unset when the var has no 
+    // current value in this snapshot.
     optional bytes value = 3;
-    // Hex-encoded ids of wool.Tokens minted by this var that
-    // have been consumed by wool.ContextVar.reset in this
-    // logical chain. Rides forward- and back-propagation so
-    // receivers (a) see consumed tokens as used and cannot
-    // double-reset and (b) pop the corresponding var from
-    // their local Context, completing the reset signal.
-    repeated string consumed_tokens = 4;
 }
 
 // wool.Context wire shape. Rides on every Request and Response
