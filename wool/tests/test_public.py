@@ -35,16 +35,16 @@ def test_public_api_completeness():
         "TransientRpcError",
         "UnexpectedResponse",
         "WorkerConnection",
-        "Context",
-        "ContextAlreadyBound",
+        "ChainContention",
         "ContextDecodeWarning",
+        "TaskFactoryDisplaced",
         "ContextVar",
         "ContextVarCollision",
         "RuntimeContext",
         "Token",
-        "copy_context",
-        "create_task",
-        "current_context",
+        "TokenLike",
+        "install_task_factory",
+        "to_thread",
         "LoadBalancerContextLike",
         "LoadBalancerLike",
         "NoWorkersAvailable",
@@ -82,6 +82,32 @@ def test_public_api_completeness():
 
     # Assert
     assert actual_public_api == expected_public_api
+
+
+def test_removed_symbols_are_not_accessible():
+    """Test that symbols removed in this PR are not accessible from wool.
+
+    Given:
+        The wool package after the stdlib-context refactor.
+    When:
+        Checking for the presence of each removed symbol by name.
+    Then:
+        It should not expose any of the five removed symbols as attributes.
+    """
+    # Arrange
+    removed_names = [
+        "Context",
+        "current_context",
+        "copy_context",
+        "create_task",
+        "ContextAlreadyBound",
+    ]
+
+    # Act & assert
+    for name in removed_names:
+        assert not hasattr(wool, name), (
+            f"Removed symbol '{name}' is still accessible on the wool package"
+        )
 
 
 def test_serializer_singleton_identity():

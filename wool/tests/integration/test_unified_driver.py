@@ -38,7 +38,7 @@ class TestUnifiedDriverShape:
     async def test_coroutine_dispatch_completes_across_process_boundary(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test a single coroutine dispatch round-trips across the gRPC + worker-process boundary.
+        """Test a single coroutine dispatch round-trips across the worker boundary.
 
         Given:
             A coroutine routine with no caller-side wool.ContextVar
@@ -69,7 +69,7 @@ class TestUnifiedDriverShape:
             # Assert
             assert result == 5
             # The routine never set TENANT_ID/REGION on the worker, so
-            # the caller's snapshot must equal its pre-dispatch value
+            # the caller's context must equal its pre-dispatch value
             # — the back-propagation path is silent when the worker
             # made no mutations.
             assert routines.TENANT_ID.get() == tenant_before
@@ -81,7 +81,7 @@ class TestUnifiedDriverShape:
     async def test_async_gen_dispatch_exhausts_after_single_yield(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test an async-generator that yields exactly once terminates with StopAsyncIteration.
+        """Test an async-generator yielding once terminates with StopAsyncIteration.
 
         Given:
             An async-generator routine that yields a single value and

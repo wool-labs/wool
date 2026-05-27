@@ -340,15 +340,21 @@ class TestPoolComposition:
     async def test_build_pool_from_scenario_with_dispatch_timeout(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test building a pool with dispatch_timeout set in the context.
+        """Test the VIA_DISPATCH_TIMEOUT_VAR dimension propagates to the worker.
 
         Given:
-            A complete scenario using VIA_DISPATCH_TIMEOUT_VAR timeout.
+            A complete scenario using VIA_DISPATCH_TIMEOUT_VAR timeout,
+            which makes ``build_pool_from_scenario`` set the ambient
+            ``dispatch_timeout`` var before the dispatch.
         When:
-            A pool is built with dispatch_timeout set in the ambient
-            context and a coroutine is dispatched.
+            A pool is built and a coroutine is dispatched, then a
+            routine that returns the worker-side ``dispatch_timeout``
+            value is dispatched.
         Then:
-            It should return the correct result with the timeout active.
+            The first dispatch should return its result and the
+            second should report the builder's ``dispatch_timeout``
+            value — proving the dimension's ambient var rides the wire
+            and is restored on the worker.
         """
 
         async def body():
@@ -373,9 +379,15 @@ class TestPoolComposition:
             # Act
             async with build_pool_from_scenario(scenario, credentials_map):
                 result = await invoke_routine(scenario)
+                worker_timeout = await routines.read_dispatch_timeout()
 
             # Assert
             assert result == 3
+            # ``build_pool_from_scenario`` sets dispatch_timeout=30.0
+            # for the VIA_DISPATCH_TIMEOUT_VAR dimension; the worker
+            # must observe that value through the wire-shipped
+            # RuntimeContext.
+            assert worker_timeout == 30.0
 
         await retry_grpc_internal(body)
 

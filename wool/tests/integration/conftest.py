@@ -29,8 +29,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from hypothesis import strategies as st
 
-import wool
-from wool.runtime.context import dispatch_timeout
+from wool.runtime.context.base import dispatch_timeout
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.worker.auth import WorkerCredentials
@@ -183,7 +182,7 @@ class Scenario:
     # and serves as a documentation annotation on test IDs — it does
     # not drive ``build_pool_from_scenario`` behavior today. Tests
     # that vary along this axis set it explicitly so the pytest ID
-    # reflects the behavior under exercise.
+    # reflects the warning regime under exercise.
     strict_warnings: StrictWarnings | None = None
 
     def __or__(self, other: Scenario) -> Scenario:
@@ -245,14 +244,15 @@ def default_scenario(
     ctx_var_2: ContextVarPattern = ContextVarPattern.NONE,
     ctx_var_3: ContextVarPattern = ContextVarPattern.NONE,
     quorum: QuorumMode = QuorumMode.DEFAULT,
+    timeout: TimeoutKind = TimeoutKind.NONE,
     strict_warnings: StrictWarnings | None = None,
 ) -> Scenario:
     """Build a fully-populated :class:`Scenario` with sensible defaults.
 
     Used by happy-path integration tests that want to vary only one or two
     dimensions while leaving the rest at their canonical values. The
-    optional documentation field (``strict_warnings``) defaults to ``None``
-    so it remains absent from the pytest ID unless explicitly set.
+    optional documentation field ``strict_warnings`` defaults to
+    ``None`` so it remains absent from the pytest ID unless explicitly set.
     """
     return Scenario(
         shape=shape,
@@ -261,7 +261,7 @@ def default_scenario(
         lb=LbFactory.CLASS_REF,
         credential=CredentialType.INSECURE,
         options=WorkerOptionsKind.DEFAULT,
-        timeout=TimeoutKind.NONE,
+        timeout=timeout,
         binding=binding,
         lazy=lazy,
         backpressure=backpressure,
@@ -297,11 +297,17 @@ class _DirectDiscovery:
 
 
 @asynccontextmanager
-async def build_pool_from_scenario(scenario, credentials_map):
+async def build_pool_from_scenario(scenario, credentials_map, *, backpressure=None):
     """Build and enter a WorkerPool from a complete Scenario.
 
     Resolves each dimension to its concrete runtime value and yields the
     entered pool context.
+
+    :param backpressure:
+        Optional admission-control hook that overrides the hook the
+        ``BackpressureMode`` dimension would otherwise resolve. Tests
+        that need a bespoke (e.g. context-var-aware) hook pass it here
+        rather than building a :class:`WorkerPool` by hand.
     """
     missing = [
         f.name
@@ -403,13 +409,16 @@ async def build_pool_from_scenario(scenario, credentials_map):
 
     lazy = scenario.lazy is LazyMode.LAZY
 
-    match scenario.backpressure:
-        case BackpressureMode.SYNC:
-            bp_hook = _sync_accept_hook
-        case BackpressureMode.ASYNC:
-            bp_hook = _async_accept_hook
-        case _:
-            bp_hook = None
+    if backpressure is not None:
+        bp_hook = backpressure
+    else:
+        match scenario.backpressure:
+            case BackpressureMode.SYNC:
+                bp_hook = _sync_accept_hook
+            case BackpressureMode.ASYNC:
+                bp_hook = _async_accept_hook
+            case _:
+                bp_hook = None
 
     match scenario.quorum:
         case QuorumMode.ABOVE_DEFAULT:
@@ -708,15 +717,15 @@ def _assert_caller_vars(patterns, initial_values, *, shape=None):
     what the caller observes via back-propagation. The inner worker's
     mutations do not reach the outer worker's copied context because
     the nested dispatch crosses event loop boundaries; only the outer
-    worker's own writes are captured in its snapshot.
+    worker's own writes are captured in its context.
 
     For NESTED_ASYNC_GEN shapes, the async generator's final context
-    snapshot is sent with the last yield, not after exhaustion.
+    is sent with the last yield, not after exhaustion.
     Post-teardown mutations (UPSTREAM_RESET) are not visible to the
     caller because there is no subsequent yield to carry them. For
     DOWNSTREAM_OVERWRITE and DOWNSTREAM_RESET the outer worker's
     ``_pre_nested_setup`` runs before the first inner yield, so those
-    values ARE captured in per-yield snapshots.
+    values ARE captured in per-yield contexts.
     """
     is_nested_gen = shape is RoutineShape.NESTED_ASYNC_GEN
     for var_name, pattern in patterns.items():
@@ -755,7 +764,7 @@ def _assert_caller_vars(patterns, initial_values, *, shape=None):
                 if is_nested_gen:
                     # Async gen: inner sets "inner-set-" before
                     # yielding; that value is captured in a
-                    # per-yield snapshot and back-propagated to the
+                    # per-yield context and back-propagated to the
                     # caller. _post_nested_teardown runs after the
                     # gen exhausts — no subsequent yield carries
                     # its mutation — so the caller's final visible
@@ -767,7 +776,7 @@ def _assert_caller_vars(patterns, initial_values, *, shape=None):
                 else:
                     # Coroutine: inner sets, then _post_nested_teardown
                     # overwrites with outer-reset before the response
-                    # snapshot ships.
+                    # context ships.
                     assert var.get() == f"outer-reset-{var_name}", (
                         f"UPSTREAM_RESET: expected outer-reset value, got {var.get()!r}"
                     )
@@ -775,6 +784,10 @@ def _assert_caller_vars(patterns, initial_values, *, shape=None):
                 # After iteration, caller should see the last
                 # step value back-propagated.
                 pass  # validated inline during iteration
+            case ContextVarPattern.MID_STREAM_FORWARD:
+                # Forward propagation is asserted worker-side per
+                # frame — a mismatch raises a dispatch exception.
+                pass  # validated worker-side during iteration
 
 
 def _cleanup_caller_vars(tokens):
@@ -824,6 +837,30 @@ async def invoke_routine(scenario):
                     gen = routine(obj, 3)
                 else:
                     gen = routine(3)
+                forward = {
+                    k: v
+                    for k, v in patterns.items()
+                    if v is ContextVarPattern.MID_STREAM_FORWARD
+                }
+                # MID_STREAM_FORWARD drives the generator one step at a
+                # time, mutating the var to a per-step value before
+                # each ``__anext__`` so the worker frame observes the
+                # forward-propagated value.
+                if forward:
+                    step = 0
+                    while True:
+                        for var_name in forward:
+                            _CALLER_VARS[var_name].set(f"step-{step}")
+                        try:
+                            item = await gen.__anext__()
+                        except StopAsyncIteration:
+                            break
+                        collected.append(item)
+                        step += 1
+                    assert collected == [0, 1, 2]
+                    if patterns:
+                        _assert_caller_vars(patterns, initial_values, shape=shape)
+                    return collected
                 step = 0
                 async for item in gen:
                     collected.append(item)
@@ -1025,6 +1062,13 @@ _NESTED_ONLY_PATTERNS = (
     ContextVarPattern.DOWNSTREAM_RESET,
     ContextVarPattern.UPSTREAM_RESET,
 )
+# MID_STREAM_FORWARD requires the caller to mutate the var before each
+# ``__anext__`` and the worker to assert the forward-propagated value
+# per frame. Only the plain ``async for`` shape drives the generator
+# one step at a time through ``invoke_routine``; the asend/athrow/
+# aclose scripts and the single-yield shape do not, so the pattern is
+# constrained to ASYNC_GEN_ANEXT.
+_MID_STREAM_FORWARD_SHAPES = (RoutineShape.ASYNC_GEN_ANEXT,)
 
 
 def _is_grpc_internal(exc: BaseException) -> bool:
@@ -1053,7 +1097,8 @@ def _pairwise_filter(row):
       always uses module-level routines)
     - D11/D12/D13 (ctx_var_1/2/3): DOWNSTREAM_OVERWRITE,
       DOWNSTREAM_RESET, UPSTREAM_RESET only valid with NESTED_* shapes;
-      PER_YIELD only valid with ASYNC_GEN_* shapes
+      PER_YIELD and MID_STREAM_FORWARD only valid with ASYNC_GEN_*
+      shapes
     - D14 (quorum) ABOVE_DEFAULT (quorum=2) requires PoolMode.EPHEMERAL —
       every other pool mode in the builder produces only one worker, so
       quorum=2 would block forever.
@@ -1110,6 +1155,11 @@ def _pairwise_filter(row):
             if pattern in _NESTED_ONLY_PATTERNS and shape not in _NESTED_SHAPES:
                 return False
             if pattern is ContextVarPattern.PER_YIELD and shape not in _ASYNC_GEN_SHAPES:
+                return False
+            if (
+                pattern is ContextVarPattern.MID_STREAM_FORWARD
+                and shape not in _MID_STREAM_FORWARD_SHAPES
+            ):
                 return False
             # NESTED_ASYNC_GEN_READBACK's routine self-mutates
             # ``TENANT_ID`` per iteration; combining with framework-
@@ -1238,6 +1288,8 @@ def scenarios_strategy(draw):
             valid = [p for p in valid if p not in _NESTED_ONLY_PATTERNS]
         if shape not in _ASYNC_GEN_SHAPES:
             valid = [p for p in valid if p is not ContextVarPattern.PER_YIELD]
+        if shape not in _MID_STREAM_FORWARD_SHAPES:
+            valid = [p for p in valid if p is not ContextVarPattern.MID_STREAM_FORWARD]
         return draw(st.sampled_from(valid))
 
     ctx_var_1 = _draw_ctx_var_pattern(draw)
