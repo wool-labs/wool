@@ -22,7 +22,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from wool.protocol import WorkerMetadata as WorkerMetadataProtobuf
+from wool import protocol as wire
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryEventType
@@ -692,7 +692,7 @@ class LocalDiscovery(Discovery):
                 assert memory_block.buf is not None
                 size = struct.unpack_from("I", memory_block.buf, 0)[0]
                 serialized = struct.unpack_from(f"{size}s", memory_block.buf, 4)[0]
-                protobuf = WorkerMetadataProtobuf.FromString(serialized)
+                protobuf = wire.WorkerMetadata.FromString(serialized)
                 return WorkerMetadata.from_protobuf(protobuf)
 
         def _diff(

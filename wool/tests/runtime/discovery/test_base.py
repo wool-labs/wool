@@ -7,7 +7,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from wool.protocol import WorkerMetadata as WorkerMetadataProtobuf
+from wool import protocol as wire
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryEventType
@@ -42,7 +42,7 @@ def metadata_message():
     Creates a protobuf WorkerMetadata message with typical field values for use
     in tests that need to deserialize protobuf messages.
     """
-    return WorkerMetadataProtobuf(
+    return wire.WorkerMetadata(
         uid="12345678-1234-5678-1234-567812345678",
         address="localhost:50051",
         pid=12345,
@@ -169,7 +169,7 @@ class TestWorkerMetadata:
             It should raise ValueError
         """
         # Arrange
-        protobuf = WorkerMetadataProtobuf(
+        protobuf = wire.WorkerMetadata(
             uid="invalid-uuid",
             address="localhost:50051",
             pid=12345,

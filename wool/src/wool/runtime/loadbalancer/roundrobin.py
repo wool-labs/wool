@@ -37,8 +37,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
     :class:`~wool.runtime.worker.connection.TransientRpcError`) as
     worker-health concerns. Other exceptions raised by
     :meth:`WorkerConnection.dispatch` — e.g. a strict-mode
-    :class:`BaseExceptionGroup` of
-    :class:`wool.ContextDecodeWarning` peers from a caller-side
+    :class:`wool.ContextDecodeError` from a caller-side
     encode failure, or a programming-error
     :class:`ValueError` — propagate to the caller unwrapped, so a
     fault that has nothing to do with worker health does not evict
