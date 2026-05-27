@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import traceback
 from collections.abc import Callable
@@ -8,6 +9,7 @@ from contextlib import asynccontextmanager
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from dataclasses import field
 from inspect import isasyncgen
 from inspect import isasyncgenfunction
 from inspect import iscoroutinefunction
@@ -124,8 +126,8 @@ class Task(Generic[W]):
         Descriptive label identifying the call site, formatted as
         ``module.qualname:lineno`` by the ``@routine`` wrapper.
     :param runtime_context:
-        Snapshot of the active :class:`RuntimeContext` at construction
-        time, captured by :meth:`__post_init__` if not supplied. Ships
+        The active :class:`RuntimeContext` captured at construction
+        time by :meth:`__post_init__` if not supplied. Ships
         with the dispatch frame so the worker side can restore wire
         defaults (notably ``dispatch_timeout``) for the routine's
         execution.
@@ -141,10 +143,18 @@ class Task(Generic[W]):
     exception: TaskException | None = None
     tag: str | None = None
     runtime_context: RuntimeContext | None = None
+    # F36 — declare the single-entry guard slot at class scope, matching
+    # :class:`RuntimeContext._dispatch_timeout_token`'s precedent.
+    # ``init=False`` keeps the constructor surface unchanged; ``repr=False``
+    # / ``compare=False`` keep the field out of repr() and equality so
+    # internal lifecycle state doesn't leak into either.
+    _task_token: contextvars.Token["Task | None"] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self):
         """Validate the proxy, capture the calling task's id, and seed
-        a :class:`RuntimeContext` snapshot if one was not supplied.
+        a :class:`RuntimeContext` if one was not supplied.
 
         The runtime-context seed lets a Task built outside an active
         :class:`RuntimeContext` scope still ship the wire defaults
@@ -154,7 +164,12 @@ class Task(Generic[W]):
             raise TypeError(
                 f"proxy must conform to WorkerProxyLike, got {type(self.proxy).__name__}"
             )
-        if caller := _current_task.get():
+        # Auto-capture the calling task's id only when ``caller`` was
+        # not supplied explicitly — match the ``runtime_context`` seed
+        # pattern below. Unconditionally overwriting an explicit
+        # constructor argument violates the principle of least
+        # surprise for a public dataclass field.
+        if self.caller is None and (caller := _current_task.get()):
             self.caller = caller.id
         if self.runtime_context is None:
             self.runtime_context = RuntimeContext.get_current()
@@ -165,8 +180,20 @@ class Task(Generic[W]):
         Bind this task to the current context. On exit, re-binds
         the calling task and records any propagating exception
         on :attr:`exception` for wire transport.
+
+        :raises RuntimeError:
+            If the instance is already inside a ``with`` block
+            (``self._task_token is not None``). ``Task`` is
+            block-scoped and single-use as a context manager;
+            re-entering would leak the outer token.
         """
         logging.debug(f"Entering {self.__class__.__name__} with ID {self.id}")
+        if self._task_token is not None:
+            raise RuntimeError(
+                f"{self.__class__.__name__} is already active in a `with` "
+                "block; instances are block-scoped and single-use as context "
+                "managers"
+            )
         self._task_token = _current_task.set(self)
         return self
 
@@ -203,7 +230,19 @@ class Task(Generic[W]):
                     for y in x.split("\n")
                 ],
             )
-        _current_task.reset(self._task_token)
+        # F11 — guard against __exit__ invoked without a preceding
+        # successful __enter__. ``_task_token`` is ``None`` until
+        # __enter__ runs; without this guard, ``_current_task.reset(None)``
+        # raises ``TypeError: instance of Token expected`` at runtime
+        # and pyright (rightly) flags the type as
+        # ``Token | None`` → ``Token``. Mirrors __enter__'s
+        # re-entry guard symmetrically: __enter__ raises on double-
+        # enter, __exit__ no-ops on double-exit.
+        token = self._task_token
+        if token is None:
+            return False
+        _current_task.reset(token)
+        self._task_token = None
         return False
 
     @classmethod

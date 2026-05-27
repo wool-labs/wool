@@ -14,7 +14,7 @@ from typing import cast
 from uuid import uuid4
 
 import wool
-from wool.runtime.context import dispatch_timeout
+from wool.runtime.context.base import dispatch_timeout
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import do_dispatch
 
@@ -114,23 +114,23 @@ def routine(fn: C) -> C:
 
     **Context propagation and decode-failure semantics:**
 
-    Routines run inside their own :class:`wool.Context` on the worker,
-    which receives the caller's :class:`wool.ContextVar` snapshot on
-    dispatch and ships post-run mutations back on the response. Wool
-    treats this propagation as **ancillary state** — separate from the
-    routine's primary signal (its return value or raised exception):
+    Routines run on the worker under the caller's Wool chain: the
+    caller's :class:`wool.ContextVar` context is decoded from the
+    dispatch frame and the routine runs under it, with post-run
+    mutations shipped back on the response. Wool treats this
+    propagation as **ancillary state** — separate from the routine's
+    primary signal (its return value or raised exception):
 
     - **Primary signal preservation.** A failure to decode the wire
-      :class:`wool.Context` (e.g., cross-version pickle skew on a
-      single var value) never preempts the routine's outcome. The
+      context (e.g., cross-version pickle skew on a single
+      variable value) never preempts the routine's outcome. The
       result is still returned; a routine exception is still raised.
     - **Visibility via warning.** Every ancillary decode failure emits
       a :class:`wool.ContextDecodeWarning` on the side that observed
-      the failure. On the caller, an exception-frame decode failure
-      is bundled alongside the routine's raised exception in a
-      :class:`BaseExceptionGroup` so both signals reach user code —
-      ``except*`` splits the worker exception from the per-entry
-      decode failures.
+      the failure. Under the default warning filter the routine
+      exception's type is preserved — ``except RoutineError:`` still
+      matches as written — and the warnings remain visible in the
+      Python warnings stream.
     - **Strict mode (opt-in).** Promote the warning to an exception
       to treat ancillary failures as fatal::
 
@@ -139,14 +139,21 @@ def routine(fn: C) -> C:
 
           warnings.filterwarnings("error", category=wool.ContextDecodeWarning)
 
-      In strict mode :meth:`wool.Context.from_protobuf` aggregates
-      the per-entry exceptions into a :class:`BaseExceptionGroup`
-      that the caller observes in place of the primary signal:
+      In strict mode the wire-context decode aggregates the per-entry
+      warnings into a single :class:`wool.ContextDecodeError` (a
+      :class:`RuntimeError` subclass with the warnings on
+      :attr:`~wool.ContextDecodeError.warnings`):
 
-      * Result frames lose the routine's return value — the group
-        raises instead.
-      * Exception frames preserve the routine exception as a peer
-        of the decode-failure group, so ``except*`` recovers both.
+      * **Result frames** lose the routine's return value — the
+        :class:`~wool.ContextDecodeError` raises in place of the
+        primary signal so the caller observes every bad entry, not
+        just the first.
+      * **Exception frames** still preserve the routine exception as
+        the primary signal; the :class:`~wool.ContextDecodeError`
+        rides on it as ``__cause__`` via ``raise routine_exc from
+        decode_err``. The routine exception's class is preserved so
+        ``except RoutineError:`` keeps matching — no migration to
+        ``except*`` required.
 
       Callers that want both result preservation *and* failure
       visibility should instead use ``warnings.catch_warnings(record=True)``
@@ -159,10 +166,10 @@ def routine(fn: C) -> C:
 
           PYTHONWARNINGS = "error::wool.ContextDecodeWarning"
 
-      When the worker promotes the warning, wool ships it back
-      through the routine-exception channel so the caller catches
-      the same ``wool.ContextDecodeWarning`` class — no
-      :class:`grpc.aio.AioRpcError` to special-case.
+      When the worker promotes the warning, wool ships the resulting
+      :class:`wool.ContextDecodeError` back through the
+      routine-exception channel so the caller catches the same error
+      class — no :class:`grpc.aio.AioRpcError` to special-case.
 
     Example usage with coroutines:
 
