@@ -7,8 +7,7 @@ from types import MappingProxyType
 
 import grpc
 
-from wool.protocol import ChannelOptions as ChannelOptionsProtobuf
-from wool.protocol import WorkerMetadata as WorkerMetadataProtobuf
+from wool import protocol as wire
 from wool.runtime.worker.base import ChannelOptions
 
 
@@ -53,7 +52,7 @@ class WorkerMetadata:
     options: ChannelOptions = field(default_factory=ChannelOptions, hash=False)
 
     @classmethod
-    def from_protobuf(cls, protobuf: WorkerMetadataProtobuf) -> WorkerMetadata:
+    def from_protobuf(cls, protobuf: wire.WorkerMetadata) -> WorkerMetadata:
         """Create a WorkerMetadata instance from a protobuf message.
 
         :param protobuf:
@@ -75,14 +74,14 @@ class WorkerMetadata:
             options=cls._options_from_protobuf(protobuf),
         )
 
-    def to_protobuf(self) -> WorkerMetadataProtobuf:
+    def to_protobuf(self) -> wire.WorkerMetadata:
         """Convert this WorkerMetadata instance to a protobuf message.
 
         :returns:
             A protobuf WorkerMetadata message containing this instance's data.
         """
 
-        msg = WorkerMetadataProtobuf(
+        msg = wire.WorkerMetadata(
             uid=str(self.uid),
             address=self.address,
             pid=self.pid,
@@ -92,7 +91,7 @@ class WorkerMetadata:
             secure=self.secure,
         )
         msg.connection.CopyFrom(
-            ChannelOptionsProtobuf(
+            wire.ChannelOptions(
                 max_receive_message_length=self.options.max_receive_message_length,
                 max_send_message_length=self.options.max_send_message_length,
                 keepalive_time_ms=self.options.keepalive_time_ms,
@@ -106,7 +105,7 @@ class WorkerMetadata:
         return msg
 
     @classmethod
-    def _options_from_protobuf(cls, protobuf: WorkerMetadataProtobuf) -> ChannelOptions:
+    def _options_from_protobuf(cls, protobuf: wire.WorkerMetadata) -> ChannelOptions:
         """Reconstruct ChannelOptions from the protobuf connection config.
 
         :param protobuf:

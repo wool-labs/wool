@@ -37,12 +37,12 @@ class PicklableMock(MagicMock):
 
 @pytest.fixture(autouse=True)
 def _isolate_wool_context():
-    """Install a fresh wool.Context for the duration of the test.
+    """Install a fresh, unarmed Wool context for the duration of the test.
 
-    Each test runs under its own scoped Context so var values set in
-    one test do not leak into subsequent tests via the per-task data
-    map. The process-wide var_registry is not reset; tests SHOULD
-    use unique key namespaces (e.g. via uuid suffix) to avoid
+    Each test runs under its own unarmed context so var values set
+    in one test do not leak into subsequent tests via the chain
+    context. The process-wide var_registry is not reset; tests
+    SHOULD use unique key namespaces (e.g. via uuid suffix) to avoid
     cross-test collisions on shared keys.
     """
     with scoped_context():

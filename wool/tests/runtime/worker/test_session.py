@@ -2,7 +2,7 @@
 
 These tests exercise :class:`Rejected` and :class:`DispatchSession` through
 their public surface (constructor, ``async with``, ``async for``,
-:meth:`drain`, :meth:`cancel`, public attributes ``task``/``context``/
+:meth:`drain`, :meth:`cancel`, public attributes ``task``/``decoded``/
 ``serializer``). Worker-loop interactions use the
 ``new_event_loop + threading.Thread + install_task_factory`` pattern
 so the handler can drive a real :func:`scoped` routine across loops.
@@ -22,8 +22,8 @@ from tests.runtime.worker.conftest import PicklableMock
 from wool import protocol
 from wool.protocol import WorkerStub
 from wool.protocol import add_WorkerServicer_to_server
-from wool.runtime.context import Context
 from wool.runtime.context import install_task_factory
+from wool.runtime.context.manifest import _ContextManifest
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
 from wool.runtime.worker.interceptor import VersionInterceptor
@@ -108,6 +108,31 @@ def _sync_callable():
     return "not_async"
 
 
+# Unarmed-worker regression fixture — a module-level wool.ContextVar
+# with a default plus a coroutine routine that offloads, via *plain*
+# asyncio.to_thread, a function that reads it. When the routine is
+# dispatched with no caller Wool state, the worker context stays
+# unarmed, so the offload runs as a plain contextvars context and the
+# read returns the default instead of tripping ChainContention.
+# Module-level so the routine and the var are picklable for cloudpickle
+# transport.
+_UNARMED_WORKER_VAR: wool.ContextVar[str] = wool.ContextVar(
+    "unarmed_worker_var", default="unset-default"
+)
+
+
+def _read_unarmed_worker_var() -> str:
+    """Read the unarmed-worker regression var — runs in the offload thread."""
+    return _UNARMED_WORKER_VAR.get()
+
+
+async def _coro_offloads_plain_to_thread():
+    """Coroutine routine that offloads a wool.ContextVar read via
+    plain asyncio.to_thread.
+    """
+    return await asyncio.to_thread(_read_unarmed_worker_var)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -130,9 +155,19 @@ def _request_for(task: Task) -> protocol.Request:
     return protocol.Request(task=task.to_protobuf())
 
 
-def _next_request() -> protocol.Request:
-    """Build a follow-up ``next`` request frame."""
-    return protocol.Request(next=protocol.Void())
+def _next_request(*, with_context: bool = False) -> protocol.Request:
+    """Build a follow-up ``next`` request frame.
+
+    When *with_context* is True, sets an empty (but present)
+    ``context`` field on the wire so tests that exercise the
+    wire-context decode path see a present-but-empty wire frame
+    rather than the absent-field path that lazy-wire-frame semantics
+    short-circuit.
+    """
+    request = protocol.Request(next=protocol.Void())
+    if with_context:
+        request.context.CopyFrom(protocol.Context())
+    return request
 
 
 async def _stream(*requests):
@@ -248,7 +283,7 @@ class TestDispatchSession:
             :class:`DispatchSession` is constructed
         Then:
             It should be created without raising and ``task`` /
-            ``context`` / ``serializer`` should be unset before
+            ``decoded`` / ``serializer`` should be unset before
             ``__aenter__``.
         """
         # Arrange
@@ -260,15 +295,15 @@ class TestDispatchSession:
 
         # Assert
         assert isinstance(handler, DispatchSession)
-        # Class-level annotations declare ``task`` and ``context``;
+        # Class-level annotations declare ``task`` and ``decoded``;
         # they are only populated on enter so accessing them before
         # enter raises AttributeError.
         with pytest.raises(AttributeError):
             handler.task  # noqa: B018
         with pytest.raises(AttributeError):
-            handler.context  # noqa: B018
+            handler.decoded  # noqa: B018
         # All dispatch serializes through cloudpickle; this one
-        # serializer covers the payload, the context snapshots, and
+        # serializer covers the payload, the context contexts, and
         # any ``Rejected`` dumped exception (including pre-parse
         # failures such as StopAsyncIteration or a malformed frame).
         assert handler.serializer is wool.__serializer__
@@ -336,7 +371,7 @@ class TestDispatchSession:
         When:
             The handler is entered via ``async with``
         Then:
-            It should populate ``handler.task``, ``handler.context``,
+            It should populate ``handler.task``, ``handler.decoded``,
             and set ``handler.serializer`` to ``wool.__serializer__``.
         """
         # Arrange
@@ -348,7 +383,7 @@ class TestDispatchSession:
             # Assert
             assert isinstance(handler.task, Task)
             assert handler.task.callable is _coro_returning_default
-            assert isinstance(handler.context, Context)
+            assert isinstance(handler.decoded, _ContextManifest)
             assert handler.serializer is wool.__serializer__
 
     @pytest.mark.asyncio
@@ -360,12 +395,12 @@ class TestDispatchSession:
 
         Given:
             A request stream whose first frame is a valid
-            async-generator :class:`Task` serialized via
-            ``to_protobuf()`` with no wire ``serializer`` field
+            async-generator :class:`Task` with cloudpickle
+            serialization
         When:
             The handler is entered via ``async with``
         Then:
-            It should populate ``handler.task`` and ``handler.context``,
+            It should populate ``handler.task`` and ``handler.decoded``,
             set ``handler.serializer`` to ``wool.__serializer__``, and
             mark ``handler.streaming`` as ``True``.
         """
@@ -378,7 +413,7 @@ class TestDispatchSession:
             # Assert
             assert isinstance(handler.task, Task)
             assert handler.task.callable is _gen_default_two
-            assert isinstance(handler.context, Context)
+            assert isinstance(handler.decoded, _ContextManifest)
             assert handler.serializer is wool.__serializer__
             assert handler.streaming is True
 
@@ -525,42 +560,49 @@ class TestDispatchSession:
                 pass
 
     @pytest.mark.asyncio
-    async def test___aenter___with_decode_group_of_exceptions(
+    async def test___aenter___wraps_context_decode_error_in_rejected(
         self,
         worker_loop,
         mock_worker_proxy_cache,
         mocker: MockerFixture,
     ):
-        """Test :meth:`__aenter__` wraps an Exception-only decode
-        :class:`BaseExceptionGroup` as :class:`Rejected`.
+        """Test :meth:`__aenter__` wraps a pre-Ack
+        :class:`ContextDecodeError` in :class:`Rejected` for Nack
+        transport.
 
         Given:
             A request stream whose first frame is well-formed but
-            :meth:`Context.from_protobuf` raises a
-            :class:`BaseExceptionGroup` of :class:`Exception` peers
+            :func:`Context.from_protobuf` raises a
+            :class:`ContextDecodeError` aggregating per-var warnings
+            (strict mode).
         When:
-            The handler is entered via ``async with``
+            The handler is entered via ``async with``.
         Then:
-            It should raise :class:`Rejected` whose ``.original`` is a
-            :class:`BaseExceptionGroup` labeled
-            "request context decode failed".
+            It should raise :class:`Rejected` whose ``.original`` is
+            the :class:`ContextDecodeError` itself — the routine
+            does not run; the dispatch handler ships the error via
+            the Nack channel; the caller catches the same error class
+            symmetrically.
         """
         # Arrange
-        task = _make_task(_coro_returning_default)
-        stream = _stream(_request_for(task))
+        import wool
 
-        # Patch Context.from_protobuf to raise an Exception-only group.
-        # The constructor downgrades Exception-only groups to
-        # ExceptionGroup so the parse-phase ``except Exception`` arm
-        # routes it through Rejected.
-        peer = ValueError("decode peer")
-        eg = BaseExceptionGroup("simulated decode failure", [peer])
-        from wool.runtime.context import base as ctx_base
+        task = _make_task(_coro_returning_default)
+        # Carry a present (but minimal) wire context so the lazy-wire-
+        # frame receiver actually invokes
+        # ``ContextManifest.from_protobuf``.
+        request = _request_for(task)
+        request.context.CopyFrom(protocol.Context())
+        stream = _stream(request)
+
+        peer = wool.ContextDecodeWarning("decode peer")
+        err = wool.ContextDecodeError(peer)
+        from wool.runtime.context.manifest import _ContextManifest
 
         mocker.patch.object(
-            ctx_base.Context,
+            _ContextManifest,
             "from_protobuf",
-            classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(eg)),
+            classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(err)),
         )
 
         # Act & assert
@@ -569,56 +611,58 @@ class TestDispatchSession:
                 pass
 
         original = exc_info.value.original
-        assert isinstance(original, BaseExceptionGroup)
-        assert "request context decode failed" in original.message
+        assert original is err
+        assert isinstance(original, wool.ContextDecodeError)
+        assert len(original.warnings) == 1
+        assert original.warnings[0] is peer
 
     @pytest.mark.asyncio
-    async def test___aenter___with_decode_group_with_non_exception_peer(
+    async def test___aenter___propagates_base_exception_from_decode_raw(
         self,
         worker_loop,
         mock_worker_proxy_cache,
         mocker: MockerFixture,
     ):
-        """Test :meth:`__aenter__` propagates a true
-        :class:`BaseExceptionGroup` raw.
+        """Test :meth:`__aenter__` propagates a non-Exception raise
+        from decode raw (no Rejected wrap).
 
         Given:
-            A request stream whose first frame triggers a
-            :class:`BaseExceptionGroup` containing a non-Exception peer
-            (e.g. :class:`asyncio.CancelledError`) from
-            :meth:`Context.from_protobuf`
+            A request stream whose first frame triggers an
+            :class:`asyncio.CancelledError` raised directly from
+            :meth:`ContextManifest.from_protobuf` (e.g. cancellation
+            arriving mid-decode).
         When:
-            The handler is entered via ``async with``
+            The handler is entered via ``async with``.
         Then:
-            It should propagate the :class:`BaseExceptionGroup` raw
-            (not as :class:`Rejected`).
+            It should propagate the :class:`asyncio.CancelledError`
+            raw — the parse-phase ``except Exception`` arm does not
+            catch :class:`BaseException` subclasses; Nack is the wrong
+            channel for cancellation/interrupt signals.
         """
         # Arrange
         task = _make_task(_coro_returning_default)
-        stream = _stream(_request_for(task))
+        # Carry a present wire context so the lazy-wire-frame receiver
+        # actually invokes ``ContextManifest.from_protobuf``.
+        request = _request_for(task)
+        request.context.CopyFrom(protocol.Context())
+        stream = _stream(request)
 
-        # A group with a non-Exception peer stays a
-        # BaseExceptionGroup (no auto-downgrade) and so falls through
-        # the parse-phase ``except Exception`` arm.
-        peer = asyncio.CancelledError()
-        eg = BaseExceptionGroup("simulated decode failure", [peer])
-        from wool.runtime.context import base as ctx_base
+        cancelled = asyncio.CancelledError()
+        from wool.runtime.context.manifest import _ContextManifest
 
         mocker.patch.object(
-            ctx_base.Context,
+            _ContextManifest,
             "from_protobuf",
-            classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(eg)),
+            classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(cancelled)),
         )
 
         # Act & assert
-        with pytest.raises(BaseExceptionGroup) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             async with DispatchSession(stream, worker_loop):
                 pass
 
-        # The raised group should carry the rewrap label and the
-        # original non-Exception peer, not be wrapped in Rejected.
         assert not isinstance(exc_info.value, Rejected)
-        assert "request context decode failed" in exc_info.value.message
+        assert exc_info.value is cancelled
 
     # -- __aiter__ --------------------------------------------------------
 
@@ -631,13 +675,16 @@ class TestDispatchSession:
 
         Given:
             A handler past :meth:`__aenter__` with a coroutine routine
-            returning a value
+            returning a value, dispatched with no caller Wool context
+            state
         When:
             The handler is iterated via ``async for``
         Then:
             It should yield exactly one response whose result is the
-            coroutine's return value and whose context carries the
-            post-step :class:`protocol.Context` snapshot.
+            coroutine's return value and whose context is a stateless
+            :class:`protocol.Context` — a stateless dispatch leaves the
+            worker context unarmed, so the post-step context carries no
+            variable entries.
         """
         # Arrange
         task = _make_task(_coro_returning_default)
@@ -649,15 +696,42 @@ class TestDispatchSession:
 
         # Assert
         assert len(results) == 1
-        assert results[0].result == "coroutine_value"
-        # The unified driver MUST emit a post-step context snapshot on
-        # every successful step (issue #187 motivation: "snapshot-encode
-        # duplicated across both paths"). The presence of an ``id`` on
-        # the response's :class:`protocol.Context` proves a snapshot
-        # was actually populated (a missing snapshot would surface as
-        # the empty default).
-        assert results[0].context is not None
-        assert results[0].context.id
+        assert results[0].payload == "coroutine_value"
+        # Under lazy-wire-frame semantics the unarmed worker omits
+        # the optional context field entirely — current_wire_context
+        # returns None when current_context() is None.
+        assert results[0].context is None
+
+    @pytest.mark.asyncio
+    async def test___aiter___stateless_dispatch_leaves_worker_context_unarmed(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test a stateless dispatch leaves the worker context unarmed.
+
+        Given:
+            A coroutine routine dispatched with no caller wool.ContextVar
+            state, whose body offloads a wool.ContextVar read through
+            plain asyncio.to_thread
+        When:
+            The handler is iterated via ``async for``
+        Then:
+            It should yield one response whose result is the variable's
+            constructor default — the worker context stayed unarmed
+            (context_has_state gating), so the plain to_thread
+            offload ran as a bare contextvars context and never tripped
+            wool.ChainContention.
+        """
+        # Arrange
+        task = _make_task(_coro_offloads_plain_to_thread)
+        stream = _stream(_request_for(task))
+
+        # Act
+        async with DispatchSession(stream, worker_loop) as handler:
+            results = [r async for r in handler]
+
+        # Assert
+        assert len(results) == 1
+        assert results[0].payload == "unset-default"
 
     @pytest.mark.asyncio
     async def test___aiter___with_async_generator_task_yields_per_request(
@@ -689,7 +763,7 @@ class TestDispatchSession:
             results = [r async for r in handler]
 
         # Assert
-        assert [r.result for r in results] == [1, 2, 3]
+        assert [r.payload for r in results] == [1, 2, 3]
 
     @pytest.mark.asyncio
     async def test___aiter___with_async_generator_yields_per_caller_request(
@@ -720,7 +794,7 @@ class TestDispatchSession:
             results = [r async for r in handler]
 
         # Assert
-        assert [r.result for r in results] == ["a", "b"]
+        assert [r.payload for r in results] == ["a", "b"]
 
     @pytest.mark.asyncio
     async def test___aiter___called_twice_returns_same_iterator(
@@ -1217,7 +1291,7 @@ class TestDispatchSession:
         """Test :meth:`drain` returns when ``_start`` fails to
         create the worker task on the worker loop.
 
-        Regression test for A8. Pre-fix, ``_start`` (scheduled
+        Regression test. Pre-fix, ``_start`` (scheduled
         via :meth:`asyncio.AbstractEventLoop.call_soon_threadsafe`
         from :meth:`_schedule_worker`) called
         :meth:`asyncio.AbstractEventLoop.create_task` without a
@@ -1498,57 +1572,67 @@ class TestDispatchSession:
     async def test___aiter___streaming_rewraps_mid_stream_context_decode_failure(
         self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test mid-stream context decode failures are re-wrapped
-        with a labeled message so the dispatch handler can
-        distinguish them from initial-frame decode failures.
+        """Test mid-stream context decode failures propagate as
+        :class:`ContextDecodeError` through the routine-exception
+        channel.
 
         Given:
             A streaming session whose first ``next`` request decodes
             cleanly but whose second ``next`` request's context
-            decode raises a :class:`BaseExceptionGroup` (operator
-            promoted :class:`ContextDecodeWarning` to an exception)
+            decode raises a :class:`ContextDecodeError` aggregating
+            per-var warnings (operator promoted
+            :class:`ContextDecodeWarning` to an exception).
         When:
-            The caller iterates the session past the first response
+            The caller iterates the session past the first response.
         Then:
-            The error should surface as a :class:`BaseExceptionGroup`
-            (or :class:`ExceptionGroup` after constructor downgrade)
-            labeled "mid-stream request context decode failed" so
-            the dispatch handler can distinguish it from
-            initial-frame decode failures that share the same peer
-            type.
+            The :class:`ContextDecodeError` should surface
+            unmolested out of the iterator — under the strict-mode
+            "fail loud" contract the worker ships it via the
+            routine-exception channel; the caller's existing
+            ``except ContextDecodeError`` catches without migrating
+            to ``except*``.
         """
-        from wool.runtime.context import base as ctx_base
+        # Arrange — streaming routine that yields per ``next``. The
+        # mid-stream next-requests carry a present-but-empty context so
+        # ``RequestFrame.from_protobuf`` routes into
+        # ``ContextManifest.from_protobuf`` (and hence the patched
+        # mock) under lazy-wire-frame semantics — without a present
+        # field, the decode path short-circuits before the mock can
+        # fire. ``__aenter__``'s initial decode does not hit the mock
+        # either because the task-frame fixture omits the optional
+        # context field; so the first patched call corresponds to the
+        # first mid-stream decode.
+        import wool
 
-        # Arrange — streaming routine that yields per ``next``.
         task = _make_task(_gen_three)
         stream = _stream(
             _request_for(task),
-            _next_request(),
-            _next_request(),
+            _next_request(with_context=True),
+            _next_request(with_context=True),
         )
 
-        # Counter-based patch: let the initial __aenter__ decode
-        # and the first per-step decode succeed; the third call
-        # (second mid-stream decode) raises a
-        # ``BaseExceptionGroup`` of Exception-only peers.
-        original = ctx_base.Context.from_protobuf
-        calls = {"n": 0}
-        peer = ValueError("decode peer")
+        # Counter-based patch: let the first per-step decode succeed;
+        # the second mid-stream decode raises a ContextDecodeError.
+        from wool.runtime.context.manifest import _ContextManifest
 
-        def fake_from_protobuf(cls, proto_ctx, *, serializer):
+        original = _ContextManifest.from_protobuf
+        calls = {"n": 0}
+        peer = wool.ContextDecodeWarning("decode peer")
+
+        def fake_from_protobuf(cls, wire, *, serializer=None):
             calls["n"] += 1
-            if calls["n"] >= 3:
-                raise BaseExceptionGroup("simulated decode failure", [peer])
-            return original.__func__(cls, proto_ctx, serializer=serializer)
+            if calls["n"] >= 2:
+                raise wool.ContextDecodeError(peer)
+            return original(wire, serializer=serializer)
 
         mocker.patch.object(
-            ctx_base.Context,
+            _ContextManifest,
             "from_protobuf",
             classmethod(fake_from_protobuf),
         )
 
-        # Act — iterate; the second step raises the re-wrapped
-        # group, which surfaces out of the iterator.
+        # Act — iterate; the second step raises ContextDecodeError,
+        # which surfaces out of the iterator.
         captured: list[BaseException] = []
         async with DispatchSession(stream, worker_loop) as handler:
             try:
@@ -1557,11 +1641,12 @@ class TestDispatchSession:
             except BaseException as e:
                 captured.append(e)
 
-        # Assert
+        # Assert: typed ContextDecodeError carrying the original
+        # warning on .warnings.
         assert len(captured) == 1
-        eg = captured[0]
-        assert isinstance(eg, BaseExceptionGroup)
-        assert "mid-stream request context decode failed" in eg.message
+        primary = captured[0]
+        assert isinstance(primary, wool.ContextDecodeError)
+        assert primary.warnings == (peer,)
 
     @pytest.mark.asyncio
     async def test___aenter___propagates_keyboard_interrupt_during_aclose(
@@ -1696,7 +1781,7 @@ class TestDispatchSession:
         # worker would advance the generator to ``3``, and the
         # response would appear in ``observed["responses"]``.
         assert len(observed.get("responses", [])) == 1
-        assert observed["responses"][0].result == 1
+        assert observed["responses"][0].payload == 1
 
     @pytest.mark.asyncio
     async def test_cancel_tolerates_closed_worker_loop(
@@ -1741,7 +1826,7 @@ class TestDispatchSession:
             # RuntimeError was swallowed.
             assert handler._cancelled is True
 
-    # -- Migrated from test_service.py::TestWorkerService (F17) -----------
+    # -- Migrated from test_service.py::TestWorkerService -----------------
 
     @pytest.mark.asyncio
     async def test___aenter___preserves_parse_error_when_aclose_raises(
@@ -1811,15 +1896,14 @@ class TestDispatchSession:
         :meth:`__aenter__`.
 
         Regression test for the race between dispatch's backpressure
-        hook and the worker for :meth:`Context._guard` ownership.
-        Pre-fix :meth:`__aenter__` scheduled the worker eagerly; with
-        a backpressure hook that yielded the main loop while holding
-        ``attached(handler.context)``, the worker thread would race
-        to acquire the same Context's guard and spuriously raise
-        ``RuntimeError("wool.Context is already running...")``. The
-        invariant tested here — :meth:`__aenter__` is parse-only —
-        guarantees no contention regardless of how long any
-        post-parse main-loop work holds the Context.
+        hook and the worker for chain-context ownership. Pre-fix
+        :meth:`__aenter__` scheduled the worker eagerly; with a
+        backpressure hook that yielded the main loop while reading the
+        decoded context, the worker thread would race to re-stamp the
+        same context's owner. The invariant tested here —
+        :meth:`__aenter__` is parse-only — guarantees no contention
+        regardless of how long any post-parse main-loop work holds the
+        context.
 
         Given:
             A :class:`DispatchSession` constructed around a parsed
@@ -1856,7 +1940,7 @@ class TestDispatchSession:
                 "DispatchSession.__aiter__ must schedule the worker on first call"
             )
             response = await anext(iterator)
-            assert response.result == "coroutine_value"
+            assert response.payload == "coroutine_value"
 
     @pytest.mark.asyncio
     async def test___aiter___swallows_request_queue_runtime_error_mid_stream(
@@ -1872,25 +1956,25 @@ class TestDispatchSession:
         un-guarded. :meth:`_RequestQueue.put` schedules onto the
         worker loop via ``call_soon_threadsafe``; if the worker loop
         has been torn down (graceful shutdown teardown landing
-        between two main-loop pumps), put raises ``RuntimeError(
-        "Event loop is closed")``. The unguarded propagation
-        surfaced the runtime error out of :meth:`_iterate` — but the
-        routine never failed; the worker loop did. The fix mirrors
-        :meth:`drain`'s pattern: catch ``RuntimeError`` at the put
-        site and break cleanly.
+        between two main-loop pumps), put now raises the typed
+        :class:`_WorkerLoopClosed` signal (F35), which the streaming
+        branch catches specifically to break cleanly. Other
+        :class:`RuntimeError` instances propagate so protocol
+        violations remain visible.
 
         Given:
             A streaming session with :meth:`_RequestQueue.put` patched
-            to succeed on the first call and raise ``RuntimeError``
-            on the second
+            to succeed on the first call and raise
+            :class:`_WorkerLoopClosed` on the second
         When:
             The iterator is driven for the second response — the
-            patched put triggers the runtime error mid-stream
+            patched put triggers the typed signal mid-stream
         Then:
             The iterator should terminate cleanly without surfacing
-            a synthetic :class:`RuntimeError` as a routine failure.
+            the signal as a routine failure.
         """
         from wool.runtime.worker.session import _RequestQueue
+        from wool.runtime.worker.session import _WorkerLoopClosed
 
         # Arrange — patching :class:`_RequestQueue.put` is justified
         # here: the "real boundary" alternative (closing the worker
@@ -1899,9 +1983,8 @@ class TestDispatchSession:
         # ``request_queue.get`` leaves the worker-completion future
         # ``_worker_done`` unresolved (the ``_on_done`` callback
         # never fires), hanging the subsequent :meth:`drain` call
-        # from ``__aexit__``. The patch injects the exact failure
-        # mode the fix targets — a ``call_soon_threadsafe`` raise on
-        # a torn-down loop — without leaking the worker task.
+        # from ``__aexit__``. The patch injects the typed signal
+        # the fix targets without leaking the worker task.
         call_count = 0
         original_put = _RequestQueue.put
 
@@ -1909,7 +1992,7 @@ class TestDispatchSession:
             nonlocal call_count
             call_count += 1
             if call_count >= 2:
-                raise RuntimeError("simulated closed worker loop during put")
+                raise _WorkerLoopClosed()
             return original_put(self, request)
 
         mocker.patch.object(_RequestQueue, "put", patched_put)
@@ -1927,22 +2010,19 @@ class TestDispatchSession:
             try:
                 async for response in handler:
                     responses.append(response)
-            except RuntimeError as e:
-                if "simulated closed worker loop" in str(e):
-                    pytest.fail(
-                        "_iterate must catch RuntimeError from "
-                        "request_queue.put and terminate the stream "
-                        "cleanly; the unguarded raise surfaced "
-                        "the synthetic loop-teardown error as a "
-                        "routine failure"
-                    )
-                raise
+            except _WorkerLoopClosed:
+                pytest.fail(
+                    "_iterate must catch _WorkerLoopClosed from "
+                    "request_queue.put and terminate the stream "
+                    "cleanly; the unguarded signal surfaced as a "
+                    "routine failure"
+                )
 
         # Assert — iterator terminated cleanly. The first put
         # succeeded so one response was yielded; the second put
         # raised and was swallowed.
         assert len(responses) == 1
-        assert responses[0].result == "a"
+        assert responses[0].payload == "a"
 
     @pytest.mark.asyncio
     async def test___aexit___drains_on_terminal_exception(
@@ -1957,10 +2037,11 @@ class TestDispatchSession:
         terminal-exception clause is reached while the worker is
         still alive. Main-loop handler-level failures (e.g.
         ``response.to_protobuf`` raising on dump) reach the except
-        clause with the worker mid-``_step`` mutating ``work_ctx``.
-        Without an explicit drain before the snapshot,
-        ``handler.context.to_protobuf(...)`` reads ``_data`` while
-        the worker writes it. The fix calls
+        clause with the worker mid-``_step`` mutating the work
+        context. Without an explicit drain before reading
+        ``session._final_wire_context``, the handler would read the
+        worker-published wire context before the worker task has
+        finished encoding it inside its own Context. The fix calls
         :meth:`DispatchSession.drain` from dispatch's terminal-
         exception clause; :meth:`__aexit__` also calls drain (via
         its exit stack, idempotent) so the spy observes two calls
@@ -2012,12 +2093,13 @@ class TestDispatchSession:
         # dispatch handler's terminal-exception clause (the fix) and
         # once from :meth:`__aexit__`'s exit-stack unwind. Without
         # the fix, drain is called only from ``__aexit__`` and the
-        # context snapshot races the still-alive worker.
+        # read of ``session._final_wire_context`` races the
+        # still-alive worker.
         assert drain_spy.call_count >= 2, (
             f"Expected dispatch's terminal-exception clause to call "
-            f"DispatchSession.drain before snapshotting "
-            f"DispatchSession.context (plus __aexit__'s call); "
-            f"observed {drain_spy.call_count} call(s)."
+            f"DispatchSession.drain before reading "
+            f"DispatchSession._final_wire_context (plus __aexit__'s "
+            f"call); observed {drain_spy.call_count} call(s)."
         )
 
     @pytest.mark.asyncio

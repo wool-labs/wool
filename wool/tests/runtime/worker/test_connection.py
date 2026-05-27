@@ -2315,19 +2315,23 @@ class TestWorkerConnection:
 
         var = ContextVar("conn_e_var", namespace="conn_e")
         var.set("original")
+        from wool.runtime.context import current_context as _current_context
+
+        caller_chain = _current_context().chain_id
 
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(
                 result=protocol.Message(dump=cloudpickle.dumps("result")),
                 context=protocol.Context(
+                    id=caller_chain.hex,
                     vars=[
                         protocol.ContextVar(
                             namespace=var.namespace,
                             name=var.name,
                             value=cloudpickle.dumps("back_propagated"),
                         )
-                    ]
+                    ],
                 ),
             ),
         )
@@ -2349,6 +2353,71 @@ class TestWorkerConnection:
         # Assert
         assert results == ["result"]
         assert var.get() == "back_propagated"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_back_propagates_a_routine_set_to_the_caller(
+        self, mocker: MockerFixture, async_stream, mock_grpc_call
+    ):
+        """Test a routine's set on a wool.ContextVar reaches the caller.
+
+        Given:
+            A caller dispatching a routine, and a response whose
+            context carries a new value for a wool.ContextVar — the
+            shape of a routine that set the variable on the worker.
+        When:
+            The dispatch result is consumed.
+        Then:
+            The caller should observe the routine-set value — the set
+            direction of back-propagation, complementing the reset
+            direction.
+        """
+        # Arrange
+        var = ContextVar("conn_set_back_var", namespace="conn_set_back")
+
+        async def routine() -> None:
+            return None
+
+        wool_task = Task(
+            id=uuid4(),
+            callable=routine,
+            args=(),
+            kwargs={},
+            proxy=PicklableMock(spec=WorkerProxyLike, id="test-proxy-id"),
+        )
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(
+                result=protocol.Message(dump=cloudpickle.dumps("done")),
+                context=protocol.Context(
+                    id=uuid4().hex,
+                    vars=[
+                        protocol.ContextVar(
+                            namespace=var.namespace,
+                            name=var.name,
+                            value=cloudpickle.dumps("routine-set-value"),
+                        )
+                    ],
+                ),
+            ),
+        )
+        mock_call = mock_grpc_call(async_stream(responses))
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        # Act
+        results = []
+        async for result in await connection.dispatch(wool_task):
+            results.append(result)
+
+        # Assert
+        assert results == ["done"]
+        assert var.get() == "routine-set-value"
 
     @pytest.mark.asyncio
     async def test_dispatch_with_corrupt_response_context_and_worker_exception(
@@ -2499,16 +2568,16 @@ class TestWorkerConnection:
             ``warnings.filterwarnings("error", category=ContextDecodeWarning)``
             for the duration of the dispatch
         Then:
-            Iterating the dispatch raises a :class:`BaseExceptionGroup`
-            whose sole peer is the promoted
-            :class:`ContextDecodeWarning` — wool emits decode failures
-            uniformly through the group shape so caller code stays
-            symmetric across single- and multi-peer cases (e.g.
-            decode failure alongside a worker exception). The opt-in
-            strict mode lets callers treat ancillary failures as
-            fatal without changing wool's wire-protocol defaults.
+            Iterating the dispatch raises a typed
+            :class:`wool.ContextDecodeError` aggregating the promoted
+            warnings on ``.warnings``. On a result frame the decode
+            error IS the primary — the routine's value is dropped
+            because a result cannot be trusted alongside a context
+            that failed to apply (strict-mode "fail loud" contract).
         """
         # Arrange
+        import wool
+
         target = "localhost:50051"
         var = ContextVar(
             "strict_corrupt_context_var",
@@ -2543,11 +2612,11 @@ class TestWorkerConnection:
 
         with _warnings.catch_warnings():
             _warnings.simplefilter("error", category=ContextDecodeWarning)
-            with pytest.raises(BaseExceptionGroup) as exc_info:
+            with pytest.raises(wool.ContextDecodeError) as exc_info:
                 async for _ in await connection.dispatch(sample_task):
                     pass
-        assert len(exc_info.value.exceptions) == 1
-        assert isinstance(exc_info.value.exceptions[0], ContextDecodeWarning)
+        assert len(exc_info.value.warnings) == 1
+        assert isinstance(exc_info.value.warnings[0], ContextDecodeWarning)
 
     @pytest.mark.asyncio
     async def test_dispatch_without_serializer_uses_cloudpickle_for_vars(
@@ -2905,21 +2974,21 @@ class TestWorkerConnection:
         assert not isinstance(exc_info.value, RpcError)
 
     @pytest.mark.asyncio
-    async def test_dispatch_response_exception_with_cancelled_error_increments_caller_cancelling(
+    async def test_dispatch_response_exception_with_cancelled_error_does_not_increment_cancelling(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch increments current_task().cancelling() on
-        a worker-side CancelledError.
+        """Test dispatch does NOT increment ``current_task().cancelling()``
+        on a worker-side CancelledError.
 
-        Mirrors stdlib's local-cancel state shape: a caller catching
-        :class:`asyncio.CancelledError` from a wool routine must
-        observe ``current_task().cancelling() > 0`` — the same shape
-        it would see for a local cancel — so idiomatic
-        ``if cancelling() > 0: raise`` re-raise gates and
-        ``current_task().uncancel()`` absorbers behave identically
-        regardless of whether the cancel originated locally or on
-        the worker. ``uncancel()`` must also decrement the count
-        back to zero per asyncio's documented contract.
+        Matches stdlib ``await task`` semantics: when the awaitee
+        raises :class:`asyncio.CancelledError`, the awaiter's
+        ``cancelling()`` count is **not** bumped. A caller that
+        catches ``CancelledError`` and continues to ``await``
+        something else (a recovery path) is therefore not
+        re-interrupted at the next checkpoint — the wool-naive
+        caller does not need to call
+        ``current_task().uncancel()`` to absorb a phantom bump
+        (F9).
 
         Given:
             A :class:`protocol.Response` whose ``exception`` field
@@ -2929,9 +2998,9 @@ class TestWorkerConnection:
             ``dispatch(task)`` is awaited and the result iterator is
             consumed, and the resulting ``CancelledError`` is caught
         Then:
-            It should observe ``current_task().cancelling() > 0``
-            synchronously with the catch, and ``uncancel()`` should
-            decrement the count back to ``0``.
+            ``current_task().cancelling()`` should remain ``0`` —
+            the worker-shipped CancelledError propagates as-is and
+            no synchronous bump of the awaiter's state happens.
         """
         # Arrange
         cancellation = asyncio.CancelledError("worker self-raised cancel")
@@ -2951,18 +3020,8 @@ class TestWorkerConnection:
             "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
         )
 
-        observed: dict[str, int | None] = {
-            "cancelling": None,
-            "post_uncancel": None,
-        }
+        observed: dict[str, int | None] = {"cancelling": None}
 
-        # Run the cancellable consumption in an inner task so the
-        # observations happen on a task we control. On Python 3.11
-        # ``Task.uncancel()`` only decrements the counter without
-        # clearing ``_must_cancel`` — the inner task therefore
-        # finalises as cancelled even though ``body()`` returned a
-        # value. The outer ``await wrapped`` consumes that
-        # cancellation, isolating the test runner's task.
         async def body():
             try:
                 async for _ in await connection.dispatch(sample_task):
@@ -2971,23 +3030,15 @@ class TestWorkerConnection:
                 current = asyncio.current_task()
                 assert current is not None
                 observed["cancelling"] = current.cancelling()
-                observed["post_uncancel"] = current.uncancel()
 
-        wrapped = asyncio.ensure_future(body())
-
-        # Act
-        try:
-            await wrapped
-        except asyncio.CancelledError:
-            # On Python 3.11 the scheduled cancel still fires after
-            # body() returns; on 3.12+ uncancel() suppresses it.
-            # Either outcome is fine — we assert on the observations
-            # captured inside the except arm.
-            pass
+        await asyncio.ensure_future(body())
 
         # Assert
-        assert observed["cancelling"] is not None and observed["cancelling"] > 0
-        assert observed["post_uncancel"] == 0
+        assert observed["cancelling"] == 0, (
+            "worker-shipped CancelledError must not bump the "
+            "awaiter's cancelling() count — stdlib ``await task`` "
+            "semantics keep it at 0"
+        )
 
     @pytest.mark.asyncio
     async def test_dispatch_response_exception_with_cancelled_error_propagates_to_task_cancelled_state(
@@ -3069,21 +3120,21 @@ class TestWorkerConnection:
             and ``except AttributeError`` respectively, so the
             routine's primary signal still ships.
         """
-        from wool.runtime.context import Context
+        # Arrange — patch ContextManifest.from_protobuf to raise the
+        # strict-mode decode group on each call. The exception arm in
+        # _read_next gets ``decode_failures`` populated and then tries
+        # to attach them via add_note and a sidecar attribute.
+        from wool.runtime.context.manifest import _ContextManifest
 
-        # Arrange — patch Context.from_protobuf to raise the
-        # strict-mode decode group on each call. The exception arm
-        # in _read_next gets ``decode_failures`` populated and then
-        # tries to attach them via add_note and a sidecar attribute.
-        peer = ContextDecodeWarning("var-1 unencodable")
+        peer = ContextDecodeWarning("var-1 decode failure")
 
-        def encode_with_strict_failure(cls, *args, **kwargs):
-            raise BaseExceptionGroup("strict-mode encode group", [peer])
+        def decode_with_strict_failure(cls, *args, **kwargs):
+            raise BaseExceptionGroup("strict-mode decode group", [peer])
 
         mocker.patch.object(
-            Context,
+            _ContextManifest,
             "from_protobuf",
-            classmethod(encode_with_strict_failure),
+            classmethod(decode_with_strict_failure),
         )
 
         responses = (
@@ -3117,31 +3168,31 @@ class TestWorkerConnection:
         assert not hasattr(exc_info.value, "__wool_context_warnings__")
 
     @pytest.mark.asyncio
-    async def test_dispatch_response_result_with_malformed_payload_falls_back_to_unexpected_response(
+    async def test_dispatch_response_result_with_malformed_payload_propagates_raw(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch wraps a malformed ``Response.result`` payload
-        as :class:`UnexpectedResponse` so the load balancer does not
-        evict the worker for what is typically caller-side version
-        skew on a shared result class.
+        """Test dispatch lets a malformed ``Response.result`` payload
+        deserialization error propagate with its original type.
 
         Given:
             A :class:`protocol.Response` whose ``result`` field
             carries bytes that cannot be deserialized
-            (b"not a valid pickle stream")
+            (b"not a valid pickle stream").
         When:
             ``dispatch(task)`` is awaited and the result iterator is
-            consumed
+            consumed.
         Then:
-            It should raise :class:`UnexpectedResponse` whose
-            message names the malformed result payload, chained
-            from the underlying deserialization error via
-            ``__cause__``; :class:`UnexpectedResponse` is not an
-            :class:`RpcError` subclass so the load-balancer
-            classification treats it as a caller-fault and does
-            not evict the worker.
+            It should raise the underlying serializer error
+            (:class:`pickle.UnpicklingError` for cloudpickle's
+            default deserializer) raw — no wrapper class, no
+            indirection. The original exception type carries the
+            diagnostic detail. Since it isn't an :class:`RpcError`
+            subclass the load-balancer classification treats it as
+            a caller-fault and does not evict the worker.
         """
         # Arrange
+        import pickle
+
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(
@@ -3159,46 +3210,41 @@ class TestWorkerConnection:
         )
 
         # Act & assert
-        with pytest.raises(
-            UnexpectedResponse, match="malformed result payload"
-        ) as exc_info:
+        with pytest.raises(pickle.UnpicklingError) as exc_info:
             async for _ in await connection.dispatch(sample_task):
                 pass
-        # Belt-and-suspenders: the worker-eviction contract is
-        # carried by ``RpcError``; a malformed-result degradation
-        # must not surface as an ``RpcError`` subclass.
+        # The serializer error propagates raw — not wrapped in
+        # UnexpectedResponse, not an RpcError subclass.
+        assert not isinstance(exc_info.value, UnexpectedResponse)
         assert not isinstance(exc_info.value, RpcError)
-        # The underlying deserialization error is preserved on
-        # ``__cause__`` for diagnostic chains.
-        assert exc_info.value.__cause__ is not None
 
     @pytest.mark.asyncio
-    async def test_dispatch_response_exception_with_malformed_payload_falls_back_to_unexpected_response(
+    async def test_dispatch_response_exception_with_malformed_payload_propagates_raw(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch wraps a malformed ``Response.exception``
-        payload as :class:`UnexpectedResponse` so the load balancer
-        does not evict the worker for what is typically caller-side
-        version skew on a shared exception class.
+        """Test dispatch lets a malformed ``Response.exception``
+        payload deserialization error propagate with its original
+        type.
 
         Given:
             A :class:`protocol.Response` whose ``exception`` field
             carries bytes that cannot be deserialized
-            (b"not a valid pickle stream")
+            (b"not a valid pickle stream").
         When:
             ``dispatch(task)`` is awaited and the result iterator is
-            consumed
+            consumed.
         Then:
-            It should raise :class:`UnexpectedResponse` whose
-            message names the malformed exception payload, with the
-            underlying deserialization error preserved on
-            ``__cause__`` and ``__suppress_context__`` set so the
-            implicit context chain is suppressed.
-            :class:`UnexpectedResponse` is not an :class:`RpcError`
-            subclass so the load-balancer classification treats it
-            as a caller-fault and does not evict the worker.
+            It should raise the underlying serializer error
+            (:class:`pickle.UnpicklingError` for cloudpickle's
+            default deserializer) raw — no wrapper class, no
+            indirection. The original exception type carries the
+            diagnostic detail. Since it isn't an :class:`RpcError`
+            subclass the load-balancer classification treats it as
+            a caller-fault and does not evict the worker.
         """
         # Arrange
+        import pickle
+
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(
@@ -3216,19 +3262,13 @@ class TestWorkerConnection:
         )
 
         # Act & assert
-        with pytest.raises(
-            UnexpectedResponse, match="malformed exception payload"
-        ) as exc_info:
+        with pytest.raises(pickle.UnpicklingError) as exc_info:
             async for _ in await connection.dispatch(sample_task):
                 pass
-        # Belt-and-suspenders: a routine-time decode mismatch must
-        # not surface as an ``RpcError`` subclass.
+        # The serializer error propagates raw — not wrapped in
+        # UnexpectedResponse, not an RpcError subclass.
+        assert not isinstance(exc_info.value, UnexpectedResponse)
         assert not isinstance(exc_info.value, RpcError)
-        # Manual ``__cause__`` chaining preserves the original
-        # pickle/import failure for diagnostics; the implicit
-        # context chain is suppressed via ``__suppress_context__``.
-        assert exc_info.value.__cause__ is not None
-        assert exc_info.value.__suppress_context__ is True
 
 
 @pytest.mark.asyncio
