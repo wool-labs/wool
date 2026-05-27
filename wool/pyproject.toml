@@ -50,6 +50,7 @@ dev = [
     "pytest-grpc-aio~=0.3.0",
     "pytest-mock",
     "ruff",
+    "uvloop",
 ]
 
 [project.scripts]
@@ -87,6 +88,7 @@ addopts = "--cov --cov-config=.coveragerc"
 pythonpath = ["."]
 markers = [
     "integration: end-to-end integration tests against real WorkerPool",
+    "stdlib_parity: stdlib contextvars propagation parity pins",
 ]
 
 [tool.ruff]
