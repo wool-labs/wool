@@ -78,9 +78,9 @@ class DiscoveryPublisherLike(Protocol):
 
         Publishers cannot assume they saw every prior event for a
         worker, so lifecycles may arrive out of order. An
-        implementation may tolerate this — e.g. treat an update for an
+        implementation may tolerate this (e.g., treat an update for an
         unknown worker as a registration and a drop for an unknown
-        worker as a no-op — or it may reject the event (e.g. raise) if
+        worker as a no-op) or it may reject the event (e.g., raise) if
         the application requires strict lifecycle ordering; wool is
         unopinionated about which.
 

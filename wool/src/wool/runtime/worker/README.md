@@ -82,12 +82,32 @@ async with wool.WorkerPool(spawn=4, discovery=wool.LanDiscovery()):
 - **start**: Spawns a `WorkerProcess` subprocess. The subprocess creates a gRPC server, binds to the configured host and port (port 0 selects an available port), and sends the actual port back to the parent via a multiprocessing pipe. The parent constructs `WorkerMetadata` from the resolved address.
 - **stop**: Sends a gRPC `stop` RPC to the subprocess. The subprocess sets a stopping flag — once set, new dispatches are rejected with `UNAVAILABLE` — then drains or cancels in-flight tasks according to the timeout, stops the gRPC server with a grace period, and exits.
 
+### Durable workers
+
+A standalone worker deployed to serve off-host, e.g., a container or VM that outlives any one pool, must bind beyond loopback and publish itself:
+
+```python
+worker = LocalWorker(host="0.0.0.0")
+await worker.start()
+async with LanDiscovery("my-pool").publisher as publisher:
+    await publisher.publish("worker-added", worker.metadata)
+    ...
+```
+
+The wildcard bind makes the publisher auto-resolve a routable advertised address (the pod or machine IP). Leaving the worker on its loopback default and publishing it over LAN discovery emits a `LoopbackAdvertisementWarning`, since off-host subscribers cannot reach it.
+
 ### Custom workers
 
-`WorkerPool` accepts a `WorkerFactory` for its `worker` parameter. The factory protocol is a callable that receives tags and an optional `credentials` parameter and returns a `WorkerLike`:
+`WorkerPool` accepts either factory protocol for its `worker` parameter. A `WorkerFactory` declares a keyword-passable `host` and receives the bind host prescribed by the pool's discovery publisher, so factory-customized workers stay reachable wherever the publisher advertises them. `LocalWorker` itself qualifies, as does a partial of it that leaves `host` unset. A `BoundWorkerFactory` declares no `host` and owns its own binding. A bound factory always wins (a partial that pre-supplies `host` is treated as bound). The pool classifies a factory by inspecting its signature for an explicitly declared `host` (see the `WorkerFactory` docstring for details):
 
 ```python
 class WorkerFactory(Protocol):
+    def __call__(
+        self, *tags: str, credentials: WorkerCredentials | None = None,
+        host: str,
+    ) -> WorkerLike: ...
+
+class BoundWorkerFactory(Protocol):
     def __call__(
         self, *tags: str, credentials: WorkerCredentials | None = None,
     ) -> WorkerLike: ...
