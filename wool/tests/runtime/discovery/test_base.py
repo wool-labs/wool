@@ -437,7 +437,8 @@ class TestDiscoveryPublisherLike:
         """Test runtime_checkable protocol with conforming class.
 
         Given:
-            A class with async publish(event) method
+            A class with an async publish(event) method and a
+            bind_host attribute
         When:
             Checking protocol compliance with isinstance
         Then:
@@ -446,6 +447,8 @@ class TestDiscoveryPublisherLike:
 
         # Arrange
         class ConformingPublisher:
+            bind_host = "127.0.0.1"
+
             async def publish(
                 self, type: DiscoveryEventType, metadata: WorkerMetadata
             ): ...
@@ -475,6 +478,29 @@ class TestDiscoveryPublisherLike:
         # Act & assert
         assert not isinstance(publisher, DiscoveryPublisherLike)
 
+    def test_nonconforming_protocol_missing_bind_host(self):
+        """Test runtime_checkable protocol rejects missing bind_host.
+
+        Given:
+            A class with an async publish(event) method but no
+            bind_host attribute
+        When:
+            Checking protocol compliance with isinstance
+        Then:
+            It should return False
+        """
+
+        # Arrange
+        class MissingBindHostPublisher:
+            async def publish(
+                self, type: DiscoveryEventType, metadata: WorkerMetadata
+            ): ...
+
+        publisher = MissingBindHostPublisher()
+
+        # Act & assert
+        assert not isinstance(publisher, DiscoveryPublisherLike)
+
     def test_runtime_checkable(self):
         """Test protocol is runtime_checkable.
 
@@ -488,6 +514,8 @@ class TestDiscoveryPublisherLike:
 
         # Arrange
         class Publisher:
+            bind_host = "127.0.0.1"
+
             async def publish(
                 self, type: DiscoveryEventType, metadata: WorkerMetadata
             ) -> None: ...

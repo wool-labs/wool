@@ -7,9 +7,11 @@ subprocess overhead and ensure deterministic behavior.
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from contextlib import contextmanager
+from functools import partial
 from types import MappingProxyType
 from typing import cast
 
@@ -566,6 +568,599 @@ class TestWorkerPool:
         wp.LocalWorker.assert_called()
         _, kwargs = wp.LocalWorker.call_args
         assert kwargs["credentials"] is worker_credentials
+
+    @pytest.mark.asyncio
+    async def test_worker_context_default_factory_without_discovery(
+        self,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test default factory binds loopback for spawn-only pools.
+
+        Given:
+            A pool with spawn and no discovery, using the default
+            factory
+        When:
+            A worker is created
+        Then:
+            It should pass host="127.0.0.1" to LocalWorker.
+        """
+        # Act
+        async with WorkerPool(spawn=1):
+            pass
+
+        # Assert
+        import wool.runtime.worker.pool as wp
+
+        wp.LocalWorker.assert_called()
+        _, kwargs = wp.LocalWorker.call_args
+        assert kwargs["host"] == "127.0.0.1"
+
+    @pytest.mark.asyncio
+    async def test_worker_context_default_factory_with_wildcard_bind_publisher(
+        self,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_discovery_service_for_pool,
+    ):
+        """Test default factory binds the publisher's prescribed host.
+
+        Given:
+            A hybrid pool whose discovery publisher prescribes
+            bind_host="0.0.0.0" and no explicit worker factory
+        When:
+            A worker is created
+        Then:
+            It should pass host="0.0.0.0" to LocalWorker so the
+            advertised routable address is actually served.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+
+        # Act
+        async with WorkerPool(spawn=1, discovery=mock_discovery_service_for_pool):
+            pass
+
+        # Assert
+        import wool.runtime.worker.pool as wp
+
+        wp.LocalWorker.assert_called()
+        _, kwargs = wp.LocalWorker.call_args
+        assert kwargs["host"] == "0.0.0.0"
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_bound_factory(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test a bound factory is never passed a bind host.
+
+        Given:
+            A hybrid pool whose discovery publisher prescribes
+            bind_host="0.0.0.0" and a factory without an explicit
+            host parameter (a MagicMock accepts only **kwargs)
+        When:
+            A worker is created
+        Then:
+            It should call the factory without a host argument — a
+            bound factory always wins.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+        spy_factory = mocker.MagicMock()
+        mock_worker = mocker.MagicMock(spec=LocalWorker)
+        mock_worker.start = mocker.AsyncMock()
+        mock_worker.stop = mocker.AsyncMock()
+        mock_worker.metadata = _make_worker_metadata()
+        spy_factory.return_value = mock_worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            worker=spy_factory,
+            discovery=mock_discovery_service_for_pool,
+        ):
+            pass
+
+        # Assert
+        spy_factory.assert_called_once()
+        _, kwargs = spy_factory.call_args
+        assert "host" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_unbound_factory(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test an unbound factory receives the publisher's bind host.
+
+        Given:
+            A hybrid pool whose discovery publisher prescribes
+            bind_host="0.0.0.0" and a factory declaring an explicit
+            host parameter
+        When:
+            A worker is created
+        Then:
+            It should pass the publisher's bind host to the factory.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+        received = []
+
+        def unbound_factory(*tags, credentials=None, host):
+            received.append(host)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            worker=unbound_factory,
+            discovery=mock_discovery_service_for_pool,
+        ):
+            pass
+
+        # Assert
+        assert received == ["0.0.0.0"]
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_kwargs_sink_factory(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test a kwargs-accepting factory is classified bound.
+
+        Given:
+            A hybrid pool whose discovery publisher prescribes
+            bind_host="0.0.0.0" and a factory accepting **kwargs but
+            declaring no explicit host parameter
+        When:
+            A worker is created
+        Then:
+            It should call the factory without a host argument rather
+            than pass a host into a keyword sink.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+        received = []
+
+        def sink_factory(*tags, credentials=None, **kwargs):
+            received.append(kwargs)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            worker=sink_factory,
+            discovery=mock_discovery_service_for_pool,
+        ):
+            pass
+
+        # Assert
+        assert received == [{}]
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_positional_host_factory(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test a positional host parameter is classified bound.
+
+        Given:
+            A hybrid pool whose discovery publisher prescribes
+            bind_host="0.0.0.0" and a factory declaring host as a
+            positional-or-keyword parameter rather than keyword-only
+        When:
+            A worker is created
+        Then:
+            It should call the factory without injecting the publisher
+            host — only a keyword-only host opts in — so the factory
+            observes its own default and a positional host cannot
+            collide with a forwarded tag at spawn.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+        received = []
+
+        def positional_host_factory(host="127.0.0.1", *, credentials=None):
+            received.append(host)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            worker=positional_host_factory,
+            discovery=mock_discovery_service_for_pool,
+        ):
+            pass
+
+        # Assert
+        assert received == ["127.0.0.1"]
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_prebound_partial_factory(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test a partial pre-supplying host is classified bound.
+
+        Given:
+            A hybrid pool whose discovery publisher prescribes
+            bind_host="0.0.0.0" and a functools.partial of an unbound
+            factory that pre-supplies host="10.0.0.5"
+        When:
+            A worker is created
+        Then:
+            It should not override the pre-bound value — the factory
+            observes "10.0.0.5".
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+        received = []
+
+        def unbound_factory(*tags, credentials=None, host):
+            received.append(host)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            worker=partial(unbound_factory, host="10.0.0.5"),
+            discovery=mock_discovery_service_for_pool,
+        ):
+            pass
+
+        # Assert
+        assert received == ["10.0.0.5"]
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_partial_unbound_factory(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test a partial not touching host stays unbound.
+
+        Given:
+            A hybrid pool whose discovery publisher prescribes
+            bind_host="0.0.0.0" and a functools.partial of an unbound
+            factory that pre-supplies only credentials
+        When:
+            A worker is created
+        Then:
+            It should pass the publisher's bind host to the factory.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+        received = []
+
+        def unbound_factory(*tags, credentials=None, host):
+            received.append(host)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            worker=partial(unbound_factory, credentials=None),
+            discovery=mock_discovery_service_for_pool,
+        ):
+            pass
+
+        # Assert
+        assert received == ["0.0.0.0"]
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_uninspectable_factory(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+    ):
+        """Test a factory with an uninspectable signature.
+
+        Given:
+            A hybrid pool whose discovery publisher prescribes
+            bind_host="0.0.0.0" and a factory whose signature cannot
+            be inspected (simulating a C-implemented callable)
+        When:
+            A worker is created
+        Then:
+            It should call the factory without a host argument —
+            uninspectable signatures classify bound, the safe default.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+        received = []
+
+        def opaque_factory(*tags, credentials=None, **kwargs):
+            received.append(kwargs)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Simulate a C callable: inspect.signature rejects a
+        # non-Signature __signature__ override.
+        opaque_factory.__signature__ = "uninspectable"
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            worker=opaque_factory,
+            discovery=mock_discovery_service_for_pool,
+        ):
+            pass
+
+        # Assert
+        assert received == [{}]
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_publisher_missing_bind_host(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test a publisher without bind_host is rejected.
+
+        Given:
+            A hybrid pool whose discovery publisher implements publish
+            but declares no bind_host
+        When:
+            The pool is entered
+        Then:
+            It should raise TypeError naming the publisher protocol,
+            rather than silently defaulting the worker bind host.
+        """
+
+        # Arrange
+        class BarePublisher:
+            def __init__(self):
+                self.publish = mocker.AsyncMock()
+
+        class BareDiscovery:
+            def __init__(self):
+                self.publisher = BarePublisher()
+                self.subscriber = mocker.MagicMock()
+
+            def subscribe(self, filter=None):
+                return self.subscriber
+
+        # Act & assert
+        with pytest.raises(TypeError, match="DiscoveryPublisherLike"):
+            async with WorkerPool(spawn=1, discovery=BareDiscovery()):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_rejected_context_manager_publisher(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test a rejected context-manager publisher is exited.
+
+        Given:
+            A hybrid pool whose discovery publisher is an async
+            context manager implementing publish but declaring no
+            bind_host
+        When:
+            The pool is entered
+        Then:
+            It should raise TypeError and exit the publisher context
+            it entered, leaking no resources.
+        """
+        # Arrange
+        entered = []
+        exited = []
+
+        class BareContextPublisher:
+            def __init__(self):
+                self.publish = mocker.AsyncMock()
+
+            async def __aenter__(self):
+                entered.append(True)
+                return self
+
+            async def __aexit__(self, *args):
+                exited.append(True)
+
+        class BareDiscovery:
+            def __init__(self):
+                self.publisher = BareContextPublisher()
+                self.subscriber = mocker.MagicMock()
+
+            def subscribe(self, filter=None):
+                return self.subscriber
+
+        # Act
+        with pytest.raises(TypeError, match="DiscoveryPublisherLike"):
+            async with WorkerPool(spawn=1, discovery=BareDiscovery()):
+                pass
+
+        # Assert
+        assert entered == [True]
+        assert exited == [True]
+
+    @pytest.mark.asyncio
+    async def test_worker_context_default_factory_with_custom_bind_host(
+        self,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_discovery_service_for_pool,
+        worker_credentials,
+    ):
+        """Test default factory honors an arbitrary bind host.
+
+        Given:
+            A hybrid pool with a tag and credentials whose discovery
+            publisher prescribes bind_host="10.0.0.9"
+        When:
+            A worker is created
+        Then:
+            It should pass the host verbatim to LocalWorker alongside
+            the tag and credentials.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "10.0.0.9"
+
+        # Act
+        async with WorkerPool(
+            "gpu",
+            spawn=1,
+            discovery=mock_discovery_service_for_pool,
+            credentials=worker_credentials,
+        ):
+            pass
+
+        # Assert
+        import wool.runtime.worker.pool as wp
+
+        wp.LocalWorker.assert_called()
+        args, kwargs = wp.LocalWorker.call_args
+        assert kwargs["host"] == "10.0.0.9"
+        assert "gpu" in args
+        assert kwargs["credentials"] is worker_credentials
+
+    @pytest.mark.asyncio
+    async def test_worker_context_default_factory_with_discovery_factory(
+        self,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_discovery_service_for_pool,
+    ):
+        """Test bind host is read from the resolved discovery.
+
+        Given:
+            A hybrid pool whose discovery argument is a callable
+            factory returning an instance whose publisher prescribes
+            bind_host="0.0.0.0"
+        When:
+            A worker is created
+        Then:
+            It should pass host="0.0.0.0" to LocalWorker, proving the
+            host comes from the resolved instance's publisher rather
+            than the factory object.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+
+        # Act
+        async with WorkerPool(
+            spawn=1, discovery=lambda: mock_discovery_service_for_pool
+        ):
+            pass
+
+        # Assert
+        import wool.runtime.worker.pool as wp
+
+        wp.LocalWorker.assert_called()
+        _, kwargs = wp.LocalWorker.call_args
+        assert kwargs["host"] == "0.0.0.0"
+
+    @pytest.mark.asyncio
+    async def test_durable_mode_with_wildcard_bind_publisher(
+        self,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_discovery_service_for_pool,
+    ):
+        """Test durable pools spawn no workers despite the publisher.
+
+        Given:
+            A discovery-only pool whose discovery publisher prescribes
+            bind_host="0.0.0.0"
+        When:
+            The pool is entered and exited
+        Then:
+            It should never construct a LocalWorker.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+
+        # Act
+        async with WorkerPool(discovery=mock_discovery_service_for_pool):
+            pass
+
+        # Assert
+        import wool.runtime.worker.pool as wp
+
+        wp.LocalWorker.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_worker_context_default_factory_with_default_mode(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test default no-args pools bind every worker to loopback.
+
+        Given:
+            A WorkerPool with no arguments and a CPU count of 2
+        When:
+            The pool is entered and workers are created
+        Then:
+            It should pass host="127.0.0.1" to every LocalWorker.
+        """
+        # Arrange
+        mocker.patch.object(os, "cpu_count", return_value=2)
+
+        # Act
+        async with WorkerPool():
+            pass
+
+        # Assert
+        import wool.runtime.worker.pool as wp
+
+        assert wp.LocalWorker.call_count == 2
+        for _, kwargs in wp.LocalWorker.call_args_list:
+            assert kwargs["host"] == "127.0.0.1"
 
     # =========================================================================
     # Context Manager Lifecycle Tests
@@ -1716,7 +2311,7 @@ class TestWorkerPool:
         When:
             Pool is started
         Then:
-            Should raise ValueError
+            Should raise TypeError
         """
 
         # Arrange - Create discovery that doesn't implement DiscoveryLike protocol
@@ -1733,7 +2328,7 @@ class TestWorkerPool:
         invalid_discovery = InvalidDiscovery()
 
         # Act & assert
-        with pytest.raises(ValueError):
+        with pytest.raises(TypeError, match="Expected DiscoveryLike"):
             async with WorkerPool(discovery=invalid_discovery):
                 pass
 
@@ -2150,14 +2745,14 @@ class TestWorkerPool:
     async def test_worker_context_publisher_type_validation(
         self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
     ):
-        """Test raise ValueError.
+        """Test raise TypeError.
 
         Given:
             WorkerPool with a publisher that is not DiscoveryPublisherLike
         When:
             _worker_context is entered
         Then:
-            It should raise ValueError
+            It should raise TypeError
         """
 
         # Arrange
@@ -2185,7 +2780,7 @@ class TestWorkerPool:
         pool = WorkerPool(spawn=1)
 
         # Act & assert
-        with pytest.raises(ValueError):
+        with pytest.raises(TypeError, match="Expected DiscoveryPublisherLike"):
             async with pool:
                 pass
 

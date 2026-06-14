@@ -467,8 +467,17 @@ async def build_pool_from_scenario(scenario, credentials_map):
                 pool_kwargs = {
                     "loadbalancer": lb,
                     "credentials": creds,
+                    # Explicitly loopback-pinned factory by design: the
+                    # pre-supplied host classifies it bound, carrying the
+                    # options/backpressure dimensions while keeping LAN
+                    # scenarios deterministic (the test certs' SAN covers
+                    # loopback only). The publisher-prescribed bind host is
+                    # covered by test_lan_publish.py instead.
                     "worker": partial(
-                        LocalWorker, options=options, backpressure=bp_hook
+                        LocalWorker,
+                        host="127.0.0.1",
+                        options=options,
+                        backpressure=bp_hook,
                     ),
                     "lazy": lazy,
                     "quorum": quorum,
@@ -1065,7 +1074,8 @@ def _pairwise_filter(row):
       (DURABLE manages its own LocalDiscovery internally)
     - D3 must NOT be NONE when D2 is HYBRID or DURABLE_JOINED
     - D3 must be a LOCAL_* variant when D2 is DURABLE_JOINED
-      (LanDiscovery does not support namespacing)
+      (DURABLE_JOINED exercises LocalDiscovery's owner/non-owner join
+      semantics, which LanDiscovery has no analogue for)
     - D4 must not be ASYNC_CM (pre-called async CM instances are not
       picklable inside WorkerProxy.__wool_reduce__; documented limitation,
       see #61)
@@ -1187,6 +1197,31 @@ PAIRWISE_SCENARIOS = [
         filter_func=_pairwise_filter,
     )
 ]
+
+# allpairspy's greedy placement never selects LAN_ASYNC_CM under the
+# current filter constraints (LAN factories pair only with HYBRID), so
+# the generated array leaves the member entirely unexercised. Pin one
+# canonical scenario to guarantee deterministic coverage; the guard
+# test in test_integration.py fails loudly if another DiscoveryFactory
+# member ever drops out of the array.
+PAIRWISE_SCENARIOS.append(
+    Scenario(
+        shape=RoutineShape.COROUTINE,
+        pool_mode=PoolMode.HYBRID,
+        discovery=DiscoveryFactory.LAN_ASYNC_CM,
+        lb=LbFactory.CLASS_REF,
+        credential=CredentialType.INSECURE,
+        options=WorkerOptionsKind.DEFAULT,
+        timeout=TimeoutKind.NONE,
+        binding=RoutineBinding.MODULE_FUNCTION,
+        lazy=LazyMode.LAZY,
+        backpressure=BackpressureMode.NONE,
+        ctx_var_1=ContextVarPattern.NONE,
+        ctx_var_2=ContextVarPattern.NONE,
+        ctx_var_3=ContextVarPattern.NONE,
+        quorum=QuorumMode.DEFAULT,
+    )
+)
 
 
 @st.composite
