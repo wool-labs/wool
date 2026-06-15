@@ -228,9 +228,13 @@ class WorkerPool:
         ``quorum=None`` or ``quorum=0`` records the value but never
         consults it, accompanied by an
         `~wool.runtime.worker.proxy.IneffectiveQuorumTimeoutWarning`.
-        Defaults to ``60``; pass ``None`` to wait indefinitely. On
-        timeout the pool instance becomes unusable (single-use
-        semantics); construct a new pool to retry.
+        Defaults to ``60``; pass ``None`` to wait indefinitely.  With
+        ``lazy=False`` the timeout fires at ``__aenter__``; the pool,
+        never having entered, is unusable per its single-use
+        semantics, so construct a new pool to retry.  With
+        ``lazy=True`` (default) the timeout fires on the first
+        `WorkerProxy.dispatch`, which leaves the proxy un-started so a
+        later dispatch retries and recovers once a worker is admitted.
     :param shutdown_timeout:
         Maximum number of seconds to wait for spawned workers to stop
         during pool teardown. The bound applies as a single deadline to
