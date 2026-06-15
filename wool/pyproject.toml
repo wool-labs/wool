@@ -19,10 +19,10 @@ classifiers = [
 ]
 dependencies = [
     "cloudpickle",
-    "grpcio>=1.76.0",
+    "grpcio>=1.76.0,<2",
     "packaging",
     "portalocker",
-    "protobuf",
+    "protobuf>=6.31.1,<7",
     "shortuuid",
     "tblib",
     "typing-extensions",
@@ -59,7 +59,14 @@ wool = "wool.cli:cli"
 sources = ["src"]
 
 [tool.hatch.build.hooks.protobuf]
-dependencies = ["hatch-protobuf"]
+# Pin the codegen toolchain so it is the single source of version truth. The
+# generated stubs embed hard runtime assertions (GRPC_GENERATED_VERSION and
+# ValidateProtobufRuntimeVersion) against the grpcio-tools/protoc used at build
+# time, so this pin must stay in lockstep with the grpcio/protobuf floors
+# declared in [project].dependencies. grpcio-tools 1.76.0 generates code
+# requiring grpcio>=1.76.0 and protobuf>=6.31.1. The stub-floor-guard CI job
+# fails if these drift apart.
+dependencies = ["hatch-protobuf", "grpcio-tools==1.76.0"]
 generate_grpc = true
 generate_pyi = true
 output_path = "src/wool/protocol"
