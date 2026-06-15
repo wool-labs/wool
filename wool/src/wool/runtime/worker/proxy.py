@@ -25,6 +25,7 @@ from packaging.version import InvalidVersion
 from packaging.version import Version
 
 import wool
+from wool.exception import WoolWarning
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.local import LocalDiscovery
@@ -122,7 +123,8 @@ DEFAULT_LAZY: Final[bool] = True
 """Default lazy-start behavior: defer discovery setup and the quorum wait to first dispatch."""
 
 
-class IneffectiveQuorumTimeoutWarning(UserWarning):
+# public
+class IneffectiveQuorumTimeoutWarning(WoolWarning):
     """Emitted when ``quorum_timeout`` is supplied alongside ``quorum=None`` or ``0``.
 
     The timeout value is recorded on the proxy but never consulted —

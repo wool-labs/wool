@@ -404,6 +404,8 @@ def mock_discovery_service_for_pool(mocker: MockerFixture):
 
     # Create a proper mock class that implements DiscoveryPublisherLike protocol
     class MockPublisher:
+        bind_host = "127.0.0.1"
+
         def __init__(self):
             self.publish = mocker.AsyncMock()
 

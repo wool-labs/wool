@@ -12,10 +12,12 @@ from typing import Awaitable
 from typing import ContextManager
 from typing import Coroutine
 from typing import Final
+from typing import cast
 from typing import overload
 
 from typing_extensions import deprecated
 
+from wool.exception import WoolWarning
 from wool.runtime.context import install_task_factory
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
@@ -25,8 +27,10 @@ from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
+from wool.runtime.worker.base import declares_host
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.proxy import DEFAULT_LAZY
 from wool.runtime.worker.proxy import DEFAULT_QUORUM
@@ -41,15 +45,15 @@ logger = logging.getLogger(__name__)
 
 
 # public
-class IneffectiveLeaseWarning(UserWarning):
-    """Emitted when ``lease`` is supplied to a :class:`WorkerPool` that
-    has no ``discovery`` service configured.
+class IneffectiveLeaseWarning(WoolWarning):
+    """Emitted when ``lease`` is supplied to a `WorkerPool` that has
+    no ``discovery`` service configured.
 
     The pool's worker count is bounded by ``spawn`` alone in those
     modes — ``lease`` is recorded but never consulted, so the supplied
     value has no effect at runtime.  Users who want strict behaviour
     can elevate the category to an error via
-    :func:`warnings.filterwarnings`.
+    `warnings.filterwarnings`.
     """
 
 
@@ -58,14 +62,18 @@ class WorkerPool:
     """Orchestrates distributed workers for task execution.
 
     The core of wool's distributed runtime. Manages worker lifecycle,
-    discovery, and load balancing across two modes:
+    discovery, and load balancing across three modes:
 
-    - **Ephemeral pools** spawn local workers managed within the pool's
-    lifecycle. Perfect for development and single-machine deployments.
+    - **Ephemeral pools** spawn local workers managed within the
+      pool's lifecycle. Perfect for development and single-machine
+      deployments.
 
-    - **Durable pools** connect to existing remote workers through discovery
-    services. Workers run independently, serving multiple clients across
-    distributed deployments.
+    - **Durable pools** connect to existing remote workers through
+      discovery services. Workers run independently, serving multiple
+      clients across distributed deployments.
+
+    - **Hybrid pools** spawn local workers and additionally admit
+      remote workers found through discovery.
 
     **Basic ephemeral pool:**
 
@@ -178,16 +186,28 @@ class WorkerPool:
         .. deprecated::
             Use ``spawn`` instead. Will be removed in the next major release.
     :param lease:
-        Maximum number of additionally discovered workers to admit to the pool.
-        The total pool capacity is ``spawn + lease`` when both are set, or just
-        ``lease`` for external pools. Defaults to ``None`` (unbounded). Only
-        meaningful when a ``discovery`` service is configured; supplying
-        ``lease`` without ``discovery`` records the value but never consults
-        it, accompanied by an :class:`IneffectiveLeaseWarning`.
+        Maximum number of additionally discovered workers to admit to the
+        pool. The total pool capacity is ``spawn + lease`` when both are
+        set, or just ``lease`` for external pools. Defaults to ``None``
+        (unbounded). Only meaningful when a ``discovery`` service is
+        configured; supplying ``lease`` without ``discovery`` records
+        the value but never consults it, accompanied by an
+        `IneffectiveLeaseWarning`.
     :param worker:
-        Worker factory callable. Defaults to :class:`LocalWorker`.
+        Worker factory callable. A `WorkerFactory` declares a ``host``
+        keyword and receives the discovery publisher's prescribed bind
+        host. A `BoundWorkerFactory` declares no ``host`` and owns its
+        binding. Classification is by explicit signature declaration;
+        see `WorkerFactory` for the rules. Defaults to `LocalWorker`,
+        which declares ``host`` and therefore binds the publisher's
+        prescribed host; a partial of it that leaves ``host`` unset
+        (e.g. ``partial(LocalWorker, ...)``) stays bind-host-aware,
+        while ``partial(LocalWorker, host="...")`` pins the bind and
+        classifies bound.
     :param discovery:
-        Discovery service instance, factory, or context manager.
+        Discovery service to attach — a `~wool.DiscoveryLike` instance
+        or any `Factory` form resolving to one. The resolved object is
+        validated against the protocol at context entry.
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
     :param credentials:
@@ -203,11 +223,11 @@ class WorkerPool:
         first dispatch; with ``lazy=False`` it blocks at context entry.
     :param quorum_timeout:
         Seconds to wait for ``quorum`` workers to be discovered before
-        raising :class:`asyncio.TimeoutError`. Only meaningful when
+        raising `asyncio.TimeoutError`. Only meaningful when
         ``quorum`` is a positive integer; supplying it with
         ``quorum=None`` or ``quorum=0`` records the value but never
         consults it, accompanied by an
-        :class:`~wool.runtime.worker.proxy.IneffectiveQuorumTimeoutWarning`.
+        `~wool.runtime.worker.proxy.IneffectiveQuorumTimeoutWarning`.
         Defaults to ``60``; pass ``None`` to wait indefinitely. On
         timeout the pool instance becomes unusable (single-use
         semantics); construct a new pool to retry.
@@ -223,7 +243,7 @@ class WorkerPool:
         Must be positive when provided. Defaults to ``60.0``.
     :param lazy:
         When ``True`` (default), defer discovery setup and the quorum
-        wait to the first :meth:`WorkerProxy.dispatch`.  When ``False``,
+        wait to the first `WorkerProxy.dispatch`.  When ``False``,
         eagerly enter the underlying proxy at ``__aenter__`` time and
         run the quorum wait there.
     :raises ValueError:
@@ -231,15 +251,15 @@ class WorkerPool:
         ``shutdown_timeout`` is not positive.
     :raises asyncio.TimeoutError:
         If the quorum wait does not complete within ``quorum_timeout``
-        — raised by the underlying :class:`WorkerProxy` at context
-        entry (``lazy=False``) or first dispatch (``lazy=True``).
+        — raised by the underlying `WorkerProxy` at context entry
+        (``lazy=False``) or first dispatch (``lazy=True``).
 
     .. caution::
 
        Pre-called context manager instances passed as ``loadbalancer``
        or ``discovery`` are not picklable and will cause nested routine
        dispatch to fail.  Pass a callable returning the context manager
-       instead.  See :data:`Factory`.
+       instead.  See `Factory`.
     """
 
     _workers: Final[dict[WorkerLike, Coroutine]]
@@ -249,7 +269,7 @@ class WorkerPool:
         self,
         *tags: str,
         spawn: int = 0,
-        worker: WorkerFactory = LocalWorker,
+        worker: WorkerFactory | BoundWorkerFactory = LocalWorker,
         discovery: None = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
@@ -260,9 +280,10 @@ class WorkerPool:
         shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ):
-        """
-        Create an ephemeral pool of workers, spawning the specified
-        quantity of workers using the specified worker factory.
+        """Create an ephemeral pool of workers.
+
+        Spawns the specified quantity of workers using the specified
+        worker factory.
         """
         ...
 
@@ -281,8 +302,7 @@ class WorkerPool:
         shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ):
-        """
-        Connect to an external pool of workers discovered by the
+        """Connect to an external pool of workers discovered by the
         specified discovery protocol.
         """
         ...
@@ -293,7 +313,7 @@ class WorkerPool:
         *tags: str,
         spawn: int = 0,
         lease: int | None = None,
-        worker: WorkerFactory = LocalWorker,
+        worker: WorkerFactory | BoundWorkerFactory = LocalWorker,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
@@ -304,9 +324,9 @@ class WorkerPool:
         shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ):
-        """
-        Create a hybrid pool that spawns local workers and discovers
-        remote workers through the specified discovery protocol.
+        """Create a hybrid pool that spawns local workers and
+        discovers remote workers through the specified discovery
+        protocol.
         """
         ...
 
@@ -316,7 +336,7 @@ class WorkerPool:
         self,
         *tags: str,
         size: int,
-        worker: WorkerFactory = LocalWorker,
+        worker: WorkerFactory | BoundWorkerFactory = LocalWorker,
         discovery: None = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
@@ -335,7 +355,7 @@ class WorkerPool:
         *tags: str,
         size: int,
         lease: int | None = None,
-        worker: WorkerFactory = LocalWorker,
+        worker: WorkerFactory | BoundWorkerFactory = LocalWorker,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
@@ -353,7 +373,7 @@ class WorkerPool:
         spawn: int | None = None,
         size: int | None = None,
         lease: int | None = None,
-        worker: WorkerFactory | None = None,
+        worker: WorkerFactory | BoundWorkerFactory | None = None,
         discovery: DiscoveryLike | Factory[DiscoveryLike] | None = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
@@ -384,13 +404,10 @@ class WorkerPool:
         if lease is not None and lease < 0:
             raise ValueError("Lease must be non-negative")
 
-        # Warn when `quorum_timeout` is supplied alongside a falsy `quorum`;
-        # the value is recorded but never consulted.  The warning is
-        # emitted at the pool layer because `_make_proxy` elides
-        # `quorum_timeout` when forwarding to the proxy in those cases,
-        # so WorkerProxy never sees that the pool's user supplied one.
-        # Other quorum/quorum_timeout validations are delegated to
-        # WorkerProxy.
+        # Warn here rather than in WorkerProxy: _make_proxy elides
+        # quorum_timeout for falsy quorums (see its docstring), so the
+        # proxy never sees that the pool's user supplied one. Other
+        # quorum validations are delegated to WorkerProxy.
         if quorum_timeout is Undefined:
             quorum_timeout = DEFAULT_QUORUM_TIMEOUT
         elif not quorum:
@@ -479,7 +496,9 @@ class WorkerPool:
                 async def create_proxy():
                     discovery_svc, discovery_ctx = await self._enter_context(discovery)
                     if not isinstance(discovery_svc, DiscoveryLike):
-                        raise ValueError
+                        raise TypeError(
+                            f"Expected DiscoveryLike, got: {type(discovery_svc)}"
+                        )
                     try:
                         async with self._make_proxy(
                             discovery=discovery_svc.subscriber,
@@ -546,15 +565,17 @@ class WorkerPool:
 
     @noreentry
     async def __aenter__(self) -> WorkerPool:
-        """Starts the worker pool and its services, returning a session.
+        """Start the worker pool and its services.
 
-        This method starts the worker registrar, creates a connection,
-        launches all worker processes, and registers them.
+        Installs wool's task factory on the running loop and enters
+        the pool context for the configured mode — bringing up
+        discovery, spawning local workers where applicable, and
+        preparing the dispatch proxy.
 
         :returns:
-            The :class:`WorkerPool` instance itself for method chaining.
+            This `WorkerPool` instance.
         :raises RuntimeError:
-            If the pool has already been entered.  :class:`WorkerPool`
+            If the pool has already been entered.  `WorkerPool`
             contexts are single-use — create a new instance instead
             of re-entering.
         """
@@ -564,7 +585,7 @@ class WorkerPool:
         return self
 
     async def __aexit__(self, *args):
-        """Stops all workers and tears down the pool and its services."""
+        """Stop all workers and tear down the pool and its services."""
         await self._proxy_context.__aexit__(*args)
 
     @asynccontextmanager
@@ -572,32 +593,63 @@ class WorkerPool:
         self,
         *tags: str,
         spawn: int,
-        factory: WorkerFactory | None,
+        factory: WorkerFactory | BoundWorkerFactory | None,
         publisher: DiscoveryPublisherLike,
     ):
-        if factory is None:
-            factory = self._default_worker_factory()
+        """Spawn, publish, and reap the pool's local workers.
+
+        Workers start concurrently and announce themselves through
+        the entered publisher; any spawn failure aborts entry with an
+        `ExceptionGroup`. Factories that declare ``host``, including
+        the default `LocalWorker`, receive the publisher's prescribed
+        bind host (see `~wool.DiscoveryPublisherLike.bind_host`);
+        bound factories own their binding. Teardown applies the
+        pool's ``shutdown_timeout`` as a single deadline across worker
+        stops and publisher cleanup, logging any workers it abandons,
+        and runs even when publisher validation or worker construction
+        fails, so an entered publisher context is never leaked.
+
+        :yields:
+            Metadata for the spawned workers.
+        """
         publisher_svc, publisher_ctx = await self._enter_context(publisher)
-        if not isinstance(publisher_svc, DiscoveryPublisherLike):
-            raise ValueError
-
-        tasks = []
-        for _ in range(spawn):
-            worker = factory(*tags, credentials=self._credentials)
-
-            async def start(worker):
-                await worker.start()
-                await publisher.publish("worker-added", worker.metadata)
-
-            async def stop(worker):
-                await publisher.publish("worker-dropped", worker.metadata)
-                await worker.stop(timeout=self._shutdown_timeout)
-
-            task = asyncio.create_task(start(worker))
-            tasks.append(task)
-            self._workers[worker] = stop(worker)
-
         try:
+            if not isinstance(publisher_svc, DiscoveryPublisherLike):
+                raise TypeError(
+                    f"Expected DiscoveryPublisherLike, got: {type(publisher_svc)}"
+                )
+            if factory is None:
+                # The pool owns the default; no signature inspection required.
+                factory = LocalWorker
+                unbound = True
+            else:
+                unbound = declares_host(factory)
+
+            tasks = []
+            for _ in range(spawn):
+                if unbound:
+                    worker = cast(WorkerFactory, factory)(
+                        *tags,
+                        credentials=self._credentials,
+                        host=publisher_svc.bind_host,
+                    )
+                else:
+                    worker = cast(BoundWorkerFactory, factory)(
+                        *tags, credentials=self._credentials
+                    )
+
+                async def start(worker):
+                    await worker.start()
+                    await publisher_svc.publish("worker-added", worker.metadata)
+
+                async def stop(worker):
+                    await publisher_svc.publish("worker-dropped", worker.metadata)
+                    await worker.stop(timeout=self._shutdown_timeout)
+
+                task = asyncio.create_task(start(worker))
+                tasks.append(task)
+                self._workers[worker] = stop(worker)
+
             results = await asyncio.gather(*tasks, return_exceptions=True)
             if errors := [r for r in results if isinstance(r, Exception)]:
                 raise ExceptionGroup("worker spawn failures", errors)
@@ -653,12 +705,6 @@ class WorkerPool:
                     self._shutdown_timeout,
                 )
 
-    def _default_worker_factory(self):
-        def factory(*tags, credentials=None):
-            return LocalWorker(*tags, credentials=credentials)
-
-        return factory
-
     def _make_proxy(
         self,
         *,
@@ -669,10 +715,10 @@ class WorkerPool:
         quorum_timeout: float | None,
         lazy: bool,
     ) -> WorkerProxy:
-        """Construct a :class:`WorkerProxy` for this pool's discovery.
+        """Construct a `WorkerProxy` for this pool's discovery.
 
-        Selects :class:`WorkerProxy`'s typed overload via narrowing:
-        when ``quorum`` is truthy, forwards both ``quorum`` and
+        Selects `WorkerProxy`'s typed overload via narrowing: when
+        ``quorum`` is truthy, forwards both ``quorum`` and
         ``quorum_timeout``; otherwise normalizes ``quorum=0`` and
         ``quorum=None`` to literal ``None`` (which the pool's user
         contract documents as equivalent) and drops ``quorum_timeout``.
@@ -697,6 +743,14 @@ class WorkerPool:
         )
 
     async def _enter_context(self, factory):
+        """Normalize a configured dependency into a live object.
+
+        Accepts a bare instance, a callable factory, an awaitable, or
+        a sync/async context manager (entering the latter) and
+        returns ``(object, owning_context)``, where the context is
+        ``None`` unless this call entered one and owes it an exit via
+        `_exit_context`.
+        """
         ctx = None
         if isinstance(factory, ContextManager):
             ctx = factory
@@ -713,6 +767,10 @@ class WorkerPool:
         return obj, ctx
 
     async def _exit_context(self, ctx: AsyncContextManager | ContextManager | None):
+        """Exit a sync or async context manager, if any.
+
+        Forwards the active exception info; ``None`` is a no-op.
+        """
         if isinstance(ctx, AsyncContextManager):
             await ctx.__aexit__(*sys.exc_info())
         elif isinstance(ctx, ContextManager):
@@ -720,6 +778,7 @@ class WorkerPool:
 
 
 def _resolve_spawn(spawn: int) -> int:
+    """Resolve ``spawn=0`` to the CPU count and reject negative values."""
     if spawn == 0:
         cpu_count = os.cpu_count()
         if cpu_count is None:
@@ -731,4 +790,5 @@ def _resolve_spawn(spawn: int) -> int:
 
 
 def _predicate(tags):
+    """Build a tag-intersection worker filter; matches all when no tags."""
     return lambda w: bool(w.tags & set(tags)) if tags else True

@@ -504,6 +504,23 @@ class TestLocalDiscoveryPublisher:
     wool.runtime.discovery.local.LocalDiscovery.Publisher
     """
 
+    def test_bind_host_with_default_value(self, namespace):
+        """Test bind_host prescribes the loopback address.
+
+        Given:
+            A LocalDiscovery Publisher
+        When:
+            The bind_host attribute is accessed
+        Then:
+            It should be "127.0.0.1" since shared-memory announcements
+            are only discoverable same-host.
+        """
+        # Act
+        publisher = LocalDiscovery.Publisher(namespace)
+
+        # Assert
+        assert publisher.bind_host == "127.0.0.1"
+
     def test_namespace_with_provided_value(self, namespace):
         """Test Publisher.namespace property returns provided value.
 
