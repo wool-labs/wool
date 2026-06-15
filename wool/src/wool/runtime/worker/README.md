@@ -270,7 +270,7 @@ Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagat
 
 | `lazy` | `enter()` / `__aenter__` | `dispatch()` | `exit()` on un-started proxy |
 | ------ | ------------------------ | ------------- | ----------------------------- |
-| `True` | Sets context var only | Calls `start()` on first call, then dispatches | No-op (safe to call) |
+| `True` | Sets context var only | Calls `start()` on first call (retrying on a later call if it failed), then dispatches | No-op (safe to call) |
 | `False` | Sets context var, calls `start()` | Raises `RuntimeError` if not started | Raises `RuntimeError` |
 
 When `lazy=True`, concurrent `dispatch()` calls use a double-checked lock to ensure the proxy starts exactly once. The `lazy` flag is preserved through `cloudpickle` serialization, so proxies sent to worker subprocesses as part of a task retain their laziness setting.
