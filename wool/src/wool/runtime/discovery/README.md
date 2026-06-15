@@ -53,9 +53,11 @@ class DiscoveryLike(Protocol):
     ) -> DiscoverySubscriberLike: ...
 ```
 
-`DiscoveryPublisherLike` exposes a single method:
+`DiscoveryPublisherLike` exposes a `publish` method and a `bind_host` attribute declaring where workers advertised through the publisher should listen — see the protocol's docstring for the contract:
 
 ```python
+bind_host: str
+
 async def publish(self, type: DiscoveryEventType, metadata: WorkerMetadata) -> None: ...
 ```
 

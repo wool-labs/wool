@@ -341,6 +341,11 @@ class LocalDiscovery(Discovery):
         _namespace: Final[str]
         _shared_memory_pool: ResourcePool[SharedMemory]
 
+        #: Shared-memory announcements are only discoverable on a
+        #: common host, so this publisher prescribes the loopback bind.
+        #: See `~wool.DiscoveryPublisherLike.bind_host` for the contract.
+        bind_host: str = "127.0.0.1"
+
         def __init__(self, namespace: str, *, block_size: int = 512):
             if block_size < 0:
                 raise ValueError("Block size must be positive")
@@ -570,7 +575,7 @@ class LocalDiscovery(Discovery):
     ):
         """Subscriber for receiving worker discovery events.
 
-        Subscribes to worker :class:`discovery events <~wool.DiscoveryEvent>`
+        Subscribes to worker discovery events (see `~wool.DiscoveryEvent`)
         from a shared memory region, monitoring for changes via filesystem
         notifications and yielding events as workers are added, updated, or
         dropped. Multiple subscribers in different processes can read from
@@ -581,10 +586,14 @@ class LocalDiscovery(Discovery):
         of changes. Falls back to periodic polling if notifications are
         delayed or missed.
 
-        Instances are cached as singletons by
-        :class:`~wool.runtime.discovery.pool.SubscriberMeta` — two
-        calls with the same ``namespace`` and ``poll_interval`` return
-        the same object.
+        Instances are cached as singletons — two calls with the same
+        ``namespace`` and ``poll_interval`` return the same object.
+
+        Each call to ``__aiter__`` creates an isolated consumer fed from a
+        shared-memory watch shared across consumers of the same namespace.
+        The shared watch fans out, i.e., every concurrent iteration
+        receives the full event stream, and the iterations are otherwise
+        independent.
 
         :param namespace:
             The namespace identifier for the shared memory region.

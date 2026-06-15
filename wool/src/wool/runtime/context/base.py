@@ -27,6 +27,7 @@ from uuid import uuid4
 
 import wool
 from wool import protocol
+from wool.exception import WoolWarning
 from wool.runtime.context.registry import context_registry
 from wool.runtime.context.registry import lock
 from wool.runtime.context.registry import scope_key
@@ -58,7 +59,7 @@ T = TypeVar("T")
 
 
 # public
-class ContextDecodeWarning(RuntimeWarning):
+class ContextDecodeWarning(WoolWarning):
     """Emitted when a wire :class:`protocol.Context` fails to decode.
 
     Wool's wire protocol treats context propagation as ancillary

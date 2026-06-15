@@ -5,6 +5,8 @@ from typing import Final
 
 from tblib import pickling_support
 
+from wool.exception import WoolError
+from wool.exception import WoolWarning
 from wool.runtime.context import Context
 from wool.runtime.context import ContextAlreadyBound
 from wool.runtime.context import ContextDecodeWarning
@@ -22,7 +24,9 @@ from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
+from wool.runtime.discovery.lan import AdvertiseHostError
 from wool.runtime.discovery.lan import LanDiscovery
+from wool.runtime.discovery.lan import LoopbackAdvertisementWarning
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
 from wool.runtime.loadbalancer.base import LoadBalancerLike
@@ -37,6 +41,7 @@ from wool.runtime.serializer import CloudpickleSerializer
 from wool.runtime.serializer import Serializer
 from wool.runtime.typing import Factory
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
@@ -46,7 +51,9 @@ from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
+from wool.runtime.worker.pool import IneffectiveLeaseWarning
 from wool.runtime.worker.pool import WorkerPool
+from wool.runtime.worker.proxy import IneffectiveQuorumTimeoutWarning
 from wool.runtime.worker.proxy import WorkerProxy
 from wool.runtime.worker.service import BackpressureContext
 from wool.runtime.worker.service import BackpressureLike
@@ -78,8 +85,10 @@ __worker_service__: Final[contextvars.ContextVar[WorkerService | None]] = (
 )
 
 __all__ = [
+    "AdvertiseHostError",
     "BackpressureContext",
     "BackpressureLike",
+    "BoundWorkerFactory",
     "Context",
     "ContextAlreadyBound",
     "ContextDecodeWarning",
@@ -92,11 +101,14 @@ __all__ = [
     "DiscoveryPublisherLike",
     "DiscoverySubscriberLike",
     "Factory",
+    "IneffectiveLeaseWarning",
+    "IneffectiveQuorumTimeoutWarning",
     "LanDiscovery",
     "LoadBalancerContextLike",
     "LoadBalancerLike",
     "LocalDiscovery",
     "LocalWorker",
+    "LoopbackAdvertisementWarning",
     "NoWorkersAvailable",
     "PredicateFunction",
     "RoundRobinLoadBalancer",
@@ -108,6 +120,8 @@ __all__ = [
     "Token",
     "TransientRpcError",
     "UnexpectedResponse",
+    "WoolError",
+    "WoolWarning",
     "Worker",
     "WorkerConnection",
     "WorkerCredentials",

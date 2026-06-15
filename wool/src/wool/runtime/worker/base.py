@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import inspect
 import uuid
 from abc import ABC
 from abc import abstractmethod
@@ -119,10 +121,67 @@ class WorkerOptions:
 # public
 @runtime_checkable
 class WorkerFactory(Protocol):
-    """Protocol for worker factory callables.
+    """Protocol for bind-host-aware worker factory callables.
 
-    Worker factories create :class:`WorkerLike` instances with specific
-    tags and configuration. Used by :class:`WorkerPool` to spawn workers.
+    Worker factories create `WorkerLike` instances with specific tags
+    and configuration; `WorkerPool` uses them to spawn workers. This
+    protocol additionally receives the bind host prescribed by the
+    pool's discovery publisher, so factory-customized workers stay
+    reachable wherever the publisher advertises them. `LocalWorker`
+    satisfies this protocol as-is. Factories that own their binding
+    instead implement `BoundWorkerFactory`.
+
+    The pool classifies a factory as bind-host-aware by inspecting
+    its signature for an **explicitly declared**, keyword-passable
+    ``host`` parameter:
+
+    - The parameter name is the opt-in token: only a factory that
+      declares ``host`` receives it, and a misspelling silently
+      classifies the factory as bound.
+    - The parameter must be keyword-only. ``**kwargs`` does not count
+      — a factory that could merely absorb the keyword is treated as
+      bound rather than risk passing a host into a sink. Positional
+      declarations (positional-only or positional-or-keyword) are
+      likewise excluded: the pool passes the host by keyword, and a
+      positional ``host`` would collide with a forwarded tag at spawn.
+    - A `functools.partial` that pre-supplies ``host`` is treated as
+      bound — pre-bound values are never overridden.
+    - A callable whose signature cannot be inspected is treated as
+      bound, the safe default.
+    """
+
+    def __call__(
+        self,
+        *tags: str,
+        credentials: WorkerCredentials | None = None,
+        host: str,
+    ) -> WorkerLike:
+        """Create a new worker instance bound to the given host.
+
+        :param tags:
+            Capability tags for worker discovery and filtering.
+        :param credentials:
+            Credentials for the worker.
+        :param host:
+            Host the worker should bind, prescribed by the pool's
+            discovery publisher (see `~wool.DiscoveryPublisherLike.bind_host`).
+        :returns:
+            Configured worker instance.
+        """
+        ...
+
+
+# public
+@runtime_checkable
+class BoundWorkerFactory(Protocol):
+    """Protocol for worker factory callables that own their binding.
+
+    Identical to `WorkerFactory` except the factory is never passed a
+    bind host — a bound factory always wins, and the pool never
+    overrides the binding it produces. Any callable without an
+    explicitly declared, keyword-passable ``host`` parameter is
+    classified bound; see `WorkerFactory` for the classification
+    rules.
     """
 
     def __call__(
@@ -137,9 +196,31 @@ class WorkerFactory(Protocol):
         :param credentials:
             Credentials for the worker.
         :returns:
-            Configured :class:`WorkerLike` instance.
+            Configured `WorkerLike` instance.
         """
         ...
+
+
+def declares_host(factory: WorkerFactory | BoundWorkerFactory) -> bool:
+    """Whether a factory explicitly declares a host parameter.
+
+    Implements the classification rules documented on `WorkerFactory`.
+
+    :param factory:
+        The worker factory callable to classify.
+    :returns:
+        True when the factory should receive the publisher-prescribed
+        bind host.
+    """
+    if isinstance(factory, functools.partial) and "host" in factory.keywords:
+        return False
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (ValueError, TypeError):
+        return False
+    else:
+        parameter = parameters.get("host")
+        return parameter is not None and parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # public

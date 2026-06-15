@@ -7,6 +7,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
@@ -780,7 +781,7 @@ class TestWorkerFactory:
         """
 
         # Arrange
-        def factory(*tags: str, **_) -> WorkerLike:
+        def factory(*tags: str, host: str = "", **_) -> WorkerLike:
             return ConcreteWorker(*tags)
 
         # Act & assert
@@ -791,6 +792,70 @@ class TestWorkerFactory:
 
         Given:
             A callable that doesn't match WorkerFactory signature
+        When:
+            isinstance check is performed
+        Then:
+            It should return True (Protocol only checks for __call__)
+
+        Note:
+            Python's Protocol runtime checking is structural and only
+            verifies the presence of __call__, not the exact signature.
+            Runtime classification between WorkerFactory and
+            BoundWorkerFactory therefore relies on signature
+            inspection, exercised through the WorkerPool tests.
+        """
+
+        # Arrange
+        def incompatible_factory() -> str:
+            """Factory with wrong signature."""
+            return "not a worker"
+
+        # Act & assert
+        assert isinstance(incompatible_factory, WorkerFactory)
+
+    def test_isinstance_check_for_non_callable(self):
+        """Test isinstance check returns False for non-callable.
+
+        Given:
+            A non-callable object
+        When:
+            isinstance check is performed
+        Then:
+            It should return False
+        """
+        # Act
+        not_a_factory = "not callable"
+
+        # Assert
+        assert not isinstance(not_a_factory, WorkerFactory)
+
+
+class TestBoundWorkerFactory:
+    """Test suite for BoundWorkerFactory protocol."""
+
+    def test_isinstance_check_for_compatible_factory(self):
+        """Test isinstance check returns True for compatible factory.
+
+        Given:
+            A callable that implements BoundWorkerFactory protocol
+        When:
+            isinstance check is performed
+        Then:
+            It should return True
+        """
+
+        # Arrange
+        def factory(*tags: str, **_) -> WorkerLike:
+            return ConcreteWorker(*tags)
+
+        # Act & assert
+        assert isinstance(factory, BoundWorkerFactory)
+
+    def test_isinstance_check_for_incompatible_factory(self):
+        """Test isinstance check for incompatible factory.
+
+        Given:
+            A callable that doesn't match BoundWorkerFactory signature
         When:
             isinstance check is performed
         Then:
@@ -809,7 +874,7 @@ class TestWorkerFactory:
 
         # Act & assert
         # Protocol only checks for __call__ existence, not signature
-        assert isinstance(incompatible_factory, WorkerFactory)
+        assert isinstance(incompatible_factory, BoundWorkerFactory)
 
     def test_isinstance_check_for_non_callable(self):
         """Test isinstance check returns False for non-callable.
@@ -825,4 +890,4 @@ class TestWorkerFactory:
         not_a_factory = "not callable"
 
         # Assert
-        assert not isinstance(not_a_factory, WorkerFactory)
+        assert not isinstance(not_a_factory, BoundWorkerFactory)
