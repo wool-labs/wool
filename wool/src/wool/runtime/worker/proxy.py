@@ -428,7 +428,6 @@ class WorkerProxy:
 
         self._id: uuid.UUID = uuid.uuid4()
         self._started = False
-        self._start_failure: BaseException | None = None
         self._lazy = lazy
         self._start_lock = asyncio.Lock() if lazy else None
         self._loadbalancer = loadbalancer
@@ -787,18 +786,18 @@ class WorkerProxy:
         quorum; the load balancer surfaces "no workers available"
         directly if the worker set later drains.
 
-        A failed first dispatch (e.g., quorum timeout) is cached on
-        the proxy: every subsequent dispatch re-raises the same
-        exception immediately rather than re-running ``start()`` and
-        paying another ``quorum_timeout`` per attempt.  Construct a
-        new proxy to retry.
+        A failed first dispatch (e.g., quorum timeout) leaves the
+        proxy un-started: the next dispatch re-runs ``start()`` and
+        retries, re-paying the quorum wait.  This lets a pool recover
+        once a worker is admitted, without constructing a new proxy.
 
         :param task:
             The :class:`Task` to dispatch.
         :param timeout:
             Timeout in seconds for getting a worker.
         :returns:
-            A protobuf result object from the worker.
+            An async generator yielding result objects from the
+            worker.
         :raises RuntimeError:
             If the proxy is not started and ``lazy`` is ``False``.
         :raises asyncio.TimeoutError:
@@ -808,18 +807,10 @@ class WorkerProxy:
         if not self._started:
             if not self._lazy:
                 raise RuntimeError("Proxy not started - call start() first")
-            if self._start_failure is not None:
-                raise self._start_failure
             assert self._start_lock is not None
             async with self._start_lock:
-                if self._start_failure is not None:
-                    raise self._start_failure
                 if not self._started:
-                    try:
-                        await self.start()
-                    except BaseException as exc:
-                        self._start_failure = exc
-                        raise
+                    await self.start()
 
         assert isinstance(self._loadbalancer_service, LoadBalancerLike)
         assert self._loadbalancer_context

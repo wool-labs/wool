@@ -2431,35 +2431,211 @@ class TestWorkerProxy:
         assert wool.__proxy__.get() is None
 
     @pytest.mark.asyncio
-    async def test_dispatch_caches_start_failure(
-        self, mock_discovery_service, mock_wool_task
+    async def test_dispatch_retries_start_after_failed_quorum(
+        self, mocker: MockerFixture
     ):
-        """Test failed start() is cached; subsequent dispatches fail-fast.
+        """Test a failed first dispatch leaves the proxy retryable.
 
         Given:
-            A lazy proxy whose first dispatch will fail with
-            asyncio.TimeoutError due to an unsatisfiable quorum
+            A lazy proxy with quorum=1 whose first dispatch times out
+            because no worker is available, then a worker appears
         When:
-            Two dispatches are attempted in sequence
+            A second dispatch is attempted after the worker is admitted
         Then:
-            The first raises asyncio.TimeoutError and caches it; the
-            second re-raises the same exception instance immediately
+            The first dispatch raises asyncio.TimeoutError and leaves
+            the proxy un-started; the retried dispatch re-runs start()
+            and dispatches successfully
         """
         # Arrange
-        proxy = WorkerProxy(
-            discovery=mock_discovery_service,
-            quorum=2,
-            quorum_timeout=0.01,
+        worker_available = asyncio.Event()
+        metadata = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.100:50051",
+            pid=1001,
+            version="1.0.0",
         )
 
-        # Act
-        with pytest.raises(asyncio.TimeoutError) as first_excinfo:
-            await proxy.dispatch(mock_wool_task)
-        with pytest.raises(asyncio.TimeoutError) as second_excinfo:
-            await proxy.dispatch(mock_wool_task)
+        class RecoverableDiscovery:
+            def __init__(self):
+                self._emitted = False
 
-        # Assert — both dispatches raise the same cached exception
-        assert first_excinfo.value is second_excinfo.value
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await worker_available.wait()
+                if not self._emitted:
+                    self._emitted = True
+                    return DiscoveryEvent("worker-added", metadata=metadata)
+                await asyncio.Event().wait()
+                raise StopAsyncIteration
+
+        class StubLoadBalancer:
+            def __init__(self):
+                self.dispatched = False
+
+            async def dispatch(self, task, *, context, timeout=None):
+                self.dispatched = True
+
+        stub_lb = StubLoadBalancer()
+        proxy = WorkerProxy(
+            discovery=RecoverableDiscovery(),
+            loadbalancer=stub_lb,
+            quorum=1,
+            quorum_timeout=0.1,
+        )
+        mock_task = mocker.MagicMock(spec=Task)
+
+        # Act — first dispatch times out because no worker is present
+        with pytest.raises(asyncio.TimeoutError):
+            await proxy.dispatch(mock_task)
+
+        # Assert — the failed start left the proxy un-started and retryable
+        assert not proxy.started
+        assert not stub_lb.dispatched
+
+        # Act — a worker appears and a retried dispatch re-runs start()
+        worker_available.set()
+        await asyncio.wait_for(proxy.dispatch(mock_task), timeout=2.0)
+
+        # Assert — the retry started the proxy and dispatched the task
+        assert proxy.started
+        assert stub_lb.dispatched
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_recovers_concurrent_first_dispatch_after_failed_quorum(
+        self, mocker: MockerFixture
+    ):
+        """Test concurrent first dispatches recover after a failed quorum.
+
+        Given:
+            A lazy proxy with quorum=1 whose first start() times out
+            while several dispatches contend for the start lock, then a
+            worker appears
+        When:
+            Several dispatches are attempted concurrently before the
+            worker is admitted, then one more after it is admitted
+        Then:
+            Every concurrent dispatch raises asyncio.TimeoutError and
+            leaves the proxy un-started, and the later dispatch recovers
+            once the worker is present
+        """
+        # Arrange
+        worker_available = asyncio.Event()
+        metadata = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.101:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+
+        class RecoverableDiscovery:
+            def __init__(self):
+                self._emitted = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await worker_available.wait()
+                if not self._emitted:
+                    self._emitted = True
+                    return DiscoveryEvent("worker-added", metadata=metadata)
+                await asyncio.Event().wait()
+                raise StopAsyncIteration
+
+        class StubLoadBalancer:
+            def __init__(self):
+                self.dispatched = False
+
+            async def dispatch(self, task, *, context, timeout=None):
+                self.dispatched = True
+
+        stub_lb = StubLoadBalancer()
+        proxy = WorkerProxy(
+            discovery=RecoverableDiscovery(),
+            loadbalancer=stub_lb,
+            quorum=1,
+            quorum_timeout=0.1,
+        )
+        mock_task = mocker.MagicMock(spec=Task)
+
+        # Act — three dispatches race the first start() while no worker exists
+        results = await asyncio.gather(
+            proxy.dispatch(mock_task),
+            proxy.dispatch(mock_task),
+            proxy.dispatch(mock_task),
+            return_exceptions=True,
+        )
+
+        # Assert — every contender timed out and the proxy stayed un-started
+        assert all(isinstance(result, asyncio.TimeoutError) for result in results)
+        assert not proxy.started
+        assert not stub_lb.dispatched
+
+        # Act — a worker appears and a retried dispatch recovers
+        worker_available.set()
+        await asyncio.wait_for(proxy.dispatch(mock_task), timeout=2.0)
+
+        # Assert — the retry started the proxy and dispatched the task
+        assert proxy.started
+        assert stub_lb.dispatched
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_propagates_quorum_timeout_out_of_context(
+        self, mocker: MockerFixture, mock_proxy_session
+    ):
+        """Test a lazy first-dispatch failure propagates out of context.
+
+        Given:
+            A lazy proxy entered as an async context manager whose first
+            dispatch times out because no worker is ever discovered
+        When:
+            The dispatch is awaited inside the async with block
+        Then:
+            The asyncio.TimeoutError propagates out of the block and the
+            context exit is a safe no-op leaving the proxy un-started
+        """
+
+        # Arrange
+        class EmptyDiscovery:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Event().wait()
+                raise StopAsyncIteration
+
+        class StubLoadBalancer:
+            def __init__(self):
+                self.dispatched = False
+
+            async def dispatch(self, task, *, context, timeout=None):
+                self.dispatched = True
+
+        stub_lb = StubLoadBalancer()
+        proxy = WorkerProxy(
+            discovery=EmptyDiscovery(),
+            loadbalancer=stub_lb,
+            quorum=1,
+            quorum_timeout=0.1,
+        )
+        mock_task = mocker.MagicMock(spec=Task)
+
+        # Act & assert — the timeout propagates out of the async with block
+        with pytest.raises(asyncio.TimeoutError):
+            async with proxy:
+                await proxy.dispatch(mock_task)
+
+        # Assert — the exit was a safe no-op; the proxy is un-started
+        assert not proxy.started
+        assert not stub_lb.dispatched
 
     @pytest.mark.asyncio
     async def test_dispatch_with_lazy_auto_start(
