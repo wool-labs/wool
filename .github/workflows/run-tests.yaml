@@ -86,3 +86,48 @@ jobs:
           namespace: ${{ matrix.namespace }}
           pytest-marker: integration
           cov-fail-under: '70'
+
+  stub-floor-guard:
+    name: Stub import at declared floors / Python ${{ matrix.python-version }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_code_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv and prepare python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build stubs and pin runtime to the declared dependency floors
+        run: |
+          # setup-uv already created and activated .venv (VIRTUAL_ENV is set),
+          # so uv pip targets it directly. Editable install runs the protobuf
+          # build hook, generating the gRPC stubs with the pinned toolchain.
+          .github/scripts/install-python-packages.sh
+          uv pip install -e ./wool
+          # Force grpcio/protobuf down to exactly the floors declared in
+          # pyproject so the import below exercises the contract's lower bound.
+          # Capture to a variable first (not process substitution) so a non-zero
+          # exit from the resolver fails the step under `set -e`.
+          floors="$(.venv/bin/python .github/scripts/dependency-floors.py wool/pyproject.toml grpcio protobuf)"
+          read -ra floor_pins <<< "$floors"
+          echo "Installing declared floors: ${floor_pins[*]}"
+          uv pip install "${floor_pins[@]}"
+          # Fails the step under `set -e` if neither floor was actually pinned.
+          uv pip freeze | grep -iE '^(grpcio|protobuf)=='
+
+      - name: Import generated stubs under the declared floors
+        run: |
+          # The stubs embed GRPC_GENERATED_VERSION and ValidateProtobufRuntimeVersion
+          # assertions; importing them at the declared floors raises a version error
+          # (grpc RuntimeError or protobuf VersionError) and fails this job if the
+          # codegen toolchain has drifted above what pyproject advertises. Import the
+          # submodules directly (not `import wool.protocol`, whose __init__ wraps
+          # ImportError as ProtobufImportError) so the raw version error surfaces.
+          .venv/bin/python -c "import wool.protocol.wire_pb2, wool.protocol.wire_pb2_grpc; print('gRPC/protobuf stubs import cleanly at the declared dependency floors')"
