@@ -35,8 +35,8 @@ from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
-from wool.runtime.worker.auth import CredentialContext
-from wool.runtime.worker.auth import CredentialProviderLike
+from wool.runtime.worker.auth import CredentialsContext
+from wool.runtime.worker.auth import CredentialsProviderLike
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import _coerce_provider
 from wool.runtime.worker.connection import WorkerConnection
@@ -284,7 +284,7 @@ class WorkerProxy:
     :param credentials:
         Optional credentials for TLS/mTLS connections to workers — either a
         :class:`~wool.WorkerCredentials` or a
-        :class:`~wool.CredentialProviderLike` (e.g. from
+        :class:`~wool.CredentialsProviderLike` (e.g. from
         :meth:`WorkerCredentials.provider_from_files` for identity-based
         verification or credential rotation). A bare ``WorkerCredentials``
         is wrapped in a static provider. Defaults to resolving from the
@@ -339,7 +339,7 @@ class WorkerProxy:
     _loadbalancer_manager: (
         AsyncContextManager[LoadBalancerLike] | ContextManager[LoadBalancerLike]
     )
-    _provider: CredentialProviderLike | None
+    _provider: CredentialsProviderLike | None
 
     @overload
     def __init__(
@@ -350,7 +350,7 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: (
-            WorkerCredentials | CredentialProviderLike | None | UndefinedType
+            WorkerCredentials | CredentialsProviderLike | None | UndefinedType
         ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
@@ -367,7 +367,7 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: (
-            WorkerCredentials | CredentialProviderLike | None | UndefinedType
+            WorkerCredentials | CredentialsProviderLike | None | UndefinedType
         ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
@@ -384,7 +384,7 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: (
-            WorkerCredentials | CredentialProviderLike | None | UndefinedType
+            WorkerCredentials | CredentialsProviderLike | None | UndefinedType
         ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
@@ -404,7 +404,7 @@ class WorkerProxy:
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: (
-            WorkerCredentials | CredentialProviderLike | None | UndefinedType
+            WorkerCredentials | CredentialsProviderLike | None | UndefinedType
         ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
@@ -473,7 +473,7 @@ class WorkerProxy:
             )
 
         if credentials is Undefined:
-            resolved = CredentialContext.current()
+            resolved = CredentialsContext.current()
         else:
             resolved = credentials
         # Normalize either a bare WorkerCredentials or a provider (from the
@@ -863,7 +863,7 @@ class WorkerProxy:
             ctx.__exit__(*args)
 
     def _create_security_filter(
-        self, provider: CredentialProviderLike | None
+        self, provider: CredentialsProviderLike | None
     ) -> Callable[[WorkerMetadata], bool]:
         """Create discovery filter based on proxy credentials.
 

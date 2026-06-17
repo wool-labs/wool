@@ -28,8 +28,8 @@ from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.routine.task import Task
-from wool.runtime.worker.auth import CredentialContext
-from wool.runtime.worker.auth import StaticCredentialProvider
+from wool.runtime.worker.auth import CredentialsContext
+from wool.runtime.worker.auth import _StaticCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -3321,7 +3321,7 @@ class TestWorkerProxy:
             version="1.0.0",
             secure=False,
         )
-        with CredentialContext(worker_credentials):
+        with CredentialsContext(worker_credentials):
             # Unpickle restores proxy with credentials from ContextVar.
             # Verify by constructing a new proxy (same mechanism) with
             # static workers — default credentials resolve from ContextVar.
@@ -3518,7 +3518,7 @@ class TestWorkerProxy:
         )
 
         # Act — ContextVar has mTLS creds, but we pass None explicitly
-        with CredentialContext(worker_credentials):
+        with CredentialsContext(worker_credentials):
             proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
                 credentials=None,
@@ -3567,7 +3567,7 @@ class TestWorkerProxy:
         )
 
         # Act
-        with CredentialContext(worker_credentials):
+        with CredentialsContext(worker_credentials):
             proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
                 lazy=False,
@@ -3598,7 +3598,7 @@ class TestWorkerProxy:
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
-        provider = StaticCredentialProvider(worker_credentials, identity="wool-worker")
+        provider = _StaticCredentialsProvider(worker_credentials, identity="wool-worker")
         secure_worker = WorkerMetadata(
             uid=uuid.uuid4(),
             address="192.168.1.100:50051",
@@ -3646,7 +3646,7 @@ class TestWorkerProxy:
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
-        provider = StaticCredentialProvider(worker_credentials)
+        provider = _StaticCredentialsProvider(worker_credentials)
         secure_worker = WorkerMetadata(
             uid=uuid.uuid4(),
             address="192.168.1.100:50051",
@@ -3663,7 +3663,7 @@ class TestWorkerProxy:
         )
 
         # Act
-        with CredentialContext(provider):
+        with CredentialsContext(provider):
             proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
                 lazy=False,
@@ -3693,7 +3693,7 @@ class TestWorkerProxy:
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
-        provider = StaticCredentialProvider(worker_credentials)
+        provider = _StaticCredentialsProvider(worker_credentials)
         channel_opts = ChannelOptions(keepalive_time_ms=60000)
         metadata = WorkerMetadata(
             uid=uuid.uuid4(),

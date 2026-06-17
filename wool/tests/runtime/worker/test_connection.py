@@ -21,9 +21,9 @@ from wool.runtime.context import ContextDecodeWarning
 from wool.runtime.context import ContextVar
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
-from wool.runtime.worker.auth import FileCredentialProvider
-from wool.runtime.worker.auth import StaticCredentialProvider
+from wool.runtime.worker.auth import FileCredentialsProvider
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import _StaticCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
@@ -35,13 +35,13 @@ from wool.runtime.worker.connection import clear_channel_pool
 from .conftest import PicklableMock
 
 
-def _secure_provider(identity: str | None = None) -> StaticCredentialProvider:
+def _secure_provider(identity: str | None = None) -> _StaticCredentialsProvider:
     """Build a static provider over dummy credential bytes.
 
     For tests that only need a secure (non-None) provider; gRPC defers PEM
     validation to the handshake, which these tests never reach.
     """
-    return StaticCredentialProvider(
+    return _StaticCredentialsProvider(
         WorkerCredentials(ca_cert=b"ca", worker_key=b"key", worker_cert=b"cert"),
         identity=identity,
     )
@@ -957,7 +957,7 @@ class TestWorkerConnection:
         ca_path.write_bytes(ca_pem)
         key_path.write_bytes(key_pem)
         cert_path.write_bytes(cert_pem)
-        provider = FileCredentialProvider(str(ca_path), str(key_path), str(cert_path))
+        provider = FileCredentialsProvider(str(ca_path), str(key_path), str(cert_path))
 
         mock_channel = mocker.AsyncMock()
         secure_spy = mocker.patch.object(
@@ -1022,7 +1022,7 @@ class TestWorkerConnection:
         ca_path.write_bytes(ca_pem)
         key_path.write_bytes(key_pem)
         cert_path.write_bytes(cert_pem)
-        provider = FileCredentialProvider(str(ca_path), str(key_path), str(cert_path))
+        provider = FileCredentialsProvider(str(ca_path), str(key_path), str(cert_path))
 
         mock_channel = mocker.AsyncMock()
         secure_spy = mocker.patch.object(

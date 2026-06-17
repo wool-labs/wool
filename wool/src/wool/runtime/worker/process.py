@@ -25,8 +25,8 @@ import wool
 from wool import protocol
 from wool.runtime.context import install_task_factory
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.worker.auth import CredentialContext
-from wool.runtime.worker.auth import CredentialProviderLike
+from wool.runtime.worker.auth import CredentialsContext
+from wool.runtime.worker.auth import CredentialsProviderLike
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import _coerce_provider
 from wool.runtime.worker.base import WorkerOptions
@@ -66,7 +66,7 @@ class WorkerProcess(Process):
         Proxy pool TTL in seconds.
     :param credentials:
         Optional worker credentials for TLS/mTLS — either a
-        :class:`WorkerCredentials` or a :class:`CredentialProviderLike`. A
+        :class:`WorkerCredentials` or a :class:`CredentialsProviderLike`. A
         reloadable provider serves rotating server credentials via a
         per-handshake fetcher.
     :param options:
@@ -96,7 +96,7 @@ class WorkerProcess(Process):
     _metadata: WorkerMetadata | None
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
-    _provider: CredentialProviderLike | None
+    _provider: CredentialsProviderLike | None
     _options: WorkerOptions
 
     def __init__(
@@ -107,7 +107,7 @@ class WorkerProcess(Process):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
-        credentials: WorkerCredentials | CredentialProviderLike | None = None,
+        credentials: WorkerCredentials | CredentialsProviderLike | None = None,
         options: WorkerOptions | None = None,
         tags: frozenset[str] = frozenset(),
         extra: dict[str, Any] | None = None,
@@ -291,7 +291,7 @@ class WorkerProcess(Process):
         fires.
         """
         creds_ctx = (
-            CredentialContext(self._provider)
+            CredentialsContext(self._provider)
             if self._provider is not None
             else contextlib.nullcontext()
         )

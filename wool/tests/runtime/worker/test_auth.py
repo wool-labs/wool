@@ -19,11 +19,11 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
-from wool.runtime.worker.auth import CredentialProviderLike
-from wool.runtime.worker.auth import CredentialSnapshot
-from wool.runtime.worker.auth import FileCredentialProvider
-from wool.runtime.worker.auth import StaticCredentialProvider
+from wool.runtime.worker.auth import CredentialsProviderLike
+from wool.runtime.worker.auth import CredentialsSnapshot
+from wool.runtime.worker.auth import FileCredentialsProvider
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import _StaticCredentialsProvider
 
 
 def _generate_test_certificates():
@@ -352,8 +352,8 @@ class TestWorkerCredentials:
         When:
             provider_from_files() is called with reload=False.
         Then:
-            It should return a StaticCredentialProvider that satisfies the
-            CredentialProviderLike protocol.
+            It should return a _StaticCredentialsProvider that satisfies the
+            CredentialsProviderLike protocol.
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
@@ -364,8 +364,8 @@ class TestWorkerCredentials:
         )
 
         # Assert
-        assert isinstance(provider, StaticCredentialProvider)
-        assert isinstance(provider, CredentialProviderLike)
+        assert isinstance(provider, _StaticCredentialsProvider)
+        assert isinstance(provider, CredentialsProviderLike)
 
     def test_provider_from_files_should_return_file_provider_when_reload_true(
         self, temp_cert_files
@@ -377,8 +377,8 @@ class TestWorkerCredentials:
         When:
             provider_from_files() is called with reload=True.
         Then:
-            It should return a FileCredentialProvider that satisfies the
-            CredentialProviderLike protocol.
+            It should return a FileCredentialsProvider that satisfies the
+            CredentialsProviderLike protocol.
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
@@ -389,8 +389,8 @@ class TestWorkerCredentials:
         )
 
         # Assert
-        assert isinstance(provider, FileCredentialProvider)
-        assert isinstance(provider, CredentialProviderLike)
+        assert isinstance(provider, FileCredentialsProvider)
+        assert isinstance(provider, CredentialsProviderLike)
 
     def test_provider_from_files_should_carry_identity(self, temp_cert_files):
         """Test provider_from_files threads the expected identity through.
@@ -479,7 +479,7 @@ class TestWorkerCredentials:
         )
 
         # Assert
-        assert isinstance(provider, FileCredentialProvider)
+        assert isinstance(provider, FileCredentialsProvider)
 
     def test_server_credentials_with_mtls(self, test_certificates):
         """Test server credentials property for mTLS.
@@ -748,8 +748,8 @@ class TestWorkerCredentials:
             WorkerCredentials.current()
 
 
-class TestCredentialSnapshot:
-    """Test suite for CredentialSnapshot fingerprinting."""
+class TestCredentialsSnapshot:
+    """Test suite for CredentialsSnapshot fingerprinting."""
 
     def test_of_should_compute_fingerprint(self, test_certificates):
         """Test snapshot construction computes a fingerprint.
@@ -757,7 +757,7 @@ class TestCredentialSnapshot:
         Given:
             Credential material and an expected identity.
         When:
-            CredentialSnapshot.of() is called.
+            CredentialsSnapshot.of() is called.
         Then:
             It should return a snapshot carrying the material, identity, and
             a non-empty fingerprint.
@@ -769,7 +769,7 @@ class TestCredentialSnapshot:
         )
 
         # Act
-        snapshot = CredentialSnapshot.of(creds, "wool-worker")
+        snapshot = CredentialsSnapshot.of(creds, "wool-worker")
 
         # Assert
         assert snapshot.credentials == creds
@@ -800,8 +800,8 @@ class TestCredentialSnapshot:
         creds_b = WorkerCredentials(ca_cert=ca, worker_key=key, worker_cert=cert)
 
         # Act
-        fingerprint_a = CredentialSnapshot.of(creds_a, identity).fingerprint
-        fingerprint_b = CredentialSnapshot.of(creds_b, identity).fingerprint
+        fingerprint_a = CredentialsSnapshot.of(creds_a, identity).fingerprint
+        fingerprint_b = CredentialsSnapshot.of(creds_b, identity).fingerprint
 
         # Assert
         assert fingerprint_a == fingerprint_b
@@ -825,8 +825,8 @@ class TestCredentialSnapshot:
         rotated = WorkerCredentials(ca_cert=other_ca, worker_key=key, worker_cert=cert)
 
         # Act
-        fingerprint = CredentialSnapshot.of(creds).fingerprint
-        rotated_fingerprint = CredentialSnapshot.of(rotated).fingerprint
+        fingerprint = CredentialsSnapshot.of(creds).fingerprint
+        rotated_fingerprint = CredentialsSnapshot.of(rotated).fingerprint
 
         # Assert
         assert fingerprint != rotated_fingerprint
@@ -848,8 +848,8 @@ class TestCredentialSnapshot:
         )
 
         # Act
-        fingerprint_a = CredentialSnapshot.of(creds, "worker-a").fingerprint
-        fingerprint_b = CredentialSnapshot.of(creds, "worker-b").fingerprint
+        fingerprint_a = CredentialsSnapshot.of(creds, "worker-a").fingerprint
+        fingerprint_b = CredentialsSnapshot.of(creds, "worker-b").fingerprint
 
         # Assert
         assert fingerprint_a != fingerprint_b
@@ -874,14 +874,14 @@ class TestCredentialSnapshot:
         )
 
         # Act
-        mtls_fingerprint = CredentialSnapshot.of(mtls).fingerprint
-        one_way_fingerprint = CredentialSnapshot.of(one_way).fingerprint
+        mtls_fingerprint = CredentialsSnapshot.of(mtls).fingerprint
+        one_way_fingerprint = CredentialsSnapshot.of(one_way).fingerprint
 
         # Assert
         assert mtls_fingerprint != one_way_fingerprint
 
     def test_pickle_roundtrip(self, test_certificates):
-        """Test CredentialSnapshot survives a pickle roundtrip.
+        """Test CredentialsSnapshot survives a pickle roundtrip.
 
         Given:
             A snapshot of valid credential material.
@@ -895,7 +895,7 @@ class TestCredentialSnapshot:
         creds = WorkerCredentials(
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
         )
-        snapshot = CredentialSnapshot.of(creds, "wool-worker")
+        snapshot = CredentialsSnapshot.of(creds, "wool-worker")
 
         # Act
         restored = cloudpickle.loads(cloudpickle.dumps(snapshot))
@@ -904,8 +904,8 @@ class TestCredentialSnapshot:
         assert restored == snapshot
 
 
-class TestStaticCredentialProvider:
-    """Test suite for StaticCredentialProvider."""
+class TestStaticCredentialsProvider:
+    """Test suite for _StaticCredentialsProvider."""
 
     def test_resolve_should_return_constant_snapshot(self, test_certificates):
         """Test a static provider resolves to a constant snapshot.
@@ -922,7 +922,7 @@ class TestStaticCredentialProvider:
         creds = WorkerCredentials(
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
         )
-        provider = StaticCredentialProvider(creds, identity="wool-worker")
+        provider = _StaticCredentialsProvider(creds, identity="wool-worker")
 
         # Act
         first = provider.resolve()
@@ -948,7 +948,7 @@ class TestStaticCredentialProvider:
         creds = WorkerCredentials(
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
         )
-        provider = StaticCredentialProvider(creds)
+        provider = _StaticCredentialsProvider(creds)
 
         # Act
         snapshot = provider.resolve()
@@ -974,7 +974,7 @@ class TestStaticCredentialProvider:
         )
 
         # Act & assert
-        assert StaticCredentialProvider(creds).reloadable is False
+        assert _StaticCredentialsProvider(creds).reloadable is False
 
     def test_resolve_should_normalize_blank_identity_to_none(self, test_certificates):
         """Test a blank identity collapses to address-based verification.
@@ -993,7 +993,7 @@ class TestStaticCredentialProvider:
         creds = WorkerCredentials(
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
         )
-        provider = StaticCredentialProvider(creds, identity="   ")
+        provider = _StaticCredentialsProvider(creds, identity="   ")
 
         # Act & assert
         assert provider.identity is None
@@ -1002,7 +1002,7 @@ class TestStaticCredentialProvider:
     @given(mutual=st.booleans())
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test_pickle_roundtrip(self, mutual, test_certificates):
-        """Test StaticCredentialProvider survives a pickle roundtrip.
+        """Test _StaticCredentialsProvider survives a pickle roundtrip.
 
         Given:
             A static provider over valid material and any mutual flag.
@@ -1017,7 +1017,7 @@ class TestStaticCredentialProvider:
         creds = WorkerCredentials(
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=mutual
         )
-        provider = StaticCredentialProvider(creds, identity="wool-worker")
+        provider = _StaticCredentialsProvider(creds, identity="wool-worker")
 
         # Act
         restored = cloudpickle.loads(cloudpickle.dumps(provider))
@@ -1027,8 +1027,8 @@ class TestStaticCredentialProvider:
         assert restored.resolve().fingerprint == provider.resolve().fingerprint
 
 
-class TestFileCredentialProvider:
-    """Test suite for FileCredentialProvider reloading behavior."""
+class TestFileCredentialsProvider:
+    """Test suite for FileCredentialsProvider reloading behavior."""
 
     def test_resolve_should_read_material_from_files(self, temp_cert_files):
         """Test a file provider resolves material from disk.
@@ -1043,7 +1043,7 @@ class TestFileCredentialProvider:
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
-        provider = FileCredentialProvider(
+        provider = FileCredentialsProvider(
             ca_path, key_path, cert_path, identity="wool-worker"
         )
         with open(ca_path, "rb") as f:
@@ -1070,7 +1070,7 @@ class TestFileCredentialProvider:
         ca_path, key_path, cert_path = temp_cert_files
 
         # Act
-        provider = FileCredentialProvider(
+        provider = FileCredentialsProvider(
             ca_path, key_path, cert_path, identity="wool-worker"
         )
 
@@ -1092,7 +1092,7 @@ class TestFileCredentialProvider:
         ca_path, key_path, cert_path = temp_cert_files
 
         # Act & assert
-        assert FileCredentialProvider(ca_path, key_path, cert_path).reloadable is True
+        assert FileCredentialsProvider(ca_path, key_path, cert_path).reloadable is True
 
     def test_identity_should_normalize_blank_to_none(self, temp_cert_files):
         """Test a blank identity collapses to address-based verification.
@@ -1108,7 +1108,7 @@ class TestFileCredentialProvider:
         ca_path, key_path, cert_path = temp_cert_files
 
         # Act
-        provider = FileCredentialProvider(ca_path, key_path, cert_path, identity="")
+        provider = FileCredentialsProvider(ca_path, key_path, cert_path, identity="")
 
         # Assert
         assert provider.identity is None
@@ -1126,7 +1126,7 @@ class TestFileCredentialProvider:
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
-        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        provider = FileCredentialsProvider(ca_path, key_path, cert_path)
 
         # Act
         first = provider.resolve()
@@ -1148,7 +1148,7 @@ class TestFileCredentialProvider:
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
-        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        provider = FileCredentialsProvider(ca_path, key_path, cert_path)
         before = provider.resolve()
 
         # Act
@@ -1178,7 +1178,7 @@ class TestFileCredentialProvider:
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
-        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        provider = FileCredentialsProvider(ca_path, key_path, cert_path)
         before = provider.resolve()
 
         # Act
@@ -1211,7 +1211,7 @@ class TestFileCredentialProvider:
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
-        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        provider = FileCredentialsProvider(ca_path, key_path, cert_path)
         before = provider.resolve()
 
         # Act
@@ -1248,7 +1248,7 @@ class TestFileCredentialProvider:
             ca_pem = f.read()
         with open(ca_path, "wb") as f:
             f.write(ca_pem + b"\n" * 16)
-        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        provider = FileCredentialsProvider(ca_path, key_path, cert_path)
         before = provider.resolve()
         original_mtime = os.stat(ca_path).st_mtime_ns
 
@@ -1277,7 +1277,7 @@ class TestFileCredentialProvider:
         ca_path, key_path, cert_path = temp_cert_files
         with open(ca_path, "rb") as f:
             ca_pem = f.read()
-        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        provider = FileCredentialsProvider(ca_path, key_path, cert_path)
         provider.resolve()  # establish a last-good snapshot before rotating
         errors: list[Exception] = []
         snapshots: list = []
@@ -1309,7 +1309,7 @@ class TestFileCredentialProvider:
         # Assert
         assert not errors
         for snapshot in snapshots:
-            recomputed = CredentialSnapshot.of(snapshot.credentials, snapshot.identity)
+            recomputed = CredentialsSnapshot.of(snapshot.credentials, snapshot.identity)
             assert snapshot.fingerprint == recomputed.fingerprint
 
     def test_resolve_should_raise_when_first_read_fails(self):
@@ -1324,7 +1324,7 @@ class TestFileCredentialProvider:
             It should raise FileNotFoundError.
         """
         # Arrange
-        provider = FileCredentialProvider(
+        provider = FileCredentialsProvider(
             "/nonexistent/ca.pem",
             "/nonexistent/key.pem",
             "/nonexistent/cert.pem",
@@ -1348,7 +1348,7 @@ class TestFileCredentialProvider:
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
-        provider = FileCredentialProvider(
+        provider = FileCredentialsProvider(
             ca_path, key_path, cert_path, identity="wool-worker"
         )
         original = provider.resolve()

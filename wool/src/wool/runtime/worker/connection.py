@@ -23,8 +23,8 @@ from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import Serializer
-from wool.runtime.worker.auth import CredentialProviderLike
-from wool.runtime.worker.auth import CredentialSnapshot
+from wool.runtime.worker.auth import CredentialsProviderLike
+from wool.runtime.worker.auth import CredentialsSnapshot
 from wool.runtime.worker.base import ChannelOptions
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
@@ -35,7 +35,7 @@ _log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class _CredentialKey:
+class _CredentialsKey:
     """Content-stable pool-key element for a credential snapshot.
 
     Channels are pooled by credential *content*, not by the identity of a
@@ -47,18 +47,18 @@ class _CredentialKey:
     channel but is excluded from equality and hashing.
     """
 
-    snapshot: CredentialSnapshot = field(compare=False)
+    snapshot: CredentialsSnapshot = field(compare=False)
     fingerprint: str
     identity: str | None
 
     @classmethod
-    def of(cls, snapshot: CredentialSnapshot) -> _CredentialKey:
+    def of(cls, snapshot: CredentialsSnapshot) -> _CredentialsKey:
         """Build a key element from a resolved snapshot.
 
         :param snapshot:
             The resolved credential snapshot.
         :returns:
-            A :class:`_CredentialKey` hashing on the snapshot's fingerprint
+            A :class:`_CredentialsKey` hashing on the snapshot's fingerprint
             and identity.
         """
         return cls(
@@ -68,7 +68,7 @@ class _CredentialKey:
         )
 
 
-_PoolKey: TypeAlias = tuple[str, "_CredentialKey | None", ChannelOptions]
+_PoolKey: TypeAlias = tuple[str, "_CredentialsKey | None", ChannelOptions]
 
 
 @dataclass
@@ -954,7 +954,7 @@ class WorkerConnection:
         self,
         target: str,
         *,
-        provider: CredentialProviderLike | None = None,
+        provider: CredentialsProviderLike | None = None,
         options: ChannelOptions | None = None,
     ):
         self._target = target
@@ -1054,7 +1054,7 @@ class WorkerConnection:
         # Resolve current credential material per dispatch so rotated
         # material is adopted on the next connection (see class docstring).
         cred_key = (
-            _CredentialKey.of(self._provider.resolve())
+            _CredentialsKey.of(self._provider.resolve())
             if self._provider is not None
             else None
         )

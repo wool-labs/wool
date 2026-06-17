@@ -15,9 +15,9 @@ from hypothesis import strategies as st
 
 from wool import protocol
 from wool.runtime.worker import process as process_module
-from wool.runtime.worker.auth import CredentialContext
-from wool.runtime.worker.auth import CredentialProviderLike
-from wool.runtime.worker.auth import FileCredentialProvider
+from wool.runtime.worker.auth import CredentialsContext
+from wool.runtime.worker.auth import CredentialsProviderLike
+from wool.runtime.worker.auth import FileCredentialsProvider
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
@@ -1838,7 +1838,7 @@ class TestWorkerProcess:
         When:
             run() is called and the server lifecycle executes.
         Then:
-            CredentialContext.current() should return a provider resolving
+            CredentialsContext.current() should return a provider resolving
             to those credentials during the server lifecycle.
         """
         # Arrange
@@ -1864,7 +1864,7 @@ class TestWorkerProcess:
         mock_service = mocker.MagicMock()
 
         async def capture_current():
-            captured_current.append(CredentialContext.current())
+            captured_current.append(CredentialsContext.current())
 
         mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
         mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
@@ -1882,7 +1882,7 @@ class TestWorkerProcess:
         # Assert
         assert len(captured_current) == 1
         resolved = captured_current[0]
-        assert isinstance(resolved, CredentialProviderLike)
+        assert isinstance(resolved, CredentialsProviderLike)
         assert resolved.resolve().credentials == creds
 
     def test_run_does_not_set_contextvar_when_credentials_none(self, mocker):
@@ -1911,7 +1911,7 @@ class TestWorkerProcess:
         mock_service = mocker.MagicMock()
 
         async def capture_current():
-            captured_current.append(CredentialContext.current())
+            captured_current.append(CredentialsContext.current())
 
         mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
         mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
@@ -1951,7 +1951,7 @@ class TestWorkerProcess:
         ca.write_bytes(ca_pem)
         key.write_bytes(key_pem)
         cert.write_bytes(cert_pem)
-        provider = FileCredentialProvider(str(ca), str(key), str(cert))
+        provider = FileCredentialsProvider(str(ca), str(key), str(cert))
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
         mocker.patch.object(process_module, "ResourcePool")

@@ -22,7 +22,6 @@ from cryptography.x509.oid import NameOID
 import wool
 from wool import AllWorkersUnauthenticated
 from wool import HandshakeError
-from wool import StaticCredentialProvider
 from wool import WorkerCredentials
 from wool import WorkerProxy
 
@@ -201,7 +200,7 @@ async def test_untrusted_ca_rejects_with_diagnosable_signal():
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_identity_mismatch_rejects_with_identity_mismatch_reason():
+async def test_identity_mismatch_rejects_with_identity_mismatch_reason(tmp_path):
     """Test a certificate that does not match the configured identity is rejected.
 
     Given:
@@ -225,8 +224,16 @@ async def test_identity_mismatch_rejects_with_identity_mismatch_reason():
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
         )
     )
-    client_credentials = StaticCredentialProvider(
-        WorkerCredentials(ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem),
+    ca_path = tmp_path / "ca.pem"
+    key_path = tmp_path / "key.pem"
+    cert_path = tmp_path / "cert.pem"
+    ca_path.write_bytes(ca_pem)
+    key_path.write_bytes(key_pem)
+    cert_path.write_bytes(cert_pem)
+    client_credentials = WorkerCredentials.provider_from_files(
+        str(ca_path),
+        str(key_path),
+        str(cert_path),
         identity="does-not-match.example",
     )
 

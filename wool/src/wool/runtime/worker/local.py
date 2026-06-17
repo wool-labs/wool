@@ -7,7 +7,7 @@ from typing import Any
 import grpc.aio
 
 from wool import protocol
-from wool.runtime.worker.auth import CredentialProviderLike
+from wool.runtime.worker.auth import CredentialsProviderLike
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import _coerce_provider
 from wool.runtime.worker.base import Worker
@@ -62,7 +62,7 @@ class LocalWorker(Worker):
         - :class:`WorkerCredentials`: Provides both server and client
           credentials for mutual TLS. Enables secure worker-to-worker
           communication.
-        - :class:`CredentialProviderLike`: A provider (e.g. from
+        - :class:`CredentialsProviderLike`: A provider (e.g. from
           :meth:`WorkerCredentials.provider_from_files`) for identity-based
           verification or credential rotation without restart.
         - ``None``: Worker uses insecure connections.
@@ -83,7 +83,7 @@ class LocalWorker(Worker):
     """
 
     _worker_process: WorkerProcess
-    _provider: CredentialProviderLike | None
+    _provider: CredentialsProviderLike | None
 
     def __init__(
         self,
@@ -92,7 +92,7 @@ class LocalWorker(Worker):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
-        credentials: WorkerCredentials | CredentialProviderLike | None = None,
+        credentials: WorkerCredentials | CredentialsProviderLike | None = None,
         options: WorkerOptions | None = None,
         backpressure: BackpressureLike | None = None,
         **extra: Any,

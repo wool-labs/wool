@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-_current: ContextVar[WorkerCredentials | CredentialProviderLike | None] = ContextVar(
+_current: ContextVar[WorkerCredentials | CredentialsProviderLike | None] = ContextVar(
     "worker_credentials", default=None
 )
 
@@ -127,7 +127,7 @@ class WorkerCredentials:
         mutual: bool = True,
         identity: str | None = None,
         reload: bool = False,
-    ) -> CredentialProviderLike:
+    ) -> CredentialsProviderLike:
         """Build a credential provider backed by PEM files.
 
         A provider is the unit that worker pools, proxies, and worker
@@ -167,7 +167,7 @@ class WorkerCredentials:
             returns a reloading provider; if ``False`` (default), returns a
             static provider that reads the files once.
         :returns:
-            A :class:`CredentialProviderLike` resolving to the current
+            A :class:`CredentialsProviderLike` resolving to the current
             credential material.
         :raises FileNotFoundError:
             If ``reload`` is ``False`` and any certificate file doesn't
@@ -176,7 +176,7 @@ class WorkerCredentials:
             If ``reload`` is ``False`` and any file cannot be read.
         """
         if reload:
-            return FileCredentialProvider(
+            return FileCredentialsProvider(
                 ca_path,
                 key_path,
                 cert_path,
@@ -189,7 +189,7 @@ class WorkerCredentials:
             cert_path=cert_path,
             mutual=mutual,
         )
-        return StaticCredentialProvider(credentials, identity=identity)
+        return _StaticCredentialsProvider(credentials, identity=identity)
 
     def server_credentials(self) -> grpc.ServerCredentials:
         """Build server credentials for accepting connections.
@@ -303,10 +303,10 @@ def _normalize_identity(identity: str | None) -> str | None:
 
 # public
 @dataclass(frozen=True)
-class CredentialSnapshot:
+class CredentialsSnapshot:
     """An immutable, fingerprinted view of credential material.
 
-    Resolved from a :class:`CredentialProviderLike`, a snapshot bundles the
+    Resolved from a :class:`CredentialsProviderLike`, a snapshot bundles the
     concrete :class:`WorkerCredentials` with the expected ``identity`` to
     verify discovered workers against and a content ``fingerprint`` that
     changes only when the material or identity changes.
@@ -327,7 +327,7 @@ class CredentialSnapshot:
     @classmethod
     def of(
         cls, credentials: WorkerCredentials, identity: str | None = None
-    ) -> CredentialSnapshot:
+    ) -> CredentialsSnapshot:
         """Build a snapshot, computing its fingerprint.
 
         :param credentials:
@@ -347,14 +347,14 @@ class CredentialSnapshot:
 
 # public
 @runtime_checkable
-class CredentialProviderLike(Protocol):
+class CredentialsProviderLike(Protocol):
     """Protocol for objects that supply current credential material.
 
     A provider is the seam through which the runtime obtains credentials at
     the moment it needs them, so that rotated material can be adopted
     without restarting.  Implementations MUST be picklable: a provider
     crosses into worker subprocesses when supplied to a worker, and is
-    re-resolved from the active :class:`CredentialContext` on the client
+    re-resolved from the active :class:`CredentialsContext` on the client
     side.
     """
 
@@ -370,18 +370,18 @@ class CredentialProviderLike(Protocol):
         """
         ...
 
-    def resolve(self) -> CredentialSnapshot:
+    def resolve(self) -> CredentialsSnapshot:
         """Return the current credential snapshot.
 
         :returns:
-            The current :class:`CredentialSnapshot`.
+            The current :class:`CredentialsSnapshot`.
         """
         ...
 
 
-# public
+# internal
 @dataclass(frozen=True)
-class StaticCredentialProvider:
+class _StaticCredentialsProvider:
     """A provider that always resolves to fixed credential material.
 
     Wraps a single :class:`WorkerCredentials` instance and an optional
@@ -399,19 +399,19 @@ class StaticCredentialProvider:
 
     credentials: WorkerCredentials
     identity: str | None = None
-    _snapshot: CredentialSnapshot = field(init=False, repr=False, compare=False)
+    _snapshot: CredentialsSnapshot = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "identity", _normalize_identity(self.identity))
         object.__setattr__(
-            self, "_snapshot", CredentialSnapshot.of(self.credentials, self.identity)
+            self, "_snapshot", CredentialsSnapshot.of(self.credentials, self.identity)
         )
 
-    def resolve(self) -> CredentialSnapshot:
+    def resolve(self) -> CredentialsSnapshot:
         """Return the fixed credential snapshot.
 
         :returns:
-            The same :class:`CredentialSnapshot` on every call.
+            The same :class:`CredentialsSnapshot` on every call.
         """
         return self._snapshot
 
@@ -454,7 +454,7 @@ def _validate_material(ca_path: str, key_path: str, cert_path: str) -> None:
 
 
 # public
-class FileCredentialProvider:
+class FileCredentialsProvider:
     """A provider that re-reads PEM files as they are rotated.
 
     Resolves the current credential material from the certificate-
@@ -498,7 +498,7 @@ class FileCredentialProvider:
         self._cert_path = os.fspath(cert_path)
         self._mutual = mutual
         self._identity = _normalize_identity(identity)
-        self._cached_snapshot: CredentialSnapshot | None = None
+        self._cached_snapshot: CredentialsSnapshot | None = None
         self._cached_signature: tuple[tuple[int, int, int, int], ...] | None = None
         # The server-side fetcher consults resolve() from a gRPC C-core
         # thread, off the asyncio loop, concurrently with client-side
@@ -536,7 +536,7 @@ class FileCredentialProvider:
             )
         return tuple(signature)
 
-    def resolve(self) -> CredentialSnapshot:
+    def resolve(self) -> CredentialsSnapshot:
         """Return the current credential snapshot, re-reading on change.
 
         On a transient read failure or readable-but-malformed material
@@ -545,7 +545,7 @@ class FileCredentialProvider:
         rotation never tears the fleet down nor silently adopts garbage.
 
         :returns:
-            The current :class:`CredentialSnapshot`.  Reuses the cached
+            The current :class:`CredentialsSnapshot`.  Reuses the cached
             snapshot when the files are unchanged, or on a failed re-read
             when a prior snapshot exists.
         :raises OSError:
@@ -572,12 +572,12 @@ class FileCredentialProvider:
                 _validate_material(self._ca_path, self._key_path, self._cert_path)
             except OSError as exc:
                 return self._fallback_or_raise(exc)
-            snapshot = CredentialSnapshot.of(credentials, self._identity)
+            snapshot = CredentialsSnapshot.of(credentials, self._identity)
             self._cached_snapshot = snapshot
             self._cached_signature = signature
             return snapshot
 
-    def _fallback_or_raise(self, exc: Exception) -> CredentialSnapshot:
+    def _fallback_or_raise(self, exc: Exception) -> CredentialsSnapshot:
         """Return the last good snapshot, logging, or re-raise if none."""
         if self._cached_snapshot is not None:
             _log.warning(
@@ -606,12 +606,12 @@ class FileCredentialProvider:
 
 
 def _coerce_provider(
-    value: WorkerCredentials | CredentialProviderLike | None,
-) -> CredentialProviderLike | None:
+    value: WorkerCredentials | CredentialsProviderLike | None,
+) -> CredentialsProviderLike | None:
     """Normalize a credentials-or-provider value into a provider.
 
     A bare :class:`WorkerCredentials` is wrapped in a
-    :class:`StaticCredentialProvider` with no identity, preserving the
+    :class:`_StaticCredentialsProvider` with no identity, preserving the
     legacy address-based verification behaviour; a provider is returned
     unchanged; ``None`` stays ``None``.  This is the single seam through
     which pools, proxies, and worker processes accept either form.
@@ -619,35 +619,35 @@ def _coerce_provider(
     :param value:
         A :class:`WorkerCredentials`, a provider, or ``None``.
     :returns:
-        A :class:`CredentialProviderLike`, or ``None``.
+        A :class:`CredentialsProviderLike`, or ``None``.
     """
     if value is None:
         return None
-    # Branch on WorkerCredentials rather than isinstance(CredentialProviderLike):
+    # Branch on WorkerCredentials rather than isinstance(CredentialsProviderLike):
     # the latter is a runtime_checkable protocol, so a custom provider that
     # implements only resolve() (omitting the optional reloadable member)
     # would fail the check and be wrapped as if it were credentials. Treating
     # "not WorkerCredentials" as "already a provider" keeps such providers
     # working and defers the reloadable default to the worker.
     if isinstance(value, WorkerCredentials):
-        return StaticCredentialProvider(value)
+        return _StaticCredentialsProvider(value)
     return value
 
 
-class CredentialContext:
+class CredentialsContext:
     """Internal context manager for propagating credentials via ContextVar.
 
     Used by WorkerProcess._serve() to set credentials in worker subprocesses
     and by WorkerProxy.__init__() to resolve credentials from context. Carries
-    either a :class:`WorkerCredentials` or a :class:`CredentialProviderLike`.
+    either a :class:`WorkerCredentials` or a :class:`CredentialsProviderLike`.
     Not part of the public API.
     """
 
-    def __init__(self, credentials: WorkerCredentials | CredentialProviderLike) -> None:
+    def __init__(self, credentials: WorkerCredentials | CredentialsProviderLike) -> None:
         self._credentials = credentials
         self._token: Token | None = None
 
-    def __enter__(self) -> CredentialContext:
+    def __enter__(self) -> CredentialsContext:
         self._token = _current.set(self._credentials)
         return self
 
@@ -658,12 +658,12 @@ class CredentialContext:
         self._token = None
 
     @classmethod
-    def current(cls) -> WorkerCredentials | CredentialProviderLike | None:
+    def current(cls) -> WorkerCredentials | CredentialsProviderLike | None:
         """Get the current credentials or provider from the context.
 
         :returns:
             The active :class:`WorkerCredentials` or
-            :class:`CredentialProviderLike`, or ``None`` if no context is
+            :class:`CredentialsProviderLike`, or ``None`` if no context is
             set.
         """
         return _current.get()
