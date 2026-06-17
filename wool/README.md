@@ -317,6 +317,10 @@ Wool ships with two discovery protocols:
 
 Custom discovery protocols are supported via structural subtyping — implement the `DiscoveryLike` protocol and pass it to `WorkerPool`.
 
+### Discovery is an untrusted hint
+
+Discovery is **not** an authenticated channel. A worker self-advertises its `WorkerMetadata` (including the `secure` flag) over the discovery plane, and no built-in protocol authenticates those advertisements — they are forgeable by anything that can write to the plane. The advertised `secure` flag only gates transport *compatibility* (a client won't dial a plaintext peer with TLS credentials, or vice versa); it is not a trust signal. Trust is established solely by the mTLS handshake performed when a connection is made, so a forged advertisement still cannot complete a handshake without a CA-trusted certificate (and a matching SAN when an identity is configured). See the worker package's _Security → Discovery-plane trust_ note for details.
+
 ## Load balancing
 
 The load balancer decides which worker handles each dispatched task. The `WorkerProxy` maintains a load balancer and a context of discovered workers with gRPC connections. It waits for at least one worker to become available, then the load balancer selects one.

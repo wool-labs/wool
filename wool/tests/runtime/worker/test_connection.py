@@ -1,5 +1,6 @@
 import asyncio
 import os
+import pickle
 from typing import Callable
 from typing import Coroutine
 from uuid import uuid4
@@ -223,6 +224,33 @@ class TestHandshakeError:
         # Act & assert
         assert isinstance(error, RpcError)
         assert not isinstance(error, TransientRpcError)
+
+    def test_pickle_roundtrip(self):
+        """Test HandshakeError survives a serialization roundtrip.
+
+        Given:
+            A HandshakeError carrying a code, details, and reason.
+        When:
+            It is pickled and cloudpickled and restored.
+        Then:
+            The reason, code, and details should survive — it is a
+            wire-crossing type raised back to a calling process.
+        """
+        # Arrange
+        error = HandshakeError(
+            grpc.StatusCode.UNAVAILABLE,
+            "boom",
+            reason=HandshakeError.Reason.CERT_VERIFY,
+        )
+
+        # Act & assert
+        for restore in (
+            pickle.loads(pickle.dumps(error)),
+            cloudpickle.loads(cloudpickle.dumps(error)),
+        ):
+            assert restore.reason is HandshakeError.Reason.CERT_VERIFY
+            assert restore.code is grpc.StatusCode.UNAVAILABLE
+            assert restore.details == "boom"
 
 
 class TestWorkerConnection:
@@ -716,6 +744,55 @@ class TestWorkerConnection:
         assert "secure handshake failed" in exc_info.value.details
 
     @pytest.mark.asyncio
+    async def test_dispatch_should_classify_hostname_verification_as_identity_mismatch(
+        self, mocker: MockerFixture, sample_task
+    ):
+        """Test a real gRPC hostname-verification failure maps to IDENTITY_MISMATCH.
+
+        Given:
+            A handshake failure whose text is gRPC's verbatim
+            ``ssl_target_name_override`` mismatch ("Hostname Verification
+            Check failed") — a drift canary for the classifier's tokens.
+        When:
+            A task is dispatched.
+        Then:
+            The raised HandshakeError's reason should be IDENTITY_MISMATCH,
+            so an identity mismatch stays diagnosable and is not mistaken
+            for plain unreachability.
+        """
+
+        # Arrange — verbatim text from a gRPC ssl_target_name_override
+        # mismatch (captured from grpc.aio against a real worker).
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNAVAILABLE
+
+            def details(self):
+                return (
+                    "failed to connect to all addresses; last error: UNKNOWN: "
+                    "ipv4:127.0.0.1:51127: Custom verification check failed with "
+                    "error: UNAUTHENTICATED: Hostname Verification Check failed."
+                )
+
+            def debug_error_string(self):
+                return self.details()
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051",
+            provider=_secure_provider(),
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act & assert
+        with pytest.raises(HandshakeError) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        assert exc_info.value.reason is HandshakeError.Reason.IDENTITY_MISMATCH
+
+    @pytest.mark.asyncio
     async def test_dispatch_should_override_target_name_when_identity_configured(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
@@ -910,6 +987,69 @@ class TestWorkerConnection:
 
         # Assert
         assert secure_spy.call_count == 2
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_finish_inflight_stream_after_rotation(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+        tmp_path,
+        test_certificates,
+    ):
+        """Test an in-flight dispatch is not torn down by a rotation.
+
+        Given:
+            A connection over a reloading file provider, with a dispatch
+            primed and its stream still open.
+        When:
+            The credential material is rotated and the open stream is then
+            consumed to completion.
+        Then:
+            The stream should finish on its original channel — rotation is
+            adopted at the next connection, never by interrupting work in
+            flight — so no replacement channel is built for it.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        ca_path = tmp_path / "ca.pem"
+        key_path = tmp_path / "key.pem"
+        cert_path = tmp_path / "cert.pem"
+        ca_path.write_bytes(ca_pem)
+        key_path.write_bytes(key_pem)
+        cert_path.write_bytes(cert_pem)
+        provider = FileCredentialProvider(str(ca_path), str(key_path), str(cert_path))
+
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("10.0.0.7:50051", provider=provider)
+
+        # Act — prime the dispatch (builds the original channel), then rotate
+        # the material before consuming the still-open stream.
+        stream = await connection.dispatch(sample_task)
+        rotated_mtime = os.stat(ca_path).st_mtime_ns + 1_000_000_000
+        ca_path.write_bytes(ca_pem + b"\n# rotated\n")
+        os.utime(ca_path, ns=(rotated_mtime, rotated_mtime))
+        results = [result async for result in stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert secure_spy.call_count == 1
 
         # Cleanup
         await connection.close()

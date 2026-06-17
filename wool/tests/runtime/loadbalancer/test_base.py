@@ -1,6 +1,8 @@
+import pickle
 from types import MappingProxyType
 from uuid import uuid4
 
+import cloudpickle
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -409,3 +411,31 @@ class TestAllWorkersUnauthenticated:
 
         # Assert
         assert raised.rejections == {uid: error}
+
+    def test_pickle_roundtrip(self):
+        """Test AllWorkersUnauthenticated survives a serialization roundtrip.
+
+        Given:
+            An AllWorkersUnauthenticated carrying a uid-to-HandshakeError
+            rejection.
+        When:
+            It is pickled and cloudpickled and restored.
+        Then:
+            The rejection mapping and each nested reason should survive — it
+            crosses the wire to a calling process when a nested dispatch
+            drains on handshake failures.
+        """
+        # Arrange
+        uid = uuid4()
+        raised = AllWorkersUnauthenticated(
+            "drained",
+            rejections={uid: HandshakeError(reason=HandshakeError.Reason.TLS_HANDSHAKE)},
+        )
+
+        # Act & assert
+        for restore in (
+            pickle.loads(pickle.dumps(raised)),
+            cloudpickle.loads(cloudpickle.dumps(raised)),
+        ):
+            assert set(restore.rejections) == {uid}
+            assert restore.rejections[uid].reason is HandshakeError.Reason.TLS_HANDSHAKE
