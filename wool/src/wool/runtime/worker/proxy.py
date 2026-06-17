@@ -36,6 +36,7 @@ from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import CredentialContext
+from wool.runtime.worker.auth import StaticCredentialProvider
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -912,8 +913,8 @@ class WorkerProxy:
         assert self._loadbalancer_context is not None
         assert self._discovery_stream is not None
         assert self._workers_changed is not None
-        client_credentials = (
-            self._credentials.client_credentials()
+        provider = (
+            StaticCredentialProvider(self._credentials)
             if self._credentials is not None
             else None
         )
@@ -928,7 +929,7 @@ class WorkerProxy:
                         continue
                     connection = WorkerConnection(
                         event.metadata.address,
-                        credentials=client_credentials,
+                        provider=provider,
                         options=event.metadata.options,
                     )
                     if event.type == "worker-added":

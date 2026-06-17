@@ -5,6 +5,7 @@ import enum
 import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 from typing import AsyncGenerator
 from typing import Coroutine
@@ -22,14 +23,52 @@ from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import Serializer
+from wool.runtime.worker.auth import CredentialProviderLike
+from wool.runtime.worker.auth import CredentialSnapshot
 from wool.runtime.worker.base import ChannelOptions
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
-_PoolKey: TypeAlias = tuple[str, grpc.ChannelCredentials | None, ChannelOptions]
 
 _T = TypeVar("_T")
 
 _log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _CredentialKey:
+    """Content-stable pool-key element for a credential snapshot.
+
+    Channels are pooled by credential *content*, not by the identity of a
+    gRPC credentials object: two snapshots with the same material and
+    identity hash equal (so an unchanged credential reuses its pooled
+    channel), while rotated material yields a different
+    :attr:`fingerprint` and therefore a fresh channel.  The
+    :attr:`snapshot` itself is carried for the factory to build the
+    channel but is excluded from equality and hashing.
+    """
+
+    snapshot: CredentialSnapshot = field(compare=False)
+    fingerprint: str
+    identity: str | None
+
+    @classmethod
+    def of(cls, snapshot: CredentialSnapshot) -> _CredentialKey:
+        """Build a key element from a resolved snapshot.
+
+        :param snapshot:
+            The resolved credential snapshot.
+        :returns:
+            A :class:`_CredentialKey` hashing on the snapshot's fingerprint
+            and identity.
+        """
+        return cls(
+            snapshot=snapshot,
+            fingerprint=snapshot.fingerprint,
+            identity=snapshot.identity,
+        )
+
+
+_PoolKey: TypeAlias = tuple[str, "_CredentialKey | None", ChannelOptions]
 
 
 @dataclass
@@ -49,11 +88,11 @@ def _channel_factory(key):
     """Create a new :class:`_Channel` for the given pool key.
 
     :param key:
-        Tuple of ``(target, credentials, options)``.
+        Tuple of ``(target, credential_key, options)``.
     :returns:
         A new :class:`_Channel` instance.
     """
-    target, credentials, options = key
+    target, cred_key, options = key
     grpc_options = [
         ("grpc.max_receive_message_length", options.max_receive_message_length),
         ("grpc.max_send_message_length", options.max_send_message_length),
@@ -70,7 +109,16 @@ def _channel_factory(key):
             options.compression.value,
         ),
     ]
-    if credentials is not None:
+    if cred_key is not None:
+        if cred_key.identity is not None:
+            # Verify the worker's server certificate against the configured
+            # logical identity (its SAN) rather than the dynamically
+            # assigned address dialed at. Full chain + SAN verification is
+            # preserved — only the *name* checked against the certificate
+            # changes — so this strengthens rather than relaxes the
+            # existing guarantee.
+            grpc_options.append(("grpc.ssl_target_name_override", cred_key.identity))
+        credentials = cred_key.snapshot.credentials.client_credentials()
         channel = grpc.aio.secure_channel(target, credentials, options=grpc_options)
     else:
         channel = grpc.aio.insecure_channel(target, options=grpc_options)
@@ -822,12 +870,22 @@ def _classify_handshake_failure(
 class WorkerConnection:
     """gRPC connection to a worker for task dispatch.
 
-    Acquires pooled gRPC channels keyed by ``(target, credentials,
-    options)``.  Each :meth:`dispatch` call obtains a reference-counted
-    channel from the module-level pool, primes an async generator that
-    holds its own reference, then releases the dispatch-scope reference.
-    The channel stays alive until the caller finishes consuming the
-    result stream.
+    Acquires pooled gRPC channels keyed by ``(target, credential
+    fingerprint, options)``.  Each :meth:`dispatch` call resolves the
+    current credential snapshot from the configured provider, obtains a
+    reference-counted channel from the module-level pool, primes an async
+    generator that holds its own reference, then releases the
+    dispatch-scope reference.  The channel stays alive until the caller
+    finishes consuming the result stream.
+
+    **Credential rotation.** Because the pool key carries the credential
+    *fingerprint* rather than a gRPC credentials object, a connection
+    resolves its provider on every dispatch: unchanged material reuses the
+    pooled channel, while rotated material resolves to a new fingerprint
+    and a fresh channel on the next dispatch.  In-flight dispatches retain
+    their own reference to the old channel and finish on it, so rotation is
+    adopted at the natural boundary of new connections without tearing down
+    work in progress.
 
     **Cleanup semantics on cancellation.** Every code path that owns
     an in-flight gRPC call wraps its body in
@@ -857,8 +915,9 @@ class WorkerConnection:
         - ``unix:path`` - Unix domain socket
 
         Examples: ``localhost:50051``, ``192.0.2.1:50051``
-    :param credentials:
-        Optional channel credentials for TLS/mTLS connections.
+    :param provider:
+        Optional credential provider resolved on each dispatch for
+        TLS/mTLS connections.  ``None`` selects an insecure channel.
     :param options:
         Optional channel options controlling gRPC message
         size limits, keepalive, concurrency, and compression.
@@ -877,13 +936,16 @@ class WorkerConnection:
         self,
         target: str,
         *,
-        credentials: grpc.ChannelCredentials | None = None,
+        provider: CredentialProviderLike | None = None,
         options: ChannelOptions | None = None,
     ):
         self._target = target
-        self._credentials = credentials
+        self._provider = provider
         self._options = options if options is not None else ChannelOptions()
-        self._key: _PoolKey = (target, credentials, self._options)
+        # The TCP key is recomputed on each dispatch from the resolved
+        # snapshot (so rotated material yields a new key); the last one is
+        # retained for ``close``. ``None`` until the first dispatch.
+        self._key: _PoolKey | None = None
         self._uds_key: _PoolKey | None = None
 
     async def dispatch(
@@ -971,16 +1033,29 @@ class WorkerConnection:
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
 
+        # Resolve current credential material per dispatch so rotated
+        # material is adopted on the next connection (see class docstring).
+        cred_key = (
+            _CredentialKey.of(self._provider.resolve())
+            if self._provider is not None
+            else None
+        )
+        tcp_key: _PoolKey = (self._target, cred_key, self._options)
+        self._key = tcp_key
+
         if (
             metadata := wool.__worker_metadata__
         ) is not None and metadata.address == self._target:
             if (uds_address := wool.__worker_uds_address__) is not None:
+                # Self-dispatch routes over the loopback UDS, which is always
+                # insecure — the worker never does TLS/identity against
+                # itself.
                 key = (uds_address, None, self._options)
                 self._uds_key = key
             else:
-                key = self._key
+                key = tcp_key
         else:
-            key = self._key
+            key = tcp_key
 
         stream = self._execute(task, key, timeout)
         try:
@@ -995,7 +1070,7 @@ class WorkerConnection:
             # "no workers available" outcome. Non-handshake failures fall
             # through to the unchanged transient/non-transient split.
             handshake = _classify_handshake_failure(
-                error, secure=self._credentials is not None
+                error, secure=self._provider is not None
             )
             if handshake is not None:
                 raise handshake from error
@@ -1020,14 +1095,17 @@ class WorkerConnection:
     async def close(self):
         """Close the connection and release all pooled resources.
 
-        Clears the pooled channel entries for both the TCP key and,
+        Clears the pooled channel entries for the most recent TCP key and,
         if a UDS address is available, the UDS key. Idempotent: safe
         to call multiple times or on connections that were never used.
+        Channels for credential fingerprints superseded by rotation are
+        not cleared here; they expire from the pool via its TTL.
         """
-        try:
-            await _channel_pool.clear(self._key)
-        except KeyError:
-            pass
+        if self._key is not None:
+            try:
+                await _channel_pool.clear(self._key)
+            except KeyError:
+                pass
         if self._uds_key is not None:
             try:
                 await _channel_pool.clear(self._uds_key)

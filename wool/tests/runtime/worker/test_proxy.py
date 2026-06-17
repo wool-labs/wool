@@ -1294,7 +1294,7 @@ class TestWorkerProxy:
         # Assert
         mock_conn_cls.assert_called_once_with(
             metadata.address,
-            credentials=None,
+            provider=None,
             options=channel_opts,
         )
 
@@ -1338,7 +1338,7 @@ class TestWorkerProxy:
         # Assert
         mock_conn_cls.assert_called_once_with(
             metadata.address,
-            credentials=None,
+            provider=None,
             options=None,
         )
 
