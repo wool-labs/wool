@@ -40,6 +40,10 @@ from wool.runtime.routine.wrapper import routine
 from wool.runtime.serializer import CloudpickleSerializer
 from wool.runtime.serializer import Serializer
 from wool.runtime.typing import Factory
+from wool.runtime.worker.auth import CredentialProviderLike
+from wool.runtime.worker.auth import CredentialSnapshot
+from wool.runtime.worker.auth import FileCredentialProvider
+from wool.runtime.worker.auth import StaticCredentialProvider
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import Worker
@@ -94,6 +98,8 @@ __all__ = [
     "ContextDecodeWarning",
     "ContextVar",
     "ContextVarCollision",
+    "CredentialProviderLike",
+    "CredentialSnapshot",
     "Discovery",
     "DiscoveryEvent",
     "DiscoveryEventType",
@@ -101,6 +107,7 @@ __all__ = [
     "DiscoveryPublisherLike",
     "DiscoverySubscriberLike",
     "Factory",
+    "FileCredentialProvider",
     "IneffectiveLeaseWarning",
     "IneffectiveQuorumTimeoutWarning",
     "LanDiscovery",
@@ -115,6 +122,7 @@ __all__ = [
     "RpcError",
     "RuntimeContext",
     "Serializer",
+    "StaticCredentialProvider",
     "Task",
     "TaskException",
     "Token",

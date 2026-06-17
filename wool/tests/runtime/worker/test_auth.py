@@ -1,4 +1,5 @@
 import datetime
+import os
 from dataclasses import FrozenInstanceError
 
 import cloudpickle
@@ -11,10 +12,15 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from hypothesis import HealthCheck
+from hypothesis import assume
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
+from wool.runtime.worker.auth import CredentialProviderLike
+from wool.runtime.worker.auth import CredentialSnapshot
+from wool.runtime.worker.auth import FileCredentialProvider
+from wool.runtime.worker.auth import StaticCredentialProvider
 from wool.runtime.worker.auth import WorkerCredentials
 
 
@@ -334,6 +340,120 @@ class TestWorkerCredentials:
             # Restore permissions for cleanup
             restricted_file.chmod(0o644)
 
+    def test_provider_from_files_should_return_static_provider_when_reload_false(
+        self, temp_cert_files
+    ):
+        """Test provider_from_files returns a static provider by default.
+
+        Given:
+            Valid PEM file paths.
+        When:
+            provider_from_files() is called with reload=False.
+        Then:
+            It should return a StaticCredentialProvider that satisfies the
+            CredentialProviderLike protocol.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+
+        # Act
+        provider = WorkerCredentials.provider_from_files(
+            ca_path, key_path, cert_path, reload=False
+        )
+
+        # Assert
+        assert isinstance(provider, StaticCredentialProvider)
+        assert isinstance(provider, CredentialProviderLike)
+
+    def test_provider_from_files_should_return_file_provider_when_reload_true(
+        self, temp_cert_files
+    ):
+        """Test provider_from_files returns a reloading provider on demand.
+
+        Given:
+            Valid PEM file paths.
+        When:
+            provider_from_files() is called with reload=True.
+        Then:
+            It should return a FileCredentialProvider that satisfies the
+            CredentialProviderLike protocol.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+
+        # Act
+        provider = WorkerCredentials.provider_from_files(
+            ca_path, key_path, cert_path, reload=True
+        )
+
+        # Assert
+        assert isinstance(provider, FileCredentialProvider)
+        assert isinstance(provider, CredentialProviderLike)
+
+    def test_provider_from_files_should_carry_identity(self, temp_cert_files):
+        """Test provider_from_files threads the expected identity through.
+
+        Given:
+            Valid PEM file paths and an expected identity.
+        When:
+            provider_from_files() is called with that identity.
+        Then:
+            The resolved snapshot should carry the identity.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+
+        # Act
+        provider = WorkerCredentials.provider_from_files(
+            ca_path, key_path, cert_path, identity="wool-worker"
+        )
+
+        # Assert
+        assert provider.resolve().identity == "wool-worker"
+
+    def test_provider_from_files_should_raise_when_static_and_file_missing(
+        self, temp_cert_files
+    ):
+        """Test provider_from_files reads eagerly for a static provider.
+
+        Given:
+            A non-existent CA path with reload=False.
+        When:
+            provider_from_files() is called.
+        Then:
+            It should raise FileNotFoundError eagerly.
+        """
+        # Arrange
+        _, key_path, cert_path = temp_cert_files
+
+        # Act & assert
+        with pytest.raises(FileNotFoundError):
+            WorkerCredentials.provider_from_files(
+                "/nonexistent/ca.pem", key_path, cert_path, reload=False
+            )
+
+    def test_provider_from_files_should_defer_reads_when_reload_true(self):
+        """Test provider_from_files defers file reads for a reloading provider.
+
+        Given:
+            Non-existent PEM paths with reload=True.
+        When:
+            provider_from_files() is called.
+        Then:
+            It should not raise at construction; reads are deferred until
+            the provider is first resolved.
+        """
+        # Act
+        provider = WorkerCredentials.provider_from_files(
+            "/nonexistent/ca.pem",
+            "/nonexistent/key.pem",
+            "/nonexistent/cert.pem",
+            reload=True,
+        )
+
+        # Assert
+        assert isinstance(provider, FileCredentialProvider)
+
     def test_server_credentials_with_mtls(self, test_certificates):
         """Test server credentials property for mTLS.
 
@@ -599,3 +719,415 @@ class TestWorkerCredentials:
         # Act & assert
         with pytest.raises(AttributeError):
             WorkerCredentials.current()
+
+
+class TestCredentialSnapshot:
+    """Test suite for CredentialSnapshot fingerprinting."""
+
+    def test_of_should_compute_fingerprint(self, test_certificates):
+        """Test snapshot construction computes a fingerprint.
+
+        Given:
+            Credential material and an expected identity.
+        When:
+            CredentialSnapshot.of() is called.
+        Then:
+            It should return a snapshot carrying the material, identity, and
+            a non-empty fingerprint.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act
+        snapshot = CredentialSnapshot.of(creds, "wool-worker")
+
+        # Assert
+        assert snapshot.credentials == creds
+        assert snapshot.identity == "wool-worker"
+        assert snapshot.fingerprint
+
+    @given(
+        ca=st.binary(),
+        key=st.binary(),
+        cert=st.binary(),
+        identity=st.one_of(st.none(), st.text()),
+    )
+    def test_of_should_compute_identical_fingerprint_when_material_identical(
+        self, ca, key, cert, identity
+    ):
+        """Test fingerprint stability across identical material.
+
+        Given:
+            Any two credential instances built from the same bytes, mutual
+            flag, and identity.
+        When:
+            Each is snapshotted.
+        Then:
+            Both snapshots should share the same fingerprint.
+        """
+        # Arrange
+        creds_a = WorkerCredentials(ca_cert=ca, worker_key=key, worker_cert=cert)
+        creds_b = WorkerCredentials(ca_cert=ca, worker_key=key, worker_cert=cert)
+
+        # Act
+        fingerprint_a = CredentialSnapshot.of(creds_a, identity).fingerprint
+        fingerprint_b = CredentialSnapshot.of(creds_b, identity).fingerprint
+
+        # Assert
+        assert fingerprint_a == fingerprint_b
+
+    @given(ca=st.binary(), other_ca=st.binary(), key=st.binary(), cert=st.binary())
+    def test_of_should_change_fingerprint_when_material_differs(
+        self, ca, other_ca, key, cert
+    ):
+        """Test fingerprint sensitivity to material changes.
+
+        Given:
+            Two credential instances differing only in their CA bytes.
+        When:
+            Each is snapshotted.
+        Then:
+            Their fingerprints should differ.
+        """
+        # Arrange
+        assume(ca != other_ca)
+        creds = WorkerCredentials(ca_cert=ca, worker_key=key, worker_cert=cert)
+        rotated = WorkerCredentials(ca_cert=other_ca, worker_key=key, worker_cert=cert)
+
+        # Act
+        fingerprint = CredentialSnapshot.of(creds).fingerprint
+        rotated_fingerprint = CredentialSnapshot.of(rotated).fingerprint
+
+        # Assert
+        assert fingerprint != rotated_fingerprint
+
+    def test_of_should_change_fingerprint_when_identity_differs(self, test_certificates):
+        """Test fingerprint sensitivity to identity changes.
+
+        Given:
+            One credential instance and two distinct identities.
+        When:
+            Each (material, identity) pair is snapshotted.
+        Then:
+            Their fingerprints should differ.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act
+        fingerprint_a = CredentialSnapshot.of(creds, "worker-a").fingerprint
+        fingerprint_b = CredentialSnapshot.of(creds, "worker-b").fingerprint
+
+        # Assert
+        assert fingerprint_a != fingerprint_b
+
+    def test_of_should_change_fingerprint_when_mutual_differs(self, test_certificates):
+        """Test fingerprint sensitivity to the mutual-TLS flag.
+
+        Given:
+            The same bytes under mutual=True and mutual=False.
+        When:
+            Each is snapshotted.
+        Then:
+            Their fingerprints should differ.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        mtls = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=True
+        )
+        one_way = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=False
+        )
+
+        # Act
+        mtls_fingerprint = CredentialSnapshot.of(mtls).fingerprint
+        one_way_fingerprint = CredentialSnapshot.of(one_way).fingerprint
+
+        # Assert
+        assert mtls_fingerprint != one_way_fingerprint
+
+    def test_pickle_roundtrip(self, test_certificates):
+        """Test CredentialSnapshot survives a pickle roundtrip.
+
+        Given:
+            A snapshot of valid credential material.
+        When:
+            It is pickled and unpickled.
+        Then:
+            It should produce an equal snapshot.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        snapshot = CredentialSnapshot.of(creds, "wool-worker")
+
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(snapshot))
+
+        # Assert
+        assert restored == snapshot
+
+
+class TestStaticCredentialProvider:
+    """Test suite for StaticCredentialProvider."""
+
+    def test_resolve_should_return_constant_snapshot(self, test_certificates):
+        """Test a static provider resolves to a constant snapshot.
+
+        Given:
+            A static provider over fixed credential material.
+        When:
+            resolve() is called more than once.
+        Then:
+            It should return the same snapshot instance each time.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = StaticCredentialProvider(creds, identity="wool-worker")
+
+        # Act
+        first = provider.resolve()
+        second = provider.resolve()
+
+        # Assert
+        assert first is second
+        assert first.credentials == creds
+        assert first.identity == "wool-worker"
+
+    def test_resolve_should_default_identity_to_none(self, test_certificates):
+        """Test a static provider defaults to address-based verification.
+
+        Given:
+            A static provider constructed without an identity.
+        When:
+            resolve() is called.
+        Then:
+            The snapshot identity should be None.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = StaticCredentialProvider(creds)
+
+        # Act
+        snapshot = provider.resolve()
+
+        # Assert
+        assert snapshot.identity is None
+
+    @given(mutual=st.booleans())
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test_pickle_roundtrip(self, mutual, test_certificates):
+        """Test StaticCredentialProvider survives a pickle roundtrip.
+
+        Given:
+            A static provider over valid material and any mutual flag.
+        When:
+            It is pickled and unpickled.
+        Then:
+            It should produce an equal provider resolving to the same
+            fingerprint.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=mutual
+        )
+        provider = StaticCredentialProvider(creds, identity="wool-worker")
+
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(provider))
+
+        # Assert
+        assert restored == provider
+        assert restored.resolve().fingerprint == provider.resolve().fingerprint
+
+
+class TestFileCredentialProvider:
+    """Test suite for FileCredentialProvider reloading behavior."""
+
+    def test_resolve_should_read_material_from_files(self, temp_cert_files):
+        """Test a file provider resolves material from disk.
+
+        Given:
+            A file provider over valid PEM paths and an identity.
+        When:
+            resolve() is called.
+        Then:
+            It should return a snapshot whose material matches the files and
+            whose identity matches the configured identity.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        provider = FileCredentialProvider(
+            ca_path, key_path, cert_path, identity="wool-worker"
+        )
+        with open(ca_path, "rb") as f:
+            expected_ca = f.read()
+
+        # Act
+        snapshot = provider.resolve()
+
+        # Assert
+        assert snapshot.credentials.ca_cert == expected_ca
+        assert snapshot.identity == "wool-worker"
+
+    def test_identity_should_expose_configured_identity(self, temp_cert_files):
+        """Test the identity property reflects construction.
+
+        Given:
+            A file provider constructed with an identity.
+        When:
+            The identity property is read.
+        Then:
+            It should equal the configured identity.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+
+        # Act
+        provider = FileCredentialProvider(
+            ca_path, key_path, cert_path, identity="wool-worker"
+        )
+
+        # Assert
+        assert provider.identity == "wool-worker"
+
+    def test_resolve_should_reuse_snapshot_when_files_unchanged(self, temp_cert_files):
+        """Test a file provider caches the snapshot for unchanged files.
+
+        Given:
+            A file provider whose files are not modified between calls.
+        When:
+            resolve() is called twice.
+        Then:
+            It should return the same snapshot instance.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+
+        # Act
+        first = provider.resolve()
+        second = provider.resolve()
+
+        # Assert
+        assert first is second
+
+    def test_resolve_should_reread_material_when_files_change(self, temp_cert_files):
+        """Test a file provider adopts rotated material.
+
+        Given:
+            A file provider that has resolved once, then whose CA file is
+            rewritten with different bytes.
+        When:
+            resolve() is called again.
+        Then:
+            It should return a new snapshot with a different fingerprint.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        before = provider.resolve()
+
+        # Act
+        rotated_mtime = os.stat(ca_path).st_mtime_ns + 1_000_000_000
+        with open(ca_path, "wb") as f:
+            f.write(b"-----ROTATED CA-----\n" + before.credentials.ca_cert)
+        os.utime(ca_path, ns=(rotated_mtime, rotated_mtime))
+        after = provider.resolve()
+
+        # Assert
+        assert after is not before
+        assert after.fingerprint != before.fingerprint
+
+    def test_resolve_should_return_last_good_when_reread_fails(self, temp_cert_files):
+        """Test a file provider survives a failed re-read mid-rotation.
+
+        Given:
+            A file provider that has resolved once, then whose CA file is
+            replaced with unreadable content (a partial-write surrogate).
+        When:
+            resolve() is called again.
+        Then:
+            It should return the last good snapshot rather than raising.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        before = provider.resolve()
+
+        # Act
+        rotated_mtime = os.stat(ca_path).st_mtime_ns + 1_000_000_000
+        with open(ca_path, "wb") as f:
+            f.write(b"partial")
+        os.utime(ca_path, ns=(rotated_mtime, rotated_mtime))
+        os.chmod(ca_path, 0o000)
+        try:
+            after = provider.resolve()
+        finally:
+            os.chmod(ca_path, 0o644)
+
+        # Assert
+        assert after is before
+
+    def test_resolve_should_raise_when_first_read_fails(self):
+        """Test a file provider propagates an initial read failure.
+
+        Given:
+            A file provider over non-existent PEM paths with no prior
+            snapshot.
+        When:
+            resolve() is called.
+        Then:
+            It should raise FileNotFoundError.
+        """
+        # Arrange
+        provider = FileCredentialProvider(
+            "/nonexistent/ca.pem",
+            "/nonexistent/key.pem",
+            "/nonexistent/cert.pem",
+        )
+
+        # Act & assert
+        with pytest.raises(FileNotFoundError):
+            provider.resolve()
+
+    def test_pickle_roundtrip_should_reread_files(self, temp_cert_files):
+        """Test a pickled file provider re-reads the live files.
+
+        Given:
+            A file provider that has resolved once and is then pickled and
+            unpickled.
+        When:
+            The restored provider is resolved.
+        Then:
+            It should resolve to the same fingerprint by re-reading the
+            unchanged files.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        provider = FileCredentialProvider(
+            ca_path, key_path, cert_path, identity="wool-worker"
+        )
+        original = provider.resolve()
+
+        # Act
+        restored = cloudpickle.loads(cloudpickle.dumps(provider))
+
+        # Assert
+        assert restored.resolve().fingerprint == original.fingerprint

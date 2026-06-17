@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import os
 from contextvars import ContextVar
 from contextvars import Token
 from dataclasses import dataclass
+from dataclasses import field
 from typing import TYPE_CHECKING
+from typing import Protocol
+from typing import runtime_checkable
 
 if TYPE_CHECKING:
     import grpc
@@ -107,6 +112,80 @@ class WorkerCredentials:
             mutual=mutual,
         )
 
+    @classmethod
+    def provider_from_files(
+        cls,
+        ca_path: str,
+        key_path: str,
+        cert_path: str,
+        *,
+        mutual: bool = True,
+        identity: str | None = None,
+        reload: bool = False,
+    ) -> CredentialProviderLike:
+        """Build a credential provider backed by PEM files.
+
+        A provider is the unit that worker pools, proxies, and worker
+        processes consult to obtain the *current* credential material.
+        This is the entry point for the two behaviours layered on top of
+        the base :class:`WorkerCredentials` model:
+
+        - **Identity-based verification.** Pass ``identity`` to verify a
+          discovered worker's server certificate against a stable logical
+          identity (the certificate's subject-alternative name) rather
+          than the dynamically assigned address it was dialed at. A single
+          ``identity`` applies to every worker reached through the
+          provider. When ``identity`` is ``None`` (default), verification
+          falls back to the dialed address — exactly the legacy behaviour.
+
+        - **Rotation without restart.** Pass ``reload=True`` to re-read the
+          PEM files whenever they change on disk, so a long-running worker
+          or pool adopts rotated certificates, keys, or certificate-
+          authority bundles for subsequent connections without a process
+          restart. When ``reload=False`` (default), the files are read once
+          and the material is fixed for the provider's lifetime.
+
+        :param ca_path:
+            Path to the CA certificate file.
+        :param key_path:
+            Path to the worker private key file.
+        :param cert_path:
+            Path to the worker certificate file.
+        :param mutual:
+            Whether to use mutual TLS. If ``True`` (default), both server
+            and client authenticate.
+        :param identity:
+            Expected server identity to verify discovered workers against,
+            or ``None`` to verify against the dialed address.
+        :param reload:
+            Whether to re-read the PEM files when they change. If ``True``,
+            returns a reloading provider; if ``False`` (default), returns a
+            static provider that reads the files once.
+        :returns:
+            A :class:`CredentialProviderLike` resolving to the current
+            credential material.
+        :raises FileNotFoundError:
+            If ``reload`` is ``False`` and any certificate file doesn't
+            exist. A reloading provider defers reads until first resolved.
+        :raises OSError:
+            If ``reload`` is ``False`` and any file cannot be read.
+        """
+        if reload:
+            return FileCredentialProvider(
+                ca_path,
+                key_path,
+                cert_path,
+                mutual=mutual,
+                identity=identity,
+            )
+        credentials = cls.from_files(
+            ca_path=ca_path,
+            key_path=key_path,
+            cert_path=cert_path,
+            mutual=mutual,
+        )
+        return StaticCredentialProvider(credentials, identity=identity)
+
     def server_credentials(self) -> grpc.ServerCredentials:
         """Build server credentials for accepting connections.
 
@@ -166,6 +245,244 @@ class WorkerCredentials:
             private_key=self.worker_key if self.mutual else None,
             certificate_chain=self.worker_cert if self.mutual else None,
         )
+
+
+def _compute_fingerprint(credentials: WorkerCredentials, identity: str | None) -> str:
+    """Compute a stable content fingerprint for credential material.
+
+    The fingerprint changes if and only if the certificate-authority
+    bundle, worker key, worker certificate, mutual-TLS flag, or expected
+    identity changes.  It is the content-stable key under which client
+    channels are pooled, so that unchanged material reuses a cached
+    channel while rotated material yields a fresh one.
+
+    :param credentials:
+        The credential material to fingerprint.
+    :param identity:
+        The expected server identity, or ``None``.
+    :returns:
+        A hex SHA-256 digest over the material and identity.
+    """
+    hasher = hashlib.sha256()
+    for part in (
+        credentials.ca_cert,
+        credentials.worker_key,
+        credentials.worker_cert,
+    ):
+        # Length-prefix each field so distinct splits cannot collide.
+        hasher.update(len(part).to_bytes(8, "big"))
+        hasher.update(part)
+    hasher.update(b"\x01" if credentials.mutual else b"\x00")
+    hasher.update((identity or "").encode("utf-8"))
+    return hasher.hexdigest()
+
+
+# public
+@dataclass(frozen=True)
+class CredentialSnapshot:
+    """An immutable, fingerprinted view of credential material.
+
+    Resolved from a :class:`CredentialProviderLike`, a snapshot bundles the
+    concrete :class:`WorkerCredentials` with the expected ``identity`` to
+    verify discovered workers against and a content ``fingerprint`` that
+    changes only when the material or identity changes.
+
+    :param credentials:
+        The concrete credential material.
+    :param identity:
+        Expected server identity, or ``None`` to verify against the dialed
+        address.
+    :param fingerprint:
+        Content fingerprint over the material and identity.
+    """
+
+    credentials: WorkerCredentials
+    identity: str | None
+    fingerprint: str
+
+    @classmethod
+    def of(
+        cls, credentials: WorkerCredentials, identity: str | None = None
+    ) -> CredentialSnapshot:
+        """Build a snapshot, computing its fingerprint.
+
+        :param credentials:
+            The concrete credential material.
+        :param identity:
+            Expected server identity, or ``None``.
+        :returns:
+            A snapshot whose fingerprint reflects *credentials* and
+            *identity*.
+        """
+        return cls(
+            credentials=credentials,
+            identity=identity,
+            fingerprint=_compute_fingerprint(credentials, identity),
+        )
+
+
+# public
+@runtime_checkable
+class CredentialProviderLike(Protocol):
+    """Protocol for objects that supply current credential material.
+
+    A provider is the seam through which the runtime obtains credentials at
+    the moment it needs them, so that rotated material can be adopted
+    without restarting.  Implementations MUST be picklable: a provider
+    crosses into worker subprocesses when supplied to a worker, and is
+    re-resolved from the active :class:`CredentialContext` on the client
+    side.
+    """
+
+    def resolve(self) -> CredentialSnapshot:
+        """Return the current credential snapshot.
+
+        :returns:
+            The current :class:`CredentialSnapshot`.
+        """
+        ...
+
+
+# public
+@dataclass(frozen=True)
+class StaticCredentialProvider:
+    """A provider that always resolves to fixed credential material.
+
+    Wraps a single :class:`WorkerCredentials` instance and an optional
+    expected ``identity``.  This is the back-compatible default: a bare
+    :class:`WorkerCredentials` supplied to a pool, proxy, or worker is
+    wrapped in a static provider with no identity, preserving the legacy
+    address-based verification behaviour exactly.
+
+    :param credentials:
+        The fixed credential material.
+    :param identity:
+        Expected server identity, or ``None`` to verify against the dialed
+        address.
+    """
+
+    credentials: WorkerCredentials
+    identity: str | None = None
+    _snapshot: CredentialSnapshot = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "_snapshot", CredentialSnapshot.of(self.credentials, self.identity)
+        )
+
+    def resolve(self) -> CredentialSnapshot:
+        """Return the fixed credential snapshot.
+
+        :returns:
+            The same :class:`CredentialSnapshot` on every call.
+        """
+        return self._snapshot
+
+
+# public
+class FileCredentialProvider:
+    """A provider that re-reads PEM files as they are rotated.
+
+    Resolves the current credential material from the certificate-
+    authority, key, and certificate files on disk, re-reading them when
+    they change so a long-running worker or pool adopts rotated material
+    without a restart.  Unchanged files resolve to the same cached snapshot
+    (so pooled channels are reused); changed files yield a new snapshot
+    with a fresh fingerprint.
+
+    A transient read failure during rotation (e.g. a partially written
+    file) resolves to the last good snapshot rather than raising, so an
+    in-flight rotation never tears the fleet down; genuinely invalid
+    material that *can* be read surfaces later through the handshake-failure
+    channel.  The very first resolution has no last-good snapshot to fall
+    back on and propagates the error.
+
+    :param ca_path:
+        Path to the CA certificate file.
+    :param key_path:
+        Path to the worker private key file.
+    :param cert_path:
+        Path to the worker certificate file.
+    :param mutual:
+        Whether to use mutual TLS.
+    :param identity:
+        Expected server identity, or ``None`` to verify against the dialed
+        address.
+    """
+
+    def __init__(
+        self,
+        ca_path: str,
+        key_path: str,
+        cert_path: str,
+        *,
+        mutual: bool = True,
+        identity: str | None = None,
+    ) -> None:
+        self._ca_path = os.fspath(ca_path)
+        self._key_path = os.fspath(key_path)
+        self._cert_path = os.fspath(cert_path)
+        self._mutual = mutual
+        self._identity = identity
+        self._cached_snapshot: CredentialSnapshot | None = None
+        self._cached_signature: tuple[tuple[int, int], ...] | None = None
+
+    @property
+    def identity(self) -> str | None:
+        """The expected server identity, or ``None``."""
+        return self._identity
+
+    def _signature(self) -> tuple[tuple[int, int], ...]:
+        """Return a cheap (mtime, size) change signature for the files."""
+        signature = []
+        for path in (self._ca_path, self._key_path, self._cert_path):
+            stat = os.stat(path)
+            signature.append((stat.st_mtime_ns, stat.st_size))
+        return tuple(signature)
+
+    def resolve(self) -> CredentialSnapshot:
+        """Return the current credential snapshot, re-reading on change.
+
+        :returns:
+            The current :class:`CredentialSnapshot`.  Reuses the cached
+            snapshot when the files are unchanged or when a re-read fails
+            and a prior snapshot exists.
+        :raises OSError:
+            If the files cannot be read and no prior snapshot exists.
+        """
+        try:
+            # Cheap stat gate: only re-read when the files look changed.
+            signature = self._signature()
+        except OSError:
+            if self._cached_snapshot is not None:
+                return self._cached_snapshot
+            raise
+        if signature == self._cached_signature and self._cached_snapshot is not None:
+            return self._cached_snapshot
+        try:
+            credentials = WorkerCredentials.from_files(
+                ca_path=self._ca_path,
+                key_path=self._key_path,
+                cert_path=self._cert_path,
+                mutual=self._mutual,
+            )
+        except OSError:
+            if self._cached_snapshot is not None:
+                return self._cached_snapshot
+            raise
+        snapshot = CredentialSnapshot.of(credentials, self._identity)
+        self._cached_snapshot = snapshot
+        self._cached_signature = signature
+        return snapshot
+
+    def __getstate__(self) -> dict:
+        # Drop the cache so a pickled provider (e.g. crossing into a worker
+        # subprocess) re-reads the live files rather than carrying a stale
+        # snapshot from the originating process.
+        state = self.__dict__.copy()
+        state["_cached_snapshot"] = None
+        state["_cached_signature"] = None
+        return state
 
 
 class CredentialContext:
