@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import Final
 
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 
+from .base import AllWorkersUnauthenticated
 from .base import LoadBalancerContextLike
 from .base import LoadBalancerLike
 from .base import NoWorkersAvailable
@@ -77,6 +79,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
             If no healthy workers are available for dispatch.
         """
         checkpoint = None
+        rejections: dict = {}
 
         if context not in self._index:
             self._index[context] = 0
@@ -109,6 +112,29 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                     )
                     self._index[context] = self._index[context] + 1
                     continue
+                except HandshakeError as exc:
+                    # A handshake/auth failure evicts the worker exactly like
+                    # any non-transient RpcError, but is also recorded so the
+                    # terminal raise can distinguish "all workers refused my
+                    # credentials" from "the pool is empty", and so the
+                    # rejection is observable through the pool.
+                    logger.warning(
+                        "Evicting worker %s after handshake failure (%s): %s",
+                        metadata.uid,
+                        exc.reason,
+                        exc,
+                    )
+                    rejections[metadata.uid] = exc
+                    # record_rejection is an optional capability of the
+                    # built-in context, not part of the LoadBalancerContextLike
+                    # protocol, so a custom context need not provide it.
+                    record_rejection = getattr(context, "record_rejection", None)
+                    if record_rejection is not None:
+                        record_rejection(metadata, exc)
+                    context.remove_worker(metadata)
+                    if metadata.uid == checkpoint:
+                        checkpoint = None
+                    continue
                 except RpcError as exc:
                     logger.warning(
                         "Evicting worker %s after non-transient RPC error: %s",
@@ -123,4 +149,9 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                     self._index[context] = self._index[context] + 1
                     return stream
 
+        if rejections:
+            raise AllWorkersUnauthenticated(
+                "All discovered workers rejected the client's credentials",
+                rejections=rejections,
+            )
         raise NoWorkersAvailable("No healthy workers available for dispatch")

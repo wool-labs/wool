@@ -1,4 +1,5 @@
 import asyncio
+from types import MappingProxyType
 from uuid import uuid4
 
 import pytest
@@ -8,12 +9,14 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
+from wool.runtime.loadbalancer.base import AllWorkersUnauthenticated
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
@@ -113,6 +116,152 @@ class TestRoundRobinLoadBalancer:
 
         # Act & assert
         with pytest.raises(NoWorkersAvailable):
+            await lb.dispatch(task, context=ctx)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_all_workers_unauthenticated_when_all_reject(
+        self, mocker: MockerFixture
+    ):
+        """Test a fully-rejected pool surfaces a distinct typed signal.
+
+        Given:
+            A context whose every worker fails the secure handshake.
+        When:
+            A task is dispatched.
+        Then:
+            It should raise AllWorkersUnauthenticated carrying a rejection
+            for each worker, distinct from a bare empty-pool outcome.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+        reasons = [
+            HandshakeError.Reason.CERT_VERIFY,
+            HandshakeError.Reason.IDENTITY_MISMATCH,
+        ]
+        uids = []
+        for i, reason in enumerate(reasons):
+            connection = mocker.create_autospec(WorkerConnection, instance=True)
+            connection.dispatch = mocker.AsyncMock(
+                side_effect=HandshakeError(reason=reason)
+            )
+            metadata = WorkerMetadata(
+                uid=uuid4(),
+                address=f"10.0.0.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+            )
+            ctx.add_worker(metadata, connection)
+            uids.append(metadata.uid)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act & assert
+        with pytest.raises(AllWorkersUnauthenticated) as exc_info:
+            await lb.dispatch(task, context=ctx)
+        assert set(exc_info.value.rejections) == set(uids)
+        assert set(ctx.rejections) == set(uids)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_evict_handshake_worker_and_use_healthy(
+        self, mocker: MockerFixture
+    ):
+        """Test a handshake failure evicts only the failing worker.
+
+        Given:
+            A context with one worker that fails the handshake followed by
+            one healthy worker.
+        When:
+            A task is dispatched.
+        Then:
+            The failing worker should be evicted and the dispatch should
+            succeed on the healthy worker.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+        healthy_stream = mocker.MagicMock()
+
+        bad_connection = mocker.create_autospec(WorkerConnection, instance=True)
+        bad_connection.dispatch = mocker.AsyncMock(
+            side_effect=HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY)
+        )
+        bad_metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
+        )
+        good_connection = mocker.create_autospec(WorkerConnection, instance=True)
+        good_connection.dispatch = mocker.AsyncMock(return_value=healthy_stream)
+        good_metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.2:50051", pid=2, version="1.0.0"
+        )
+        ctx.add_worker(bad_metadata, bad_connection)
+        ctx.add_worker(good_metadata, good_connection)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act
+        result = await lb.dispatch(task, context=ctx)
+
+        # Assert
+        assert result is healthy_stream
+        assert bad_metadata not in ctx.workers
+        assert good_metadata in ctx.workers
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_tolerate_context_without_record_rejection(
+        self, mocker: MockerFixture
+    ):
+        """Test a legacy context lacking the ledger still drains cleanly.
+
+        Given:
+            A custom load-balancer context that implements the worker set
+            but not record_rejection, whose only worker fails the
+            handshake.
+        When:
+            A task is dispatched.
+        Then:
+            It should still raise AllWorkersUnauthenticated rather than an
+            AttributeError, so the rejection ledger remains optional.
+        """
+        # Arrange
+        connection = mocker.create_autospec(WorkerConnection, instance=True)
+        connection.dispatch = mocker.AsyncMock(
+            side_effect=HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY)
+        )
+        metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
+        )
+
+        class _LegacyContext:
+            def __init__(self):
+                self._workers = {metadata: connection}
+
+            @property
+            def workers(self):
+                return MappingProxyType(self._workers)
+
+            def remove_worker(self, meta):
+                self._workers.pop(meta, None)
+
+        lb = RoundRobinLoadBalancer()
+        ctx = _LegacyContext()
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act & assert
+        with pytest.raises(AllWorkersUnauthenticated):
             await lb.dispatch(task, context=ctx)
 
     @pytest.mark.asyncio

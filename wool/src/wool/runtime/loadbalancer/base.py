@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import Final
+from typing import Mapping
 from typing import Protocol
 from typing import runtime_checkable
+from uuid import UUID
 
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
 
@@ -21,6 +25,64 @@ class NoWorkersAvailable(Exception):
     This exception indicates that either no workers exist in the worker pool
     or all available workers have been tried and failed.
     """
+
+
+# public
+class AllWorkersUnauthenticated(NoWorkersAvailable):
+    """Raised when every discovered worker failed the secure handshake.
+
+    Distinguishes "workers are present, but every one of them refused, or
+    was refused by, my credentials" from the bare "no workers are present"
+    condition.  It is a subclass of :class:`NoWorkersAvailable` so existing
+    callers that catch ``NoWorkersAvailable`` keep working unchanged, while
+    callers that want the distinction can catch this type and inspect the
+    per-worker :attr:`rejections`.
+
+    :param message:
+        Human-readable description.
+    :param rejections:
+        Mapping of worker uid to the :class:`HandshakeError` that evicted
+        it during the failed dispatch.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rejections: Mapping[UUID, HandshakeError],
+    ):
+        super().__init__(message)
+        self.rejections = rejections
+
+
+# public
+@dataclass(frozen=True)
+class HandshakeRejection:
+    """A per-worker record of secure-handshake rejections.
+
+    Accumulated on the load-balancer context and surfaced through the pool
+    so an operator can see how many discovered workers refused the
+    client's credentials, and why.
+
+    :param uid:
+        The rejecting worker's unique identifier.
+    :param address:
+        The address at which the worker was reached.
+    :param count:
+        How many times this worker has failed the handshake.
+    :param error:
+        The most recent :class:`HandshakeError`.
+    """
+
+    uid: UUID
+    address: str
+    count: int
+    error: HandshakeError
+
+    @property
+    def reason(self) -> HandshakeError.Reason:
+        """The most recent handshake-failure reason."""
+        return self.error.reason
 
 
 # public
@@ -165,12 +227,20 @@ class LoadBalancerContext:
     Manages workers and their connections for a specific worker pool,
     enabling load balancer instances to service multiple pools with
     independent state and worker lists.
+
+    Beyond the :class:`LoadBalancerContextLike` protocol, the built-in
+    context also keeps a :attr:`rejections` ledger via
+    :meth:`record_rejection`, which the round-robin balancer populates and
+    the pool surfaces for observability.  Custom contexts need not provide
+    these; the balancer treats them as optional.
     """
 
     _workers: Final[dict[WorkerMetadata, WorkerConnection]]
+    _rejections: Final[dict[UUID, HandshakeRejection]]
 
     def __init__(self):
         self._workers = {}
+        self._rejections = {}
 
     @property
     def workers(self) -> MappingProxyType[WorkerMetadata, WorkerConnection]:
@@ -182,6 +252,38 @@ class LoadBalancerContext:
             the returned proxy.
         """
         return MappingProxyType(self._workers)
+
+    @property
+    def rejections(self) -> MappingProxyType[UUID, HandshakeRejection]:
+        """Read-only view of the secure-handshake rejection ledger.
+
+        :returns:
+            Immutable mapping of worker uid to its
+            :class:`HandshakeRejection` record.  Changes to the
+            underlying ledger are reflected in the returned proxy.
+        """
+        return MappingProxyType(self._rejections)
+
+    def record_rejection(self, metadata: WorkerMetadata, error: HandshakeError) -> None:
+        """Record that a worker failed the secure handshake.
+
+        Increments the worker's rejection count and stores the most
+        recent error, keyed by worker uid so the record survives the
+        worker's eviction and re-admission.
+
+        :param metadata:
+            Information about the rejecting worker.
+        :param error:
+            The :class:`HandshakeError` that evicted the worker.
+        """
+        previous = self._rejections.get(metadata.uid)
+        count = previous.count + 1 if previous is not None else 1
+        self._rejections[metadata.uid] = HandshakeRejection(
+            uid=metadata.uid,
+            address=metadata.address,
+            count=count,
+            error=error,
+        )
 
     def add_worker(
         self,
