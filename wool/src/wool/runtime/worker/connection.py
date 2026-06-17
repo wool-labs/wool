@@ -42,8 +42,8 @@ class _CredentialsKey:
     gRPC credentials object: two snapshots with the same material and
     identity hash equal (so an unchanged credential reuses its pooled
     channel), while rotated material yields a different
-    :attr:`fingerprint` and therefore a fresh channel.  The
-    :attr:`snapshot` itself is carried for the factory to build the
+    `fingerprint` and therefore a fresh channel.  The
+    `snapshot` itself is carried for the factory to build the
     channel but is excluded from equality and hashing.
     """
 
@@ -58,7 +58,7 @@ class _CredentialsKey:
         :param snapshot:
             The resolved credential snapshot.
         :returns:
-            A :class:`_CredentialsKey` hashing on the snapshot's fingerprint
+            A `_CredentialsKey` hashing on the snapshot's fingerprint
             and identity.
         """
         return cls(
@@ -761,8 +761,8 @@ _PROTOCOL_MISMATCH_TOKENS: Final = (
 def _error_text(error: grpc.RpcError) -> str:
     """Extract a lowercased ``details`` + ``debug_error_string`` blob.
 
-    Defensive against errors that lack either accessor (e.g. a bare
-    :class:`grpc.RpcError` without the call-side ``debug_error_string``)
+    Defensive against errors that lack either accessor (e.g., a bare
+    `grpc.RpcError` without the call-side ``debug_error_string``)
     so the classifier never raises on an unexpected error shape.
 
     :param error:
@@ -789,14 +789,14 @@ def _error_text(error: grpc.RpcError) -> str:
 
 
 def _handshake_reason(text: str, *, secure: bool) -> HandshakeError.Reason | None:
-    """Classify handshake error text into a :class:`HandshakeError.Reason`.
+    """Classify handshake error text into a `HandshakeError.Reason`.
 
     Returns ``None`` when the text carries no TLS/handshake/cert evidence —
     the signal that an ambiguous ``UNAVAILABLE`` is a genuine transient
     unreachability rather than a handshake failure.
 
     :param text:
-        Lowercased error text from :func:`_error_text`.
+        Lowercased error text from `_error_text`.
     :param secure:
         Whether the failing connection presented client credentials. An
         insecure client that reaches a TLS-only worker is reported as a
@@ -831,7 +831,7 @@ def _classify_handshake_failure(
     - ``UNAUTHENTICATED`` is always a handshake failure — the peer
       rejected the client's certificate.
     - ``UNAVAILABLE`` is ambiguous (a down worker looks the same as a
-      failed handshake), so it is promoted to a :class:`HandshakeError`
+      failed handshake), so it is promoted to a `HandshakeError`
       only when the error text carries positive TLS evidence; otherwise
       this returns ``None`` and the caller treats it as transient,
       preserving the legacy behaviour exactly.
@@ -848,7 +848,7 @@ def _classify_handshake_failure(
     :param secure:
         Whether the failing connection presented client credentials.
     :returns:
-        A classified :class:`HandshakeError`, or ``None`` if the failure is
+        A classified `HandshakeError`, or ``None`` if the failure is
         not a handshake/authentication problem.
     """
     try:

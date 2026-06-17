@@ -111,9 +111,8 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                     self._index[context] = self._index[context] + 1
                     continue
                 except HandshakeError as exc:
-                    # Skip without eviction; the warning is the observability
-                    # surface — see HandshakeError for the recoverability
-                    # contract.
+                    # Skip without eviction — see HandshakeError for the
+                    # recoverability contract.
                     logger.warning(
                         "Skipping worker %s at %s after handshake failure (%s): %s",
                         metadata.uid,

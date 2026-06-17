@@ -59,11 +59,11 @@ class LocalWorker(Worker):
     :param credentials:
         Optional credentials for TLS/mTLS authentication:
 
-        - :class:`WorkerCredentials`: Provides both server and client
+        - `WorkerCredentials`: Provides both server and client
           credentials for mutual TLS. Enables secure worker-to-worker
           communication.
-        - :class:`CredentialsProviderLike`: A provider (e.g. from
-          :meth:`WorkerCredentials.provider_from_files`) for identity-based
+        - `CredentialsProviderLike`: A provider (e.g., from
+          `WorkerCredentials.provider_from_files`) for identity-based
           verification or credential rotation without restart.
         - ``None``: Worker uses insecure connections.
     :param options:

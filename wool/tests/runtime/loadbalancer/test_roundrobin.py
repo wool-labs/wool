@@ -290,7 +290,7 @@ class TestRoundRobinLoadBalancer:
 
         Given:
             A context with a single worker whose first handshake fails and
-            whose next dispatch succeeds (e.g. after a credential rotation).
+            whose next dispatch succeeds (e.g., after a credential rotation).
         When:
             A first dispatch fails and a second dispatch is issued.
         Then:

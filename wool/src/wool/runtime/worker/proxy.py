@@ -283,9 +283,9 @@ class WorkerProxy:
         Load balancer instance, factory, or context manager.
     :param credentials:
         Optional credentials for TLS/mTLS connections to workers — either a
-        :class:`~wool.WorkerCredentials` or a
-        :class:`~wool.CredentialsProviderLike` (e.g. from
-        :meth:`WorkerCredentials.provider_from_files` for identity-based
+        `~wool.WorkerCredentials` or a
+        `~wool.CredentialsProviderLike` (e.g., from
+        `WorkerCredentials.provider_from_files` for identity-based
         verification or credential rotation). A bare ``WorkerCredentials``
         is wrapped in a static provider. Defaults to resolving from the
         ambient credential context.

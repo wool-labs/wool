@@ -66,7 +66,7 @@ class WorkerProcess(Process):
         Proxy pool TTL in seconds.
     :param credentials:
         Optional worker credentials for TLS/mTLS — either a
-        :class:`WorkerCredentials` or a :class:`CredentialsProviderLike`. A
+        `WorkerCredentials` or a `CredentialsProviderLike`. A
         reloadable provider serves rotating server credentials via a
         per-handshake fetcher.
     :param options:
@@ -248,15 +248,15 @@ class WorkerProcess(Process):
         """Build the gRPC server credentials for this worker.
 
         Returns ``None`` for an insecure worker.  A reloadable provider
-        yields :func:`grpc.dynamic_ssl_server_credentials` whose fetcher
+        yields `grpc.dynamic_ssl_server_credentials` whose fetcher
         re-resolves the provider on each new connection, so rotated
         certificate, key, or CA material is adopted without restarting the
         worker; established connections continue on their existing
         material.  A static provider takes the unchanged
-        :meth:`WorkerCredentials.server_credentials` path so the
+        `WorkerCredentials.server_credentials` path so the
         static-mTLS posture is byte-for-byte preserved.  The mutual-TLS
-        mode is fixed from the initial material — rotation replaces the
-        bytes, not the handshake mode.
+        mode is fixed from the initial material, i.e., rotation replaces
+        the bytes, not the handshake mode.
 
         :returns:
             Server credentials, or ``None`` for an insecure worker.
@@ -272,8 +272,6 @@ class WorkerProcess(Process):
                     root_certificates=(material.ca_cert if material.mutual else None),
                 )
 
-            # Resolve once for the initial config and the (fixed) mutual-TLS
-            # mode; the fetcher re-resolves per new connection for rotation.
             initial = provider.resolve()
             return grpc.dynamic_ssl_server_credentials(
                 certificate_configuration(initial.credentials),

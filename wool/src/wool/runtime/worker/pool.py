@@ -213,7 +213,7 @@ class WorkerPool:
         Load balancer instance, factory, or context manager.
     :param credentials:
         Optional credentials for TLS/mTLS — either a
-        `~wool.WorkerCredentials` or a `~wool.CredentialsProviderLike` (e.g.
+        `~wool.WorkerCredentials` or a `~wool.CredentialsProviderLike` (e.g.,
         from `WorkerCredentials.provider_from_files` for identity-based
         verification or credential rotation). Applied to both spawned
         workers and the dispatch proxy.

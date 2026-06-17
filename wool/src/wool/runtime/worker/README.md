@@ -334,10 +334,10 @@ async with wool.WorkerPool(
 | Error | gRPC codes | Load balancer behavior |
 | ----- | ---------- | ---------------------- |
 | `TransientRpcError` | `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED` | Retry on next worker. |
-| `HandshakeError` | `UNAUTHENTICATED`, or `UNAVAILABLE` with TLS evidence | Evict worker, record rejection. |
+| `HandshakeError` | `UNAUTHENTICATED`, or `UNAVAILABLE` with TLS evidence | Skip without eviction; log the rejection. |
 | `RpcError` | All others | Remove worker from context, retry next. |
 
-`HandshakeError` is a non-transient `RpcError` subclass raised when the TLS/mTLS handshake or peer authentication with a worker fails (wrong CA, identity mismatch, expired/rejected cert, plaintext-vs-encrypted). It carries a typed `reason` (`CERT_VERIFY`, `IDENTITY_MISMATCH`, `PEER_UNAUTHENTICATED`, `PLAINTEXT_VS_ENCRYPTED`, `TLS_HANDSHAKE`). Because a handshake failure is recoverable — the worker may adopt rotated credentials out of band — the load balancer **skips the worker without eviction** (like a transient error) and emits a per-rejection warning log, leaving it in the pool to retry on a later dispatch. When a full dispatch cycle drains, the load balancer raises the plain `NoWorkersAvailable`; the per-rejection warning logs — each carrying the classified `reason` — are the diagnosability surface. Surfacing the per-worker handshake failures as a typed aggregate signal (so a fleet-wide credential misconfiguration is programmatically distinguishable from an empty pool) is deferred to a future generic mechanism.
+`HandshakeError` (a non-transient `RpcError`) signals that a worker is reachable but the TLS/mTLS handshake or peer authentication failed; see `HandshakeError` for the typed `reason` classification and how the load balancer treats it. A dispatch that drains entirely on handshake failures raises the plain `NoWorkersAvailable`.
 
 ### Security filter
 
@@ -384,6 +384,7 @@ provider = wool.WorkerCredentials.provider_from_files(
     ca_path="certs/ca-cert.pem",
     key_path="certs/worker-key.pem",
     cert_path="certs/worker-cert.pem",
+    mutual=True,
     identity="wool-worker.svc",
     reload=True,
 )
@@ -392,9 +393,9 @@ async with wool.WorkerPool(spawn=4, credentials=provider):
     result = await my_routine()
 ```
 
-- **Identity-based verification.** When `identity` is set, the client verifies the worker's server certificate against that logical identity (via gRPC's `ssl_target_name_override`) rather than the address it dialed. Full chain and SAN verification are preserved — only the *name* checked against the certificate changes — so a worker presenting a cert that does not match the identity, or is not signed by the trusted CA, is still rejected. A single configured identity applies to every worker in the pool, regardless of address.
+- **Identity-based verification.** Setting `identity` verifies a worker's certificate against a stable logical identity (its SAN, via gRPC's `ssl_target_name_override`) rather than the dialed address — see `WorkerCredentials.provider_from_files`. A single configured identity applies to every worker in the pool, regardless of address.
 
-- **Rotation without restart.** A reloading provider re-reads its PEM files when they change on disk. The client channel pool is keyed by a content fingerprint, so unchanged material reuses pooled channels while rotated material yields fresh ones on the next connection; in-flight dispatches finish on their existing channel. The worker server adopts rotated material per new connection via `grpc.dynamic_ssl_server_credentials`. Rotation replaces the cert/key/CA bytes — not the mutual-TLS mode, which is fixed at startup.
+- **Rotation without restart.** Setting `reload=True` adopts rotated PEM material without a restart — see `WorkerCredentials.provider_from_files`. The mechanics span both planes: the client channel pool is keyed by a content fingerprint (rotated material yields fresh channels while unchanged material reuses pooled ones, and in-flight dispatches finish on their existing channel), and the worker server adopts new material per connection via `grpc.dynamic_ssl_server_credentials`.
 
 Providers are picklable: one supplied to a worker crosses into the worker subprocess, while the proxy re-resolves its provider from the ambient credential context (it is never serialized across the dispatch boundary).
 
@@ -404,4 +405,4 @@ For nested routines that dispatch back to the worker's own address, the worker e
 
 ### Discovery-plane trust
 
-Identity-based mTLS secures the **dispatch** plane; it does not authenticate the **discovery** plane. A worker self-advertises its `WorkerMetadata` — address, `secure` flag, tags, and channel options — over whatever discovery mechanism is in use (LAN multicast, shared-memory, a custom `Discovery`), none of which is authenticated, so the advertisement is forgeable by anything that can write to that plane. The proxy-side security filter that drops workers whose advertised `secure` flag disagrees with the client's credential posture is therefore a **compatibility gate, not a trust boundary**: it prevents a plaintext/encrypted mismatch, not a malicious advertisement. Actual confidentiality and integrity rest entirely on the mTLS handshake performed when a connection is made — a forged advertisement still cannot complete the handshake without a CA-trusted certificate (and, when an identity is configured, one whose SAN matches). Authenticating the discovery plane itself is future work; until then, treat discovery as an untrusted hint and the handshake as the trust boundary.
+Identity-based mTLS secures the **dispatch** plane; it does not authenticate the **discovery** plane. A worker self-advertises its `WorkerMetadata` — address, `secure` flag, tags, and channel options — over whatever discovery mechanism is in use (LAN multicast, shared-memory, a custom `DiscoveryLike`), none of which is authenticated, so the advertisement is forgeable by anything that can write to that plane. The proxy-side security filter that drops workers whose advertised `secure` flag disagrees with the client's credential posture is therefore a **compatibility gate, not a trust boundary**: it prevents a plaintext/encrypted mismatch, not a malicious advertisement. Actual confidentiality and integrity rest entirely on the mTLS handshake performed when a connection is made — a forged advertisement still cannot complete the handshake without a CA-trusted certificate (and, when an identity is configured, one whose SAN matches). The discovery plane is not authenticated; treat discovery as an untrusted hint and the handshake as the trust boundary.

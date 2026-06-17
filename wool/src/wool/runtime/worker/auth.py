@@ -133,7 +133,7 @@ class WorkerCredentials:
         A provider is the unit that worker pools, proxies, and worker
         processes consult to obtain the *current* credential material.
         This is the entry point for the two behaviours layered on top of
-        the base :class:`WorkerCredentials` model:
+        the base `WorkerCredentials` model:
 
         - **Identity-based verification.** Pass ``identity`` to verify a
           discovered worker's server certificate against a stable logical
@@ -167,7 +167,7 @@ class WorkerCredentials:
             returns a reloading provider; if ``False`` (default), returns a
             static provider that reads the files once.
         :returns:
-            A :class:`CredentialsProviderLike` resolving to the current
+            A `CredentialsProviderLike` resolving to the current
             credential material.
         :raises FileNotFoundError:
             If ``reload`` is ``False`` and any certificate file doesn't
@@ -306,8 +306,8 @@ def _normalize_identity(identity: str | None) -> str | None:
 class CredentialsSnapshot:
     """An immutable, fingerprinted view of credential material.
 
-    Resolved from a :class:`CredentialsProviderLike`, a snapshot bundles the
-    concrete :class:`WorkerCredentials` with the expected ``identity`` to
+    Resolved from a `CredentialsProviderLike`, a snapshot bundles the
+    concrete `WorkerCredentials` with the expected ``identity`` to
     verify discovered workers against and a content ``fingerprint`` that
     changes only when the material or identity changes.
 
@@ -354,7 +354,7 @@ class CredentialsProviderLike(Protocol):
     the moment it needs them, so that rotated material can be adopted
     without restarting.  Implementations MUST be picklable: a provider
     crosses into worker subprocesses when supplied to a worker, and is
-    re-resolved from the active :class:`CredentialsContext` on the client
+    re-resolved from the active `CredentialsContext` on the client
     side.
     """
 
@@ -374,7 +374,7 @@ class CredentialsProviderLike(Protocol):
         """Return the current credential snapshot.
 
         :returns:
-            The current :class:`CredentialsSnapshot`.
+            The current `CredentialsSnapshot`.
         """
         ...
 
@@ -384,9 +384,9 @@ class CredentialsProviderLike(Protocol):
 class _StaticCredentialsProvider:
     """A provider that always resolves to fixed credential material.
 
-    Wraps a single :class:`WorkerCredentials` instance and an optional
+    Wraps a single `WorkerCredentials` instance and an optional
     expected ``identity``.  This is the back-compatible default: a bare
-    :class:`WorkerCredentials` supplied to a pool, proxy, or worker is
+    `WorkerCredentials` supplied to a pool, proxy, or worker is
     wrapped in a static provider with no identity, preserving the legacy
     address-based verification behaviour exactly.
 
@@ -411,7 +411,7 @@ class _StaticCredentialsProvider:
         """Return the fixed credential snapshot.
 
         :returns:
-            The same :class:`CredentialsSnapshot` on every call.
+            The same `CredentialsSnapshot` on every call.
         """
         return self._snapshot
 
@@ -428,11 +428,11 @@ class _StaticCredentialsProvider:
 def _validate_material(ca_path: str, key_path: str, cert_path: str) -> None:
     """Reject readable-but-malformed PEM by loading it through ``ssl``.
 
-    :class:`WorkerCredentials.from_files` reads raw bytes without parsing,
+    `WorkerCredentials.from_files` reads raw bytes without parsing,
     so a non-atomic rotation that leaves a truncated or garbage — but
     readable — PEM would otherwise be cached as the current snapshot and
     only fail later, opaquely, at the handshake.  Loading the material into
-    an :class:`ssl.SSLContext` here parses the certificate, key, and CA
+    an `ssl.SSLContext` here parses the certificate, key, and CA
     bundle (and checks the key matches the certificate) using the same
     OpenSSL machinery the transport uses, so the reloading provider keeps
     its prior good material instead.  Stdlib ``ssl`` is used deliberately:
@@ -446,7 +446,7 @@ def _validate_material(ca_path: str, key_path: str, cert_path: str) -> None:
         Path to the worker certificate.
     :raises ssl.SSLError:
         If the certificate, key, or CA bundle is malformed (or the key does
-        not match the certificate). A subclass of :class:`OSError`.
+        not match the certificate). A subclass of `OSError`.
     """
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=cert_path, keyfile=key_path)
@@ -464,7 +464,7 @@ class FileCredentialsProvider:
     (so pooled channels are reused); changed files yield a new snapshot
     with a fresh fingerprint.
 
-    A transient read failure during rotation (e.g. a partially written
+    A transient read failure during rotation (e.g., a partially written
     file) resolves to the last good snapshot rather than raising, so an
     in-flight rotation never tears the fleet down; genuinely invalid
     material that *can* be read surfaces later through the handshake-failure
@@ -545,12 +545,12 @@ class FileCredentialsProvider:
         rotation never tears the fleet down nor silently adopts garbage.
 
         :returns:
-            The current :class:`CredentialsSnapshot`.  Reuses the cached
+            The current `CredentialsSnapshot`.  Reuses the cached
             snapshot when the files are unchanged, or on a failed re-read
             when a prior snapshot exists.
         :raises OSError:
-            If the files cannot be read or are malformed (``ssl.SSLError``
-            is an ``OSError``) and no prior snapshot exists.
+            If the files cannot be read or are malformed (`ssl.SSLError`
+            is an `OSError`) and no prior snapshot exists.
         """
         with self._lock:
             try:
@@ -590,7 +590,7 @@ class FileCredentialsProvider:
         raise exc
 
     def __getstate__(self) -> dict:
-        # Drop the cache so a pickled provider (e.g. crossing into a worker
+        # Drop the cache so a pickled provider (e.g., crossing into a worker
         # subprocess) re-reads the live files rather than carrying a stale
         # snapshot from the originating process. The lock is process-local
         # and not picklable, so drop it too and recreate on unpickle.
@@ -610,16 +610,16 @@ def _coerce_provider(
 ) -> CredentialsProviderLike | None:
     """Normalize a credentials-or-provider value into a provider.
 
-    A bare :class:`WorkerCredentials` is wrapped in a
-    :class:`_StaticCredentialsProvider` with no identity, preserving the
+    A bare `WorkerCredentials` is wrapped in a
+    `_StaticCredentialsProvider` with no identity, preserving the
     legacy address-based verification behaviour; a provider is returned
     unchanged; ``None`` stays ``None``.  This is the single seam through
     which pools, proxies, and worker processes accept either form.
 
     :param value:
-        A :class:`WorkerCredentials`, a provider, or ``None``.
+        A `WorkerCredentials`, a provider, or ``None``.
     :returns:
-        A :class:`CredentialsProviderLike`, or ``None``.
+        A `CredentialsProviderLike`, or ``None``.
     """
     if value is None:
         return None
@@ -639,7 +639,7 @@ class CredentialsContext:
 
     Used by WorkerProcess._serve() to set credentials in worker subprocesses
     and by WorkerProxy.__init__() to resolve credentials from context. Carries
-    either a :class:`WorkerCredentials` or a :class:`CredentialsProviderLike`.
+    either a `WorkerCredentials` or a `CredentialsProviderLike`.
     Not part of the public API.
     """
 
@@ -662,8 +662,8 @@ class CredentialsContext:
         """Get the current credentials or provider from the context.
 
         :returns:
-            The active :class:`WorkerCredentials` or
-            :class:`CredentialsProviderLike`, or ``None`` if no context is
+            The active `WorkerCredentials` or
+            `CredentialsProviderLike`, or ``None`` if no context is
             set.
         """
         return _current.get()
