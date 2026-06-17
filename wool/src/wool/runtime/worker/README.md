@@ -334,7 +334,10 @@ async with wool.WorkerPool(
 | Error | gRPC codes | Load balancer behavior |
 | ----- | ---------- | ---------------------- |
 | `TransientRpcError` | `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED` | Retry on next worker. |
+| `HandshakeError` | `UNAUTHENTICATED`, or `UNAVAILABLE` with TLS evidence | Evict worker, record rejection. |
 | `RpcError` | All others | Remove worker from context, retry next. |
+
+`HandshakeError` is a non-transient `RpcError` subclass raised when the TLS/mTLS handshake or peer authentication with a worker fails (wrong CA, identity mismatch, expired/rejected cert, plaintext-vs-encrypted). It carries a typed `reason` (`CERT_VERIFY`, `IDENTITY_MISMATCH`, `PEER_UNAUTHENTICATED`, `PLAINTEXT_VS_ENCRYPTED`, `TLS_HANDSHAKE`). When a pool drains because *every* discovered worker failed the handshake, the load balancer raises `AllWorkersUnauthenticated` (a subclass of `NoWorkersAvailable`, so existing `except NoWorkersAvailable` handlers keep working) carrying the per-worker errors, and the rejections are observable through `WorkerProxy.rejections` — so a fleet-wide credential misconfiguration is distinguishable from an empty pool.
 
 ### Security filter
 
@@ -364,3 +367,33 @@ async with wool.WorkerPool(spawn=4, credentials=creds):
 ```
 
 Credential flow: `server_credentials` are passed to spawned workers for their gRPC servers; `client_credentials` are passed to the proxy for outgoing connections and to workers for the stop RPC.
+
+### Credential providers: identity and rotation
+
+`WorkerCredentials` describes a fixed snapshot of material verified against the dialed address. For dynamic-address platforms (Kubernetes, ECS/Fargate) where a worker's address is assigned at startup and credentials are rotated out of band, supply a **credential provider** instead — anywhere `credentials=` is accepted (`WorkerPool`, `LocalWorker`, `WorkerProxy`). A bare `WorkerCredentials` is wrapped in a static provider automatically, so existing deployments are unaffected.
+
+`WorkerCredentials.provider_from_files(...)` builds one:
+
+```python
+import wool
+
+# Verify discovered workers against a stable logical identity (the cert's
+# SAN), not the dynamically assigned address; re-read the PEM files when
+# they rotate so a long-running fleet adopts new material without restart.
+provider = wool.WorkerCredentials.provider_from_files(
+    ca_path="certs/ca-cert.pem",
+    key_path="certs/worker-key.pem",
+    cert_path="certs/worker-cert.pem",
+    identity="wool-worker.svc",
+    reload=True,
+)
+
+async with wool.WorkerPool(spawn=4, credentials=provider):
+    result = await my_routine()
+```
+
+- **Identity-based verification.** When `identity` is set, the client verifies the worker's server certificate against that logical identity (via gRPC's `ssl_target_name_override`) rather than the address it dialed. Full chain and SAN verification are preserved — only the *name* checked against the certificate changes — so a worker presenting a cert that does not match the identity, or is not signed by the trusted CA, is still rejected. A single configured identity applies to every worker in the pool, regardless of address.
+
+- **Rotation without restart.** A reloading provider re-reads its PEM files when they change on disk. The client channel pool is keyed by a content fingerprint, so unchanged material reuses pooled channels while rotated material yields fresh ones on the next connection; in-flight dispatches finish on their existing channel. The worker server adopts rotated material per new connection via `grpc.dynamic_ssl_server_credentials`. Rotation replaces the cert/key/CA bytes — not the mutual-TLS mode, which is fixed at startup.
+
+Providers are picklable: one supplied to a worker crosses into the worker subprocess, while the proxy re-resolves its provider from the ambient credential context (it is never serialized across the dispatch boundary).
