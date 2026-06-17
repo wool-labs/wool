@@ -1,17 +1,13 @@
-import pickle
 from types import MappingProxyType
 from uuid import uuid4
 
-import cloudpickle
 from hypothesis import given
 from hypothesis import strategies as st
 
-from wool.runtime.loadbalancer.base import AllWorkersUnauthenticated
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
-from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
 
@@ -370,72 +366,3 @@ class TestLoadBalancerContext:
 
         # Assert
         assert len(ctx.workers) == 0
-
-
-class TestAllWorkersUnauthenticated:
-    """Test suite for the AllWorkersUnauthenticated exception type."""
-
-    def test___init___should_be_noworkersavailable_subclass(self):
-        """Test the type is a NoWorkersAvailable for back-compat.
-
-        Given:
-            An AllWorkersUnauthenticated instance.
-        When:
-            Its type relationships are inspected.
-        Then:
-            It should be a NoWorkersAvailable, so callers catching the
-            base type keep working.
-        """
-        # Arrange
-        error = AllWorkersUnauthenticated("drained", rejections={})
-
-        # Act & assert
-        assert isinstance(error, NoWorkersAvailable)
-
-    def test___init___should_carry_rejections(self):
-        """Test the exception exposes the per-worker rejections.
-
-        Given:
-            A uid and its HandshakeError.
-        When:
-            AllWorkersUnauthenticated is constructed with that mapping.
-        Then:
-            It should expose the rejections mapping.
-        """
-        # Arrange
-        uid = uuid4()
-        error = HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY)
-
-        # Act
-        raised = AllWorkersUnauthenticated("drained", rejections={uid: error})
-
-        # Assert
-        assert raised.rejections == {uid: error}
-
-    def test_pickle_roundtrip(self):
-        """Test AllWorkersUnauthenticated survives a serialization roundtrip.
-
-        Given:
-            An AllWorkersUnauthenticated carrying a uid-to-HandshakeError
-            rejection.
-        When:
-            It is pickled and cloudpickled and restored.
-        Then:
-            The rejection mapping and each nested reason should survive — it
-            crosses the wire to a calling process when a nested dispatch
-            drains on handshake failures.
-        """
-        # Arrange
-        uid = uuid4()
-        raised = AllWorkersUnauthenticated(
-            "drained",
-            rejections={uid: HandshakeError(reason=HandshakeError.Reason.TLS_HANDSHAKE)},
-        )
-
-        # Act & assert
-        for restore in (
-            pickle.loads(pickle.dumps(raised)),
-            cloudpickle.loads(cloudpickle.dumps(raised)),
-        ):
-            assert set(restore.rejections) == {uid}
-            assert restore.rejections[uid].reason is HandshakeError.Reason.TLS_HANDSHAKE

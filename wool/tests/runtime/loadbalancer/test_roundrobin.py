@@ -9,7 +9,6 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
-from wool.runtime.loadbalancer.base import AllWorkersUnauthenticated
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
@@ -119,19 +118,19 @@ class TestRoundRobinLoadBalancer:
             await lb.dispatch(task, context=ctx)
 
     @pytest.mark.asyncio
-    async def test_dispatch_should_raise_all_workers_unauthenticated_when_all_reject(
+    async def test_dispatch_should_raise_no_workers_and_keep_pool_when_all_reject(
         self, mocker: MockerFixture
     ):
-        """Test a fully-rejected pool surfaces a distinct typed signal.
+        """Test a fully-rejected pool drains without evicting its workers.
 
         Given:
             A context whose every worker fails the secure handshake.
         When:
             A task is dispatched.
         Then:
-            It should raise AllWorkersUnauthenticated carrying a rejection
-            for each worker, while leaving the workers in the pool (skipped,
-            not evicted) so a later rotation can recover them.
+            It should raise NoWorkersAvailable while leaving the workers in
+            the pool (skipped, not evicted) so a later rotation can recover
+            them once their credentials are valid.
         """
         # Arrange
         lb = RoundRobinLoadBalancer()
@@ -140,7 +139,6 @@ class TestRoundRobinLoadBalancer:
             HandshakeError.Reason.CERT_VERIFY,
             HandshakeError.Reason.IDENTITY_MISMATCH,
         ]
-        uids = []
         for i, reason in enumerate(reasons):
             connection = mocker.create_autospec(WorkerConnection, instance=True)
             connection.dispatch = mocker.AsyncMock(
@@ -153,7 +151,6 @@ class TestRoundRobinLoadBalancer:
                 version="1.0.0",
             )
             ctx.add_worker(metadata, connection)
-            uids.append(metadata.uid)
 
         async def routine():
             return "Hello world!"
@@ -162,9 +159,8 @@ class TestRoundRobinLoadBalancer:
         task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
 
         # Act & assert
-        with pytest.raises(AllWorkersUnauthenticated) as exc_info:
+        with pytest.raises(NoWorkersAvailable):
             await lb.dispatch(task, context=ctx)
-        assert set(exc_info.value.rejections) == set(uids)
         assert len(ctx.workers) == 2
 
     @pytest.mark.asyncio
@@ -221,7 +217,7 @@ class TestRoundRobinLoadBalancer:
     async def test_dispatch_should_raise_plain_no_workers_when_a_transient_survives(
         self, mocker: MockerFixture
     ):
-        """Test a surviving transient worker keeps the signal unspecific.
+        """Test a mix of handshake and transient failures drains cleanly.
 
         Given:
             A context with one handshake-failing worker and one
@@ -229,9 +225,9 @@ class TestRoundRobinLoadBalancer:
         When:
             A task is dispatched and the cycle exhausts.
         Then:
-            It should raise the plain NoWorkersAvailable, not
-            AllWorkersUnauthenticated — the pool was not uniformly refusing
-            the client's credentials.
+            It should raise NoWorkersAvailable with both workers left in the
+            pool — handshake and transient failures are both skipped without
+            eviction.
         """
         # Arrange
         lb = RoundRobinLoadBalancer()
@@ -259,9 +255,9 @@ class TestRoundRobinLoadBalancer:
         task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
 
         # Act & assert
-        with pytest.raises(NoWorkersAvailable) as exc_info:
+        with pytest.raises(NoWorkersAvailable):
             await lb.dispatch(task, context=ctx)
-        assert not isinstance(exc_info.value, AllWorkersUnauthenticated)
+        assert len(ctx.workers) == 2
 
     @pytest.mark.asyncio
     async def test_dispatch_should_recover_skipped_worker_on_later_dispatch(
@@ -275,8 +271,8 @@ class TestRoundRobinLoadBalancer:
         When:
             A first dispatch fails and a second dispatch is issued.
         Then:
-            The first should raise AllWorkersUnauthenticated and the second
-            should succeed on the same, still-pooled worker.
+            The first should raise NoWorkersAvailable and the second should
+            succeed on the same, still-pooled worker.
         """
         # Arrange
         lb = RoundRobinLoadBalancer()
@@ -301,7 +297,7 @@ class TestRoundRobinLoadBalancer:
         task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
 
         # Act
-        with pytest.raises(AllWorkersUnauthenticated):
+        with pytest.raises(NoWorkersAvailable):
             await lb.dispatch(task, context=ctx)
         result = await lb.dispatch(task, context=ctx)
 
@@ -343,7 +339,7 @@ class TestRoundRobinLoadBalancer:
 
         # Act
         with caplog.at_level(logging.WARNING):
-            with pytest.raises(AllWorkersUnauthenticated):
+            with pytest.raises(NoWorkersAvailable):
                 await lb.dispatch(task, context=ctx)
 
         # Assert

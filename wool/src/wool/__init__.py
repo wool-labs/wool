@@ -28,7 +28,6 @@ from wool.runtime.discovery.lan import AdvertiseHostError
 from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.lan import LoopbackAdvertisementWarning
 from wool.runtime.discovery.local import LocalDiscovery
-from wool.runtime.loadbalancer.base import AllWorkersUnauthenticated
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
@@ -91,7 +90,6 @@ __worker_service__: Final[contextvars.ContextVar[WorkerService | None]] = (
 
 __all__ = [
     "AdvertiseHostError",
-    "AllWorkersUnauthenticated",
     "BackpressureContext",
     "BackpressureLike",
     "BoundWorkerFactory",

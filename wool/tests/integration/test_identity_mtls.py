@@ -9,6 +9,7 @@ misconfiguration as a distinct, diagnosable signal.
 
 import datetime
 import ipaddress
+import logging
 import os
 
 import pytest
@@ -20,8 +21,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 import wool
-from wool import AllWorkersUnauthenticated
-from wool import HandshakeError
+from wool import NoWorkersAvailable
 from wool import WorkerCredentials
 from wool import WorkerProxy
 
@@ -154,8 +154,8 @@ async def test_identity_based_mtls_dispatch_succeeds(identity_cert_files):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_untrusted_ca_rejects_with_diagnosable_signal():
-    """Test a credential mismatch surfaces as a distinct typed signal.
+async def test_untrusted_ca_rejects_with_diagnosable_signal(caplog):
+    """Test a credential mismatch is rejected and the reason is diagnosable.
 
     Given:
         A running worker whose certificate is signed by one certificate
@@ -164,10 +164,10 @@ async def test_untrusted_ca_rejects_with_diagnosable_signal():
     When:
         A routine is dispatched at the worker through that client.
     Then:
-        The handshake should fail and surface as AllWorkersUnauthenticated
-        — a distinct subclass of NoWorkersAvailable carrying per-worker
-        handshake reasons — rather than collapsing into a bare empty-pool
-        outcome, so a fleet-wide misconfiguration is diagnosable.
+        The handshake should fail, the dispatch should drain to
+        NoWorkersAvailable (the worker is skipped, not evicted), and the
+        load balancer should log the classified CERT_VERIFY reason so the
+        misconfiguration is diagnosable.
     """
     # Arrange — server and client trust different CAs (loopback SANs so the
     # worker's own stop RPC, which dials the address, still validates).
@@ -189,18 +189,19 @@ async def test_untrusted_ca_rejects_with_diagnosable_signal():
         async with WorkerProxy(
             workers=[worker.metadata], credentials=client_credentials
         ):
-            with pytest.raises(AllWorkersUnauthenticated) as exc_info:
-                await add(2, 3)
+            with caplog.at_level(logging.WARNING):
+                with pytest.raises(NoWorkersAvailable):
+                    await add(2, 3)
 
-        reasons = {rej.reason for rej in exc_info.value.rejections.values()}
-        assert HandshakeError.Reason.CERT_VERIFY in reasons
+        assert "handshake" in caplog.text.lower()
+        assert "cert_verify" in caplog.text.lower()
     finally:
         await worker.stop()
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_identity_mismatch_rejects_with_identity_mismatch_reason(tmp_path):
+async def test_identity_mismatch_rejects_with_identity_mismatch_reason(tmp_path, caplog):
     """Test a certificate that does not match the configured identity is rejected.
 
     Given:
@@ -210,9 +211,9 @@ async def test_identity_mismatch_rejects_with_identity_mismatch_reason(tmp_path)
     When:
         A routine is dispatched at the worker through that client.
     Then:
-        The handshake should be rejected with the IDENTITY_MISMATCH reason
-        — verifying against the configured identity strengthens, not
-        relaxes, the guarantee.
+        The dispatch should drain to NoWorkersAvailable and the load
+        balancer should log the IDENTITY_MISMATCH reason — verifying against
+        the configured identity strengthens, not relaxes, the guarantee.
     """
     # Arrange — one CA; the worker cert's SANs include loopback (so its own
     # stop RPC validates) and a logical identity the client will not expect.
@@ -244,11 +245,12 @@ async def test_identity_mismatch_rejects_with_identity_mismatch_reason(tmp_path)
         async with WorkerProxy(
             workers=[worker.metadata], credentials=client_credentials
         ):
-            with pytest.raises(AllWorkersUnauthenticated) as exc_info:
-                await add(2, 3)
+            with caplog.at_level(logging.WARNING):
+                with pytest.raises(NoWorkersAvailable):
+                    await add(2, 3)
 
-        reasons = {rej.reason for rej in exc_info.value.rejections.values()}
-        assert HandshakeError.Reason.IDENTITY_MISMATCH in reasons
+        assert "handshake" in caplog.text.lower()
+        assert "identity_mismatch" in caplog.text.lower()
     finally:
         await worker.stop()
 

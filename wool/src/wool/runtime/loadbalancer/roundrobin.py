@@ -11,7 +11,6 @@ from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 
-from .base import AllWorkersUnauthenticated
 from .base import LoadBalancerContextLike
 from .base import LoadBalancerLike
 from .base import NoWorkersAvailable
@@ -79,8 +78,6 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
             If no healthy workers are available for dispatch.
         """
         checkpoint = None
-        rejections: dict = {}
-        had_non_handshake_failure = False
 
         if context not in self._index:
             self._index[context] = 0
@@ -111,18 +108,17 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                         metadata.uid,
                         exc,
                     )
-                    had_non_handshake_failure = True
                     self._index[context] = self._index[context] + 1
                     continue
                 except HandshakeError as exc:
                     # A failed secure handshake is recoverable: the worker may
                     # adopt rotated credentials out of band. Skip it without
                     # eviction (like a transient error) so a later dispatch
-                    # retries with freshly-resolved credentials, and record the
-                    # rejection so the terminal raise can tell "every worker
-                    # refused my credentials" apart from "the pool is empty".
-                    # The per-rejection warning is the observability surface;
-                    # aggregation over time is left to metrics/tracing.
+                    # retries with freshly-resolved credentials. The
+                    # per-rejection warning — carrying the classified reason —
+                    # is the observability surface; aggregating handshake
+                    # failures across a drained dispatch is deferred to a
+                    # future generic mechanism (see #249 follow-up).
                     logger.warning(
                         "Skipping worker %s at %s after handshake failure (%s): %s",
                         metadata.uid,
@@ -130,7 +126,6 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                         exc.reason,
                         exc,
                     )
-                    rejections[metadata.uid] = exc
                     self._index[context] = self._index[context] + 1
                     continue
                 except RpcError as exc:
@@ -139,7 +134,6 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                         metadata.uid,
                         exc,
                     )
-                    had_non_handshake_failure = True
                     context.remove_worker(metadata)
                     if metadata.uid == checkpoint:
                         checkpoint = None
@@ -148,13 +142,4 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                     self._index[context] = self._index[context] + 1
                     return stream
 
-        # Promote to AllWorkersUnauthenticated only when the cycle drained
-        # purely on handshake rejections — a surviving transient worker or a
-        # non-handshake eviction means the pool was not uniformly refusing the
-        # client's credentials, so the plain empty-pool signal is correct.
-        if rejections and not had_non_handshake_failure:
-            raise AllWorkersUnauthenticated(
-                "Every worker tried refused the client's credentials",
-                rejections=rejections,
-            )
         raise NoWorkersAvailable("No healthy workers available for dispatch")

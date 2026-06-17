@@ -4,12 +4,9 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import Final
-from typing import Mapping
 from typing import Protocol
 from typing import runtime_checkable
-from uuid import UUID
 
-from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
 
@@ -22,40 +19,13 @@ class NoWorkersAvailable(Exception):
     """Raised when no workers are available for task dispatch.
 
     This exception indicates that either no workers exist in the worker pool
-    or all available workers have been tried and failed.
+    or all available workers have been tried and failed — including when
+    every worker tried failed the secure handshake. A failed handshake is
+    recoverable (the worker may adopt rotated credentials out of band), so
+    the load balancer skips it without eviction and logs the classified
+    reason; surfacing the per-worker failures programmatically is deferred
+    to a future generic mechanism.
     """
-
-
-# public
-class AllWorkersUnauthenticated(NoWorkersAvailable):
-    """Raised when a dispatch drained purely on secure-handshake failures.
-
-    Distinguishes "workers are present, but every one I tried refused, or
-    was refused by, my credentials" from the bare "no workers are present"
-    condition.  It is raised only when a full dispatch cycle exhausted with
-    at least one handshake rejection and *no* worker failed for a
-    non-handshake reason (a surviving transient worker or a non-handshake
-    eviction yields the plain :class:`NoWorkersAvailable` instead).  It is a
-    subclass of :class:`NoWorkersAvailable` so existing callers that catch
-    ``NoWorkersAvailable`` keep working unchanged, while callers that want
-    the distinction can catch this type and inspect the per-worker
-    :attr:`rejections`.
-
-    :param message:
-        Human-readable description.
-    :param rejections:
-        Mapping of worker uid to the :class:`HandshakeError` it raised
-        during the failed dispatch.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        rejections: Mapping[UUID, HandshakeError],
-    ):
-        super().__init__(message)
-        self.rejections = rejections
 
 
 # public
