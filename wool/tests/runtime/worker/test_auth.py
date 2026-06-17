@@ -413,6 +413,31 @@ class TestWorkerCredentials:
         # Assert
         assert provider.resolve().identity == "wool-worker"
 
+    @pytest.mark.parametrize("reload", [False, True])
+    def test_provider_from_files_should_normalize_blank_identity(
+        self, temp_cert_files, reload
+    ):
+        """Test a blank identity is normalized away by provider_from_files.
+
+        Given:
+            Valid PEM file paths and a whitespace-only identity, for both
+            the static and reloading providers.
+        When:
+            provider_from_files() is called and the snapshot resolved.
+        Then:
+            The resolved identity should be None (address-based path).
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+
+        # Act
+        provider = WorkerCredentials.provider_from_files(
+            ca_path, key_path, cert_path, identity="  ", reload=reload
+        )
+
+        # Assert
+        assert provider.resolve().identity is None
+
     def test_provider_from_files_should_raise_when_static_and_file_missing(
         self, temp_cert_files
     ):
@@ -931,6 +956,49 @@ class TestStaticCredentialProvider:
         # Assert
         assert snapshot.identity is None
 
+    def test_reloadable_should_be_false(self, test_certificates):
+        """Test a static provider reports itself non-reloadable.
+
+        Given:
+            A static provider.
+        When:
+            Its reloadable flag is read.
+        Then:
+            It should be False, so a worker built from it serves fixed
+            credentials.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act & assert
+        assert StaticCredentialProvider(creds).reloadable is False
+
+    def test_resolve_should_normalize_blank_identity_to_none(self, test_certificates):
+        """Test a blank identity collapses to address-based verification.
+
+        Given:
+            A static provider constructed with a whitespace-only identity.
+        When:
+            resolve() is called.
+        Then:
+            The snapshot identity (and the provider's identity) should be
+            None, taking the address-based path rather than emitting an
+            empty target-name override.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = StaticCredentialProvider(creds, identity="   ")
+
+        # Act & assert
+        assert provider.identity is None
+        assert provider.resolve().identity is None
+
     @given(mutual=st.booleans())
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test_pickle_roundtrip(self, mutual, test_certificates):
@@ -1008,6 +1076,43 @@ class TestFileCredentialProvider:
 
         # Assert
         assert provider.identity == "wool-worker"
+
+    def test_reloadable_should_be_true(self, temp_cert_files):
+        """Test a file provider reports itself reloadable.
+
+        Given:
+            A file provider.
+        When:
+            Its reloadable flag is read.
+        Then:
+            It should be True, so a worker built from it serves rotating
+            credentials via a per-handshake fetcher.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+
+        # Act & assert
+        assert FileCredentialProvider(ca_path, key_path, cert_path).reloadable is True
+
+    def test_identity_should_normalize_blank_to_none(self, temp_cert_files):
+        """Test a blank identity collapses to address-based verification.
+
+        Given:
+            A file provider constructed with an empty identity.
+        When:
+            The identity is read and the snapshot resolved.
+        Then:
+            Both should be None, taking the address-based path.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+
+        # Act
+        provider = FileCredentialProvider(ca_path, key_path, cert_path, identity="")
+
+        # Assert
+        assert provider.identity is None
+        assert provider.resolve().identity is None
 
     def test_resolve_should_reuse_snapshot_when_files_unchanged(self, temp_cert_files):
         """Test a file provider caches the snapshot for unchanged files.

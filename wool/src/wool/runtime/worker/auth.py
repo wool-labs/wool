@@ -281,6 +281,25 @@ def _compute_fingerprint(credentials: WorkerCredentials, identity: str | None) -
     return hasher.hexdigest()
 
 
+def _normalize_identity(identity: str | None) -> str | None:
+    """Collapse an empty or whitespace-only identity to ``None``.
+
+    A blank identity would otherwise emit an empty
+    ``grpc.ssl_target_name_override`` and fail verification opaquely;
+    ``None`` instead selects the address-based path, the intended
+    "no identity configured" behaviour.
+
+    :param identity:
+        The configured identity, or ``None``.
+    :returns:
+        The stripped identity, or ``None`` if blank.
+    """
+    if identity is None:
+        return None
+    identity = identity.strip()
+    return identity or None
+
+
 # public
 @dataclass(frozen=True)
 class CredentialSnapshot:
@@ -338,6 +357,18 @@ class CredentialProviderLike(Protocol):
     side.
     """
 
+    @property
+    def reloadable(self) -> bool:
+        """Whether the material may change over the provider's lifetime.
+
+        A worker built from a reloadable provider serves rotating server
+        credentials via a per-handshake fetcher; a non-reloadable provider
+        takes the fixed static-credentials path.  Conforming providers
+        declare this; the worker treats a provider that omits it as
+        non-reloadable.
+        """
+        ...
+
     def resolve(self) -> CredentialSnapshot:
         """Return the current credential snapshot.
 
@@ -370,6 +401,7 @@ class StaticCredentialProvider:
     _snapshot: CredentialSnapshot = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "identity", _normalize_identity(self.identity))
         object.__setattr__(
             self, "_snapshot", CredentialSnapshot.of(self.credentials, self.identity)
         )
@@ -460,7 +492,7 @@ class FileCredentialProvider:
         self._key_path = os.fspath(key_path)
         self._cert_path = os.fspath(cert_path)
         self._mutual = mutual
-        self._identity = identity
+        self._identity = _normalize_identity(identity)
         self._cached_snapshot: CredentialSnapshot | None = None
         self._cached_signature: tuple[tuple[int, int, int, int], ...] | None = None
         # The server-side fetcher consults resolve() from a gRPC C-core
@@ -587,9 +619,15 @@ def _coerce_provider(
     """
     if value is None:
         return None
-    if isinstance(value, CredentialProviderLike):
-        return value
-    return StaticCredentialProvider(value)
+    # Branch on WorkerCredentials rather than isinstance(CredentialProviderLike):
+    # the latter is a runtime_checkable protocol, so a custom provider that
+    # implements only resolve() (omitting the optional reloadable member)
+    # would fail the check and be wrapped as if it were credentials. Treating
+    # "not WorkerCredentials" as "already a provider" keeps such providers
+    # working and defers the reloadable default to the worker.
+    if isinstance(value, WorkerCredentials):
+        return StaticCredentialProvider(value)
+    return value
 
 
 class CredentialContext:
