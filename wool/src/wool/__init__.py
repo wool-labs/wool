@@ -29,7 +29,6 @@ from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.lan import LoopbackAdvertisementWarning
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import AllWorkersUnauthenticated
-from wool.runtime.loadbalancer.base import HandshakeRejection
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
@@ -113,7 +112,6 @@ __all__ = [
     "Factory",
     "FileCredentialProvider",
     "HandshakeError",
-    "HandshakeRejection",
     "IneffectiveLeaseWarning",
     "IneffectiveQuorumTimeoutWarning",
     "LanDiscovery",

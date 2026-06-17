@@ -5,7 +5,6 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from wool.runtime.loadbalancer.base import AllWorkersUnauthenticated
-from wool.runtime.loadbalancer.base import HandshakeRejection
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
 from wool.runtime.loadbalancer.base import LoadBalancerLike
@@ -370,57 +369,6 @@ class TestLoadBalancerContext:
         # Assert
         assert len(ctx.workers) == 0
 
-    def test_rejections_should_be_empty_initially(self):
-        """Test the rejection ledger starts empty.
-
-        Given:
-            A freshly constructed load balancer context.
-        When:
-            The rejections ledger is read.
-        Then:
-            It should be an empty immutable mapping.
-        """
-        # Act
-        ctx = LoadBalancerContext()
-
-        # Assert
-        assert isinstance(ctx.rejections, MappingProxyType)
-        assert len(ctx.rejections) == 0
-
-    def test_record_rejection_should_track_count_per_worker(self):
-        """Test the ledger accumulates per-worker rejection counts.
-
-        Given:
-            A context and a worker that fails the handshake twice.
-        When:
-            record_rejection is called for that worker twice.
-        Then:
-            The ledger should hold one entry keyed by the worker uid with
-            count 2 and the most recent error's reason.
-        """
-        # Arrange
-        ctx = LoadBalancerContext()
-        worker = WorkerMetadata(
-            uid=uuid4(),
-            address="10.0.0.5:50051",
-            pid=42,
-            version="1.0.0",
-        )
-
-        # Act
-        ctx.record_rejection(
-            worker, HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY)
-        )
-        ctx.record_rejection(
-            worker, HandshakeError(reason=HandshakeError.Reason.IDENTITY_MISMATCH)
-        )
-
-        # Assert
-        record = ctx.rejections[worker.uid]
-        assert record.count == 2
-        assert record.address == "10.0.0.5:50051"
-        assert record.reason is HandshakeError.Reason.IDENTITY_MISMATCH
-
 
 class TestAllWorkersUnauthenticated:
     """Test suite for the AllWorkersUnauthenticated exception type."""
@@ -461,26 +409,3 @@ class TestAllWorkersUnauthenticated:
 
         # Assert
         assert raised.rejections == {uid: error}
-
-
-class TestHandshakeRejection:
-    """Test suite for the HandshakeRejection record."""
-
-    def test_reason_should_return_latest_error_reason(self):
-        """Test the reason property reflects the recorded error.
-
-        Given:
-            A HandshakeRejection wrapping a HandshakeError.
-        When:
-            The reason property is read.
-        Then:
-            It should equal the wrapped error's reason.
-        """
-        # Arrange
-        error = HandshakeError(reason=HandshakeError.Reason.PEER_UNAUTHENTICATED)
-        record = HandshakeRejection(
-            uid=uuid4(), address="10.0.0.5:50051", count=1, error=error
-        )
-
-        # Act & assert
-        assert record.reason is HandshakeError.Reason.PEER_UNAUTHENTICATED

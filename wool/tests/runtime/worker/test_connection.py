@@ -671,6 +671,51 @@ class TestWorkerConnection:
                 pass
 
     @pytest.mark.asyncio
+    async def test_dispatch_should_redact_debug_string_from_handshake_details(
+        self, mocker: MockerFixture, sample_task
+    ):
+        """Test the handshake error does not leak gRPC's debug string.
+
+        Given:
+            A handshake failure whose ``details()`` is empty and whose debug
+            string carries an internal peer address and source paths.
+        When:
+            A task is dispatched.
+        Then:
+            The raised HandshakeError's details should be a fixed message,
+            not the verbose gRPC debug blob, so internal topology does not
+            ride into logs or across the wire.
+        """
+
+        # Arrange
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNAVAILABLE
+
+            def details(self):
+                return ""
+
+            def debug_error_string(self):
+                return "Ssl handshake failed; peer 10.1.2.3:8443; src/core/tsi/ssl.cc"
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051",
+            provider=_secure_provider(),
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act & assert
+        with pytest.raises(HandshakeError) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        assert "10.1.2.3" not in exc_info.value.details
+        assert "src/core" not in exc_info.value.details
+        assert "secure handshake failed" in exc_info.value.details
+
+    @pytest.mark.asyncio
     async def test_dispatch_should_override_target_name_when_identity_configured(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):

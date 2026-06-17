@@ -4,7 +4,6 @@ import asyncio
 import uuid
 import warnings
 from contextlib import AsyncExitStack
-from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import AsyncContextManager
@@ -15,7 +14,6 @@ from typing import Callable
 from typing import ContextManager
 from typing import Final
 from typing import Generic
-from typing import Mapping
 from typing import NoReturn
 from typing import Sequence
 from typing import SupportsIndex
@@ -31,7 +29,6 @@ from wool.exception import WoolWarning
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.local import LocalDiscovery
-from wool.runtime.loadbalancer.base import HandshakeRejection
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
@@ -639,23 +636,6 @@ class WorkerProxy:
             return list(self._loadbalancer_context.workers.keys())
         else:
             return []
-
-    @property
-    def rejections(self) -> Mapping[uuid.UUID, HandshakeRejection]:
-        """Per-worker secure-handshake rejection ledger.
-
-        Surfaces how many discovered workers refused, or were refused by,
-        the client's credentials, and why — so a fleet-wide mTLS
-        misconfiguration is distinguishable from an empty pool. Empty when
-        the proxy is not started.
-
-        :returns:
-            Immutable mapping of worker uid to its
-            :class:`HandshakeRejection` record.
-        """
-        if self._loadbalancer_context:
-            return self._loadbalancer_context.rejections
-        return MappingProxyType({})
 
     @noreentry
     async def enter(self) -> None:

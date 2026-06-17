@@ -3724,25 +3724,6 @@ class TestWorkerProxy:
         await proxy.stop()
 
     @pytest.mark.asyncio
-    async def test_rejections_should_be_empty_when_not_started(
-        self, mock_discovery_service
-    ):
-        """Test the rejection ledger is empty before the proxy starts.
-
-        Given:
-            A lazy WorkerProxy that has not been started.
-        When:
-            The rejections property is read.
-        Then:
-            It should be an empty mapping.
-        """
-        # Arrange
-        proxy = WorkerProxy(discovery=mock_discovery_service)
-
-        # Act & assert
-        assert len(proxy.rejections) == 0
-
-    @pytest.mark.asyncio
     async def test_credentials_none_without_contextvar(
         self, mock_proxy_session, mocker: MockerFixture
     ):

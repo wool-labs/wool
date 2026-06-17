@@ -36,7 +36,6 @@ def test_public_api_completeness():
         "UnexpectedResponse",
         "HandshakeError",
         "AllWorkersUnauthenticated",
-        "HandshakeRejection",
         "CredentialProviderLike",
         "CredentialSnapshot",
         "StaticCredentialProvider",

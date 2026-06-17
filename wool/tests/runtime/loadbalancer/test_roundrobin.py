@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from types import MappingProxyType
 from uuid import uuid4
 
 import pytest
@@ -217,55 +216,6 @@ class TestRoundRobinLoadBalancer:
         assert result is healthy_stream
         assert bad_metadata in ctx.workers
         assert good_metadata in ctx.workers
-
-    @pytest.mark.asyncio
-    async def test_dispatch_should_tolerate_context_without_record_rejection(
-        self, mocker: MockerFixture
-    ):
-        """Test a legacy context lacking the ledger still drains cleanly.
-
-        Given:
-            A custom load-balancer context that implements the worker set
-            but not record_rejection, whose only worker fails the
-            handshake.
-        When:
-            A task is dispatched.
-        Then:
-            It should still raise AllWorkersUnauthenticated rather than an
-            AttributeError, so the rejection ledger remains optional.
-        """
-        # Arrange
-        connection = mocker.create_autospec(WorkerConnection, instance=True)
-        connection.dispatch = mocker.AsyncMock(
-            side_effect=HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY)
-        )
-        metadata = WorkerMetadata(
-            uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
-        )
-
-        class _LegacyContext:
-            def __init__(self):
-                self._workers = {metadata: connection}
-
-            @property
-            def workers(self):
-                return MappingProxyType(self._workers)
-
-            def remove_worker(self, meta):
-                self._workers.pop(meta, None)
-
-        lb = RoundRobinLoadBalancer()
-        ctx = _LegacyContext()
-
-        async def routine():
-            return "Hello world!"
-
-        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
-        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
-
-        # Act & assert
-        with pytest.raises(AllWorkersUnauthenticated):
-            await lb.dispatch(task, context=ctx)
 
     @pytest.mark.asyncio
     async def test_dispatch_should_raise_plain_no_workers_when_a_transient_survives(

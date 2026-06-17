@@ -851,7 +851,15 @@ def _classify_handshake_failure(
         details = error.details()
     except Exception:
         details = None
-    details = details or str(error)
+    if not details:
+        # Avoid str(error): for an AioRpcError it embeds gRPC's
+        # debug_error_string (peer internal address, BoringSSL/C-core
+        # source paths), which would then ride on HandshakeError.details
+        # into logs and across the wire. Token classification still reads
+        # the verbose blob transiently via _error_text; it is just never
+        # stored on the surfaced exception.
+        code_name = code.name if code is not None else "UNKNOWN"
+        details = f"{code_name}: secure handshake failed"
 
     if code == grpc.StatusCode.UNAUTHENTICATED:
         return HandshakeError(
