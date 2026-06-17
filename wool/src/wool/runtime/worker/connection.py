@@ -718,12 +718,22 @@ _HANDSHAKE_TOKENS: Final = (
     "certificate",
     "x509",
     "alpn",
+    # gRPC wraps a failed peer/hostname/cert check from its TLS credentials in
+    # a "... verification check failed ..." status whose text carries none of
+    # the tokens above; treat it as positive TLS evidence so such a failure is
+    # never mistaken for plain unreachability.
+    "verification check failed",
 )
 # Specific phrases mapping a handshake failure to a finer reason. These are
 # best-effort and may drift across gRPC versions; a miss degrades to the
 # generic ``TLS_HANDSHAKE`` reason, never to a misclassification of worker
 # health.
 _IDENTITY_TOKENS: Final = (
+    # gRPC/BoringSSL phrasings for a server-name/SAN mismatch. The hostname
+    # phrasing is what surfaces on the RpcError when an
+    # ``ssl_target_name_override`` identity does not match the peer
+    # certificate; "no match found for server name" appears in C-core logs.
+    "hostname verification",
     "no match found for server name",
     "target name",
     "subject alternative name",

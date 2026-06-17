@@ -9,6 +9,7 @@ misconfiguration as a distinct, diagnosable signal.
 
 import datetime
 import ipaddress
+import os
 
 import pytest
 from cryptography import x509
@@ -21,6 +22,7 @@ from cryptography.x509.oid import NameOID
 import wool
 from wool import AllWorkersUnauthenticated
 from wool import HandshakeError
+from wool import StaticCredentialProvider
 from wool import WorkerCredentials
 from wool import WorkerProxy
 
@@ -192,7 +194,103 @@ async def test_untrusted_ca_rejects_with_diagnosable_signal():
                 await add(2, 3)
 
         reasons = {rej.reason for rej in exc_info.value.rejections.values()}
-        assert reasons
-        assert reasons <= set(HandshakeError.Reason)
+        assert HandshakeError.Reason.CERT_VERIFY in reasons
     finally:
         await worker.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_identity_mismatch_rejects_with_identity_mismatch_reason():
+    """Test a certificate that does not match the configured identity is rejected.
+
+    Given:
+        A running worker whose certificate carries one logical identity,
+        and a client that trusts the same CA but expects a different
+        identity.
+    When:
+        A routine is dispatched at the worker through that client.
+    Then:
+        The handshake should be rejected with the IDENTITY_MISMATCH reason
+        — verifying against the configured identity strengthens, not
+        relaxes, the guarantee.
+    """
+    # Arrange — one CA; the worker cert's SANs include loopback (so its own
+    # stop RPC validates) and a logical identity the client will not expect.
+    ca_pem, key_pem, cert_pem = _generate_ca_and_leaf(
+        [*_LOOPBACK_SANS, x509.DNSName(_WORKER_IDENTITY)]
+    )
+    worker = wool.LocalWorker(
+        credentials=WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+    )
+    client_credentials = StaticCredentialProvider(
+        WorkerCredentials(ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem),
+        identity="does-not-match.example",
+    )
+
+    # Act & assert
+    await worker.start()
+    try:
+        assert worker.metadata is not None
+        async with WorkerProxy(
+            workers=[worker.metadata], credentials=client_credentials
+        ):
+            with pytest.raises(AllWorkersUnauthenticated) as exc_info:
+                await add(2, 3)
+
+        reasons = {rej.reason for rej in exc_info.value.rejections.values()}
+        assert HandshakeError.Reason.IDENTITY_MISMATCH in reasons
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_credential_rotation_without_restart(tmp_path):
+    """Test a long-running pool adopts rotated credentials without a restart.
+
+    Given:
+        An ephemeral pool on a reloading file provider, with one successful
+        dispatch, after which the CA, key, and certificate are rotated to a
+        brand-new certificate authority on disk.
+    When:
+        A second routine is dispatched without restarting the worker or the
+        pool.
+    Then:
+        It should succeed over a real handshake on the rotated material —
+        the worker server adopts it per connection and the client adopts it
+        per dispatch.
+    """
+    # Arrange — start on CA #1.
+    sans = [*_LOOPBACK_SANS, x509.DNSName(_WORKER_IDENTITY)]
+    ca_pem, key_pem, cert_pem = _generate_ca_and_leaf(sans)
+    ca_path = tmp_path / "ca.pem"
+    key_path = tmp_path / "key.pem"
+    cert_path = tmp_path / "cert.pem"
+    ca_path.write_bytes(ca_pem)
+    key_path.write_bytes(key_pem)
+    cert_path.write_bytes(cert_pem)
+    provider = WorkerCredentials.provider_from_files(
+        str(ca_path),
+        str(key_path),
+        str(cert_path),
+        identity=_WORKER_IDENTITY,
+        reload=True,
+    )
+
+    # Act & assert
+    async with wool.WorkerPool(spawn=1, credentials=provider):
+        assert await add(2, 3) == 5
+
+        # Rotate to a fresh, independent CA on disk (new key and cert too).
+        new_ca, new_key, new_cert = _generate_ca_and_leaf(sans)
+        rotated_mtime = os.stat(ca_path).st_mtime_ns + 1_000_000_000
+        ca_path.write_bytes(new_ca)
+        key_path.write_bytes(new_key)
+        cert_path.write_bytes(new_cert)
+        for path in (ca_path, key_path, cert_path):
+            os.utime(path, ns=(rotated_mtime, rotated_mtime))
+
+        assert await add(2, 3) == 5
