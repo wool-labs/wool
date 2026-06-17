@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import ssl
 import threading
 from contextvars import ContextVar
 from contextvars import Token
@@ -424,28 +425,32 @@ class StaticCredentialProvider:
         return False
 
 
-def _validate_material(credentials: WorkerCredentials) -> None:
-    """Parse the PEM material to reject readable-but-malformed bytes.
+def _validate_material(ca_path: str, key_path: str, cert_path: str) -> None:
+    """Reject readable-but-malformed PEM by loading it through ``ssl``.
 
     :class:`WorkerCredentials.from_files` reads raw bytes without parsing,
     so a non-atomic rotation that leaves a truncated or garbage — but
     readable — PEM would otherwise be cached as the current snapshot and
-    only fail later, opaquely, at the handshake.  Parsing here lets the
-    reloading provider keep its prior good material instead.
+    only fail later, opaquely, at the handshake.  Loading the material into
+    an :class:`ssl.SSLContext` here parses the certificate, key, and CA
+    bundle (and checks the key matches the certificate) using the same
+    OpenSSL machinery the transport uses, so the reloading provider keeps
+    its prior good material instead.  Stdlib ``ssl`` is used deliberately:
+    validation must not add a third-party runtime dependency.
 
-    :param credentials:
-        The freshly-read credential material.
-    :raises ValueError:
-        If the CA bundle, certificate, or private key is not valid PEM.
+    :param ca_path:
+        Path to the CA certificate bundle.
+    :param key_path:
+        Path to the worker private key.
+    :param cert_path:
+        Path to the worker certificate.
+    :raises ssl.SSLError:
+        If the certificate, key, or CA bundle is malformed (or the key does
+        not match the certificate). A subclass of :class:`OSError`.
     """
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.x509 import load_pem_x509_certificates
-
-    if not load_pem_x509_certificates(credentials.ca_cert):
-        raise ValueError("CA bundle contains no certificates")
-    if not load_pem_x509_certificates(credentials.worker_cert):
-        raise ValueError("worker certificate contains no certificates")
-    serialization.load_pem_private_key(credentials.worker_key, password=None)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    context.load_verify_locations(cafile=ca_path)
 
 
 # public
@@ -544,9 +549,8 @@ class FileCredentialProvider:
             snapshot when the files are unchanged, or on a failed re-read
             when a prior snapshot exists.
         :raises OSError:
-            If the files cannot be read and no prior snapshot exists.
-        :raises ValueError:
-            If the material is malformed and no prior snapshot exists.
+            If the files cannot be read or are malformed (``ssl.SSLError``
+            is an ``OSError``) and no prior snapshot exists.
         """
         with self._lock:
             try:
@@ -565,8 +569,8 @@ class FileCredentialProvider:
                 )
                 # Validate before caching so a readable-but-truncated PEM
                 # never overwrites the last good snapshot.
-                _validate_material(credentials)
-            except (OSError, ValueError) as exc:
+                _validate_material(self._ca_path, self._key_path, self._cert_path)
+            except OSError as exc:
                 return self._fallback_or_raise(exc)
             snapshot = CredentialSnapshot.of(credentials, self._identity)
             self._cached_snapshot = snapshot

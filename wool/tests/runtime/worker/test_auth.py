@@ -1278,6 +1278,7 @@ class TestFileCredentialProvider:
         with open(ca_path, "rb") as f:
             ca_pem = f.read()
         provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        provider.resolve()  # establish a last-good snapshot before rotating
         errors: list[Exception] = []
         snapshots: list = []
 
@@ -1289,9 +1290,13 @@ class TestFileCredentialProvider:
                 errors.append(exc)
 
         def rotator():
+            # Rotate atomically (write-temp + os.replace), as a real rotator
+            # would, so a reader never observes a torn file.
             for i in range(25):
-                with open(ca_path, "wb") as f:
+                tmp = f"{ca_path}.{i}.tmp"
+                with open(tmp, "wb") as f:
                     f.write(ca_pem + b"\n" * (i % 8))
+                os.replace(tmp, ca_path)
 
         # Act
         threads = [threading.Thread(target=resolver) for _ in range(6)]
