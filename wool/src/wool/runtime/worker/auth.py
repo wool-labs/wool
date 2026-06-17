@@ -13,7 +13,7 @@ from typing import runtime_checkable
 if TYPE_CHECKING:
     import grpc
 
-_current: ContextVar[WorkerCredentials | None] = ContextVar(
+_current: ContextVar[WorkerCredentials | CredentialProviderLike | None] = ContextVar(
     "worker_credentials", default=None
 )
 
@@ -485,15 +485,39 @@ class FileCredentialProvider:
         return state
 
 
+def _coerce_provider(
+    value: WorkerCredentials | CredentialProviderLike | None,
+) -> CredentialProviderLike | None:
+    """Normalize a credentials-or-provider value into a provider.
+
+    A bare :class:`WorkerCredentials` is wrapped in a
+    :class:`StaticCredentialProvider` with no identity, preserving the
+    legacy address-based verification behaviour; a provider is returned
+    unchanged; ``None`` stays ``None``.  This is the single seam through
+    which pools, proxies, and worker processes accept either form.
+
+    :param value:
+        A :class:`WorkerCredentials`, a provider, or ``None``.
+    :returns:
+        A :class:`CredentialProviderLike`, or ``None``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, CredentialProviderLike):
+        return value
+    return StaticCredentialProvider(value)
+
+
 class CredentialContext:
-    """Internal context manager for propagating WorkerCredentials via ContextVar.
+    """Internal context manager for propagating credentials via ContextVar.
 
     Used by WorkerProcess._serve() to set credentials in worker subprocesses
-    and by WorkerProxy.__init__() to resolve credentials from context.
+    and by WorkerProxy.__init__() to resolve credentials from context. Carries
+    either a :class:`WorkerCredentials` or a :class:`CredentialProviderLike`.
     Not part of the public API.
     """
 
-    def __init__(self, credentials: WorkerCredentials) -> None:
+    def __init__(self, credentials: WorkerCredentials | CredentialProviderLike) -> None:
         self._credentials = credentials
         self._token: Token | None = None
 
@@ -508,10 +532,12 @@ class CredentialContext:
         self._token = None
 
     @classmethod
-    def current(cls) -> WorkerCredentials | None:
-        """Get the current worker credentials from the context.
+    def current(cls) -> WorkerCredentials | CredentialProviderLike | None:
+        """Get the current credentials or provider from the context.
 
         :returns:
-            The active WorkerCredentials, or None if no context is set.
+            The active :class:`WorkerCredentials` or
+            :class:`CredentialProviderLike`, or ``None`` if no context is
+            set.
         """
         return _current.get()
