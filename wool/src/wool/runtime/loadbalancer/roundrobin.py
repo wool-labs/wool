@@ -80,6 +80,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
         """
         checkpoint = None
         rejections: dict = {}
+        had_non_handshake_failure = False
 
         if context not in self._index:
             self._index[context] = 0
@@ -110,30 +111,27 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                         metadata.uid,
                         exc,
                     )
+                    had_non_handshake_failure = True
                     self._index[context] = self._index[context] + 1
                     continue
                 except HandshakeError as exc:
-                    # A handshake/auth failure evicts the worker exactly like
-                    # any non-transient RpcError, but is also recorded so the
-                    # terminal raise can distinguish "all workers refused my
-                    # credentials" from "the pool is empty", and so the
-                    # rejection is observable through the pool.
+                    # A failed secure handshake is recoverable: the worker may
+                    # adopt rotated credentials out of band. Skip it without
+                    # eviction (like a transient error) so a later dispatch
+                    # retries with freshly-resolved credentials, and record the
+                    # rejection so the terminal raise can tell "every worker
+                    # refused my credentials" apart from "the pool is empty".
+                    # The per-rejection warning is the observability surface;
+                    # aggregation over time is left to metrics/tracing.
                     logger.warning(
-                        "Evicting worker %s after handshake failure (%s): %s",
+                        "Skipping worker %s at %s after handshake failure (%s): %s",
                         metadata.uid,
+                        metadata.address,
                         exc.reason,
                         exc,
                     )
                     rejections[metadata.uid] = exc
-                    # record_rejection is an optional capability of the
-                    # built-in context, not part of the LoadBalancerContextLike
-                    # protocol, so a custom context need not provide it.
-                    record_rejection = getattr(context, "record_rejection", None)
-                    if record_rejection is not None:
-                        record_rejection(metadata, exc)
-                    context.remove_worker(metadata)
-                    if metadata.uid == checkpoint:
-                        checkpoint = None
+                    self._index[context] = self._index[context] + 1
                     continue
                 except RpcError as exc:
                     logger.warning(
@@ -141,6 +139,7 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                         metadata.uid,
                         exc,
                     )
+                    had_non_handshake_failure = True
                     context.remove_worker(metadata)
                     if metadata.uid == checkpoint:
                         checkpoint = None
@@ -149,9 +148,13 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                     self._index[context] = self._index[context] + 1
                     return stream
 
-        if rejections:
+        # Promote to AllWorkersUnauthenticated only when the cycle drained
+        # purely on handshake rejections — a surviving transient worker or a
+        # non-handshake eviction means the pool was not uniformly refusing the
+        # client's credentials, so the plain empty-pool signal is correct.
+        if rejections and not had_non_handshake_failure:
             raise AllWorkersUnauthenticated(
-                "All discovered workers rejected the client's credentials",
+                "Every worker tried refused the client's credentials",
                 rejections=rejections,
             )
         raise NoWorkersAvailable("No healthy workers available for dispatch")

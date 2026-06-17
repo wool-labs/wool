@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -130,7 +131,8 @@ class TestRoundRobinLoadBalancer:
             A task is dispatched.
         Then:
             It should raise AllWorkersUnauthenticated carrying a rejection
-            for each worker, distinct from a bare empty-pool outcome.
+            for each worker, while leaving the workers in the pool (skipped,
+            not evicted) so a later rotation can recover them.
         """
         # Arrange
         lb = RoundRobinLoadBalancer()
@@ -164,13 +166,13 @@ class TestRoundRobinLoadBalancer:
         with pytest.raises(AllWorkersUnauthenticated) as exc_info:
             await lb.dispatch(task, context=ctx)
         assert set(exc_info.value.rejections) == set(uids)
-        assert set(ctx.rejections) == set(uids)
+        assert len(ctx.workers) == 2
 
     @pytest.mark.asyncio
-    async def test_dispatch_should_evict_handshake_worker_and_use_healthy(
+    async def test_dispatch_should_skip_handshake_worker_and_use_healthy(
         self, mocker: MockerFixture
     ):
-        """Test a handshake failure evicts only the failing worker.
+        """Test a handshake failure skips the worker without evicting it.
 
         Given:
             A context with one worker that fails the handshake followed by
@@ -178,8 +180,9 @@ class TestRoundRobinLoadBalancer:
         When:
             A task is dispatched.
         Then:
-            The failing worker should be evicted and the dispatch should
-            succeed on the healthy worker.
+            The dispatch should succeed on the healthy worker, and the
+            failing worker should remain in the pool (skipped, not evicted)
+            so it can recover after a credential rotation.
         """
         # Arrange
         lb = RoundRobinLoadBalancer()
@@ -212,7 +215,7 @@ class TestRoundRobinLoadBalancer:
 
         # Assert
         assert result is healthy_stream
-        assert bad_metadata not in ctx.workers
+        assert bad_metadata in ctx.workers
         assert good_metadata in ctx.workers
 
     @pytest.mark.asyncio
@@ -263,6 +266,140 @@ class TestRoundRobinLoadBalancer:
         # Act & assert
         with pytest.raises(AllWorkersUnauthenticated):
             await lb.dispatch(task, context=ctx)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_plain_no_workers_when_a_transient_survives(
+        self, mocker: MockerFixture
+    ):
+        """Test a surviving transient worker keeps the signal unspecific.
+
+        Given:
+            A context with one handshake-failing worker and one
+            persistently-transient worker.
+        When:
+            A task is dispatched and the cycle exhausts.
+        Then:
+            It should raise the plain NoWorkersAvailable, not
+            AllWorkersUnauthenticated — the pool was not uniformly refusing
+            the client's credentials.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+
+        handshake_connection = mocker.create_autospec(WorkerConnection, instance=True)
+        handshake_connection.dispatch = mocker.AsyncMock(
+            side_effect=HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY)
+        )
+        transient_connection = mocker.create_autospec(WorkerConnection, instance=True)
+        transient_connection.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
+        handshake_metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
+        )
+        transient_metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.2:50051", pid=2, version="1.0.0"
+        )
+        ctx.add_worker(handshake_metadata, handshake_connection)
+        ctx.add_worker(transient_metadata, transient_connection)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable) as exc_info:
+            await lb.dispatch(task, context=ctx)
+        assert not isinstance(exc_info.value, AllWorkersUnauthenticated)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_recover_skipped_worker_on_later_dispatch(
+        self, mocker: MockerFixture
+    ):
+        """Test a handshake-skipped worker recovers without re-discovery.
+
+        Given:
+            A context with a single worker whose first handshake fails and
+            whose next dispatch succeeds (e.g. after a credential rotation).
+        When:
+            A first dispatch fails and a second dispatch is issued.
+        Then:
+            The first should raise AllWorkersUnauthenticated and the second
+            should succeed on the same, still-pooled worker.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+        healthy_stream = mocker.MagicMock()
+        connection = mocker.create_autospec(WorkerConnection, instance=True)
+        connection.dispatch = mocker.AsyncMock(
+            side_effect=[
+                HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY),
+                healthy_stream,
+            ]
+        )
+        metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
+        )
+        ctx.add_worker(metadata, connection)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act
+        with pytest.raises(AllWorkersUnauthenticated):
+            await lb.dispatch(task, context=ctx)
+        result = await lb.dispatch(task, context=ctx)
+
+        # Assert
+        assert result is healthy_stream
+        assert metadata in ctx.workers
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_log_each_handshake_rejection(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test each handshake rejection is logged for observability.
+
+        Given:
+            A context with a single handshake-failing worker.
+        When:
+            A task is dispatched.
+        Then:
+            A warning should be logged naming the worker uid and the
+            handshake-failure reason.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+        connection = mocker.create_autospec(WorkerConnection, instance=True)
+        connection.dispatch = mocker.AsyncMock(
+            side_effect=HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY)
+        )
+        metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
+        )
+        ctx.add_worker(metadata, connection)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(AllWorkersUnauthenticated):
+                await lb.dispatch(task, context=ctx)
+
+        # Assert
+        assert str(metadata.uid) in caplog.text
+        assert "handshake" in caplog.text.lower()
+        assert "cert_verify" in caplog.text.lower()
 
     @pytest.mark.asyncio
     @settings(

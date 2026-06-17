@@ -29,20 +29,24 @@ class NoWorkersAvailable(Exception):
 
 # public
 class AllWorkersUnauthenticated(NoWorkersAvailable):
-    """Raised when every discovered worker failed the secure handshake.
+    """Raised when a dispatch drained purely on secure-handshake failures.
 
-    Distinguishes "workers are present, but every one of them refused, or
+    Distinguishes "workers are present, but every one I tried refused, or
     was refused by, my credentials" from the bare "no workers are present"
-    condition.  It is a subclass of :class:`NoWorkersAvailable` so existing
-    callers that catch ``NoWorkersAvailable`` keep working unchanged, while
-    callers that want the distinction can catch this type and inspect the
-    per-worker :attr:`rejections`.
+    condition.  It is raised only when a full dispatch cycle exhausted with
+    at least one handshake rejection and *no* worker failed for a
+    non-handshake reason (a surviving transient worker or a non-handshake
+    eviction yields the plain :class:`NoWorkersAvailable` instead).  It is a
+    subclass of :class:`NoWorkersAvailable` so existing callers that catch
+    ``NoWorkersAvailable`` keep working unchanged, while callers that want
+    the distinction can catch this type and inspect the per-worker
+    :attr:`rejections`.
 
     :param message:
         Human-readable description.
     :param rejections:
-        Mapping of worker uid to the :class:`HandshakeError` that evicted
-        it during the failed dispatch.
+        Mapping of worker uid to the :class:`HandshakeError` it raised
+        during the failed dispatch.
     """
 
     def __init__(
