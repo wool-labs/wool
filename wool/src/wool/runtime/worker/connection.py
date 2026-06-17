@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -603,6 +604,221 @@ class TransientRpcError(RpcError):
 
 
 # public
+class HandshakeError(RpcError):
+    """Raised when the secure handshake with a worker cannot be completed.
+
+    A handshake error means the worker is reachable but the TLS/mTLS
+    handshake or peer authentication failed — a wrong certificate
+    authority, an identity that does not match what the client expects, an
+    expired or otherwise rejected certificate, or a plaintext-versus-
+    encrypted mismatch.  It is a *distinct, diagnosable* condition: an
+    operator can tell "workers are present but refused, or were refused by,
+    my credentials" apart from "no workers are present".
+
+    **Worker-health classification.** :class:`HandshakeError` is a
+    non-transient :class:`RpcError`, so the load balancer evicts the
+    offending worker exactly as it does for any other non-transient
+    failure — a worker the client cannot authenticate with is not a viable
+    dispatch target.  Unlike a generic :class:`RpcError`, the load balancer
+    records it so that a pool which drained entirely because every worker
+    failed the handshake surfaces a distinct signal instead of collapsing
+    into the bare "no workers available" condition.
+
+    :param code:
+        The gRPC status code, if available.
+    :param details:
+        The gRPC error details, if available.
+    :param reason:
+        The :class:`Reason` classifying the failure.
+    """
+
+    class Reason(enum.Enum):
+        """Best-effort classification of a handshake failure's cause.
+
+        The reason is advisory diagnostic metadata derived from the gRPC
+        status code and error text; the load-bearing signal is the
+        :class:`HandshakeError` type itself.
+        """
+
+        TLS_HANDSHAKE = "tls_handshake"
+        CERT_VERIFY = "cert_verify"
+        IDENTITY_MISMATCH = "identity_mismatch"
+        PEER_UNAUTHENTICATED = "peer_unauthenticated"
+        PLAINTEXT_VS_ENCRYPTED = "plaintext_vs_encrypted"
+
+    def __init__(
+        self,
+        code: grpc.StatusCode | None = None,
+        details: str | None = None,
+        *,
+        reason: HandshakeError.Reason,
+    ):
+        super().__init__(code, details)
+        self.reason = reason
+
+
+# Broad tokens that gate promotion of an ambiguous ``UNAVAILABLE`` to a
+# handshake failure: their presence in the error text is positive evidence
+# that TLS — not plain unreachability — was involved. Kept deliberately
+# wide so the *gate* is robust across gRPC/BoringSSL versions; the more
+# specific reason tokens below only refine the diagnosis. Matched
+# case-insensitively as substrings.
+_HANDSHAKE_TOKENS: Final = (
+    "ssl",
+    "tls",
+    "handshake",
+    "certificate",
+    "x509",
+    "alpn",
+)
+# Specific phrases mapping a handshake failure to a finer reason. These are
+# best-effort and may drift across gRPC versions; a miss degrades to the
+# generic ``TLS_HANDSHAKE`` reason, never to a misclassification of worker
+# health.
+_IDENTITY_TOKENS: Final = (
+    "no match found for server name",
+    "target name",
+    "subject alternative name",
+    "ssl_target_name",
+)
+_CERT_VERIFY_TOKENS: Final = (
+    "certificate verify failed",
+    "verify failed",
+    "unable to get local issuer",
+    "self signed certificate",
+    "self-signed certificate",
+    "unknown ca",
+    "bad certificate",
+    "certificate has expired",
+    "certificate is not yet valid",
+    "certificate signature failure",
+)
+_PROTOCOL_MISMATCH_TOKENS: Final = (
+    "wrong version number",
+    "wrong_version_number",
+    "http/1",
+)
+
+
+def _error_text(error: grpc.RpcError) -> str:
+    """Extract a lowercased ``details`` + ``debug_error_string`` blob.
+
+    Defensive against errors that lack either accessor (e.g. a bare
+    :class:`grpc.RpcError` without the call-side ``debug_error_string``)
+    so the classifier never raises on an unexpected error shape.
+
+    :param error:
+        The gRPC error to read.
+    :returns:
+        Concatenated, lowercased error text (possibly empty).
+    """
+    parts: list[str] = []
+    try:
+        details = error.details()
+    except Exception:
+        details = None
+    if details:
+        parts.append(str(details))
+    debug = getattr(error, "debug_error_string", None)
+    if callable(debug):
+        try:
+            blob = debug()
+        except Exception:
+            blob = None
+        if blob:
+            parts.append(str(blob))
+    return "\n".join(parts).lower()
+
+
+def _handshake_reason(text: str, *, secure: bool) -> HandshakeError.Reason | None:
+    """Classify handshake error text into a :class:`HandshakeError.Reason`.
+
+    Returns ``None`` when the text carries no TLS/handshake/cert evidence —
+    the signal that an ambiguous ``UNAVAILABLE`` is a genuine transient
+    unreachability rather than a handshake failure.
+
+    :param text:
+        Lowercased error text from :func:`_error_text`.
+    :param secure:
+        Whether the failing connection presented client credentials. An
+        insecure client that reaches a TLS-only worker is reported as a
+        plaintext-versus-encrypted mismatch.
+    :returns:
+        The classified reason, or ``None`` if no handshake evidence.
+    """
+    if any(token in text for token in _IDENTITY_TOKENS):
+        return HandshakeError.Reason.IDENTITY_MISMATCH
+    if any(token in text for token in _CERT_VERIFY_TOKENS):
+        return HandshakeError.Reason.CERT_VERIFY
+    if any(token in text for token in _PROTOCOL_MISMATCH_TOKENS):
+        return HandshakeError.Reason.PLAINTEXT_VS_ENCRYPTED
+    if any(token in text for token in _HANDSHAKE_TOKENS):
+        return (
+            HandshakeError.Reason.PLAINTEXT_VS_ENCRYPTED
+            if not secure
+            else HandshakeError.Reason.TLS_HANDSHAKE
+        )
+    return None
+
+
+def _classify_handshake_failure(
+    error: grpc.RpcError,
+    *,
+    secure: bool,
+) -> HandshakeError | None:
+    """Classify a gRPC error as a handshake failure, or ``None``.
+
+    The classification is structural, not phrase-dependent:
+
+    - ``UNAUTHENTICATED`` is always a handshake failure — the peer
+      rejected the client's certificate.
+    - ``UNAVAILABLE`` is ambiguous (a down worker looks the same as a
+      failed handshake), so it is promoted to a :class:`HandshakeError`
+      only when the error text carries positive TLS evidence; otherwise
+      this returns ``None`` and the caller treats it as transient,
+      preserving the legacy behaviour exactly.
+    - All other codes are never handshake failures.
+
+    An identity mismatch (the worker's certificate does not match the
+    configured identity) is distinguished from a certificate-authority
+    rejection by the gRPC error text itself — gRPC reports a name-override
+    mismatch as "no match found for server name" — so the configured
+    identity value is not needed here to tell those two cases apart.
+
+    :param error:
+        The gRPC error raised during the dispatch handshake.
+    :param secure:
+        Whether the failing connection presented client credentials.
+    :returns:
+        A classified :class:`HandshakeError`, or ``None`` if the failure is
+        not a handshake/authentication problem.
+    """
+    try:
+        code = error.code()
+    except Exception:
+        code = None
+
+    details = None
+    try:
+        details = error.details()
+    except Exception:
+        details = None
+    details = details or str(error)
+
+    if code == grpc.StatusCode.UNAUTHENTICATED:
+        return HandshakeError(
+            code, details, reason=HandshakeError.Reason.PEER_UNAUTHENTICATED
+        )
+    if code != grpc.StatusCode.UNAVAILABLE:
+        return None
+
+    reason = _handshake_reason(_error_text(error), secure=secure)
+    if reason is None:
+        return None
+    return HandshakeError(code, details, reason=reason)
+
+
+# public
 class WorkerConnection:
     """gRPC connection to a worker for task dispatch.
 
@@ -772,6 +988,17 @@ class WorkerConnection:
         except grpc.RpcError as error:
             code = error.code()
             details = error.details() or str(error)
+            # A failed secure handshake (wrong CA, identity mismatch,
+            # expired/rejected cert, plaintext-vs-encrypted) is a distinct,
+            # diagnosable condition — surface it as :class:`HandshakeError`
+            # so the load balancer does not collapse it into a generic
+            # "no workers available" outcome. Non-handshake failures fall
+            # through to the unchanged transient/non-transient split.
+            handshake = _classify_handshake_failure(
+                error, secure=self._credentials is not None
+            )
+            if handshake is not None:
+                raise handshake from error
             if code in self.TRANSIENT_ERRORS:
                 raise TransientRpcError(code, details) from error
             else:

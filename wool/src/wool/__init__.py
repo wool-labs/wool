@@ -49,6 +49,7 @@ from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
@@ -108,6 +109,7 @@ __all__ = [
     "DiscoverySubscriberLike",
     "Factory",
     "FileCredentialProvider",
+    "HandshakeError",
     "IneffectiveLeaseWarning",
     "IneffectiveQuorumTimeoutWarning",
     "LanDiscovery",

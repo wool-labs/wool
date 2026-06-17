@@ -20,6 +20,7 @@ from wool.runtime.context import ContextVar
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
 from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
@@ -161,6 +162,51 @@ def mock_grpc_call(mocker: MockerFixture):
         return mock_call
 
     return create_call
+
+
+class TestHandshakeError:
+    """Test suite for the HandshakeError exception type."""
+
+    def test___init___should_set_reason_code_and_details(self):
+        """Test HandshakeError records its classification and gRPC fields.
+
+        Given:
+            A status code, details, and a reason.
+        When:
+            HandshakeError is constructed.
+        Then:
+            It should expose the reason, code, and details.
+        """
+        # Act
+        error = HandshakeError(
+            grpc.StatusCode.UNAVAILABLE,
+            "boom",
+            reason=HandshakeError.Reason.CERT_VERIFY,
+        )
+
+        # Assert
+        assert error.reason is HandshakeError.Reason.CERT_VERIFY
+        assert error.code is grpc.StatusCode.UNAVAILABLE
+        assert error.details == "boom"
+
+    def test___init___should_be_non_transient_rpc_error(self):
+        """Test HandshakeError sits in the worker-health hierarchy.
+
+        Given:
+            A HandshakeError instance.
+        When:
+            Its type relationships are inspected.
+        Then:
+            It should be an RpcError (so the load balancer evicts it) but
+            not a TransientRpcError (so it is not treated as a retryable
+            hiccup).
+        """
+        # Arrange
+        error = HandshakeError(reason=HandshakeError.Reason.TLS_HANDSHAKE)
+
+        # Act & assert
+        assert isinstance(error, RpcError)
+        assert not isinstance(error, TransientRpcError)
 
 
 class TestWorkerConnection:
@@ -436,6 +482,175 @@ class TestWorkerConnection:
 
         # Act & assert
         with pytest.raises(RpcError):
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_handshake_error_when_peer_unauthenticated(
+        self, mocker: MockerFixture, sample_task
+    ):
+        """Test dispatch surfaces a rejected client certificate distinctly.
+
+        Given:
+            A secure connection whose stub raises UNAUTHENTICATED.
+        When:
+            A task is dispatched.
+        Then:
+            It should raise HandshakeError with the PEER_UNAUTHENTICATED
+            reason.
+        """
+
+        # Arrange
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNAUTHENTICATED
+
+            def details(self):
+                return "peer certificate rejected"
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051",
+            credentials=grpc.ssl_channel_credentials(),
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act & assert
+        with pytest.raises(HandshakeError) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        assert exc_info.value.reason is HandshakeError.Reason.PEER_UNAUTHENTICATED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "secure, details, debug, expected_reason",
+        [
+            (
+                True,
+                "",
+                "Ssl handshake: certificate verify failed",
+                HandshakeError.Reason.CERT_VERIFY,
+            ),
+            (
+                True,
+                "certificate has expired",
+                "",
+                HandshakeError.Reason.CERT_VERIFY,
+            ),
+            (
+                True,
+                "",
+                "No match found for server name: wool-worker",
+                HandshakeError.Reason.IDENTITY_MISMATCH,
+            ),
+            (
+                True,
+                "",
+                "wrong version number",
+                HandshakeError.Reason.PLAINTEXT_VS_ENCRYPTED,
+            ),
+            (
+                True,
+                "",
+                "tls handshake eof",
+                HandshakeError.Reason.TLS_HANDSHAKE,
+            ),
+            (
+                False,
+                "",
+                "Ssl handshake failed",
+                HandshakeError.Reason.PLAINTEXT_VS_ENCRYPTED,
+            ),
+        ],
+    )
+    async def test_dispatch_should_raise_handshake_error_when_tls_handshake_fails(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        secure: bool,
+        details: str,
+        debug: str,
+        expected_reason: HandshakeError.Reason,
+    ):
+        """Test dispatch classifies a failed TLS handshake distinctly.
+
+        Given:
+            A connection whose stub raises UNAVAILABLE carrying TLS evidence
+            in its error text.
+        When:
+            A task is dispatched.
+        Then:
+            It should raise HandshakeError with the reason matching the
+            evidence.
+        """
+
+        # Arrange
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNAVAILABLE
+
+            def details(self):
+                return details
+
+            def debug_error_string(self):
+                return debug
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051",
+            credentials=grpc.ssl_channel_credentials() if secure else None,
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act & assert
+        with pytest.raises(HandshakeError) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        assert exc_info.value.reason is expected_reason
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_transient_error_when_unavailable_not_tls(
+        self, mocker: MockerFixture, sample_task
+    ):
+        """Test dispatch keeps a plain unreachable worker transient.
+
+        Given:
+            A connection whose stub raises UNAVAILABLE with no TLS evidence
+            in its error text.
+        When:
+            A task is dispatched.
+        Then:
+            It should raise TransientRpcError and not HandshakeError, so a
+            genuinely unreachable worker is not mistaken for a handshake
+            failure.
+        """
+
+        # Arrange
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNAVAILABLE
+
+            def details(self):
+                return "failed to connect to all addresses"
+
+            def debug_error_string(self):
+                return "failed to connect to all addresses"
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051",
+            credentials=grpc.ssl_channel_credentials(),
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act & assert
+        with pytest.raises(TransientRpcError):
             async for _ in await connection.dispatch(sample_task):
                 pass
 
