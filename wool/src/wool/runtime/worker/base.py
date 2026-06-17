@@ -17,6 +17,7 @@ from typing import runtime_checkable
 import grpc
 
 if TYPE_CHECKING:
+    from wool.runtime.worker.auth import CredentialProviderLike
     from wool.runtime.worker.auth import WorkerCredentials
     from wool.runtime.worker.metadata import WorkerMetadata
 
@@ -153,7 +154,7 @@ class WorkerFactory(Protocol):
     def __call__(
         self,
         *tags: str,
-        credentials: WorkerCredentials | None = None,
+        credentials: WorkerCredentials | CredentialProviderLike | None = None,
         host: str,
     ) -> WorkerLike:
         """Create a new worker instance bound to the given host.
@@ -187,7 +188,7 @@ class BoundWorkerFactory(Protocol):
     def __call__(
         self,
         *tags: str,
-        credentials: WorkerCredentials | None = None,
+        credentials: WorkerCredentials | CredentialProviderLike | None = None,
     ) -> WorkerLike:
         """Create a new worker instance.
 

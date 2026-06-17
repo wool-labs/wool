@@ -26,7 +26,9 @@ from wool import protocol
 from wool.runtime.context import install_task_factory
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import CredentialContext
+from wool.runtime.worker.auth import CredentialProviderLike
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import _coerce_provider
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -63,7 +65,10 @@ class WorkerProcess(Process):
     :param proxy_pool_ttl:
         Proxy pool TTL in seconds.
     :param credentials:
-        Optional worker credentials for TLS/mTLS.
+        Optional worker credentials for TLS/mTLS — either a
+        :class:`WorkerCredentials` or a :class:`CredentialProviderLike`. A
+        reloadable provider serves rotating server credentials via a
+        per-handshake fetcher.
     :param options:
         gRPC message size options. Defaults to
         :class:`WorkerOptions` with 100 MB limits.
@@ -91,7 +96,7 @@ class WorkerProcess(Process):
     _metadata: WorkerMetadata | None
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
-    _credentials: WorkerCredentials | None
+    _provider: CredentialProviderLike | None
     _options: WorkerOptions
 
     def __init__(
@@ -102,7 +107,7 @@ class WorkerProcess(Process):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
-        credentials: WorkerCredentials | None = None,
+        credentials: WorkerCredentials | CredentialProviderLike | None = None,
         options: WorkerOptions | None = None,
         tags: frozenset[str] = frozenset(),
         extra: dict[str, Any] | None = None,
@@ -122,7 +127,7 @@ class WorkerProcess(Process):
         if proxy_pool_ttl <= 0:
             raise ValueError("Proxy pool TTL must be positive")
         self._proxy_pool_ttl = proxy_pool_ttl
-        self._credentials = credentials
+        self._provider = _coerce_provider(credentials)
         self._options = options or WorkerOptions()
         self._uid = uid if uid is not None else uuid.uuid4()
         self._tags = tags
@@ -239,6 +244,44 @@ class WorkerProcess(Process):
             logger.exception(f"Worker process crashed: {type(e).__name__}: {e}")
             raise
 
+    def _server_credentials(self) -> grpc.ServerCredentials | None:
+        """Build the gRPC server credentials for this worker.
+
+        Returns ``None`` for an insecure worker.  A reloadable provider
+        yields :func:`grpc.dynamic_ssl_server_credentials` whose fetcher
+        re-resolves the provider on each new connection, so rotated
+        certificate, key, or CA material is adopted without restarting the
+        worker; established connections continue on their existing
+        material.  A static provider takes the unchanged
+        :meth:`WorkerCredentials.server_credentials` path so the
+        static-mTLS posture is byte-for-byte preserved.  The mutual-TLS
+        mode is fixed from the initial material — rotation replaces the
+        bytes, not the handshake mode.
+
+        :returns:
+            Server credentials, or ``None`` for an insecure worker.
+        """
+        provider = self._provider
+        if provider is None:
+            return None
+        if getattr(provider, "reloadable", False):
+
+            def fetch_certificate_configuration():
+                snapshot = provider.resolve()
+                material = snapshot.credentials
+                return grpc.ssl_server_certificate_configuration(
+                    [(material.worker_key, material.worker_cert)],
+                    root_certificates=(material.ca_cert if material.mutual else None),
+                )
+
+            initial = provider.resolve()
+            return grpc.dynamic_ssl_server_credentials(
+                fetch_certificate_configuration(),
+                fetch_certificate_configuration,
+                require_client_authentication=initial.credentials.mutual,
+            )
+        return provider.resolve().credentials.server_credentials()
+
     async def _serve(self):
         """Run the worker's gRPC server for the lifetime of the process.
 
@@ -248,8 +291,8 @@ class WorkerProcess(Process):
         fires.
         """
         creds_ctx = (
-            CredentialContext(self._credentials)
-            if self._credentials is not None
+            CredentialContext(self._provider)
+            if self._provider is not None
             else contextlib.nullcontext()
         )
         with creds_ctx:
@@ -296,11 +339,7 @@ class WorkerProcess(Process):
             server = grpc.aio.server(
                 interceptors=[VersionInterceptor()], options=grpc_options
             )
-            credentials = (
-                self._credentials.server_credentials()
-                if self._credentials is not None
-                else None
-            )
+            credentials = self._server_credentials()
             address = self._address(self._host, self._port)
 
             if credentials is not None:
@@ -339,7 +378,7 @@ class WorkerProcess(Process):
                         version=protocol.__version__,
                         tags=self._tags,
                         extra=MappingProxyType(self._extra),
-                        secure=self._credentials is not None,
+                        secure=self._provider is not None,
                         options=self._options.channel,
                     )
                     wool.__worker_metadata__ = metadata

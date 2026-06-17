@@ -378,6 +378,15 @@ class StaticCredentialProvider:
         """
         return self._snapshot
 
+    @property
+    def reloadable(self) -> bool:
+        """Whether the material can change over the provider's lifetime.
+
+        Always ``False`` for a static provider, so a worker built from one
+        uses fixed server credentials.
+        """
+        return False
+
 
 # public
 class FileCredentialProvider:
@@ -431,6 +440,15 @@ class FileCredentialProvider:
     def identity(self) -> str | None:
         """The expected server identity, or ``None``."""
         return self._identity
+
+    @property
+    def reloadable(self) -> bool:
+        """Whether the material can change over the provider's lifetime.
+
+        Always ``True`` for a file provider, so a worker built from one
+        serves rotating credentials via a per-handshake fetcher.
+        """
+        return True
 
     def _signature(self) -> tuple[tuple[int, int], ...]:
         """Return a cheap (mtime, size) change signature for the files."""

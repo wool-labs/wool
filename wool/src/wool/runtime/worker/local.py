@@ -7,7 +7,9 @@ from typing import Any
 import grpc.aio
 
 from wool import protocol
+from wool.runtime.worker.auth import CredentialProviderLike
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import _coerce_provider
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.process import WorkerProcess
@@ -60,6 +62,9 @@ class LocalWorker(Worker):
         - :class:`WorkerCredentials`: Provides both server and client
           credentials for mutual TLS. Enables secure worker-to-worker
           communication.
+        - :class:`CredentialProviderLike`: A provider (e.g. from
+          :meth:`WorkerCredentials.provider_from_files`) for identity-based
+          verification or credential rotation without restart.
         - ``None``: Worker uses insecure connections.
     :param options:
         gRPC message size options. Defaults to
@@ -78,7 +83,7 @@ class LocalWorker(Worker):
     """
 
     _worker_process: WorkerProcess
-    _credentials: WorkerCredentials | None
+    _provider: CredentialProviderLike | None
 
     def __init__(
         self,
@@ -87,20 +92,20 @@ class LocalWorker(Worker):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
-        credentials: WorkerCredentials | None = None,
+        credentials: WorkerCredentials | CredentialProviderLike | None = None,
         options: WorkerOptions | None = None,
         backpressure: BackpressureLike | None = None,
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
-        self._credentials = credentials
+        self._provider = _coerce_provider(credentials)
         self._worker_process = WorkerProcess(
             uid=self._uid,
             host=host,
             port=port,
             shutdown_grace_period=shutdown_grace_period,
             proxy_pool_ttl=proxy_pool_ttl,
-            credentials=credentials,
+            credentials=self._provider,
             options=options,
             tags=frozenset(self._tags),
             extra=self._extra,
@@ -142,17 +147,27 @@ class LocalWorker(Worker):
         up the registrar service. If graceful shutdown fails, the process
         is forcefully terminated.
 
-        For workers configured with :class:`WorkerCredentials`, uses
-        the client credentials to establish a secure connection for the
-        stop operation. For insecure workers, uses an insecure channel.
+        For secure workers, resolves the current credential snapshot and
+        establishes a secure connection for the stop operation, applying
+        the configured identity override so the worker's own certificate
+        verifies against its logical identity rather than the loopback
+        address. For insecure workers, uses an insecure channel.
         """
         if self._worker_process.is_alive():
             assert self.address
 
             # Create appropriate channel based on available credentials
-            if self._credentials is not None:
-                credentials = self._credentials.client_credentials()
-                channel = grpc.aio.secure_channel(self.address, credentials)
+            if self._provider is not None:
+                snapshot = self._provider.resolve()
+                credentials = snapshot.credentials.client_credentials()
+                options = (
+                    [("grpc.ssl_target_name_override", snapshot.identity)]
+                    if snapshot.identity is not None
+                    else None
+                )
+                channel = grpc.aio.secure_channel(
+                    self.address, credentials, options=options
+                )
             else:
                 channel = grpc.aio.insecure_channel(self.address)
 

@@ -13,6 +13,8 @@ from hypothesis import strategies as st
 from wool import protocol
 from wool.runtime.worker import process as process_module
 from wool.runtime.worker.auth import CredentialContext
+from wool.runtime.worker.auth import CredentialProviderLike
+from wool.runtime.worker.auth import FileCredentialProvider
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
@@ -1826,15 +1828,15 @@ class TestWorkerProcess:
         assert deserialized.options == channel
 
     def test_run_sets_worker_credentials_contextvar(self, mocker):
-        """Test run sets WorkerCredentials ContextVar when credentials are provided.
+        """Test run binds a credential provider in the context.
 
         Given:
             A WorkerProcess with valid WorkerCredentials.
         When:
             run() is called and the server lifecycle executes.
         Then:
-            WorkerCredentials.current() should return the credentials
-            during the server lifecycle.
+            CredentialContext.current() should return a provider resolving
+            to those credentials during the server lifecycle.
         """
         # Arrange
         dummy_key = (
@@ -1876,7 +1878,9 @@ class TestWorkerProcess:
 
         # Assert
         assert len(captured_current) == 1
-        assert captured_current[0] is creds
+        resolved = captured_current[0]
+        assert isinstance(resolved, CredentialProviderLike)
+        assert resolved.resolve().credentials == creds
 
     def test_run_does_not_set_contextvar_when_credentials_none(self, mocker):
         """Test run does not set WorkerCredentials ContextVar without credentials.
@@ -1922,3 +1926,89 @@ class TestWorkerProcess:
         # Assert
         assert len(captured_current) == 1
         assert captured_current[0] is None
+
+    def test_run_should_use_dynamic_server_credentials_when_reloadable(
+        self, mocker, tmp_path
+    ):
+        """Test a reloading provider serves rotating server credentials.
+
+        Given:
+            A WorkerProcess configured with a reloading file provider.
+        When:
+            run() executes the server lifecycle.
+        Then:
+            It should build dynamic SSL server credentials whose fetcher
+            re-resolves the provider, and bind a secure port.
+        """
+        # Arrange
+        ca = tmp_path / "ca.pem"
+        key = tmp_path / "key.pem"
+        cert = tmp_path / "cert.pem"
+        ca.write_bytes(b"ca")
+        key.write_bytes(b"key")
+        cert.write_bytes(b"cert")
+        provider = FileCredentialProvider(str(ca), str(key), str(cert))
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch.object(process_module, "ResourcePool")
+        mock_server = mocker.MagicMock()
+        mock_server.add_secure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
+        mocker.patch.object(process_module, "_signal_handlers")
+        dynamic_spy = mocker.patch.object(
+            grpc, "dynamic_ssl_server_credentials", return_value=mocker.MagicMock()
+        )
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=provider)
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        dynamic_spy.assert_called_once()
+        mock_server.add_secure_port.assert_called_once()
+
+    def test_run_should_use_static_server_credentials_when_not_reloadable(self, mocker):
+        """Test a static provider keeps the fixed server-credential path.
+
+        Given:
+            A WorkerProcess configured with a bare WorkerCredentials.
+        When:
+            run() executes the server lifecycle.
+        Then:
+            It should bind a secure port without building dynamic SSL
+            server credentials, preserving the static-mTLS posture.
+        """
+        # Arrange
+        creds = WorkerCredentials(ca_cert=b"ca", worker_key=b"key", worker_cert=b"cert")
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch.object(process_module, "ResourcePool")
+        mock_server = mocker.MagicMock()
+        mock_server.add_secure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
+        mocker.patch.object(process_module, "_signal_handlers")
+        dynamic_spy = mocker.patch.object(grpc, "dynamic_ssl_server_credentials")
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        dynamic_spy.assert_not_called()
+        mock_server.add_secure_port.assert_called_once()
