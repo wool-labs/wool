@@ -46,12 +46,6 @@ logger = logging.getLogger(__name__)
 
 _HAS_UDS: Final[bool] = hasattr(socket, "AF_UNIX")
 
-# struct sockaddr_un.sun_path caps a Unix-domain-socket path at 104 bytes on
-# macOS/BSD (108 on Linux); binding an over-long path wedges startup. We use
-# the smaller limit as a portable ceiling and fall back to TCP self-dispatch
-# when a deeply nested $TMPDIR would exceed it.
-_UDS_PATH_MAX: Final[int] = 104
-
 
 class WorkerProcess(Process):
     """Subprocess hosting a gRPC worker server.
@@ -357,35 +351,23 @@ class WorkerProcess(Process):
             uds_dir = None
             if _HAS_UDS:
                 # The loopback self-dispatch socket serves the full,
-                # unauthenticated dispatch service, so confine its
-                # reachability to this worker's own uid: bind it inside a
-                # per-worker 0700 directory (tempfile.mkdtemp), which blocks a
-                # co-located process running as a different user from
-                # connecting even though the socket itself is plaintext. The
-                # directory is already unique per worker, so the socket name is
-                # fixed and short (a per-worker uid in the name would needlessly
-                # consume the tight AF_UNIX path budget).
-                candidate_dir = tempfile.mkdtemp(prefix="wool-")
-                uds_path = os.path.join(candidate_dir, "dispatch.sock")
-                if len(uds_path.encode()) < _UDS_PATH_MAX:
-                    server.add_insecure_port(f"unix:{uds_path}")
-                    uds_dir = candidate_dir
-                    uds_address = f"unix:{uds_path}"
-                else:
-                    # A deeply nested $TMPDIR pushed the path past the socket
-                    # limit; binding it would wedge startup. Degrade to
-                    # TCP-only self-dispatch instead of hanging. (Discovery's
-                    # shared-memory names hit the analogous flat-namespace
-                    # limit and abbreviate via _short_hash; a filesystem path
-                    # can't shorten its $TMPDIR prefix, so we fall back here.)
-                    with contextlib.suppress(OSError):
-                        os.rmdir(candidate_dir)
-                    logger.warning(
-                        "Self-dispatch UDS path would exceed the %d-byte socket "
-                        "limit (%d bytes); using TCP self-dispatch instead.",
-                        _UDS_PATH_MAX,
-                        len(uds_path.encode()),
-                    )
+                # unauthenticated dispatch service, so confine its reachability
+                # to this worker's own uid by binding it inside a per-worker
+                # 0700 directory. Place that directory under a SHORT base —
+                # $XDG_RUNTIME_DIR (the per-user runtime dir on Linux, already
+                # a 0700 tmpfs) where set, else /tmp — rather than the system
+                # temp dir: an AF_UNIX path is capped near 104 bytes (108 on
+                # Linux, as little as 92 on some platforms), and macOS's
+                # per-user $TMPDIR (/var/folders/.../T) is deep enough to
+                # overflow it. Binding under a short directory is the standard
+                # way to stay within that limit.
+                uds_base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+                if not os.path.isdir(uds_base):
+                    uds_base = "/tmp"
+                uds_dir = tempfile.mkdtemp(prefix="wool-", dir=uds_base)
+                uds_path = os.path.join(uds_dir, "dispatch.sock")
+                server.add_insecure_port(f"unix:{uds_path}")
+                uds_address = f"unix:{uds_path}"
 
             backpressure = (
                 cloudpickle.loads(self._backpressure)

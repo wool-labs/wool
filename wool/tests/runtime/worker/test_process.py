@@ -2066,28 +2066,27 @@ class TestWorkerProcess:
     @pytest.mark.skipif(
         not hasattr(socket, "AF_UNIX"), reason="UDS self-dispatch requires AF_UNIX"
     )
-    def test_run_should_skip_uds_when_path_too_long(self, mocker):
-        """Test an over-long UDS path degrades to TCP instead of hanging.
+    def test_run_should_bind_uds_under_short_base_directory(self, mocker):
+        """Test the self-dispatch socket stays within the AF_UNIX path limit.
 
         Given:
-            A worker whose temp directory would push the self-dispatch
-            socket path past the AF_UNIX limit.
+            A worker that opens its self-dispatch socket.
         When:
             run() executes the server lifecycle.
         Then:
-            No Unix-domain port should be bound (self-dispatch falls back to
-            the TCP address), so an over-long path cannot wedge startup.
+            The socket path should be bound under a short base directory
+            (not macOS's deep per-user temp dir) and stay within the
+            portable 92-byte AF_UNIX path budget, so binding never wedges
+            startup.
         """
         # Arrange
-        targets = []
+        captured = {}
 
         def add_insecure_port(target):
-            targets.append(target)
+            if target.startswith("unix:"):
+                captured["path"] = target.removeprefix("unix:")
             return 50051
 
-        mocker.patch.object(
-            process_module.tempfile, "mkdtemp", return_value="/tmp/" + "x" * 200
-        )
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
         mocker.patch.object(process_module, "ResourcePool")
         mock_server = mocker.MagicMock()
@@ -2108,4 +2107,5 @@ class TestWorkerProcess:
         process.run()
 
         # Assert
-        assert not any(target.startswith("unix:") for target in targets)
+        assert "path" in captured
+        assert len(captured["path"].encode()) <= 92
