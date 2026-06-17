@@ -46,6 +46,12 @@ logger = logging.getLogger(__name__)
 
 _HAS_UDS: Final[bool] = hasattr(socket, "AF_UNIX")
 
+# struct sockaddr_un.sun_path caps a Unix-domain-socket path at 104 bytes on
+# macOS/BSD (108 on Linux); binding an over-long path wedges startup. We use
+# the smaller limit as a portable ceiling and fall back to TCP self-dispatch
+# when a deeply nested $TMPDIR would exceed it.
+_UDS_PATH_MAX: Final[int] = 104
+
 
 class WorkerProcess(Process):
     """Subprocess hosting a gRPC worker server.
@@ -355,16 +361,31 @@ class WorkerProcess(Process):
                 # reachability to this worker's own uid: bind it inside a
                 # per-worker 0700 directory (tempfile.mkdtemp), which blocks a
                 # co-located process running as a different user from
-                # connecting even though the socket itself is plaintext.
-                # The mkdtemp directory is already unique per worker, so the
-                # socket name is fixed and short — a per-worker uid here would
-                # risk exceeding the AF_UNIX path limit (~104 bytes on macOS)
-                # once nested under the temp directory.
-                uds_dir = tempfile.mkdtemp(prefix="wool-")
-                uds_path = os.path.join(uds_dir, "dispatch.sock")
-                uds_target = f"unix:{uds_path}"
-                server.add_insecure_port(uds_target)
-                uds_address = uds_target
+                # connecting even though the socket itself is plaintext. The
+                # directory is already unique per worker, so the socket name is
+                # fixed and short (a per-worker uid in the name would needlessly
+                # consume the tight AF_UNIX path budget).
+                candidate_dir = tempfile.mkdtemp(prefix="wool-")
+                uds_path = os.path.join(candidate_dir, "dispatch.sock")
+                if len(uds_path.encode()) < _UDS_PATH_MAX:
+                    server.add_insecure_port(f"unix:{uds_path}")
+                    uds_dir = candidate_dir
+                    uds_address = f"unix:{uds_path}"
+                else:
+                    # A deeply nested $TMPDIR pushed the path past the socket
+                    # limit; binding it would wedge startup. Degrade to
+                    # TCP-only self-dispatch instead of hanging. (Discovery's
+                    # shared-memory names hit the analogous flat-namespace
+                    # limit and abbreviate via _short_hash; a filesystem path
+                    # can't shorten its $TMPDIR prefix, so we fall back here.)
+                    with contextlib.suppress(OSError):
+                        os.rmdir(candidate_dir)
+                    logger.warning(
+                        "Self-dispatch UDS path would exceed the %d-byte socket "
+                        "limit (%d bytes); using TCP self-dispatch instead.",
+                        _UDS_PATH_MAX,
+                        len(uds_path.encode()),
+                    )
 
             backpressure = (
                 cloudpickle.loads(self._backpressure)

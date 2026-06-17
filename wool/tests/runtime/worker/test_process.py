@@ -2062,3 +2062,50 @@ class TestWorkerProcess:
 
         # Assert
         assert captured.get("mode") == 0o700
+
+    @pytest.mark.skipif(
+        not hasattr(socket, "AF_UNIX"), reason="UDS self-dispatch requires AF_UNIX"
+    )
+    def test_run_should_skip_uds_when_path_too_long(self, mocker):
+        """Test an over-long UDS path degrades to TCP instead of hanging.
+
+        Given:
+            A worker whose temp directory would push the self-dispatch
+            socket path past the AF_UNIX limit.
+        When:
+            run() executes the server lifecycle.
+        Then:
+            No Unix-domain port should be bound (self-dispatch falls back to
+            the TCP address), so an over-long path cannot wedge startup.
+        """
+        # Arrange
+        targets = []
+
+        def add_insecure_port(target):
+            targets.append(target)
+            return 50051
+
+        mocker.patch.object(
+            process_module.tempfile, "mkdtemp", return_value="/tmp/" + "x" * 200
+        )
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch.object(process_module, "ResourcePool")
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(side_effect=add_insecure_port)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
+        mocker.patch.object(process_module, "_signal_handlers")
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        assert not any(target.startswith("unix:") for target in targets)
