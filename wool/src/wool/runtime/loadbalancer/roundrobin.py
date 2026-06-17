@@ -111,14 +111,9 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                     self._index[context] = self._index[context] + 1
                     continue
                 except HandshakeError as exc:
-                    # A failed secure handshake is recoverable: the worker may
-                    # adopt rotated credentials out of band. Skip it without
-                    # eviction (like a transient error) so a later dispatch
-                    # retries with freshly-resolved credentials. The
-                    # per-rejection warning — carrying the classified reason —
-                    # is the observability surface; aggregating handshake
-                    # failures across a drained dispatch is deferred to a
-                    # future generic mechanism (see #249 follow-up).
+                    # Skip without eviction; the warning is the observability
+                    # surface — see HandshakeError for the recoverability
+                    # contract.
                     logger.warning(
                         "Skipping worker %s at %s after handshake failure (%s): %s",
                         metadata.uid,

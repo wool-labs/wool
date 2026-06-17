@@ -18,13 +18,11 @@ if TYPE_CHECKING:
 class NoWorkersAvailable(Exception):
     """Raised when no workers are available for task dispatch.
 
-    This exception indicates that either no workers exist in the worker pool
-    or all available workers have been tried and failed — including when
-    every worker tried failed the secure handshake. A failed handshake is
-    recoverable (the worker may adopt rotated credentials out of band), so
-    the load balancer skips it without eviction and logs the classified
-    reason; surfacing the per-worker failures programmatically is deferred
-    to a future generic mechanism.
+    Either the pool is empty, or every worker tried was unusable. A worker
+    that fails the secure handshake is skipped without eviction (see
+    `HandshakeError`), so a pool that drains entirely on handshake failures
+    still raises this bare condition, leaving those workers in place to
+    recover on a later dispatch.
     """
 
 

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import pickle
 from uuid import uuid4
 
 import pytest
@@ -67,6 +68,28 @@ def dispatch_side_effects(
 
 
 class TestRoundRobinLoadBalancer:
+    def test_should_pickle_to_a_fresh_balancer(self):
+        """Test the load balancer survives a serialization round-trip.
+
+        Given:
+            A RoundRobinLoadBalancer.
+        When:
+            It is pickled and restored.
+        Then:
+            A distinct balancer of the same type is reconstructed — its
+            per-context cursor state is process-local and intentionally not
+            carried across the boundary.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+
+        # Act
+        restored = pickle.loads(pickle.dumps(lb))
+
+        # Assert
+        assert isinstance(restored, RoundRobinLoadBalancer)
+        assert restored is not lb
+
     def test_isinstance_satisfies_protocol(self):
         """Test RoundRobinLoadBalancer satisfies the
         LoadBalancerLike protocol.

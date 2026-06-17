@@ -656,28 +656,28 @@ class HandshakeError(RpcError):
     """Raised when the secure handshake with a worker cannot be completed.
 
     A handshake error means the worker is reachable but the TLS/mTLS
-    handshake or peer authentication failed — a wrong certificate
+    handshake or peer authentication failed, e.g., a wrong certificate
     authority, an identity that does not match what the client expects, an
     expired or otherwise rejected certificate, or a plaintext-versus-
     encrypted mismatch.  It is a *distinct, diagnosable* condition: an
     operator can tell "workers are present but refused, or were refused by,
     my credentials" apart from "no workers are present".
 
-    **Worker-health classification.** :class:`HandshakeError` is a
-    non-transient :class:`RpcError`, so the load balancer evicts the
-    offending worker exactly as it does for any other non-transient
-    failure — a worker the client cannot authenticate with is not a viable
-    dispatch target.  Unlike a generic :class:`RpcError`, the load balancer
-    records it so that a pool which drained entirely because every worker
-    failed the handshake surfaces a distinct signal instead of collapsing
-    into the bare "no workers available" condition.
+    **Worker-health classification.** `HandshakeError` is a non-transient
+    `RpcError`, but a failed handshake is *recoverable* — the worker may
+    adopt rotated credentials out of band — so the load balancer treats it
+    like a transient error rather than evicting: it skips the worker
+    without removing it from the pool, leaving it to recover on a later
+    dispatch once its credentials resolve.  Each rejection is logged as a
+    warning carrying the classified `Reason`; that log is the observability
+    surface for diagnosing a fleet-wide credential misconfiguration.
 
     :param code:
         The gRPC status code, if available.
     :param details:
         The gRPC error details, if available.
     :param reason:
-        The :class:`Reason` classifying the failure.
+        The `Reason` classifying the failure.
     """
 
     class Reason(enum.Enum):
@@ -685,7 +685,7 @@ class HandshakeError(RpcError):
 
         The reason is advisory diagnostic metadata derived from the gRPC
         status code and error text; the load-bearing signal is the
-        :class:`HandshakeError` type itself.
+        `HandshakeError` type itself.
         """
 
         TLS_HANDSHAKE = "tls_handshake"
