@@ -266,18 +266,18 @@ class WorkerProcess(Process):
             return None
         if getattr(provider, "reloadable", False):
 
-            def fetch_certificate_configuration():
-                snapshot = provider.resolve()
-                material = snapshot.credentials
+            def certificate_configuration(material):
                 return grpc.ssl_server_certificate_configuration(
                     [(material.worker_key, material.worker_cert)],
                     root_certificates=(material.ca_cert if material.mutual else None),
                 )
 
+            # Resolve once for the initial config and the (fixed) mutual-TLS
+            # mode; the fetcher re-resolves per new connection for rotation.
             initial = provider.resolve()
             return grpc.dynamic_ssl_server_credentials(
-                fetch_certificate_configuration(),
-                fetch_certificate_configuration,
+                certificate_configuration(initial.credentials),
+                lambda: certificate_configuration(provider.resolve().credentials),
                 require_client_authentication=initial.credentials.mutual,
             )
         return provider.resolve().credentials.server_credentials()
@@ -348,11 +348,21 @@ class WorkerProcess(Process):
                 port = server.add_insecure_port(address)
 
             uds_address = None
+            uds_dir = None
             if _HAS_UDS:
-                uds_path = os.path.join(tempfile.gettempdir(), f"wool-{self._uid}.sock")
+                # The loopback self-dispatch socket serves the full,
+                # unauthenticated dispatch service, so confine its
+                # reachability to this worker's own uid: bind it inside a
+                # per-worker 0700 directory (tempfile.mkdtemp), which blocks a
+                # co-located process running as a different user from
+                # connecting even though the socket itself is plaintext.
+                # The mkdtemp directory is already unique per worker, so the
+                # socket name is fixed and short — a per-worker uid here would
+                # risk exceeding the AF_UNIX path limit (~104 bytes on macOS)
+                # once nested under the temp directory.
+                uds_dir = tempfile.mkdtemp(prefix="wool-")
+                uds_path = os.path.join(uds_dir, "dispatch.sock")
                 uds_target = f"unix:{uds_path}"
-                with contextlib.suppress(OSError):
-                    os.unlink(uds_path)
                 server.add_insecure_port(uds_target)
                 uds_address = uds_target
 
@@ -403,6 +413,9 @@ class WorkerProcess(Process):
                         uds_path = uds_address.removeprefix("unix:")
                         with contextlib.suppress(OSError):
                             os.unlink(uds_path)
+                        if uds_dir is not None:
+                            with contextlib.suppress(OSError):
+                                os.rmdir(uds_dir)
 
     def _address(self, host, port) -> str:
         """Format network address for the given host and port.

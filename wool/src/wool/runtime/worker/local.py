@@ -140,12 +140,11 @@ class LocalWorker(Worker):
             raise RuntimeError("Worker process failed to start - no metadata")
 
     async def _stop(self, timeout: float | None):
-        """Stop the worker process and unregister it from the pool.
+        """Stop the worker process via a gRPC stop request.
 
-        Unregisters the worker from the registrar service, gracefully
-        shuts down the worker process using a gRPC stop request, and cleans
-        up the registrar service. If graceful shutdown fails, the process
-        is forcefully terminated.
+        Sends the worker a ``stop`` RPC and lets it drain and shut down its
+        gRPC server within the configured grace period. Does nothing if the
+        process is not alive.
 
         For secure workers, resolves the current credential snapshot and
         establishes a secure connection for the stop operation, applying

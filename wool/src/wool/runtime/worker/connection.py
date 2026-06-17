@@ -1077,9 +1077,7 @@ class WorkerConnection:
             # so the load balancer does not collapse it into a generic
             # "no workers available" outcome. Non-handshake failures fall
             # through to the unchanged transient/non-transient split.
-            handshake = _classify_handshake_failure(
-                error, secure=self._provider is not None
-            )
+            handshake = _classify_handshake_failure(error, secure=key[1] is not None)
             if handshake is not None:
                 raise handshake from error
             if code in self.TRANSIENT_ERRORS:

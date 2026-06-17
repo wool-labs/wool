@@ -295,7 +295,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 ### Connection pooling
 
-`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`.
+`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credential fingerprint, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Keying on a content fingerprint rather than a credentials object is what lets rotated material yield a fresh channel while unchanged material reuses the pooled one (see _Security_). Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`.
 
 ### Transport configuration
 
@@ -397,3 +397,7 @@ async with wool.WorkerPool(spawn=4, credentials=provider):
 - **Rotation without restart.** A reloading provider re-reads its PEM files when they change on disk. The client channel pool is keyed by a content fingerprint, so unchanged material reuses pooled channels while rotated material yields fresh ones on the next connection; in-flight dispatches finish on their existing channel. The worker server adopts rotated material per new connection via `grpc.dynamic_ssl_server_credentials`. Rotation replaces the cert/key/CA bytes — not the mutual-TLS mode, which is fixed at startup.
 
 Providers are picklable: one supplied to a worker crosses into the worker subprocess, while the proxy re-resolves its provider from the ambient credential context (it is never serialized across the dispatch boundary).
+
+### Local self-dispatch socket
+
+For nested routines that dispatch back to the worker's own address, the worker exposes an additional **insecure** Unix-domain-socket port and routes self-dispatch over it (a worker never does TLS against itself). That socket serves the full dispatch service with no transport authentication, so its reachability is confined to the worker's own user: it is bound inside a per-worker `0700` directory under the system temp dir. This assumes the local host is a trust boundary — any process running as the same uid can dispatch to the worker over the socket. On a shared or multi-tenant host, isolate workers by uid (or container/network namespace) accordingly.

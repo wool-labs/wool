@@ -1,4 +1,7 @@
+import os
 import signal
+import socket
+import stat
 import uuid
 from types import MappingProxyType
 
@@ -2013,3 +2016,49 @@ class TestWorkerProcess:
         # Assert
         dynamic_spy.assert_not_called()
         mock_server.add_secure_port.assert_called_once()
+
+    @pytest.mark.skipif(
+        not hasattr(socket, "AF_UNIX"), reason="UDS self-dispatch requires AF_UNIX"
+    )
+    def test_run_should_bind_uds_socket_in_private_directory(self, mocker):
+        """Test the self-dispatch UDS socket is not world-reachable.
+
+        Given:
+            A worker process that opens its insecure self-dispatch socket.
+        When:
+            run() executes the server lifecycle.
+        Then:
+            The socket should be bound inside a per-worker 0700 directory,
+            so a co-located process under another uid cannot connect to the
+            unauthenticated dispatch service.
+        """
+        # Arrange
+        captured = {}
+
+        def add_insecure_port(target):
+            if target.startswith("unix:"):
+                sock_dir = os.path.dirname(target.removeprefix("unix:"))
+                captured["mode"] = stat.S_IMODE(os.stat(sock_dir).st_mode)
+            return 50051
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch.object(process_module, "ResourcePool")
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(side_effect=add_insecure_port)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
+        mocker.patch.object(process_module, "_signal_handlers")
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        assert captured.get("mode") == 0o700
