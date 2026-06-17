@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+import threading
 from contextvars import ContextVar
 from contextvars import Token
 from dataclasses import dataclass
@@ -12,6 +14,8 @@ from typing import runtime_checkable
 
 if TYPE_CHECKING:
     import grpc
+
+_log = logging.getLogger(__name__)
 
 _current: ContextVar[WorkerCredentials | CredentialProviderLike | None] = ContextVar(
     "worker_credentials", default=None
@@ -388,6 +392,30 @@ class StaticCredentialProvider:
         return False
 
 
+def _validate_material(credentials: WorkerCredentials) -> None:
+    """Parse the PEM material to reject readable-but-malformed bytes.
+
+    :class:`WorkerCredentials.from_files` reads raw bytes without parsing,
+    so a non-atomic rotation that leaves a truncated or garbage — but
+    readable — PEM would otherwise be cached as the current snapshot and
+    only fail later, opaquely, at the handshake.  Parsing here lets the
+    reloading provider keep its prior good material instead.
+
+    :param credentials:
+        The freshly-read credential material.
+    :raises ValueError:
+        If the CA bundle, certificate, or private key is not valid PEM.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.x509 import load_pem_x509_certificates
+
+    if not load_pem_x509_certificates(credentials.ca_cert):
+        raise ValueError("CA bundle contains no certificates")
+    if not load_pem_x509_certificates(credentials.worker_cert):
+        raise ValueError("worker certificate contains no certificates")
+    serialization.load_pem_private_key(credentials.worker_key, password=None)
+
+
 # public
 class FileCredentialProvider:
     """A provider that re-reads PEM files as they are rotated.
@@ -434,7 +462,12 @@ class FileCredentialProvider:
         self._mutual = mutual
         self._identity = identity
         self._cached_snapshot: CredentialSnapshot | None = None
-        self._cached_signature: tuple[tuple[int, int], ...] | None = None
+        self._cached_signature: tuple[tuple[int, int, int, int], ...] | None = None
+        # The server-side fetcher consults resolve() from a gRPC C-core
+        # thread, off the asyncio loop, concurrently with client-side
+        # dispatch — so guard the read-compare-write with a threading (not
+        # asyncio) lock. Excluded from __getstate__; recreated on unpickle.
+        self._lock = threading.Lock()
 
     @property
     def identity(self) -> str | None:
@@ -450,57 +483,90 @@ class FileCredentialProvider:
         """
         return True
 
-    def _signature(self) -> tuple[tuple[int, int], ...]:
-        """Return a cheap (mtime, size) change signature for the files."""
+    def _signature(self) -> tuple[tuple[int, int, int, int], ...]:
+        """Return a cheap change signature for the files.
+
+        Includes ``st_ino`` and ``st_ctime_ns`` alongside ``(mtime, size)``
+        so an inode swap (atomic rename) and a same-size in-place content
+        rewrite — which bumps ctime even if mtime is forced back — are both
+        detected, not just an mtime/size change.
+        """
         signature = []
         for path in (self._ca_path, self._key_path, self._cert_path):
             stat = os.stat(path)
-            signature.append((stat.st_mtime_ns, stat.st_size))
+            signature.append(
+                (stat.st_mtime_ns, stat.st_size, stat.st_ino, stat.st_ctime_ns)
+            )
         return tuple(signature)
 
     def resolve(self) -> CredentialSnapshot:
         """Return the current credential snapshot, re-reading on change.
 
+        On a transient read failure or readable-but-malformed material
+        during a rotation, a prior good snapshot is kept (and a warning is
+        logged) rather than caching broken bytes, so an in-progress
+        rotation never tears the fleet down nor silently adopts garbage.
+
         :returns:
             The current :class:`CredentialSnapshot`.  Reuses the cached
-            snapshot when the files are unchanged or when a re-read fails
-            and a prior snapshot exists.
+            snapshot when the files are unchanged, or on a failed re-read
+            when a prior snapshot exists.
         :raises OSError:
             If the files cannot be read and no prior snapshot exists.
+        :raises ValueError:
+            If the material is malformed and no prior snapshot exists.
         """
-        try:
-            # Cheap stat gate: only re-read when the files look changed.
-            signature = self._signature()
-        except OSError:
-            if self._cached_snapshot is not None:
+        with self._lock:
+            try:
+                # Cheap stat gate: only re-read when the files look changed.
+                signature = self._signature()
+            except OSError as exc:
+                return self._fallback_or_raise(exc)
+            if signature == self._cached_signature and self._cached_snapshot is not None:
                 return self._cached_snapshot
-            raise
-        if signature == self._cached_signature and self._cached_snapshot is not None:
-            return self._cached_snapshot
-        try:
-            credentials = WorkerCredentials.from_files(
-                ca_path=self._ca_path,
-                key_path=self._key_path,
-                cert_path=self._cert_path,
-                mutual=self._mutual,
+            try:
+                credentials = WorkerCredentials.from_files(
+                    ca_path=self._ca_path,
+                    key_path=self._key_path,
+                    cert_path=self._cert_path,
+                    mutual=self._mutual,
+                )
+                # Validate before caching so a readable-but-truncated PEM
+                # never overwrites the last good snapshot.
+                _validate_material(credentials)
+            except (OSError, ValueError) as exc:
+                return self._fallback_or_raise(exc)
+            snapshot = CredentialSnapshot.of(credentials, self._identity)
+            self._cached_snapshot = snapshot
+            self._cached_signature = signature
+            return snapshot
+
+    def _fallback_or_raise(self, exc: Exception) -> CredentialSnapshot:
+        """Return the last good snapshot, logging, or re-raise if none."""
+        if self._cached_snapshot is not None:
+            _log.warning(
+                "Credential reload failed for %s; serving the last good "
+                "material until it succeeds: %s",
+                self._cert_path,
+                exc,
             )
-        except OSError:
-            if self._cached_snapshot is not None:
-                return self._cached_snapshot
-            raise
-        snapshot = CredentialSnapshot.of(credentials, self._identity)
-        self._cached_snapshot = snapshot
-        self._cached_signature = signature
-        return snapshot
+            return self._cached_snapshot
+        raise exc
 
     def __getstate__(self) -> dict:
         # Drop the cache so a pickled provider (e.g. crossing into a worker
         # subprocess) re-reads the live files rather than carrying a stale
-        # snapshot from the originating process.
+        # snapshot from the originating process. The lock is process-local
+        # and not picklable, so drop it too and recreate on unpickle.
         state = self.__dict__.copy()
         state["_cached_snapshot"] = None
         state["_cached_signature"] = None
+        state.pop("_lock", None)
         return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
 
 
 def _coerce_provider(

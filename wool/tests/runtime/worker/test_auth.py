@@ -1,5 +1,7 @@
 import datetime
+import logging
 import os
+import threading
 from dataclasses import FrozenInstanceError
 
 import cloudpickle
@@ -1055,7 +1057,9 @@ class TestFileCredentialProvider:
         assert after is not before
         assert after.fingerprint != before.fingerprint
 
-    def test_resolve_should_return_last_good_when_reread_fails(self, temp_cert_files):
+    def test_resolve_should_return_last_good_when_reread_fails(
+        self, temp_cert_files, caplog
+    ):
         """Test a file provider survives a failed re-read mid-rotation.
 
         Given:
@@ -1064,7 +1068,8 @@ class TestFileCredentialProvider:
         When:
             resolve() is called again.
         Then:
-            It should return the last good snapshot rather than raising.
+            It should return the last good snapshot rather than raising, and
+            log a warning so the stuck rotation is diagnosable.
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
@@ -1078,12 +1083,124 @@ class TestFileCredentialProvider:
         os.utime(ca_path, ns=(rotated_mtime, rotated_mtime))
         os.chmod(ca_path, 0o000)
         try:
-            after = provider.resolve()
+            with caplog.at_level(logging.WARNING):
+                after = provider.resolve()
         finally:
             os.chmod(ca_path, 0o644)
 
         # Assert
         assert after is before
+        assert "reload failed" in caplog.text.lower()
+
+    def test_resolve_should_keep_last_good_when_material_invalid(self, temp_cert_files):
+        """Test a readable-but-malformed rotation never overwrites good material.
+
+        Given:
+            A file provider that has resolved once, then whose certificate
+            file is replaced with a readable but malformed PEM.
+        When:
+            resolve() is called again.
+        Then:
+            It should keep the prior good snapshot rather than caching the
+            broken material (which would only fail later at the handshake).
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        before = provider.resolve()
+
+        # Act
+        rotated_mtime = os.stat(cert_path).st_mtime_ns + 1_000_000_000
+        with open(cert_path, "wb") as f:
+            f.write(
+                b"-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n"
+            )
+        os.utime(cert_path, ns=(rotated_mtime, rotated_mtime))
+        after = provider.resolve()
+
+        # Assert
+        assert after is before
+
+    def test_resolve_should_detect_same_size_rewrite_with_reset_mtime(
+        self, temp_cert_files
+    ):
+        """Test an in-place rewrite is detected even when mtime is reset.
+
+        Given:
+            A file provider over a CA file, and a same-size in-place rewrite
+            whose mtime is forced back to the prior value (the (mtime,size)
+            spoof an attacker or a non-atomic writer could produce).
+        When:
+            resolve() is called again.
+        Then:
+            It should still detect the change and return a new snapshot,
+            because the change signature also tracks ctime/inode.
+        """
+        # Arrange — two same-size payloads differing only in trailing bytes
+        # outside the PEM block (ignored by the parser, so both validate).
+        ca_path, key_path, cert_path = temp_cert_files
+        with open(ca_path, "rb") as f:
+            ca_pem = f.read()
+        with open(ca_path, "wb") as f:
+            f.write(ca_pem + b"\n" * 16)
+        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        before = provider.resolve()
+        original_mtime = os.stat(ca_path).st_mtime_ns
+
+        # Act
+        with open(ca_path, "wb") as f:
+            f.write(ca_pem + b"\n" * 15 + b"#")
+        os.utime(ca_path, ns=(original_mtime, original_mtime))
+        after = provider.resolve()
+
+        # Assert
+        assert after.fingerprint != before.fingerprint
+
+    def test_resolve_should_be_thread_safe_under_rotation(self, temp_cert_files):
+        """Test concurrent resolves during rotation stay consistent.
+
+        Given:
+            A file provider resolved concurrently from several threads while
+            its CA file is rewritten repeatedly.
+        When:
+            Each thread resolves many times.
+        Then:
+            No resolve should raise, and every returned snapshot should be
+            internally consistent (its material recomputes its fingerprint).
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        with open(ca_path, "rb") as f:
+            ca_pem = f.read()
+        provider = FileCredentialProvider(ca_path, key_path, cert_path)
+        errors: list[Exception] = []
+        snapshots: list = []
+
+        def resolver():
+            try:
+                for _ in range(25):
+                    snapshots.append(provider.resolve())
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def rotator():
+            for i in range(25):
+                with open(ca_path, "wb") as f:
+                    f.write(ca_pem + b"\n" * (i % 8))
+
+        # Act
+        threads = [threading.Thread(target=resolver) for _ in range(6)]
+        threads.append(threading.Thread(target=rotator))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        # Assert
+        assert not errors
+        for snapshot in snapshots:
+            recomputed = CredentialSnapshot.of(snapshot.credentials, snapshot.identity)
+            assert snapshot.fingerprint == recomputed.fingerprint
 
     def test_resolve_should_raise_when_first_read_fails(self):
         """Test a file provider propagates an initial read failure.

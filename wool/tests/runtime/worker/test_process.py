@@ -1928,7 +1928,7 @@ class TestWorkerProcess:
         assert captured_current[0] is None
 
     def test_run_should_use_dynamic_server_credentials_when_reloadable(
-        self, mocker, tmp_path
+        self, mocker, tmp_path, test_certificates
     ):
         """Test a reloading provider serves rotating server credentials.
 
@@ -1941,12 +1941,13 @@ class TestWorkerProcess:
             re-resolves the provider, and bind a secure port.
         """
         # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
         ca = tmp_path / "ca.pem"
         key = tmp_path / "key.pem"
         cert = tmp_path / "cert.pem"
-        ca.write_bytes(b"ca")
-        key.write_bytes(b"key")
-        cert.write_bytes(b"cert")
+        ca.write_bytes(ca_pem)
+        key.write_bytes(key_pem)
+        cert.write_bytes(cert_pem)
         provider = FileCredentialProvider(str(ca), str(key), str(cert))
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")

@@ -857,6 +857,7 @@ class TestWorkerConnection:
         async_stream,
         mock_grpc_call,
         tmp_path,
+        test_certificates,
     ):
         """Test rotated credential material yields a fresh channel.
 
@@ -870,13 +871,15 @@ class TestWorkerConnection:
             resolves to a new fingerprint and a new pooled channel, while
             the original channel remains for in-flight work.
         """
-        # Arrange
+        # Arrange — real PEM so the provider's validate-before-cache passes;
+        # rotation appends ignored trailing bytes for a distinct fingerprint.
+        key_pem, cert_pem, ca_pem = test_certificates
         ca_path = tmp_path / "ca.pem"
         key_path = tmp_path / "key.pem"
         cert_path = tmp_path / "cert.pem"
-        ca_path.write_bytes(b"ca-v1")
-        key_path.write_bytes(b"key")
-        cert_path.write_bytes(b"cert")
+        ca_path.write_bytes(ca_pem)
+        key_path.write_bytes(key_pem)
+        cert_path.write_bytes(cert_pem)
         provider = FileCredentialProvider(str(ca_path), str(key_path), str(cert_path))
 
         mock_channel = mocker.AsyncMock()
@@ -900,7 +903,7 @@ class TestWorkerConnection:
         async for _ in await connection.dispatch(sample_task):
             pass
         rotated_mtime = os.stat(ca_path).st_mtime_ns + 1_000_000_000
-        ca_path.write_bytes(b"ca-v2-rotated")
+        ca_path.write_bytes(ca_pem + b"\n# rotated\n")
         os.utime(ca_path, ns=(rotated_mtime, rotated_mtime))
         async for _ in await connection.dispatch(sample_task):
             pass
