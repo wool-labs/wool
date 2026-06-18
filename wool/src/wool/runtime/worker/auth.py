@@ -246,7 +246,7 @@ def _normalize_identity(identity: str | None) -> str | None:
 
 # public
 @dataclass(frozen=True)
-class CredentialsSnapshot:
+class WorkerCredentialsSnapshot:
     """An immutable, fingerprinted view of credential material.
 
     Resolved from a `WorkerCredentialsProvider`, a snapshot bundles the
@@ -270,7 +270,7 @@ class CredentialsSnapshot:
     @classmethod
     def of(
         cls, credentials: WorkerCredentials, identity: str | None = None
-    ) -> CredentialsSnapshot:
+    ) -> WorkerCredentialsSnapshot:
         """Build a snapshot, computing its fingerprint.
 
         :param credentials:
@@ -294,7 +294,7 @@ class WorkerCredentialsProvider:
 
     The provider is a thin adapter: ``fetch`` returns the current
     `WorkerCredentials`, and the provider stamps the expected ``identity``
-    onto a fingerprinted `CredentialsSnapshot`. Every source-specific
+    onto a fingerprinted `WorkerCredentialsSnapshot`. Every source-specific
     concern — change detection, returning cached material when nothing has
     changed, validation, and failure handling — belongs to ``fetch``, which
     keeps the provider itself a pass-through. `WorkerCredentials.as_provider`
@@ -341,8 +341,10 @@ class WorkerCredentialsProvider:
         # A non-reloadable provider resolves eagerly so the snapshot — not
         # the callback — is what crosses into worker subprocesses (see
         # __getstate__); a reloadable provider defers to resolve().
-        self._snapshot: CredentialsSnapshot | None = (
-            None if self._reloadable else CredentialsSnapshot.of(fetch(), self._identity)
+        self._snapshot: WorkerCredentialsSnapshot | None = (
+            None
+            if self._reloadable
+            else WorkerCredentialsSnapshot.of(fetch(), self._identity)
         )
 
     @property
@@ -360,7 +362,7 @@ class WorkerCredentialsProvider:
         """
         return self._reloadable
 
-    def resolve(self) -> CredentialsSnapshot:
+    def resolve(self) -> WorkerCredentialsSnapshot:
         """Return the current credential snapshot.
 
         A non-reloadable provider returns the snapshot captured at
@@ -370,11 +372,11 @@ class WorkerCredentialsProvider:
         channel and only the re-read is paid for by ``fetch``.
 
         :returns:
-            The current `CredentialsSnapshot`.
+            The current `WorkerCredentialsSnapshot`.
         """
         if self._snapshot is not None:
             return self._snapshot
-        return CredentialsSnapshot.of(self._fetch(), self._identity)
+        return WorkerCredentialsSnapshot.of(self._fetch(), self._identity)
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()

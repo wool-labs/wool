@@ -20,9 +20,9 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool.runtime.worker.auth import CredentialsContext
-from wool.runtime.worker.auth import CredentialsSnapshot
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import WorkerCredentialsSnapshot
 
 
 def _generate_test_certificates():
@@ -710,8 +710,8 @@ class TestWorkerCredentials:
             WorkerCredentials.current()
 
 
-class TestCredentialsSnapshot:
-    """Test suite for CredentialsSnapshot fingerprinting."""
+class TestWorkerCredentialsSnapshot:
+    """Test suite for WorkerCredentialsSnapshot fingerprinting."""
 
     def test_of_should_compute_fingerprint(self, test_certificates):
         """Test snapshot construction computes a fingerprint.
@@ -719,7 +719,7 @@ class TestCredentialsSnapshot:
         Given:
             Credential material and an expected identity.
         When:
-            CredentialsSnapshot.of() is called.
+            WorkerCredentialsSnapshot.of() is called.
         Then:
             It should return a snapshot carrying the material, identity, and
             a non-empty fingerprint.
@@ -731,7 +731,7 @@ class TestCredentialsSnapshot:
         )
 
         # Act
-        snapshot = CredentialsSnapshot.of(creds, "wool-worker")
+        snapshot = WorkerCredentialsSnapshot.of(creds, "wool-worker")
 
         # Assert
         assert snapshot.credentials == creds
@@ -762,8 +762,8 @@ class TestCredentialsSnapshot:
         creds_b = WorkerCredentials(ca_cert=ca, worker_key=key, worker_cert=cert)
 
         # Act
-        fingerprint_a = CredentialsSnapshot.of(creds_a, identity).fingerprint
-        fingerprint_b = CredentialsSnapshot.of(creds_b, identity).fingerprint
+        fingerprint_a = WorkerCredentialsSnapshot.of(creds_a, identity).fingerprint
+        fingerprint_b = WorkerCredentialsSnapshot.of(creds_b, identity).fingerprint
 
         # Assert
         assert fingerprint_a == fingerprint_b
@@ -787,8 +787,8 @@ class TestCredentialsSnapshot:
         rotated = WorkerCredentials(ca_cert=other_ca, worker_key=key, worker_cert=cert)
 
         # Act
-        fingerprint = CredentialsSnapshot.of(creds).fingerprint
-        rotated_fingerprint = CredentialsSnapshot.of(rotated).fingerprint
+        fingerprint = WorkerCredentialsSnapshot.of(creds).fingerprint
+        rotated_fingerprint = WorkerCredentialsSnapshot.of(rotated).fingerprint
 
         # Assert
         assert fingerprint != rotated_fingerprint
@@ -810,8 +810,8 @@ class TestCredentialsSnapshot:
         )
 
         # Act
-        fingerprint_a = CredentialsSnapshot.of(creds, "worker-a").fingerprint
-        fingerprint_b = CredentialsSnapshot.of(creds, "worker-b").fingerprint
+        fingerprint_a = WorkerCredentialsSnapshot.of(creds, "worker-a").fingerprint
+        fingerprint_b = WorkerCredentialsSnapshot.of(creds, "worker-b").fingerprint
 
         # Assert
         assert fingerprint_a != fingerprint_b
@@ -836,14 +836,14 @@ class TestCredentialsSnapshot:
         )
 
         # Act
-        mtls_fingerprint = CredentialsSnapshot.of(mtls).fingerprint
-        one_way_fingerprint = CredentialsSnapshot.of(one_way).fingerprint
+        mtls_fingerprint = WorkerCredentialsSnapshot.of(mtls).fingerprint
+        one_way_fingerprint = WorkerCredentialsSnapshot.of(one_way).fingerprint
 
         # Assert
         assert mtls_fingerprint != one_way_fingerprint
 
     def test_pickle_roundtrip(self, test_certificates):
-        """Test CredentialsSnapshot survives a pickle roundtrip.
+        """Test WorkerCredentialsSnapshot survives a pickle roundtrip.
 
         Given:
             A snapshot of valid credential material.
@@ -857,7 +857,7 @@ class TestCredentialsSnapshot:
         creds = WorkerCredentials(
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
         )
-        snapshot = CredentialsSnapshot.of(creds, "wool-worker")
+        snapshot = WorkerCredentialsSnapshot.of(creds, "wool-worker")
 
         # Act
         restored = cloudpickle.loads(cloudpickle.dumps(snapshot))

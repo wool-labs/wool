@@ -40,9 +40,9 @@ from wool.runtime.routine.wrapper import routine
 from wool.runtime.serializer import CloudpickleSerializer
 from wool.runtime.serializer import Serializer
 from wool.runtime.typing import Factory
-from wool.runtime.worker.auth import CredentialsSnapshot
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import WorkerCredentialsSnapshot
 from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
@@ -97,7 +97,6 @@ __all__ = [
     "ContextDecodeWarning",
     "ContextVar",
     "ContextVarCollision",
-    "CredentialsSnapshot",
     "Discovery",
     "DiscoveryEvent",
     "DiscoveryEventType",
@@ -131,6 +130,7 @@ __all__ = [
     "WorkerConnection",
     "WorkerCredentials",
     "WorkerCredentialsProvider",
+    "WorkerCredentialsSnapshot",
     "WorkerFactory",
     "WorkerLike",
     "WorkerMetadata",

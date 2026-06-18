@@ -23,8 +23,8 @@ from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import Serializer
-from wool.runtime.worker.auth import CredentialsSnapshot
 from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import WorkerCredentialsSnapshot
 from wool.runtime.worker.base import ChannelOptions
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
@@ -47,12 +47,12 @@ class _CredentialsKey:
     channel but is excluded from equality and hashing.
     """
 
-    snapshot: CredentialsSnapshot = field(compare=False)
+    snapshot: WorkerCredentialsSnapshot = field(compare=False)
     fingerprint: str
     identity: str | None
 
     @classmethod
-    def of(cls, snapshot: CredentialsSnapshot) -> _CredentialsKey:
+    def of(cls, snapshot: WorkerCredentialsSnapshot) -> _CredentialsKey:
         """Build a key element from a resolved snapshot.
 
         :param snapshot:
