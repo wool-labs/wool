@@ -147,7 +147,7 @@ class LocalWorker(Worker):
         gRPC server within the configured grace period. Does nothing if the
         process is not alive.
 
-        For secure workers, resolves the current credential snapshot and
+        For secure workers, resolves the current credentials and
         establishes a secure connection for the stop operation, applying
         the configured identity override so the worker's own certificate
         verifies against its logical identity rather than the loopback
@@ -158,11 +158,11 @@ class LocalWorker(Worker):
 
             # Create appropriate channel based on available credentials
             if self._provider is not None:
-                snapshot = self._provider.resolve()
-                credentials = snapshot.credentials.client_credentials()
+                resolved = self._provider.resolve()
+                credentials = resolved.client_credentials()
                 options = (
-                    [("grpc.ssl_target_name_override", snapshot.identity)]
-                    if snapshot.identity is not None
+                    [("grpc.ssl_target_name_override", resolved.identity)]
+                    if resolved.identity is not None
                     else None
                 )
                 channel = grpc.aio.secure_channel(

@@ -1882,7 +1882,7 @@ class TestWorkerProcess:
         assert len(captured_current) == 1
         resolved = captured_current[0]
         assert isinstance(resolved, WorkerCredentialsProvider)
-        assert resolved.resolve().credentials == creds
+        assert resolved.resolve() == creds
 
     def test_run_does_not_set_contextvar_when_credentials_none(self, mocker):
         """Test run does not set WorkerCredentials ContextVar without credentials.

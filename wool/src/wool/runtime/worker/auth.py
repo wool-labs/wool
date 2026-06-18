@@ -6,6 +6,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from contextvars import Token
 from dataclasses import dataclass
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -58,12 +59,34 @@ class WorkerCredentials:
     :param mutual:
         Whether to use mutual TLS (mTLS). If True (default), both server
         and client authenticate. If False, only server is authenticated.
+    :param identity:
+        Expected server identity — the peer certificate's subject-alternative
+        name — to verify dialed workers against, or ``None`` (default) to
+        verify against the dialed address. A blank value normalizes to
+        ``None``. Consumed only client-side; inert when presenting the
+        worker's own server certificate.
     """
 
     ca_cert: bytes
     worker_key: bytes
     worker_cert: bytes
     mutual: bool = True
+    identity: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "identity", _normalize_identity(self.identity))
+
+    @property
+    def fingerprint(self) -> str:
+        """A hex SHA-256 digest over the material, mutual flag, and identity.
+
+        A stable content identifier: equal credentials produce equal
+        fingerprints, and any change to the certificate-authority bundle,
+        key, certificate, mutual flag, or identity changes it.  The client
+        channel pool reuses a cached channel for unchanged credentials and
+        builds a fresh one when they rotate.
+        """
+        return _compute_fingerprint(self)
 
     @classmethod
     def from_files(
@@ -195,21 +218,17 @@ class WorkerCredentials:
         )
 
 
-def _compute_fingerprint(credentials: WorkerCredentials, identity: str | None) -> str:
+def _compute_fingerprint(credentials: WorkerCredentials) -> str:
     """Compute a stable content fingerprint for credential material.
 
     The fingerprint changes if and only if the certificate-authority
     bundle, worker key, worker certificate, mutual-TLS flag, or expected
-    identity changes.  It is the content-stable key under which client
-    channels are pooled, so that unchanged material reuses a cached
-    channel while rotated material yields a fresh one.
+    identity changes.
 
     :param credentials:
         The credential material to fingerprint.
-    :param identity:
-        The expected server identity, or ``None``.
     :returns:
-        A hex SHA-256 digest over the material and identity.
+        A hex SHA-256 digest over the material, mutual flag, and identity.
     """
     hasher = hashlib.sha256()
     for part in (
@@ -221,7 +240,7 @@ def _compute_fingerprint(credentials: WorkerCredentials, identity: str | None) -
         hasher.update(len(part).to_bytes(8, "big"))
         hasher.update(part)
     hasher.update(b"\x01" if credentials.mutual else b"\x00")
-    hasher.update((identity or "").encode("utf-8"))
+    hasher.update((credentials.identity or "").encode("utf-8"))
     return hasher.hexdigest()
 
 
@@ -245,63 +264,19 @@ def _normalize_identity(identity: str | None) -> str | None:
 
 
 # public
-@dataclass(frozen=True)
-class WorkerCredentialsSnapshot:
-    """An immutable, fingerprinted view of credential material.
-
-    Resolved from a `WorkerCredentialsProvider`, a snapshot bundles the
-    concrete `WorkerCredentials` with the expected ``identity`` to
-    verify discovered workers against and a content ``fingerprint`` that
-    changes only when the material or identity changes.
-
-    :param credentials:
-        The concrete credential material.
-    :param identity:
-        Expected server identity, or ``None`` to verify against the dialed
-        address.
-    :param fingerprint:
-        Content fingerprint over the material and identity.
-    """
-
-    credentials: WorkerCredentials
-    identity: str | None
-    fingerprint: str
-
-    @classmethod
-    def of(
-        cls, credentials: WorkerCredentials, identity: str | None = None
-    ) -> WorkerCredentialsSnapshot:
-        """Build a snapshot, computing its fingerprint.
-
-        :param credentials:
-            The concrete credential material.
-        :param identity:
-            Expected server identity, or ``None``.
-        :returns:
-            A snapshot whose fingerprint reflects *credentials* and
-            *identity*.
-        """
-        return cls(
-            credentials=credentials,
-            identity=identity,
-            fingerprint=_compute_fingerprint(credentials, identity),
-        )
-
-
-# public
 class WorkerCredentialsProvider:
     """A credential provider backed by a user-supplied fetch callback.
 
     The provider is a thin adapter: ``fetch`` returns the current
-    `WorkerCredentials`, and the provider stamps the expected ``identity``
-    onto a fingerprinted `WorkerCredentialsSnapshot`. Every source-specific
-    concern — change detection, returning cached material when nothing has
-    changed, validation, and failure handling — belongs to ``fetch``, which
-    keeps the provider itself a pass-through. `WorkerCredentials.as_provider`
-    is the shorthand for the fixed-material case.
+    `WorkerCredentials`, and `resolve` hands them back with the provider's
+    ``identity`` applied. Every source-specific concern — change detection,
+    returning cached material when nothing has changed, validation, and
+    failure handling — belongs to ``fetch``, which keeps the provider itself
+    a pass-through. `WorkerCredentials.as_provider` is the shorthand for the
+    fixed-material case.
 
     A non-reloadable provider resolves once when constructed and serves that
-    fixed snapshot thereafter, so the fixed-material case needs no dedicated
+    fixed result thereafter, so the fixed-material case needs no dedicated
     type — it is the general provider with a constant fetch:
 
     .. code-block:: python
@@ -319,13 +294,14 @@ class WorkerCredentialsProvider:
     :param fetch:
         A zero-argument callable returning the current `WorkerCredentials`.
     :param identity:
-        Expected server identity to verify discovered workers against, or
-        ``None`` to verify against the dialed address. Applies to every
-        worker reached through the provider.
+        Expected server identity to verify discovered workers against,
+        applied to every credential the provider yields (overriding any
+        identity the credentials already carry). ``None`` (default) leaves
+        the credentials' own identity untouched.
     :param reloadable:
         Whether ``fetch`` is consulted on every resolution. If ``False``
-        (default), ``fetch`` is called once at construction and the
-        resulting snapshot is fixed for the provider's lifetime.
+        (default), ``fetch`` is called once at construction and the result
+        is fixed for the provider's lifetime.
     """
 
     def __init__(
@@ -338,14 +314,19 @@ class WorkerCredentialsProvider:
         self._fetch = fetch
         self._identity = _normalize_identity(identity)
         self._reloadable = bool(reloadable)
-        # A non-reloadable provider resolves eagerly so the snapshot — not
-        # the callback — is what crosses into worker subprocesses (see
+        # A non-reloadable provider resolves eagerly so the credentials — not
+        # the callback — are what cross into worker subprocesses (see
         # __getstate__); a reloadable provider defers to resolve().
-        self._snapshot: WorkerCredentialsSnapshot | None = (
-            None
-            if self._reloadable
-            else WorkerCredentialsSnapshot.of(fetch(), self._identity)
+        self._cached: WorkerCredentials | None = (
+            None if self._reloadable else self._apply(fetch())
         )
+
+    def _apply(self, credentials: WorkerCredentials) -> WorkerCredentials:
+        # The provider's identity, when configured, is authoritative;
+        # otherwise the credentials keep whatever identity they carry.
+        if self._identity is None:
+            return credentials
+        return replace(credentials, identity=self._identity)
 
     @property
     def identity(self) -> str | None:
@@ -362,26 +343,26 @@ class WorkerCredentialsProvider:
         """
         return self._reloadable
 
-    def resolve(self) -> WorkerCredentialsSnapshot:
-        """Return the current credential snapshot.
+    def resolve(self) -> WorkerCredentials:
+        """Return the current credentials, with the provider's identity applied.
 
-        A non-reloadable provider returns the snapshot captured at
-        construction. A reloadable provider calls ``fetch`` and stamps the
-        identity onto a fresh snapshot; identical material yields an
-        identical fingerprint, so unchanged credentials reuse the pooled
-        channel and only the re-read is paid for by ``fetch``.
+        A non-reloadable provider returns the credentials captured at
+        construction. A reloadable provider calls ``fetch`` each time;
+        identical material has an identical fingerprint, so unchanged
+        credentials reuse the pooled channel and only the re-read is paid for
+        by ``fetch``.
 
         :returns:
-            The current `WorkerCredentialsSnapshot`.
+            The current `WorkerCredentials`.
         """
-        if self._snapshot is not None:
-            return self._snapshot
-        return WorkerCredentialsSnapshot.of(self._fetch(), self._identity)
+        if self._cached is not None:
+            return self._cached
+        return self._apply(self._fetch())
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         if not self._reloadable:
-            # The fixed snapshot already rides along, so drop the callback:
+            # The fixed credentials already ride along, so drop the callback:
             # a non-reloadable fetch (e.g., a lambda over in-memory material)
             # need not be picklable to cross into a worker subprocess.
             state["_fetch"] = None

@@ -2,6 +2,7 @@ import datetime
 import functools
 import pickle
 from dataclasses import FrozenInstanceError
+from dataclasses import replace
 from pathlib import Path
 
 import cloudpickle
@@ -22,7 +23,6 @@ from hypothesis import strategies as st
 from wool.runtime.worker.auth import CredentialsContext
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
-from wool.runtime.worker.auth import WorkerCredentialsSnapshot
 
 
 def _generate_test_certificates():
@@ -362,7 +362,7 @@ class TestWorkerCredentials:
         # Assert
         assert isinstance(provider, WorkerCredentialsProvider)
         assert provider.reloadable is False
-        assert provider.resolve().credentials == credentials
+        assert provider.resolve() == credentials
 
     def test_as_provider_should_carry_identity(self, temp_cert_files):
         """Test as_provider threads the expected identity through.
@@ -710,33 +710,30 @@ class TestWorkerCredentials:
             WorkerCredentials.current()
 
 
-class TestWorkerCredentialsSnapshot:
-    """Test suite for WorkerCredentialsSnapshot fingerprinting."""
+class TestWorkerCredentialsFingerprint:
+    """Test suite for the WorkerCredentials content fingerprint."""
 
-    def test_of_should_compute_fingerprint(self, test_certificates):
-        """Test snapshot construction computes a fingerprint.
+    def test_fingerprint_should_be_non_empty(self, test_certificates):
+        """Test credentials expose a non-empty content fingerprint.
 
         Given:
-            Credential material and an expected identity.
+            Credential material carrying an identity.
         When:
-            WorkerCredentialsSnapshot.of() is called.
+            The fingerprint property is read.
         Then:
-            It should return a snapshot carrying the material, identity, and
-            a non-empty fingerprint.
+            It should be a non-empty hex digest.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
         creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+            ca_cert=ca_pem,
+            worker_key=key_pem,
+            worker_cert=cert_pem,
+            identity="wool-worker",
         )
 
-        # Act
-        snapshot = WorkerCredentialsSnapshot.of(creds, "wool-worker")
-
-        # Assert
-        assert snapshot.credentials == creds
-        assert snapshot.identity == "wool-worker"
-        assert snapshot.fingerprint
+        # Act & assert
+        assert creds.fingerprint
 
     @given(
         ca=st.binary(),
@@ -744,87 +741,88 @@ class TestWorkerCredentialsSnapshot:
         cert=st.binary(),
         identity=st.one_of(st.none(), st.text()),
     )
-    def test_of_should_compute_identical_fingerprint_when_material_identical(
+    def test_fingerprint_should_be_identical_for_identical_material(
         self, ca, key, cert, identity
     ):
-        """Test fingerprint stability across identical material.
+        """Test the fingerprint is stable across identical material.
 
         Given:
             Any two credential instances built from the same bytes, mutual
             flag, and identity.
         When:
-            Each is snapshotted.
+            Their fingerprints are read.
         Then:
-            Both snapshots should share the same fingerprint.
+            They should be equal.
         """
         # Arrange
-        creds_a = WorkerCredentials(ca_cert=ca, worker_key=key, worker_cert=cert)
-        creds_b = WorkerCredentials(ca_cert=ca, worker_key=key, worker_cert=cert)
+        creds_a = WorkerCredentials(
+            ca_cert=ca, worker_key=key, worker_cert=cert, identity=identity
+        )
+        creds_b = WorkerCredentials(
+            ca_cert=ca, worker_key=key, worker_cert=cert, identity=identity
+        )
 
-        # Act
-        fingerprint_a = WorkerCredentialsSnapshot.of(creds_a, identity).fingerprint
-        fingerprint_b = WorkerCredentialsSnapshot.of(creds_b, identity).fingerprint
-
-        # Assert
-        assert fingerprint_a == fingerprint_b
+        # Act & assert
+        assert creds_a.fingerprint == creds_b.fingerprint
 
     @given(ca=st.binary(), other_ca=st.binary(), key=st.binary(), cert=st.binary())
-    def test_of_should_change_fingerprint_when_material_differs(
+    def test_fingerprint_should_change_when_material_differs(
         self, ca, other_ca, key, cert
     ):
-        """Test fingerprint sensitivity to material changes.
+        """Test the fingerprint is sensitive to material changes.
 
         Given:
             Two credential instances differing only in their CA bytes.
         When:
-            Each is snapshotted.
+            Their fingerprints are read.
         Then:
-            Their fingerprints should differ.
+            They should differ.
         """
         # Arrange
         assume(ca != other_ca)
         creds = WorkerCredentials(ca_cert=ca, worker_key=key, worker_cert=cert)
         rotated = WorkerCredentials(ca_cert=other_ca, worker_key=key, worker_cert=cert)
 
-        # Act
-        fingerprint = WorkerCredentialsSnapshot.of(creds).fingerprint
-        rotated_fingerprint = WorkerCredentialsSnapshot.of(rotated).fingerprint
+        # Act & assert
+        assert creds.fingerprint != rotated.fingerprint
 
-        # Assert
-        assert fingerprint != rotated_fingerprint
-
-    def test_of_should_change_fingerprint_when_identity_differs(self, test_certificates):
-        """Test fingerprint sensitivity to identity changes.
+    def test_fingerprint_should_change_when_identity_differs(self, test_certificates):
+        """Test the fingerprint is sensitive to identity changes.
 
         Given:
-            One credential instance and two distinct identities.
+            The same material under two distinct identities.
         When:
-            Each (material, identity) pair is snapshotted.
+            Their fingerprints are read.
         Then:
-            Their fingerprints should differ.
+            They should differ.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        worker_a = WorkerCredentials(
+            ca_cert=ca_pem,
+            worker_key=key_pem,
+            worker_cert=cert_pem,
+            identity="worker-a",
+        )
+        worker_b = WorkerCredentials(
+            ca_cert=ca_pem,
+            worker_key=key_pem,
+            worker_cert=cert_pem,
+            identity="worker-b",
         )
 
-        # Act
-        fingerprint_a = WorkerCredentialsSnapshot.of(creds, "worker-a").fingerprint
-        fingerprint_b = WorkerCredentialsSnapshot.of(creds, "worker-b").fingerprint
+        # Act & assert
+        assert worker_a.fingerprint != worker_b.fingerprint
 
-        # Assert
-        assert fingerprint_a != fingerprint_b
-
-    def test_of_should_change_fingerprint_when_mutual_differs(self, test_certificates):
-        """Test fingerprint sensitivity to the mutual-TLS flag.
+    def test_fingerprint_should_change_when_mutual_differs(self, test_certificates):
+        """Test the fingerprint is sensitive to the mutual-TLS flag.
 
         Given:
             The same bytes under mutual=True and mutual=False.
         When:
-            Each is snapshotted.
+            Their fingerprints are read.
         Then:
-            Their fingerprints should differ.
+            They should differ.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
@@ -835,52 +833,53 @@ class TestWorkerCredentialsSnapshot:
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=False
         )
 
-        # Act
-        mtls_fingerprint = WorkerCredentialsSnapshot.of(mtls).fingerprint
-        one_way_fingerprint = WorkerCredentialsSnapshot.of(one_way).fingerprint
+        # Act & assert
+        assert mtls.fingerprint != one_way.fingerprint
 
-        # Assert
-        assert mtls_fingerprint != one_way_fingerprint
-
-    def test_pickle_roundtrip(self, test_certificates):
-        """Test WorkerCredentialsSnapshot survives a pickle roundtrip.
+    def test_pickle_should_preserve_identity_and_fingerprint(self, test_certificates):
+        """Test credentials survive a pickle roundtrip with identity intact.
 
         Given:
-            A snapshot of valid credential material.
+            Credentials carrying an identity.
         When:
-            It is pickled and unpickled.
+            They are pickled and unpickled.
         Then:
-            It should produce an equal snapshot.
+            The restored credentials should be equal and share the
+            fingerprint.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
         creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+            ca_cert=ca_pem,
+            worker_key=key_pem,
+            worker_cert=cert_pem,
+            identity="wool-worker",
         )
-        snapshot = WorkerCredentialsSnapshot.of(creds, "wool-worker")
 
         # Act
-        restored = cloudpickle.loads(cloudpickle.dumps(snapshot))
+        restored = cloudpickle.loads(cloudpickle.dumps(creds))
 
         # Assert
-        assert restored == snapshot
+        assert restored == creds
+        assert restored.fingerprint == creds.fingerprint
 
 
 class TestWorkerCredentialsProvider:
     """Test suite for WorkerCredentialsProvider."""
 
-    def test_resolve_should_return_constant_snapshot_when_not_reloadable(
+    def test_resolve_should_return_constant_credentials_when_not_reloadable(
         self, test_certificates
     ):
-        """Test a non-reloadable provider resolves to a constant snapshot.
+        """Test a non-reloadable provider resolves to constant credentials.
 
         Given:
-            A non-reloadable provider over fixed credential material.
+            A non-reloadable provider over fixed credential material and an
+            identity.
         When:
             resolve() is called more than once.
         Then:
-            It should return the same snapshot instance each time, carrying
-            the configured material and identity.
+            It should return the same credentials instance each time, with the
+            provider's identity stamped onto the material.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
@@ -895,8 +894,7 @@ class TestWorkerCredentialsProvider:
 
         # Assert
         assert first is second
-        assert first.credentials == creds
-        assert first.identity == "wool-worker"
+        assert first == replace(creds, identity="wool-worker")
 
     def test_resolve_should_default_identity_to_none(self, test_certificates):
         """Test a provider defaults to address-based verification.

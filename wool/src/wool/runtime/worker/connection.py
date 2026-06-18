@@ -5,7 +5,6 @@ import enum
 import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from dataclasses import field
 from typing import Any
 from typing import AsyncGenerator
 from typing import Coroutine
@@ -23,8 +22,8 @@ from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import Serializer
+from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
-from wool.runtime.worker.auth import WorkerCredentialsSnapshot
 from wool.runtime.worker.base import ChannelOptions
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
@@ -34,41 +33,10 @@ _T = TypeVar("_T")
 _log = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class _CredentialsKey:
-    """Content-stable pool-key element for a credential snapshot.
-
-    Channels are pooled by credential *content*, not by the identity of a
-    gRPC credentials object: two snapshots with the same material and
-    identity hash equal (so an unchanged credential reuses its pooled
-    channel), while rotated material yields a different
-    `fingerprint` and therefore a fresh channel.  The
-    `snapshot` itself is carried for the factory to build the
-    channel but is excluded from equality and hashing.
-    """
-
-    snapshot: WorkerCredentialsSnapshot = field(compare=False)
-    fingerprint: str
-    identity: str | None
-
-    @classmethod
-    def of(cls, snapshot: WorkerCredentialsSnapshot) -> _CredentialsKey:
-        """Build a key element from a resolved snapshot.
-
-        :param snapshot:
-            The resolved credential snapshot.
-        :returns:
-            A `_CredentialsKey` hashing on the snapshot's fingerprint
-            and identity.
-        """
-        return cls(
-            snapshot=snapshot,
-            fingerprint=snapshot.fingerprint,
-            identity=snapshot.identity,
-        )
-
-
-_PoolKey: TypeAlias = tuple[str, "_CredentialsKey | None", ChannelOptions]
+# Channels are pooled by credential *content*: WorkerCredentials is a frozen
+# dataclass, so equal material (including identity) hashes equal and reuses its
+# pooled channel, while rotated material is unequal and yields a fresh one.
+_PoolKey: TypeAlias = tuple[str, "WorkerCredentials | None", ChannelOptions]
 
 
 @dataclass
@@ -92,7 +60,7 @@ def _channel_factory(key):
     :returns:
         A new :class:`_Channel` instance.
     """
-    target, cred_key, options = key
+    target, credentials, options = key
     grpc_options = [
         ("grpc.max_receive_message_length", options.max_receive_message_length),
         ("grpc.max_send_message_length", options.max_send_message_length),
@@ -109,17 +77,18 @@ def _channel_factory(key):
             options.compression.value,
         ),
     ]
-    if cred_key is not None:
-        if cred_key.identity is not None:
+    if credentials is not None:
+        if credentials.identity is not None:
             # Verify the worker's server certificate against the configured
             # logical identity (its SAN) rather than the dynamically
             # assigned address dialed at. Full chain + SAN verification is
             # preserved — only the *name* checked against the certificate
             # changes — so this strengthens rather than relaxes the
             # existing guarantee.
-            grpc_options.append(("grpc.ssl_target_name_override", cred_key.identity))
-        credentials = cred_key.snapshot.credentials.client_credentials()
-        channel = grpc.aio.secure_channel(target, credentials, options=grpc_options)
+            grpc_options.append(("grpc.ssl_target_name_override", credentials.identity))
+        channel = grpc.aio.secure_channel(
+            target, credentials.client_credentials(), options=grpc_options
+        )
     else:
         channel = grpc.aio.insecure_channel(target, options=grpc_options)
     stub = protocol.WorkerStub(channel)
@@ -1053,12 +1022,8 @@ class WorkerConnection:
 
         # Resolve current credential material per dispatch so rotated
         # material is adopted on the next connection (see class docstring).
-        cred_key = (
-            _CredentialsKey.of(self._provider.resolve())
-            if self._provider is not None
-            else None
-        )
-        tcp_key: _PoolKey = (self._target, cred_key, self._options)
+        credentials = self._provider.resolve() if self._provider is not None else None
+        tcp_key: _PoolKey = (self._target, credentials, self._options)
         self._key = tcp_key
 
         if (

@@ -274,11 +274,11 @@ class WorkerProcess(Process):
 
             initial = provider.resolve()
             return grpc.dynamic_ssl_server_credentials(
-                certificate_configuration(initial.credentials),
-                lambda: certificate_configuration(provider.resolve().credentials),
-                require_client_authentication=initial.credentials.mutual,
+                certificate_configuration(initial),
+                lambda: certificate_configuration(provider.resolve()),
+                require_client_authentication=initial.mutual,
             )
-        return provider.resolve().credentials.server_credentials()
+        return provider.resolve().server_credentials()
 
     async def _serve(self):
         """Run the worker's gRPC server for the lifetime of the process.
