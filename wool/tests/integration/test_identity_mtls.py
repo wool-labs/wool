@@ -8,6 +8,7 @@ misconfiguration as a distinct, diagnosable signal.
 """
 
 import datetime
+import functools
 import ipaddress
 import logging
 import os
@@ -23,6 +24,7 @@ from cryptography.x509.oid import NameOID
 import wool
 from wool import NoWorkersAvailable
 from wool import WorkerCredentials
+from wool import WorkerCredentialsProvider
 from wool import WorkerProxy
 
 from .routines import add
@@ -140,8 +142,8 @@ async def test_identity_based_mtls_dispatch_succeeds(identity_cert_files):
     """
     # Arrange
     ca_path, key_path, cert_path = identity_cert_files
-    provider = WorkerCredentials.provider_from_files(
-        ca_path, key_path, cert_path, identity=_WORKER_IDENTITY
+    provider = WorkerCredentials.from_files(ca_path, key_path, cert_path).as_provider(
+        identity=_WORKER_IDENTITY
     )
 
     # Act
@@ -231,12 +233,9 @@ async def test_identity_mismatch_rejects_with_identity_mismatch_reason(tmp_path,
     ca_path.write_bytes(ca_pem)
     key_path.write_bytes(key_pem)
     cert_path.write_bytes(cert_pem)
-    client_credentials = WorkerCredentials.provider_from_files(
-        str(ca_path),
-        str(key_path),
-        str(cert_path),
-        identity="does-not-match.example",
-    )
+    client_credentials = WorkerCredentials.from_files(
+        str(ca_path), str(key_path), str(cert_path)
+    ).as_provider(identity="does-not-match.example")
 
     # Act & assert
     await worker.start()
@@ -281,12 +280,12 @@ async def test_credential_rotation_without_restart(tmp_path):
     ca_path.write_bytes(ca_pem)
     key_path.write_bytes(key_pem)
     cert_path.write_bytes(cert_pem)
-    provider = WorkerCredentials.provider_from_files(
-        str(ca_path),
-        str(key_path),
-        str(cert_path),
+    provider = WorkerCredentialsProvider(
+        functools.partial(
+            WorkerCredentials.from_files, str(ca_path), str(key_path), str(cert_path)
+        ),
         identity=_WORKER_IDENTITY,
-        reload=True,
+        reloadable=True,
     )
 
     # Act & assert

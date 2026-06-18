@@ -16,8 +16,8 @@ from hypothesis import strategies as st
 from wool import protocol
 from wool.runtime.worker import process as process_module
 from wool.runtime.worker.auth import CredentialsContext
-from wool.runtime.worker.auth import CredentialsProviderLike
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -1881,7 +1881,7 @@ class TestWorkerProcess:
         # Assert
         assert len(captured_current) == 1
         resolved = captured_current[0]
-        assert isinstance(resolved, CredentialsProviderLike)
+        assert isinstance(resolved, WorkerCredentialsProvider)
         assert resolved.resolve().credentials == creds
 
     def test_run_does_not_set_contextvar_when_credentials_none(self, mocker):
@@ -1950,8 +1950,9 @@ class TestWorkerProcess:
         ca.write_bytes(ca_pem)
         key.write_bytes(key_pem)
         cert.write_bytes(cert_pem)
-        provider = WorkerCredentials.provider_from_files(
-            str(ca), str(key), str(cert), reload=True
+        provider = WorkerCredentialsProvider(
+            lambda: WorkerCredentials.from_files(str(ca), str(key), str(cert)),
+            reloadable=True,
         )
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")

@@ -23,8 +23,8 @@ from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import Serializer
-from wool.runtime.worker.auth import CredentialsProviderLike
 from wool.runtime.worker.auth import CredentialsSnapshot
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
@@ -954,7 +954,7 @@ class WorkerConnection:
         self,
         target: str,
         *,
-        provider: CredentialsProviderLike | None = None,
+        provider: WorkerCredentialsProvider | None = None,
         options: ChannelOptions | None = None,
     ):
         self._target = target

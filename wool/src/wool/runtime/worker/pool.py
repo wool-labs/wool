@@ -26,8 +26,8 @@ from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
-from wool.runtime.worker.auth import CredentialsProviderLike
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
@@ -212,11 +212,11 @@ class WorkerPool:
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
     :param credentials:
-        Optional credentials for TLS/mTLS — either a
-        `~wool.WorkerCredentials` or a `~wool.CredentialsProviderLike` (e.g.,
-        from `WorkerCredentials.provider_from_files` for identity-based
-        verification or credential rotation). Applied to both spawned
-        workers and the dispatch proxy.
+        Optional credentials for TLS/mTLS — either a `WorkerCredentials` or a
+        `WorkerCredentialsProvider` (from `WorkerCredentials.as_provider`, or
+        built with a fetch callback for identity-based verification or
+        credential rotation). Applied to both spawned workers and the
+        dispatch proxy.
     :param quorum:
         Minimum number of workers that must be discovered before the proxy
         considers itself ready. Defaults to ``1`` — block until at least
@@ -283,7 +283,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | CredentialsProviderLike | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
         shutdown_timeout: float | None = 60.0,
@@ -305,7 +305,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | CredentialsProviderLike | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
         shutdown_timeout: float | None = 60.0,
@@ -327,7 +327,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | CredentialsProviderLike | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
         shutdown_timeout: float | None = 60.0,
@@ -350,7 +350,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | CredentialsProviderLike | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
         shutdown_timeout: float | None = 60.0,
@@ -369,7 +369,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | CredentialsProviderLike | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
         shutdown_timeout: float | None = 60.0,
@@ -387,7 +387,7 @@ class WorkerPool:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | CredentialsProviderLike | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None | UndefinedType = Undefined,
         shutdown_timeout: float | None = 60.0,

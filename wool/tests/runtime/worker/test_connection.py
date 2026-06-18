@@ -956,8 +956,11 @@ class TestWorkerConnection:
         ca_path.write_bytes(ca_pem)
         key_path.write_bytes(key_pem)
         cert_path.write_bytes(cert_pem)
-        provider = WorkerCredentials.provider_from_files(
-            str(ca_path), str(key_path), str(cert_path), reload=True
+        provider = WorkerCredentialsProvider(
+            lambda: WorkerCredentials.from_files(
+                str(ca_path), str(key_path), str(cert_path)
+            ),
+            reloadable=True,
         )
 
         mock_channel = mocker.AsyncMock()
@@ -1023,8 +1026,11 @@ class TestWorkerConnection:
         ca_path.write_bytes(ca_pem)
         key_path.write_bytes(key_pem)
         cert_path.write_bytes(cert_pem)
-        provider = WorkerCredentials.provider_from_files(
-            str(ca_path), str(key_path), str(cert_path), reload=True
+        provider = WorkerCredentialsProvider(
+            lambda: WorkerCredentials.from_files(
+                str(ca_path), str(key_path), str(cert_path)
+            ),
+            reloadable=True,
         )
 
         mock_channel = mocker.AsyncMock()

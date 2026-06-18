@@ -26,8 +26,8 @@ from wool import protocol
 from wool.runtime.context import install_task_factory
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import CredentialsContext
-from wool.runtime.worker.auth import CredentialsProviderLike
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.auth import _coerce_provider
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.interceptor import VersionInterceptor
@@ -66,7 +66,7 @@ class WorkerProcess(Process):
         Proxy pool TTL in seconds.
     :param credentials:
         Optional worker credentials for TLS/mTLS — either a
-        `WorkerCredentials` or a `CredentialsProviderLike`. A
+        `WorkerCredentials` or a `WorkerCredentialsProvider`. A
         reloadable provider serves rotating server credentials via a
         per-handshake fetcher.
     :param options:
@@ -96,7 +96,7 @@ class WorkerProcess(Process):
     _metadata: WorkerMetadata | None
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
-    _provider: CredentialsProviderLike | None
+    _provider: WorkerCredentialsProvider | None
     _options: WorkerOptions
 
     def __init__(
@@ -107,7 +107,7 @@ class WorkerProcess(Process):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
-        credentials: WorkerCredentials | CredentialsProviderLike | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         options: WorkerOptions | None = None,
         tags: frozenset[str] = frozenset(),
         extra: dict[str, Any] | None = None,

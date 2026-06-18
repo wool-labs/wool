@@ -40,7 +40,6 @@ from wool.runtime.routine.wrapper import routine
 from wool.runtime.serializer import CloudpickleSerializer
 from wool.runtime.serializer import Serializer
 from wool.runtime.typing import Factory
-from wool.runtime.worker.auth import CredentialsProviderLike
 from wool.runtime.worker.auth import CredentialsSnapshot
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
@@ -98,7 +97,6 @@ __all__ = [
     "ContextDecodeWarning",
     "ContextVar",
     "ContextVarCollision",
-    "CredentialsProviderLike",
     "CredentialsSnapshot",
     "Discovery",
     "DiscoveryEvent",
