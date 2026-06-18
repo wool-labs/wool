@@ -5,10 +5,10 @@ import logging
 import os
 import ssl
 import threading
+from collections.abc import Callable
 from contextvars import ContextVar
 from contextvars import Token
 from dataclasses import dataclass
-from dataclasses import field
 from typing import TYPE_CHECKING
 from typing import Protocol
 from typing import runtime_checkable
@@ -176,12 +176,15 @@ class WorkerCredentials:
             If ``reload`` is ``False`` and any file cannot be read.
         """
         if reload:
-            return FileCredentialsProvider(
-                ca_path,
-                key_path,
-                cert_path,
-                mutual=mutual,
+            return WorkerCredentialsProvider(
+                _FileCredentialsReader(
+                    ca_path,
+                    key_path,
+                    cert_path,
+                    mutual=mutual,
+                ),
                 identity=identity,
+                reloadable=True,
             )
         credentials = cls.from_files(
             ca_path=ca_path,
@@ -189,7 +192,7 @@ class WorkerCredentials:
             cert_path=cert_path,
             mutual=mutual,
         )
-        return _StaticCredentialsProvider(credentials, identity=identity)
+        return WorkerCredentialsProvider(lambda: credentials, identity=identity)
 
     def server_credentials(self) -> grpc.ServerCredentials:
         """Build server credentials for accepting connections.
@@ -379,50 +382,102 @@ class CredentialsProviderLike(Protocol):
         ...
 
 
-# internal
-@dataclass(frozen=True)
-class _StaticCredentialsProvider:
-    """A provider that always resolves to fixed credential material.
+# public
+class WorkerCredentialsProvider:
+    """A credential provider backed by a user-supplied fetch callback.
 
-    Wraps a single `WorkerCredentials` instance and an optional
-    expected ``identity``.  This is the back-compatible default: a bare
-    `WorkerCredentials` supplied to a pool, proxy, or worker is
-    wrapped in a static provider with no identity, preserving the legacy
-    address-based verification behaviour exactly.
+    The provider is a thin adapter: ``fetch`` returns the current
+    `WorkerCredentials`, and the provider stamps the expected ``identity``
+    onto a fingerprinted `CredentialsSnapshot`. Every source-specific
+    concern — change detection, returning cached material when nothing has
+    changed, validation, and failure handling — belongs to ``fetch``, which
+    keeps the provider itself a pass-through. The file-backed factory
+    `WorkerCredentials.provider_from_files` supplies exactly such a fetch.
 
-    :param credentials:
-        The fixed credential material.
+    A non-reloadable provider resolves once when constructed and serves that
+    fixed snapshot thereafter, so the fixed-material case needs no dedicated
+    type — it is the general provider with a constant fetch:
+
+    .. code-block:: python
+
+        provider = WorkerCredentialsProvider(lambda: creds, reloadable=False)
+
+    The lambda runs once in the constructing process and is dropped before
+    the provider is pickled into a worker subprocess, so a non-reloadable
+    ``fetch`` need not be picklable. A reloadable provider instead calls
+    ``fetch`` on every resolution — including from the worker's per-handshake
+    server fetcher — so a reloadable ``fetch`` MUST be an importable,
+    picklable callable (a module-level function or a picklable object) and
+    MUST be safe to call concurrently from gRPC handshake threads.
+
+    :param fetch:
+        A zero-argument callable returning the current `WorkerCredentials`.
     :param identity:
-        Expected server identity, or ``None`` to verify against the dialed
-        address.
+        Expected server identity to verify discovered workers against, or
+        ``None`` to verify against the dialed address. Applies to every
+        worker reached through the provider.
+    :param reloadable:
+        Whether ``fetch`` is consulted on every resolution. If ``False``
+        (default), ``fetch`` is called once at construction and the
+        resulting snapshot is fixed for the provider's lifetime.
     """
 
-    credentials: WorkerCredentials
-    identity: str | None = None
-    _snapshot: CredentialsSnapshot = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "identity", _normalize_identity(self.identity))
-        object.__setattr__(
-            self, "_snapshot", CredentialsSnapshot.of(self.credentials, self.identity)
+    def __init__(
+        self,
+        fetch: Callable[[], WorkerCredentials],
+        *,
+        identity: str | None = None,
+        reloadable: bool = False,
+    ) -> None:
+        self._fetch = fetch
+        self._identity = _normalize_identity(identity)
+        self._reloadable = bool(reloadable)
+        # A non-reloadable provider resolves eagerly so the snapshot — not
+        # the callback — is what crosses into worker subprocesses (see
+        # __getstate__); a reloadable provider defers to resolve().
+        self._snapshot: CredentialsSnapshot | None = (
+            None if self._reloadable else CredentialsSnapshot.of(fetch(), self._identity)
         )
 
-    def resolve(self) -> CredentialsSnapshot:
-        """Return the fixed credential snapshot.
-
-        :returns:
-            The same `CredentialsSnapshot` on every call.
-        """
-        return self._snapshot
+    @property
+    def identity(self) -> str | None:
+        """The expected server identity, or ``None``."""
+        return self._identity
 
     @property
     def reloadable(self) -> bool:
         """Whether the material can change over the provider's lifetime.
 
-        Always ``False`` for a static provider, so a worker built from one
-        uses fixed server credentials.
+        A worker built from a reloadable provider serves rotating server
+        credentials via a per-handshake fetcher; a non-reloadable provider
+        takes the fixed static-credentials path.
         """
-        return False
+        return self._reloadable
+
+    def resolve(self) -> CredentialsSnapshot:
+        """Return the current credential snapshot.
+
+        A non-reloadable provider returns the snapshot captured at
+        construction. A reloadable provider calls ``fetch`` and stamps the
+        identity onto a fresh snapshot; identical material yields an
+        identical fingerprint, so unchanged credentials reuse the pooled
+        channel and only the re-read is paid for by ``fetch``.
+
+        :returns:
+            The current `CredentialsSnapshot`.
+        """
+        if self._snapshot is not None:
+            return self._snapshot
+        return CredentialsSnapshot.of(self._fetch(), self._identity)
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        if not self._reloadable:
+            # The fixed snapshot already rides along, so drop the callback:
+            # a non-reloadable fetch (e.g., a lambda over in-memory material)
+            # need not be picklable to cross into a worker subprocess.
+            state["_fetch"] = None
+        return state
 
 
 def _validate_material(ca_path: str, key_path: str, cert_path: str) -> None:
@@ -453,23 +508,29 @@ def _validate_material(ca_path: str, key_path: str, cert_path: str) -> None:
     context.load_verify_locations(cafile=ca_path)
 
 
-# public
-class FileCredentialsProvider:
-    """A provider that re-reads PEM files as they are rotated.
+# internal
+class _FileCredentialsReader:
+    """A picklable, stateful fetch that reads credentials from PEM files.
 
-    Resolves the current credential material from the certificate-
-    authority, key, and certificate files on disk, re-reading them when
+    Supplies the ``fetch`` for a reloadable `WorkerCredentialsProvider`
+    built via `WorkerCredentials.provider_from_files`. Reads the
+    certificate-authority, key, and certificate files, re-reading them when
     they change so a long-running worker or pool adopts rotated material
-    without a restart.  Unchanged files resolve to the same cached snapshot
-    (so pooled channels are reused); changed files yield a new snapshot
-    with a fresh fingerprint.
+    without a restart. Unchanged files return the cached material (so the
+    provider's fingerprint is stable and pooled channels are reused);
+    changed files are re-read and re-validated.
 
     A transient read failure during rotation (e.g., a partially written
-    file) resolves to the last good snapshot rather than raising, so an
+    file) returns the last good material rather than raising, so an
     in-flight rotation never tears the fleet down; genuinely invalid
     material that *can* be read surfaces later through the handshake-failure
-    channel.  The very first resolution has no last-good snapshot to fall
-    back on and propagates the error.
+    channel. The very first read has no last-good material to fall back on
+    and propagates the error.
+
+    The reader guards its own read-compare-write with a lock: the provider
+    leaves synchronization to the fetch, and the worker's per-handshake
+    server fetcher calls it from a gRPC C-core thread, off the asyncio loop,
+    concurrently with client-side dispatch.
 
     :param ca_path:
         Path to the CA certificate file.
@@ -479,9 +540,6 @@ class FileCredentialsProvider:
         Path to the worker certificate file.
     :param mutual:
         Whether to use mutual TLS.
-    :param identity:
-        Expected server identity, or ``None`` to verify against the dialed
-        address.
     """
 
     def __init__(
@@ -491,34 +549,53 @@ class FileCredentialsProvider:
         cert_path: str,
         *,
         mutual: bool = True,
-        identity: str | None = None,
     ) -> None:
         self._ca_path = os.fspath(ca_path)
         self._key_path = os.fspath(key_path)
         self._cert_path = os.fspath(cert_path)
         self._mutual = mutual
-        self._identity = _normalize_identity(identity)
-        self._cached_snapshot: CredentialsSnapshot | None = None
+        self._cached_credentials: WorkerCredentials | None = None
         self._cached_signature: tuple[tuple[int, int, int, int], ...] | None = None
-        # The server-side fetcher consults resolve() from a gRPC C-core
-        # thread, off the asyncio loop, concurrently with client-side
-        # dispatch — so guard the read-compare-write with a threading (not
-        # asyncio) lock. Excluded from __getstate__; recreated on unpickle.
+        # Excluded from __getstate__; recreated on unpickle.
         self._lock = threading.Lock()
 
-    @property
-    def identity(self) -> str | None:
-        """The expected server identity, or ``None``."""
-        return self._identity
+    def __call__(self) -> WorkerCredentials:
+        """Return the current credentials, re-reading the files on change.
 
-    @property
-    def reloadable(self) -> bool:
-        """Whether the material can change over the provider's lifetime.
-
-        Always ``True`` for a file provider, so a worker built from one
-        serves rotating credentials via a per-handshake fetcher.
+        :returns:
+            The current `WorkerCredentials`. Reuses the cached material when
+            the files are unchanged, or on a failed re-read when prior
+            material exists.
+        :raises OSError:
+            If the files cannot be read or are malformed (`ssl.SSLError` is
+            an `OSError`) and no prior material exists.
         """
-        return True
+        with self._lock:
+            try:
+                # Cheap stat gate: only re-read when the files look changed.
+                signature = self._signature()
+            except OSError as exc:
+                return self._fallback_or_raise(exc)
+            if (
+                signature == self._cached_signature
+                and self._cached_credentials is not None
+            ):
+                return self._cached_credentials
+            try:
+                credentials = WorkerCredentials.from_files(
+                    ca_path=self._ca_path,
+                    key_path=self._key_path,
+                    cert_path=self._cert_path,
+                    mutual=self._mutual,
+                )
+                # Validate before caching so a readable-but-truncated PEM
+                # never overwrites the last good material.
+                _validate_material(self._ca_path, self._key_path, self._cert_path)
+            except OSError as exc:
+                return self._fallback_or_raise(exc)
+            self._cached_credentials = credentials
+            self._cached_signature = signature
+            return credentials
 
     def _signature(self) -> tuple[tuple[int, int, int, int], ...]:
         """Return a cheap change signature for the files.
@@ -536,66 +613,25 @@ class FileCredentialsProvider:
             )
         return tuple(signature)
 
-    def resolve(self) -> CredentialsSnapshot:
-        """Return the current credential snapshot, re-reading on change.
-
-        On a transient read failure or readable-but-malformed material
-        during a rotation, a prior good snapshot is kept (and a warning is
-        logged) rather than caching broken bytes, so an in-progress
-        rotation never tears the fleet down nor silently adopts garbage.
-
-        :returns:
-            The current `CredentialsSnapshot`.  Reuses the cached
-            snapshot when the files are unchanged, or on a failed re-read
-            when a prior snapshot exists.
-        :raises OSError:
-            If the files cannot be read or are malformed (`ssl.SSLError`
-            is an `OSError`) and no prior snapshot exists.
-        """
-        with self._lock:
-            try:
-                # Cheap stat gate: only re-read when the files look changed.
-                signature = self._signature()
-            except OSError as exc:
-                return self._fallback_or_raise(exc)
-            if signature == self._cached_signature and self._cached_snapshot is not None:
-                return self._cached_snapshot
-            try:
-                credentials = WorkerCredentials.from_files(
-                    ca_path=self._ca_path,
-                    key_path=self._key_path,
-                    cert_path=self._cert_path,
-                    mutual=self._mutual,
-                )
-                # Validate before caching so a readable-but-truncated PEM
-                # never overwrites the last good snapshot.
-                _validate_material(self._ca_path, self._key_path, self._cert_path)
-            except OSError as exc:
-                return self._fallback_or_raise(exc)
-            snapshot = CredentialsSnapshot.of(credentials, self._identity)
-            self._cached_snapshot = snapshot
-            self._cached_signature = signature
-            return snapshot
-
-    def _fallback_or_raise(self, exc: Exception) -> CredentialsSnapshot:
-        """Return the last good snapshot, logging, or re-raise if none."""
-        if self._cached_snapshot is not None:
+    def _fallback_or_raise(self, exc: Exception) -> WorkerCredentials:
+        """Return the last good credentials, logging, or re-raise if none."""
+        if self._cached_credentials is not None:
             _log.warning(
                 "Credential reload failed for %s; serving the last good "
                 "material until it succeeds: %s",
                 self._cert_path,
                 exc,
             )
-            return self._cached_snapshot
+            return self._cached_credentials
         raise exc
 
     def __getstate__(self) -> dict:
-        # Drop the cache so a pickled provider (e.g., crossing into a worker
-        # subprocess) re-reads the live files rather than carrying a stale
-        # snapshot from the originating process. The lock is process-local
-        # and not picklable, so drop it too and recreate on unpickle.
+        # Drop the cache so a pickled reader (crossing into a worker
+        # subprocess) re-reads the live files rather than carrying material
+        # from the originating process. The lock is process-local and not
+        # picklable, so drop it too and recreate on unpickle.
         state = self.__dict__.copy()
-        state["_cached_snapshot"] = None
+        state["_cached_credentials"] = None
         state["_cached_signature"] = None
         state.pop("_lock", None)
         return state
@@ -610,11 +646,11 @@ def _coerce_provider(
 ) -> CredentialsProviderLike | None:
     """Normalize a credentials-or-provider value into a provider.
 
-    A bare `WorkerCredentials` is wrapped in a
-    `_StaticCredentialsProvider` with no identity, preserving the
-    legacy address-based verification behaviour; a provider is returned
-    unchanged; ``None`` stays ``None``.  This is the single seam through
-    which pools, proxies, and worker processes accept either form.
+    A bare `WorkerCredentials` is wrapped in a non-reloadable
+    `WorkerCredentialsProvider` with no identity, so it verifies against the
+    dialed address; a provider is returned unchanged; ``None`` stays
+    ``None``.  This is the single seam through which pools, proxies, and
+    worker processes accept either form.
 
     :param value:
         A `WorkerCredentials`, a provider, or ``None``.
@@ -630,7 +666,7 @@ def _coerce_provider(
     # "not WorkerCredentials" as "already a provider" keeps such providers
     # working and defers the reloadable default to the worker.
     if isinstance(value, WorkerCredentials):
-        return _StaticCredentialsProvider(value)
+        return WorkerCredentialsProvider(lambda: value, reloadable=False)
     return value
 
 

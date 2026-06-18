@@ -8,7 +8,7 @@ from hypothesis import strategies as st
 from wool import protocol
 from wool.runtime.worker import local as local_module
 from wool.runtime.worker.auth import WorkerCredentials
-from wool.runtime.worker.auth import _StaticCredentialsProvider
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.base import WorkerOptions
@@ -676,7 +676,9 @@ class TestLocalWorker:
             rather than the loopback address.
         """
         # Arrange
-        provider = _StaticCredentialsProvider(worker_credentials, identity="wool-worker")
+        provider = WorkerCredentialsProvider(
+            lambda: worker_credentials, identity="wool-worker"
+        )
         mock_process = mocker.MagicMock(spec=WorkerProcess)
         mock_process.address = "127.0.0.1:50051"
         mock_process.metadata = _make_metadata()

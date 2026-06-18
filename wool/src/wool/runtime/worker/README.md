@@ -397,7 +397,21 @@ async with wool.WorkerPool(spawn=4, credentials=provider):
 
 - **Rotation without restart.** Setting `reload=True` adopts rotated PEM material without a restart — see `WorkerCredentials.provider_from_files`. The mechanics span both planes: the client channel pool is keyed by a content fingerprint (rotated material yields fresh channels while unchanged material reuses pooled ones, and in-flight dispatches finish on their existing channel), and the worker server adopts new material per connection via `grpc.dynamic_ssl_server_credentials`.
 
-Providers are picklable: one supplied to a worker crosses into the worker subprocess, while the proxy re-resolves its provider from the ambient credential context (it is never serialized across the dispatch boundary).
+Beyond files, `WorkerCredentialsProvider(fetch, *, identity=..., reloadable=...)` adapts any source — a secrets manager, an environment variable, an in-memory blob — to the provider contract: `fetch` is a zero-argument callable returning the current `WorkerCredentials`, and the provider stamps the identity and computes the content fingerprint. `provider_from_files` is itself this provider over a file-reading `fetch`, so a custom source needs no new class:
+
+```python
+def fetch_credentials() -> wool.WorkerCredentials:
+    ...  # e.g., pull the current PEM material from a secrets manager
+
+
+provider = wool.WorkerCredentialsProvider(
+    fetch_credentials, identity="wool-worker.svc", reloadable=True
+)
+```
+
+A `reloadable=True` `fetch` is consulted on every resolution — including from the worker's per-handshake server fetcher, off the event loop — so it must be **importable** (a module-level function or picklable object, since it crosses into worker subprocesses) and **safe to call concurrently**, and it should return its cached material when nothing has changed (the file-backed `fetch` does this via a stat gate; the provider re-fingerprints cheaply, so unchanged material still reuses pooled channels). A `reloadable=False` provider resolves once at construction and serves that fixed snapshot; its `fetch` runs in the constructing process and may be a lambda.
+
+A provider supplied to a worker crosses into the worker subprocess (hence the importability note above); the proxy instead re-resolves its provider from the ambient credential context, so it is never serialized across the dispatch boundary.
 
 ### Local self-dispatch socket
 

@@ -17,7 +17,6 @@ from wool import protocol
 from wool.runtime.worker import process as process_module
 from wool.runtime.worker.auth import CredentialsContext
 from wool.runtime.worker.auth import CredentialsProviderLike
-from wool.runtime.worker.auth import FileCredentialsProvider
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
@@ -1951,7 +1950,9 @@ class TestWorkerProcess:
         ca.write_bytes(ca_pem)
         key.write_bytes(key_pem)
         cert.write_bytes(cert_pem)
-        provider = FileCredentialsProvider(str(ca), str(key), str(cert))
+        provider = WorkerCredentials.provider_from_files(
+            str(ca), str(key), str(cert), reload=True
+        )
 
         mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
         mocker.patch.object(process_module, "ResourcePool")

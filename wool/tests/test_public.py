@@ -37,7 +37,7 @@ def test_public_api_completeness():
         "HandshakeError",
         "CredentialsProviderLike",
         "CredentialsSnapshot",
-        "FileCredentialsProvider",
+        "WorkerCredentialsProvider",
         "WorkerConnection",
         "Context",
         "ContextAlreadyBound",
