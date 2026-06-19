@@ -372,7 +372,7 @@ Credential flow: `server_credentials` are passed to spawned workers for their gR
 
 `WorkerCredentials` describes a fixed snapshot of material verified against the dialed address. For dynamic-address platforms (Kubernetes, ECS/Fargate) where a worker's address is assigned at startup and credentials are rotated out of band, supply a **credential provider** instead — anywhere `credentials=` is accepted (`WorkerPool`, `LocalWorker`, `WorkerProxy`). A bare `WorkerCredentials` is wrapped in a non-reloadable provider automatically, so existing deployments are unaffected.
 
-A `WorkerCredentialsProvider` is a thin adapter over a `fetch` callback returning the current `WorkerCredentials`; it stamps an optional `identity` and computes the content fingerprint the channel pool is keyed by. It comes in two shapes.
+A `WorkerCredentialsProvider` is a thin adapter over a `factory` callable returning the current `WorkerCredentials`; it stamps an optional `identity` and computes the content fingerprint the channel pool is keyed by. It comes in two shapes.
 
 **Fixed material — `WorkerCredentials.as_provider`.** Read or build credentials once, then adapt them, optionally pinning the identity to verify discovered workers against:
 
@@ -390,27 +390,27 @@ async with wool.WorkerPool(spawn=4, credentials=provider):
     result = await my_routine()
 ```
 
-**Rotating material — `reloadable=True`.** Supply a `fetch` the runtime calls to obtain current material, so a long-running fleet adopts rotated certificates without a restart. Wool is unopinionated about *how* you reload — `fetch` owns the strategy (re-read a file, poll a secrets manager, cache with a TTL, keep a last-good fallback):
+**Rotating material — `reloadable=True`.** Supply a `factory` the runtime calls to obtain current material, so a long-running fleet adopts rotated certificates without a restart. Wool is unopinionated about *how* you reload — `factory` owns the strategy (re-read a file, poll a secrets manager, cache with a TTL, keep a last-good fallback):
 
 ```python
 import functools
 
 # Re-read the PEM files on each resolution. For an expensive source, or to
 # survive a torn read mid-rotation, add caching / last-good fallback here.
-fetch = functools.partial(
+factory = functools.partial(
     wool.WorkerCredentials.from_files,
     "certs/ca-cert.pem",
     "certs/worker-key.pem",
     "certs/worker-cert.pem",
 )
 provider = wool.WorkerCredentialsProvider(
-    fetch, identity="wool-worker.svc", reloadable=True
+    factory, identity="wool-worker.svc", reloadable=True
 )
 ```
 
 A configured `identity` verifies a worker's certificate against a stable logical identity (its SAN, via gRPC's `ssl_target_name_override`) rather than the dialed address, and applies to every worker reached through the provider. Rotation spans both planes: the client channel pool is keyed by a content fingerprint (rotated material yields fresh channels while unchanged material reuses pooled ones, and in-flight dispatches finish on their existing channel), and the worker server adopts new material per connection via `grpc.dynamic_ssl_server_credentials`.
 
-A `reloadable=True` `fetch` is consulted on every resolution — including from the worker's per-handshake server fetcher, off the event loop — so it must be **importable** (a module-level function or picklable object, since it crosses into worker subprocesses) and **safe to call concurrently**; if re-fetching is expensive, return cached material when nothing has changed (the provider re-fingerprints cheaply, so unchanged material still reuses pooled channels). A `reloadable=False` provider resolves once at construction and serves that fixed snapshot; its `fetch` runs in the constructing process and may be a lambda.
+A `reloadable=True` `factory` is consulted on every resolution — including from the worker's per-handshake server fetcher, off the event loop — so it must be **importable** (a module-level function or picklable object, since it crosses into worker subprocesses) and **safe to call concurrently**; if re-invoking it is expensive, return cached material when nothing has changed (the provider re-fingerprints cheaply, so unchanged material still reuses pooled channels). A `reloadable=False` provider resolves once at construction and serves that fixed snapshot; its `factory` runs in the constructing process and may be a lambda.
 
 A provider supplied to a worker crosses into the worker subprocess (hence the importability note above); the proxy instead re-resolves its provider from the ambient credential context, so it is never serialized across the dispatch boundary.
 

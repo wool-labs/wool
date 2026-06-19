@@ -136,17 +136,15 @@ class WorkerCredentials:
     def as_provider(self, *, identity: str | None = None) -> WorkerCredentialsProvider:
         """Adapt these fixed credentials into a non-reloadable provider.
 
-        The result always resolves to this material, so it is the in-memory
-        equivalent of supplying a bare `WorkerCredentials` (and what the
-        runtime wraps one in). ``identity`` sets the stable logical identity
-        — the certificate's subject-alternative name — to verify discovered
-        workers against, instead of the address they were dialed at; with
-        ``None`` (default) verification falls back to the dialed address.
+        Equivalent to supplying a bare `WorkerCredentials`. ``identity``
+        sets the stable logical identity to verify discovered workers against,
+        instead of the address they were dialed at; with ``None`` (default)
+        verification falls back to the dialed address.
 
-        For material that changes over a process's lifetime, build a
-        reloadable provider directly with a fetch callback instead, e.g.,
-        ``WorkerCredentialsProvider(fetch, reloadable=True)``; the reload
-        strategy then lives in ``fetch``.
+        For credentials that change over a process's lifetime, build a
+        reloadable provider directly with a factory callable instead, e.g.,
+        ``WorkerCredentialsProvider(factory, reloadable=True)``; the reload
+        strategy then lives in ``factory``.
 
         :param identity:
             Expected server identity, or ``None`` to verify against the
@@ -264,33 +262,27 @@ def _normalize_identity(identity: str | None) -> str | None:
 
 # public
 class WorkerCredentialsProvider:
-    """A credential provider backed by a user-supplied fetch callback.
+    """A credential provider backed by a user-supplied factory callable.
 
-    The provider is a thin adapter: ``fetch`` returns the current
+    The provider is a thin adapter: ``factory`` returns the current
     `WorkerCredentials`, and `resolve` hands them back with the provider's
-    ``identity`` applied. Every source-specific concern — change detection,
-    returning cached material when nothing has changed, validation, and
-    failure handling — belongs to ``fetch``, which keeps the provider itself
-    a pass-through. `WorkerCredentials.as_provider` is the shorthand for the
-    fixed-material case.
+    ``identity`` applied. Every source-specific concern, e.g., rotation,
+    validation, failure handling, etc., belongs to ``factory``, which keeps
+    the provider itself a pass-through. `WorkerCredentials.as_provider` is
+    the shorthand for the fixed-material case.
 
     A non-reloadable provider resolves once when constructed and serves that
-    fixed result thereafter, so the fixed-material case needs no dedicated
-    type — it is the general provider with a constant fetch:
+    fixed result thereafter.  The lambda runs once in the constructing process
+    and is dropped before the provider is pickled into a worker subprocess,
+    so a non-reloadable ``factory`` need not be picklable.
 
-    .. code-block:: python
+    A reloadable provider instead calls ``factory`` on every resolution,
+    including from the worker's per-handshake server fetcher, so a reloadable
+    ``factory`` MUST be an importable, picklable callable (a module-level
+    function or a picklable object) and MUST be safe to call concurrently
+    from gRPC handshake threads.
 
-        provider = WorkerCredentialsProvider(lambda: creds, reloadable=False)
-
-    The lambda runs once in the constructing process and is dropped before
-    the provider is pickled into a worker subprocess, so a non-reloadable
-    ``fetch`` need not be picklable. A reloadable provider instead calls
-    ``fetch`` on every resolution — including from the worker's per-handshake
-    server fetcher — so a reloadable ``fetch`` MUST be an importable,
-    picklable callable (a module-level function or a picklable object) and
-    MUST be safe to call concurrently from gRPC handshake threads.
-
-    :param fetch:
+    :param factory:
         A zero-argument callable returning the current `WorkerCredentials`.
     :param identity:
         Expected server identity to verify discovered workers against,
@@ -298,26 +290,26 @@ class WorkerCredentialsProvider:
         identity the credentials already carry). ``None`` (default) leaves
         the credentials' own identity untouched.
     :param reloadable:
-        Whether ``fetch`` is consulted on every resolution. If ``False``
-        (default), ``fetch`` is called once at construction and the result
+        Whether ``factory`` is consulted on every resolution. If ``False``
+        (default), ``factory`` is called once at construction and the result
         is fixed for the provider's lifetime.
     """
 
     def __init__(
         self,
-        fetch: Callable[[], WorkerCredentials],
+        factory: Callable[[], WorkerCredentials],
         *,
         identity: str | None = None,
         reloadable: bool = False,
     ) -> None:
-        self._fetch = fetch
+        self._factory = factory
         self._identity = _normalize_identity(identity)
         self._reloadable = bool(reloadable)
-        # A non-reloadable provider resolves eagerly so the credentials — not
-        # the callback — are what cross into worker subprocesses (see
+        # A non-reloadable provider resolves eagerly so the credentials,
+        # not the callback, are what cross into worker subprocesses (see
         # __getstate__); a reloadable provider defers to resolve().
         self._cached: WorkerCredentials | None = (
-            None if self._reloadable else self._apply(fetch())
+            None if self._reloadable else self._apply(factory())
         )
 
     def _apply(self, credentials: WorkerCredentials) -> WorkerCredentials:
@@ -334,7 +326,7 @@ class WorkerCredentialsProvider:
 
     @property
     def reloadable(self) -> bool:
-        """Whether the material can change over the provider's lifetime.
+        """Whether the credentials can change over the provider's lifetime.
 
         A worker built from a reloadable provider serves rotating server
         credentials via a per-handshake fetcher; a non-reloadable provider
@@ -346,25 +338,25 @@ class WorkerCredentialsProvider:
         """Return the current credentials, with the provider's identity applied.
 
         A non-reloadable provider returns the credentials captured at
-        construction. A reloadable provider calls ``fetch`` each time;
+        construction. A reloadable provider calls ``factory`` each time;
         identical material has an identical fingerprint, so unchanged
         credentials reuse the pooled channel and only the re-read is paid for
-        by ``fetch``.
+        by ``factory``.
 
         :returns:
             The current `WorkerCredentials`.
         """
         if self._cached is not None:
             return self._cached
-        return self._apply(self._fetch())
+        return self._apply(self._factory())
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         if not self._reloadable:
             # The fixed credentials already ride along, so drop the callback:
-            # a non-reloadable fetch (e.g., a lambda over in-memory material)
+            # a non-reloadable factory (e.g., a lambda over in-memory material)
             # need not be picklable to cross into a worker subprocess.
-            state["_fetch"] = None
+            state["_factory"] = None
         return state
 
 

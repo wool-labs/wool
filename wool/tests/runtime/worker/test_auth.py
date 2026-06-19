@@ -985,17 +985,17 @@ class TestWorkerCredentialsProvider:
         assert provider.identity is None
         assert provider.resolve().identity is None
 
-    def test_non_reloadable_should_call_fetch_once_at_construction(
+    def test_non_reloadable_should_call_factory_once_at_construction(
         self, test_certificates
     ):
         """Test a non-reloadable provider resolves eagerly and caches.
 
         Given:
-            A non-reloadable provider over a counting fetch.
+            A non-reloadable provider over a counting factory.
         When:
             The provider is constructed and then resolved several times.
         Then:
-            fetch should be called exactly once, at construction.
+            factory should be called exactly once, at construction.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
@@ -1004,12 +1004,12 @@ class TestWorkerCredentialsProvider:
         )
         calls = []
 
-        def fetch():
+        def factory():
             calls.append(1)
             return creds
 
         # Act
-        provider = WorkerCredentialsProvider(fetch)
+        provider = WorkerCredentialsProvider(factory)
         assert len(calls) == 1
         provider.resolve()
         provider.resolve()
@@ -1017,15 +1017,15 @@ class TestWorkerCredentialsProvider:
         # Assert
         assert len(calls) == 1
 
-    def test_reloadable_should_call_fetch_each_resolve(self, test_certificates):
-        """Test a reloadable provider consults fetch on every resolution.
+    def test_reloadable_should_call_factory_each_resolve(self, test_certificates):
+        """Test a reloadable provider consults factory on every resolution.
 
         Given:
-            A reloadable provider over a counting fetch.
+            A reloadable provider over a counting factory.
         When:
             The provider is constructed and then resolved several times.
         Then:
-            fetch should be deferred at construction and called once per
+            factory should be deferred at construction and called once per
             resolve.
         """
         # Arrange
@@ -1035,12 +1035,12 @@ class TestWorkerCredentialsProvider:
         )
         calls = []
 
-        def fetch():
+        def factory():
             calls.append(1)
             return creds
 
         # Act
-        provider = WorkerCredentialsProvider(fetch, reloadable=True)
+        provider = WorkerCredentialsProvider(factory, reloadable=True)
         assert len(calls) == 0
         provider.resolve()
         provider.resolve()
@@ -1050,10 +1050,10 @@ class TestWorkerCredentialsProvider:
         assert len(calls) == 3
 
     def test_reloadable_resolve_should_reflect_rotated_material(self, test_certificates):
-        """Test a reloadable provider adopts material returned by fetch.
+        """Test a reloadable provider adopts material returned by factory.
 
         Given:
-            A reloadable provider whose fetch returns rotated material on the
+            A reloadable provider whose factory returns rotated material on the
             second call.
         When:
             resolve() is called before and after the rotation.
@@ -1109,16 +1109,16 @@ class TestWorkerCredentialsProvider:
         assert restored.resolve().fingerprint == provider.resolve().fingerprint
         assert restored.identity == "wool-worker"
 
-    def test_reloadable_pickle_should_keep_fetch_and_reread(self, temp_cert_files):
+    def test_reloadable_pickle_should_keep_factory_and_reread(self, temp_cert_files):
         """Test a reloadable provider re-resolves through a pickle roundtrip.
 
         Given:
-            A reloadable, file-backed provider (whose fetch is picklable)
+            A reloadable, file-backed provider (whose factory is picklable)
             that has resolved once.
         When:
             It is pickled with the standard library pickler and unpickled.
         Then:
-            The restored provider should keep its fetch and resolve to the
+            The restored provider should keep its factory and resolve to the
             same fingerprint by re-reading the unchanged files.
         """
         # Arrange
