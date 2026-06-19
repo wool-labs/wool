@@ -60,11 +60,11 @@ class WorkerCredentials:
         Whether to use mutual TLS (mTLS). If True (default), both server
         and client authenticate. If False, only server is authenticated.
     :param identity:
-        Expected server identity — the peer certificate's subject-alternative
-        name — to verify dialed workers against, or ``None`` (default) to
-        verify against the dialed address. A blank value normalizes to
-        ``None``. Consumed only client-side; inert when presenting the
-        worker's own server certificate.
+        Expected server identity, i.e., the peer certificate's subject-
+        alternative name to verify dialed workers against, or ``None``
+        (default) to verify against the dialed address. A blank value
+        normalizes to ``None``. Only consumed client-side; inert when
+        presenting the worker's own server certificate.
     """
 
     ca_cert: bytes
@@ -78,7 +78,7 @@ class WorkerCredentials:
 
     @property
     def fingerprint(self) -> str:
-        """A hex SHA-256 digest over the material, mutual flag, and identity.
+        """A hex SHA-256 digest over the credentials, mutual flag, and identity.
 
         A stable content identifier: equal credentials produce equal
         fingerprints, and any change to the certificate-authority bundle,
@@ -143,9 +143,8 @@ class WorkerCredentials:
         workers against, instead of the address they were dialed at; with
         ``None`` (default) verification falls back to the dialed address.
 
-        For material that changes over a process's lifetime — rotated files,
-        a secrets manager — build a reloadable provider directly with a fetch
-        callback instead, e.g.,
+        For material that changes over a process's lifetime, build a
+        reloadable provider directly with a fetch callback instead, e.g.,
         ``WorkerCredentialsProvider(fetch, reloadable=True)``; the reload
         strategy then lives in ``fetch``.
 
