@@ -16,6 +16,7 @@ _current: ContextVar[WorkerCredentials | WorkerCredentialsProvider | None] = Con
 )
 
 
+# public
 @dataclass(frozen=True)
 class WorkerCredentials:
     """Container for worker TLS/mTLS credentials.
@@ -237,11 +238,11 @@ class WorkerCredentialsProvider:
     and is dropped before the provider is pickled into a worker subprocess,
     so a non-reloadable ``factory`` need not be picklable.
 
-    A reloadable provider instead calls ``factory`` on every resolution,
-    including from the worker's per-handshake server fetcher, so a reloadable
-    ``factory`` MUST be an importable, picklable callable (a module-level
-    function or a picklable object) and MUST be safe to call concurrently
-    from gRPC handshake threads.
+    A reloadable provider resolves on every dispatch (the resolved credentials
+    key the channel pool) client-side, and with each TLS handshake server-side.
+    A reloadable ``factory`` therefore MUST be an importable, picklable callable
+    (a module-level function or a picklable object) and MUST be safe to call
+    concurrently from gRPC handshake threads.
 
     :param factory:
         A zero-argument callable returning the current `WorkerCredentials`.
@@ -273,12 +274,17 @@ class WorkerCredentialsProvider:
             None if self._reloadable else self._apply(factory())
         )
 
-    def _apply(self, credentials: WorkerCredentials) -> WorkerCredentials:
-        # The provider's identity, when configured, is authoritative;
-        # otherwise the credentials keep whatever identity they carry.
-        if self._identity is None:
-            return credentials
-        return replace(credentials, identity=self._identity)
+    def __getstate__(self) -> dict:
+        """Return the picklable state, dropping a non-reloadable factory.
+
+        The fixed credentials already ride along in the state, so the callback
+        is dropped: a non-reloadable ``factory`` (e.g., a lambda over in-memory
+        material) need not be picklable to cross into a worker subprocess.
+        """
+        state = self.__dict__.copy()
+        if not self._reloadable:
+            state["_factory"] = None
+        return state
 
     @property
     def identity(self) -> str | None:
@@ -300,9 +306,8 @@ class WorkerCredentialsProvider:
 
         A non-reloadable provider returns the credentials captured at
         construction. A reloadable provider calls ``factory`` each time;
-        identical material has an identical fingerprint, so unchanged
-        credentials reuse the pooled channel and only the re-read is paid for
-        by ``factory``.
+        identical material compares equal, so unchanged credentials reuse the
+        pooled channel and only the re-read is paid for by ``factory``.
 
         :returns:
             The current `WorkerCredentials`.
@@ -311,14 +316,15 @@ class WorkerCredentialsProvider:
             return self._cached
         return self._apply(self._factory())
 
-    def __getstate__(self) -> dict:
-        state = self.__dict__.copy()
-        if not self._reloadable:
-            # The fixed credentials already ride along, so drop the callback:
-            # a non-reloadable factory (e.g., a lambda over in-memory material)
-            # need not be picklable to cross into a worker subprocess.
-            state["_factory"] = None
-        return state
+    def _apply(self, credentials: WorkerCredentials) -> WorkerCredentials:
+        """Return ``credentials`` with the provider's identity applied.
+
+        The provider's identity, when configured, is authoritative;
+        otherwise the credentials keep whatever identity they carry.
+        """
+        if self._identity is None:
+            return credentials
+        return replace(credentials, identity=self._identity)
 
 
 def _coerce_provider(
