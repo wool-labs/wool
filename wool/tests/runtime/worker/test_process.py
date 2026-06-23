@@ -2111,3 +2111,49 @@ class TestWorkerProcess:
         # Assert
         assert "path" in captured
         assert len(captured["path"].encode()) <= 92
+
+    def test_run_should_fall_back_to_tmp_when_runtime_dir_is_not_a_directory(
+        self, mocker, tmp_path
+    ):
+        """Test the self-dispatch socket falls back to /tmp for an invalid base.
+
+        Given:
+            A worker whose XDG_RUNTIME_DIR points to a path that is not an
+            existing directory.
+        When:
+            run() executes the server lifecycle and binds the self-dispatch
+            socket.
+        Then:
+            The socket should be bound under /tmp, the fallback base, rather
+            than the unusable XDG_RUNTIME_DIR.
+        """
+        # Arrange
+        captured = {}
+
+        def add_insecure_port(target):
+            if target.startswith("unix:"):
+                captured["path"] = target.removeprefix("unix:")
+            return 50051
+
+        mocker.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(tmp_path / "nonexistent")})
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch.object(process_module, "ResourcePool")
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(side_effect=add_insecure_port)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
+        mocker.patch.object(process_module, "_signal_handlers")
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        assert captured["path"].startswith("/tmp/wool-")
