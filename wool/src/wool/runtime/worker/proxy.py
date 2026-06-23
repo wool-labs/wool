@@ -35,10 +35,9 @@ from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
-from wool.runtime.worker.auth import CredentialsContext
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
-from wool.runtime.worker.auth import _coerce_provider
+from wool.runtime.worker.auth import current_credentials
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.noreentry import noreentry
@@ -472,13 +471,18 @@ class WorkerProxy:
             )
 
         if credentials is Undefined:
-            resolved = CredentialsContext.current()
+            resolved = current_credentials()
         else:
             resolved = credentials
         # Normalize either a bare WorkerCredentials or a provider (from the
         # argument or the ambient credential context) into a provider the
-        # sentinel resolves per connection.
-        self._provider = _coerce_provider(resolved)
+        # sentinel resolves per connection. A bare WorkerCredentials is wrapped;
+        # anything else is assumed to already be a (duck-typed) provider.
+        self._provider = (
+            resolved.as_provider()
+            if isinstance(resolved, WorkerCredentials)
+            else resolved
+        )
 
         # Create security filter based on resolved credentials
         security_filter = self._create_security_filter(self._provider)

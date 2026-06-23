@@ -25,10 +25,9 @@ import wool
 from wool import protocol
 from wool.runtime.context import install_task_factory
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.worker.auth import CredentialsContext
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
-from wool.runtime.worker.auth import _coerce_provider
+from wool.runtime.worker.auth import credentials_scope
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -127,7 +126,12 @@ class WorkerProcess(Process):
         if proxy_pool_ttl <= 0:
             raise ValueError("Proxy pool TTL must be positive")
         self._proxy_pool_ttl = proxy_pool_ttl
-        self._provider = _coerce_provider(credentials)
+        # A bare WorkerCredentials is wrapped; a provider is used as-is.
+        self._provider = (
+            credentials.as_provider()
+            if isinstance(credentials, WorkerCredentials)
+            else credentials
+        )
         self._options = options or WorkerOptions()
         self._uid = uid if uid is not None else uuid.uuid4()
         self._tags = tags
@@ -289,7 +293,7 @@ class WorkerProcess(Process):
         fires.
         """
         creds_ctx = (
-            CredentialsContext(self._provider)
+            credentials_scope(self._provider)
             if self._provider is not None
             else contextlib.nullcontext()
         )

@@ -9,7 +9,6 @@ import grpc.aio
 from wool import protocol
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
-from wool.runtime.worker.auth import _coerce_provider
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.process import WorkerProcess
@@ -99,7 +98,12 @@ class LocalWorker(Worker):
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
-        self._provider = _coerce_provider(credentials)
+        # A bare WorkerCredentials is wrapped; a provider is used as-is.
+        self._provider = (
+            credentials.as_provider()
+            if isinstance(credentials, WorkerCredentials)
+            else credentials
+        )
         self._worker_process = WorkerProcess(
             uid=self._uid,
             host=host,

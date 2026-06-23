@@ -28,8 +28,8 @@ from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.routine.task import Task
-from wool.runtime.worker.auth import CredentialsContext
 from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import credentials_scope
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -3321,7 +3321,7 @@ class TestWorkerProxy:
             version="1.0.0",
             secure=False,
         )
-        with CredentialsContext(worker_credentials):
+        with credentials_scope(worker_credentials):
             # Unpickle restores proxy with credentials from ContextVar.
             # Verify by constructing a new proxy (same mechanism) with
             # static workers — default credentials resolve from ContextVar.
@@ -3518,7 +3518,7 @@ class TestWorkerProxy:
         )
 
         # Act — ContextVar has mTLS creds, but we pass None explicitly
-        with CredentialsContext(worker_credentials):
+        with credentials_scope(worker_credentials):
             proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
                 credentials=None,
@@ -3567,7 +3567,7 @@ class TestWorkerProxy:
         )
 
         # Act
-        with CredentialsContext(worker_credentials):
+        with credentials_scope(worker_credentials):
             proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
                 lazy=False,
@@ -3665,7 +3665,7 @@ class TestWorkerProxy:
         )
 
         # Act
-        with CredentialsContext(provider):
+        with credentials_scope(provider):
             proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
                 lazy=False,

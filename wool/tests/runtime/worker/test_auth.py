@@ -19,7 +19,6 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
-from wool.runtime.worker.auth import CredentialsContext
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 
@@ -986,29 +985,3 @@ class TestWorkerCredentialsProvider:
 
         # Assert
         assert restored.resolve() == original
-
-
-class TestCredentialsContext:
-    """Test suite for CredentialsContext."""
-
-    def test_exit_should_raise_without_matching_enter(self, test_certificates):
-        """Test __exit__ guards against use without a matching __enter__.
-
-        Given:
-            A CredentialsContext that was never entered.
-        When:
-            __exit__ is called.
-        Then:
-            It should raise RuntimeError rather than resetting a token it
-            never set.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        credentials = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
-        )
-        context = CredentialsContext(credentials)
-
-        # Act & assert
-        with pytest.raises(RuntimeError, match="without matching __enter__"):
-            context.__exit__()

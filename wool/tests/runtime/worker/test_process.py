@@ -15,9 +15,9 @@ from hypothesis import strategies as st
 
 from wool import protocol
 from wool.runtime.worker import process as process_module
-from wool.runtime.worker.auth import CredentialsContext
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import current_credentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -1837,7 +1837,7 @@ class TestWorkerProcess:
         When:
             run() is called and the server lifecycle executes.
         Then:
-            CredentialsContext.current() should return a provider resolving
+            current_credentials() should return a provider resolving
             to those credentials during the server lifecycle.
         """
         # Arrange
@@ -1863,7 +1863,7 @@ class TestWorkerProcess:
         mock_service = mocker.MagicMock()
 
         async def capture_current():
-            captured_current.append(CredentialsContext.current())
+            captured_current.append(current_credentials())
 
         mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
         mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
@@ -1910,7 +1910,7 @@ class TestWorkerProcess:
         mock_service = mocker.MagicMock()
 
         async def capture_current():
-            captured_current.append(CredentialsContext.current())
+            captured_current.append(current_credentials())
 
         mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
         mocker.patch.object(process_module, "WorkerService", return_value=mock_service)

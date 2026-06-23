@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
-from contextvars import Token
 from dataclasses import dataclass
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -327,65 +328,26 @@ class WorkerCredentialsProvider:
         return replace(credentials, identity=self._identity)
 
 
-def _coerce_provider(
-    value: WorkerCredentials | WorkerCredentialsProvider | None,
-) -> WorkerCredentialsProvider | None:
-    """Normalize a credentials-or-provider value into a provider.
+@contextmanager
+def credentials_scope(
+    credentials: WorkerCredentials | WorkerCredentialsProvider,
+) -> Iterator[None]:
+    """Bind ``credentials`` as the ambient credentials for the enclosed scope.
 
-    A bare `WorkerCredentials` is adapted via `WorkerCredentials.as_provider`
-    into a non-reloadable provider with no identity, so it verifies against
-    the dialed address; a provider is returned unchanged; ``None`` stays
-    ``None``.  This is the single seam through which pools, proxies, and
-    worker processes accept either form.
-
-    :param value:
-        A `WorkerCredentials`, a provider, or ``None``.
-    :returns:
-        A `WorkerCredentialsProvider`, or ``None``.
+    Code running within the scope reads them via `current_credentials`; the
+    binding is reset on exit. Carries either a bare `WorkerCredentials` or a
+    `WorkerCredentialsProvider`. Not part of the public API.
     """
-    if value is None:
-        return None
-    # WorkerCredentials is the one thing to wrap; anything else is assumed to
-    # already be a provider. Providers are consumed structurally — resolve()
-    # plus an optional reloadable the worker defaults off — so there is no
-    # nominal protocol to isinstance-check here.
-    if isinstance(value, WorkerCredentials):
-        return value.as_provider()
-    return value
+    token = _current.set(credentials)
+    try:
+        yield
+    finally:
+        _current.reset(token)
 
 
-class CredentialsContext:
-    """Internal context manager for propagating credentials via ContextVar.
+def current_credentials() -> WorkerCredentials | WorkerCredentialsProvider | None:
+    """Return the ambient credentials or provider, or ``None`` if unset.
 
-    Used by WorkerProcess._serve() to set credentials in worker subprocesses
-    and by WorkerProxy.__init__() to resolve credentials from context. Carries
-    either a `WorkerCredentials` or a `WorkerCredentialsProvider`.
     Not part of the public API.
     """
-
-    def __init__(
-        self, credentials: WorkerCredentials | WorkerCredentialsProvider
-    ) -> None:
-        self._credentials = credentials
-        self._token: Token | None = None
-
-    def __enter__(self) -> CredentialsContext:
-        self._token = _current.set(self._credentials)
-        return self
-
-    def __exit__(self, *_) -> None:
-        if self._token is None:
-            raise RuntimeError("__exit__ called without matching __enter__")
-        _current.reset(self._token)
-        self._token = None
-
-    @classmethod
-    def current(cls) -> WorkerCredentials | WorkerCredentialsProvider | None:
-        """Get the current credentials or provider from the context.
-
-        :returns:
-            The active `WorkerCredentials` or
-            `WorkerCredentialsProvider`, or ``None`` if no context is
-            set.
-        """
-        return _current.get()
+    return _current.get()
