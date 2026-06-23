@@ -892,7 +892,7 @@ class TestWorkerConnection:
             unchanged.
         Then:
             The secure channel should be built only once — the pooled
-            channel is reused because the credential fingerprint is
+            channel is reused because the credentials value is
             unchanged.
         """
         # Arrange
@@ -944,11 +944,11 @@ class TestWorkerConnection:
             A second task is dispatched.
         Then:
             A second secure channel should be built — the rotated material
-            resolves to a new fingerprint and a new pooled channel, while
-            the original channel remains for in-flight work.
+            resolves to a different credentials value and a new pooled
+            channel, while the original channel remains for in-flight work.
         """
         # Arrange — real PEM so the provider's validate-before-cache passes;
-        # rotation appends ignored trailing bytes for a distinct fingerprint.
+        # rotation appends ignored trailing bytes for a distinct credentials value.
         key_pem, cert_pem, ca_pem = test_certificates
         ca_path = tmp_path / "ca.pem"
         key_path = tmp_path / "key.pem"

@@ -857,22 +857,23 @@ def _classify_handshake_failure(
 class WorkerConnection:
     """gRPC connection to a worker for task dispatch.
 
-    Acquires pooled gRPC channels keyed by ``(target, credential
-    fingerprint, options)``.  Each :meth:`dispatch` call resolves the
-    current credential snapshot from the configured provider, obtains a
-    reference-counted channel from the module-level pool, primes an async
-    generator that holds its own reference, then releases the
-    dispatch-scope reference.  The channel stays alive until the caller
-    finishes consuming the result stream.
+    Acquires pooled gRPC channels keyed by ``(target, credentials,
+    options)`` — the `WorkerCredentials` value itself, which is hashable
+    and value-equal.  Each :meth:`dispatch` call resolves the current
+    credentials from the configured provider, obtains a reference-counted
+    channel from the module-level pool, primes an async generator that
+    holds its own reference, then releases the dispatch-scope reference.
+    The channel stays alive until the caller finishes consuming the result
+    stream.
 
-    **Credential rotation.** Because the pool key carries the credential
-    *fingerprint* rather than a gRPC credentials object, a connection
-    resolves its provider on every dispatch: unchanged material reuses the
-    pooled channel, while rotated material resolves to a new fingerprint
-    and a fresh channel on the next dispatch.  In-flight dispatches retain
-    their own reference to the old channel and finish on it, so rotation is
-    adopted at the natural boundary of new connections without tearing down
-    work in progress.
+    **Credential rotation.** Because the pool key carries the
+    `WorkerCredentials` *value* rather than a gRPC credentials object, a
+    connection resolves its provider on every dispatch: unchanged material
+    is an equal key and reuses the pooled channel, while rotated material
+    is a different key and builds a fresh channel on the next dispatch.
+    In-flight dispatches retain their own reference to the old channel and
+    finish on it, so rotation is adopted at the natural boundary of new
+    connections without tearing down work in progress.
 
     **Cleanup semantics on cancellation.** Every code path that owns
     an in-flight gRPC call wraps its body in
@@ -1079,8 +1080,8 @@ class WorkerConnection:
         Clears the pooled channel entries for the most recent TCP key and,
         if a UDS address is available, the UDS key. Idempotent: safe
         to call multiple times or on connections that were never used.
-        Channels for credential fingerprints superseded by rotation are
-        not cleared here; they expire from the pool via its TTL.
+        Channels for credentials superseded by rotation are not cleared
+        here; they expire from the pool via its TTL.
         """
         if self._key is not None:
             try:

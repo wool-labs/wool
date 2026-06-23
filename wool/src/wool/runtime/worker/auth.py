@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -76,18 +75,6 @@ class WorkerCredentials:
     def __post_init__(self) -> None:
         object.__setattr__(self, "identity", _normalize_identity(self.identity))
 
-    @property
-    def fingerprint(self) -> str:
-        """A hex SHA-256 digest over the credentials, mutual flag, and identity.
-
-        A stable content identifier: equal credentials produce equal
-        fingerprints, and any change to the certificate-authority bundle,
-        key, certificate, mutual flag, or identity changes it.  The client
-        channel pool reuses a cached channel for unchanged credentials and
-        builds a fresh one when they rotate.
-        """
-        return _compute_fingerprint(self)
-
     @classmethod
     def from_files(
         cls,
@@ -138,8 +125,8 @@ class WorkerCredentials:
 
         Equivalent to supplying a bare `WorkerCredentials`. ``identity``
         sets the stable logical identity to verify discovered workers against,
-        instead of the address they were dialed at; with ``None`` (default)
-        verification falls back to the dialed address.
+        instead of the address they were dialed at. Given an identity of ``None``
+        (default), verification falls back to the dialed address.
 
         For credentials that change over a process's lifetime, build a
         reloadable provider directly with a factory callable instead, e.g.,
@@ -213,32 +200,6 @@ class WorkerCredentials:
             private_key=self.worker_key if self.mutual else None,
             certificate_chain=self.worker_cert if self.mutual else None,
         )
-
-
-def _compute_fingerprint(credentials: WorkerCredentials) -> str:
-    """Compute a stable content fingerprint for credential material.
-
-    The fingerprint changes if and only if the certificate-authority
-    bundle, worker key, worker certificate, mutual-TLS flag, or expected
-    identity changes.
-
-    :param credentials:
-        The credential material to fingerprint.
-    :returns:
-        A hex SHA-256 digest over the material, mutual flag, and identity.
-    """
-    hasher = hashlib.sha256()
-    for part in (
-        credentials.ca_cert,
-        credentials.worker_key,
-        credentials.worker_cert,
-    ):
-        # Length-prefix each field so distinct splits cannot collide.
-        hasher.update(len(part).to_bytes(8, "big"))
-        hasher.update(part)
-    hasher.update(b"\x01" if credentials.mutual else b"\x00")
-    hasher.update((credentials.identity or "").encode("utf-8"))
-    return hasher.hexdigest()
 
 
 def _normalize_identity(identity: str | None) -> str | None:

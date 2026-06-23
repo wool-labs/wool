@@ -295,7 +295,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 ### Connection pooling
 
-`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credential fingerprint, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Keying on a content fingerprint rather than a credentials object is what lets rotated material yield a fresh channel while unchanged material reuses the pooled one (see _Security_). Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`.
+`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Keying on the `WorkerCredentials` value (a frozen dataclass, so hashable and value-equal) is what lets rotated material yield a fresh channel while unchanged material reuses the pooled one (see _Security_). Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`.
 
 ### Transport configuration
 
@@ -372,7 +372,7 @@ Credential flow: `server_credentials` are passed to spawned workers for their gR
 
 `WorkerCredentials` describes a fixed snapshot of material verified against the dialed address. For dynamic-address platforms (Kubernetes, ECS/Fargate) where a worker's address is assigned at startup and credentials are rotated out of band, supply a **credential provider** instead — anywhere `credentials=` is accepted (`WorkerPool`, `LocalWorker`, `WorkerProxy`). A bare `WorkerCredentials` is wrapped in a non-reloadable provider automatically, so existing deployments are unaffected.
 
-A `WorkerCredentialsProvider` is a thin adapter over a `factory` callable returning the current `WorkerCredentials`; it stamps an optional `identity` and computes the content fingerprint the channel pool is keyed by. It comes in two shapes.
+A `WorkerCredentialsProvider` is a thin adapter over a `factory` callable returning the current `WorkerCredentials`; it stamps an optional `identity` onto the credentials the channel pool keys on. It comes in two shapes.
 
 **Fixed material — `WorkerCredentials.as_provider`.** Read or build credentials once, then adapt them, optionally pinning the identity to verify discovered workers against:
 
@@ -408,9 +408,9 @@ provider = wool.WorkerCredentialsProvider(
 )
 ```
 
-A configured `identity` verifies a worker's certificate against a stable logical identity (its SAN, via gRPC's `ssl_target_name_override`) rather than the dialed address, and applies to every worker reached through the provider. Rotation spans both planes: the client channel pool is keyed by a content fingerprint (rotated material yields fresh channels while unchanged material reuses pooled ones, and in-flight dispatches finish on their existing channel), and the worker server adopts new material per connection via `grpc.dynamic_ssl_server_credentials`.
+A configured `identity` verifies a worker's certificate against a stable logical identity (its SAN, via gRPC's `ssl_target_name_override`) rather than the dialed address, and applies to every worker reached through the provider. Rotation spans both planes: the client channel pool is keyed by the `WorkerCredentials` value (rotated material is a different key and yields fresh channels while unchanged material reuses pooled ones, and in-flight dispatches finish on their existing channel), and the worker server adopts new material per connection via `grpc.dynamic_ssl_server_credentials`.
 
-A `reloadable=True` `factory` is consulted on every resolution — including from the worker's per-handshake server fetcher, off the event loop — so it must be **importable** (a module-level function or picklable object, since it crosses into worker subprocesses) and **safe to call concurrently**; if re-invoking it is expensive, return cached material when nothing has changed (the provider re-fingerprints cheaply, so unchanged material still reuses pooled channels). A `reloadable=False` provider resolves once at construction and serves that fixed snapshot; its `factory` runs in the constructing process and may be a lambda.
+A `reloadable=True` `factory` is consulted on every resolution — including from the worker's per-handshake server fetcher, off the event loop — so it must be **importable** (a module-level function or picklable object, since it crosses into worker subprocesses) and **safe to call concurrently**; if re-invoking it is expensive, return cached material when nothing has changed (an equal `WorkerCredentials` value is the same pool key, so unchanged material still reuses pooled channels). A `reloadable=False` provider resolves once at construction and serves that fixed snapshot; its `factory` runs in the constructing process and may be a lambda.
 
 A provider supplied to a worker crosses into the worker subprocess (hence the importability note above); the proxy instead re-resolves its provider from the ambient credential context, so it is never serialized across the dispatch boundary.
 

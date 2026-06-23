@@ -15,7 +15,6 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from hypothesis import HealthCheck
-from hypothesis import assume
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
@@ -646,24 +645,28 @@ class TestWorkerCredentials:
         assert type(server1) is type(server2)
         assert type(client1) is type(client2)
 
-    @given(mutual=st.booleans())
+    @given(mutual=st.booleans(), identity=st.one_of(st.none(), st.text()))
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_pickle_roundtrip(self, mutual, test_certificates):
+    def test_pickle_roundtrip(self, mutual, identity, test_certificates):
         """Test WorkerCredentials survives pickle roundtrip.
 
         Given:
-            WorkerCredentials with valid certificates and any mutual
-            flag value.
+            WorkerCredentials with valid certificates, any mutual flag
+            value, and any identity.
         When:
             The instance is pickled and unpickled.
         Then:
-            It should produce an equal instance that still builds
-            valid gRPC credentials.
+            It should produce an equal instance — preserving the
+            identity — that still builds valid gRPC credentials.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
         creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=mutual
+            ca_cert=ca_pem,
+            worker_key=key_pem,
+            worker_cert=cert_pem,
+            mutual=mutual,
+            identity=identity,
         )
 
         # Act
@@ -708,160 +711,6 @@ class TestWorkerCredentials:
         # Act & assert
         with pytest.raises(AttributeError):
             WorkerCredentials.current()
-
-
-class TestWorkerCredentialsFingerprint:
-    """Test suite for the WorkerCredentials content fingerprint."""
-
-    def test_fingerprint_should_be_non_empty(self, test_certificates):
-        """Test credentials expose a non-empty content fingerprint.
-
-        Given:
-            Credential material carrying an identity.
-        When:
-            The fingerprint property is read.
-        Then:
-            It should be a non-empty hex digest.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem,
-            worker_key=key_pem,
-            worker_cert=cert_pem,
-            identity="wool-worker",
-        )
-
-        # Act & assert
-        assert creds.fingerprint
-
-    @given(
-        ca=st.binary(),
-        key=st.binary(),
-        cert=st.binary(),
-        identity=st.one_of(st.none(), st.text()),
-    )
-    def test_fingerprint_should_be_identical_for_identical_material(
-        self, ca, key, cert, identity
-    ):
-        """Test the fingerprint is stable across identical material.
-
-        Given:
-            Any two credential instances built from the same bytes, mutual
-            flag, and identity.
-        When:
-            Their fingerprints are read.
-        Then:
-            They should be equal.
-        """
-        # Arrange
-        creds_a = WorkerCredentials(
-            ca_cert=ca, worker_key=key, worker_cert=cert, identity=identity
-        )
-        creds_b = WorkerCredentials(
-            ca_cert=ca, worker_key=key, worker_cert=cert, identity=identity
-        )
-
-        # Act & assert
-        assert creds_a.fingerprint == creds_b.fingerprint
-
-    @given(ca=st.binary(), other_ca=st.binary(), key=st.binary(), cert=st.binary())
-    def test_fingerprint_should_change_when_material_differs(
-        self, ca, other_ca, key, cert
-    ):
-        """Test the fingerprint is sensitive to material changes.
-
-        Given:
-            Two credential instances differing only in their CA bytes.
-        When:
-            Their fingerprints are read.
-        Then:
-            They should differ.
-        """
-        # Arrange
-        assume(ca != other_ca)
-        creds = WorkerCredentials(ca_cert=ca, worker_key=key, worker_cert=cert)
-        rotated = WorkerCredentials(ca_cert=other_ca, worker_key=key, worker_cert=cert)
-
-        # Act & assert
-        assert creds.fingerprint != rotated.fingerprint
-
-    def test_fingerprint_should_change_when_identity_differs(self, test_certificates):
-        """Test the fingerprint is sensitive to identity changes.
-
-        Given:
-            The same material under two distinct identities.
-        When:
-            Their fingerprints are read.
-        Then:
-            They should differ.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        worker_a = WorkerCredentials(
-            ca_cert=ca_pem,
-            worker_key=key_pem,
-            worker_cert=cert_pem,
-            identity="worker-a",
-        )
-        worker_b = WorkerCredentials(
-            ca_cert=ca_pem,
-            worker_key=key_pem,
-            worker_cert=cert_pem,
-            identity="worker-b",
-        )
-
-        # Act & assert
-        assert worker_a.fingerprint != worker_b.fingerprint
-
-    def test_fingerprint_should_change_when_mutual_differs(self, test_certificates):
-        """Test the fingerprint is sensitive to the mutual-TLS flag.
-
-        Given:
-            The same bytes under mutual=True and mutual=False.
-        When:
-            Their fingerprints are read.
-        Then:
-            They should differ.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        mtls = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=True
-        )
-        one_way = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=False
-        )
-
-        # Act & assert
-        assert mtls.fingerprint != one_way.fingerprint
-
-    def test_pickle_should_preserve_identity_and_fingerprint(self, test_certificates):
-        """Test credentials survive a pickle roundtrip with identity intact.
-
-        Given:
-            Credentials carrying an identity.
-        When:
-            They are pickled and unpickled.
-        Then:
-            The restored credentials should be equal and share the
-            fingerprint.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem,
-            worker_key=key_pem,
-            worker_cert=cert_pem,
-            identity="wool-worker",
-        )
-
-        # Act
-        restored = cloudpickle.loads(cloudpickle.dumps(creds))
-
-        # Assert
-        assert restored == creds
-        assert restored.fingerprint == creds.fingerprint
 
 
 class TestWorkerCredentialsProvider:
@@ -1058,8 +907,8 @@ class TestWorkerCredentialsProvider:
         When:
             resolve() is called before and after the rotation.
         Then:
-            The fingerprints should differ, since each snapshot reflects the
-            current material.
+            The resolved credentials should differ, since each reflects
+            the current material.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
@@ -1079,7 +928,7 @@ class TestWorkerCredentialsProvider:
         after = provider.resolve()
 
         # Assert
-        assert before.fingerprint != after.fingerprint
+        assert before != after
 
     def test_non_reloadable_pickle_should_drop_callback_and_ship_snapshot(
         self, test_certificates
@@ -1093,7 +942,7 @@ class TestWorkerCredentialsProvider:
             It is pickled with the standard library pickler and unpickled.
         Then:
             It should round-trip — the eager snapshot rides along and the
-            callback is dropped — and resolve to the same fingerprint.
+            callback is dropped — and resolve to equal credentials.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
@@ -1106,7 +955,7 @@ class TestWorkerCredentialsProvider:
         restored = pickle.loads(pickle.dumps(provider))
 
         # Assert
-        assert restored.resolve().fingerprint == provider.resolve().fingerprint
+        assert restored.resolve() == provider.resolve()
         assert restored.identity == "wool-worker"
 
     def test_reloadable_pickle_should_keep_factory_and_reread(self, temp_cert_files):
@@ -1118,8 +967,8 @@ class TestWorkerCredentialsProvider:
         When:
             It is pickled with the standard library pickler and unpickled.
         Then:
-            The restored provider should keep its factory and resolve to the
-            same fingerprint by re-reading the unchanged files.
+            The restored provider should keep its factory and resolve to
+            the same credentials by re-reading the unchanged files.
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
@@ -1136,7 +985,7 @@ class TestWorkerCredentialsProvider:
         restored = pickle.loads(pickle.dumps(provider))
 
         # Assert
-        assert restored.resolve().fingerprint == original.fingerprint
+        assert restored.resolve() == original
 
 
 class TestCredentialsContext:
