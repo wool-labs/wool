@@ -647,16 +647,16 @@ class HandshakeError(RpcError):
     """
 
     class Reason(enum.Enum):
-        """Best-effort classification of a handshake failure's cause.
+        """Coarse, structural classification of a handshake failure's cause.
 
-        The reason is advisory diagnostic metadata derived from the gRPC
-        status code and error text; the load-bearing signal is the
+        Taken from the gRPC status code and the ``secure`` flag once broad
+        TLS evidence in the error text gates the failure as a handshake
+        failure — not from fine-grained phrase matching. The reason is
+        advisory diagnostic metadata; the load-bearing signal is the
         `HandshakeError` type itself.
         """
 
         TLS_HANDSHAKE = "tls_handshake"
-        CERT_VERIFY = "cert_verify"
-        IDENTITY_MISMATCH = "identity_mismatch"
         PEER_UNAUTHENTICATED = "peer_unauthenticated"
         PLAINTEXT_VS_ENCRYPTED = "plaintext_vs_encrypted"
 
@@ -673,9 +673,10 @@ class HandshakeError(RpcError):
 
 # Broad tokens that gate promotion of an ambiguous ``UNAVAILABLE`` to a
 # handshake failure: their presence in the error text is positive evidence
-# that TLS — not plain unreachability — was involved. Kept deliberately
-# wide so the *gate* is robust across gRPC/BoringSSL versions; the more
-# specific reason tokens below only refine the diagnosis. Matched
+# that TLS — not plain unreachability — was involved. Kept deliberately wide
+# so the gate is robust across gRPC/BoringSSL versions; it decides only
+# *whether* a failure is a handshake failure, never which flavor — the reason
+# is taken structurally from the status code and the ``secure`` flag. Matched
 # case-insensitively as substrings.
 _HANDSHAKE_TOKENS: Final = (
     "ssl",
@@ -689,38 +690,6 @@ _HANDSHAKE_TOKENS: Final = (
     # the tokens above; treat it as positive TLS evidence so such a failure is
     # never mistaken for plain unreachability.
     "verification check failed",
-)
-# Specific phrases mapping a handshake failure to a finer reason. These are
-# best-effort and may drift across gRPC versions; a miss degrades to the
-# generic ``TLS_HANDSHAKE`` reason, never to a misclassification of worker
-# health.
-_IDENTITY_TOKENS: Final = (
-    # gRPC/BoringSSL phrasings for a server-name/SAN mismatch. The hostname
-    # phrasing is what surfaces on the RpcError when an
-    # ``ssl_target_name_override`` identity does not match the peer
-    # certificate; "no match found for server name" appears in C-core logs.
-    "hostname verification",
-    "no match found for server name",
-    "target name",
-    "subject alternative name",
-    "ssl_target_name",
-)
-_CERT_VERIFY_TOKENS: Final = (
-    "certificate verify failed",
-    "verify failed",
-    "unable to get local issuer",
-    "self signed certificate",
-    "self-signed certificate",
-    "unknown ca",
-    "bad certificate",
-    "certificate has expired",
-    "certificate is not yet valid",
-    "certificate signature failure",
-)
-_PROTOCOL_MISMATCH_TOKENS: Final = (
-    "wrong version number",
-    "wrong_version_number",
-    "http/1",
 )
 
 
@@ -758,24 +727,18 @@ def _handshake_reason(text: str, *, secure: bool) -> HandshakeError.Reason | Non
     """Classify handshake error text into a `HandshakeError.Reason`.
 
     Returns ``None`` when the text carries no TLS/handshake/cert evidence —
-    the signal that an ambiguous ``UNAVAILABLE`` is a genuine transient
-    unreachability rather than a handshake failure.
+    the signal that an ambiguous ``UNAVAILABLE`` is genuine transient
+    unreachability rather than a handshake failure. When evidence is present
+    the reason is structural: a secure connection yields ``TLS_HANDSHAKE``,
+    an insecure one ``PLAINTEXT_VS_ENCRYPTED`` (it reached a TLS-only worker).
 
     :param text:
         Lowercased error text from `_error_text`.
     :param secure:
-        Whether the failing connection presented client credentials. An
-        insecure client that reaches a TLS-only worker is reported as a
-        plaintext-versus-encrypted mismatch.
+        Whether the failing connection presented client credentials.
     :returns:
         The classified reason, or ``None`` if no handshake evidence.
     """
-    if any(token in text for token in _IDENTITY_TOKENS):
-        return HandshakeError.Reason.IDENTITY_MISMATCH
-    if any(token in text for token in _CERT_VERIFY_TOKENS):
-        return HandshakeError.Reason.CERT_VERIFY
-    if any(token in text for token in _PROTOCOL_MISMATCH_TOKENS):
-        return HandshakeError.Reason.PLAINTEXT_VS_ENCRYPTED
     if any(token in text for token in _HANDSHAKE_TOKENS):
         return (
             HandshakeError.Reason.PLAINTEXT_VS_ENCRYPTED
@@ -792,22 +755,21 @@ def _classify_handshake_failure(
 ) -> HandshakeError | None:
     """Classify a gRPC error as a handshake failure, or ``None``.
 
-    The classification is structural, not phrase-dependent:
+    The decision is structural:
 
     - ``UNAUTHENTICATED`` is always a handshake failure — the peer
       rejected the client's certificate.
     - ``UNAVAILABLE`` is ambiguous (a down worker looks the same as a
       failed handshake), so it is promoted to a `HandshakeError`
-      only when the error text carries positive TLS evidence; otherwise
+      only when the error text carries broad TLS evidence; otherwise
       this returns ``None`` and the caller treats it as transient,
       preserving the legacy behaviour exactly.
     - All other codes are never handshake failures.
 
-    An identity mismatch (the worker's certificate does not match the
-    configured identity) is distinguished from a certificate-authority
-    rejection by the gRPC error text itself — gRPC reports a name-override
-    mismatch as "no match found for server name" — so the configured
-    identity value is not needed here to tell those two cases apart.
+    The error text feeds only that gate. The reason is then taken from the
+    status code and the ``secure`` flag — a handshake failure is not
+    sub-classified by phrase, so wrong-CA, wrong-identity, and expired-
+    certificate failures all surface as ``TLS_HANDSHAKE``.
 
     :param error:
         The gRPC error raised during the dispatch handshake.

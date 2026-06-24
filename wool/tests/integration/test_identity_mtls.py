@@ -168,7 +168,7 @@ async def test_untrusted_ca_rejects_with_diagnosable_signal(caplog):
     Then:
         The handshake should fail, the dispatch should drain to
         NoWorkersAvailable (the worker is skipped, not evicted), and the
-        load balancer should log the classified CERT_VERIFY reason so the
+        load balancer should log the classified TLS_HANDSHAKE reason so the
         misconfiguration is diagnosable.
     """
     # Arrange — server and client trust different CAs (loopback SANs so the
@@ -196,14 +196,14 @@ async def test_untrusted_ca_rejects_with_diagnosable_signal(caplog):
                     await add(2, 3)
 
         assert "handshake" in caplog.text.lower()
-        assert "cert_verify" in caplog.text.lower()
+        assert "tls_handshake" in caplog.text.lower()
     finally:
         await worker.stop()
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_identity_mismatch_rejects_with_identity_mismatch_reason(tmp_path, caplog):
+async def test_identity_mismatch_is_rejected_with_diagnosable_signal(tmp_path, caplog):
     """Test a certificate that does not match the configured identity is rejected.
 
     Given:
@@ -214,8 +214,8 @@ async def test_identity_mismatch_rejects_with_identity_mismatch_reason(tmp_path,
         A routine is dispatched at the worker through that client.
     Then:
         The dispatch should drain to NoWorkersAvailable and the load
-        balancer should log the IDENTITY_MISMATCH reason — verifying against
-        the configured identity strengthens, not relaxes, the guarantee.
+        balancer should log a TLS_HANDSHAKE reason — verifying against the
+        configured identity strengthens, not relaxes, the guarantee.
     """
     # Arrange — one CA; the worker cert's SANs include loopback (so its own
     # stop RPC validates) and a logical identity the client will not expect.
@@ -249,7 +249,7 @@ async def test_identity_mismatch_rejects_with_identity_mismatch_reason(tmp_path,
                     await add(2, 3)
 
         assert "handshake" in caplog.text.lower()
-        assert "identity_mismatch" in caplog.text.lower()
+        assert "tls_handshake" in caplog.text.lower()
     finally:
         await worker.stop()
 

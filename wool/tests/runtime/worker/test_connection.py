@@ -197,11 +197,11 @@ class TestHandshakeError:
         error = HandshakeError(
             grpc.StatusCode.UNAVAILABLE,
             "boom",
-            reason=HandshakeError.Reason.CERT_VERIFY,
+            reason=HandshakeError.Reason.TLS_HANDSHAKE,
         )
 
         # Assert
-        assert error.reason is HandshakeError.Reason.CERT_VERIFY
+        assert error.reason is HandshakeError.Reason.TLS_HANDSHAKE
         assert error.code is grpc.StatusCode.UNAVAILABLE
         assert error.details == "boom"
 
@@ -239,7 +239,7 @@ class TestHandshakeError:
         error = HandshakeError(
             grpc.StatusCode.UNAVAILABLE,
             "boom",
-            reason=HandshakeError.Reason.CERT_VERIFY,
+            reason=HandshakeError.Reason.TLS_HANDSHAKE,
         )
 
         # Act & assert
@@ -247,7 +247,7 @@ class TestHandshakeError:
             pickle.loads(pickle.dumps(error)),
             cloudpickle.loads(cloudpickle.dumps(error)),
         ):
-            assert restore.reason is HandshakeError.Reason.CERT_VERIFY
+            assert restore.reason is HandshakeError.Reason.TLS_HANDSHAKE
             assert restore.code is grpc.StatusCode.UNAVAILABLE
             assert restore.details == "boom"
 
@@ -570,29 +570,19 @@ class TestWorkerConnection:
     @pytest.mark.parametrize(
         "secure, details, debug, expected_reason",
         [
+            # Distinct secure-handshake flavors (CA rejection, expired cert,
+            # generic TLS failure) all collapse to one structural reason.
             (
                 True,
                 "",
                 "Ssl handshake: certificate verify failed",
-                HandshakeError.Reason.CERT_VERIFY,
+                HandshakeError.Reason.TLS_HANDSHAKE,
             ),
             (
                 True,
                 "certificate has expired",
                 "",
-                HandshakeError.Reason.CERT_VERIFY,
-            ),
-            (
-                True,
-                "",
-                "No match found for server name: wool-worker",
-                HandshakeError.Reason.IDENTITY_MISMATCH,
-            ),
-            (
-                True,
-                "",
-                "wrong version number",
-                HandshakeError.Reason.PLAINTEXT_VS_ENCRYPTED,
+                HandshakeError.Reason.TLS_HANDSHAKE,
             ),
             (
                 True,
@@ -600,6 +590,7 @@ class TestWorkerConnection:
                 "tls handshake eof",
                 HandshakeError.Reason.TLS_HANDSHAKE,
             ),
+            # An insecure client that reached a TLS-only worker.
             (
                 False,
                 "",
@@ -617,7 +608,7 @@ class TestWorkerConnection:
         debug: str,
         expected_reason: HandshakeError.Reason,
     ):
-        """Test dispatch classifies a failed TLS handshake distinctly.
+        """Test dispatch classifies a failed TLS handshake structurally.
 
         Given:
             A connection whose stub raises UNAVAILABLE carrying TLS evidence
@@ -625,8 +616,9 @@ class TestWorkerConnection:
         When:
             A task is dispatched.
         Then:
-            It should raise HandshakeError with the reason matching the
-            evidence.
+            It should raise HandshakeError whose reason is TLS_HANDSHAKE for a
+            secure connection or PLAINTEXT_VS_ENCRYPTED for an insecure one —
+            the failure flavor is not sub-classified.
         """
 
         # Arrange
@@ -743,21 +735,21 @@ class TestWorkerConnection:
         assert "secure handshake failed" in exc_info.value.details
 
     @pytest.mark.asyncio
-    async def test_dispatch_should_classify_hostname_verification_as_identity_mismatch(
+    async def test_dispatch_should_classify_hostname_verification_as_handshake_failure(
         self, mocker: MockerFixture, sample_task
     ):
-        """Test a real gRPC hostname-verification failure maps to IDENTITY_MISMATCH.
+        """Test a real gRPC hostname-verification failure is gated as a handshake.
 
         Given:
             A handshake failure whose text is gRPC's verbatim
             ``ssl_target_name_override`` mismatch ("Hostname Verification
-            Check failed") — a drift canary for the classifier's tokens.
+            Check failed") — a drift canary for the broad handshake gate.
         When:
             A task is dispatched.
         Then:
-            The raised HandshakeError's reason should be IDENTITY_MISMATCH,
-            so an identity mismatch stays diagnosable and is not mistaken
-            for plain unreachability.
+            The raised HandshakeError's reason should be TLS_HANDSHAKE, so an
+            identity mismatch stays diagnosable as a handshake failure and is
+            not mistaken for plain unreachability.
         """
 
         # Arrange — verbatim text from a gRPC ssl_target_name_override
@@ -789,7 +781,7 @@ class TestWorkerConnection:
         with pytest.raises(HandshakeError) as exc_info:
             async for _ in await connection.dispatch(sample_task):
                 pass
-        assert exc_info.value.reason is HandshakeError.Reason.IDENTITY_MISMATCH
+        assert exc_info.value.reason is HandshakeError.Reason.TLS_HANDSHAKE
 
     @pytest.mark.asyncio
     async def test_dispatch_should_override_target_name_when_identity_configured(

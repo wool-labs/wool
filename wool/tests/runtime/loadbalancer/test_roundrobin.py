@@ -159,8 +159,8 @@ class TestRoundRobinLoadBalancer:
         lb = RoundRobinLoadBalancer()
         ctx = LoadBalancerContext()
         reasons = [
-            HandshakeError.Reason.CERT_VERIFY,
-            HandshakeError.Reason.IDENTITY_MISMATCH,
+            HandshakeError.Reason.TLS_HANDSHAKE,
+            HandshakeError.Reason.PLAINTEXT_VS_ENCRYPTED,
         ]
         for i, reason in enumerate(reasons):
             connection = mocker.create_autospec(WorkerConnection, instance=True)
@@ -209,7 +209,7 @@ class TestRoundRobinLoadBalancer:
 
         bad_connection = mocker.create_autospec(WorkerConnection, instance=True)
         bad_connection.dispatch = mocker.AsyncMock(
-            side_effect=HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY)
+            side_effect=HandshakeError(reason=HandshakeError.Reason.TLS_HANDSHAKE)
         )
         bad_metadata = WorkerMetadata(
             uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
@@ -258,7 +258,7 @@ class TestRoundRobinLoadBalancer:
 
         handshake_connection = mocker.create_autospec(WorkerConnection, instance=True)
         handshake_connection.dispatch = mocker.AsyncMock(
-            side_effect=HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY)
+            side_effect=HandshakeError(reason=HandshakeError.Reason.TLS_HANDSHAKE)
         )
         transient_connection = mocker.create_autospec(WorkerConnection, instance=True)
         transient_connection.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
@@ -304,7 +304,7 @@ class TestRoundRobinLoadBalancer:
         connection = mocker.create_autospec(WorkerConnection, instance=True)
         connection.dispatch = mocker.AsyncMock(
             side_effect=[
-                HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY),
+                HandshakeError(reason=HandshakeError.Reason.TLS_HANDSHAKE),
                 healthy_stream,
             ]
         )
@@ -347,7 +347,7 @@ class TestRoundRobinLoadBalancer:
         ctx = LoadBalancerContext()
         connection = mocker.create_autospec(WorkerConnection, instance=True)
         connection.dispatch = mocker.AsyncMock(
-            side_effect=HandshakeError(reason=HandshakeError.Reason.CERT_VERIFY)
+            side_effect=HandshakeError(reason=HandshakeError.Reason.TLS_HANDSHAKE)
         )
         metadata = WorkerMetadata(
             uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
@@ -368,7 +368,7 @@ class TestRoundRobinLoadBalancer:
         # Assert
         assert str(metadata.uid) in caplog.text
         assert "handshake" in caplog.text.lower()
-        assert "cert_verify" in caplog.text.lower()
+        assert "tls_handshake" in caplog.text.lower()
 
     @pytest.mark.asyncio
     @settings(
