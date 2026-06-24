@@ -28,15 +28,11 @@ from wool.runtime.worker.base import ChannelOptions
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
 
+_ChannelKey: TypeAlias = tuple[str, WorkerCredentials | None, ChannelOptions]
+
 _T = TypeVar("_T")
 
 _log = logging.getLogger(__name__)
-
-
-# Channels are pooled by credential *content*: WorkerCredentials is a frozen
-# dataclass, so equal material (including identity) hashes equal and reuses its
-# pooled channel, while rotated material is unequal and yields a fresh one.
-_PoolKey: TypeAlias = tuple[str, "WorkerCredentials | None", ChannelOptions]
 
 
 @dataclass
@@ -53,15 +49,22 @@ class _Channel:
 
 
 def _channel_factory(key):
-    """Create a new :class:`_Channel` for the given pool key.
+    """Create a new `_Channel` for the given pool key.
+
+    Builds a secure channel from the key's `WorkerCredentials` when present,
+    or an insecure channel otherwise. When the credentials carry an
+    ``identity``, the channel verifies the worker's server certificate
+    against that configured logical identity (its SAN), via
+    ``grpc.ssl_target_name_override``, rather than the dynamically assigned
+    address it was dialed at. Full chain and SAN verification is preserved.
 
     :param key:
-        Tuple of ``(target, credential_key, options)``.
+        Tuple of ``(target, credentials, options)``.
     :returns:
-        A new :class:`_Channel` instance.
+        A new `_Channel` instance.
     """
-    target, credentials, options = key
-    grpc_options = [
+    target, credentials, options = cast(_ChannelKey, key)
+    grpc_options: list[tuple[str, int | str]] = [
         ("grpc.max_receive_message_length", options.max_receive_message_length),
         ("grpc.max_send_message_length", options.max_send_message_length),
         ("grpc.keepalive_time_ms", options.keepalive_time_ms),
@@ -79,12 +82,6 @@ def _channel_factory(key):
     ]
     if credentials is not None:
         if credentials.identity is not None:
-            # Verify the worker's server certificate against the configured
-            # logical identity (its SAN) rather than the dynamically
-            # assigned address dialed at. Full chain + SAN verification is
-            # preserved — only the *name* checked against the certificate
-            # changes — so this strengthens rather than relaxes the
-            # existing guarantee.
             grpc_options.append(("grpc.ssl_target_name_override", credentials.identity))
         channel = grpc.aio.secure_channel(
             target, credentials.client_credentials(), options=grpc_options
@@ -933,8 +930,8 @@ class WorkerConnection:
         # The TCP key is recomputed on each dispatch from the resolved
         # snapshot (so rotated material yields a new key); the last one is
         # retained for ``close``. ``None`` until the first dispatch.
-        self._key: _PoolKey | None = None
-        self._uds_key: _PoolKey | None = None
+        self._key: _ChannelKey | None = None
+        self._uds_key: _ChannelKey | None = None
 
     async def dispatch(
         self,
@@ -1024,7 +1021,7 @@ class WorkerConnection:
         # Resolve current credential material per dispatch so rotated
         # material is adopted on the next connection (see class docstring).
         credentials = self._provider.resolve() if self._provider is not None else None
-        tcp_key: _PoolKey = (self._target, credentials, self._options)
+        tcp_key: _ChannelKey = (self._target, credentials, self._options)
         self._key = tcp_key
 
         if (
@@ -1147,7 +1144,7 @@ class WorkerConnection:
     async def _execute(
         self,
         task: Task,
-        key: _PoolKey,
+        key: _ChannelKey,
         timeout: float | None,
     ) -> AsyncGenerator[protocol.Message | None, None]:
         """Async generator that owns the full dispatch lifecycle.
