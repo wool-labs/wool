@@ -208,12 +208,12 @@ class TestHandshakeError:
         When:
             Its type relationships are inspected.
         Then:
-            It should be an RpcError (so the load balancer evicts it) but
-            not a TransientRpcError (so it is not treated as a retryable
-            hiccup).
+            It should be an RpcError (so non-handshake call sites still catch
+            it) but not a TransientRpcError — see HandshakeError for why the
+            load balancer skips rather than evicts it.
         """
         # Arrange
-        error = HandshakeError(reason=HandshakeError.Reason.TLS_HANDSHAKE)
+        error = HandshakeError()
 
         # Act & assert
         assert isinstance(error, RpcError)

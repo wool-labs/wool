@@ -211,14 +211,14 @@ class WorkerCredentialsProvider:
     The provider is a thin adapter: ``factory`` returns the current
     `WorkerCredentials`, and `resolve` hands them back with the provider's
     ``identity`` applied. Every source-specific concern, e.g., rotation,
-    validation, failure handling, etc., belongs to ``factory``, which keeps
+    validation, failure handling belongs to ``factory``, which keeps
     the provider itself a pass-through. `WorkerCredentials.as_provider` is
     the shorthand for the fixed-material case.
 
     A non-reloadable provider resolves once when constructed and serves that
-    fixed result thereafter.  The lambda runs once in the constructing process
-    and is dropped before the provider is pickled into a worker subprocess,
-    so a non-reloadable ``factory`` need not be picklable.
+    fixed result thereafter; its ``factory`` runs only in the constructing
+    process and need not be picklable (`__getstate__` drops the callback
+    before the provider crosses into a worker subprocess).
 
     A reloadable provider resolves on every dispatch (the resolved credentials
     key the channel pool) client-side, and with each TLS handshake server-side.

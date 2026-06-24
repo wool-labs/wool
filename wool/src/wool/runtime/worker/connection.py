@@ -776,7 +776,7 @@ class WorkerConnection:
 
     Acquires pooled gRPC channels keyed by ``(target, credentials,
     options)`` — the `WorkerCredentials` value itself, which is hashable
-    and value-equal.  Each :meth:`dispatch` call resolves the current
+    and value-equal.  Each `dispatch` call resolves the current
     credentials from the configured provider, obtains a reference-counted
     channel from the module-level pool, primes an async generator that
     holds its own reference, then releases the dispatch-scope reference.
@@ -967,7 +967,7 @@ class WorkerConnection:
             details = error.details() or str(error)
             # A failed secure handshake (wrong CA, identity mismatch,
             # expired/rejected cert, plaintext-vs-encrypted) is a distinct,
-            # diagnosable condition — surface it as :class:`HandshakeError`
+            # diagnosable condition — surface it as `HandshakeError`
             # so the load balancer does not collapse it into a generic
             # "no workers available" outcome. Non-handshake failures fall
             # through to the unchanged transient/non-transient split.
