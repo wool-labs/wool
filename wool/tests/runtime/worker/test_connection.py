@@ -183,25 +183,20 @@ def mock_grpc_call(mocker: MockerFixture):
 class TestHandshakeError:
     """Test suite for the HandshakeError exception type."""
 
-    def test___init___should_set_reason_code_and_details(self):
-        """Test HandshakeError records its classification and gRPC fields.
+    def test___init___should_set_code_and_details(self):
+        """Test HandshakeError records its gRPC fields.
 
         Given:
-            A status code, details, and a reason.
+            A status code and details.
         When:
             HandshakeError is constructed.
         Then:
-            It should expose the reason, code, and details.
+            It should expose the code and details.
         """
         # Act
-        error = HandshakeError(
-            grpc.StatusCode.UNAVAILABLE,
-            "boom",
-            reason=HandshakeError.Reason.TLS_HANDSHAKE,
-        )
+        error = HandshakeError(grpc.StatusCode.UNAVAILABLE, "boom")
 
         # Assert
-        assert error.reason is HandshakeError.Reason.TLS_HANDSHAKE
         assert error.code is grpc.StatusCode.UNAVAILABLE
         assert error.details == "boom"
 
@@ -228,26 +223,21 @@ class TestHandshakeError:
         """Test HandshakeError survives a serialization roundtrip.
 
         Given:
-            A HandshakeError carrying a code, details, and reason.
+            A HandshakeError carrying a code and details.
         When:
             It is pickled and cloudpickled and restored.
         Then:
-            The reason, code, and details should survive — it is a
-            wire-crossing type raised back to a calling process.
+            The code and details should survive — it is a wire-crossing type
+            raised back to a calling process.
         """
         # Arrange
-        error = HandshakeError(
-            grpc.StatusCode.UNAVAILABLE,
-            "boom",
-            reason=HandshakeError.Reason.TLS_HANDSHAKE,
-        )
+        error = HandshakeError(grpc.StatusCode.UNAVAILABLE, "boom")
 
         # Act & assert
         for restore in (
             pickle.loads(pickle.dumps(error)),
             cloudpickle.loads(cloudpickle.dumps(error)),
         ):
-            assert restore.reason is HandshakeError.Reason.TLS_HANDSHAKE
             assert restore.code is grpc.StatusCode.UNAVAILABLE
             assert restore.details == "boom"
 
@@ -539,8 +529,8 @@ class TestWorkerConnection:
         When:
             A task is dispatched.
         Then:
-            It should raise HandshakeError with the PEER_UNAUTHENTICATED
-            reason.
+            It should raise HandshakeError (the peer rejected the client's
+            certificate).
         """
 
         # Arrange
@@ -564,39 +554,19 @@ class TestWorkerConnection:
         with pytest.raises(HandshakeError) as exc_info:
             async for _ in await connection.dispatch(sample_task):
                 pass
-        assert exc_info.value.reason is HandshakeError.Reason.PEER_UNAUTHENTICATED
+        assert exc_info.value.code is grpc.StatusCode.UNAUTHENTICATED
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "secure, details, debug, expected_reason",
+        "secure, details, debug",
         [
             # Distinct secure-handshake flavors (CA rejection, expired cert,
-            # generic TLS failure) all collapse to one structural reason.
-            (
-                True,
-                "",
-                "Ssl handshake: certificate verify failed",
-                HandshakeError.Reason.TLS_HANDSHAKE,
-            ),
-            (
-                True,
-                "certificate has expired",
-                "",
-                HandshakeError.Reason.TLS_HANDSHAKE,
-            ),
-            (
-                True,
-                "",
-                "tls handshake eof",
-                HandshakeError.Reason.TLS_HANDSHAKE,
-            ),
+            # generic TLS failure) all surface as the same HandshakeError.
+            (True, "", "Ssl handshake: certificate verify failed"),
+            (True, "certificate has expired", ""),
+            (True, "", "tls handshake eof"),
             # An insecure client that reached a TLS-only worker.
-            (
-                False,
-                "",
-                "Ssl handshake failed",
-                HandshakeError.Reason.PLAINTEXT_VS_ENCRYPTED,
-            ),
+            (False, "", "Ssl handshake failed"),
         ],
     )
     async def test_dispatch_should_raise_handshake_error_when_tls_handshake_fails(
@@ -606,7 +576,6 @@ class TestWorkerConnection:
         secure: bool,
         details: str,
         debug: str,
-        expected_reason: HandshakeError.Reason,
     ):
         """Test dispatch classifies a failed TLS handshake structurally.
 
@@ -616,9 +585,8 @@ class TestWorkerConnection:
         When:
             A task is dispatched.
         Then:
-            It should raise HandshakeError whose reason is TLS_HANDSHAKE for a
-            secure connection or PLAINTEXT_VS_ENCRYPTED for an insecure one —
-            the failure flavor is not sub-classified.
+            It should raise HandshakeError, whatever the TLS failure flavor —
+            the failure is not sub-classified.
         """
 
         # Arrange
@@ -642,10 +610,9 @@ class TestWorkerConnection:
         )
 
         # Act & assert
-        with pytest.raises(HandshakeError) as exc_info:
+        with pytest.raises(HandshakeError):
             async for _ in await connection.dispatch(sample_task):
                 pass
-        assert exc_info.value.reason is expected_reason
 
     @pytest.mark.asyncio
     async def test_dispatch_should_raise_transient_error_when_unavailable_not_tls(
@@ -747,9 +714,9 @@ class TestWorkerConnection:
         When:
             A task is dispatched.
         Then:
-            The raised HandshakeError's reason should be TLS_HANDSHAKE, so an
-            identity mismatch stays diagnosable as a handshake failure and is
-            not mistaken for plain unreachability.
+            It should raise HandshakeError, so an identity mismatch stays
+            diagnosable as a handshake failure and is not mistaken for plain
+            unreachability.
         """
 
         # Arrange — verbatim text from a gRPC ssl_target_name_override
@@ -778,10 +745,9 @@ class TestWorkerConnection:
         )
 
         # Act & assert
-        with pytest.raises(HandshakeError) as exc_info:
+        with pytest.raises(HandshakeError):
             async for _ in await connection.dispatch(sample_task):
                 pass
-        assert exc_info.value.reason is HandshakeError.Reason.TLS_HANDSHAKE
 
     @pytest.mark.asyncio
     async def test_dispatch_should_override_target_name_when_identity_configured(

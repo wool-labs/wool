@@ -196,7 +196,6 @@ async def test_untrusted_ca_rejects_with_diagnosable_signal(caplog):
                     await add(2, 3)
 
         assert "handshake" in caplog.text.lower()
-        assert "tls_handshake" in caplog.text.lower()
     finally:
         await worker.stop()
 
@@ -249,7 +248,6 @@ async def test_identity_mismatch_is_rejected_with_diagnosable_signal(tmp_path, c
                     await add(2, 3)
 
         assert "handshake" in caplog.text.lower()
-        assert "tls_handshake" in caplog.text.lower()
     finally:
         await worker.stop()
 

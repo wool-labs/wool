@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import enum
 import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -635,49 +634,29 @@ class HandshakeError(RpcError):
     like a transient error rather than evicting: it skips the worker
     without removing it from the pool, leaving it to recover on a later
     dispatch once its credentials resolve.  Each rejection is logged as a
-    warning carrying the classified `Reason`; that log is the observability
+    warning carrying the gRPC code and details; that log is the observability
     surface for diagnosing a fleet-wide credential misconfiguration.
 
     :param code:
         The gRPC status code, if available.
     :param details:
         The gRPC error details, if available.
-    :param reason:
-        The `Reason` classifying the failure.
     """
-
-    class Reason(enum.Enum):
-        """Coarse, structural classification of a handshake failure's cause.
-
-        Taken from the gRPC status code and the ``secure`` flag once broad
-        TLS evidence in the error text gates the failure as a handshake
-        failure — not from fine-grained phrase matching. The reason is
-        advisory diagnostic metadata; the load-bearing signal is the
-        `HandshakeError` type itself.
-        """
-
-        TLS_HANDSHAKE = "tls_handshake"
-        PEER_UNAUTHENTICATED = "peer_unauthenticated"
-        PLAINTEXT_VS_ENCRYPTED = "plaintext_vs_encrypted"
 
     def __init__(
         self,
         code: grpc.StatusCode | None = None,
         details: str | None = None,
-        *,
-        reason: HandshakeError.Reason,
     ):
         super().__init__(code, details)
-        self.reason = reason
 
 
 # Broad tokens that gate promotion of an ambiguous ``UNAVAILABLE`` to a
 # handshake failure: their presence in the error text is positive evidence
 # that TLS — not plain unreachability — was involved. Kept deliberately wide
 # so the gate is robust across gRPC/BoringSSL versions; it decides only
-# *whether* a failure is a handshake failure, never which flavor — the reason
-# is taken structurally from the status code and the ``secure`` flag. Matched
-# case-insensitively as substrings.
+# *whether* a failure is a handshake failure. Matched case-insensitively as
+# substrings.
 _HANDSHAKE_TOKENS: Final = (
     "ssl",
     "tls",
@@ -723,36 +702,21 @@ def _error_text(error: grpc.RpcError) -> str:
     return "\n".join(parts).lower()
 
 
-def _handshake_reason(text: str, *, secure: bool) -> HandshakeError.Reason | None:
-    """Classify handshake error text into a `HandshakeError.Reason`.
+def _has_handshake_evidence(text: str) -> bool:
+    """Report whether the error text carries positive TLS/handshake evidence.
 
-    Returns ``None`` when the text carries no TLS/handshake/cert evidence —
-    the signal that an ambiguous ``UNAVAILABLE`` is genuine transient
-    unreachability rather than a handshake failure. When evidence is present
-    the reason is structural: a secure connection yields ``TLS_HANDSHAKE``,
-    an insecure one ``PLAINTEXT_VS_ENCRYPTED`` (it reached a TLS-only worker).
+    ``True`` gates an ambiguous ``UNAVAILABLE`` as a handshake failure; ``False``
+    leaves it as genuine transient unreachability.
 
     :param text:
         Lowercased error text from `_error_text`.
-    :param secure:
-        Whether the failing connection presented client credentials.
     :returns:
-        The classified reason, or ``None`` if no handshake evidence.
+        Whether any handshake token is present in *text*.
     """
-    if any(token in text for token in _HANDSHAKE_TOKENS):
-        return (
-            HandshakeError.Reason.PLAINTEXT_VS_ENCRYPTED
-            if not secure
-            else HandshakeError.Reason.TLS_HANDSHAKE
-        )
-    return None
+    return any(token in text for token in _HANDSHAKE_TOKENS)
 
 
-def _classify_handshake_failure(
-    error: grpc.RpcError,
-    *,
-    secure: bool,
-) -> HandshakeError | None:
+def _classify_handshake_failure(error: grpc.RpcError) -> HandshakeError | None:
     """Classify a gRPC error as a handshake failure, or ``None``.
 
     The decision is structural:
@@ -766,15 +730,13 @@ def _classify_handshake_failure(
       preserving the legacy behaviour exactly.
     - All other codes are never handshake failures.
 
-    The error text feeds only that gate. The reason is then taken from the
-    status code and the ``secure`` flag — a handshake failure is not
-    sub-classified by phrase, so wrong-CA, wrong-identity, and expired-
-    certificate failures all surface as ``TLS_HANDSHAKE``.
+    The failure is not sub-classified: wrong-CA, wrong-identity, expired-
+    certificate, and plaintext-versus-encrypted all surface as the same
+    `HandshakeError`, whose `RpcError` code and details carry the diagnostic
+    text the load balancer logs.
 
     :param error:
         The gRPC error raised during the dispatch handshake.
-    :param secure:
-        Whether the failing connection presented client credentials.
     :returns:
         A classified `HandshakeError`, or ``None`` if the failure is
         not a handshake/authentication problem.
@@ -800,16 +762,12 @@ def _classify_handshake_failure(
         details = f"{code_name}: secure handshake failed"
 
     if code == grpc.StatusCode.UNAUTHENTICATED:
-        return HandshakeError(
-            code, details, reason=HandshakeError.Reason.PEER_UNAUTHENTICATED
-        )
+        return HandshakeError(code, details)
     if code != grpc.StatusCode.UNAVAILABLE:
         return None
-
-    reason = _handshake_reason(_error_text(error), secure=secure)
-    if reason is None:
+    if not _has_handshake_evidence(_error_text(error)):
         return None
-    return HandshakeError(code, details, reason=reason)
+    return HandshakeError(code, details)
 
 
 # public
@@ -1012,7 +970,7 @@ class WorkerConnection:
             # so the load balancer does not collapse it into a generic
             # "no workers available" outcome. Non-handshake failures fall
             # through to the unchanged transient/non-transient split.
-            handshake = _classify_handshake_failure(error, secure=key[1] is not None)
+            handshake = _classify_handshake_failure(error)
             if handshake is not None:
                 raise handshake from error
             if code in self.TRANSIENT_ERRORS:

@@ -114,10 +114,9 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                     # Skip without eviction — see HandshakeError for the
                     # recoverability contract.
                     logger.warning(
-                        "Skipping worker %s at %s after handshake failure (%s): %s",
+                        "Skipping worker %s at %s after handshake failure: %s",
                         metadata.uid,
                         metadata.address,
-                        exc.reason,
                         exc,
                     )
                     self._index[context] = self._index[context] + 1
