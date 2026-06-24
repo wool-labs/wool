@@ -715,6 +715,31 @@ class TestWorkerCredentials:
 class TestWorkerCredentialsProvider:
     """Test suite for WorkerCredentialsProvider."""
 
+    def test_coerce_should_normalize_value_provider_and_none(self, test_certificates):
+        """Test coerce wraps a bare value and passes a provider or None through.
+
+        Given:
+            A bare WorkerCredentials, an existing provider, and None.
+        When:
+            Each is passed to WorkerCredentialsProvider.coerce.
+        Then:
+            The bare value becomes a provider resolving to it, the provider is
+            returned unchanged, and None becomes None.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds)
+
+        # Act & assert
+        wrapped = WorkerCredentialsProvider.coerce(creds)
+        assert isinstance(wrapped, WorkerCredentialsProvider)
+        assert wrapped.resolve() == creds
+        assert WorkerCredentialsProvider.coerce(provider) is provider
+        assert WorkerCredentialsProvider.coerce(None) is None
+
     def test_resolve_should_return_constant_credentials_when_not_reloadable(
         self, test_certificates
     ):

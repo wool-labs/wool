@@ -476,13 +476,8 @@ class WorkerProxy:
             resolved = credentials
         # Normalize either a bare WorkerCredentials or a provider (from the
         # argument or the ambient credential context) into a provider the
-        # sentinel resolves per connection. A bare WorkerCredentials is wrapped;
-        # anything else is assumed to already be a (duck-typed) provider.
-        self._provider = (
-            resolved.as_provider()
-            if isinstance(resolved, WorkerCredentials)
-            else resolved
-        )
+        # sentinel resolves per connection.
+        self._provider = WorkerCredentialsProvider.coerce(resolved)
 
         # Create security filter based on resolved credentials
         security_filter = self._create_security_filter(self._provider)

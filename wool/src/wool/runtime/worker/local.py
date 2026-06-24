@@ -98,12 +98,7 @@ class LocalWorker(Worker):
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
-        # A bare WorkerCredentials is wrapped; a provider is used as-is.
-        self._provider = (
-            credentials.as_provider()
-            if isinstance(credentials, WorkerCredentials)
-            else credentials
-        )
+        self._provider = WorkerCredentialsProvider.coerce(credentials)
         self._worker_process = WorkerProcess(
             uid=self._uid,
             host=host,

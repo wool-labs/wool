@@ -204,25 +204,6 @@ class WorkerCredentials:
         )
 
 
-def _normalize_identity(identity: str | None) -> str | None:
-    """Collapse an empty or whitespace-only identity to ``None``.
-
-    A blank identity would otherwise emit an empty
-    ``grpc.ssl_target_name_override`` and fail verification opaquely;
-    ``None`` instead selects the address-based path, the intended
-    "no identity configured" behaviour.
-
-    :param identity:
-        The configured identity, or ``None``.
-    :returns:
-        The stripped identity, or ``None`` if blank.
-    """
-    if identity is None:
-        return None
-    identity = identity.strip()
-    return identity or None
-
-
 # public
 class WorkerCredentialsProvider:
     """A credential provider backed by a user-supplied factory callable.
@@ -302,6 +283,27 @@ class WorkerCredentialsProvider:
         """
         return self._reloadable
 
+    @classmethod
+    def coerce(
+        cls, credentials: WorkerCredentials | WorkerCredentialsProvider | None
+    ) -> WorkerCredentialsProvider | None:
+        """Return ``credentials`` as a provider.
+
+        A bare `WorkerCredentials` is wrapped via `WorkerCredentials.as_provider`;
+        an existing provider — or ``None`` — passes through unchanged. This is
+        the single home for the "accept a bare value or a provider" normalization
+        the worker entry points share.
+
+        :param credentials:
+            A bare value, a provider, or ``None``.
+        :returns:
+            A `WorkerCredentialsProvider`, or ``None`` when *credentials* is
+            ``None``.
+        """
+        if isinstance(credentials, WorkerCredentials):
+            return credentials.as_provider()
+        return credentials
+
     def resolve(self) -> WorkerCredentials:
         """Return the current credentials, with the provider's identity applied.
 
@@ -313,7 +315,9 @@ class WorkerCredentialsProvider:
         :returns:
             The current `WorkerCredentials`.
         """
-        if self._cached is not None:
+        if not self._reloadable:
+            # A non-reloadable provider cached its result at construction.
+            assert self._cached is not None
             return self._cached
         return self._apply(self._factory())
 
@@ -348,3 +352,22 @@ def credentials_scope(
 def current_credentials() -> WorkerCredentials | WorkerCredentialsProvider | None:
     """Return the ambient credentials or provider, or ``None`` if unset."""
     return _current.get()
+
+
+def _normalize_identity(identity: str | None) -> str | None:
+    """Collapse an empty or whitespace-only identity to ``None``.
+
+    A blank identity would otherwise emit an empty
+    ``grpc.ssl_target_name_override`` and fail verification opaquely;
+    ``None`` instead selects the address-based path, the intended
+    "no identity configured" behaviour.
+
+    :param identity:
+        The configured identity, or ``None``.
+    :returns:
+        The stripped identity, or ``None`` if blank.
+    """
+    if identity is None:
+        return None
+    identity = identity.strip()
+    return identity or None

@@ -126,12 +126,7 @@ class WorkerProcess(Process):
         if proxy_pool_ttl <= 0:
             raise ValueError("Proxy pool TTL must be positive")
         self._proxy_pool_ttl = proxy_pool_ttl
-        # A bare WorkerCredentials is wrapped; a provider is used as-is.
-        self._provider = (
-            credentials.as_provider()
-            if isinstance(credentials, WorkerCredentials)
-            else credentials
-        )
+        self._provider = WorkerCredentialsProvider.coerce(credentials)
         self._options = options or WorkerOptions()
         self._uid = uid if uid is not None else uuid.uuid4()
         self._tags = tags
