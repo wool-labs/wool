@@ -546,7 +546,7 @@ class TestWorkerConnection:
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection(
             "localhost:50051",
-            provider=_secure_provider(),
+            credentials=_secure_provider(),
             options=ChannelOptions(max_concurrent_streams=10),
         )
 
@@ -605,7 +605,7 @@ class TestWorkerConnection:
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection(
             "localhost:50051",
-            provider=_secure_provider() if secure else None,
+            credentials=_secure_provider() if secure else None,
             options=ChannelOptions(max_concurrent_streams=10),
         )
 
@@ -647,7 +647,7 @@ class TestWorkerConnection:
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection(
             "localhost:50051",
-            provider=_secure_provider(),
+            credentials=_secure_provider(),
             options=ChannelOptions(max_concurrent_streams=10),
         )
 
@@ -689,7 +689,7 @@ class TestWorkerConnection:
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection(
             "localhost:50051",
-            provider=_secure_provider(),
+            credentials=_secure_provider(),
             options=ChannelOptions(max_concurrent_streams=10),
         )
 
@@ -740,7 +740,7 @@ class TestWorkerConnection:
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection(
             "localhost:50051",
-            provider=_secure_provider(),
+            credentials=_secure_provider(),
             options=ChannelOptions(max_concurrent_streams=10),
         )
 
@@ -781,7 +781,7 @@ class TestWorkerConnection:
         )
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection(
-            "10.0.0.7:50051", provider=_secure_provider(identity="wool-worker")
+            "10.0.0.7:50051", credentials=_secure_provider(identity="wool-worker")
         )
 
         # Act
@@ -824,7 +824,7 @@ class TestWorkerConnection:
             return_value=mock_grpc_call(async_stream(responses))
         )
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
-        connection = WorkerConnection("10.0.0.7:50051", provider=_secure_provider())
+        connection = WorkerConnection("10.0.0.7:50051", credentials=_secure_provider())
 
         # Act
         results = [result async for result in await connection.dispatch(sample_task)]
@@ -833,6 +833,57 @@ class TestWorkerConnection:
         assert results == ["ok"]
         option_keys = [key for key, _ in secure_spy.call_args.kwargs["options"]]
         assert "grpc.ssl_target_name_override" not in option_keys
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_override_target_name_from_bare_credentials_identity(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test a bare WorkerCredentials identity overrides the SAN target.
+
+        Given:
+            A connection built from a bare `WorkerCredentials` (not a provider)
+            that carries an identity.
+        When:
+            A task is dispatched.
+        Then:
+            The secure channel should carry the grpc.ssl_target_name_override
+            option for that identity — the ``credentials`` union coerces the
+            bare value and its identity flows through.
+        """
+        # Arrange
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "10.0.0.7:50051",
+            credentials=WorkerCredentials(
+                ca_cert=b"ca",
+                worker_key=b"key",
+                worker_cert=b"cert",
+                identity="wool-worker",
+            ),
+        )
+
+        # Act
+        results = [result async for result in await connection.dispatch(sample_task)]
+
+        # Assert
+        assert results == ["ok"]
+        options = secure_spy.call_args.kwargs["options"]
+        assert ("grpc.ssl_target_name_override", "wool-worker") in options
 
         # Cleanup
         await connection.close()
@@ -869,7 +920,7 @@ class TestWorkerConnection:
         mock_stub = mocker.MagicMock()
         mock_stub.dispatch = mocker.MagicMock(side_effect=fresh_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
-        connection = WorkerConnection("10.0.0.7:50051", provider=_secure_provider())
+        connection = WorkerConnection("10.0.0.7:50051", credentials=_secure_provider())
 
         # Act
         async for _ in await connection.dispatch(sample_task):
@@ -936,7 +987,7 @@ class TestWorkerConnection:
         mock_stub = mocker.MagicMock()
         mock_stub.dispatch = mocker.MagicMock(side_effect=fresh_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
-        connection = WorkerConnection("10.0.0.7:50051", provider=provider)
+        connection = WorkerConnection("10.0.0.7:50051", credentials=provider)
 
         # Act
         async for _ in await connection.dispatch(sample_task):
@@ -1004,7 +1055,7 @@ class TestWorkerConnection:
             return_value=mock_grpc_call(async_stream(responses))
         )
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
-        connection = WorkerConnection("10.0.0.7:50051", provider=provider)
+        connection = WorkerConnection("10.0.0.7:50051", credentials=provider)
 
         # Act — prime the dispatch (builds the original channel), then rotate
         # the material before consuming the still-open stream.
@@ -1064,7 +1115,7 @@ class TestWorkerConnection:
             grpc.aio, "secure_channel", return_value=mock_channel
         )
         connection = WorkerConnection(
-            target, provider=_secure_provider(identity="wool-worker")
+            target, credentials=_secure_provider(identity="wool-worker")
         )
 
         # Act
@@ -2196,7 +2247,7 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        connection = WorkerConnection("localhost:50051", provider=_secure_provider())
+        connection = WorkerConnection("localhost:50051", credentials=_secure_provider())
 
         # Act
         results = []

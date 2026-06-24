@@ -942,7 +942,7 @@ class WorkerProxy:
                         continue
                     connection = WorkerConnection(
                         event.metadata.address,
-                        provider=provider,
+                        credentials=provider,
                         options=event.metadata.options,
                     )
                     if event.type == "worker-added":

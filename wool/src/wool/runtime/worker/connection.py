@@ -820,9 +820,10 @@ class WorkerConnection:
         - ``unix:path`` - Unix domain socket
 
         Examples: ``localhost:50051``, ``192.0.2.1:50051``
-    :param provider:
-        Optional credential provider resolved on each dispatch for
-        TLS/mTLS connections.  ``None`` selects an insecure channel.
+    :param credentials:
+        Optional `WorkerCredentials` or `WorkerCredentialsProvider`, resolved
+        on each dispatch for TLS/mTLS connections.  ``None`` selects an
+        insecure channel.
     :param options:
         Optional channel options controlling gRPC message
         size limits, keepalive, concurrency, and compression.
@@ -841,11 +842,11 @@ class WorkerConnection:
         self,
         target: str,
         *,
-        provider: WorkerCredentialsProvider | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         options: ChannelOptions | None = None,
     ):
         self._target = target
-        self._provider = provider
+        self._provider = WorkerCredentialsProvider.coerce(credentials)
         self._options = options if options is not None else ChannelOptions()
         # The TCP key is recomputed on each dispatch from the resolved
         # snapshot (so rotated material yields a new key); the last one is
