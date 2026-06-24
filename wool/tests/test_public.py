@@ -34,6 +34,8 @@ def test_public_api_completeness():
         "RpcError",
         "TransientRpcError",
         "UnexpectedResponse",
+        "HandshakeError",
+        "WorkerCredentialsProvider",
         "WorkerConnection",
         "Context",
         "ContextAlreadyBound",

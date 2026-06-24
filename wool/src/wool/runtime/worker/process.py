@@ -25,8 +25,9 @@ import wool
 from wool import protocol
 from wool.runtime.context import install_task_factory
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import credentials_scope
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -63,7 +64,10 @@ class WorkerProcess(Process):
     :param proxy_pool_ttl:
         Proxy pool TTL in seconds.
     :param credentials:
-        Optional worker credentials for TLS/mTLS.
+        Optional worker credentials for TLS/mTLS — either a
+        `WorkerCredentials` or a `WorkerCredentialsProvider`. A
+        reloadable provider serves rotating server credentials via a
+        per-handshake fetcher.
     :param options:
         gRPC message size options. Defaults to
         :class:`WorkerOptions` with 100 MB limits.
@@ -91,7 +95,7 @@ class WorkerProcess(Process):
     _metadata: WorkerMetadata | None
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
-    _credentials: WorkerCredentials | None
+    _provider: WorkerCredentialsProvider | None
     _options: WorkerOptions
 
     def __init__(
@@ -102,7 +106,7 @@ class WorkerProcess(Process):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
-        credentials: WorkerCredentials | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         options: WorkerOptions | None = None,
         tags: frozenset[str] = frozenset(),
         extra: dict[str, Any] | None = None,
@@ -122,7 +126,7 @@ class WorkerProcess(Process):
         if proxy_pool_ttl <= 0:
             raise ValueError("Proxy pool TTL must be positive")
         self._proxy_pool_ttl = proxy_pool_ttl
-        self._credentials = credentials
+        self._provider = WorkerCredentialsProvider.coerce(credentials)
         self._options = options or WorkerOptions()
         self._uid = uid if uid is not None else uuid.uuid4()
         self._tags = tags
@@ -239,6 +243,42 @@ class WorkerProcess(Process):
             logger.exception(f"Worker process crashed: {type(e).__name__}: {e}")
             raise
 
+    def _server_credentials(self) -> grpc.ServerCredentials | None:
+        """Build the gRPC server credentials for this worker.
+
+        Returns ``None`` for an insecure worker.  A reloadable provider
+        yields `grpc.dynamic_ssl_server_credentials` whose fetcher
+        re-resolves the provider on each new connection, so rotated
+        certificate, key, or CA material is adopted without restarting the
+        worker; established connections continue on their existing
+        material.  A static provider takes the unchanged
+        `WorkerCredentials.server_credentials` path so the
+        static-mTLS posture is byte-for-byte preserved.  The mutual-TLS
+        mode is fixed from the initial material, i.e., rotation replaces
+        the bytes, not the handshake mode.
+
+        :returns:
+            Server credentials, or ``None`` for an insecure worker.
+        """
+        provider = self._provider
+        if provider is None:
+            return None
+        if getattr(provider, "reloadable", False):
+
+            def certificate_configuration(material):
+                return grpc.ssl_server_certificate_configuration(
+                    [(material.worker_key, material.worker_cert)],
+                    root_certificates=(material.ca_cert if material.mutual else None),
+                )
+
+            initial = provider.resolve()
+            return grpc.dynamic_ssl_server_credentials(
+                certificate_configuration(initial),
+                lambda: certificate_configuration(provider.resolve()),
+                require_client_authentication=initial.mutual,
+            )
+        return provider.resolve().server_credentials()
+
     async def _serve(self):
         """Run the worker's gRPC server for the lifetime of the process.
 
@@ -248,8 +288,8 @@ class WorkerProcess(Process):
         fires.
         """
         creds_ctx = (
-            CredentialContext(self._credentials)
-            if self._credentials is not None
+            credentials_scope(self._provider)
+            if self._provider is not None
             else contextlib.nullcontext()
         )
         with creds_ctx:
@@ -296,11 +336,7 @@ class WorkerProcess(Process):
             server = grpc.aio.server(
                 interceptors=[VersionInterceptor()], options=grpc_options
             )
-            credentials = (
-                self._credentials.server_credentials()
-                if self._credentials is not None
-                else None
-            )
+            credentials = self._server_credentials()
             address = self._address(self._host, self._port)
 
             if credentials is not None:
@@ -309,13 +345,26 @@ class WorkerProcess(Process):
                 port = server.add_insecure_port(address)
 
             uds_address = None
+            uds_dir = None
             if _HAS_UDS:
-                uds_path = os.path.join(tempfile.gettempdir(), f"wool-{self._uid}.sock")
-                uds_target = f"unix:{uds_path}"
-                with contextlib.suppress(OSError):
-                    os.unlink(uds_path)
-                server.add_insecure_port(uds_target)
-                uds_address = uds_target
+                # The loopback self-dispatch socket serves the full,
+                # unauthenticated dispatch service, so confine its reachability
+                # to this worker's own uid by binding it inside a per-worker
+                # 0700 directory. Place that directory under a SHORT base —
+                # $XDG_RUNTIME_DIR (the per-user runtime dir on Linux, already
+                # a 0700 tmpfs) where set, else /tmp — rather than the system
+                # temp dir: an AF_UNIX path is capped near 104 bytes (108 on
+                # Linux, as little as 92 on some platforms), and macOS's
+                # per-user $TMPDIR (/var/folders/.../T) is deep enough to
+                # overflow it. Binding under a short directory is the standard
+                # way to stay within that limit.
+                uds_base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+                if not os.path.isdir(uds_base):
+                    uds_base = "/tmp"
+                uds_dir = tempfile.mkdtemp(prefix="wool-", dir=uds_base)
+                uds_path = os.path.join(uds_dir, "dispatch.sock")
+                server.add_insecure_port(f"unix:{uds_path}")
+                uds_address = f"unix:{uds_path}"
 
             backpressure = (
                 cloudpickle.loads(self._backpressure)
@@ -339,7 +388,7 @@ class WorkerProcess(Process):
                         version=protocol.__version__,
                         tags=self._tags,
                         extra=MappingProxyType(self._extra),
-                        secure=self._credentials is not None,
+                        secure=self._provider is not None,
                         options=self._options.channel,
                     )
                     wool.__worker_metadata__ = metadata
@@ -364,6 +413,9 @@ class WorkerProcess(Process):
                         uds_path = uds_address.removeprefix("unix:")
                         with contextlib.suppress(OSError):
                             os.unlink(uds_path)
+                        if uds_dir is not None:
+                            with contextlib.suppress(OSError):
+                                os.rmdir(uds_dir)
 
     def _address(self, host, port) -> str:
         """Format network address for the given host and port.

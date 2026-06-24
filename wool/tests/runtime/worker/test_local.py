@@ -8,6 +8,7 @@ from hypothesis import strategies as st
 from wool import protocol
 from wool.runtime.worker import local as local_module
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.base import WorkerOptions
@@ -656,6 +657,53 @@ class TestLocalWorker:
         # Assert
         mock_secure_channel.assert_called_once()
         mock_stub.stop.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_should_apply_identity_override_when_configured(
+        self, mocker, worker_credentials
+    ):
+        """Test the stop RPC verifies the worker against its identity.
+
+        Given:
+            A running LocalWorker whose provider carries an expected
+            identity.
+        When:
+            stop() is called.
+        Then:
+            The secure stop channel should carry a
+            grpc.ssl_target_name_override option for that identity, so the
+            worker's own certificate verifies against its logical identity
+            rather than the loopback address.
+        """
+        # Arrange
+        provider = WorkerCredentialsProvider(
+            lambda: worker_credentials, identity="wool-worker"
+        )
+        mock_process = mocker.MagicMock(spec=WorkerProcess)
+        mock_process.address = "127.0.0.1:50051"
+        mock_process.metadata = _make_metadata()
+        mock_process.start.return_value = None
+        mock_process.is_alive.return_value = True
+        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
+
+        worker = LocalWorker(credentials=provider)
+        await worker.start()
+
+        mock_channel = mocker.MagicMock()
+        mock_channel.close = mocker.AsyncMock()
+        mock_stub = mocker.MagicMock()
+        mock_stub.stop = mocker.AsyncMock()
+        mock_secure_channel = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        # Act
+        await worker.stop()
+
+        # Assert
+        options = mock_secure_channel.call_args.kwargs["options"]
+        assert ("grpc.ssl_target_name_override", "wool-worker") in options
 
     @pytest.mark.parametrize("mutual", [True, False], ids=["mtls", "one_way_tls"])
     @pytest.mark.asyncio

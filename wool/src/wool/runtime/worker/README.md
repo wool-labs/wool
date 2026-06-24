@@ -295,7 +295,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 ### Connection pooling
 
-`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`.
+`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Keying on the `WorkerCredentials` value (a frozen dataclass, so hashable and value-equal) is what lets rotated material yield a fresh channel while unchanged material reuses the pooled one (see _Security_). Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`.
 
 ### Transport configuration
 
@@ -334,7 +334,10 @@ async with wool.WorkerPool(
 | Error | gRPC codes | Load balancer behavior |
 | ----- | ---------- | ---------------------- |
 | `TransientRpcError` | `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED` | Retry on next worker. |
+| `HandshakeError` | `UNAUTHENTICATED`, or `UNAVAILABLE` with TLS evidence | Skip without eviction; log the rejection. |
 | `RpcError` | All others | Remove worker from context, retry next. |
+
+`HandshakeError` (a non-transient `RpcError`) signals that a worker is reachable but the TLS/mTLS handshake or peer authentication failed; see `HandshakeError` for the typed `reason` classification and how the load balancer treats it. A dispatch that drains entirely on handshake failures raises the plain `NoWorkersAvailable`.
 
 ### Security filter
 
@@ -364,3 +367,57 @@ async with wool.WorkerPool(spawn=4, credentials=creds):
 ```
 
 Credential flow: `server_credentials` are passed to spawned workers for their gRPC servers; `client_credentials` are passed to the proxy for outgoing connections and to workers for the stop RPC.
+
+### Credential providers: identity and rotation
+
+`WorkerCredentials` describes a fixed snapshot of material verified against the dialed address. For dynamic-address platforms (Kubernetes, ECS/Fargate) where a worker's address is assigned at startup and credentials are rotated out of band, supply a **credential provider** instead — anywhere `credentials=` is accepted (`WorkerPool`, `LocalWorker`, `WorkerProxy`). A bare `WorkerCredentials` is wrapped in a non-reloadable provider automatically, so existing deployments are unaffected.
+
+A `WorkerCredentialsProvider` is a thin adapter over a `factory` callable returning the current `WorkerCredentials`; it stamps an optional `identity` onto the credentials the channel pool keys on. It comes in two shapes.
+
+**Fixed material — `WorkerCredentials.as_provider`.** Read or build credentials once, then adapt them, optionally pinning the identity to verify discovered workers against:
+
+```python
+import wool
+
+credentials = wool.WorkerCredentials.from_files(
+    ca_path="certs/ca-cert.pem",
+    key_path="certs/worker-key.pem",
+    cert_path="certs/worker-cert.pem",
+)
+provider = credentials.as_provider(identity="wool-worker.svc")
+
+async with wool.WorkerPool(spawn=4, credentials=provider):
+    result = await my_routine()
+```
+
+**Rotating material — `reloadable=True`.** Supply a `factory` the runtime calls to obtain current material, so a long-running fleet adopts rotated certificates without a restart. Wool is unopinionated about *how* you reload — `factory` owns the strategy (re-read a file, poll a secrets manager, cache with a TTL, keep a last-good fallback):
+
+```python
+import functools
+
+# Re-read the PEM files on each resolution. For an expensive source, or to
+# survive a torn read mid-rotation, add caching / last-good fallback here.
+factory = functools.partial(
+    wool.WorkerCredentials.from_files,
+    "certs/ca-cert.pem",
+    "certs/worker-key.pem",
+    "certs/worker-cert.pem",
+)
+provider = wool.WorkerCredentialsProvider(
+    factory, identity="wool-worker.svc", reloadable=True
+)
+```
+
+A configured `identity` verifies a worker's certificate against a stable logical identity (its SAN, via gRPC's `ssl_target_name_override`) rather than the dialed address, and applies to every worker reached through the provider. Rotation spans both planes: the client channel pool is keyed by the `WorkerCredentials` value (rotated material is a different key and yields fresh channels while unchanged material reuses pooled ones, and in-flight dispatches finish on their existing channel), and the worker server adopts new material per connection via `grpc.dynamic_ssl_server_credentials`.
+
+A `reloadable=True` `factory` is consulted on every resolution — including from the worker's per-handshake server fetcher, off the event loop — so it must be **importable** (a module-level function or picklable object, since it crosses into worker subprocesses) and **safe to call concurrently**; if re-invoking it is expensive, return cached material when nothing has changed (an equal `WorkerCredentials` value is the same pool key, so unchanged material still reuses pooled channels). A `reloadable=False` provider resolves once at construction and serves that fixed snapshot; its `factory` runs in the constructing process and may be a lambda.
+
+A provider supplied to a worker crosses into the worker subprocess (hence the importability note above); the proxy instead re-resolves its provider from the ambient credential context, so it is never serialized across the dispatch boundary.
+
+### Local self-dispatch socket
+
+For nested routines that dispatch back to the worker's own address, the worker exposes an additional **insecure** Unix-domain-socket port and routes self-dispatch over it (a worker never does TLS against itself). That socket serves the full dispatch service with no transport authentication, so its reachability is confined to the worker's own user: it is bound inside a per-worker `0700` directory under a short base directory (`$XDG_RUNTIME_DIR` where set, else `/tmp` — short to stay within the platform's `AF_UNIX` path limit). This assumes the local host is a trust boundary — any process running as the same uid can dispatch to the worker over the socket. On a shared or multi-tenant host, isolate workers by uid (or container/network namespace) accordingly.
+
+### Discovery-plane trust
+
+Identity-based mTLS secures the **dispatch** plane; it does not authenticate the **discovery** plane. A worker self-advertises its `WorkerMetadata` — address, `secure` flag, tags, and channel options — over whatever discovery mechanism is in use (LAN multicast, shared-memory, a custom `DiscoveryLike`), none of which is authenticated, so the advertisement is forgeable by anything that can write to that plane. The proxy-side security filter that drops workers whose advertised `secure` flag disagrees with the client's credential posture is therefore a **compatibility gate, not a trust boundary**: it prevents a plaintext/encrypted mismatch, not a malicious advertisement. Actual confidentiality and integrity rest entirely on the mTLS handshake performed when a connection is made — a forged advertisement still cannot complete the handshake without a CA-trusted certificate (and, when an identity is configured, one whose SAN matches). The discovery plane is not authenticated; treat discovery as an untrusted hint and the handshake as the trust boundary.

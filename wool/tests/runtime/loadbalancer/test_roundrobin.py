@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import pickle
 from uuid import uuid4
 
 import pytest
@@ -14,6 +16,7 @@ from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
@@ -65,6 +68,28 @@ def dispatch_side_effects(
 
 
 class TestRoundRobinLoadBalancer:
+    def test_should_pickle_to_a_fresh_balancer(self):
+        """Test the load balancer survives a serialization round-trip.
+
+        Given:
+            A RoundRobinLoadBalancer.
+        When:
+            It is pickled and restored.
+        Then:
+            A distinct balancer of the same type is reconstructed — its
+            per-context cursor state is process-local and intentionally not
+            carried across the boundary.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+
+        # Act
+        restored = pickle.loads(pickle.dumps(lb))
+
+        # Assert
+        assert isinstance(restored, RoundRobinLoadBalancer)
+        assert restored is not lb
+
     def test_isinstance_satisfies_protocol(self):
         """Test RoundRobinLoadBalancer satisfies the
         LoadBalancerLike protocol.
@@ -114,6 +139,223 @@ class TestRoundRobinLoadBalancer:
         # Act & assert
         with pytest.raises(NoWorkersAvailable):
             await lb.dispatch(task, context=ctx)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_no_workers_and_keep_pool_when_all_reject(
+        self, mocker: MockerFixture
+    ):
+        """Test a fully-rejected pool drains without evicting its workers.
+
+        Given:
+            A context whose every worker fails the secure handshake.
+        When:
+            A task is dispatched.
+        Then:
+            It should raise NoWorkersAvailable while leaving the workers in
+            the pool (skipped, not evicted) so a later rotation can recover
+            them once their credentials are valid.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+        for i in range(2):
+            connection = mocker.create_autospec(WorkerConnection, instance=True)
+            connection.dispatch = mocker.AsyncMock(side_effect=HandshakeError())
+            metadata = WorkerMetadata(
+                uid=uuid4(),
+                address=f"10.0.0.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+            )
+            ctx.add_worker(metadata, connection)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable):
+            await lb.dispatch(task, context=ctx)
+        assert len(ctx.workers) == 2
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_skip_handshake_worker_and_use_healthy(
+        self, mocker: MockerFixture
+    ):
+        """Test a handshake failure skips the worker without evicting it.
+
+        Given:
+            A context with one worker that fails the handshake followed by
+            one healthy worker.
+        When:
+            A task is dispatched.
+        Then:
+            The dispatch should succeed on the healthy worker, and the
+            failing worker should remain in the pool (skipped, not evicted)
+            so it can recover after a credential rotation.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+        healthy_stream = mocker.MagicMock()
+
+        bad_connection = mocker.create_autospec(WorkerConnection, instance=True)
+        bad_connection.dispatch = mocker.AsyncMock(side_effect=HandshakeError())
+        bad_metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
+        )
+        good_connection = mocker.create_autospec(WorkerConnection, instance=True)
+        good_connection.dispatch = mocker.AsyncMock(return_value=healthy_stream)
+        good_metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.2:50051", pid=2, version="1.0.0"
+        )
+        ctx.add_worker(bad_metadata, bad_connection)
+        ctx.add_worker(good_metadata, good_connection)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act
+        result = await lb.dispatch(task, context=ctx)
+
+        # Assert
+        assert result is healthy_stream
+        assert bad_metadata in ctx.workers
+        assert good_metadata in ctx.workers
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_plain_no_workers_when_a_transient_survives(
+        self, mocker: MockerFixture
+    ):
+        """Test a mix of handshake and transient failures drains cleanly.
+
+        Given:
+            A context with one handshake-failing worker and one
+            persistently-transient worker.
+        When:
+            A task is dispatched and the cycle exhausts.
+        Then:
+            It should raise NoWorkersAvailable with both workers left in the
+            pool — handshake and transient failures are both skipped without
+            eviction.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+
+        handshake_connection = mocker.create_autospec(WorkerConnection, instance=True)
+        handshake_connection.dispatch = mocker.AsyncMock(side_effect=HandshakeError())
+        transient_connection = mocker.create_autospec(WorkerConnection, instance=True)
+        transient_connection.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
+        handshake_metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
+        )
+        transient_metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.2:50051", pid=2, version="1.0.0"
+        )
+        ctx.add_worker(handshake_metadata, handshake_connection)
+        ctx.add_worker(transient_metadata, transient_connection)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable):
+            await lb.dispatch(task, context=ctx)
+        assert len(ctx.workers) == 2
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_recover_skipped_worker_on_later_dispatch(
+        self, mocker: MockerFixture
+    ):
+        """Test a handshake-skipped worker recovers without re-discovery.
+
+        Given:
+            A context with a single worker whose first handshake fails and
+            whose next dispatch succeeds (e.g., after a credential rotation).
+        When:
+            A first dispatch fails and a second dispatch is issued.
+        Then:
+            The first should raise NoWorkersAvailable and the second should
+            succeed on the same, still-pooled worker.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+        healthy_stream = mocker.MagicMock()
+        connection = mocker.create_autospec(WorkerConnection, instance=True)
+        connection.dispatch = mocker.AsyncMock(
+            side_effect=[
+                HandshakeError(),
+                healthy_stream,
+            ]
+        )
+        metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
+        )
+        ctx.add_worker(metadata, connection)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act
+        with pytest.raises(NoWorkersAvailable):
+            await lb.dispatch(task, context=ctx)
+        result = await lb.dispatch(task, context=ctx)
+
+        # Assert
+        assert result is healthy_stream
+        assert metadata in ctx.workers
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_log_each_handshake_rejection(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test each handshake rejection is logged for observability.
+
+        Given:
+            A context with a single handshake-failing worker.
+        When:
+            A task is dispatched.
+        Then:
+            A warning should be logged naming the worker uid and details of
+            the handshake failure.
+        """
+        # Arrange
+        lb = RoundRobinLoadBalancer()
+        ctx = LoadBalancerContext()
+        connection = mocker.create_autospec(WorkerConnection, instance=True)
+        connection.dispatch = mocker.AsyncMock(side_effect=HandshakeError())
+        metadata = WorkerMetadata(
+            uid=uuid4(), address="10.0.0.1:50051", pid=1, version="1.0.0"
+        )
+        ctx.add_worker(metadata, connection)
+
+        async def routine():
+            return "Hello world!"
+
+        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
+        task = Task(id=uuid4(), callable=routine, args=(), kwargs={}, proxy=mock_proxy)
+
+        # Act
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(NoWorkersAvailable):
+                await lb.dispatch(task, context=ctx)
+
+        # Assert
+        assert str(metadata.uid) in caplog.text
+        assert "handshake" in caplog.text.lower()
 
     @pytest.mark.asyncio
     @settings(
