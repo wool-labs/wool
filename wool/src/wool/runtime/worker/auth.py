@@ -336,7 +336,7 @@ def credentials_scope(
 
     Code running within the scope reads them via `current_credentials`; the
     binding is reset on exit. Carries either a bare `WorkerCredentials` or a
-    `WorkerCredentialsProvider`. Not part of the public API.
+    `WorkerCredentialsProvider`.
     """
     token = _current.set(credentials)
     try:
@@ -346,8 +346,5 @@ def credentials_scope(
 
 
 def current_credentials() -> WorkerCredentials | WorkerCredentialsProvider | None:
-    """Return the ambient credentials or provider, or ``None`` if unset.
-
-    Not part of the public API.
-    """
+    """Return the ambient credentials or provider, or ``None`` if unset."""
     return _current.get()
