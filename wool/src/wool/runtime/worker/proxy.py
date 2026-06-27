@@ -25,7 +25,7 @@ from packaging.version import InvalidVersion
 from packaging.version import Version
 
 import wool
-from wool.exception import WoolWarning
+from wool.exceptions import WoolWarning
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.local import LocalDiscovery

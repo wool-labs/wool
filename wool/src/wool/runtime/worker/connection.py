@@ -17,11 +17,18 @@ import grpc.aio
 
 import wool
 from wool import protocol
-from wool.runtime import context
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import Serializer
 from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.frame import ExceptionResponseFrame
+from wool.runtime.worker.frame import Frame
+from wool.runtime.worker.frame import NextRequestFrame
+from wool.runtime.worker.frame import RequestFrame
+from wool.runtime.worker.frame import ResultResponseFrame
+from wool.runtime.worker.frame import SendRequestFrame
+from wool.runtime.worker.frame import TaskRequestFrame
+from wool.runtime.worker.frame import ThrowRequestFrame
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
 _PoolKey: TypeAlias = tuple[str, grpc.ChannelCredentials | None, ChannelOptions]
@@ -45,12 +52,12 @@ class _Channel:
 
 
 def _channel_factory(key):
-    """Create a new :class:`_Channel` for the given pool key.
+    """Create a new `_Channel` for the given pool key.
 
     :param key:
         Tuple of ``(target, credentials, options)``.
     :returns:
-        A new :class:`_Channel` instance.
+        A new `_Channel` instance.
     """
     target, credentials, options = key
     grpc_options = [
@@ -78,10 +85,10 @@ def _channel_factory(key):
 
 
 async def _channel_finalizer(channel: _Channel):
-    """Close the gRPC channel held by a :class:`_Channel`.
+    """Close the gRPC channel held by a `_Channel`.
 
     :param channel:
-        The :class:`_Channel` to finalize.
+        The `_Channel` to finalize.
     """
     await channel.close()
 
@@ -106,11 +113,11 @@ _TEARDOWN_TIMEOUT: Final = 60.0
 async def _complete_teardown(teardown: Coroutine[Any, Any, None]) -> None:
     """Drive *teardown* to completion, immune to caller cancellation.
 
-    Resource teardown registered on an :class:`AsyncExitStack`
+    Resource teardown registered on an `AsyncExitStack`
     awaits its release callbacks. When the caller task carries a
-    pending cancellation — externally via ``task.cancel()`` or after
-    a worker-side ``CancelledError`` bumped ``cancelling()`` in
-    :meth:`_DispatchStream._read_next` — asyncio would pre-empt the
+    pending cancellation — externally via ``task.cancel()`` or from
+    a worker-side ``CancelledError`` re-raised into it by
+    `_DispatchStream._read_next` — asyncio would pre-empt the
     next suspending teardown ``await`` and skip the remaining
     callbacks, leaking a pooled resource reference.
 
@@ -125,7 +132,7 @@ async def _complete_teardown(teardown: Coroutine[Any, Any, None]) -> None:
     ``KeyboardInterrupt`` and ``SystemExit`` are captured off the child
     task — where they would otherwise escape straight to the event-loop
     runner via ``Task.__step`` — and re-raised in the caller's context.
-    If teardown does not finish within :data:`_TEARDOWN_TIMEOUT` the
+    If teardown does not finish within `_TEARDOWN_TIMEOUT` the
     caller is unblocked and the shielded task is left running detached
     so the release still completes.
     """
@@ -158,6 +165,17 @@ async def _complete_teardown(teardown: Coroutine[Any, Any, None]) -> None:
                 "release deferred to a detached task.",
                 _TEARDOWN_TIMEOUT,
             )
+            # If the shielded task is still in flight at
+            # timeout, a captured process-level interrupt could
+            # surface from it later with no awaiter. Log so an
+            # operator can correlate. The done-with-interrupt case
+            # falls through to the post-loop ``raise interrupt``.
+            if not task.done():
+                _log.debug(
+                    "Routine teardown detached with shielded task "
+                    "still pending; a process-level interrupt may "
+                    "surface later from the detached task."
+                )
             break
         except asyncio.CancelledError as exc:
             if not task.done():
@@ -211,60 +229,95 @@ class _DispatchStream(Generic[_T]):
         :raises RuntimeError:
             If another iteration is already in progress.
         :raises UnexpectedResponse:
-            If the response payload is unrecognised (neither a
-            result nor an exception), if a result or exception
-            dump cannot be deserialised (e.g. cloudpickle version
-            skew, missing class on the caller's path, truncated
-            bytes, etc.), or if the worker ships a non-:class:`Exception`
-            :class:`BaseException` payload other than
-            :class:`asyncio.CancelledError` (e.g. :class:`KeyboardInterrupt`,
-            :class:`SystemExit`, user-defined :class:`BaseException`
-            subclasses, etc.).
+            If the response payload is unrecognised (the wire's
+            ``oneof`` carries neither a ``result`` nor an
+            ``exception``), or if the worker ships a
+            non-`Exception` `BaseException` payload
+            other than `asyncio.CancelledError` (e.g.,
+            `KeyboardInterrupt`, `SystemExit`,
+            user-defined `BaseException` subclasses). Both
+            are protocol-shape violations.
+        :raises pickle.UnpicklingError:
+            If a result or exception payload cannot be deserialised
+            (cloudpickle version skew, missing class on the caller's
+            path, truncated bytes, worker-side serializer bug, etc.).
+            The original exception type from the serializer
+            propagates with no wrapping — `pickle.PickleError`
+            subclasses, `AttributeError`,
+            `ImportError`, and similar all surface raw. The
+            load balancer treats anything outside `RpcError`
+            as caller-fault and does not evict the worker.
         :raises asyncio.CancelledError:
             When the worker-side routine raises
-            :class:`asyncio.CancelledError` from its body (or is
+            `asyncio.CancelledError` from its body (or is
             externally cancelled and propagates the
             ``CancelledError`` out). Mirrors stdlib's ``await task``
             semantics where ``raise CancelledError`` from the
             awaitee is indistinguishable from
             ``task.cancel()`` — both transition the task to
             ``CANCELLED`` and the caller's ``await`` raises
-            ``CancelledError``. The caller task's ``cancelling()``
-            count is incremented synchronously with the raise,
-            mirroring stdlib's local-cancel state shape so that
-            ``if cancelling() > 0: raise`` re-raise gates and
-            ``current_task().uncancel()`` absorbers behave
-            identically for worker-side and local cancels.
+            ``CancelledError``. This site does not bump the caller
+            task's ``cancelling()`` count — the worker-shipped
+            ``CancelledError`` is re-raised as-is, leaving the
+            awaiter's cancelling count untouched exactly as stdlib
+            does when the awaitee raises ``CancelledError``.
+            A caller that catches it and continues to ``await`` a
+            recovery path may be re-interrupted at the next checkpoint
+            until it calls ``current_task().uncancel()`` — a step the
+            wool-naive caller cannot reasonably know to add.
         :raises Exception:
             The worker-side routine's exception, re-raised in its
             original class. The class is narrowed to
-            :class:`Exception` for non-:class:`CancelledError`
-            :class:`BaseException` subclasses (:class:`KeyboardInterrupt`,
-            :class:`SystemExit`, or user-defined :class:`BaseException`
+            `Exception` for non-`CancelledError`
+            `BaseException` subclasses (`KeyboardInterrupt`,
+            `SystemExit`, or user-defined `BaseException`
             subclasses): these are degraded to
-            :class:`UnexpectedResponse` so process-level signals
+            `UnexpectedResponse` so process-level signals
             cannot be smuggled across the wire and trip caller-side
-            signal handlers. :class:`UnexpectedResponse` is not a
-            :class:`RpcError` subclass, so the load balancer treats
+            signal handlers. `UnexpectedResponse` is not a
+            `RpcError` subclass, so the load balancer treats
             it as a caller-fault and does not evict the worker.
             Caller-side gRPC cancellation arrives via a different
             path, not via this exception.
+        :raises wool.ChainSerializationError:
+            Under strict mode, when the response's chain manifest
+            fails to decode. On a result frame it raises as the
+            primary (the routine's value is dropped — a result
+            cannot be trusted alongside a chain manifest that failed to
+            apply). On an exception frame it is appended to the
+            tail of the worker exception's ``__context__`` chain
+            (preserving any routine-side chain the worker brought
+            via tblib) — neither failure caused the other, so
+            ``__context__`` is the honest channel rather than
+            ``__cause__``.
         """
         if self._closed:  # pragma: no cover
             raise StopAsyncIteration
+        return await self._send_and_read(
+            NextRequestFrame.for_send(serializer=self._serializer),
+            method_name="anext",
+        )
+
+    async def _send_and_read(
+        self, request_frame: RequestFrame, *, method_name: str
+    ) -> _T:
+        """Common send-then-read choreography for ``__anext__`` /
+        ``asend`` / ``athrow``.
+
+        Centralizes the guard/write/read/finally shape so each
+        caller (``__anext__`` / ``asend`` / ``athrow``) stays a
+        two-line wrapper. *method_name* is used purely for the
+        already-running guard's error message so the diagnostic
+        still names the caller-facing entry point.
+        """
         if self._running:  # pragma: no cover
-            raise RuntimeError("anext(): asynchronous generator is already running")
+            raise RuntimeError(
+                f"{method_name}(): asynchronous generator is already running"
+            )
         self._running = True
         try:
-            request = protocol.Request(
-                next=protocol.Void(),
-                context=context.current_context().to_protobuf(
-                    serializer=self._serializer
-                ),
-            )
-            await self._call.write(request)
-            result = await self._read_next()
-            return result
+            await self._call.write(request_frame.to_protobuf())
+            return await self._read_next()
         finally:
             self._running = False
 
@@ -272,162 +325,109 @@ class _DispatchStream(Generic[_T]):
         """Read the next response from the stream without writing —
         for paths that have already written their own request.
 
-        Applies the response's :class:`Context` into the caller's
-        current :class:`Context` — var mutations and consumed-token
-        state both ride back-propagation.
+        Decodes the wire envelope into the matching response leaf
+        (typically `ResultResponseFrame` or
+        `ExceptionResponseFrame`), then merges the response's
+        chain manifest into the caller's active chain — variable
+        mutations and consumed-token state both ride back-propagation.
 
         :returns:
             The next task result from the worker.
         """
         try:
             response = await anext(self._iter)
-            # Wool treats response context as ancillary state. Per-var
-            # decode failures aggregate inside
-            # :meth:`Context.from_protobuf` and surface as a
-            # :class:`BaseExceptionGroup` only under strict mode; on the
-            # primary-signal path we bundle them with the worker
-            # exception (or the result-bearing response's group) so
-            # callers can extract both signals via ``except*``.
-            decode_failures: list[BaseException] = []
-            try:
-                incoming_context = context.Context.from_protobuf(
-                    response.context, serializer=self._serializer
+            # Up-front protocol-shape check. ``Frame.from_protobuf``
+            # raises ``ValueError`` for an unset payload oneof; surface
+            # that as ``UnexpectedResponse`` (the caller-side
+            # protocol-violation channel) before any decode so the
+            # serializer never sees malformed bytes.
+            kind = response.WhichOneof("payload")
+            if kind not in ("result", "exception"):
+                raise UnexpectedResponse(
+                    f"Expected 'result' or 'exception' response, received '{kind}'"
                 )
-            except BaseExceptionGroup as eg:
-                decode_failures.extend(eg.exceptions)
-            else:
-                if incoming_context.has_state():
-                    context.current_context().update(incoming_context)
-            if response.HasField("result"):
-                try:
-                    result = self._serializer.loads(response.result.dump)
-                except Exception as exc:
-                    # Degrade malformed result payloads to
-                    # :class:`UnexpectedResponse` so callers can
-                    # ``except UnexpectedResponse`` uniformly while
-                    # the original pickle/import failure remains on
-                    # ``__cause__`` for diagnostic chains. Load
-                    # balancer treats this as caller-fault and does
-                    # not evict the worker (typically a version
-                    # skew on a shared result class).
-                    raise UnexpectedResponse(
-                        "Worker shipped a malformed result payload"
-                    ) from exc
-                if decode_failures:
-                    raise BaseExceptionGroup(
-                        "response context decode failed",
-                        decode_failures,
-                    )
-                return result
-            elif response.HasField("exception"):
-                # Degrade malformed exception payloads (cloudpickle
-                # version skew, missing class on the caller's path,
-                # truncated bytes, worker-side serializer bug) to
-                # :class:`UnexpectedResponse` so the load balancer
-                # treats it as a caller-fault and does not evict the
-                # worker for what is typically a version-skew issue.
-                # Mirrors the non-Exception payload degradation
-                # below; the parse-phase Nack path keeps its
-                # :class:`RpcError` fallback because worker-side
-                # parse rejection has different worker-health
-                # semantics than a routine-time decode mismatch.
-                try:
-                    worker_exc = self._serializer.loads(response.exception.dump)
-                except Exception as exc:
-                    # Preserve the original pickle/import failure
-                    # via manual ``__cause__`` chaining — we assign
-                    # ``worker_exc`` and continue into the
-                    # narrowing + note-attachment block below, so
-                    # ``raise X from Y`` syntax isn't applicable
-                    # here. The later ``raise worker_exc`` honors
-                    # the manually-set ``__cause__`` identically to
-                    # ``raise X from Y``.
-                    worker_exc = UnexpectedResponse(
-                        "Worker shipped a malformed exception payload"
-                    )
-                    worker_exc.__cause__ = exc
-                    worker_exc.__suppress_context__ = True
-                # See ``__anext__``'s ``:raises Exception:`` /
-                # ``:raises asyncio.CancelledError:`` for the
-                # narrowing contract. ``CancelledError`` is allowed
-                # to propagate raw to mirror stdlib's ``await
-                # task`` semantics where a routine that self-raises
-                # ``CancelledError`` is indistinguishable from one
-                # that was externally cancelled. Other non-Exception
-                # ``BaseException`` subclasses are degraded to
-                # :class:`UnexpectedResponse` (not :class:`RpcError`)
-                # so process-level signals cannot be smuggled and
-                # the load balancer does not evict the worker for a
-                # routine-level fault.
-                if not isinstance(worker_exc, (Exception, asyncio.CancelledError)):
-                    worker_exc = UnexpectedResponse(
+            # Decode the response envelope. A payload deserialization
+            # failure (cloudpickle/pickle error, missing class on the
+            # caller's path, version skew, etc.) propagates with its
+            # original type — the load balancer treats anything outside
+            # RpcError as caller-fault.
+            frame = Frame.from_protobuf(response, serializer=self._serializer)
+
+            if isinstance(frame, ResultResponseFrame):
+                # A strict-mode chain-manifest decode failure is fatal
+                # on a result frame — the value can't be trusted
+                # alongside a chain manifest that failed to apply — so
+                # ChainSerializationError from frame.mount() propagates raw
+                # and the result is dropped.
+                frame.mount()
+                return frame.payload
+
+            elif isinstance(frame, ExceptionResponseFrame):
+                exception = frame.payload
+
+                # Narrow non-Exception payloads up-front so subsequent
+                # code can assume `exception` is Exception |
+                # CancelledError (raisable and chainable). Catches both
+                # non-BaseException payloads (dict, string, arbitrary
+                # objects from a buggy/malicious worker) and
+                # non-Exception BaseException subclasses
+                # (KeyboardInterrupt, SystemExit, user-defined
+                # BaseException). Process-level signals cannot be
+                # smuggled across the wire; the original is preserved
+                # on UnexpectedResponse.__context__ when it's a
+                # BaseException (Python rejects non-BaseException as
+                # __context__).
+                if not isinstance(exception, (Exception, asyncio.CancelledError)):
+                    original = exception
+                    exception = UnexpectedResponse(
                         "Worker shipped a non-Exception payload in "
-                        f"Response.exception: {type(worker_exc).__name__}"
+                        f"Response.exception: {type(original).__name__}"
                     )
-                if decode_failures:
-                    # Attach decode failures to the worker exception
-                    # rather than wrap both in a
-                    # :class:`BaseExceptionGroup`. Mirrors the
-                    # worker's encode-side handling
-                    # (:mod:`wool.runtime.worker.service`), so the
-                    # caller's existing ``except`` against the
-                    # routine's exception class keeps matching —
-                    # users don't have to migrate to ``except*``.
-                    try:
-                        for w in decode_failures:
-                            worker_exc.add_note(f"wool context warning: {w}")
-                    except (AttributeError, TypeError):
-                        pass
-                    try:
-                        setattr(
-                            worker_exc,
-                            "__wool_context_warnings__",
-                            decode_failures,
-                        )
-                    except AttributeError:
-                        pass
-                # Mirror stdlib's local-cancel state shape: bump
-                # ``current_task().cancelling()`` synchronously and
-                # forward the worker's cancel message so idiomatic
-                # ``except CancelledError`` patterns
-                # (``if cancelling() > 0: raise`` re-raise gates,
-                # ``current_task().uncancel()`` absorbers) and any
-                # caller that introspects task state behave
-                # identically for worker-side and local cancels. The
-                # next-cycle ``CancelledError`` that ``Task.cancel()``
-                # schedules is suppressed by ``uncancel()`` per
-                # asyncio's contract.
-                if isinstance(worker_exc, asyncio.CancelledError):
-                    current = asyncio.current_task()
-                    if current is not None:
-                        cancel_msg = worker_exc.args[0] if worker_exc.args else None
-                        current.cancel(cancel_msg)
-                raise worker_exc
-            else:
+                    if isinstance(original, BaseException):
+                        exception.__context__ = original
+                    # Replace the frame's payload so the decode-error
+                    # chaining walks the validated exception's
+                    # ``__context__`` rather than the raw worker-shipped
+                    # non-Exception payload.
+                    frame.payload = exception
+
+                # Mount the chain manifest. ``ExceptionResponseFrame``
+                # carries ``_chain_exceptions`` so a
+                # deferred ChainSerializationError is silently chained onto
+                # the payload exception's ``__context__`` walked to the
+                # bottom — no raise propagates here. The two failures
+                # are independent (the worker raised X for routine
+                # reasons; the chain manifest failed to apply for
+                # serializer reasons), so neither caused the other and
+                # ``__cause__`` would overclaim.
+                frame.mount()
+
+                # Worker-shipped ``CancelledError`` propagates as-is;
+                # this site does not bump ``current_task().cancelling()``
+                # to mirror stdlib's local-cancel state shape. That
+                # would deviate from ``await task`` semantics: stdlib
+                # does not bump the awaiter's cancelling count when the
+                # awaitee raises CancelledError. A caller that catches
+                # ``CancelledError`` and continues to ``await``
+                # something else (a recovery path) would be
+                # re-interrupted at the next checkpoint until it called
+                # ``current_task().uncancel()`` — a step the wool-naive
+                # caller cannot reasonably know to add.
+                raise exception
+
+            else:  # pragma: no cover — guarded by the up-front kind check
                 raise UnexpectedResponse(
                     f"Expected 'result' or 'exception' response, "
-                    f"received '{response.WhichOneof('payload')}'"
+                    f"received {type(frame).__name__}"
                 )
         except BaseException:
-            # Cancel the underlying gRPC call on any abnormal exit
-            # — including ``asyncio.CancelledError`` (a
-            # ``BaseException`` subclass), so cancellation
-            # propagates without leaking the in-flight call.
-            # Mirrors stdlib ``await agen.__anext__()`` cleanup
-            # semantics: any non-normal-return exit triggers
-            # resource cleanup before re-raising.
-            #
-            # The inner cancel-swallow is ``Exception``, not
-            # ``BaseException``: this is cleanup-during-cleanup,
-            # so a ``KeyboardInterrupt`` mid-cancel should
-            # propagate rather than be silently dropped.
             try:
                 self._call.cancel()
             except Exception:
                 pass
             raise
 
-    async def aclose(self) -> None:
+    async def aclose(self) -> None:  # pragma: no cover — no production caller
         """Close the async generator and cancel the underlying gRPC call.
 
         This method provides proper cleanup for async generators decorated
@@ -438,7 +438,7 @@ class _DispatchStream(Generic[_T]):
         native Python async generator behavior. This method is idempotent
         and can be safely called multiple times.
         """
-        if self._closed:  # pragma: no cover
+        if self._closed:
             return
 
         self._closed = True
@@ -465,21 +465,10 @@ class _DispatchStream(Generic[_T]):
         """
         if self._closed:  # pragma: no cover
             raise StopAsyncIteration
-        if self._running:  # pragma: no cover
-            raise RuntimeError("asend(): asynchronous generator is already running")
-        self._running = True
-        try:
-            request = protocol.Request(
-                send=protocol.Message(dump=self._serializer.dumps(value)),
-                context=context.current_context().to_protobuf(
-                    serializer=self._serializer
-                ),
-            )
-            await self._call.write(request)
-            result = await self._read_next()
-            return result
-        finally:
-            self._running = False
+        return await self._send_and_read(
+            SendRequestFrame.for_send(value, serializer=self._serializer),
+            method_name="asend",
+        )
 
     async def athrow(self, typ, val=None, tb=None):
         """Throw an exception into the remote async generator.
@@ -504,28 +493,16 @@ class _DispatchStream(Generic[_T]):
         """
         if self._closed:  # pragma: no cover
             raise StopAsyncIteration
-        if self._running:  # pragma: no cover
-            raise RuntimeError("athrow(): asynchronous generator is already running")
-        self._running = True
-        try:
-            if isinstance(typ, BaseException):  # pragma: no cover
-                exc = typ
-            elif val is not None:
-                exc = val
-            else:  # pragma: no cover
-                exc = typ()
-
-            request = protocol.Request(
-                throw=protocol.Message(dump=self._serializer.dumps(exc)),
-                context=context.current_context().to_protobuf(
-                    serializer=self._serializer
-                ),
-            )
-            await self._call.write(request)
-            result = await self._read_next()
-            return result
-        finally:
-            self._running = False
+        if isinstance(typ, BaseException):  # pragma: no cover
+            exc = typ
+        elif val is not None:
+            exc = val
+        else:  # pragma: no cover
+            exc = typ()
+        return await self._send_and_read(
+            ThrowRequestFrame.for_send(exc, serializer=self._serializer),
+            method_name="athrow",
+        )
 
 
 # public
@@ -549,14 +526,14 @@ class RpcError(Exception):
     server-side bugs, version skew).
 
     **Worker-health exception contract.** Load-balancer strategies
-    treat exception classes from :meth:`WorkerConnection.dispatch`
+    treat exception classes from `WorkerConnection.dispatch`
     as a three-way classification:
 
-    - :class:`TransientRpcError` — worker is hiccupping
+    - `TransientRpcError` — worker is hiccupping
       (``UNAVAILABLE`` / ``DEADLINE_EXCEEDED`` /
       ``RESOURCE_EXHAUSTED``); the strategy should **skip** to
       the next worker without eviction. The worker may recover.
-    - :class:`RpcError` (non-transient) — worker is unhealthy
+    - `RpcError` (non-transient) — worker is unhealthy
       (``INTERNAL``, ``FAILED_PRECONDITION``, malformed Nack
       dump, version skew, etc.); the strategy should **evict**.
       Today's binary policy is "evict on first occurrence";
@@ -566,8 +543,8 @@ class RpcError(Exception):
       encode failures, programming bugs); the strategy
       **propagates** to the caller without touching the pool.
 
-    Strategy authors implementing :class:`LoadBalancerLike` MUST
-    honor this contract: a strategy that catches :class:`Exception`
+    Strategy authors implementing `LoadBalancerLike` MUST
+    honor this contract: a strategy that catches `Exception`
     indiscriminately will silently evict workers on every
     caller-side bug, wiping the pool over time.
     """
@@ -607,7 +584,7 @@ class WorkerConnection:
     """gRPC connection to a worker for task dispatch.
 
     Acquires pooled gRPC channels keyed by ``(target, credentials,
-    options)``.  Each :meth:`dispatch` call obtains a reference-counted
+    options)``.  Each `dispatch` call obtains a reference-counted
     channel from the module-level pool, primes an async generator that
     holds its own reference, then releases the dispatch-scope reference.
     The channel stays alive until the caller finishes consuming the
@@ -616,9 +593,9 @@ class WorkerConnection:
     **Cleanup semantics on cancellation.** Every code path that owns
     an in-flight gRPC call wraps its body in
     ``try / except BaseException`` so that ``asyncio.CancelledError``
-    (a :class:`BaseException` subclass, not :class:`Exception`) still
+    (a `BaseException` subclass, not `Exception`) still
     triggers ``call.cancel()`` before re-raising. The cancel itself
-    is swallowed at :class:`Exception` (not :class:`BaseException`) —
+    is swallowed at `Exception` (not `BaseException`) —
     cleanup-during-cleanup should let ``KeyboardInterrupt`` propagate
     rather than silently drop a process-level signal.
 
@@ -646,7 +623,7 @@ class WorkerConnection:
     :param options:
         Optional channel options controlling gRPC message
         size limits, keepalive, concurrency, and compression.
-        See :class:`ChannelOptions` for defaults.  The
+        See `ChannelOptions` for defaults.  The
         ``max_concurrent_streams`` field sizes the per-channel
         concurrency semaphore.
     """
@@ -683,38 +660,40 @@ class WorkerConnection:
         concurrency limits and applies timeout to the dispatch phase only
         (semaphore acquisition and acknowledgment).
 
-        **Context decode failures (caller-side).**
-        Each response frame may carry a back-propagated wire context
+        **Chain decode failures (caller-side).**
+        Each response frame may carry a back-propagated chain manifest
         that needs decoding before the caller can merge worker-side
-        mutations. Wire context is **ancillary state** under wool's
+        mutations. The chain manifest is **ancillary state** under wool's
         protocol contract: per-entry decode failures emit
-        :class:`wool.ContextDecodeWarning` instances inside
-        :meth:`Context.from_protobuf`. Under the warnings system's
-        default filter these surface once as warnings and decoding
-        returns the partial Context; under a filter that promotes
-        :class:`wool.ContextDecodeWarning` to an error,
-        :meth:`Context.from_protobuf` aggregates the per-entry
-        exceptions into a :class:`BaseExceptionGroup` and raises in
-        place of returning. Caller-side handling after loading the
-        primary signal:
+        `wool.SerializationWarning` instances inside
+        `~wool.runtime.context.manifest.ChainManifest.from_protobuf`.
+        Under the warnings system's default filter these surface once
+        as warnings and decoding returns the partial manifest; under a
+        filter that promotes `wool.SerializationWarning` to an
+        error,
+        `~wool.runtime.context.manifest.ChainManifest.from_protobuf`
+        aggregates the per-entry warnings into a
+        `wool.ChainSerializationError` and raises in place of
+        returning. Caller-side handling after loading the primary
+        signal:
 
-        * On a result frame, if decoding aggregated, the
-          :class:`BaseExceptionGroup` raises in place of the return —
-          strict mode loses the primary value but every decode
-          failure surfaces, not just the first.
-        * On an exception frame, decode failures are attached to
-          the worker exception via PEP 678 ``__notes__`` (visible
-          in tracebacks) and a ``__wool_context_warnings__``
-          attribute (programmatic access), mirroring the worker's
-          encode-side handling. The worker exception class is
-          preserved so the caller's existing
-          ``except RoutineError`` continues to catch without
-          migration to ``except*``. Under the default filter the
-          per-entry warnings emit once during decode and the worker
-          exception raises unwrapped.
+        * On a result frame, the `wool.ChainSerializationError`
+          raises as the primary — strict mode loses the result value
+          but every decode failure surfaces, not just the first. The
+          result cannot be trusted alongside a chain manifest that failed
+          to apply.
+        * On an exception frame, the decode error chains onto the
+          worker exception's ``__context__`` (implicit context, set
+          directly rather than via ``raise ... from``). The worker
+          exception class is preserved so the caller's existing
+          ``except RoutineError`` continues to catch — no migration
+          to ``except*`` required. The decode error remains visible
+          in the traceback through context chaining. Under the
+          default filter the per-entry warnings emit once during
+          decode and the worker exception raises unchained.
 
         :param task:
-            The :class:`Task` instance to dispatch to the worker.
+            The `Task` instance to dispatch to the worker.
         :param timeout:
             Timeout in seconds for semaphore acquisition and task
             acknowledgment. If ``None``, no timeout is applied. Does not
@@ -740,14 +719,15 @@ class WorkerConnection:
         is deserialized from the Nack and re-raised so the caller
         observes the actual failure class rather than an opaque
         protocol error. A malformed Nack payload falls back to
-        :class:`RpcError`.
+        `RpcError`.
 
-        Encode-side failures (e.g. a strict-mode
-        :class:`BaseExceptionGroup` of
-        :class:`wool.ContextDecodeWarning` peers raised by
-        :meth:`Context.to_protobuf` when an unpicklable
-        :class:`wool.ContextVar` value is set) propagate unwrapped:
-        the load-balancer contract treats only :class:`RpcError`
+        Encode-side failures (e.g., a strict-mode
+        `wool.ChainSerializationError` aggregating
+        `wool.SerializationWarning` peers raised by
+        `~wool.runtime.context.chain.Chain.to_protobuf` when
+        an unpicklable `wool.ContextVar` value is set)
+        propagate unwrapped:
+        the load-balancer contract treats only `RpcError`
         instances as worker-health concerns, so a caller-side encode
         failure surfaces directly to the caller rather than evicting
         workers.
@@ -780,7 +760,7 @@ class WorkerConnection:
             # Local dispatch-phase timeout is the same semantic as
             # gRPC DEADLINE_EXCEEDED — request took too long. Wrap
             # so the load-balancer contract only needs to know
-            # about :class:`RpcError`. Worker isn't presumed
+            # about `RpcError`. Worker isn't presumed
             # unhealthy; transient-class makes the LB skip without
             # eviction.
             raise TransientRpcError(
@@ -810,23 +790,22 @@ class WorkerConnection:
     async def _handshake(
         self,
         call: _DispatchCall,
-        wire_task: protocol.Task,
+        task: Task,
     ) -> None:
         """Send the dispatch request and wait for the worker's
         acknowledgement. Caller is responsible for channel-permit
-        and call-cancel lifecycle; :meth:`_execute` pins both on
+        and call-cancel lifecycle; `_execute` pins both on
         its exit stack so any failure here triggers the registered
         cleanup callbacks during unwind.
 
         On a Nack (parse-phase worker rejection), re-raises the
         worker's original exception unchanged. On a malformed
         Nack payload (loads raises, or yields a non-Exception),
-        falls back to :class:`RpcError`.
+        falls back to `RpcError`.
         """
-        request = protocol.Request(
-            task=wire_task,
-            context=context.current_context().to_protobuf(),
-        )
+        request = TaskRequestFrame.for_send(
+            task, serializer=wool.__serializer__
+        ).to_protobuf()
         await call.write(request)
         response = await anext(aiter(call))
         if response.HasField("nack"):
@@ -835,7 +814,7 @@ class WorkerConnection:
             # actual failure class rather than an opaque RpcError.
             # Envelope-level rejections (e.g., protocol-version
             # mismatch) ride gRPC status codes, not Nack — those
-            # land in :meth:`dispatch`'s ``except grpc.RpcError``
+            # land in `dispatch`'s ``except grpc.RpcError``
             # arm instead.
             try:
                 raised = wool.__serializer__.loads(response.nack.exception.dump)
@@ -846,7 +825,7 @@ class WorkerConnection:
             # constructs ``Rejected`` only from
             # ``except Exception``). A worker that ships a
             # non-``Exception`` ``BaseException`` would be a worker
-            # bug; degrade to :class:`RpcError` rather than smuggle
+            # bug; degrade to `RpcError` rather than smuggle
             # cancel/interrupt signals across the wire. A malformed
             # dump (loads raises) lands here too.
             if isinstance(raised, Exception):
@@ -867,13 +846,13 @@ class WorkerConnection:
 
         Pins the channel pool ref, the channel-concurrency permit,
         and the gRPC call's cancel hook on a single
-        :class:`AsyncExitStack`.
+        `AsyncExitStack`.
         Completes the handshake before yielding to the caller; any
         exit path — setup failure, priming-yield ``GeneratorExit``,
         mid-stream exception, natural end of stream — unwinds the
         stack and releases every resource exactly once.
 
-        The stack unwind is driven through :func:`_complete_teardown`
+        The stack unwind is driven through `_complete_teardown`
         so the release callbacks run to completion even when the
         caller task is mid-cancellation — otherwise a pending
         ``CancelledError`` could pre-empt ``AsyncExitStack.__aexit__``
@@ -882,7 +861,6 @@ class WorkerConnection:
         stack = AsyncExitStack()
         try:
             channel = await stack.enter_async_context(_channel_pool.get(key))
-            wire_task = task.to_protobuf()
 
             # Acquire the concurrency permit and complete the
             # handshake under the dispatch-phase timeout.
@@ -909,7 +887,7 @@ class WorkerConnection:
                         pass
 
                 stack.callback(_safe_cancel)
-                await self._handshake(call, wire_task)
+                await self._handshake(call, task)
 
             # Priming yield. All resources are pinned on the stack
             # and the worker has acknowledged the task. The
@@ -947,7 +925,7 @@ class WorkerConnection:
         finally:
             # Shield the stack unwind from caller cancellation so
             # every pooled-resource release callback runs — see
-            # :func:`_complete_teardown`. ``aclose()`` drives each
+            # `_complete_teardown`. ``aclose()`` drives each
             # registered ``__aexit__`` with no exception info; that
             # is equivalent to the implicit ``async with`` exit only
             # because every context manager on this stack is

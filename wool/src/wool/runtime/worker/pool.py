@@ -17,8 +17,8 @@ from typing import overload
 
 from typing_extensions import deprecated
 
-from wool.exception import WoolWarning
-from wool.runtime.context import install_task_factory
+from wool.exceptions import WoolWarning
+from wool.runtime.context.factory import install_task_factory
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
