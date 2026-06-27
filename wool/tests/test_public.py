@@ -1,7 +1,7 @@
 import wool
 
 
-def test_public_symbol_accessibility():
+def test_public_symbol_accessibility_should_import_every_symbol():
     """Test public symbol accessibility from wool package.
 
     Given:
@@ -19,7 +19,7 @@ def test_public_symbol_accessibility():
         assert hasattr(wool, symbol), f"Symbol '{symbol}' not found in wool package"
 
 
-def test_public_api_completeness():
+def test_public_api_completeness_should_match_expected_surface():
     """Test public API completeness of wool package.
 
     Given:
@@ -35,16 +35,19 @@ def test_public_api_completeness():
         "TransientRpcError",
         "UnexpectedResponse",
         "WorkerConnection",
-        "Context",
-        "ContextAlreadyBound",
-        "ContextDecodeWarning",
+        "ChainContention",
+        "ChainSerializationError",
+        "TaskFactoryDisplaced",
         "ContextVar",
         "ContextVarCollision",
         "RuntimeContext",
+        "SerializationError",
+        "SerializationWarning",
         "Token",
-        "copy_context",
-        "create_task",
-        "current_context",
+        "WoolError",
+        "WoolWarning",
+        "install_task_factory",
+        "to_thread",
         "LoadBalancerContextLike",
         "LoadBalancerLike",
         "NoWorkersAvailable",
@@ -82,6 +85,7 @@ def test_public_api_completeness():
         "PredicateFunction",
         "WorkerMetadata",
         "Factory",
+        "UndefinedType",
     }
 
     # Act
@@ -91,7 +95,50 @@ def test_public_api_completeness():
     assert actual_public_api == expected_public_api
 
 
-def test_serializer_singleton_identity():
+def test_removed_symbols_should_not_be_accessible():
+    """Test that symbols removed in this PR are not accessible from wool.
+
+    Given:
+        The wool package after the stdlib-context refactor.
+    When:
+        Checking for the presence of each removed symbol by name.
+    Then:
+        It should not expose any of the five removed symbols as attributes.
+    """
+    # Arrange
+    removed_names = [
+        "Chain",
+        "current_context",
+        "copy_context",
+        "create_task",
+        "ContextAlreadyBound",
+    ]
+
+    # Act & assert
+    for name in removed_names:
+        assert not hasattr(wool, name), (
+            f"Removed symbol '{name}' is still accessible on the wool package"
+        )
+
+
+def test_wool_error_should_subclass_exception_not_runtime_error():
+    """Test WoolError descends from Exception and nothing narrower.
+
+    Given:
+        The wool.WoolError umbrella class.
+    When:
+        Its position in the builtin exception hierarchy is checked.
+    Then:
+        It should subclass Exception directly — not RuntimeError — so
+        Wool-domain signals never match broad handlers written for
+        stdlib runtime errors.
+    """
+    # Arrange, act, & assert
+    assert issubclass(wool.WoolError, Exception)
+    assert not issubclass(wool.WoolError, RuntimeError)
+
+
+def test_serializer_singleton_should_return_same_instance():
     """Test wool.__serializer__ is a stable module-level singleton.
 
     Given:
@@ -105,7 +152,7 @@ def test_serializer_singleton_identity():
     assert wool.__serializer__ is wool.__serializer__
 
 
-def test_serializer_singleton_with_serializer_protocol():
+def test_serializer_singleton_should_satisfy_serializer_protocol():
     """Test wool.__serializer__ satisfies the wool.Serializer protocol.
 
     Given:

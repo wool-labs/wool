@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -20,6 +21,17 @@ from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
 
 
+def make_task(callable):
+    """Build a `wool.Task` wrapping *callable* with a throwaway worker proxy."""
+    return Task(
+        id=uuid4(),
+        callable=callable,
+        args=(),
+        kwargs={},
+        proxy=MagicMock(spec=WorkerProxyLike, id="mock-proxy"),
+    )
+
+
 @st.composite
 def dispatch_side_effects(
     draw, min_size: int, max_size: int, include_transient: bool = True
@@ -28,10 +40,10 @@ def dispatch_side_effects(
 
     Generates a list of failure side effects drawn from the
     load-balancer's worker-health exception contract: only
-    :class:`RpcError` and its transient subclass
-    :class:`TransientRpcError` (the LB's documented catch surface).
-    Exceptions outside this contract — e.g. raw :class:`Exception`,
-    :class:`BaseExceptionGroup`, or local :class:`asyncio.TimeoutError`
+    `RpcError` and its transient subclass
+    `TransientRpcError` (the LB's documented catch surface).
+    Exceptions outside this contract — e.g., raw `Exception`,
+    `BaseExceptionGroup`, or local `asyncio.TimeoutError`
     — propagate past the LB to the caller and are exercised
     separately.
 
@@ -79,11 +91,32 @@ class TestRoundRobinLoadBalancer:
         # Act & assert
         assert isinstance(RoundRobinLoadBalancer(), LoadBalancerLike)
 
+    def test_pickle_round_trip_yields_a_fresh_balancer(self):
+        """Test a RoundRobinLoadBalancer round-trips through pickle.
+
+        Given:
+            A RoundRobinLoadBalancer instance.
+        When:
+            It is pickled and unpickled.
+        Then:
+            The result should be a fresh RoundRobinLoadBalancer — the
+            balancer reduces to its bare class, dropping the unpicklable
+            per-process rotation state and lock.
+        """
+        # Arrange
+        import pickle
+
+        balancer = RoundRobinLoadBalancer()
+
+        # Act
+        restored = pickle.loads(pickle.dumps(balancer))
+
+        # Assert
+        assert isinstance(restored, RoundRobinLoadBalancer)
+        assert restored is not balancer
+
     @pytest.mark.asyncio
-    async def test_dispatch_with_empty_context(
-        self,
-        mocker: MockerFixture,
-    ):
+    async def test_dispatch_with_empty_context(self):
         """Test dispatch raises NoWorkersAvailable with empty
         context.
 
@@ -101,15 +134,7 @@ class TestRoundRobinLoadBalancer:
         async def routine():
             return "Hello world!"
 
-        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
-
-        task = Task(
-            id=uuid4(),
-            callable=routine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        task = make_task(routine)
 
         # Act & assert
         with pytest.raises(NoWorkersAvailable):
@@ -163,15 +188,7 @@ class TestRoundRobinLoadBalancer:
         async def routine():
             return "Hello world!"
 
-        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
-
-        task = Task(
-            id=uuid4(),
-            callable=routine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        task = make_task(routine)
 
         # Track dispatch attempts to verify round-robin behavior
         tasks_dispatched = []
@@ -294,15 +311,7 @@ class TestRoundRobinLoadBalancer:
         async def routine():
             return "Hello world!"
 
-        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
-
-        task = Task(
-            id=uuid4(),
-            callable=routine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        task = make_task(routine)
 
         # Track dispatch attempts to verify round-robin behavior
         tasks_dispatched = []
@@ -410,18 +419,7 @@ class TestRoundRobinLoadBalancer:
         async def routine():
             return "Hello world!"
 
-        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
-
-        tasks = [
-            Task(
-                id=uuid4(),
-                callable=routine,
-                args=(),
-                kwargs={},
-                proxy=mock_proxy,
-            )
-            for _ in range(4)
-        ]
+        tasks = [make_task(routine) for _ in range(4)]
 
         # Act
         results = await asyncio.gather(
@@ -478,22 +476,8 @@ class TestRoundRobinLoadBalancer:
         async def routine():
             return "Hello world!"
 
-        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
-
-        task1 = Task(
-            id=uuid4(),
-            callable=routine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
-        task2 = Task(
-            id=uuid4(),
-            callable=routine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        task1 = make_task(routine)
+        task2 = make_task(routine)
 
         # Act
         await lb.dispatch(task1, context=ctx)
@@ -547,15 +531,7 @@ class TestRoundRobinLoadBalancer:
         async def routine():
             return "Hello world!"
 
-        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
-
-        task = Task(
-            id=uuid4(),
-            callable=routine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        task = make_task(routine)
 
         # Act & assert
         with pytest.raises(NoWorkersAvailable):
@@ -614,15 +590,7 @@ class TestRoundRobinLoadBalancer:
         async def routine():
             return "Hello world!"
 
-        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
-
-        task = Task(
-            id=uuid4(),
-            callable=routine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        task = make_task(routine)
 
         # Act
         result = await lb.dispatch(task, context=ctx)
@@ -640,17 +608,17 @@ class TestRoundRobinLoadBalancer:
 
         Given:
             A load balancer with one worker whose dispatch raises a
-            non-:class:`RpcError` exception (modelling e.g. a strict-
-            mode :class:`BaseExceptionGroup` of
-            :class:`wool.ContextDecodeWarning` peers from
-            :meth:`Context.to_protobuf`, or a programming-error
-            :class:`ValueError`).
+            non-`RpcError` exception (modelling e.g., a strict-
+            mode `BaseExceptionGroup` of
+            `wool.SerializationWarning` peers from
+            `ChainManifest.to_protobuf`, or a programming-error
+            `ValueError`).
         When:
             ``await lb.dispatch(...)`` is called.
         Then:
             The exception should propagate unwrapped to the caller and
             the worker should remain in the context — the LB's
-            worker-health contract treats only :class:`RpcError`
+            worker-health contract treats only `RpcError`
             instances as worker-health concerns, so a fault that has
             nothing to do with worker health does not evict the pool.
         """
@@ -675,14 +643,7 @@ class TestRoundRobinLoadBalancer:
         async def routine():
             return "Hello world!"
 
-        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
-        task = Task(
-            id=uuid4(),
-            callable=routine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        task = make_task(routine)
 
         # Act & assert
         with pytest.raises(BaseExceptionGroup) as exc_info:
@@ -741,18 +702,7 @@ class TestRoundRobinLoadBalancer:
         async def routine():
             return "Hello world!"
 
-        mock_proxy = mocker.MagicMock(spec=WorkerProxyLike, id="mock-proxy")
-
-        tasks = [
-            Task(
-                id=uuid4(),
-                callable=routine,
-                args=(),
-                kwargs={},
-                proxy=mock_proxy,
-            )
-            for _ in range(8)
-        ]
+        tasks = [make_task(routine) for _ in range(8)]
 
         # Act
         dispatch_futures = [
