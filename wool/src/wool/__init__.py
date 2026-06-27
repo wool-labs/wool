@@ -1,22 +1,24 @@
 import contextvars
+from contextvars import Token
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
+from typing import TYPE_CHECKING
 from typing import Final
 
 from tblib import pickling_support
 
-from wool.exception import WoolError
-from wool.exception import WoolWarning
-from wool.runtime.context import Context
-from wool.runtime.context import ContextAlreadyBound
-from wool.runtime.context import ContextDecodeWarning
-from wool.runtime.context import ContextVar
-from wool.runtime.context import ContextVarCollision
-from wool.runtime.context import RuntimeContext
-from wool.runtime.context import Token
-from wool.runtime.context import copy_context
-from wool.runtime.context import create_task
-from wool.runtime.context import current_context
+from wool.exceptions import WoolError
+from wool.exceptions import WoolWarning
+from wool.runtime.context.exceptions import ChainContention
+from wool.runtime.context.exceptions import ChainSerializationError
+from wool.runtime.context.exceptions import ContextVarCollision
+from wool.runtime.context.exceptions import SerializationError
+from wool.runtime.context.exceptions import SerializationWarning
+from wool.runtime.context.exceptions import TaskFactoryDisplaced
+from wool.runtime.context.factory import install_task_factory
+from wool.runtime.context.runtime import RuntimeContext
+from wool.runtime.context.threading import to_thread
+from wool.runtime.context.var import ContextVar
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryEventType
@@ -40,6 +42,7 @@ from wool.runtime.routine.wrapper import routine
 from wool.runtime.serializer import CloudpickleSerializer
 from wool.runtime.serializer import Serializer
 from wool.runtime.typing import Factory
+from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import Worker
@@ -59,6 +62,9 @@ from wool.runtime.worker.service import BackpressureContext
 from wool.runtime.worker.service import BackpressureLike
 from wool.runtime.worker.service import WorkerService
 
+if TYPE_CHECKING:
+    from wool.runtime.context.chain import Chain
+
 pickling_support.install()
 
 try:
@@ -67,6 +73,10 @@ except PackageNotFoundError:
     __version__ = "unknown"
 
 __serializer__: Final[Serializer] = CloudpickleSerializer()
+
+__chain__: Final[contextvars.ContextVar["Chain"]] = contextvars.ContextVar(
+    "__wool_chain__"
+)
 
 __proxy__: Final[contextvars.ContextVar[WorkerProxy | None]] = contextvars.ContextVar(
     "__proxy__", default=None
@@ -89,9 +99,8 @@ __all__ = [
     "BackpressureContext",
     "BackpressureLike",
     "BoundWorkerFactory",
-    "Context",
-    "ContextAlreadyBound",
-    "ContextDecodeWarning",
+    "ChainContention",
+    "ChainSerializationError",
     "ContextVar",
     "ContextVarCollision",
     "Discovery",
@@ -114,11 +123,15 @@ __all__ = [
     "RoundRobinLoadBalancer",
     "RpcError",
     "RuntimeContext",
+    "SerializationError",
+    "SerializationWarning",
     "Serializer",
     "Task",
     "TaskException",
+    "TaskFactoryDisplaced",
     "Token",
     "TransientRpcError",
+    "UndefinedType",
     "UnexpectedResponse",
     "WoolError",
     "WoolWarning",
@@ -131,11 +144,10 @@ __all__ = [
     "WorkerPool",
     "WorkerProxy",
     "WorkerService",
-    "copy_context",
-    "create_task",
-    "current_context",
     "current_task",
+    "install_task_factory",
     "routine",
+    "to_thread",
 ]
 
 for symbol in __all__:

@@ -16,8 +16,8 @@ from hypothesis import strategies as st
 
 import wool
 from wool import protocol
-from wool.runtime.context import RuntimeContext
-from wool.runtime.context import dispatch_timeout
+from wool.runtime.context.runtime import RuntimeContext
+from wool.runtime.context.runtime import dispatch_timeout
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
 from wool.runtime.routine.task import current_task
@@ -85,7 +85,7 @@ class _GuardedProxy(_PicklableProxy):
 class TestWorkerProxyLike:
     """Tests for :py:class:`WorkerProxyLike` protocol conformance."""
 
-    def test_positive_conformance(self, sample_task):
+    def test_positive_conformance_should_instantiate_task(self, sample_task):
         """Test that a conforming proxy is accepted by Task.
 
         Given:
@@ -119,7 +119,7 @@ class TestWorkerProxyLike:
         assert hasattr(task.proxy, "id")
         assert callable(task.proxy.dispatch)
 
-    def test_negative_conformance(self, sample_async_callable):
+    def test_negative_conformance_should_raise(self, sample_async_callable):
         """Test that a non-conforming proxy is rejected by Task.
 
         Given:
@@ -152,7 +152,7 @@ class TestWorkerProxyLike:
             )
 
 
-def test_do_dispatch_with_default_context():
+def test_do_dispatch_should_return_true_when_no_active_context():
     """Test do_dispatch returns True with no active context.
 
     Given:
@@ -166,7 +166,7 @@ def test_do_dispatch_with_default_context():
     assert do_dispatch() is True
 
 
-def test_do_dispatch_with_false_flag():
+def test_do_dispatch_should_return_false_when_inside_false_context():
     """Test do_dispatch returns False inside a False context.
 
     Given:
@@ -183,7 +183,7 @@ def test_do_dispatch_with_false_flag():
     assert do_dispatch()
 
 
-def test_do_dispatch_with_nested_contexts():
+def test_do_dispatch_should_return_innermost_value_when_nested():
     """Test do_dispatch tracks the innermost nested context.
 
     Given:
@@ -205,7 +205,9 @@ def test_do_dispatch_with_nested_contexts():
 
 
 @pytest.mark.asyncio
-async def test_current_task_inside_task_context(sample_task, mock_worker_proxy_cache):
+async def test_current_task_should_return_current_task_when_inside_task_context(
+    sample_task, mock_worker_proxy_cache
+):
     """Test current_task returns the active Task during dispatch.
 
     Given:
@@ -230,7 +232,7 @@ async def test_current_task_inside_task_context(sample_task, mock_worker_proxy_c
     assert result == task
 
 
-def test_current_task_outside_task_context():
+def test_current_task_should_return_none_when_outside_task_context():
     """Test current_task returns None outside any task context.
 
     Given:
@@ -248,7 +250,7 @@ def test_current_task_outside_task_context():
 
 
 @pytest.mark.asyncio
-async def test_current_task_with_nested_task_contexts(sample_task):
+async def test_current_task_should_set_caller_to_outer_task_when_nested(sample_task):
     """Test nested task contexts set caller to the outer task.
 
     Given:
@@ -277,7 +279,9 @@ async def test_current_task_with_nested_task_contexts(sample_task):
 )
 @given(depth=st.integers(min_value=2, max_value=5))
 @pytest.mark.asyncio
-async def test_current_task_with_variable_nesting_depth(depth, sample_task):
+async def test_current_task_should_track_caller_when_variable_nesting_depth(
+    depth, sample_task
+):
     """Test nested task context tracking at variable depth.
 
     Given:
@@ -318,7 +322,9 @@ class TestTask:
     """Tests for :py:class:`Task`."""
 
     @pytest.mark.asyncio
-    async def test___post_init___inside_task_context(self, sample_task):
+    async def test___post_init___should_set_caller_when_inside_task_context(
+        self, sample_task
+    ):
         """Test post-init sets caller inside a task context.
 
         Given:
@@ -339,7 +345,9 @@ class TestTask:
         # Assert
         assert inner_task.caller == outer_task.id
 
-    def test___post_init___outside_task_context(self, sample_task):
+    def test___post_init___should_leave_caller_none_when_outside_task_context(
+        self, sample_task
+    ):
         """Test post-init leaves caller as None without context.
 
         Given:
@@ -355,7 +363,9 @@ class TestTask:
         # Assert
         assert task.caller is None
 
-    def test___post_init___without_explicit_context(self, sample_async_callable):
+    def test___post_init___should_capture_caller_runtime_context(
+        self, sample_async_callable
+    ):
         """Test post-init auto-captures the caller's RuntimeContext.
 
         Given:
@@ -388,7 +398,9 @@ class TestTask:
             assert dispatch_timeout.get() == 1.25
 
     @pytest.mark.asyncio
-    async def test___enter___with_coroutine_callable(self, sample_task):
+    async def test___enter___should_bind_current_task_when_coroutine_callable(
+        self, sample_task
+    ):
         """Test __enter__ returns a callable for coroutine tasks.
 
         Given:
@@ -408,7 +420,9 @@ class TestTask:
             assert current_task() is task
 
     @pytest.mark.asyncio
-    async def test___enter___with_async_generator(self, sample_task):
+    async def test___enter___should_bind_current_task_when_async_generator(
+        self, sample_task
+    ):
         """Test __enter__ binds ``_current_task`` for an async-gen task.
 
         Given:
@@ -432,7 +446,7 @@ class TestTask:
             assert current_task() is task
 
     @pytest.mark.asyncio
-    async def test___exit___without_exception(self, sample_task):
+    async def test___exit___should_exit_cleanly_when_no_exception(self, sample_task):
         """Test __exit__ completes cleanly without exceptions.
 
         Given:
@@ -449,8 +463,55 @@ class TestTask:
         with task:
             pass
 
+    def test___enter___should_raise_when_already_active(self, sample_task):
+        """Test re-entering an already-active Task raises.
+
+        Given:
+            A :py:class:`Task` currently inside an active ``with``
+            block.
+        When:
+            The same instance is entered as a context manager a
+            second time.
+        Then:
+            It should raise RuntimeError — Task instances are
+            block-scoped and single-use as context managers.
+        """
+        # Arrange
+        task = sample_task()
+
+        # Act & assert
+        with task:
+            with pytest.raises(RuntimeError, match="already active"):
+                with task:
+                    pass
+
+    def test___exit___should_return_false_when_never_entered(self, sample_task):
+        """Test __exit__ on a never-entered Task is a no-op.
+
+        Given:
+            A :py:class:`Task` whose ``__enter__`` was never invoked.
+        When:
+            ``__exit__`` is invoked directly with no exception
+            propagating.
+        Then:
+            It should return False (exceptions propagate) and leave
+            state untouched — symmetric with ``__enter__``'s double-
+            entry guard so misuse is well-defined rather than
+            crashing on the underlying ``Token.reset(None)``.
+        """
+        # Arrange
+        task = sample_task()
+
+        # Act
+        # No ``with`` idiom can invoke ``__exit__`` without a matching
+        # ``__enter__``, so the misuse guard is exercised by a direct call.
+        result = task.__exit__(None, None, None)
+
+        # Assert
+        assert result is False
+
     @pytest.mark.asyncio
-    async def test___exit___with_value_error(self, sample_task):
+    async def test___exit___should_capture_exception_when_value_error(self, sample_task):
         """Test __exit__ captures ValueError as TaskException.
 
         Given:
@@ -479,7 +540,9 @@ class TestTask:
         assert any("test error" in line for line in task.exception.traceback)
 
     @pytest.mark.asyncio
-    async def test___exit___with_runtime_error(self, sample_task):
+    async def test___exit___should_capture_exception_when_runtime_error(
+        self, sample_task
+    ):
         """Test __exit__ captures RuntimeError as TaskException.
 
         Given:
@@ -516,7 +579,7 @@ class TestTask:
         tag=st.one_of(st.none(), st.text(min_size=1, max_size=100)),
     )
     @pytest.mark.asyncio
-    async def test_to_protobuf_with_picklable_proxy(
+    async def test_to_protobuf_should_preserve_all_attributes_when_round_tripped(
         self,
         task_id,
         timeout,
@@ -568,7 +631,7 @@ class TestTask:
         assert deserialized_task.timeout == original_task.timeout
         assert deserialized_task.tag == original_task.tag
 
-    def test_to_protobuf_round_trip_produces_distinct_objects(self):
+    def test_to_protobuf_should_produce_distinct_objects_when_round_tripped(self):
         """Test the protobuf round-trip returns independent copies.
 
         Given:
@@ -607,7 +670,7 @@ class TestTask:
         assert restored.kwargs is not original.kwargs
         assert restored.proxy is not original.proxy
 
-    def test_to_protobuf_round_trip_copies_mutable_args(self):
+    def test_to_protobuf_should_copy_mutable_args_when_round_tripped(self):
         """Test the protobuf round-trip yields independent mutable args.
 
         Given:
@@ -641,7 +704,7 @@ class TestTask:
         assert restored.args[0] == [1, 2, 3, 4]
         assert original_list == [1, 2, 3]
 
-    def test_to_protobuf_with_uncloudpicklable_arg_fails(self, picklable_proxy):
+    def test_to_protobuf_should_raise_when_arg_uncloudpicklable(self, picklable_proxy):
         """Test to_protobuf raises for a non-cloudpicklable positional arg.
 
         Given:
@@ -669,7 +732,7 @@ class TestTask:
         with pytest.raises((TypeError, pickle.PicklingError)):
             task.to_protobuf()
 
-    def test_to_protobuf_with_uncloudpicklable_kwarg_fails(self, picklable_proxy):
+    def test_to_protobuf_should_raise_when_kwarg_uncloudpicklable(self, picklable_proxy):
         """Test to_protobuf raises for a non-cloudpicklable keyword arg.
 
         Given:
@@ -697,7 +760,7 @@ class TestTask:
         with pytest.raises((TypeError, pickle.PicklingError)):
             task.to_protobuf()
 
-    def test_to_protobuf_omits_serializer_field(
+    def test_to_protobuf_should_omit_serializer_field(
         self, sample_async_callable, picklable_proxy
     ):
         """Test to_protobuf produces a message without a serializer field.
@@ -732,7 +795,7 @@ class TestTask:
 
     @settings(max_examples=50, deadline=None)
     @given(payload=_arbitrary_payloads())
-    def test_to_protobuf_round_trip_copies_arbitrary_payloads(self, payload):
+    def test_to_protobuf_should_copy_arbitrary_payloads(self, payload):
         """Test the protobuf round-trip copies arbitrary nested payloads.
 
         Given:
@@ -777,7 +840,7 @@ class TestTask:
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @given(value_count=st.integers(min_value=0, max_value=10))
-    async def test_dispatch_with_async_generator(
+    async def test_dispatch_should_yield_all_values_when_async_generator(
         self,
         value_count,
         mock_worker_proxy_cache,
@@ -818,7 +881,7 @@ class TestTask:
         assert results == list(range(value_count))
 
     @pytest.mark.asyncio
-    async def test_from_protobuf_all_fields(
+    async def test_from_protobuf_should_deserialize_all_fields(
         self, sample_async_callable, picklable_proxy
     ):
         """Test from_protobuf deserializes all fields correctly.
@@ -865,7 +928,7 @@ class TestTask:
         assert task.tag == "test_tag"
 
     @pytest.mark.asyncio
-    async def test_from_protobuf_empty_optionals(
+    async def test_from_protobuf_should_default_optionals_when_empty(
         self, sample_async_callable, picklable_proxy
     ):
         """Test from_protobuf handles empty optional fields.
@@ -905,7 +968,7 @@ class TestTask:
         assert task.tag is None
 
     @pytest.mark.asyncio
-    async def test_from_protobuf_with_runtime_context(
+    async def test_from_protobuf_should_read_runtime_context(
         self, sample_async_callable, picklable_proxy
     ):
         """Test from_protobuf reads the RuntimeContext submessage.
@@ -944,7 +1007,7 @@ class TestTask:
             assert dispatch_timeout.get() == 12.5
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_dispatch_timeout_on_coroutine(
+    async def test_dispatch_should_apply_dispatch_timeout_when_coroutine(
         self, mock_worker_proxy_cache
     ):
         """Test coroutine dispatch applies context dispatch_timeout.
@@ -982,7 +1045,7 @@ class TestTask:
         assert captured == [7.5]
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_dispatch_timeout_on_async_generator(
+    async def test_dispatch_should_apply_dispatch_timeout_each_iteration(
         self, mock_worker_proxy_cache
     ):
         """Test async-gen dispatch applies context dispatch_timeout each iteration.
@@ -1023,7 +1086,9 @@ class TestTask:
         # Assert
         assert captured == [3.0, 3.0]
 
-    def test_to_protobuf_all_fields(self, sample_async_callable, picklable_proxy):
+    def test_to_protobuf_should_serialize_all_fields(
+        self, sample_async_callable, picklable_proxy
+    ):
         """Test to_protobuf serializes all fields correctly.
 
         Given:
@@ -1066,7 +1131,9 @@ class TestTask:
         assert task_msg.timeout == 30
         assert task_msg.tag == "test_tag"
 
-    def test_to_protobuf_none_optionals(self, sample_async_callable, picklable_proxy):
+    def test_to_protobuf_should_serialize_defaults_when_optionals_none(
+        self, sample_async_callable, picklable_proxy
+    ):
         """Test to_protobuf serializes None optionals as defaults.
 
         Given:
@@ -1098,7 +1165,7 @@ class TestTask:
         assert task_msg.timeout == 0
         assert task_msg.tag == ""
 
-    def test_to_protobuf_with_version_field(
+    def test_to_protobuf_should_include_version(
         self, sample_async_callable, picklable_proxy
     ):
         """Test to_protobuf includes the protocol version.
@@ -1133,7 +1200,7 @@ class TestTask:
     @given(
         version=st.from_regex(r"\d{1,3}\.\d{1,3}(rc\d{1,3}|\.\d{1,3})", fullmatch=True),
     )
-    def test_from_protobuf_with_version_roundtrip(self, version):
+    def test_from_protobuf_should_preserve_version_when_round_tripped(self, version):
         """Test protobuf round-trip preserves the version field.
 
         Given:
@@ -1172,7 +1239,7 @@ class TestTask:
         assert parsed.version == version
 
     @pytest.mark.asyncio
-    async def test_dispatch_successful_execution(
+    async def test_dispatch_should_return_result(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1205,7 +1272,7 @@ class TestTask:
         assert result == 8
 
     @pytest.mark.asyncio
-    async def test_dispatch_without_proxy_pool_raises_error(self, sample_task):
+    async def test_dispatch_should_raise_when_no_proxy_pool(self, sample_task):
         """Test dispatch raises RuntimeError without a proxy pool.
 
         Given:
@@ -1228,7 +1295,7 @@ class TestTask:
             async with routine_scope(task) as routine:
                 await cast(Coroutine, routine)
 
-    def test_to_protobuf_with_unpicklable_callable_fails(self, picklable_proxy):
+    def test_to_protobuf_should_raise_when_callable_unpicklable(self, picklable_proxy):
         """Test to_protobuf fails with an unpicklable callable.
 
         Given:
@@ -1260,7 +1327,7 @@ class TestTask:
             task.to_protobuf()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_async_generator_callable(
+    async def test_dispatch_should_yield_all_values_when_async_generator_callable(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1294,7 +1361,7 @@ class TestTask:
         assert results == ["value_0", "value_1", "value_2"]
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_coroutine_callable(
+    async def test_dispatch_should_return_result_when_coroutine_callable(
         self,
         sample_task: Callable[..., Task],
         mock_worker_proxy_cache,
@@ -1324,7 +1391,7 @@ class TestTask:
         assert result == "coroutine_result"
 
     @pytest.mark.asyncio
-    async def test_routine_scope_with_invalid_callable(
+    async def test_routine_scope_should_raise_when_invalid_callable(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1355,7 +1422,7 @@ class TestTask:
                 pass
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_without_proxy_pool_raises_error(
+    async def test_dispatch_should_raise_when_async_generator_no_proxy_pool(
         self,
         sample_task,
     ):
@@ -1387,7 +1454,7 @@ class TestTask:
                     pass
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_raises_during_iteration(
+    async def test_dispatch_should_propagate_exception_when_generator_raises(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1421,7 +1488,7 @@ class TestTask:
         assert results == ["first"]
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_early_termination(
+    async def test_dispatch_should_stop_when_early_break(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1455,7 +1522,7 @@ class TestTask:
         assert results == ["value_0", "value_1"]
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_multiple_values(
+    async def test_dispatch_should_yield_multiple_values_in_order(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1489,7 +1556,7 @@ class TestTask:
         assert results == [0, 10, 20, 30, 40]
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_empty(
+    async def test_dispatch_should_yield_nothing_when_generator_empty(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1522,7 +1589,7 @@ class TestTask:
         # Assert
         assert results == []
 
-    def test_to_protobuf_with_guarded_proxy(self, sample_async_callable):
+    def test_to_protobuf_should_serialize_guarded_proxy(self, sample_async_callable):
         """Test to_protobuf serializes a guarded proxy via wool.__serializer__.
 
         Given:
@@ -1551,7 +1618,7 @@ class TestTask:
         assert task_msg.proxy
         assert task_msg.proxy_id == str(proxy.id)
 
-    def test_from_protobuf_with_guarded_proxy(self, sample_async_callable):
+    def test_from_protobuf_should_restore_guarded_proxy(self, sample_async_callable):
         """Test the to_protobuf / from_protobuf round-trip with a guarded proxy.
 
         Given:
@@ -1581,7 +1648,7 @@ class TestTask:
         assert isinstance(restored.proxy, _PicklableProxy)
         assert restored.proxy.id == proxy.id
 
-    def test_from_protobuf_with_cloudpickle_fields(
+    def test_from_protobuf_should_deserialize_cloudpickle_fields(
         self, sample_async_callable, picklable_proxy
     ):
         """Test from_protobuf deserializes cloudpickle-encoded payload fields.
@@ -1619,7 +1686,7 @@ class TestTask:
         assert task.args == args
         assert task.kwargs == kwargs
 
-    def test_from_protobuf_with_invalid_payload_fails(self, picklable_proxy):
+    def test_from_protobuf_should_raise_when_invalid_payload(self, picklable_proxy):
         """Test from_protobuf raises for a non-cloudpickle payload.
 
         Given:
@@ -1654,7 +1721,7 @@ class TestRoutineScope:
     """Tests for :func:`wool.runtime.routine.task.routine_scope`."""
 
     @pytest.mark.asyncio
-    async def test_routine_scope_with_null_runtime_context_asserts(
+    async def test_routine_scope_should_raise_when_null_runtime_context(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test :func:`routine_scope` asserts a non-None runtime context.
@@ -1688,7 +1755,7 @@ class TestRoutineScope:
                 pass
 
     @pytest.mark.asyncio
-    async def test_routine_scope_without_proxy_pool(self, sample_task):
+    async def test_routine_scope_should_raise_when_no_proxy_pool(self, sample_task):
         """Test routine_scope raises when wool.__proxy_pool__ is unset.
 
         Given:
@@ -1711,7 +1778,7 @@ class TestRoutineScope:
                 pass
 
     @pytest.mark.asyncio
-    async def test_routine_scope_with_coroutine_callable(
+    async def test_routine_scope_should_yield_coroutine_when_coroutine_callable(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope yields an awaitable coroutine for coroutine tasks.
@@ -1742,7 +1809,7 @@ class TestRoutineScope:
         assert result == "coro_result"
 
     @pytest.mark.asyncio
-    async def test_routine_scope_with_async_generator_callable(
+    async def test_routine_scope_should_yield_async_generator_when_generator_callable(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope yields an iterable async generator for stream tasks.
@@ -1776,7 +1843,7 @@ class TestRoutineScope:
         assert results == [1, 2, 3]
 
     @pytest.mark.asyncio
-    async def test_routine_scope_establishes_task_scope(
+    async def test_routine_scope_should_bind_task_scope(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope binds current_task and disables dispatch routing.
@@ -1813,7 +1880,7 @@ class TestRoutineScope:
         assert do_dispatch() is outer_dispatch_before
 
     @pytest.mark.asyncio
-    async def test_routine_scope_resets_proxy_token_on_exit(
+    async def test_routine_scope_should_restore_proxy_on_exit(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope restores wool.__proxy__ on exit.
@@ -1848,7 +1915,7 @@ class TestRoutineScope:
         assert wool.__proxy__.get() is None
 
     @pytest.mark.asyncio
-    async def test_routine_scope_applies_runtime_context(
+    async def test_routine_scope_should_apply_runtime_context(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope applies the Task's RuntimeContext.
@@ -1882,7 +1949,7 @@ class TestRoutineScope:
         assert observed["dispatch_timeout"] == 4.5
 
     @pytest.mark.asyncio
-    async def test_routine_scope_aclose_unconsumed_async_gen(
+    async def test_routine_scope_should_aclose_when_async_gen_unconsumed(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope acloses an async generator never iterated.
@@ -1913,7 +1980,7 @@ class TestRoutineScope:
         assert captured_routine.ag_frame is None
 
     @pytest.mark.asyncio
-    async def test_routine_scope_swallows_generator_exit_during_aclose(
+    async def test_routine_scope_should_exit_cleanly_when_routine_reraises_ge(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope exits cleanly when the routine reacts to GeneratorExit.
@@ -1948,7 +2015,7 @@ class TestRoutineScope:
         assert routine.ag_frame is None
 
     @pytest.mark.asyncio
-    async def test_routine_scope_propagates_internal_cancelled_during_aclose(
+    async def test_routine_scope_should_propagate_cancellation_when_routine_internal(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope propagates routine-internal CancelledError on aclose.
@@ -1958,7 +2025,7 @@ class TestRoutineScope:
         :class:`asyncio.CancelledError` during its cleanup, the
         exception propagates from :func:`routine_scope`'s exit handler
         unchanged. Paired stdlib parity test
-        :meth:`test_stdlib_aclose_propagates_internal_cancelled`
+        :meth:`test_stdlib_aclose_should_propagate_internal_cancelled`
         pins the stdlib behavior so a future stdlib change
         signals that wool's parity needs revisiting.
 
@@ -1995,7 +2062,7 @@ class TestRoutineScope:
                 await it.__anext__()
 
     @pytest.mark.asyncio
-    async def test_routine_scope_propagates_external_cancellation_during_aclose(
+    async def test_routine_scope_should_propagate_cancellation_when_externally_cancelled(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope re-raises CancelledError when externally cancelled.
@@ -2045,7 +2112,7 @@ class TestRoutineScope:
             await wrapped
 
     @pytest.mark.asyncio
-    async def test_routine_scope_propagates_runtime_error_when_routine_yields_during_ge(
+    async def test_routine_scope_should_propagate_runtime_error_when_yields_during_ge(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope propagates the synthesized RuntimeError when
@@ -2057,7 +2124,7 @@ class TestRoutineScope:
         ``RuntimeError("async generator ignored GeneratorExit")``
         from ``aclose``. Wool propagates this unchanged. Paired
         stdlib parity test
-        :meth:`test_stdlib_aclose_raises_runtime_error_when_yielding_during_ge`
+        :meth:`test_stdlib_aclose_should_raise_runtime_error_when_yields_during_ge`
         pins the stdlib behavior.
 
         Given:
@@ -2088,7 +2155,7 @@ class TestRoutineScope:
                 await it.__anext__()
 
     @pytest.mark.asyncio
-    async def test_routine_scope_with_coroutine_does_not_aclose(
+    async def test_routine_scope_should_not_aclose_when_coroutine(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope does not invoke aclose teardown for coroutines.
@@ -2128,7 +2195,7 @@ class TestRoutineScope:
         assert events == ["enter", "finally"]
 
     @pytest.mark.asyncio
-    async def test_routine_scope_propagates_caller_body_exception(
+    async def test_routine_scope_should_propagate_exception_when_caller_body_raises(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope propagates exceptions raised in the caller body.
@@ -2167,7 +2234,7 @@ class TestRoutineScope:
         assert aexit_mock.await_count >= 1
 
     @pytest.mark.asyncio
-    async def test_routine_scope_propagates_routine_exception_transparently(
+    async def test_routine_scope_should_propagate_exception_when_routine_raises(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope propagates routine-raised exceptions unchanged.
@@ -2199,10 +2266,83 @@ class TestRoutineScope:
         assert results == [1]
 
 
+class TestAsyncGenAcloseParity:
+    """Stdlib parity pins for ``async-generator.aclose`` semantics.
+
+    These tests assert observations about CPython's own
+    ``await agen.aclose()`` behavior. They are intentionally NOT tests
+    of any wool code — they pin stdlib semantics so that a future
+    change in CPython's async-generator close protocol fails here
+    first, signaling that the paired :class:`TestRoutineScope`
+    regression tests (and :func:`routine_scope`'s contract) may need
+    to be revisited.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stdlib_aclose_should_propagate_internal_cancelled(self):
+        """Test ``aclose`` propagates internal CancelledError.
+
+        Given:
+            A direct ``asyncio`` async generator that raises
+            :class:`asyncio.CancelledError` during aclose unwind
+            while the awaiting task's ``cancelling()`` count is 0.
+        When:
+            ``await agen.aclose()`` is invoked after one iteration.
+        Then:
+            It should raise :class:`asyncio.CancelledError`.
+        """
+
+        # Arrange
+        async def naughty_gen():
+            try:
+                yield 1
+                yield 2
+            except GeneratorExit:
+                raise asyncio.CancelledError()
+
+        agen = naughty_gen()
+        await agen.__anext__()
+
+        # Act & assert
+        with pytest.raises(asyncio.CancelledError):
+            await agen.aclose()
+
+    @pytest.mark.asyncio
+    async def test_stdlib_aclose_should_raise_runtime_error_when_yields_during_ge(self):
+        """Test ``aclose`` raises RuntimeError when the routine yields
+        during ``GeneratorExit``.
+
+        Given:
+            A direct ``asyncio`` async generator that catches
+            :class:`GeneratorExit` and yields a value (a PEP 525
+            protocol violation).
+        When:
+            ``await agen.aclose()`` is invoked after one iteration.
+        Then:
+            It should raise
+            ``RuntimeError("async generator ignored GeneratorExit")``.
+        """
+
+        # Arrange
+        async def yielding_gen():
+            try:
+                yield 1
+                yield 2
+            except GeneratorExit:
+                yield "rude"
+
+        agen = yielding_gen()
+        await agen.__anext__()
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="ignored GeneratorExit"):
+            await agen.aclose()
+
+
 class TestRuntimeContext:
     """Tests for :py:class:`RuntimeContext`."""
 
-    def test___enter___and___exit___apply_inner_and_restore_outer_dispatch_timeout(self):
+    def test___enter___should_apply_inner_and_restore_outer_dispatch_timeout(self):
         """Test RuntimeContext sets and restores dispatch_timeout.
 
         Given:
@@ -2224,7 +2364,7 @@ class TestRuntimeContext:
         finally:
             dispatch_timeout.reset(outer_token)
 
-    def test___enter___when_dispatch_timeout_unset(self):
+    def test___enter___should_not_touch_dispatch_timeout_when_unset(self):
         """Test an empty RuntimeContext does not touch dispatch_timeout.
 
         Given:
@@ -2245,7 +2385,7 @@ class TestRuntimeContext:
         finally:
             dispatch_timeout.reset(outer_token)
 
-    def test_get_current_with_dispatch_timeout_set(self):
+    def test_get_current_should_snapshot_dispatch_timeout(self):
         """Test get_current snapshots the current dispatch_timeout.
 
         Given:
@@ -2268,7 +2408,7 @@ class TestRuntimeContext:
         with captured:
             assert dispatch_timeout.get() == 4.0
 
-    def test_to_protobuf_with_dispatch_timeout_set(self):
+    def test_to_protobuf_should_serialize_dispatch_timeout(self):
         """Test to_protobuf serializes dispatch_timeout on the wire.
 
         Given:
@@ -2286,7 +2426,7 @@ class TestRuntimeContext:
         assert pb.HasField("dispatch_timeout")
         assert pb.dispatch_timeout == 6.0
 
-    def test_to_protobuf_when_dispatch_timeout_unset(self):
+    def test_to_protobuf_should_fall_back_to_current_var_when_unset(self):
         """Test to_protobuf falls back to the current var when unset.
 
         Given:
@@ -2310,7 +2450,7 @@ class TestRuntimeContext:
         assert pb.HasField("dispatch_timeout")
         assert pb.dispatch_timeout == 9.25
 
-    def test_to_protobuf_without_value(self):
+    def test_to_protobuf_should_omit_dispatch_timeout_when_none(self):
         """Test to_protobuf omits dispatch_timeout when it is None.
 
         Given:
@@ -2326,7 +2466,7 @@ class TestRuntimeContext:
         # Assert
         assert not pb.HasField("dispatch_timeout")
 
-    def test_from_protobuf_roundtrip(self):
+    def test_from_protobuf_should_reconstruct_runtime_context(self):
         """Test from_protobuf reconstructs a usable RuntimeContext.
 
         Given:
@@ -2351,7 +2491,7 @@ class TestRuntimeContext:
 class TestTaskException:
     """Tests for :py:class:`TaskException`."""
 
-    def test___init___with_type_and_traceback(self):
+    def test___init___should_store_type_and_traceback(self):
         """Test TaskException stores type and traceback correctly.
 
         Given:

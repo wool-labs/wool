@@ -263,7 +263,7 @@ class TestResourcePool:
 
     @pytest.mark.asyncio
     @given(setup=setup())
-    async def test_get_returns_resource_instance(self, setup):
+    async def test_get_should_return_resource_instance(self, setup):
         """Test that get returns a Resource instance.
 
         Given:
@@ -283,8 +283,8 @@ class TestResourcePool:
         assert isinstance(resource_acquisition, Resource)
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
-    async def test_release_decrements_reference_counts(self):
+    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
+    async def test_release_should_decrement_reference_counts(self):
         """Test releasing resources decrements reference counts properly.
 
         Given:
@@ -323,8 +323,12 @@ class TestResourcePool:
         assert pool.stats.referenced_entries == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_release_decrements_reference_counts")
-    async def test_release_nonexistent_key_raises_error(self, counting_factory):
+    @pytest.mark.dependency(
+        "TestResourcePool::test_release_should_decrement_reference_counts"
+    )
+    async def test_release_should_not_affect_existing_resources_when_key_nonexistent(
+        self, counting_factory
+    ):
         """Test releasing nonexistent key raises KeyError.
 
         Given:
@@ -355,8 +359,10 @@ class TestResourcePool:
         assert pool.stats.referenced_entries == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_release_decrements_reference_counts")
-    async def test_release_zero_reference_count_raises_error(self):
+    @pytest.mark.dependency(
+        "TestResourcePool::test_release_should_decrement_reference_counts"
+    )
+    async def test_release_should_raise_value_error_when_zero_reference_count(self):
         """Test releasing key with zero ref count raises ValueError.
 
         Given:
@@ -392,8 +398,148 @@ class TestResourcePool:
             await ttl_pool.release(unique_key)
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
-    async def test_clear_finalizes_all_resources(self):
+    async def test_finalizer_should_still_evict_entry_when_raising_base_exception(self):
+        """Test a cancelled finalizer still evicts the cache entry.
+
+        Given:
+            A ``ttl=0`` pool whose finalizer raises
+            ``CancelledError`` — a ``BaseException``, not an
+            ``Exception`` — on its first call, modelling cleanup that
+            runs under a cancelled teardown
+        When:
+            A resource is acquired and released, driving immediate
+            cleanup whose finalizer raises
+        Then:
+            The ``CancelledError`` propagates, but the torn-down entry
+            is still evicted, so the next acquire is a cache miss that
+            builds a fresh resource via the factory rather than handing
+            back the finalized one
+        """
+
+        # Arrange
+        finalizer_calls = {"count": 0}
+
+        async def finalizer(obj):
+            finalizer_calls["count"] += 1
+            if finalizer_calls["count"] == 1:
+                # First cleanup runs under cancellation.
+                raise asyncio.CancelledError()
+
+        factory = Mock(
+            side_effect=[
+                SimpleNamespace(name="first"),
+                SimpleNamespace(name="second"),
+            ]
+        )
+        pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=0)
+
+        # Act
+        # Acquire then release: rc -> 0 drives immediate cleanup, whose
+        # finalizer raises CancelledError out of the release.
+        with pytest.raises(asyncio.CancelledError):
+            async with pool.get("key"):
+                pass
+
+        # Assert
+        # The finalized resource must not survive in the cache.
+        assert pool.stats.total_entries == 0
+        # The next acquire is therefore a miss that builds a fresh
+        # resource, never the torn-down one.
+        async with pool.get("key") as resource:
+            assert resource.name == "second"
+        assert factory.call_count == 2
+
+    def test_acquire_should_cancel_cross_loop_cleanup_task_threadsafe(self):
+        """Test acquire cancels a foreign-loop cleanup task cross-loop.
+
+        Given:
+            A pool whose cached entry has a pending TTL cleanup task
+            scheduled on one event loop, which has since closed.
+        When:
+            The same key is re-acquired from a different event loop.
+        Then:
+            The cleanup should be cancelled on its own (now-closed) loop
+            via call_soon_threadsafe rather than awaited cross-loop, the
+            resulting RuntimeError should be swallowed, the cached object
+            should be returned, and the pending cleanup should be
+            cleared.
+        """
+        # Arrange
+        pool = ResourcePool(factory=Mock(return_value="obj"), ttl=60)
+
+        # Acquire and release on a dedicated loop so a TTL cleanup task is
+        # scheduled and bound to that loop, then close it. The pending task is
+        # held by reference so it survives until the cross-loop cancel runs.
+        foreign_loop = asyncio.new_event_loop()
+
+        async def schedule_cleanup_on_foreign_loop():
+            async with pool.get("key"):
+                pass
+
+        foreign_loop.run_until_complete(schedule_cleanup_on_foreign_loop())
+        pending_cleanup = pool.pending_cleanup["key"]
+        foreign_loop.close()
+
+        acquiring_loop = asyncio.new_event_loop()
+        try:
+            # Act
+            acquired = acquiring_loop.run_until_complete(pool.acquire("key"))
+
+            # Assert
+            assert acquired == "obj"
+            assert pool.pending_cleanup == {}
+        finally:
+            acquiring_loop.close()
+            del pending_cleanup
+
+    def test_clear_should_cancel_cross_loop_cleanup_task_threadsafe(self):
+        """Test clear cancels a foreign-loop cleanup task cross-loop.
+
+        Given:
+            A pool whose cached entry has a pending TTL cleanup task
+            scheduled on one event loop, which has since closed.
+        When:
+            The key is cleared from a different event loop.
+        Then:
+            The cleanup should be cancelled on its own (now-closed) loop
+            via call_soon_threadsafe, the resulting RuntimeError should be
+            swallowed, the finalizer should still run, and the entry
+            should be evicted.
+        """
+        # Arrange
+        finalizer = AsyncMock()
+        pool = ResourcePool(
+            factory=Mock(return_value="obj"), finalizer=finalizer, ttl=60
+        )
+
+        # Acquire and release on a dedicated loop so a TTL cleanup task is
+        # scheduled and bound to that loop, then close it. The pending task is
+        # held by reference so it survives until the cross-loop cancel runs.
+        foreign_loop = asyncio.new_event_loop()
+
+        async def schedule_cleanup_on_foreign_loop():
+            async with pool.get("key"):
+                pass
+
+        foreign_loop.run_until_complete(schedule_cleanup_on_foreign_loop())
+        pending_cleanup = pool.pending_cleanup["key"]
+        foreign_loop.close()
+
+        clearing_loop = asyncio.new_event_loop()
+        try:
+            # Act
+            clearing_loop.run_until_complete(pool.clear("key"))
+
+            # Assert
+            finalizer.assert_awaited_once_with("obj")
+            assert pool.stats.total_entries == 0
+        finally:
+            clearing_loop.close()
+            del pending_cleanup
+
+    @pytest.mark.asyncio
+    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
+    async def test_clear_should_finalize_all_resources(self):
         """Test clearing the pool calls finalizer on all resources.
 
         Given:
@@ -431,8 +577,10 @@ class TestResourcePool:
         assert mock_finalizer.call_count == 3
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
-    async def test_clear_key_removes_specific_resource(self, mock_finalizer):
+    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
+    async def test_clear_should_remove_specific_resource_when_key_given(
+        self, mock_finalizer
+    ):
         """Test clearing a specific key from the pool.
 
         Given:
@@ -477,7 +625,7 @@ class TestResourcePool:
         mock_finalizer.assert_called_once_with(mock_resource1)
 
     @pytest.mark.asyncio
-    async def test_clear_nonexistent_key_raises_error(self):
+    async def test_clear_should_raise_key_error_when_key_nonexistent(self):
         """Test clearing a non-existent key raises KeyError.
 
         Given:
@@ -513,8 +661,8 @@ class TestResourcePool:
         mock_finalizer.assert_not_called()
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
-    async def test_ttl_cleanup_schedules_resource_removal(self):
+    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
+    async def test_ttl_cleanup_should_schedule_resource_removal(self):
         """Test TTL-based cleanup schedules and executes properly.
 
         Given:
@@ -573,8 +721,8 @@ class TestResourcePool:
         mock_finalizer.assert_called_once_with(mock_resource)
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
-    async def test_ttl_cleanup_cancelled_on_reacquire(self):
+    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
+    async def test_ttl_cleanup_should_be_cancelled_when_reacquired(self):
         """Test TTL cleanup is cancelled when resource is reacquired.
 
         Given:
@@ -619,8 +767,8 @@ class TestResourcePool:
         assert pool.stats.referenced_entries == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
-    async def test_stats_returns_accurate_counts(self):
+    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
+    async def test_stats_should_return_accurate_counts(self):
         """Test stats method returns accurate cache statistics.
 
         Given:
@@ -656,8 +804,8 @@ class TestResourcePool:
                     assert stats.pending_cleanup == 0  # None scheduled yet
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_returns_resource_instance")
-    async def test_async_context_manager_clears_resources(self):
+    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
+    async def test_async_context_manager_should_clear_resources(self):
         """Test ResourcePool as async context manager clears all on exit.
 
         Given:
@@ -685,7 +833,7 @@ class TestResourcePool:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("ttl", [0, 0.1, 1, 1.1, 10, 10.1])
-    async def test_ttl_specific_behavior_with_mocked_sleep(self, ttl):
+    async def test_ttl_should_schedule_cleanup_based_on_value(self, ttl):
         """Test specific TTL values with controlled sleep mocking.
 
         Given:
@@ -754,7 +902,7 @@ class TestResourcePool:
                 )
 
     @pytest.mark.asyncio
-    async def test_finalizer_exception_handling_catches_errors(self):
+    async def test_finalizer_should_catch_exception_and_remove_resource(self):
         """Test finalizer exceptions are caught and logged.
 
         Given:
@@ -786,7 +934,7 @@ class TestResourcePool:
         assert pool.stats.total_entries == 0
 
     @pytest.mark.asyncio
-    async def test_clear_with_nonexistent_key_raises_error(self):
+    async def test_clear_should_raise_key_error_when_key_absent(self):
         """Test clear with non-existent key raises appropriate error.
 
         Given:
@@ -810,7 +958,9 @@ class TestResourcePool:
             await pool.clear("nonexistent-key")
 
     @pytest.mark.asyncio
-    async def test_concurrent_acquire_release_same_key(self, counting_factory):
+    async def test_concurrent_should_maintain_consistency_when_acquire_release_same_key(
+        self, counting_factory
+    ):
         """Test concurrent operations on same key maintain consistency.
 
         Given:
@@ -842,7 +992,7 @@ class TestResourcePool:
         assert pool.stats.total_entries <= 1  # 0 or 1 depending on TTL timing
 
     @pytest.mark.asyncio
-    async def test_resource_pool_with_zero_ttl_immediate_cleanup(
+    async def test_resource_pool_should_cleanup_immediately_when_zero_ttl(
         self, resource_pool_immediate_cleanup
     ):
         """Test TTL=0 performs immediate cleanup as expected.
@@ -874,7 +1024,7 @@ class TestResourcePool:
         pool._finalizer.assert_called_once_with(mock_resource)
 
     @pytest.mark.asyncio
-    async def test_get_with_none_key_handles_gracefully(self):
+    async def test_get_should_handle_none_key(self):
         """Test resource pool handles None key appropriately.
 
         Given:
@@ -903,7 +1053,7 @@ class TestResource:
     """Test suite for the Resource class."""
 
     @pytest.mark.asyncio
-    async def test_context_manager_auto_releases(self):
+    async def test_context_manager_should_auto_release(self):
         """Test Resource as async context manager.
 
         Given:
@@ -932,7 +1082,7 @@ class TestResource:
         assert pool.stats.total_entries == 0
 
     @pytest.mark.asyncio
-    async def test_resource_has_no_manual_release_method(self):
+    async def test_resource_should_have_no_manual_release_method(self):
         """Test Resource has no manual release method.
 
         Given:
@@ -956,7 +1106,7 @@ class TestResource:
         assert not hasattr(resource_acquisition, "release")
 
     @pytest.mark.asyncio
-    async def test_resource_lifecycle_with_ttl(self):
+    async def test_resource_should_stay_cached_when_ttl_set(self):
         """Test Resource lifecycle with TTL keeps resource in cache.
 
         Given:
@@ -985,7 +1135,7 @@ class TestResource:
         assert pool.stats.referenced_entries == 0
 
     @pytest.mark.asyncio
-    async def test_context_manager_only_usage_handles_lifecycle(self):
+    async def test_context_manager_should_handle_lifecycle(self):
         """Test using Resource only as context manager.
 
         Given:
@@ -1012,7 +1162,7 @@ class TestResource:
         assert pool.stats.total_entries == 0
 
     @pytest.mark.asyncio
-    async def test_acquire_twice(self):
+    async def test_acquire_should_raise_runtime_error_when_acquired_twice(self):
         """Test that re-acquiring the same Resource instance raises error.
 
         Given:
@@ -1039,7 +1189,7 @@ class TestResource:
                 pass
 
     @pytest.mark.asyncio
-    async def test_resource_context_acquire_exception(self):
+    async def test_resource_context_should_propagate_acquire_exception(self):
         """Test Resource context manager handles acquire exceptions properly.
 
         Given:
@@ -1066,7 +1216,7 @@ class TestResource:
         assert resource._acquired is False
 
     @pytest.mark.asyncio
-    async def test_resource_context_release_not_acquired(self):
+    async def test_resource_context_should_raise_runtime_error_when_not_acquired(self):
         """Test Resource release when not acquired raises RuntimeError.
 
         Given:
@@ -1089,7 +1239,9 @@ class TestResource:
             await resource.__aexit__(None, None, None)
 
     @pytest.mark.asyncio
-    async def test_resource_context_release_already_released(self):
+    async def test_resource_context_should_raise_runtime_error_when_already_released(
+        self,
+    ):
         """Test Resource release when already released raises RuntimeError.
 
         Given:

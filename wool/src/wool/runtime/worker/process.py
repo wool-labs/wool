@@ -23,7 +23,7 @@ import grpc.aio
 
 import wool
 from wool import protocol
-from wool.runtime.context import install_task_factory
+from wool.runtime.context.factory import install_task_factory
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials

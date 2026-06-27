@@ -79,6 +79,30 @@ class TestRoundRobinLoadBalancer:
         # Act & assert
         assert isinstance(RoundRobinLoadBalancer(), LoadBalancerLike)
 
+    def test_pickle_round_trip_yields_a_fresh_balancer(self):
+        """Test a RoundRobinLoadBalancer round-trips through pickle.
+
+        Given:
+            A RoundRobinLoadBalancer instance.
+        When:
+            It is pickled and unpickled.
+        Then:
+            The result should be a fresh RoundRobinLoadBalancer — the
+            balancer reduces to its bare class, dropping the unpicklable
+            per-process rotation state and lock.
+        """
+        # Arrange
+        import pickle
+
+        balancer = RoundRobinLoadBalancer()
+
+        # Act
+        restored = pickle.loads(pickle.dumps(balancer))
+
+        # Assert
+        assert isinstance(restored, RoundRobinLoadBalancer)
+        assert restored is not balancer
+
     @pytest.mark.asyncio
     async def test_dispatch_with_empty_context(
         self,
@@ -642,8 +666,8 @@ class TestRoundRobinLoadBalancer:
             A load balancer with one worker whose dispatch raises a
             non-:class:`RpcError` exception (modelling e.g. a strict-
             mode :class:`BaseExceptionGroup` of
-            :class:`wool.ContextDecodeWarning` peers from
-            :meth:`Context.to_protobuf`, or a programming-error
+            :class:`wool.SerializationWarning` peers from
+            :meth:`Chain.to_protobuf`, or a programming-error
             :class:`ValueError`).
         When:
             ``await lb.dispatch(...)`` is called.

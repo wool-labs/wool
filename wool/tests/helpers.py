@@ -1,33 +1,30 @@
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Iterator
-from uuid import UUID
 
-from wool import protocol
-from wool.runtime.context import Context
-from wool.runtime.context import attached
+import wool
 
 
 @contextmanager
-def scoped_context(id: UUID | None = None) -> Iterator[Context]:
-    """Test helper — install a wool.Context for the duration of the block.
+def scoped_context() -> Generator[None]:
+    """Test helper — bracket a block of Wool chain mutations.
 
-    Mints a fresh chain id by default. Pass *id* to construct a
-    Context with a specific chain id, used by tests that exercise
-    chain-id-dependent semantics (e.g. ContextVar.reset's same-id
-    fallback). The id-bearing path goes through the public
-    ``Context.from_protobuf`` rather than the private
-    ``_reconstitute`` builder, since wool deliberately does not
-    expose an in-process id-only constructor (that would invite
-    duplicate-id Contexts and undercut the single-task-per-Context
-    invariant). On exit the prior scope's Context is restored.
-
-    Attaches without claiming the single-task guard so tests can
-    invoke ``Context.run`` / ``attached(ctx)`` on the yielded
-    Context themselves.
+    Per-test isolation lives in the ``pytest_pyfunc_call`` hook in
+    ``tests/conftest.py``, which runs each sync test in a fresh
+    :func:`contextvars.copy_context` (async tests self-isolate via their
+    task's context copy). With ``__chain__`` typed
+    :class:`~wool.runtime.context.chain.Chain` there is no settable
+    "unarmed" value to install in place, so this manager no longer
+    disarms; it is retained as a no-op scope around chain mutations.
     """
-    if id is None:
-        ctx = Context()
-    else:
-        ctx = Context.from_protobuf(protocol.Context(id=id.hex))
-    with attached(ctx, guarded=False):
-        yield ctx
+    yield
+
+
+def context_is_unarmed() -> bool:
+    """Test helper — return whether the current context carries no Wool state.
+
+    A module-level, picklable function so it can be dispatched to a
+    :class:`~concurrent.futures.ProcessPoolExecutor` worker, where it
+    proves a bare ``run_in_executor`` offload carries no Wool chain
+    into a worker process.
+    """
+    return wool.__chain__.get(None) is None

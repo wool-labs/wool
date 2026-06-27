@@ -1,3 +1,4 @@
+import contextvars
 import logging
 from typing import Final
 
@@ -11,6 +12,21 @@ logger = logging.getLogger(__name__)
 
 _automark = True
 _ignore_unknown = True
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem):
+    """Run each sync test in a fresh ``contextvars.copy_context`` so a
+    ``wool.ContextVar`` set in one test cannot leak its armed chain into
+    the next. Async tests self-isolate — their task copies the context —
+    and are owned by pytest-asyncio's ``pytest_pyfunc_call``, so defer.
+    """
+    if pyfuncitem.get_closest_marker("asyncio") is not None:
+        return None
+    argnames = pyfuncitem._fixtureinfo.argnames
+    testargs = {name: pyfuncitem.funcargs[name] for name in argnames}
+    contextvars.copy_context().run(pyfuncitem.obj, **testargs)
+    return True
 
 
 @pytest.hookimpl(tryfirst=True)

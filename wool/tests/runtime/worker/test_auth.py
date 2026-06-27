@@ -15,6 +15,7 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
+from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
 
 
@@ -118,7 +119,7 @@ def temp_cert_files(test_certificates, tmp_path):
 class TestWorkerCredentials:
     """Test suite for WorkerCredentials credential management."""
 
-    def test___init___with_mtls(self, test_certificates):
+    def test___init___should_set_all_fields_when_mtls(self, test_certificates):
         """Test basic instantiation with mTLS.
 
         Given:
@@ -142,7 +143,7 @@ class TestWorkerCredentials:
         assert creds.worker_cert == cert_pem
         assert creds.mutual is True
 
-    def test___init___with_one_way_tls(self, test_certificates):
+    def test___init___should_set_mutual_false_when_one_way_tls(self, test_certificates):
         """Test instantiation with one-way TLS.
 
         Given:
@@ -163,7 +164,7 @@ class TestWorkerCredentials:
         # Assert
         assert creds.mutual is False
 
-    def test___init___frozen_dataclass_immutability(self, test_certificates):
+    def test___init___should_raise_when_field_mutated(self, test_certificates):
         """Test immutability via frozen dataclass.
 
         Given:
@@ -184,7 +185,7 @@ class TestWorkerCredentials:
         with pytest.raises((FrozenInstanceError, AttributeError)):
             creds.mutual = False
 
-    def test_from_files_with_mtls(self, temp_cert_files):
+    def test_from_files_should_load_bytes_when_mtls(self, temp_cert_files):
         """Test from_files classmethod with mTLS.
 
         Given:
@@ -209,7 +210,7 @@ class TestWorkerCredentials:
         assert len(creds.worker_cert) > 0
         assert creds.mutual is True
 
-    def test_from_files_with_one_way_tls(self, temp_cert_files):
+    def test_from_files_should_set_mutual_false_when_one_way_tls(self, temp_cert_files):
         """Test from_files classmethod with one-way TLS.
 
         Given:
@@ -230,7 +231,7 @@ class TestWorkerCredentials:
         # Assert
         assert creds.mutual is False
 
-    def test_from_files_default_mutual_parameter(self, temp_cert_files):
+    def test_from_files_should_default_mutual_to_true(self, temp_cert_files):
         """Test default mutual=True parameter.
 
         Given:
@@ -251,7 +252,7 @@ class TestWorkerCredentials:
         # Assert
         assert creds.mutual is True
 
-    def test_from_files_missing_ca_cert(self, temp_cert_files):
+    def test_from_files_should_raise_when_ca_cert_missing(self, temp_cert_files):
         """Test missing CA file error handling.
 
         Given:
@@ -270,7 +271,7 @@ class TestWorkerCredentials:
                 ca_path="/nonexistent/ca.pem", key_path=key_path, cert_path=cert_path
             )
 
-    def test_from_files_missing_key(self, temp_cert_files):
+    def test_from_files_should_raise_when_key_missing(self, temp_cert_files):
         """Test missing key file error handling.
 
         Given:
@@ -289,7 +290,7 @@ class TestWorkerCredentials:
                 ca_path=ca_path, key_path="/nonexistent/key.pem", cert_path=cert_path
             )
 
-    def test_from_files_missing_cert(self, temp_cert_files):
+    def test_from_files_should_raise_when_cert_missing(self, temp_cert_files):
         """Test missing cert file error handling.
 
         Given:
@@ -308,7 +309,9 @@ class TestWorkerCredentials:
                 ca_path=ca_path, key_path=key_path, cert_path="/nonexistent/cert.pem"
             )
 
-    def test_from_files_permission_error(self, temp_cert_files, tmp_path):
+    def test_from_files_should_raise_when_permission_denied(
+        self, temp_cert_files, tmp_path
+    ):
         """Test permission error handling.
 
         Given:
@@ -334,7 +337,9 @@ class TestWorkerCredentials:
             # Restore permissions for cleanup
             restricted_file.chmod(0o644)
 
-    def test_server_credentials_with_mtls(self, test_certificates):
+    def test_server_credentials_should_return_server_credentials_when_mtls(
+        self, test_certificates
+    ):
         """Test server credentials property for mTLS.
 
         Given:
@@ -356,7 +361,9 @@ class TestWorkerCredentials:
         # Assert
         assert isinstance(server_creds, grpc.ServerCredentials)
 
-    def test_server_credentials_with_one_way_tls(self, test_certificates):
+    def test_server_credentials_should_return_server_credentials_when_one_way_tls(
+        self, test_certificates
+    ):
         """Test server credentials property for one-way TLS.
 
         Given:
@@ -378,7 +385,9 @@ class TestWorkerCredentials:
         # Assert
         assert isinstance(server_creds, grpc.ServerCredentials)
 
-    def test_client_credentials_with_mtls(self, test_certificates):
+    def test_client_credentials_should_return_channel_credentials_when_mtls(
+        self, test_certificates
+    ):
         """Test client credentials property for mTLS.
 
         Given:
@@ -400,7 +409,9 @@ class TestWorkerCredentials:
         # Assert
         assert isinstance(client_creds, grpc.ChannelCredentials)
 
-    def test_client_credentials_with_one_way_tls(self, test_certificates):
+    def test_client_credentials_should_return_channel_credentials_when_one_way_tls(
+        self, test_certificates
+    ):
         """Test client credentials property for one-way TLS.
 
         Given:
@@ -422,7 +433,7 @@ class TestWorkerCredentials:
         # Assert
         assert isinstance(client_creds, grpc.ChannelCredentials)
 
-    def test_server_credentials_and_client_credentials_bidirectional(
+    def test_server_and_client_credentials_should_both_build_valid_credentials(
         self, test_certificates
     ):
         """Test bidirectional credential generation.
@@ -450,7 +461,9 @@ class TestWorkerCredentials:
         assert isinstance(server_creds, grpc.ServerCredentials)
         assert isinstance(client_creds, grpc.ChannelCredentials)
 
-    def test_server_credentials_idempotent_access(self, test_certificates):
+    def test_server_credentials_should_return_credentials_on_repeated_access(
+        self, test_certificates
+    ):
         """Test server credentials method idempotency.
 
         Given:
@@ -475,7 +488,9 @@ class TestWorkerCredentials:
         assert isinstance(server_creds_1, grpc.ServerCredentials)
         assert isinstance(server_creds_2, grpc.ServerCredentials)
 
-    def test_client_credentials_idempotent_access(self, test_certificates):
+    def test_client_credentials_should_return_credentials_on_repeated_access(
+        self, test_certificates
+    ):
         """Test client credentials method idempotency.
 
         Given:
@@ -502,7 +517,7 @@ class TestWorkerCredentials:
 
     @given(mutual=st.booleans())
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_server_credentials_and_client_credentials_type_consistency(
+    def test_server_credentials_and_client_credentials_should_return_consistent_types(
         self, mutual, test_certificates
     ):
         """Test credential method idempotency across mutual flag values.
@@ -539,7 +554,9 @@ class TestWorkerCredentials:
 
     @given(mutual=st.booleans())
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_pickle_roundtrip(self, mutual, test_certificates):
+    def test_pickle_roundtrip_should_produce_equal_instance(
+        self, mutual, test_certificates
+    ):
         """Test WorkerCredentials survives pickle roundtrip.
 
         Given:
@@ -565,7 +582,9 @@ class TestWorkerCredentials:
         assert isinstance(restored.server_credentials(), grpc.ServerCredentials)
         assert isinstance(restored.client_credentials(), grpc.ChannelCredentials)
 
-    def test___enter___not_supported(self, test_certificates):
+    def test___enter___should_raise_when_used_as_context_manager(
+        self, test_certificates
+    ):
         """Test WorkerCredentials does not support context manager protocol.
 
         Given:
@@ -586,7 +605,7 @@ class TestWorkerCredentials:
             with creds:
                 pass
 
-    def test_current_not_supported(self):
+    def test_current_should_raise_attribute_error(self):
         """Test WorkerCredentials does not expose current() classmethod.
 
         Given:
@@ -599,3 +618,29 @@ class TestWorkerCredentials:
         # Act & assert
         with pytest.raises(AttributeError):
             WorkerCredentials.current()
+
+
+class TestCredentialContext:
+    """Test suite for the internal CredentialContext manager."""
+
+    def test___exit___should_raise_when_invoked_without_enter(self):
+        """Test exit guards against running without a matching enter.
+
+        Given:
+            A CredentialContext that was never entered, so it holds no
+            reset token.
+        When:
+            Its exit is invoked directly.
+        Then:
+            It should raise RuntimeError — the credential reset is
+            guarded against running without a token from a matching
+            enter.
+        """
+        # Arrange
+        context = CredentialContext(credentials=None)  # type: ignore[arg-type]
+
+        # Act & assert
+        # No ``with`` idiom can invoke ``__exit__`` without a matching
+        # ``__enter__``, so the misuse guard is exercised by a direct call.
+        with pytest.raises(RuntimeError, match="without matching __enter__"):
+            context.__exit__(None, None, None)

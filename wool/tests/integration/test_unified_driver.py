@@ -38,7 +38,7 @@ class TestUnifiedDriverShape:
     async def test_coroutine_dispatch_completes_across_process_boundary(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test a single coroutine dispatch round-trips across the gRPC + worker-process boundary.
+        """Test a single coroutine dispatch round-trips across the worker boundary.
 
         Given:
             A coroutine routine with no caller-side wool.ContextVar
@@ -69,7 +69,7 @@ class TestUnifiedDriverShape:
             # Assert
             assert result == 5
             # The routine never set TENANT_ID/REGION on the worker, so
-            # the caller's snapshot must equal its pre-dispatch value
+            # the caller's context must equal its pre-dispatch value
             # — the back-propagation path is silent when the worker
             # made no mutations.
             assert routines.TENANT_ID.get() == tenant_before
@@ -81,7 +81,7 @@ class TestUnifiedDriverShape:
     async def test_async_gen_dispatch_exhausts_after_single_yield(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test an async-generator that yields exactly once terminates with StopAsyncIteration.
+        """Test an async-generator yielding once terminates with StopAsyncIteration.
 
         Given:
             An async-generator routine that yields a single value and
@@ -385,13 +385,13 @@ class TestUnifiedDriverShape:
             A coroutine routine with caller-side wool.ContextVars set
             to fully-decodable values and a DEFAULT pool, with
             ``warnings.simplefilter("error",
-            category=wool.ContextDecodeWarning)`` active for the
+            category=wool.SerializationWarning)`` active for the
             dispatch.
         When:
             The caller dispatches the routine.
         Then:
             The dispatch should complete without raising and without
-            emitting a single ``wool.ContextDecodeWarning``, since
+            emitting a single ``wool.SerializationWarning``, since
             every shipped var is decodable on the worker.
         """
 
@@ -410,7 +410,7 @@ class TestUnifiedDriverShape:
                 try:
                     with warnings.catch_warnings(record=True) as captured:
                         warnings.simplefilter(
-                            "error", category=wool.ContextDecodeWarning
+                            "error", category=wool.SerializationWarning
                         )
                         result = await routines.get_tenant_id()
                 finally:
@@ -420,10 +420,10 @@ class TestUnifiedDriverShape:
             # Assert
             assert result == "strict-tenant"
             decode_warnings = [
-                w for w in captured if issubclass(w.category, wool.ContextDecodeWarning)
+                w for w in captured if issubclass(w.category, wool.SerializationWarning)
             ]
             assert decode_warnings == [], (
-                f"Expected no ContextDecodeWarning under strict mode "
+                f"Expected no SerializationWarning under strict mode "
                 f"with decodable vars, got {decode_warnings!r}"
             )
 
@@ -444,7 +444,7 @@ class TestUnifiedDriverShape:
         Then:
             Each yielded value should equal the per-step value the
             outer worker set, proving ``_current_task`` and
-            ``wool.Context`` stay live across the streaming routine's
+            ``wool.Chain`` stay live across the streaming routine's
             lifespan and every nested dispatch finds the streaming
             task as the caller.
         """

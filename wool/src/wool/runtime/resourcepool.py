@@ -366,13 +366,25 @@ class ResourcePool(Generic[T]):
                     except RuntimeError:
                         pass
         finally:
-            # Call finalizer
-            if self._finalizer:
-                try:
-                    await self._await(self._finalizer, entry.obj)
-                except Exception:
-                    pass
-            del self._cache[key]
+            # Evict from the cache *unconditionally*, before and
+            # regardless of how the finalizer exits. A finalized
+            # resource must never remain cached: if the finalizer
+            # raises — including ``CancelledError`` when cleanup runs
+            # under a cancelled teardown, which is a ``BaseException``
+            # and so escapes ``except Exception`` — the entry must
+            # still be removed, or a later ``acquire`` hands back a
+            # torn-down resource (e.g. a closed event loop). The
+            # inner ``try`` lets the finalizer run for its side
+            # effects while the outer ``finally`` guarantees eviction
+            # and lets any cancellation propagate.
+            try:
+                if self._finalizer:
+                    try:
+                        await self._await(self._finalizer, entry.obj)
+                    except Exception:
+                        pass
+            finally:
+                del self._cache[key]
 
     async def _await(self, func: Callable, *args) -> Any:
         """

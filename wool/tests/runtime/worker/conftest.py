@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import multiprocessing.shared_memory
 import threading
 import uuid
 from types import MappingProxyType
@@ -18,7 +19,7 @@ from pytest_mock import MockerFixture
 
 import wool.runtime.worker.pool as wp
 from tests.helpers import scoped_context
-from wool.runtime.context import install_task_factory
+from wool.runtime.context.factory import install_task_factory
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -37,12 +38,12 @@ class PicklableMock(MagicMock):
 
 @pytest.fixture(autouse=True)
 def _isolate_wool_context():
-    """Install a fresh wool.Context for the duration of the test.
+    """Install a fresh, unarmed Wool context for the duration of the test.
 
-    Each test runs under its own scoped Context so var values set in
-    one test do not leak into subsequent tests via the per-task data
-    map. The process-wide var_registry is not reset; tests SHOULD
-    use unique key namespaces (e.g. via uuid suffix) to avoid
+    Each test runs under its own unarmed context so var values set
+    in one test do not leak into subsequent tests via the chain
+    context. The process-wide var_registry is not reset; tests
+    SHOULD use unique key namespaces (e.g. via uuid suffix) to avoid
     cross-test collisions on shared keys.
     """
     with scoped_context():
@@ -358,7 +359,9 @@ def mock_shared_memory(mocker: MockerFixture):
     mock_memory.buf = bytearray(1024)
     mock_memory.close = mocker.MagicMock()
     mock_memory.unlink = mocker.MagicMock()
-    mocker.patch("multiprocessing.shared_memory.SharedMemory", return_value=mock_memory)
+    mocker.patch.object(
+        multiprocessing.shared_memory, "SharedMemory", return_value=mock_memory
+    )
     return mock_memory
 
 

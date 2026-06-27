@@ -1,5 +1,13 @@
 [run]
 source = src/wool
+# Measure code that runs in spawned worker processes (WorkerProcess is a
+# ``multiprocessing.get_context("spawn").Process``). Without this the
+# integration suite's worker-side coverage (service.py/session.py) is
+# invisible, understating what those tests actually exercise. ``sigterm``
+# flushes coverage when a worker is stopped via SIGTERM at teardown.
+concurrency = multiprocessing,thread
+parallel = true
+sigterm = true
 omit =
     src/wool/__init__.py
     src/wool/cli.py
