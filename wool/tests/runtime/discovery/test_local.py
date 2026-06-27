@@ -1004,6 +1004,29 @@ class TestLocalDiscoveryPublisher:
         assert attempt == 2
 
 
+class TestWorkerReference:
+    """Tests for the internal _WorkerReference value object."""
+
+    def test_is_hashable_by_its_uuid(self):
+        """Test a _WorkerReference hashes by its UUID.
+
+        Given:
+            A _WorkerReference wrapping a UUID.
+        When:
+            It is hashed.
+        Then:
+            Its hash should equal the UUID's hash — references are
+            usable as dict keys / set members keyed by worker identity.
+        """
+        # Arrange
+        from wool.runtime.discovery.local import _WorkerReference
+
+        uid = uuid.uuid4()
+
+        # Act & assert
+        assert hash(_WorkerReference(uid)) == hash(uid)
+
+
 class TestLocalDiscoverySubscriber:
     """Tests for LocalDiscovery.Subscriber class.
 
