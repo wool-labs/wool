@@ -1,21 +1,22 @@
 from __future__ import annotations
 
+import contextvars
 import inspect
 from typing import Any
 from typing import Callable
 from typing import Final
-from typing import Generic
-from typing import NoReturn
-from typing import SupportsIndex
 from typing import TypeVar
+from typing import cast
 from typing import overload
 
-from wool.runtime.context.base import current_context
+import wool
+from wool.runtime.context.chain import Chain
+from wool.runtime.context.exceptions import ContextVarCollision
+from wool.runtime.context.guard import assert_chain_owner
+from wool.runtime.context.manifest import ContextVarManifest
+from wool.runtime.context.manifest import resolve_stub
 from wool.runtime.context.registry import lock
 from wool.runtime.context.registry import var_registry
-from wool.runtime.context.stub import release_stub
-from wool.runtime.context.stub import resolve_stub
-from wool.runtime.context.token import Token
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 
@@ -25,69 +26,79 @@ T = TypeVar("T")
 
 
 # public
-class ContextVarCollision(Exception):
-    """Raised when two distinct :class:`ContextVar` instances are
-    constructed with the same ``(namespace, name)`` key.
-
-    Keys must be unique within the inferred package namespace. Library
-    authors should pass ``namespace=`` explicitly when constructing
-    vars from shared factory code; application code can rely on the
-    implicit package-name inference.
-    """
-
-
-# public
-class ContextVar(Generic[T]):
+class ContextVar(ContextVarManifest[T]):
     """Propagating context variable that crosses worker boundaries.
 
-    Mirrors :class:`contextvars.ContextVar` at the surface: construct
-    with a name and optional default; call :meth:`get`, :meth:`set`,
-    :meth:`reset`. Unlike :class:`contextvars.ContextVar`, instances
+    Mirrors `contextvars.ContextVar` across the `get` / `set` /
+    `reset` call shapes: construct with a name and optional default,
+    then call `get`, `set`, `reset`. Two deliberate divergences bound
+    that parity. First, `get`, `set`, and `reset` additionally raise
+    `wool.ChainContention` when a chain is entered by a thread or
+    asyncio task other than the one that owns it — stdlib
+    `contextvars.ContextVar` never raises it; see
+    `wool.ChainContention` for the full scenario catalogue. Second,
+    the `contextvars.Token` that `set` returns is process-local, and
+    its ``var`` attribute references the variable's internal backing
+    rather than this `ContextVar`, so ``wool_var.set(x).var is
+    wool_var`` is `False` where stdlib's is `True` — the supported
+    reset path is ``wool_var.reset(token)`` and ``token.var`` is not a
+    supported attribute. Unlike `contextvars.ContextVar`, instances
     pickle across process boundaries and their values propagate through
     ``@wool.routine`` dispatches.
 
-    **Identity model** — Every :class:`ContextVar` has a unique
+    **Identity model** — Every `ContextVar` has a unique
     ``(namespace, name)`` key. The ``name`` is the first positional
     argument; the ``namespace`` is inferred from the top-level package
     of the calling frame or provided explicitly via ``namespace=``.
     Two distinct instances constructed under the same key raise
-    :class:`ContextVarCollision`.
+    `ContextVarCollision`.
 
     **Namespace stability** — The inferred namespace is the top-level
     package of the calling frame. This is deliberately coarse so that
     wire keys stay stable when a module is refactored deeper within
-    its package — a rolling deploy that moves
-    ``myapp.auth.tokens`` to ``myapp.auth.credentials.tokens``
-    continues to propagate values between caller and worker. The
-    trade-off is that two subpackages of the same library cannot
-    define distinct vars with the same ``name`` without one of them
-    passing ``namespace=`` explicitly; the construction raises
-    :class:`ContextVarCollision` instead.
+    its package — a rolling deploy that moves ``myapp.auth.tokens``
+    to ``myapp.auth.credentials.tokens`` continues to propagate
+    values between caller and worker. The trade-off is that two
+    subpackages of the same library cannot define distinct variables
+    with the same ``name`` without one of them passing ``namespace=``
+    explicitly; the construction raises `ContextVarCollision`
+    instead.
 
-    **Storage model** — Values are stored in the current
-    :class:`wool.Context` (one per :class:`asyncio.Task`, one per
-    thread for sync code) — separate state from the surrounding
-    :class:`contextvars.Context`. Child tasks fork a copy of the
-    parent's :class:`wool.Context` on creation when Wool's task
-    factory is installed on the running loop.
+    **Storage model** — Values ride in a single immutable
+    `~wool.runtime.context.chain.Chain` held in one
+    Wool-owned stdlib `contextvars.ContextVar`. Because the
+    Wool chain rides in stdlib ``contextvars``, ``wool.ContextVar``
+    values propagate with stdlib visibility across every conformant
+    event loop and every cooperative asyncio scheduling edge — task
+    creation, ``call_soon``/``call_later``/``call_at``,
+    ``add_reader``/``add_writer``/``add_signal_handler``,
+    ``Future.add_done_callback``. The first `set` on a context
+    *arms* it: a chain UUID is minted and the chain-contention guard
+    engages. A context in which no `ContextVar` has been set
+    is unarmed and behaves as a plain `contextvars.Context`.
+    Once armed, the Wool-owned variable is a permanent member of the
+    `contextvars.Context`: a `contextvars.copy_context`
+    of an armed context carries one extra variable, and it stays even
+    after every `ContextVar` is reset.
+
+    Child tasks fork a copy of the parent's context under a fresh
+    chain UUID when Wool's task factory is installed on the running
+    loop.
 
     Values propagated across the wire must be cloudpicklable.
+    Variable serialisation is dispatch-path-only — vanilla
+    ``pickle.dumps`` / ``cloudpickle.dumps`` / `copy.copy` /
+    `copy.deepcopy` raise `TypeError`; see
+    `__reduce_ex__`.
     """
 
-    __slots__ = (
-        "_name",
-        "_namespace",
-        "_key",
-        "_default",
-        "_stub",
-        "__weakref__",
-    )
-
-    _name: str
-    _namespace: str
-    _key: tuple[str, str]
-    _default: T | UndefinedType
-    _stub: bool
+    # No instance slots of its own — the data layer (the key, default,
+    # stub flag, and backing) lives on ``ContextVarManifest``. This
+    # empty-slots invariant is load-bearing: it keeps a manifest layout-
+    # compatible with ``ContextVar`` so ``promote`` can reassign
+    # ``__class__`` in place. Adding a slot here breaks that swap (see
+    # ``promote`` and its guard test).
+    __slots__ = ()
 
     @overload
     def __new__(
@@ -116,7 +127,7 @@ class ContextVar(Generic[T]):
         namespace: str | None = None,
         default: T | UndefinedType = Undefined,
     ) -> ContextVar[T]:
-        """Resolve or construct the :class:`ContextVar` for *namespace:name*.
+        """Resolve or construct the `ContextVar` for *namespace:name*.
 
         The lookup, the registry insert, and the new instance's
         observable state are all serialized under the registry lock
@@ -127,16 +138,19 @@ class ContextVar(Generic[T]):
 
         * No prior registration — a fresh instance is constructed and
           registered.
-        * A stub already registered (seeded by an earlier pickle-path
-          ingress before any user declaration) — promoted in place.
+        * A stub already registered (seeded by an earlier wire
+          ingress — pickle-embedded or chain-manifest — before any user
+          declaration) — promoted in place.
           An explicit ``default=`` wins; an implicit
-          :data:`~wool.runtime.typing.Undefined` preserves whatever
+          `~wool.runtime.typing.Undefined` preserves whatever
           default the stub already carries, mirroring
-          :func:`~wool.runtime.context.stub.resolve_stub`'s
+          `resolve_stub`'s
           "don't silently discard a known default" rule.
-        * A non-stub registration already exists — :class:`ContextVarCollision`
+        * A non-stub registration already exists — `ContextVarCollision`
           raises; keys must be unique within a namespace.
         """
+        if not isinstance(name, str):
+            raise TypeError("context variable name must be a str")
         if namespace is None:
             namespace = _infer_namespace()
         key = (namespace, name)
@@ -144,22 +158,16 @@ class ContextVar(Generic[T]):
             existing = var_registry.get(key)
             if existing is not None:
                 if existing._stub:
+                    promoted = promote(existing)
                     if default is not Undefined:
-                        existing._default = default
-                    existing._stub = False
-                    release_stub(key)
-                    return existing
+                        promoted._default = default
+                    return promoted
                 raise ContextVarCollision(
                     f"wool.ContextVar {key!r} is already registered "
                     f"({existing!r}). Keys must be unique within a "
                     f"namespace."
                 )
-            instance = super().__new__(cls)
-            instance._name = name
-            instance._namespace = namespace
-            instance._key = key
-            instance._default = default
-            instance._stub = False
+            instance = cast(ContextVar[T], cls._build(key, default, stub=False))
             var_registry[key] = instance
             return instance
 
@@ -168,69 +176,33 @@ class ContextVar(Generic[T]):
     ) -> tuple[Callable[..., ContextVar[Any]], tuple[Any, ...]]:
         """Return constructor args for unpickling via Wool's pickler.
 
-        A :class:`ContextVar` is a key for resolving a value from
-        the active :class:`wool.Context`; its pickled state is
-        therefore the key plus the constructor default, never a
-        value snapshot. State propagation rides on the wire-context
-        path (:meth:`Context.to_protobuf` walks the sender's
-        ``_data``; :meth:`Context.from_protobuf` populates the
-        receiver's). The pickle path stays pure-identity so a
-        reconstituted var is a key only — `var.get()` on the
-        receiver resolves through the receiver's :class:`Context`
-        without the unpickle ever writing to it.
+        A `ContextVar` is a key for resolving a value from the active
+        `~wool.runtime.context.chain.Chain`; its pickled state is
+        therefore the key plus the constructor default, never a captured
+        value. State propagation rides on the chain-manifest path
+        (`~wool.runtime.context.chain.Chain.to_manifest` snapshots the
+        sender's context and
+        `~wool.runtime.context.manifest.ChainManifest.to_protobuf`
+        encodes it;
+        `~wool.runtime.context.manifest.ChainManifest.from_protobuf`
+        decodes the wire frame and
+        `~wool.runtime.context.chain.Chain.from_manifest` populates the
+        receiver's context). The pickle path stays pure-identity so a
+        reconstituted variable is a key only — ``var.get()`` on the
+        receiver resolves through the receiver's context without the
+        unpickle ever writing to it.
 
-        ContextVar is guarded against vanilla pickling (see
-        :meth:`__reduce_ex__`); this method is invoked only by
-        Wool's own pickler.
+        The pickle surface lives on `ContextVar` rather than
+        `~wool.runtime.context.manifest.ContextVarManifest` because
+        unpickling reconstitutes a *usable* variable — the receiver calls
+        `get`/`set`/`reset` on it — so `_reconstitute` upgrades a bare
+        manifest to a behavioral `ContextVar`. The vanilla-pickle guard
+        (`__reduce_ex__`) lives on the base, covering both flavors.
         """
         return (
             ContextVar._reconstitute,
             (self._namespace, self._name, self._default),
         )
-
-    def __reduce_ex__(self, _protocol: SupportsIndex) -> NoReturn:
-        """Reject vanilla pickling.
-
-        ContextVar identity is registered against the process-wide
-        :data:`var_registry`; restoring an instance outside Wool's
-        dispatch path bypasses the stub-promotion and collision-
-        detection that :meth:`_reconstitute` relies on. Wool's own
-        pickler consults ``reducer_override`` (and therefore
-        :meth:`__wool_reduce__`) before ``__reduce_ex__``, so this
-        guard is invisible to Wool's serialization.
-
-        :func:`copy.copy` and :func:`copy.deepcopy` also route
-        through ``__reduce_ex__`` and are rejected for the same
-        reason — a registry-bound ContextVar has no meaningful
-        copy semantics.
-
-        :raises TypeError:
-            Always.
-        """
-        raise TypeError(
-            "wool.ContextVar cannot be pickled via vanilla pickle/cloudpickle; "
-            "it is serialized automatically when dispatched through Wool's "
-            "runtime."
-        )
-
-    def __repr__(self) -> str:
-        default_part = (
-            f" default={self._default!r}" if self._default is not Undefined else ""
-        )
-        return (
-            f"<wool.ContextVar namespace={self._namespace!r} "
-            f"name={self._name!r}{default_part} at 0x{id(self):x}>"
-        )
-
-    @property
-    def name(self) -> str:
-        """The variable's name, matching the :class:`contextvars.ContextVar` API."""
-        return self._name
-
-    @property
-    def namespace(self) -> str:
-        """The namespace this var belongs to."""
-        return self._namespace
 
     @overload
     def get(self) -> T: ...
@@ -238,12 +210,12 @@ class ContextVar(Generic[T]):
     @overload
     def get(self, default: T, /) -> T: ...
 
-    # ``*args`` sentinel pattern mirrors :meth:`contextvars.ContextVar.get` —
-    # distinguishes "no default supplied" (raise :class:`LookupError`) from
-    # "default is :data:`None`" (return :data:`None`). The user-facing surface
+    # ``*args`` sentinel pattern mirrors `contextvars.ContextVar.get` —
+    # distinguishes "no default supplied" (raise `LookupError`) from
+    # "default is `None`" (return `None`). The user-facing surface
     # is constrained by the two ``@overload`` declarations above.
     def get(self, *args: T) -> T:
-        """Return the current value in the active :class:`wool.Context`.
+        """Return the current value in the active context.
 
         :param default:
             Optional fallback returned when the variable has no value
@@ -251,73 +223,184 @@ class ContextVar(Generic[T]):
         :returns:
             The current value, the supplied fallback, or the
             constructor default.
+        :raises TypeError:
+            If more than one positional argument is supplied.
         :raises LookupError:
             If the variable has no value, no fallback, and no default.
+        :raises ChainContention:
+            If the active chain is being entered by a thread or asyncio
+            task other than the one that owns it. See
+            `wool.ChainContention` for full detail.
         """
-        ctx = current_context()
-        try:
-            return ctx._data[self]
-        except KeyError:
-            if args:
-                return args[0]
-            if self._default is not Undefined:
-                return self._default
-            raise LookupError(self)
+        if len(args) > 1:
+            raise TypeError(f"get expected at most 1 argument, got {len(args)}")
+        # Resolve through the backing variable. ``Undefined`` — whether
+        # the backing variable was never set in this Chain or was
+        # reset/merged to the sentinel value — means "fall through to
+        # the default ladder" (get argument, constructor default,
+        # LookupError). Guard at the user-facing API boundary to
+        # match `set` and `reset` — the storage layer
+        # (raw stdlib contextvars.ContextVar) carries no guard, so
+        # ``self._backing.get`` is direct stdlib plumbing.
+        assert_chain_owner(wool.__chain__.get(None))
+        value = self._backing.get(Undefined)
+        if value is not Undefined:
+            return value
+        if args:
+            return args[0]
+        if self._default is not Undefined:
+            return self._default
+        raise LookupError(self)
 
-    def set(self, value: T) -> Token[T]:
-        """Set the variable's value in the active :class:`wool.Context`.
+    def set(self, value: T) -> contextvars.Token[T | UndefinedType]:
+        """Set the variable's value in the active context.
+
+        The first `set` on an unarmed context arms it — mints a
+        fresh chain UUID, installs the first context, and self-installs
+        Wool's task factory on the running loop (raising
+        `~wool.TaskFactoryDisplaced` if Wool's factory was
+        previously installed on the loop but has since been displaced
+        by a third-party factory installed after it). The value rides
+        in the variable's backing
+        `contextvars.ContextVar`; the context's ``vars`` index
+        gains an entry for this variable the first time it is bound in
+        the chain. The factory install is performed by
+        `~wool.runtime.context.chain.Chain.mount`, which this
+        method routes through on every set, but the user-visible effect
+        chain is the same.
 
         :param value:
             The new value.
         :returns:
-            A :class:`Token` usable with :meth:`reset` to restore
-            the previous value.
+            A `contextvars.Token` usable with `reset` to
+            restore the previous value. The token is process-local, and
+            its ``var`` attribute references the variable's internal
+            backing `contextvars.ContextVar` rather than this
+            `ContextVar` (see the class docstring); the supported reset
+            path is ``wool_var.reset(token)``.
+        :raises ChainContention:
+            If the active chain is being entered by a thread or asyncio
+            task other than the one that owns it. See
+            `wool.ChainContention` for full detail.
         """
-        ctx = current_context()
-        old_value = ctx._data.get(self, Undefined)
-        ctx._data[self] = value
-        return Token(self, old_value, ctx)
+        # Enforce the chain-ownership invariant against the *currently
+        # installed* `Chain` before doing anything else.
+        # `Chain.mount` below unconditionally re-stamps the
+        # owning thread/task, so a guard check that runs after mount
+        # would silently transfer ownership to the calling thread —
+        # the exact corruption `ChainContention` is meant to
+        # surface. The guard lives at the user-facing API boundary
+        # (here, plus `get` and `reset`); the storage
+        # layer (raw stdlib contextvars.ContextVar) is plumbing.
+        assert_chain_owner(wool.__chain__.get(None))
+        chain = wool.__chain__.get(None)
+        if chain is None:
+            # First set on this chain: arm it with a fresh chain
+            # UUID. ``Chain.mount`` below is the single point at
+            # which Wool's task factory self-installs on the running
+            # loop — every code path that arms a chain transits
+            # through here.
+            chain = Chain()
+        # Add this variable to the chain's vars index the first time
+        # it is bound in the chain, and clear any prior reset signal —
+        # the variable now carries a value again. When it is already
+        # indexed and not reset, the chain is unchanged.
+        if self not in chain.vars or self._key in chain.resets:
+            chain = chain._evolve(
+                vars=chain.vars | {self},
+                resets=chain.resets - {self._key},
+            )
+        # Mount before mutating the backing so that a mount-time
+        # raise (e.g., ``TaskFactoryDisplaced``) rolls back cleanly
+        # without leaving the backing in a state inconsistent with the
+        # Wool Chain. Mount in the set path doesn't touch this
+        # variable's backing — the evolve above removed ``self._key``
+        # from ``resets``, so mount's reset-drain loop skips it, so
+        # the later ``self._backing.set(value)`` operates on a freshly
+        # mounted-but-unmodified backing.
+        chain.mount()
+        return self._backing.set(value)
 
-    def reset(self, token: Token[T]) -> None:
+    def reset(self, token: contextvars.Token[T | UndefinedType]) -> None:
         """Restore the variable to the value it had before *token*.
 
-        Matches :meth:`contextvars.ContextVar.reset` semantics,
-        scoped to the :class:`wool.Context`: the token must have
-        been created in the same :class:`wool.Context` as the one
-        currently active. Same-Context identity is checked by
-        comparing the :class:`wool.Context` UUID — the canonical
-        chain identity that holds across in-process and cross-
-        process boundaries.
+        Matches `contextvars.ContextVar.reset` semantics. The
+        reset delegates to the backing variable's native
+        `contextvars.ContextVar.reset`, so stdlib itself
+        enforces single-use, rejects a token whose ``var`` is not this
+        variable's backing, and rejects a token reset in a different
+        `contextvars.Context` than the one it was minted in.
 
         :param token:
-            A token previously returned by :meth:`set`.
-        :raises RuntimeError:
-            If the token has already been used.
+            A `contextvars.Token` previously returned by
+            `set`. ``token.var`` references the variable's
+            internal backing `contextvars.ContextVar` rather
+            than this `ContextVar` instance — supported reset
+            path is ``wool_var.reset(token)``, not direct stdlib
+            reset.
         :raises ValueError:
             If the token was created by a different
-            :class:`ContextVar` or in a different
-            :class:`wool.Context`.
+            `ContextVar` or in a different
+            `contextvars.Context` (surfaced by stdlib
+            `contextvars.ContextVar.reset`).
+        :raises RuntimeError:
+            If the token has already been used (surfaced by stdlib
+            single-use enforcement).
+        :raises ChainContention:
+            If the active chain is being entered by a thread or asyncio
+            task other than the one that owns it. See
+            `wool.ChainContention` for full detail.
         """
-        if token._key != self._key:
-            raise ValueError("Token was created by a different ContextVar")
-        ctx = current_context()
-        if token._context_id != ctx._id:
-            raise ValueError("Token was created in a different wool.Context")
-        if token._used:
-            raise RuntimeError("Token has already been used")
-        token._used = True
-        # Track the live Token via :class:`weakref.WeakSet` so the ID
-        # is reclaimed automatically when the Token is collected. If
-        # this UUID arrived earlier as a wire-supplied external entry
-        # (e.g. propagated from a prior hop before the local Token
-        # materialized), promote it now so emission goes through the
-        # auto-pruning path.
-        ctx._used_tokens.add(token)
-        ctx._external_used_tokens.pop(token._id, None)
-        if token._old_value is Undefined:
-            ctx._data.pop(self, None)
+        # Enforce the chain-ownership invariant against the *currently
+        # installed* `Chain` before doing anything else.
+        # `Chain.mount` below unconditionally re-stamps the
+        # owning thread/task, so a guard check that runs after mount
+        # would silently transfer ownership to the calling thread.
+        # See `set` for the analogous guard placement.
+        assert_chain_owner(wool.__chain__.get(None))
+        # Atomicity: run the native reset first. Stdlib
+        # ``ContextVar.reset`` is atomic — if it rejects (wrong var,
+        # wrong Context, already used) observable state is unchanged.
+        # Mounting first would break that contract: by the time
+        # stdlib raised, the Wool ``Chain`` would already have been
+        # evolved + installed and (for the unset case) the backing
+        # rewound to ``Undefined`` via the mount drain.
+        # Native-reset-first preserves stdlib parity:
+        # if the native reset raises, no Wool bookkeeping happens;
+        # if it succeeds, evolve + mount commit the Wool view.
+        self._backing.reset(token)
+        # Below this point the native reset has succeeded; mutate Wool
+        # bookkeeping. A subsequent mount-time raise (e.g.
+        # ``TaskFactoryDisplaced``) does leave the backing in its
+        # restored state — but mount-time raises on the reset path
+        # are pathological (the chain was already armed; reset just
+        # rewound it) and the diagnostic surface intent of mount
+        # raising is unrelated to reset atomicity.
+        context = wool.__chain__.get(None)
+        if context is None:
+            # Unarmed context — native reset already raised the
+            # appropriate ValueError, so this branch is unreachable
+            # except via test mocks. Safe to no-op.
+            return
+        # ``token.old_value`` is `contextvars.Token.MISSING` when
+        # the variable was never set in this Chain (true first-set),
+        # ``Undefined`` (Wool's sentinel) when the backing was
+        # rewound by a prior ``mount`` drain, and the prior value
+        # otherwise. Both ``MISSING`` and ``Undefined`` mean "reset to
+        # no observable value" for the Wool ``Chain`` bookkeeping.
+        old_value = token.old_value
+        old_was_unset = old_value is contextvars.Token.MISSING or old_value is Undefined
+        if old_was_unset:
+            new_vars = context.vars - {self}
+            new_resets = context.resets | {self._key}
         else:
-            ctx._data[self] = token._old_value
+            new_vars = context.vars | {self}
+            new_resets = context.resets - {self._key}
+        evolved = context._evolve(
+            vars=new_vars,
+            resets=new_resets,
+        )
+        evolved.mount()
 
     @classmethod
     def _reconstitute(
@@ -326,24 +409,27 @@ class ContextVar(Generic[T]):
         name: str,
         default: Any,
     ) -> ContextVar[Any]:
-        """Rebuild or resolve a :class:`ContextVar` from externally-
-        supplied parts.
+        """Rebuild or resolve a usable `ContextVar` from pickled parts.
 
-        Routes through :func:`resolve_stub` for the lookup-or-stub
-        path so the wire-snapshot ingress (via
-        :meth:`Context.from_protobuf`) and the pickle ingress (this
-        method) converge on a single creation site. Pickle restores
-        identity only — the receiver's :class:`Context` is the
-        source of truth for value lookup, populated via the
-        wire-context path rather than as a side-effect of
-        unpickling.
+        Routes through `~wool.runtime.context.manifest.resolve_stub` so
+        the chain-manifest ingress and the pickle ingress (this method)
+        converge on a single registry entry per key. Where the manifest
+        ingress is content with a bare
+        `~wool.runtime.context.manifest.ContextVarManifest`, the pickle
+        ingress needs behavior — the receiver invokes `get`/`set`/`reset`
+        — so `_as_contextvar` upgrades a freshly minted manifest to a
+        functional `ContextVar` in place. The instance stays flagged as a
+        stub
+        (``_stub`` is untouched) so a later user declaration still
+        promotes it without `ContextVarCollision`. Pickle restores
+        identity only — the receiver's context, populated via the
+        chain-manifest path, is the source of truth for value lookup.
         """
-        ctx = current_context()
-        return resolve_stub((namespace, name), ctx, default=default)
+        return _as_contextvar(resolve_stub((namespace, name), default=default))
 
 
 def _infer_namespace() -> str:
-    """Infer the namespace for a :class:`ContextVar` constructor call.
+    """Infer the namespace for a `ContextVar` constructor call.
 
     Walks up the call stack from the current frame, skipping frames
     from any ``wool.runtime.context`` submodule, and returns the
@@ -357,3 +443,43 @@ def _infer_namespace() -> str:
             return module.partition(".")[0]
         frame = frame.f_back
     return "__main__"  # pragma: no cover — stack always has a caller
+
+
+def _as_contextvar(manifest: ContextVarManifest[T]) -> ContextVar[T]:
+    """Retag a bare `ContextVarManifest` as a behavioral `ContextVar` in place.
+
+    The upgrade preserves identity: ``manifest`` keeps its backing
+    `contextvars.ContextVar` and its registry registration, so a value
+    drained into the backing before the upgrade survives, and every
+    immutable `~wool.runtime.context.chain.Chain` that already captured
+    the manifest observes the upgrade without rebuild. In-place is
+    mandatory: a fresh object would leave those chains pointing at a
+    stale manifest and break the one-instance-per-key invariant.
+
+    ``_stub`` is left untouched — this only grants behavior, not
+    declared status (`promote` is the declaration transition).
+
+    Reassigning ``__class__`` is sound only because `ContextVar` adds no
+    instance slots over `ContextVarManifest` (``__slots__ = ()``),
+    keeping the two memory layouts compatible. A future slot on
+    `ContextVar` would make this raise `TypeError` at the first upgrade;
+    ``test_contextvar_should_declare_empty_slots`` guards the invariant.
+    """
+    if type(manifest) is ContextVarManifest:
+        manifest.__class__ = ContextVar
+    return cast(ContextVar[T], manifest)
+
+
+def promote(manifest: ContextVarManifest[T]) -> ContextVar[T]:
+    """Promote a stub-state manifest to a *declared* `ContextVar`, in place.
+
+    The receiver-side counterpart to `resolve_stub`: when user code
+    finally declares a variable whose key a wire ingress already
+    registered as a stub, `ContextVar.__new__` calls this to upgrade the
+    registered placeholder. Grants behavior via `_as_contextvar` and
+    clears ``_stub`` so the variable counts as declared — a subsequent
+    declaration of the same key then raises `ContextVarCollision`.
+    """
+    promoted = _as_contextvar(manifest)
+    promoted._stub = False
+    return promoted

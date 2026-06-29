@@ -58,14 +58,17 @@ class VersionInterceptor(grpc.aio.ServerInterceptor):
                 request_msg.ParseFromString(first_bytes)
                 task_bytes = request_msg.task.SerializeToString()
                 envelope.ParseFromString(task_bytes)
+                # F38 — keep parse_version inside the envelope-parse
+                # try/except so any failure (TypeError for a non-str
+                # input, etc.) routes through ``FAILED_PRECONDITION``
+                # rather than propagating as gRPC ``UNKNOWN``.
+                client_version = parse_version(envelope.version)
+                local_version = parse_version(protocol.__version__)
             except Exception:
                 await context.abort(
                     grpc.StatusCode.FAILED_PRECONDITION,
                     "Failed to parse version envelope",
                 )
-
-            client_version = parse_version(envelope.version)
-            local_version = parse_version(protocol.__version__)
 
             if client_version is None or local_version is None:
                 await context.abort(
