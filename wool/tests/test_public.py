@@ -35,6 +35,7 @@ def test_public_api_completeness_should_match_expected_surface():
     expected_public_api = {
         "RpcError",
         "TransientRpcError",
+        "HandshakeError",
         "UnexpectedResponse",
         "UnparsableVersionWarning",
         "WorkerConnection",
@@ -72,6 +73,7 @@ def test_public_api_completeness_should_match_expected_surface():
         "LoopbackAdvertisementWarning",
         "Worker",
         "WorkerCredentials",
+        "WorkerCredentialsProvider",
         "Refreshing",
         "WoolError",
         "WoolWarning",

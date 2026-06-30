@@ -51,10 +51,12 @@ from wool.runtime.serializer import Serializer
 from wool.runtime.typing import Factory
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
@@ -124,6 +126,7 @@ __all__ = [
     "DiscoveryWorkerNotFound",
     "DispatchingLoadBalancerLike",
     "Factory",
+    "HandshakeError",
     "IneffectiveLeaseWarning",
     "IneffectiveQuorumTimeoutWarning",
     "LanDiscovery",
@@ -154,6 +157,7 @@ __all__ = [
     "Worker",
     "WorkerConnection",
     "WorkerCredentials",
+    "WorkerCredentialsProvider",
     "Refreshing",
     "WorkerFactory",
     "WorkerLike",
