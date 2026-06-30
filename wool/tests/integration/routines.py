@@ -10,6 +10,7 @@ Routines are organized by dimension:
 """
 
 import asyncio
+import contextvars
 import functools
 import inspect
 from enum import Enum
@@ -1108,3 +1109,99 @@ async def read_var_off_thread_via_wool_to_thread(value: str) -> str:
     """
     TENANT_ID.set(value)
     return await wool.to_thread(TENANT_ID.get)
+
+
+async def _drive_proxy_collision_on_worker() -> wool.ChainContention:
+    """Drive two tasks sharing one fresh context into a proxy collision.
+
+    Runs inside a dispatched routine, whose own chain is already armed
+    and owned by the routine task. A FRESH `contextvars.Context` is used
+    — not `contextvars.copy_context` — so it starts unarmed and is shared
+    (not forked) by the two child tasks: the first child enters a proxy
+    in it and owns it, and the second child's entry into that context it
+    does not own raises `wool.ChainContention` with kind ``"task"``. The
+    events serialize the interleave so the first always enters first and
+    stays live until the second has contended. The proxies are lazy, so
+    entry incurs no discovery or worker startup.
+    """
+    wool.install_task_factory()
+    loop = asyncio.get_running_loop()
+    shared = contextvars.Context()
+    armed = asyncio.Event()
+    first_can_finish = asyncio.Event()
+
+    async def first() -> None:
+        async with wool.WorkerProxy("proxy-collision-pool", lazy=True):
+            armed.set()
+            await first_can_finish.wait()
+
+    async def second():
+        await armed.wait()
+        try:
+            async with wool.WorkerProxy("proxy-collision-pool", lazy=True):
+                return None
+        except wool.ChainContention as exc:
+            return exc
+        finally:
+            first_can_finish.set()
+
+    first_task = loop.create_task(first(), context=shared)
+    second_task = loop.create_task(second(), context=shared)
+    observed, _ = await asyncio.gather(second_task, first_task)
+    assert isinstance(observed, wool.ChainContention)
+    return observed
+
+
+@wool.routine
+async def report_proxy_collision_in_shared_context() -> str:
+    """Trigger a worker-side proxy collision and return its contention kind.
+
+    Drives two tasks sharing one fresh context into a `wool.WorkerProxy`
+    collision on the worker, catches the resulting `wool.ChainContention`,
+    and returns its ``kind`` (``"task"``) as a plain string — proving the
+    guard fired on the worker without relying on the exception crossing
+    the wire.
+    """
+    return (await _drive_proxy_collision_on_worker()).kind
+
+
+@wool.routine
+async def raise_proxy_collision_in_shared_context() -> None:
+    """Trigger a worker-side proxy collision and re-raise it to the caller.
+
+    Lets the worker-side `wool.ChainContention` propagate through the
+    routine-exception back-propagation channel so the caller observes it
+    directly (relies on the contention being wire-safe).
+    """
+    raise await _drive_proxy_collision_on_worker()
+
+
+@wool.routine
+async def stream_proxy_collision_in_shared_context():
+    """Stream a worker-side proxy collision: yield ``"ready"``, then its kind.
+
+    Async-generator variant of
+    `report_proxy_collision_in_shared_context`: yields ``"ready"`` first,
+    then drives the worker-side collision and yields its contention
+    ``kind`` (``"task"``) — exercising the async-generator dispatch
+    driver.
+    """
+    yield "ready"
+    yield (await _drive_proxy_collision_on_worker()).kind
+
+
+@wool.routine
+async def enter_proxies_in_separate_tasks_on_worker() -> str:
+    """Enter two proxies in separate forked tasks on the worker (no collision).
+
+    Each ``asyncio.gather`` child forks a fresh, child-owned chain via
+    the task factory, so concurrent proxy entries inside a dispatched
+    routine never contend. Returns ``"ok"``.
+    """
+
+    async def use_proxy() -> None:
+        async with wool.WorkerProxy("proxy-collision-pool", lazy=True):
+            await asyncio.sleep(0)
+
+    await asyncio.gather(use_proxy(), use_proxy())
+    return "ok"

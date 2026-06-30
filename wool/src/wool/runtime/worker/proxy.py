@@ -11,6 +11,7 @@ from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Awaitable
 from typing import Callable
+from typing import ClassVar
 from typing import ContextManager
 from typing import Final
 from typing import Generic
@@ -26,6 +27,7 @@ from packaging.version import Version
 
 import wool
 from wool.exceptions import WoolWarning
+from wool.runtime.context.var import ContextVar
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.local import LocalDiscovery
@@ -333,6 +335,16 @@ class WorkerProxy:
     )
     _credentials: WorkerCredentials | None
 
+    # ``wool.__proxy__`` is a plain ``contextvars.ContextVar``, invisible to
+    # the chain-contention guard; this ``wool.ContextVar`` is the guarded
+    # marker whose arming brings proxy entry under the guard. The value is an
+    # inert arming sentinel — only ``set`` is consulted (it arms the chain),
+    # so the ``bool`` payload and ``default`` are never read. ``__aenter__``
+    # owns the contention contract.
+    _armed: ClassVar[ContextVar[bool]] = ContextVar(
+        "_armed", namespace="wool", default=False
+    )
+
     @overload
     def __init__(
         self,
@@ -435,6 +447,7 @@ class WorkerProxy:
         self._quorum = quorum
         self._quorum_timeout = quorum_timeout
         self._proxy_token: Token[WorkerProxy | None] | None = None
+        self._exit_stack: AsyncExitStack | None = None
 
         if isinstance(loadbalancer, (ContextManager, AsyncContextManager)):
             warnings.warn(
@@ -503,13 +516,31 @@ class WorkerProxy:
         self._loadbalancer_context: LoadBalancerContext | None = None
 
     async def __aenter__(self):
-        """Enters the proxy context and sets it as the active proxy."""
-        await self.enter()
+        """Enter the proxy context and set it as the active proxy.
+
+        Arm `_armed` *before* binding the proxy, so a second task
+        entering a proxy in a `contextvars.Context` it does not own
+        raises `wool.ChainContention` at this point rather than silently
+        clobbering `wool.__proxy__`. The arming and its reset are
+        registered on an `~contextlib.AsyncExitStack` (the same idiom
+        `start` uses) so the marker is unwound if `enter` raises and
+        reset on `__aexit__` — never leaked.
+        """
+        async with AsyncExitStack() as stack:
+            token = self._armed.set(True)
+            stack.callback(self._armed.reset, token)
+            await self.enter()
+            self._exit_stack = stack.pop_all()
         return self
 
     async def __aexit__(self, *args):
-        """Exits the proxy context and resets the active proxy."""
-        await self.exit(*args)
+        """Exit the proxy context and reset the active proxy."""
+        try:
+            await self.exit(*args)
+        finally:
+            if self._exit_stack is not None:
+                await self._exit_stack.aclose()
+                self._exit_stack = None
 
     def __hash__(self) -> int:
         return hash(str(self.id))

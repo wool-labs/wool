@@ -2006,30 +2006,32 @@ class TestCopyContextWidthAcrossWorkers:
         """Test copy_context enumerates 1+N wool variables after a dispatch.
 
         Given:
-            A caller with an unarmed context and a routine that
-            counts wool-owned ``contextvars.ContextVar``s visible in a
-            worker-side ``contextvars.copy_context()``
+            A caller that has entered a pool — which arms its context — and
+            a routine that counts wool-owned `contextvars.ContextVar`s
+            visible in a worker-side `contextvars.copy_context`.
         When:
-            The caller arms its context by binding two
-            ``wool.ContextVar``s and dispatches the counting routine
+            The caller binds two more `wool.ContextVar`s and dispatches the
+            counting routine.
         Then:
-            The unarmed caller's own copy_context should enumerate
-            zero wool variables, and the worker — running with two
-            bound variables forward-propagated — should report
-            ``1 + 2`` (the context variable plus one backing
-            variable per bound var).
+            The caller's own copy_context should enumerate exactly two wool
+            variables — the chain variable plus one arming backing marker —
+            confirming that entering a proxy arms the context; and the
+            worker — running with the propagated marker plus the two user
+            variables — should report ``1 + 3`` (the chain variable plus
+            one backing per bound var).
         """
 
         # Arrange, act, & assert
         async def body():
             scenario = default_scenario()
             async with build_pool_from_scenario(scenario, credentials_map):
-                # Unarmed: no wool-owned variables in a copy.
-                unarmed = [
-                    var
+                # Entering the pool arms the context, so the caller carries
+                # the chain variable plus one arming backing marker.
+                armed = sorted(
+                    var.name
                     for var in contextvars.copy_context()
                     if var.name.startswith("__wool")
-                ]
+                )
 
                 tenant_token = routines.TENANT_ID.set("width-tenant")
                 region_token = routines.REGION.set("width-region")
@@ -2038,10 +2040,11 @@ class TestCopyContextWidthAcrossWorkers:
                 finally:
                     routines.REGION.reset(region_token)
                     routines.TENANT_ID.reset(tenant_token)
-            assert unarmed == []
-            # 1 context variable + 2 backing variables for the two
-            # bound wool.ContextVars propagated to the worker.
-            assert worker_count == 3
+            assert len(armed) == 2
+            assert "__wool_chain__" in armed
+            # 1 chain variable + 3 backing variables: the arming marker plus
+            # the two bound wool.ContextVars propagated to the worker.
+            assert worker_count == 4
 
         await retry_grpc_internal(body)
 
@@ -2235,5 +2238,120 @@ class TestChainContentionAcrossDispatch:
 
             # Assert
             assert collected == [caller.id.hex] * 6
+
+        await retry_grpc_internal(body)
+
+
+@pytest.mark.integration
+class TestProxyCollisionAcrossDispatch:
+    @pytest.mark.asyncio
+    async def test_worker_proxy_collision_should_report_task_contention(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a proxy collision inside a dispatched routine fires on the worker.
+
+        Given:
+            A DEFAULT pool running a routine that spawns two tasks sharing
+            one fresh `contextvars.Context` on the worker loop, each
+            entering its own `wool.WorkerProxy`, and catches the second
+            entry's contention.
+        When:
+            The caller dispatches the routine.
+        Then:
+            It should return ``"task"`` — the contention guard fired inside
+            the dispatched routine on the worker, and the kind crossed the
+            wire as a plain string.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await routines.report_proxy_collision_in_shared_context()
+            assert result == "task"
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_worker_proxy_collision_should_surface_chain_contention(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a re-raised worker proxy collision reaches the caller intact.
+
+        Given:
+            A DEFAULT pool running a routine that drives a worker-side
+            `wool.WorkerProxy` collision and re-raises the resulting
+            `wool.ChainContention` instead of catching it.
+        When:
+            The caller dispatches the routine.
+        Then:
+            The caller should catch a `wool.ChainContention` with kind
+            ``"task"`` — the cross-task contention survives the
+            worker-to-caller exception channel as itself rather than
+            degrading to a plain `RuntimeError`.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                with pytest.raises(wool.ChainContention) as exc_info:
+                    await routines.raise_proxy_collision_in_shared_context()
+            assert exc_info.value.kind == "task"
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_worker_separate_task_proxy_entry_should_not_raise(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test concurrent forked proxy entries inside a routine do not contend.
+
+        Given:
+            A DEFAULT pool running a routine that enters two
+            `wool.WorkerProxy` contexts in separate forked tasks
+            (`asyncio.gather`) on the worker.
+        When:
+            The caller dispatches the routine.
+        Then:
+            It should return ``"ok"`` with no `wool.ChainContention` — the
+            task factory forks a fresh, child-owned chain per task, so
+            legitimate concurrent proxy use on the worker never trips.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await routines.enter_proxies_in_separate_tasks_on_worker()
+            assert result == "ok"
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_async_gen_worker_proxy_collision_should_report_contention(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a worker proxy collision fires under the async-gen driver.
+
+        Given:
+            A DEFAULT pool running an async-generator routine that yields
+            ``"ready"``, then drives a worker-side `wool.WorkerProxy`
+            collision and yields the contention kind.
+        When:
+            The caller iterates the dispatched generator.
+        Then:
+            It should yield ``["ready", "task"]`` — the guard fires
+            identically under the async-generator dispatch driver and the
+            kind streams back over the wire.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                gen = routines.stream_proxy_collision_in_shared_context()
+                collected = [value async for value in gen]
+            assert collected == ["ready", "task"]
 
         await retry_grpc_internal(body)
