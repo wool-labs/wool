@@ -72,6 +72,7 @@ def test_public_api_completeness_should_match_expected_surface():
         "LoopbackAdvertisementWarning",
         "Worker",
         "WorkerCredentials",
+        "Refreshing",
         "WoolError",
         "WoolWarning",
         "WorkerFactory",

@@ -69,6 +69,7 @@ from wool.runtime.worker.proxy import WorkerProxy
 from wool.runtime.worker.service import BackpressureContext
 from wool.runtime.worker.service import BackpressureLike
 from wool.runtime.worker.service import WorkerService
+from wool.utilities.refreshing import Refreshing
 
 if TYPE_CHECKING:
     from wool.runtime.context.chain import Chain
@@ -153,6 +154,7 @@ __all__ = [
     "Worker",
     "WorkerConnection",
     "WorkerCredentials",
+    "Refreshing",
     "WorkerFactory",
     "WorkerLike",
     "WorkerMetadata",
