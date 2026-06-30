@@ -1,8 +1,10 @@
+import asyncio
 import pickle
 import warnings
 from uuid import uuid4
 
 import pytest
+from hypothesis import HealthCheck
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
@@ -382,6 +384,62 @@ class TestChainContention:
         assert restored.owning_thread == 12345
         assert restored.current_thread == 67890
         assert str(restored) == str(exc)
+
+    @settings(max_examples=25, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        chain_id=st.uuids(),
+        with_owning=st.booleans(),
+        with_current=st.booleans(),
+    )
+    def test_chain_contention_should_round_trip_task_kind_carrying_live_tasks(
+        self, chain_id, with_owning, with_current
+    ):
+        """Test a task-kind ChainContention survives the wire carrying live tasks.
+
+        Given:
+            A ChainContention with kind "task" carrying live asyncio.Task
+            objects in any combination of the owning and current fields.
+        When:
+            The exception is pickled and unpickled.
+        Then:
+            It should restore as a ChainContention with kind "task" — not
+            a demoted RuntimeError — with each task field rendered as its
+            repr string and the message unchanged.
+        """
+
+        # Arrange, act, & assert
+        async def roundtrip() -> None:
+            async def idle() -> None:
+                await asyncio.sleep(0)
+
+            owning = asyncio.ensure_future(idle()) if with_owning else None
+            current = asyncio.ensure_future(idle()) if with_current else None
+            try:
+                exc = ChainContention(
+                    chain_id=chain_id,
+                    kind="task",
+                    owning_task=owning,
+                    current_task=current,
+                )
+                expected_message = str(exc)
+                expected_owning = repr(owning) if owning is not None else None
+                expected_current = repr(current) if current is not None else None
+
+                restored = pickle.loads(pickle.dumps(exc))
+
+                assert type(restored) is ChainContention
+                assert restored.kind == "task"
+                assert restored.chain_id == chain_id
+                assert restored.owning_task == expected_owning
+                assert restored.current_task == expected_current
+                assert str(restored) == expected_message
+            finally:
+                live = [t for t in (owning, current) if t is not None]
+                for task in live:
+                    task.cancel()
+                await asyncio.gather(*live, return_exceptions=True)
+
+        asyncio.run(roundtrip())
 
     def test_chain_contention_should_interpolate_chain_id_when_create_task_kind(self):
         """Test the create_task kind interpolates the chain id.
