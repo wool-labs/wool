@@ -20,6 +20,8 @@ from wool import protocol
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import Serializer
+from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.frame import ExceptionResponseFrame
 from wool.runtime.worker.frame import Frame
@@ -31,7 +33,7 @@ from wool.runtime.worker.frame import TaskRequestFrame
 from wool.runtime.worker.frame import ThrowRequestFrame
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
-_PoolKey: TypeAlias = tuple[str, grpc.ChannelCredentials | None, ChannelOptions]
+_PoolKey: TypeAlias = tuple[str, WorkerCredentials | None, ChannelOptions]
 
 _T = TypeVar("_T")
 
@@ -122,6 +124,160 @@ class TransientRpcError(RpcError):
 
 
 # public
+class HandshakeError(RpcError):
+    """Raised when the secure handshake with a worker cannot be completed.
+
+    A handshake error means the worker is reachable but the TLS/mTLS
+    handshake or peer authentication failed, e.g., a wrong certificate
+    authority, an identity that does not match what the client expects, an
+    expired or otherwise rejected certificate, or a plaintext-versus-
+    encrypted mismatch.  It is a *distinct, diagnosable* condition: an
+    operator can tell "workers are present but refused, or were refused by,
+    my credentials" apart from "no workers are present".
+
+    **Worker-health classification.** `HandshakeError` is a non-transient
+    `RpcError`, but a failed handshake is *recoverable* — the worker may
+    adopt rotated credentials out of band — so the load balancer treats it
+    like a transient error rather than evicting: it skips the worker
+    without removing it from the pool, leaving it to recover on a later
+    dispatch once its credentials resolve.  Each rejection is logged as a
+    warning carrying the gRPC code and details; that log is the observability
+    surface for diagnosing a fleet-wide credential misconfiguration.
+
+    :param code:
+        The gRPC status code, if available.
+    :param details:
+        The gRPC error details, if available.
+    """
+
+    def __init__(
+        self,
+        code: grpc.StatusCode | None = None,
+        details: str | None = None,
+    ):
+        super().__init__(code, details)
+
+
+# Broad tokens that gate promotion of an ambiguous ``UNAVAILABLE`` to a
+# handshake failure: their presence in the error text is positive evidence
+# that TLS — not plain unreachability — was involved. Kept deliberately wide
+# so the gate is robust across gRPC/BoringSSL versions; it decides only
+# *whether* a failure is a handshake failure. Matched case-insensitively as
+# substrings.
+_HANDSHAKE_TOKENS: Final = (
+    "ssl",
+    "tls",
+    "handshake",
+    "certificate",
+    "x509",
+    "alpn",
+    # gRPC wraps a failed peer/hostname/cert check from its TLS credentials in
+    # a "... verification check failed ..." status whose text carries none of
+    # the tokens above; treat it as positive TLS evidence so such a failure is
+    # never mistaken for plain unreachability.
+    "verification check failed",
+)
+
+
+def _error_text(error: grpc.RpcError) -> str:
+    """Extract a lowercased ``details`` + ``debug_error_string`` blob.
+
+    Defensive against errors that lack either accessor (e.g., a bare
+    `grpc.RpcError` without the call-side ``debug_error_string``)
+    so the classifier never raises on an unexpected error shape.
+
+    :param error:
+        The gRPC error to read.
+    :returns:
+        Concatenated, lowercased error text (possibly empty).
+    """
+    parts: list[str] = []
+    try:
+        details = error.details()
+    except Exception:
+        details = None
+    if details:
+        parts.append(str(details))
+    debug = getattr(error, "debug_error_string", None)
+    if callable(debug):
+        try:
+            blob = debug()
+        except Exception:
+            blob = None
+        if blob:
+            parts.append(str(blob))
+    return "\n".join(parts).lower()
+
+
+def _has_handshake_evidence(text: str) -> bool:
+    """Report whether the error text carries positive TLS/handshake evidence.
+
+    ``True`` gates an ambiguous ``UNAVAILABLE`` as a handshake failure; ``False``
+    leaves it as genuine transient unreachability.
+
+    :param text:
+        Lowercased error text from `_error_text`.
+    :returns:
+        Whether any handshake token is present in *text*.
+    """
+    return any(token in text for token in _HANDSHAKE_TOKENS)
+
+
+def _classify_handshake_failure(error: grpc.RpcError) -> HandshakeError | None:
+    """Classify a gRPC error as a handshake failure, or ``None``.
+
+    The decision is structural:
+
+    - ``UNAUTHENTICATED`` is always a handshake failure — the peer
+      rejected the client's certificate.
+    - ``UNAVAILABLE`` is ambiguous (a down worker looks the same as a
+      failed handshake), so it is promoted to a `HandshakeError`
+      only when the error text carries broad TLS evidence; otherwise
+      this returns ``None`` and the caller treats it as transient,
+      preserving the legacy behaviour exactly.
+    - All other codes are never handshake failures.
+
+    The failure is not sub-classified: wrong-CA, wrong-identity, expired-
+    certificate, and plaintext-versus-encrypted all surface as the same
+    `HandshakeError`, whose `RpcError` code and details carry the diagnostic
+    text the load balancer logs.
+
+    :param error:
+        The gRPC error raised during the dispatch handshake.
+    :returns:
+        A classified `HandshakeError`, or ``None`` if the failure is
+        not a handshake/authentication problem.
+    """
+    try:
+        code = error.code()
+    except Exception:
+        code = None
+
+    details = None
+    try:
+        details = error.details()
+    except Exception:
+        details = None
+    if not details:
+        # Avoid str(error): for an AioRpcError it embeds gRPC's
+        # debug_error_string (peer internal address, BoringSSL/C-core
+        # source paths), which would then ride on HandshakeError.details
+        # into logs and across the wire. Token classification still reads
+        # the verbose blob transiently via _error_text; it is just never
+        # stored on the surfaced exception.
+        code_name = code.name if code is not None else "UNKNOWN"
+        details = f"{code_name}: secure handshake failed"
+
+    if code == grpc.StatusCode.UNAUTHENTICATED:
+        return HandshakeError(code, details)
+    if code != grpc.StatusCode.UNAVAILABLE:
+        return None
+    if not _has_handshake_evidence(_error_text(error)):
+        return None
+    return HandshakeError(code, details)
+
+
+# public
 class WorkerConnection:
     """gRPC connection to a worker for task dispatch.
 
@@ -152,7 +308,10 @@ class WorkerConnection:
 
         Examples: ``localhost:50051``, ``192.0.2.1:50051``
     :param credentials:
-        Optional channel credentials for TLS/mTLS connections.
+        Optional `WorkerCredentials` or `WorkerCredentialsProvider` for
+        TLS/mTLS connections. A bare value is coerced to a provider; a
+        provider's material is resolved per dispatch so rotated credentials
+        are adopted on the next connection without reconnecting.
     :param options:
         Optional channel options controlling gRPC message
         size limits, keepalive, concurrency, and compression.
@@ -180,13 +339,16 @@ class WorkerConnection:
         self,
         target: str,
         *,
-        credentials: grpc.ChannelCredentials | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         options: ChannelOptions | None = None,
     ):
         self._target = target
-        self._credentials = credentials
+        self._provider = WorkerCredentialsProvider.coerce(credentials)
         self._options = options if options is not None else ChannelOptions()
-        self._key: _PoolKey = (target, credentials, self._options)
+        # The TCP key is recomputed on each dispatch from the resolved
+        # snapshot (so rotated material yields a new key); the last one is
+        # retained for ``close``. ``None`` until the first dispatch.
+        self._key: _PoolKey | None = None
         self._uds_key: _PoolKey | None = None
 
     async def dispatch(
@@ -277,16 +439,24 @@ class WorkerConnection:
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
 
+        # Resolve current credential material per dispatch so rotated
+        # material is adopted on the next connection (see class docstring).
+        credentials = self._provider.resolve() if self._provider is not None else None
+        tcp_key: _PoolKey = (self._target, credentials, self._options)
+        self._key = tcp_key
+
         if (
             metadata := wool.__worker_metadata__
         ) is not None and metadata.address == self._target:
             if (uds_address := wool.__worker_uds_address__) is not None:
+                # Self-dispatch routes over the loopback UDS, which is always
+                # insecure — the worker never does TLS/identity against itself.
                 key = (uds_address, None, self._options)
                 self._uds_key = key
             else:
-                key = self._key
+                key = tcp_key
         else:
-            key = self._key
+            key = tcp_key
 
         stream = self._execute(task, key, timeout)
         try:
@@ -294,6 +464,15 @@ class WorkerConnection:
         except grpc.RpcError as error:
             code = error.code()
             details = error.details() or str(error)
+            # A failed secure handshake (wrong CA, identity mismatch,
+            # expired/rejected cert, plaintext-vs-encrypted) is a distinct,
+            # diagnosable condition — surface it as `HandshakeError` so the
+            # load balancer does not collapse it into a generic "no workers
+            # available" outcome. Non-handshake failures fall through to the
+            # unchanged transient/non-transient split.
+            handshake = _classify_handshake_failure(error)
+            if handshake is not None:
+                raise handshake from error
             if code in self.TRANSIENT_ERRORS:
                 raise TransientRpcError(code, details) from error
             else:
@@ -315,14 +494,17 @@ class WorkerConnection:
     async def close(self):
         """Close the connection and release all pooled resources.
 
-        Clears the pooled channel entries for both the TCP key and,
+        Clears the pooled channel entries for the most recent TCP key and,
         if a UDS address is available, the UDS key. Idempotent: safe
         to call multiple times or on connections that were never used.
+        Channels for credentials superseded by rotation are not cleared
+        here; they expire from the pool via its TTL.
         """
-        try:
-            await _channel_pool.clear(self._key)
-        except KeyError:
-            pass
+        if self._key is not None:
+            try:
+                await _channel_pool.clear(self._key)
+            except KeyError:
+                pass
         if self._uds_key is not None:
             try:
                 await _channel_pool.clear(self._uds_key)
@@ -492,13 +674,20 @@ class _Channel:
 def _channel_factory(key):
     """Create a new `_Channel` for the given pool key.
 
+    Builds a secure channel from the key's `WorkerCredentials` when present,
+    or an insecure channel otherwise. When the credentials carry an
+    ``identity``, the channel verifies the worker's server certificate
+    against that configured logical identity (its SAN), via
+    ``grpc.ssl_target_name_override``, rather than the dynamically assigned
+    address it was dialed at. Full chain and SAN verification is preserved.
+
     :param key:
         Tuple of ``(target, credentials, options)``.
     :returns:
         A new `_Channel` instance.
     """
-    target, credentials, options = key
-    grpc_options = [
+    target, credentials, options = cast(_PoolKey, key)
+    grpc_options: list[tuple[str, int | str]] = [
         ("grpc.max_receive_message_length", options.max_receive_message_length),
         ("grpc.max_send_message_length", options.max_send_message_length),
         ("grpc.keepalive_time_ms", options.keepalive_time_ms),
@@ -515,7 +704,11 @@ def _channel_factory(key):
         ),
     ]
     if credentials is not None:
-        channel = grpc.aio.secure_channel(target, credentials, options=grpc_options)
+        if credentials.identity is not None:
+            grpc_options.append(("grpc.ssl_target_name_override", credentials.identity))
+        channel = grpc.aio.secure_channel(
+            target, credentials.client_credentials(), options=grpc_options
+        )
     else:
         channel = grpc.aio.insecure_channel(target, options=grpc_options)
     stub = protocol.WorkerStub(channel)
