@@ -1,5 +1,9 @@
 import datetime
+import functools
+import pickle
 from dataclasses import FrozenInstanceError
+from dataclasses import replace
+from pathlib import Path
 
 import cloudpickle
 import grpc
@@ -15,8 +19,8 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
-from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 
 
 def _generate_test_certificates():
@@ -337,9 +341,109 @@ class TestWorkerCredentials:
             # Restore permissions for cleanup
             restricted_file.chmod(0o644)
 
-    def test_server_credentials_should_return_server_credentials_when_mtls(
-        self, test_certificates
-    ):
+    def test_as_provider_should_return_non_reloadable_provider(self, temp_cert_files):
+        """Test as_provider wraps fixed credentials in a static provider.
+
+        Given:
+            Credentials loaded from PEM files.
+        When:
+            as_provider() is called.
+        Then:
+            It should return a non-reloadable WorkerCredentialsProvider whose
+            snapshot carries the same material.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        credentials = WorkerCredentials.from_files(ca_path, key_path, cert_path)
+
+        # Act
+        provider = credentials.as_provider()
+
+        # Assert
+        assert isinstance(provider, WorkerCredentialsProvider)
+        assert provider.reloadable is False
+        assert provider.resolve() == credentials
+
+    def test_as_provider_should_carry_identity(self, temp_cert_files):
+        """Test as_provider threads the expected identity through.
+
+        Given:
+            Credentials loaded from PEM files and an expected identity.
+        When:
+            as_provider() is called with that identity.
+        Then:
+            The resolved snapshot should carry the identity.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        credentials = WorkerCredentials.from_files(ca_path, key_path, cert_path)
+
+        # Act
+        provider = credentials.as_provider(identity="wool-worker")
+
+        # Assert
+        assert provider.resolve().identity == "wool-worker"
+
+    def test_as_provider_should_normalize_blank_identity(self, temp_cert_files):
+        """Test a blank identity is normalized away by as_provider.
+
+        Given:
+            Credentials and a whitespace-only identity.
+        When:
+            as_provider() is called and the snapshot resolved.
+        Then:
+            The resolved identity should be None (address-based path).
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        credentials = WorkerCredentials.from_files(ca_path, key_path, cert_path)
+
+        # Act
+        provider = credentials.as_provider(identity="  ")
+
+        # Assert
+        assert provider.resolve().identity is None
+
+    def test_from_files_should_raise_when_file_missing(self, temp_cert_files):
+        """Test from_files reads eagerly and propagates a missing file.
+
+        Given:
+            A non-existent CA path.
+        When:
+            from_files() is called.
+        Then:
+            It should raise FileNotFoundError.
+        """
+        # Arrange
+        _, key_path, cert_path = temp_cert_files
+
+        # Act & assert
+        with pytest.raises(FileNotFoundError):
+            WorkerCredentials.from_files("/nonexistent/ca.pem", key_path, cert_path)
+
+    def test_from_files_should_accept_path_objects(self, temp_cert_files):
+        """Test from_files accepts os.PathLike paths, not just strings.
+
+        Given:
+            The PEM file paths as pathlib.Path objects.
+        When:
+            from_files() is called with them.
+        Then:
+            It should load the same material as the string paths would.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+
+        # Act
+        credentials = WorkerCredentials.from_files(
+            Path(ca_path), Path(key_path), Path(cert_path)
+        )
+
+        # Assert
+        with open(ca_path, "rb") as f:
+            assert credentials.ca_cert == f.read()
+
+    def test_server_credentials_with_mtls(self, test_certificates):
         """Test server credentials property for mTLS.
 
         Given:
@@ -552,26 +656,28 @@ class TestWorkerCredentials:
         assert type(server1) is type(server2)
         assert type(client1) is type(client2)
 
-    @given(mutual=st.booleans())
+    @given(mutual=st.booleans(), identity=st.one_of(st.none(), st.text()))
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_pickle_roundtrip_should_produce_equal_instance(
-        self, mutual, test_certificates
-    ):
+    def test_pickle_roundtrip(self, mutual, identity, test_certificates):
         """Test WorkerCredentials survives pickle roundtrip.
 
         Given:
-            WorkerCredentials with valid certificates and any mutual
-            flag value.
+            WorkerCredentials with valid certificates, any mutual flag
+            value, and any identity.
         When:
             The instance is pickled and unpickled.
         Then:
-            It should produce an equal instance that still builds
-            valid gRPC credentials.
+            It should produce an equal instance — preserving the
+            identity — that still builds valid gRPC credentials.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
         creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=mutual
+            ca_cert=ca_pem,
+            worker_key=key_pem,
+            worker_cert=cert_pem,
+            mutual=mutual,
+            identity=identity,
         )
 
         # Act
@@ -620,27 +726,301 @@ class TestWorkerCredentials:
             WorkerCredentials.current()
 
 
-class TestCredentialContext:
-    """Test suite for the internal CredentialContext manager."""
+class TestWorkerCredentialsProvider:
+    """Test suite for WorkerCredentialsProvider."""
 
-    def test___exit___should_raise_when_invoked_without_enter(self):
-        """Test exit guards against running without a matching enter.
+    def test_coerce_should_normalize_value_provider_and_none(self, test_certificates):
+        """Test coerce wraps a bare value and passes a provider or None through.
 
         Given:
-            A CredentialContext that was never entered, so it holds no
-            reset token.
+            A bare WorkerCredentials, an existing provider, and None.
         When:
-            Its exit is invoked directly.
+            Each is passed to WorkerCredentialsProvider.coerce.
         Then:
-            It should raise RuntimeError — the credential reset is
-            guarded against running without a token from a matching
-            enter.
+            The bare value becomes a provider resolving to it, the provider is
+            returned unchanged, and None becomes None.
         """
         # Arrange
-        context = CredentialContext(credentials=None)  # type: ignore[arg-type]
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds)
 
         # Act & assert
-        # No ``with`` idiom can invoke ``__exit__`` without a matching
-        # ``__enter__``, so the misuse guard is exercised by a direct call.
-        with pytest.raises(RuntimeError, match="without matching __enter__"):
-            context.__exit__(None, None, None)
+        wrapped = WorkerCredentialsProvider.coerce(creds)
+        assert isinstance(wrapped, WorkerCredentialsProvider)
+        assert wrapped.resolve() == creds
+        assert WorkerCredentialsProvider.coerce(provider) is provider
+        assert WorkerCredentialsProvider.coerce(None) is None
+
+    def test_resolve_should_return_constant_credentials_when_not_reloadable(
+        self, test_certificates
+    ):
+        """Test a non-reloadable provider resolves to constant credentials.
+
+        Given:
+            A non-reloadable provider over fixed credential material and an
+            identity.
+        When:
+            resolve() is called more than once.
+        Then:
+            It should return the same credentials instance each time, with the
+            provider's identity stamped onto the material.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds, identity="wool-worker")
+
+        # Act
+        first = provider.resolve()
+        second = provider.resolve()
+
+        # Assert
+        assert first is second
+        assert first == replace(creds, identity="wool-worker")
+
+    def test_resolve_should_default_identity_to_none(self, test_certificates):
+        """Test a provider defaults to address-based verification.
+
+        Given:
+            A provider constructed without an identity.
+        When:
+            resolve() is called.
+        Then:
+            The snapshot identity should be None.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds)
+
+        # Act
+        snapshot = provider.resolve()
+
+        # Assert
+        assert snapshot.identity is None
+
+    def test_identity_should_expose_configured_identity(self, test_certificates):
+        """Test the identity property reflects construction.
+
+        Given:
+            A provider constructed with an identity.
+        When:
+            The identity property is read.
+        Then:
+            It should equal the configured identity.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act
+        provider = WorkerCredentialsProvider(lambda: creds, identity="wool-worker")
+
+        # Assert
+        assert provider.identity == "wool-worker"
+
+    def test_reloadable_should_reflect_the_flag(self, test_certificates):
+        """Test reloadable mirrors the constructor argument.
+
+        Given:
+            A non-reloadable and a reloadable provider over fixed material.
+        When:
+            Their reloadable flags are read.
+        Then:
+            They should be False and True respectively.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act & assert
+        assert WorkerCredentialsProvider(lambda: creds).reloadable is False
+        assert (
+            WorkerCredentialsProvider(lambda: creds, reloadable=True).reloadable is True
+        )
+
+    def test_resolve_should_normalize_blank_identity_to_none(self, test_certificates):
+        """Test a blank identity collapses to address-based verification.
+
+        Given:
+            A provider constructed with a whitespace-only identity.
+        When:
+            The identity property is read and the snapshot resolved.
+        Then:
+            Both should be None, taking the address-based path rather than
+            emitting an empty target-name override.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds, identity="   ")
+
+        # Act & assert
+        assert provider.identity is None
+        assert provider.resolve().identity is None
+
+    def test_non_reloadable_should_call_factory_once_at_construction(
+        self, test_certificates
+    ):
+        """Test a non-reloadable provider resolves eagerly and caches.
+
+        Given:
+            A non-reloadable provider over a counting factory.
+        When:
+            The provider is constructed and then resolved several times.
+        Then:
+            factory should be called exactly once, at construction.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        calls = []
+
+        def factory():
+            calls.append(1)
+            return creds
+
+        # Act
+        provider = WorkerCredentialsProvider(factory)
+        assert len(calls) == 1
+        provider.resolve()
+        provider.resolve()
+
+        # Assert
+        assert len(calls) == 1
+
+    def test_reloadable_should_call_factory_each_resolve(self, test_certificates):
+        """Test a reloadable provider consults factory on every resolution.
+
+        Given:
+            A reloadable provider over a counting factory.
+        When:
+            The provider is constructed and then resolved several times.
+        Then:
+            factory should be deferred at construction and called once per
+            resolve.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        calls = []
+
+        def factory():
+            calls.append(1)
+            return creds
+
+        # Act
+        provider = WorkerCredentialsProvider(factory, reloadable=True)
+        assert len(calls) == 0
+        provider.resolve()
+        provider.resolve()
+        provider.resolve()
+
+        # Assert
+        assert len(calls) == 3
+
+    def test_reloadable_resolve_should_reflect_rotated_material(self, test_certificates):
+        """Test a reloadable provider adopts material returned by factory.
+
+        Given:
+            A reloadable provider whose factory returns rotated material on the
+            second call.
+        When:
+            resolve() is called before and after the rotation.
+        Then:
+            The resolved credentials should differ, since each reflects
+            the current material.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        original = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        rotated = WorkerCredentials(
+            ca_cert=b"-----ROTATED-----\n" + ca_pem,
+            worker_key=key_pem,
+            worker_cert=cert_pem,
+        )
+        materials = iter([original, rotated])
+
+        # Act
+        provider = WorkerCredentialsProvider(lambda: next(materials), reloadable=True)
+        before = provider.resolve()
+        after = provider.resolve()
+
+        # Assert
+        assert before != after
+
+    def test_non_reloadable_pickle_should_drop_callback_and_ship_snapshot(
+        self, test_certificates
+    ):
+        """Test a non-reloadable provider pickles without its callback.
+
+        Given:
+            A non-reloadable provider built over a lambda, which the standard
+            library pickler cannot serialize directly.
+        When:
+            It is pickled with the standard library pickler and unpickled.
+        Then:
+            It should round-trip — the eager snapshot rides along and the
+            callback is dropped — and resolve to equal credentials.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds, identity="wool-worker")
+
+        # Act
+        restored = pickle.loads(pickle.dumps(provider))
+
+        # Assert
+        assert restored.resolve() == provider.resolve()
+        assert restored.identity == "wool-worker"
+
+    def test_reloadable_pickle_should_keep_factory_and_reread(self, temp_cert_files):
+        """Test a reloadable provider re-resolves through a pickle roundtrip.
+
+        Given:
+            A reloadable, file-backed provider (whose factory is picklable)
+            that has resolved once.
+        When:
+            It is pickled with the standard library pickler and unpickled.
+        Then:
+            The restored provider should keep its factory and resolve to
+            the same credentials by re-reading the unchanged files.
+        """
+        # Arrange
+        ca_path, key_path, cert_path = temp_cert_files
+        provider = WorkerCredentialsProvider(
+            functools.partial(
+                WorkerCredentials.from_files, ca_path, key_path, cert_path
+            ),
+            identity="wool-worker",
+            reloadable=True,
+        )
+        original = provider.resolve()
+
+        # Act
+        restored = pickle.loads(pickle.dumps(provider))
+
+        # Assert
+        assert restored.resolve() == original
