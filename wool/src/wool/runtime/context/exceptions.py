@@ -141,8 +141,8 @@ _KIND_MESSAGES: dict[str, str] = {
         "wool.to_thread to offload work onto a fresh, detached chain."
     ),
     "task": (
-        "wool.ContextVar accessed by task {current_task!r} but chain "
-        "{chain_id} is owned by task {owning_task!r}; a Wool chain cannot "
+        "wool.ContextVar accessed by task {current_task} but chain "
+        "{chain_id} is owned by task {owning_task}; a Wool chain cannot "
         "be entered by two tasks at once. Each task must run on "
         "its own chain — create child tasks the ordinary way (the task "
         "factory forks a fresh chain per task), or pass a fresh "
@@ -198,17 +198,21 @@ class ChainContention(WoolError):
     :param current_thread:
         Offending thread identity, when *kind* is ``"thread"``.
     :param owning_task:
-        Owner task, when *kind* is ``"task"``.
+        Owner task, when *kind* is ``"task"``; after a cross-process hop
+        the task's ``repr`` string instead (see `__reduce__`).
     :param current_task:
-        Offending task, when *kind* is ``"task"``.
+        Offending task, when *kind* is ``"task"``; after a cross-process
+        hop the task's ``repr`` string instead (see `__reduce__`).
     """
 
     chain_id: UUID
     kind: Literal["thread", "task", "create_task"]
     owning_thread: int | None
     current_thread: int | None
-    owning_task: asyncio.Future[Any] | None
-    current_task: asyncio.Future[Any] | None
+    # Post-wire ``str`` form documented on the ``owning_task`` /
+    # ``current_task`` params (see ``__reduce__``).
+    owning_task: asyncio.Future[Any] | str | None
+    current_task: asyncio.Future[Any] | str | None
 
     def __init__(
         self,
@@ -217,8 +221,8 @@ class ChainContention(WoolError):
         kind: Literal["thread", "task", "create_task"],
         owning_thread: int | None = None,
         current_thread: int | None = None,
-        owning_task: asyncio.Future[Any] | None = None,
-        current_task: asyncio.Future[Any] | None = None,
+        owning_task: asyncio.Future[Any] | str | None = None,
+        current_task: asyncio.Future[Any] | str | None = None,
     ) -> None:
         # Validate ``kind`` explicitly so an unknown value raises a
         # typed ``ValueError`` from a known origin rather than a bare
@@ -255,9 +259,19 @@ class ChainContention(WoolError):
         # ``serializer.dumps`` path, but the type-preserving fallback
         # rebuilds via ``cls(*exc.args)``, which our keyword-only
         # constructor rejects. ``__reduce__`` returning the structured
-        # kwargs as a ``(cls, (), state)`` triple keeps both paths
-        # intact: the structured fields ride the wire, and the message
-        # is re-composed by ``__init__`` on the receiver.
+        # kwargs keeps both paths intact: the structured fields ride the
+        # wire and the message is re-composed by ``__init__`` on the
+        # receiver.
+        #
+        # ``owning_task``/``current_task`` hold live ``asyncio.Task``
+        # objects, which are unpicklable — left as-is a ``kind="task"``
+        # contention fails the primary ``dumps`` *and* the
+        # ``cls(*exc.args)`` fallback, demoting to a plain
+        # ``RuntimeError`` across the wire (wool-labs/wool#256). Substitute
+        # their ``repr`` so the structured identity rides the wire as
+        # diagnostic text; the message templates render a live ``Task``
+        # and its ``repr`` identically, so the reconstructed message is
+        # unchanged.
         return (
             _reconstruct_chain_contention,
             (
@@ -265,8 +279,8 @@ class ChainContention(WoolError):
                 self.kind,
                 self.owning_thread,
                 self.current_thread,
-                self.owning_task,
-                self.current_task,
+                repr(self.owning_task) if self.owning_task is not None else None,
+                repr(self.current_task) if self.current_task is not None else None,
             ),
         )
 
@@ -276,8 +290,8 @@ def _reconstruct_chain_contention(
     kind: Literal["thread", "task", "create_task"],
     owning_thread: int | None,
     current_thread: int | None,
-    owning_task: asyncio.Future[Any] | None,
-    current_task: asyncio.Future[Any] | None,
+    owning_task: asyncio.Future[Any] | str | None,
+    current_task: asyncio.Future[Any] | str | None,
 ) -> ChainContention:
     """Module-level constructor for `ChainContention.__reduce__`."""
     return ChainContention(

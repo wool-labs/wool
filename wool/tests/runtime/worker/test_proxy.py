@@ -6,6 +6,7 @@ to avoid network overhead and ensure deterministic behavior.
 """
 
 import asyncio
+import contextvars
 import copy
 import pickle
 import uuid
@@ -23,6 +24,7 @@ from pytest_mock import MockerFixture
 
 import wool
 import wool.runtime.worker.proxy as wp
+from tests.helpers import _unique
 from wool import protocol
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.local import LocalDiscovery
@@ -2171,8 +2173,258 @@ class TestWorkerProxy:
         assert proxy.started
         assert len(proxy.workers) == 2
 
-        # Cleanup
-        await proxy.__aexit__(None, None, None)
+        # Cleanup. ``__aenter__`` ran inside ``enter_task``'s context, so the
+        # ``_armed`` token it minted cannot be reset from this (different)
+        # context; tear the started proxy down directly instead.
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_enter_should_not_arm_chain_when_called_directly(
+        self, mock_discovery_service
+    ):
+        """Test the direct enter() path does not arm the chain.
+
+        Given:
+            A fresh, unarmed context and a lazy proxy.
+        When:
+            `enter` is called directly (the path the worker pool factory
+            uses) rather than via the async context manager.
+        Then:
+            `wool.__proxy__` should be bound to the proxy, but the chain
+            should remain unarmed — only `__aenter__` arms, so the worker
+            pool path stays unguarded by design.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service)
+        assert wool.__chain__.get(None) is None
+
+        # Act
+        await proxy.enter()
+        try:
+            # Assert
+            assert wool.__proxy__.get() is proxy
+            assert wool.__chain__.get(None) is None
+        finally:
+            await proxy.exit()
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_arm_chain_for_contention_guard(
+        self, mock_discovery_service
+    ):
+        """Test entering a proxy via the context manager arms the chain.
+
+        Given:
+            A fresh, unarmed context.
+        When:
+            A proxy is entered as an async context manager.
+        Then:
+            The chain should be armed inside the block — this is what
+            brings `wool.__proxy__`'s lifecycle under the contention
+            guard.
+        """
+        # Arrange
+        assert wool.__chain__.get(None) is None
+
+        # Act & assert
+        async with WorkerProxy(discovery=mock_discovery_service):
+            assert wool.__chain__.get(None) is not None
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_preserve_active_proxy_when_second_task_contends(
+        self, mock_discovery_service
+    ):
+        """Test a contended second entry never clobbers the first proxy.
+
+        Given:
+            Two tasks share one context; the first enters `proxy_first`
+            (binding `wool.__proxy__`) and holds it open.
+        When:
+            The second task, sharing that context it does not own, enters
+            its own `proxy_second` and the entry is rejected.
+        Then:
+            It should raise `wool.ChainContention` (kind ``"task"``)
+            before enter() runs, so the first task still observes
+            `wool.__proxy__` as `proxy_first` — the active proxy is never
+            silently clobbered.
+        """
+        # Arrange
+        wool.install_task_factory()
+        loop = asyncio.get_running_loop()
+        shared = contextvars.copy_context()
+        proxy_first = WorkerProxy(discovery=mock_discovery_service)
+        proxy_second = WorkerProxy(discovery=mock_discovery_service)
+        armed = asyncio.Event()
+        first_can_finish = asyncio.Event()
+        observed: dict[str, object] = {}
+
+        async def first() -> None:
+            async with proxy_first:
+                observed["before"] = wool.__proxy__.get()
+                armed.set()
+                await first_can_finish.wait()
+                observed["after"] = wool.__proxy__.get()
+
+        async def second() -> BaseException | None:
+            await armed.wait()
+            try:
+                async with proxy_second:
+                    return None
+            except wool.ChainContention as exc:
+                return exc
+            finally:
+                first_can_finish.set()
+
+        # Act
+        first_task = loop.create_task(first(), context=shared)
+        second_task = loop.create_task(second(), context=shared)
+        contention, _ = await asyncio.gather(second_task, first_task)
+
+        # Assert
+        assert isinstance(contention, wool.ChainContention)
+        assert contention.kind == "task"
+        assert observed["before"] is proxy_first
+        assert observed["after"] is proxy_first
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_raise_when_foreign_task_enters_pre_armed_context(
+        self, mock_discovery_service
+    ):
+        """Test entering a proxy on a pre-armed, foreign-owned context fails.
+
+        Given:
+            A `contextvars.Context` already armed and owned by a first
+            task via a plain `wool.ContextVar` (not a proxy); the first
+            task then enters its own proxy without raising and holds it.
+        When:
+            A second task, sharing that context it does not own, enters a
+            proxy.
+        Then:
+            It should raise `wool.ChainContention` with kind ``"task"`` —
+            the guard keys on chain ownership, not on the proxy having
+            done the arming.
+        """
+        # Arrange
+        wool.install_task_factory()
+        loop = asyncio.get_running_loop()
+        shared = contextvars.copy_context()
+        marker = wool.ContextVar(_unique("prearmed"))
+        armed = asyncio.Event()
+        first_can_finish = asyncio.Event()
+
+        async def first() -> None:
+            marker.set("owned-by-first")
+            async with WorkerProxy(discovery=mock_discovery_service):
+                armed.set()
+                await first_can_finish.wait()
+
+        async def second() -> BaseException | None:
+            await armed.wait()
+            try:
+                async with WorkerProxy(discovery=mock_discovery_service):
+                    return None
+            except wool.ChainContention as exc:
+                return exc
+            finally:
+                first_can_finish.set()
+
+        # Act
+        first_task = loop.create_task(first(), context=shared)
+        second_task = loop.create_task(second(), context=shared)
+        observed, _ = await asyncio.gather(second_task, first_task)
+
+        # Assert
+        assert isinstance(observed, wool.ChainContention)
+        assert observed.kind == "task"
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_bind_inner_then_revert_to_outer_when_nested(
+        self, mock_discovery_service
+    ):
+        """Test nesting two proxies in one task rebinds then reverts.
+
+        Given:
+            One task and two distinct lazy proxies.
+        When:
+            The task enters an outer proxy and, while it is open, enters
+            an inner proxy.
+        Then:
+            Neither entry should raise — a single owner satisfies the
+            guard — and `wool.__proxy__` should be the inner proxy inside
+            the nested block and revert to the outer proxy after it.
+        """
+        # Arrange
+        outer = WorkerProxy(discovery=mock_discovery_service)
+        inner = WorkerProxy(discovery=mock_discovery_service)
+
+        # Act & assert
+        async with outer:
+            assert wool.__proxy__.get() is outer
+            async with inner:
+                assert wool.__proxy__.get() is inner
+            assert wool.__proxy__.get() is outer
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_not_raise_in_forked_child_when_parent_armed(
+        self, mock_discovery_service
+    ):
+        """Test a forked child entering a proxy under an armed parent is fine.
+
+        Given:
+            A parent task whose context is already armed (a bound
+            `wool.ContextVar`), then a child task forked the ordinary way.
+        When:
+            The forked child enters its own proxy.
+        Then:
+            It should not raise — the task factory forks a fresh,
+            child-owned chain, so the child owns the chain it arms (this
+            discriminates from the concurrent-isolation negative, which
+            starts from an unarmed parent).
+        """
+        # Arrange
+        wool.install_task_factory()
+        marker = wool.ContextVar(_unique("parent_armed"))
+        marker.set("parent")
+
+        async def child() -> None:
+            async with WorkerProxy(discovery=mock_discovery_service):
+                await asyncio.sleep(0)
+
+        # Act & assert
+        await asyncio.create_task(child())
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_isolate_distinct_proxies_across_concurrent_tasks(
+        self, mock_discovery_service
+    ):
+        """Test concurrent coroutines each entering their own proxy stay isolated.
+
+        Given:
+            Two coroutines, each entering a distinct proxy, run
+            concurrently as ordinary separate tasks.
+        When:
+            They run via asyncio.gather.
+        Then:
+            Neither should raise and each should observe its own proxy as
+            `wool.__proxy__` — each coroutine task runs in its own context
+            with its own chain, so distinct proxies never collide or cross
+            over (the common concurrent-dispatch case).
+        """
+        # Arrange
+        proxy_a = WorkerProxy(discovery=mock_discovery_service)
+        proxy_b = WorkerProxy(discovery=mock_discovery_service)
+        seen: dict[str, object] = {}
+
+        async def use(proxy: WorkerProxy, key: str) -> None:
+            async with proxy:
+                await asyncio.sleep(0)
+                seen[key] = wool.__proxy__.get()
+
+        # Act
+        await asyncio.gather(use(proxy_a, "a"), use(proxy_b, "b"))
+
+        # Assert
+        assert seen["a"] is proxy_a
+        assert seen["b"] is proxy_b
 
     @pytest.mark.asyncio
     async def test_cloudpickle_serialization_preserves_quorum(

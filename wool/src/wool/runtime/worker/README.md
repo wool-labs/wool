@@ -252,6 +252,10 @@ Worker subprocesses can dispatch tasks to other workers. Each subprocess is conf
 
 Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagates its `lazy` flag to every `WorkerProxy` it constructs, and each task serializes the proxy (including the flag) so that workers receiving the task inherit the same laziness setting. A lazy proxy defers discovery subscription and worker-sentinel task setup until its first `dispatch()` call, so workers that never invoke nested routines pay no startup cost.
 
+### Concurrent-entry guard
+
+`wool.__proxy__` — the active proxy a nested `@wool.routine` reads to dispatch — is a plain `contextvars.ContextVar`, so it is invisible to the [chain-contention guard](../context/README.md#the-chain-contention-guard). To stop two tasks that share one `contextvars.Context` from silently clobbering each other's proxy (last-write-wins, so both dispatch through the wrong proxy), `WorkerProxy.__aenter__` arms a guarded marker (`WorkerProxy._armed`, a `wool.ContextVar`) before binding the proxy, so a contended second entry fails loud instead of corrupting the first task's dispatch — see `WorkerProxy.__aenter__` for the precise contract. A consequence is that entering a proxy with `async with` arms the chain, even when the routine sets no `wool.ContextVar` of its own. Only the `async with` path arms: the worker pool binds `wool.__proxy__` through `enter()` directly, which deliberately leaves the chain unarmed.
+
 ## Connections
 
 `WorkerProxy` is the client-side bridge between routines and workers. It manages discovery, connection pooling, and load-balanced dispatch.
