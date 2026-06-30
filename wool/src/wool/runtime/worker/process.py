@@ -5,13 +5,14 @@ import contextlib
 import logging
 import multiprocessing as _mp
 import os
+import shutil
 import signal
 import socket
 import sys
-import tempfile
 import threading
 import time
 import uuid
+import warnings
 from contextlib import contextmanager
 from functools import partial
 from multiprocessing.connection import Connection
@@ -27,9 +28,11 @@ import wool
 from wool import protocol
 from wool.runtime.context.factory import install_task_factory
 from wool.runtime.resourcepool import ResourcePool
-from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import credentials_scope
 from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.exceptions import SlowCredentialResolutionWarning
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.service import WorkerService
@@ -43,6 +46,15 @@ Pipe = _ctx.Pipe
 Process = _ctx.Process
 
 logger = logging.getLogger(__name__)
+
+# A worker's own credentials are resolved once, before it serves. The
+# resolution is awaited so it cannot stall the child's event loop, but a
+# slow one still delays the worker becoming available and, from outside,
+# is indistinguishable from a hung start. Warn once this much of it has
+# elapsed, while the resolution is still running — a warning that waited
+# for the resolution to finish would arrive exactly when it stopped being
+# useful.
+_SLOW_STARTUP_RESOLVE_S: Final = 5.0
 
 _HAS_UDS: Final[bool] = hasattr(socket, "AF_UNIX")
 
@@ -65,9 +77,8 @@ class WorkerProcess(Process):
     startup. Handles SIGTERM and SIGINT for graceful shutdown.
 
     Spawned daemonic by default, so a worker still alive at interpreter
-    exit never blocks it and never outlives its parent. One
-    consequence: daemonic processes cannot spawn
-    `multiprocessing` children (including
+    exit never blocks it and never outlives its parent. One consequence:
+    daemonic processes cannot spawn `multiprocessing` children (including
     `concurrent.futures.ProcessPoolExecutor`), so a routine that must
     create them requires a non-daemonic worker; `subprocess` and
     `asyncio` subprocesses are unaffected.
@@ -81,7 +92,11 @@ class WorkerProcess(Process):
     :param proxy_pool_ttl:
         Proxy pool TTL in seconds.
     :param credentials:
-        Optional worker credentials for TLS/mTLS.
+        Optional worker credentials for TLS/mTLS — either a
+        `WorkerCredentials` or a `WorkerCredentialsProvider`. With a
+        reloadable provider, rotated material is adopted without
+        restarting the worker — see `_server_credentials` for the
+        per-handshake mechanics.
     :param options:
         gRPC message size options. Defaults to
         `WorkerOptions` with 100 MB limits.
@@ -126,7 +141,7 @@ class WorkerProcess(Process):
     _metadata: WorkerMetadata | None
     _shutdown_grace_period: float
     _proxy_pool_ttl: float
-    _credentials: WorkerCredentials | None
+    _provider: WorkerCredentialsProvider | None
     _options: WorkerOptions
 
     def __init__(
@@ -137,7 +152,7 @@ class WorkerProcess(Process):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
-        credentials: WorkerCredentials | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         options: WorkerOptions | None = None,
         tags: frozenset[str] = frozenset(),
         extra: dict[str, Any] | None = None,
@@ -158,7 +173,7 @@ class WorkerProcess(Process):
         if proxy_pool_ttl <= 0:
             raise ValueError("Proxy pool TTL must be positive")
         self._proxy_pool_ttl = proxy_pool_ttl
-        self._credentials = credentials
+        self._provider = WorkerCredentialsProvider.coerce(credentials)
         self._options = options or WorkerOptions()
         self._uid = uid if uid is not None else uuid.uuid4()
         self._tags = tags
@@ -305,6 +320,67 @@ class WorkerProcess(Process):
             logger.exception(f"Worker process crashed: {type(e).__name__}: {e}")
             raise
 
+    async def _server_credentials(self) -> grpc.ServerCredentials | None:
+        """Build the gRPC server credentials for this worker.
+
+        Returns ``None`` for an insecure worker.  A reloadable provider
+        yields `grpc.dynamic_ssl_server_credentials` whose fetcher
+        re-resolves the provider on each new connection, so rotated
+        certificate, key, or CA material is adopted without restarting the
+        worker; the fetcher rides the provider's caching (see
+        `WorkerCredentialsProvider.credentials`), and established
+        connections continue on their existing material.  A static
+        provider takes the unchanged `WorkerCredentials.server_credentials`
+        path so the static-mTLS posture is byte-for-byte preserved. The
+        mutual-TLS mode is fixed from the initial material, i.e., rotation
+        replaces the bytes, not the handshake mode.
+
+        :returns:
+            Server credentials, or ``None`` for an insecure worker.
+        """
+        provider = self._provider
+        if provider is None:
+            return None
+        initial = await self._resolve_startup_credentials(provider)
+        if provider.reloadable:
+            return grpc.dynamic_ssl_server_credentials(
+                initial.server_certificate_configuration(),
+                # Synchronous by necessity: the gRPC core calls this per
+                # handshake, from its own thread, with no loop to await on.
+                lambda: provider.credentials.get().server_certificate_configuration(),
+                require_client_authentication=initial.mutual,
+            )
+        return initial.server_credentials()
+
+    async def _resolve_startup_credentials(
+        self, provider: WorkerCredentialsProvider
+    ) -> WorkerCredentials:
+        """Resolve this worker's own credentials before it begins serving.
+
+        Awaited rather than read inline so a ``factory`` that blocks cannot
+        stall the child's event loop while the server is still being built.
+        Nothing is being served yet, so the delay is invisible to callers;
+        it is not invisible to whoever is waiting for the worker to come
+        up, so a timer warns them the moment it turns pathological rather
+        than once it is over. Keeping the loop free is what lets that timer
+        fire at all, which is the second reason this is awaited.
+        """
+        handle = asyncio.get_running_loop().call_later(
+            _SLOW_STARTUP_RESOLVE_S,
+            lambda: warnings.warn(
+                f"Worker credential resolution has exceeded "
+                f"{_SLOW_STARTUP_RESOLVE_S:g}s and is still running; a slow "
+                f"credential factory delays the worker becoming available.",
+                SlowCredentialResolutionWarning,
+                stacklevel=2,
+            ),
+        )
+        try:
+            return await provider.credentials
+        finally:
+            # A no-op once it has fired, so this needs no guard.
+            handle.cancel()
+
     async def _serve(self):
         """Run the worker's gRPC server for the lifetime of the process.
 
@@ -312,11 +388,38 @@ class WorkerProcess(Process):
         registers the worker service, ties the process's lifetime to
         its parent via the parent-death watchdog, installs credential
         and signal-handler context managers, and blocks until a
-        shutdown signal fires.
+        shutdown signal fires.  Where the platform supports ``AF_UNIX``,
+        also binds the loopback self-dispatch socket — an insecure
+        Unix-domain port whose reachability is confined to the worker's
+        own uid (see the worker README's "Local self-dispatch socket"
+        for the trust boundary).
+
+        .. rubric:: Implementation notes
+
+        Self-dispatch socket placement.  The socket serves the full,
+        unauthenticated dispatch service, so it is bound inside a
+        per-worker ``0700`` directory.  That directory lives under a
+        short base — ``$XDG_RUNTIME_DIR`` (the per-user runtime dir on
+        Linux, already a 0700 tmpfs) where set and present, else
+        ``/tmp`` — rather than the system temp dir, because an
+        ``AF_UNIX`` path is capped near 104 bytes (108 on Linux, as
+        little as 92 on some platforms) and macOS's per-user
+        ``$TMPDIR`` (``/var/folders/.../T``) is deep enough to
+        overflow it.  The directory name is derived deterministically
+        from the worker uid (``wool-{uid}``) so a respawned worker
+        reclaims whatever an unclean exit (SIGKILL/OOM skips the
+        graceful removal in the ``finally`` block) left behind: uids
+        are unique per worker instance — each defaults to a fresh
+        ``uuid4`` at construction — so any pre-existing entry at the
+        path can only be a dead predecessor's, and it is removed
+        before the directory is recreated.  Creation uses a bare
+        ``mkdir(0o700)``, not ``makedirs(exist_ok=True)``, so a
+        concurrent recreation or a symlink planted between removal
+        and creation raises instead of silently binding through it.
         """
         creds_ctx = (
-            CredentialContext(self._credentials)
-            if self._credentials is not None
+            credentials_scope(self._provider)
+            if self._provider is not None
             else contextlib.nullcontext()
         )
         with creds_ctx:
@@ -366,11 +469,7 @@ class WorkerProcess(Process):
             server = grpc.aio.server(
                 interceptors=[VersionInterceptor()], options=grpc_options
             )
-            credentials = (
-                self._credentials.server_credentials()
-                if self._credentials is not None
-                else None
-            )
+            credentials = await self._server_credentials()
             address = self._address(self._host, self._port)
 
             if credentials is not None:
@@ -379,13 +478,23 @@ class WorkerProcess(Process):
                 port = server.add_insecure_port(address)
 
             uds_address = None
+            uds_dir = None
             if _HAS_UDS:
-                uds_path = os.path.join(tempfile.gettempdir(), f"wool-{self._uid}.sock")
-                uds_target = f"unix:{uds_path}"
-                with contextlib.suppress(OSError):
-                    os.unlink(uds_path)
-                server.add_insecure_port(uds_target)
-                uds_address = uds_target
+                # Uid-confined, self-reclaiming socket dir — see this
+                # method's implementation notes.
+                uds_base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+                if not os.path.isdir(uds_base):
+                    uds_base = "/tmp"
+                uds_dir = os.path.join(uds_base, f"wool-{self._uid}")
+                if os.path.lexists(uds_dir):
+                    if os.path.isdir(uds_dir) and not os.path.islink(uds_dir):
+                        shutil.rmtree(uds_dir)
+                    else:
+                        os.unlink(uds_dir)
+                os.mkdir(uds_dir, 0o700)
+                uds_path = os.path.join(uds_dir, "dispatch.sock")
+                server.add_insecure_port(f"unix:{uds_path}")
+                uds_address = f"unix:{uds_path}"
 
             backpressure = (
                 cloudpickle.loads(self._backpressure)
@@ -413,7 +522,7 @@ class WorkerProcess(Process):
                         version=protocol.__version__,
                         tags=self._tags,
                         extra=MappingProxyType(self._extra),
-                        secure=self._credentials is not None,
+                        secure=self._provider is not None,
                         options=self._options.channel,
                     )
                     wool.__worker_metadata__ = metadata
@@ -438,6 +547,9 @@ class WorkerProcess(Process):
                         uds_path = uds_address.removeprefix("unix:")
                         with contextlib.suppress(OSError):
                             os.unlink(uds_path)
+                        if uds_dir is not None:
+                            with contextlib.suppress(OSError):
+                                os.rmdir(uds_dir)
 
     def _address(self, host, port) -> str:
         """Format network address for the given host and port.

@@ -37,6 +37,7 @@ def test_public_api_completeness_should_match_expected_surface():
         "TransientRpcError",
         "HandshakeError",
         "UnexpectedResponse",
+        "SlowCredentialResolutionWarning",
         "UnparsableVersionWarning",
         "WorkerConnection",
         "ChainContention",
