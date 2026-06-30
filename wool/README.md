@@ -327,6 +327,10 @@ Wool ships with two discovery protocols:
 
 Custom discovery protocols are supported via structural subtyping — implement the `DiscoveryLike` protocol and pass it to `WorkerPool`.
 
+### Discovery is an untrusted hint
+
+Discovery is **not** an authenticated channel. A worker self-advertises its `WorkerMetadata` (including the `secure` flag) over the discovery plane, and no built-in protocol authenticates those advertisements — they are forgeable by anything that can write to the plane. The advertised `secure` flag only gates transport *compatibility* (a client won't dial a plaintext peer with TLS credentials, or vice versa); it is not a trust signal. Trust is established solely by the mTLS handshake performed when a connection is made, so a forged advertisement still cannot complete a handshake without a CA-trusted certificate (and a matching SAN when an identity is configured). See the worker package's _Security → Discovery-plane trust_ note for details.
+
 ## Load balancing
 
 The load balancer decides which worker handles each dispatched task. The `WorkerProxy` maintains a load balancer and a context of discovered workers with gRPC connections. It waits for at least one worker to become available, then the load balancer selects one.
@@ -412,11 +416,15 @@ async with wool.WorkerPool(spawn=4, credentials=creds):
 
 With mutual TLS (`mutual=True`), the server requires client authentication — both sides present and verify certificates signed by the same CA. With one-way TLS (`mutual=False`), the server presents its certificate for the client to verify, but the client remains anonymous at the transport layer. The `mutual` flag controls `require_client_auth` on the server and whether the client includes its key and cert when opening the channel.
 
+### Identity-based verification and rotation
+
+`WorkerCredentials` describes a fixed snapshot of material verified against the dialed address — which breaks on platforms (Kubernetes, ECS/Fargate) that assign a worker's address at startup and rotate credentials out of band. For those, supply a **credential provider** anywhere `credentials=` is accepted; a bare `WorkerCredentials` is wrapped in a non-reloadable provider automatically, so existing deployments are unaffected. `WorkerCredentials.from_files(...).as_provider(identity=...)` adapts fixed material, while `WorkerCredentialsProvider(factory, identity=..., reloadable=True)` wraps any callable returning the current `WorkerCredentials`. Setting `identity` verifies a discovered worker's certificate against a stable logical identity (its SAN, via gRPC's `ssl_target_name_override`) instead of the dialed address — full chain and SAN verification preserved, so a wrong or untrusted certificate is still rejected. A reloadable provider re-invokes its factory per resolution, so a long-running worker (server) and pool (client) adopt rotated cert/key/CA material on subsequent connections without a restart; in-flight dispatches finish on their existing channel, and the reload strategy (re-read a file, poll a secrets manager, cache with a TTL) lives in your `factory`. See [`src/wool/runtime/worker/README.md`](src/wool/runtime/worker/README.md#credential-providers-identity-and-rotation) for details.
+
 ### Discovery security filtering
 
-Each `WorkerMetadata` carries a `secure` boolean flag set at startup based on whether the worker was given credentials. The `WorkerProxy` applies a security filter to discovery events: a proxy with credentials only accepts workers with `secure=True`, and a proxy without credentials only accepts workers with `secure=False`. This prevents secure proxies from connecting to insecure workers and vice versa, but does not guard against incompatible credentials between two secure peers (e.g., certificates signed by different CAs).
+Each `WorkerMetadata` carries a `secure` boolean flag set at startup based on whether the worker was given credentials. The `WorkerProxy` applies a security filter to discovery events: a proxy with credentials only accepts workers with `secure=True`, and a proxy without credentials only accepts workers with `secure=False`. This prevents secure proxies from connecting to insecure workers and vice versa, but does not by itself guard against incompatible credentials between two secure peers (e.g., certificates signed by different CAs) — that case is caught at the handshake.
 
-If a TLS handshake fails (e.g., incompatible, invalid, or expired certificates), gRPC surfaces it as an `RpcError`. The `WorkerConnection` classifies the error by status code using the same transient/non-transient logic as any other gRPC failure — there is no TLS-specific error handling path.
+A failed TLS/mTLS handshake surfaces as a `HandshakeError` (a non-transient `RpcError`): the load balancer skips the worker without eviction (so a rotated worker recovers on a later dispatch), and a dispatch that drains entirely on handshake failures raises the plain `NoWorkersAvailable`. See `HandshakeError` for the `reason` classification and how it is handled.
 
 ## Error handling
 
@@ -450,6 +458,7 @@ Before dispatch, the caller's `WorkerConnection` serializes the routine callable
 The handshake opens the bidirectional stream, writes the task frame, and reads the first response. Failures classify by gRPC status code:
 
 - **Transient** (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`) — surfaces as `TransientRpcError`. The load balancer skips to the next worker. `NoWorkersAvailable` is raised if a full cycle of all workers is exhausted without success.
+- **Handshake/authentication** (`UNAUTHENTICATED`, or `UNAVAILABLE` carrying TLS evidence) — surfaces as `HandshakeError` (a non-transient `RpcError`). The load balancer skips the worker without eviction, so a rotated credential is retried on a later dispatch; see `HandshakeError` for the typed `reason` and the recoverability contract.
 - **Non-transient** (everything else, including `FAILED_PRECONDITION` for protocol-version mismatch and `INTERNAL` for handler-side bugs) — surfaces as `RpcError`. The load balancer evicts the worker from its context.
 
 Version compatibility is checked by `VersionInterceptor` **before** the dispatch handler runs. A mismatch aborts the RPC with `FAILED_PRECONDITION`; the caller observes `RpcError(FAILED_PRECONDITION)` like any other handshake rejection. (The `Nack` frame retains its in-stream role only for parse-phase rejections — see the next section.)
