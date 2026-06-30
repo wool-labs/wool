@@ -45,12 +45,14 @@ from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.auth import current_credentials
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.noreentry import noreentry
+from wool.utilities.throttle import Throttle
 
 if TYPE_CHECKING:
     from contextvars import Token
@@ -130,10 +132,17 @@ DEFAULT_QUORUM: Final[int] = 1
 """Default minimum worker count required before dispatch."""
 
 DEFAULT_QUORUM_TIMEOUT: Final[float] = 60.0
-"""Default seconds to wait for ``quorum`` workers before raising :class:`asyncio.TimeoutError`."""
+"""Default seconds to wait for ``quorum`` workers before raising
+:class:`asyncio.TimeoutError`."""
 
 DEFAULT_LAZY: Final[bool] = True
-"""Default lazy-start behavior: defer discovery setup and the quorum wait to first dispatch."""
+"""Default lazy-start behavior: defer discovery setup and the quorum wait to
+first dispatch."""
+
+# Minimum wall-clock interval between identical handshake-failure warnings
+# for one worker. A rejected worker is retried at dispatch rate, so this is
+# what keeps a persistent rejection from flooding the log.
+_HANDSHAKE_WARNING_INTERVAL_S: Final[float] = 60.0
 
 
 # public
@@ -211,6 +220,42 @@ def _restore_proxy(
     return proxy
 
 
+class _HandshakeWarningThrottle:
+    """Per-worker suppression for repeated handshake-failure warnings.
+
+    Bounds the log volume of a handshake-rejected worker that is retried
+    forever, keying `Throttle` on the worker's uid and comparing on
+    ``str(exc)``: the first rejection per worker logs immediately,
+    identical rejections then log at most once per
+    ``_HANDSHAKE_WARNING_INTERVAL_S`` carrying a count of what they
+    suppressed, and a rejection whose detail differs logs immediately.
+    Callers discard a worker's entry when it leaves the pool or
+    dispatches successfully, so a recovered or re-added worker logs fresh
+    and state stays bounded by pool size. Event-loop-confined, which is
+    what `Throttle` requires.
+    """
+
+    def __init__(self) -> None:
+        self._throttle = Throttle(_HANDSHAKE_WARNING_INTERVAL_S)
+
+    def warn(self, metadata: WorkerMetadata, exc: HandshakeError) -> None:
+        """Log the rejection, unless suppressed by the cadence contract."""
+        emit, suppressed = self._throttle.due(metadata.uid, str(exc))
+        if not emit:
+            return
+        _logger.warning(
+            "Skipping worker %s at %s after handshake failure: %s%s",
+            metadata.uid,
+            metadata.address,
+            exc,
+            f" ({suppressed} similar warnings suppressed)" if suppressed else "",
+        )
+
+    def discard(self, uid: uuid.UUID) -> None:
+        """Forget a worker so its next failure logs fresh."""
+        self._throttle.discard(uid)
+
+
 class WorkerProxy:
     """Client-side proxy for dispatching tasks to distributed workers.
 
@@ -233,8 +278,8 @@ class WorkerProxy:
     closed — a worker whose advertised version does not parse is
     rejected, and if the local protocol version is unresolvable no
     worker is admitted at all (observable as the quorum
-    `asyncio.TimeoutError`). The gate is re-derived from the credential
-    context and protocol version of whichever process holds the proxy,
+    `asyncio.TimeoutError`). The gate is re-derived from the
+    credentials and protocol version of whichever process holds the proxy,
     so a static-worker proxy re-gated after serialization may admit
     fewer workers than at construction, and its construction-time
     quorum check (see ``:raises ValueError:``) does not carry across a
@@ -329,10 +374,11 @@ class WorkerProxy:
     :param credentials:
         Optional credentials for TLS/mTLS connections to workers — either a
         `WorkerCredentials` or a `WorkerCredentialsProvider` (from
-        `WorkerCredentials.as_provider`, or built with a fetch callback for
+        `WorkerCredentials.as_provider`, or built with a factory callable for
         identity-based verification or credential rotation). A bare
-        `WorkerCredentials` is wrapped in a non-reloadable provider. Defaults
-        to resolving from the ambient credential context.
+        `WorkerCredentials` is wrapped in a non-reloadable provider. When
+        omitted, a proxy created inside a worker defaults to that worker's
+        own credentials; otherwise connections are insecure.
     :param lease:
         Maximum number of workers this proxy will admit from discovery.
         Defaults to ``None`` (unbounded).  The cap counts distinct
@@ -553,9 +599,9 @@ class WorkerProxy:
             resolved = current_credentials()
         else:
             resolved = credentials
-        # Normalize either a bare WorkerCredentials or a provider (from the
-        # argument or the ambient credential context) into a provider the
-        # sentinel resolves per connection.
+        # Normalize an explicitly passed value into a provider the sentinel
+        # resolves per connection; an ambient read already yields a coerced
+        # provider (see credentials_scope), for which this is a no-op.
         self._provider = WorkerCredentialsProvider.coerce(resolved)
 
         # Build both halves of the admission gate from the resolved
@@ -602,6 +648,7 @@ class WorkerProxy:
                 )
         self._sentinel_task: asyncio.Task[None] | None = None
         self._loadbalancer_context: LoadBalancerContext | None = None
+        self._handshake_throttle: _HandshakeWarningThrottle | None = None
 
     async def __aenter__(self):
         """Enter the proxy context and set it as the active proxy.
@@ -834,6 +881,11 @@ class WorkerProxy:
             )
 
             self._loadbalancer_context = LoadBalancerContext()
+            # Built here, not in __init__, so its keys cannot outlive the
+            # pool membership they mirror: a uid stranded by teardown could
+            # never be discarded again, since a respawned worker gets a
+            # fresh one.
+            self._handshake_throttle = _HandshakeWarningThrottle()
             self._workers_changed = asyncio.Event()
             self._sentinel_task = asyncio.create_task(self._worker_sentinel())
             stack.push_async_callback(self._teardown_sentinel)
@@ -863,6 +915,7 @@ class WorkerProxy:
                 pass
             self._sentinel_task = None
         self._loadbalancer_context = None
+        self._handshake_throttle = None
         self._loadbalancer_service = None
         self._loadbalancer_context_manager = None
         self._discovery_stream = None
@@ -990,7 +1043,12 @@ class WorkerProxy:
         Only `RpcError` is treated as a worker-health signal:
         a non-transient `RpcError` triggers eviction from the
         context before the balancer is notified, so it observes the
-        capacity change when choosing the next candidate.
+        capacity change when choosing the next candidate; a
+        `TransientRpcError` skips the worker without eviction. A
+        `HandshakeError` is skipped without eviction by the same rule
+        (see `HandshakeError` for the recoverability and logging
+        contract and `_HandshakeWarningThrottle` for the warning
+        cadence).
 
         Exceptions that are not worker-health signals — e.g., a
         strict-mode `wool.ChainSerializationError` or a
@@ -1016,6 +1074,7 @@ class WorkerProxy:
             after receiving a success signal via ``asend``.
         """
         assert self._loadbalancer_context is not None
+        assert self._handshake_throttle is not None
         ctx = self._loadbalancer_context
         generator = loadbalancer.delegate(task, context=ctx)
         try:
@@ -1044,11 +1103,22 @@ class WorkerProxy:
                     # eviction.
                     if not isinstance(exc, TransientRpcError):
                         ctx.remove_worker(metadata)
+                        self._handshake_throttle.discard(metadata.uid)
+                    elif isinstance(exc, HandshakeError):
+                        # Transient by the worker-health contract, so the
+                        # split above already skips without eviction; this
+                        # branch only selects the diagnostic warning — see
+                        # HandshakeError and _HandshakeWarningThrottle.
+                        self._handshake_throttle.warn(metadata, exc)
                     try:
                         uid = await generator.athrow(exc)
                     except StopAsyncIteration:
                         raise NoWorkersAvailable() from exc
                     continue
+
+                # Successful dispatch: a later failure from this worker
+                # is a new incident — see _HandshakeWarningThrottle.
+                self._handshake_throttle.discard(uid)
 
                 # Success path: connection.dispatch() returned a live
                 # stream. The proxy owns it until handed off via
@@ -1216,6 +1286,7 @@ class WorkerProxy:
         unknown worker is a no-op.
         """
         assert self._loadbalancer_context is not None
+        assert self._handshake_throttle is not None
         assert self._discovery_stream is not None
         assert self._workers_changed is not None
 
@@ -1250,6 +1321,9 @@ class WorkerProxy:
                                 reason,
                             )
                             self._loadbalancer_context.remove_worker(event.metadata)
+                            # Departed the pool — see
+                            # _HandshakeWarningThrottle.
+                            self._handshake_throttle.discard(uid)
                             self._workers_changed.set()
                         else:
                             # Fires per rescan for standing chaff, so
@@ -1282,4 +1356,6 @@ class WorkerProxy:
                         self._workers_changed.set()
                 case "worker-dropped":
                     self._loadbalancer_context.remove_worker(event.metadata)
+                    # Departed the pool — see _HandshakeWarningThrottle.
+                    self._handshake_throttle.discard(event.metadata.uid)
                     self._workers_changed.set()

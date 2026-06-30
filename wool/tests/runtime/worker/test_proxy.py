@@ -9,6 +9,7 @@ import asyncio
 import contextvars
 import copy
 import inspect
+import logging
 import pickle
 import uuid
 import warnings
@@ -27,6 +28,7 @@ from pytest_mock import MockerFixture
 
 import wool
 import wool.runtime.worker.proxy as wp
+import wool.utilities.throttle as wt
 from tests.helpers import _unique
 from wool import protocol
 from wool.runtime.discovery.base import DiscoveryEvent
@@ -37,6 +39,7 @@ from wool.runtime.routine.task import Task
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.auth import credentials_scope
 from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
@@ -6430,16 +6433,16 @@ class TestWorkerProxy:
         await proxy.stop()
 
     @pytest.mark.asyncio
-    async def test_sentinel_should_pass_provider_to_connection(
+    async def test_start_should_pass_provider_to_connection_when_worker_added(
         self, worker_credentials, mocker: MockerFixture
     ):
-        """Test the sentinel forwards the proxy's provider to connections.
+        """Test start forwards the proxy's provider to new connections.
 
         Given:
             A non-lazy WorkerProxy constructed with a credential provider
             and a discovery stream yielding a worker-added event.
         When:
-            The sentinel processes the event.
+            The proxy is started and processes the event.
         Then:
             It should create the WorkerConnection with that same provider,
             so the connection resolves rotated material per dispatch.
@@ -6952,6 +6955,15 @@ def _make_outcome_connection(outcome, marker, mocker: MockerFixture):
     return connection
 
 
+def _handshake_warnings(caplog, uid):
+    """Return the captured handshake-warning records mentioning ``uid``."""
+    return [
+        record
+        for record in caplog.records
+        if "handshake" in record.getMessage().lower() and str(uid) in record.getMessage()
+    ]
+
+
 class _GatedDiscovery:
     """Discovery stream yielding initial events, then gated deferred events.
 
@@ -7124,6 +7136,482 @@ class TestWorkerProxyDispatchRetryEviction:
         # to athrow — only the healthy worker remained visible.
         assert len(observed_workers_during_athrow) == 1
         assert observed_workers_during_athrow[0] == [metadata_list[1]]
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_skip_worker_without_eviction_when_handshake_fails(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Test handshake failures skip to the next candidate without eviction.
+
+        Given:
+            A delegating balancer with two workers; the first worker's
+            connection raises ``HandshakeError``, the second succeeds
+        When:
+            dispatch() is called
+        Then:
+            The proxy skips the first worker without evicting it,
+            dispatches to the second, and logs a warning carrying the
+            rejected worker's uid and address.
+        """
+        # Arrange
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(
+            side_effect=HandshakeError(details="certificate verify failed")
+        )
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
+
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=[failing_connection, success_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.proxy"):
+            result_stream = await proxy.dispatch(mock_wool_task)
+            results = [r async for r in result_stream]
+
+        # Assert
+        assert results == ["ok"]
+        # Handshake failures do NOT evict workers — the worker may adopt
+        # rotated credentials out of band.
+        assert metadata_list[0] in proxy.workers
+        assert metadata_list[1] in proxy.workers
+        assert any(
+            "handshake" in record.getMessage().lower()
+            and str(metadata_list[0].uid) in record.getMessage()
+            and metadata_list[0].address in record.getMessage()
+            for record in caplog.records
+        )
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_spare_worker_via_contract_when_handshake_fails(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test the isinstance contract alone spares a handshake-rejected worker.
+
+        Given:
+            A delegating balancer with two workers; the first worker's
+            connection raises ``HandshakeError``, the second succeeds
+        When:
+            dispatch() is called and the failure is thrown into the balancer
+        Then:
+            The exception the balancer observes should satisfy
+            ``isinstance(exc, TransientRpcError)`` — the documented
+            worker-health contract — and that classification alone should
+            spare the worker from eviction, so any contract-honoring
+            consumer gets skip-without-evict with no handshake special case.
+        """
+        # Arrange
+        observed_exceptions: list = []
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(
+            side_effect=HandshakeError(details="certificate verify failed")
+        )
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
+
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=[failing_connection, success_connection],
+            loadbalancer=make_delegating_balancer(
+                on_throw=lambda exception, context: observed_exceptions.append(exception)
+            ),
+            mocker=mocker,
+        )
+
+        # Act
+        result_stream = await proxy.dispatch(mock_wool_task)
+        results = [r async for r in result_stream]
+
+        # Assert
+        assert results == ["ok"]
+        # The balancer observed the failure as a TransientRpcError — the
+        # published three-way contract, not a handshake carve-out.
+        assert len(observed_exceptions) == 1
+        assert isinstance(observed_exceptions[0], HandshakeError)
+        assert isinstance(observed_exceptions[0], TransientRpcError)
+        # The transient classification spared the worker from eviction.
+        assert metadata_list[0] in proxy.workers
+        assert metadata_list[1] in proxy.workers
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_no_workers_and_keep_pool_when_all_reject(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test a fully-rejected pool drains without evicting its workers.
+
+        Given:
+            A delegating balancer whose every worker's connection raises
+            ``HandshakeError``
+        When:
+            dispatch() is called
+        Then:
+            It should raise NoWorkersAvailable while every worker remains
+            in the pool — handshake failures skip without eviction, so
+            the pool survives to recover once credentials resolve.
+        """
+        # Arrange
+        connections = []
+        for _ in range(2):
+            connection = mocker.MagicMock(spec=WorkerConnection)
+            connection.dispatch = mocker.AsyncMock(
+                side_effect=HandshakeError(details="certificate verify failed")
+            )
+            connections.append(connection)
+
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=connections,
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable):
+            await proxy.dispatch(mock_wool_task)
+        assert metadata_list[0] in proxy.workers
+        assert metadata_list[1] in proxy.workers
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_suppress_handshake_warning_when_repeat_in_window(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Test an identical repeated handshake failure is suppressed.
+
+        Given:
+            A delegating balancer with two workers; the first worker's
+            connection always raises ``HandshakeError`` with unchanged
+            details, the second succeeds
+        When:
+            dispatch() is called twice within the throttle window
+        Then:
+            It should log exactly one handshake warning for the failing
+            worker — the identical repeat is suppressed
+        """
+        # Arrange
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(
+            side_effect=HandshakeError(details="certificate verify failed")
+        )
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=[failing_connection, success_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.proxy"):
+            for _ in range(2):
+                stream = await proxy.dispatch(mock_wool_task)
+                async for _ in stream:
+                    pass
+
+        # Assert
+        assert len(_handshake_warnings(caplog, metadata_list[0].uid)) == 1
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_log_handshake_warning_when_detail_changes(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Test a handshake failure with new details bypasses suppression.
+
+        Given:
+            A delegating balancer with two workers; the first worker's
+            connection raises ``HandshakeError`` with different details
+            on each attempt, the second succeeds
+        When:
+            dispatch() is called twice within the throttle window
+        Then:
+            It should log both handshake warnings — a changed detail is
+            new signal and emits immediately
+        """
+        # Arrange
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(
+            side_effect=[
+                HandshakeError(details="certificate verify failed"),
+                HandshakeError(details="certificate expired"),
+            ]
+        )
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=[failing_connection, success_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.proxy"):
+            for _ in range(2):
+                stream = await proxy.dispatch(mock_wool_task)
+                async for _ in stream:
+                    pass
+
+        # Assert
+        records = _handshake_warnings(caplog, metadata_list[0].uid)
+        assert len(records) == 2
+        assert "certificate verify failed" in records[0].getMessage()
+        assert "certificate expired" in records[1].getMessage()
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_flush_suppressed_count_when_interval_elapses(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Test a post-interval repeat re-emits carrying the suppressed count.
+
+        Given:
+            A delegating balancer with two workers; the first worker's
+            connection always raises an identical ``HandshakeError``,
+            the second succeeds, and the proxy module's monotonic clock
+            is controlled by the test
+        When:
+            dispatch() is called three times within the throttle window
+            and once more after the window elapses
+        Then:
+            It should log two handshake warnings for the failing
+            worker, the second carrying a count of the two suppressed
+            occurrences
+        """
+        # Arrange
+        clock = {"now": 100.0}
+        # The cadence clock lives in the shared throttle the proxy delegates to.
+        mocker.patch.object(wt, "time", mocker.Mock(monotonic=lambda: clock["now"]))
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(
+            side_effect=HandshakeError(details="certificate verify failed")
+        )
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=[failing_connection, success_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.proxy"):
+            for _ in range(3):
+                stream = await proxy.dispatch(mock_wool_task)
+                async for _ in stream:
+                    pass
+            clock["now"] = 161.0
+            stream = await proxy.dispatch(mock_wool_task)
+            async for _ in stream:
+                pass
+
+        # Assert
+        records = _handshake_warnings(caplog, metadata_list[0].uid)
+        assert len(records) == 2
+        assert "(2 similar warnings suppressed)" in records[1].getMessage()
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_log_handshake_warning_when_worker_readded(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Test worker removal resets suppression so a re-add logs fresh.
+
+        Given:
+            A delegating balancer with one worker whose connection
+            always raises an identical ``HandshakeError``, and a gated
+            discovery stream holding a ``worker-dropped`` event and a
+            same-uid re-add for that worker
+        When:
+            dispatch() fails twice within the throttle window, the
+            worker is then dropped and re-added, and dispatch() fails
+            again with the same details
+        Then:
+            It should log two handshake warnings — one for the first
+            incident and one for the re-added worker — neither carrying
+            a suppressed count
+        """
+        # Arrange
+        gate = asyncio.Event()
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50100",
+            pid=9000,
+            version=protocol.__version__,
+        )
+        readded = WorkerMetadata(
+            uid=worker.uid,
+            address="127.0.0.1:50109",
+            pid=9009,
+            version=protocol.__version__,
+        )
+        connections = []
+        for _ in range(2):
+            connection = mocker.MagicMock(spec=WorkerConnection)
+            connection.dispatch = mocker.AsyncMock(
+                side_effect=HandshakeError(details="certificate verify failed")
+            )
+            connections.append(connection)
+        discovery = _GatedDiscovery(
+            initial=[DiscoveryEvent("worker-added", metadata=worker)],
+            deferred=[
+                DiscoveryEvent("worker-dropped", metadata=worker),
+                DiscoveryEvent("worker-added", metadata=readded),
+            ],
+            gate=gate,
+        )
+        proxy, _ = await _make_proxy_with_workers(
+            connections=connections,
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+            discovery=discovery,
+            metadata_list=[worker],
+        )
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.proxy"):
+            for _ in range(2):
+                with pytest.raises(NoWorkersAvailable):
+                    await proxy.dispatch(mock_wool_task)
+            gate.set()
+            await _drain_until(lambda: readded in proxy.workers)
+            with pytest.raises(NoWorkersAvailable):
+                await proxy.dispatch(mock_wool_task)
+
+        # Assert
+        records = _handshake_warnings(caplog, worker.uid)
+        assert len(records) == 2
+        assert all("suppressed" not in r.getMessage() for r in records)
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_log_handshake_warning_when_worker_recovered(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Test a successful dispatch resets suppression for that worker.
+
+        Given:
+            A delegating balancer with one worker whose connection
+            raises ``HandshakeError``, then succeeds, then raises the
+            identical ``HandshakeError`` again
+        When:
+            dispatch() is called three times within the throttle window
+        Then:
+            It should log both handshake warnings — the success between
+            them starts a new incident, so the second failure is not
+            suppressed
+        """
+
+        # Arrange
+        async def _stream():
+            yield "ok"
+
+        connection = mocker.MagicMock(spec=WorkerConnection)
+        connection.dispatch = mocker.AsyncMock(
+            side_effect=[
+                HandshakeError(details="certificate verify failed"),
+                _stream(),
+                HandshakeError(details="certificate verify failed"),
+            ]
+        )
+        proxy, [metadata] = await _make_proxy_with_workers(
+            connections=[connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.proxy"):
+            with pytest.raises(NoWorkersAvailable):
+                await proxy.dispatch(mock_wool_task)
+            stream = await proxy.dispatch(mock_wool_task)
+            async for _ in stream:
+                pass
+            with pytest.raises(NoWorkersAvailable):
+                await proxy.dispatch(mock_wool_task)
+
+        # Assert
+        records = _handshake_warnings(caplog, metadata.uid)
+        assert len(records) == 2
+        assert all("suppressed" not in r.getMessage() for r in records)
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_key_handshake_warnings_per_worker(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Test handshake-warning suppression state is keyed per worker.
+
+        Given:
+            A delegating balancer with two workers whose connections
+            both always raise an identical ``HandshakeError``
+        When:
+            dispatch() is called twice within the throttle window
+        Then:
+            It should log one handshake warning per worker on the first
+            call — neither worker's first failure is masked by the
+            other's — and suppress both repeats on the second
+        """
+        # Arrange
+        connections = []
+        for _ in range(2):
+            connection = mocker.MagicMock(spec=WorkerConnection)
+            connection.dispatch = mocker.AsyncMock(
+                side_effect=HandshakeError(details="certificate verify failed")
+            )
+            connections.append(connection)
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=connections,
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.proxy"):
+            for _ in range(2):
+                with pytest.raises(NoWorkersAvailable):
+                    await proxy.dispatch(mock_wool_task)
+
+        # Assert
+        assert len(_handshake_warnings(caplog, metadata_list[0].uid)) == 1
+        assert len(_handshake_warnings(caplog, metadata_list[1].uid)) == 1
         await proxy.stop()
 
     @pytest.mark.asyncio
