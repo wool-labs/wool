@@ -18,8 +18,10 @@ if TYPE_CHECKING:
 class NoWorkersAvailable(Exception):
     """Raised when no workers are available for task dispatch.
 
-    This exception indicates that either no workers exist in the worker pool
-    or all available workers have been tried and failed.
+    Either the pool is empty, or every worker tried was unusable. A worker
+    that fails the secure handshake is skipped without eviction (see
+    `HandshakeError`), so a pool that drains entirely on handshake failures
+    still raises this bare condition.
     """
 
 

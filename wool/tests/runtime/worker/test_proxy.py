@@ -28,7 +28,8 @@ from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.routine.task import Task
-from wool.runtime.worker.auth import CredentialContext
+from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import credentials_scope
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -3320,7 +3321,7 @@ class TestWorkerProxy:
             version="1.0.0",
             secure=False,
         )
-        with CredentialContext(worker_credentials):
+        with credentials_scope(worker_credentials):
             # Unpickle restores proxy with credentials from ContextVar.
             # Verify by constructing a new proxy (same mechanism) with
             # static workers — default credentials resolve from ContextVar.
@@ -3517,7 +3518,7 @@ class TestWorkerProxy:
         )
 
         # Act — ContextVar has mTLS creds, but we pass None explicitly
-        with CredentialContext(worker_credentials):
+        with credentials_scope(worker_credentials):
             proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
                 credentials=None,
@@ -3566,7 +3567,7 @@ class TestWorkerProxy:
         )
 
         # Act
-        with CredentialContext(worker_credentials):
+        with credentials_scope(worker_credentials):
             proxy = WorkerProxy(
                 workers=[secure_worker, insecure_worker],
                 lazy=False,
@@ -3578,6 +3579,150 @@ class TestWorkerProxy:
         # Assert — resolved from ContextVar: only secure workers
         assert secure_worker in proxy.workers
         assert insecure_worker not in proxy.workers
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test___init___should_admit_secure_workers_when_provider_supplied(
+        self, mock_proxy_session, worker_credentials, mocker: MockerFixture
+    ):
+        """Test a credential provider engages the secure discovery filter.
+
+        Given:
+            A non-lazy WorkerProxy constructed with a credential provider
+            and a mix of secure and insecure static workers.
+        When:
+            The proxy starts.
+        Then:
+            Only the secure worker should be admitted, exactly as for a
+            bare WorkerCredentials.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        provider = WorkerCredentialsProvider(
+            lambda: worker_credentials, identity="wool-worker"
+        )
+        secure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.100:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=True,
+        )
+        insecure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.101:50052",
+            pid=1002,
+            version="1.0.0",
+            secure=False,
+        )
+
+        # Act
+        proxy = WorkerProxy(
+            workers=[secure_worker, insecure_worker],
+            credentials=provider,
+            lazy=False,
+        )
+        await proxy.start()
+        await asyncio.sleep(0.05)
+
+        # Assert
+        assert secure_worker in proxy.workers
+        assert insecure_worker not in proxy.workers
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test___init___should_resolve_provider_from_context(
+        self, mock_proxy_session, worker_credentials, mocker: MockerFixture
+    ):
+        """Test a provider bound in the credential context is resolved.
+
+        Given:
+            A credential provider is active in the credential context and a
+            non-lazy WorkerProxy with secure and insecure static workers is
+            created without explicit credentials.
+        When:
+            The proxy starts.
+        Then:
+            It should resolve the provider from the context and admit only
+            the secure worker.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        provider = WorkerCredentialsProvider(lambda: worker_credentials)
+        secure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.100:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=True,
+        )
+        insecure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.101:50052",
+            pid=1002,
+            version="1.0.0",
+            secure=False,
+        )
+
+        # Act
+        with credentials_scope(provider):
+            proxy = WorkerProxy(
+                workers=[secure_worker, insecure_worker],
+                lazy=False,
+            )
+        await proxy.start()
+        await asyncio.sleep(0.05)
+
+        # Assert
+        assert secure_worker in proxy.workers
+        assert insecure_worker not in proxy.workers
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_sentinel_should_pass_provider_to_connection(
+        self, worker_credentials, mocker: MockerFixture
+    ):
+        """Test the sentinel forwards the proxy's provider to connections.
+
+        Given:
+            A non-lazy WorkerProxy constructed with a credential provider
+            and a discovery stream yielding a worker-added event.
+        When:
+            The sentinel processes the event.
+        Then:
+            It should create the WorkerConnection with that same provider,
+            so the connection resolves rotated material per dispatch.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        provider = WorkerCredentialsProvider(lambda: worker_credentials)
+        channel_opts = ChannelOptions(keepalive_time_ms=60000)
+        metadata = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.100:50051",
+            pid=1001,
+            version="1.0.0",
+            options=channel_opts,
+        )
+        mock_conn_cls = mocker.patch.object(
+            wp, "WorkerConnection", return_value=mocker.MagicMock()
+        )
+        events = [DiscoveryEvent("worker-added", metadata=metadata)]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, credentials=provider, lazy=False)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        mock_conn_cls.assert_called_once_with(
+            metadata.address,
+            credentials=provider,
+            options=channel_opts,
+        )
+
+        # Cleanup
         await proxy.stop()
 
     @pytest.mark.asyncio

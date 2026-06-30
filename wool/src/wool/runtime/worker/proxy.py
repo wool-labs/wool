@@ -35,8 +35,9 @@ from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
-from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import current_credentials
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.noreentry import noreentry
@@ -280,7 +281,12 @@ class WorkerProxy:
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
     :param credentials:
-        Optional channel credentials for TLS/mTLS connections to workers.
+        Optional credentials for TLS/mTLS connections to workers — either a
+        `WorkerCredentials` or a `WorkerCredentialsProvider` (from
+        `WorkerCredentials.as_provider`, or built with a fetch callback for
+        identity-based verification or credential rotation). A bare
+        `WorkerCredentials` is wrapped in a non-reloadable provider. Defaults
+        to resolving from the ambient credential context.
     :param lease:
         Maximum number of workers this proxy will admit from discovery.
         Defaults to ``None`` (unbounded).
@@ -331,7 +337,7 @@ class WorkerProxy:
     _loadbalancer_manager: (
         AsyncContextManager[LoadBalancerLike] | ContextManager[LoadBalancerLike]
     )
-    _credentials: WorkerCredentials | None
+    _provider: WorkerCredentialsProvider | None
 
     @overload
     def __init__(
@@ -341,7 +347,9 @@ class WorkerProxy:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: (
+            WorkerCredentials | WorkerCredentialsProvider | None | UndefinedType
+        ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
@@ -356,7 +364,9 @@ class WorkerProxy:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: (
+            WorkerCredentials | WorkerCredentialsProvider | None | UndefinedType
+        ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
@@ -371,7 +381,9 @@ class WorkerProxy:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: (
+            WorkerCredentials | WorkerCredentialsProvider | None | UndefinedType
+        ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
@@ -389,7 +401,9 @@ class WorkerProxy:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: (
+            WorkerCredentials | WorkerCredentialsProvider | None | UndefinedType
+        ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None | UndefinedType = Undefined,
@@ -457,12 +471,16 @@ class WorkerProxy:
             )
 
         if credentials is Undefined:
-            self._credentials = CredentialContext.current()
+            resolved = current_credentials()
         else:
-            self._credentials = credentials
+            resolved = credentials
+        # Normalize either a bare WorkerCredentials or a provider (from the
+        # argument or the ambient credential context) into a provider the
+        # sentinel resolves per connection.
+        self._provider = WorkerCredentialsProvider.coerce(resolved)
 
         # Create security filter based on resolved credentials
-        security_filter = self._create_security_filter(self._credentials)
+        security_filter = self._create_security_filter(self._provider)
         version_filter = self._create_version_filter()
 
         def compatible(w):
@@ -843,7 +861,7 @@ class WorkerProxy:
             ctx.__exit__(*args)
 
     def _create_security_filter(
-        self, credentials: WorkerCredentials | None
+        self, provider: WorkerCredentialsProvider | None
     ) -> Callable[[WorkerMetadata], bool]:
         """Create discovery filter based on proxy credentials.
 
@@ -851,12 +869,12 @@ class WorkerProxy:
         - Proxy with credentials only discovers workers with secure=True
         - Proxy without credentials only discovers workers with secure=False
 
-        :param credentials:
-            Channel credentials for this proxy.
+        :param provider:
+            Credential provider for this proxy, or ``None``.
         :returns:
             Predicate function for filtering workers by security compatibility.
         """
-        if credentials is not None:
+        if provider is not None:
             # Proxy has credentials: only accept secure workers
             return lambda metadata: metadata.secure
         else:
@@ -912,11 +930,7 @@ class WorkerProxy:
         assert self._loadbalancer_context is not None
         assert self._discovery_stream is not None
         assert self._workers_changed is not None
-        client_credentials = (
-            self._credentials.client_credentials()
-            if self._credentials is not None
-            else None
-        )
+        provider = self._provider
         async for event in self._discovery_stream:
             match event.type:
                 case "worker-added" | "worker-updated":
@@ -928,7 +942,7 @@ class WorkerProxy:
                         continue
                     connection = WorkerConnection(
                         event.metadata.address,
-                        credentials=client_credentials,
+                        credentials=provider,
                         options=event.metadata.options,
                     )
                     if event.type == "worker-added":

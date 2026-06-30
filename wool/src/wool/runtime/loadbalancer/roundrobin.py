@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import Final
 
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 
@@ -104,6 +105,17 @@ class RoundRobinLoadBalancer(LoadBalancerLike):
                     logger.debug(
                         "Skipping worker %s on transient error: %s",
                         metadata.uid,
+                        exc,
+                    )
+                    self._index[context] = self._index[context] + 1
+                    continue
+                except HandshakeError as exc:
+                    # Skip without eviction — see HandshakeError for the
+                    # recoverability contract.
+                    logger.warning(
+                        "Skipping worker %s at %s after handshake failure: %s",
+                        metadata.uid,
+                        metadata.address,
                         exc,
                     )
                     self._index[context] = self._index[context] + 1
