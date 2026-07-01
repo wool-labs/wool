@@ -24,8 +24,8 @@ from zeroconf import Zeroconf
 from zeroconf.asyncio import AsyncServiceBrowser
 from zeroconf.asyncio import AsyncZeroconf
 
-from wool.exception import WoolError
-from wool.exception import WoolWarning
+from wool.exceptions import WoolError
+from wool.exceptions import WoolWarning
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryEventType

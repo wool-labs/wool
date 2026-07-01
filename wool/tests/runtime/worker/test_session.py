@@ -2,7 +2,7 @@
 
 These tests exercise :class:`Rejected` and :class:`DispatchSession` through
 their public surface (constructor, ``async with``, ``async for``,
-:meth:`drain`, :meth:`cancel`, public attributes ``task``/``context``/
+:meth:`drain`, :meth:`cancel`, public attributes ``task``/``decoded``/
 ``serializer``). Worker-loop interactions use the
 ``new_event_loop + threading.Thread + install_task_factory`` pattern
 so the handler can drive a real :func:`scoped` routine across loops.
@@ -22,12 +22,10 @@ from tests.runtime.worker.conftest import PicklableMock
 from wool import protocol
 from wool.protocol import WorkerStub
 from wool.protocol import add_WorkerServicer_to_server
-from wool.runtime.context import Context
-from wool.runtime.context import install_task_factory
+from wool.runtime.context.factory import install_task_factory
+from wool.runtime.context.manifest import ChainManifest
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
-from wool.runtime.serializer import PassthroughSerializer
-from wool.runtime.serializer import _passthrough_pool
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
 from wool.runtime.worker.session import DispatchSession
@@ -85,6 +83,25 @@ async def _slow_coro():
     return "never"
 
 
+# Module-level Event so the routine and the test share one instance
+# under cloudpickle transport — the routine is pickled by reference and
+# resolves this global on the worker side (a closure-captured Event
+# would not pickle; see ``_slow_coro``). The routine sets it on entering
+# its blocking step so a cancel-mid-step test knows the worker is
+# suspended *inside* ``_drive_step``'s per-step ``await`` before it
+# cancels.
+_STEP_BLOCKING = threading.Event()
+
+
+async def _gen_blocks_in_step():
+    """Async generator whose first step signals then blocks forever, so
+    a cancel preempts the in-flight per-step task rather than racing the
+    routine's completion."""
+    _STEP_BLOCKING.set()
+    await asyncio.sleep(3600)
+    yield "never"
+
+
 async def _gen_yielding_unpicklable():
     """Async generator that yields a non-cloudpickle-serializable
     object so the dispatch handler's :meth:`_Response.to_protobuf`
@@ -110,6 +127,31 @@ def _sync_callable():
     return "not_async"
 
 
+# Unarmed-worker regression fixture — a module-level wool.ContextVar
+# with a default plus a coroutine routine that offloads, via *plain*
+# asyncio.to_thread, a function that reads it. When the routine is
+# dispatched with no caller Wool state, the worker chain stays
+# unarmed, so the offload runs as a plain contextvars context and the
+# read returns the default instead of tripping ChainContention.
+# Module-level so the routine and the var are picklable for cloudpickle
+# transport.
+_UNARMED_WORKER_VAR: wool.ContextVar[str] = wool.ContextVar(
+    "unarmed_worker_var", default="unset-default"
+)
+
+
+def _read_unarmed_worker_var() -> str:
+    """Read the unarmed-worker regression var — runs in the offload thread."""
+    return _UNARMED_WORKER_VAR.get()
+
+
+async def _coro_offloads_plain_to_thread():
+    """Coroutine routine that offloads a wool.ContextVar read via
+    plain asyncio.to_thread.
+    """
+    return await asyncio.to_thread(_read_unarmed_worker_var)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -127,14 +169,24 @@ def _make_task(callable_obj):
     )
 
 
-def _request_for(task: Task, *, serializer=None) -> protocol.Request:
+def _request_for(task: Task) -> protocol.Request:
     """Build a first-frame Request carrying *task*'s protobuf."""
-    return protocol.Request(task=task.to_protobuf(serializer=serializer))
+    return protocol.Request(task=task.to_protobuf())
 
 
-def _next_request() -> protocol.Request:
-    """Build a follow-up ``next`` request frame."""
-    return protocol.Request(next=protocol.Void())
+def _next_request(*, with_context: bool = False) -> protocol.Request:
+    """Build a follow-up ``next`` request frame.
+
+    When *with_context* is True, sets an empty (but present)
+    ``context`` field on the wire so tests that exercise the
+    chain-manifest decode path see a present-but-empty wire frame
+    rather than the absent-field path that lazy-wire-frame semantics
+    short-circuit.
+    """
+    request = protocol.Request(next=protocol.Void())
+    if with_context:
+        request.context.CopyFrom(protocol.ChainManifest())
+    return request
 
 
 async def _stream(*requests):
@@ -181,7 +233,7 @@ def grpc_stub_cls():
 class TestRejected:
     """Tests for :class:`Rejected`."""
 
-    def test___init___with_arbitrary_exception(self):
+    def test___init___should_expose_original_and_stringify(self):
         """Test :class:`Rejected` wraps an arbitrary exception.
 
         Given:
@@ -202,7 +254,9 @@ class TestRejected:
         assert rejected.original is original
         assert str(rejected) == "ValueError: malformed task id"
 
-    def test___init___with_custom_exception_subclass(self):
+    def test___init___should_preserve_subclass_name_and_str_when_custom_exception(
+        self,
+    ):
         """Test :class:`Rejected` preserves a custom subclass and ``str()``.
 
         Given:
@@ -239,7 +293,7 @@ class TestDispatchSession:
 
     # -- construction -----------------------------------------------------
 
-    def test___init___with_request_stream_and_worker_loop(
+    def test___init___should_leave_public_attrs_unset(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :class:`DispatchSession` constructor leaves public attrs unset.
@@ -250,7 +304,7 @@ class TestDispatchSession:
             :class:`DispatchSession` is constructed
         Then:
             It should be created without raising and ``task`` /
-            ``context`` / ``serializer`` should be unset before
+            ``decoded`` / ``serializer`` should be unset before
             ``__aenter__``.
         """
         # Arrange
@@ -262,25 +316,23 @@ class TestDispatchSession:
 
         # Assert
         assert isinstance(handler, DispatchSession)
-        # Class-level annotations declare ``task`` and ``context``;
+        # Class-level annotations declare ``task`` and ``decoded``;
         # they are only populated on enter so accessing them before
         # enter raises AttributeError.
         with pytest.raises(AttributeError):
             handler.task  # noqa: B018
         with pytest.raises(AttributeError):
-            handler.context  # noqa: B018
-        # ``serializer`` is initialized in ``__init__`` to the
-        # default cloudpickle so any pre-negotiation parse failure
-        # (StopAsyncIteration, malformed task id, bad serializer
-        # hint) has a sane serializer in scope for ``Rejected`` to
-        # ship the dumped exception. ``__aenter__`` overwrites
-        # with the negotiated serializer on successful parse.
+            handler.decoded  # noqa: B018
+        # All dispatch serializes through cloudpickle; this one
+        # serializer covers the payload, the context contexts, and
+        # any ``Rejected`` dumped exception (including pre-parse
+        # failures such as StopAsyncIteration or a malformed frame).
         assert handler.serializer is wool.__serializer__
 
     # -- streaming property ----------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_streaming_with_async_generator_task(
+    async def test_streaming_should_return_true_when_async_generator_task(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :attr:`streaming` reflects an async-generator task.
@@ -303,7 +355,7 @@ class TestDispatchSession:
             assert handler.streaming is True
 
     @pytest.mark.asyncio
-    async def test_streaming_with_coroutine_task(
+    async def test_streaming_should_return_false_when_coroutine_task(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :attr:`streaming` reflects a coroutine task.
@@ -328,7 +380,7 @@ class TestDispatchSession:
     # -- __aenter__ -------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test___aenter___with_coroutine_task_and_cloudpickle(
+    async def test___aenter___should_populate_public_attrs_when_coroutine_task(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aenter__` populates public attrs for a
@@ -340,7 +392,7 @@ class TestDispatchSession:
         When:
             The handler is entered via ``async with``
         Then:
-            It should populate ``handler.task``, ``handler.context``,
+            It should populate ``handler.task``, ``handler.decoded``,
             and set ``handler.serializer`` to ``wool.__serializer__``.
         """
         # Arrange
@@ -352,101 +404,42 @@ class TestDispatchSession:
             # Assert
             assert isinstance(handler.task, Task)
             assert handler.task.callable is _coro_returning_default
-            assert isinstance(handler.context, Context)
+            assert isinstance(handler.decoded, ChainManifest)
             assert handler.serializer is wool.__serializer__
 
     @pytest.mark.asyncio
-    async def test___aenter___with_passthrough_serializer_self_dispatch(
+    async def test___aenter___should_populate_public_attrs_when_async_generator_task(
         self, worker_loop, mock_worker_proxy_cache
     ):
-        """Test :meth:`__aenter__` acquires/releases a passthrough-pool
-        entry on self-dispatch.
+        """Test :meth:`__aenter__` populates public attrs for a
+        cloudpickle-encoded async-generator task.
 
         Given:
-            A request stream whose first frame is a Task encoded with
-            :class:`PassthroughSerializer`
+            A request stream whose first frame is a valid
+            async-generator :class:`Task` with cloudpickle
+            serialization
         When:
-            The handler is entered then exited via ``async with``
+            The handler is entered via ``async with``
         Then:
-            It should set ``handler.serializer`` to a
-            :class:`PassthroughSerializer` and the pool's
-            ``referenced_entries`` count should return to baseline on
-            exit.
+            It should populate ``handler.task`` and ``handler.decoded``,
+            set ``handler.serializer`` to ``wool.__serializer__``, and
+            mark ``handler.streaming`` as ``True``.
         """
         # Arrange
-        baseline = _passthrough_pool.stats.referenced_entries
-        serializer = PassthroughSerializer()
-        task = _make_task(_coro_returning_default)
-        stream = _stream(_request_for(task, serializer=serializer))
+        task = _make_task(_gen_default_two)
+        stream = _stream(_request_for(task))
 
         # Act
         async with DispatchSession(stream, worker_loop) as handler:
-            assert isinstance(handler.serializer, PassthroughSerializer)
-            assert _passthrough_pool.stats.referenced_entries == baseline + 1
-
-        # Assert
-        assert _passthrough_pool.stats.referenced_entries == baseline
-
-    @pytest.mark.asyncio
-    async def test___aexit___releases_passthrough_pool_ref_under_cancellation(
-        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
-    ):
-        """Test __aexit__ releases the passthrough-pool entry when the
-        session is cancelled mid-teardown.
-
-        Given:
-            A passthrough self-dispatch session whose teardown release
-            suspends on a held pool lock, with the session task
-            cancelled while parked in that suspended release.
-        When:
-            The lock is released and the cancelled session task is
-            awaited.
-        Then:
-            It should return the passthrough pool to its pre-dispatch
-            referenced-entry count — no leaked reference.
-        """
-        # Arrange
-        # Contend the pool lock on a fresh instance so it does not
-        # bind the process-global lock to this test's event loop.
-        mocker.patch.object(_passthrough_pool, "_lock", asyncio.Lock())
-        baseline = _passthrough_pool.stats.referenced_entries
-        serializer = PassthroughSerializer()
-        task = _make_task(_coro_returning_default)
-        stream = _stream(_request_for(task, serializer=serializer))
-        entered = asyncio.Event()
-        proceed = asyncio.Event()
-
-        async def run_session():
-            async with DispatchSession(stream, worker_loop):
-                entered.set()
-                # Hold inside the context until the test has grabbed
-                # the pool lock, so __aexit__'s teardown release
-                # suspends on it.
-                await proceed.wait()
-
-        # Act
-        session_task = asyncio.ensure_future(run_session())
-        await entered.wait()
-        await _passthrough_pool._lock.acquire()
-        lock_released = False
-        try:
-            proceed.set()
-            for _ in range(5):
-                await asyncio.sleep(0)
-            session_task.cancel()
-            _passthrough_pool._lock.release()
-            lock_released = True
-            with pytest.raises(asyncio.CancelledError):
-                await session_task
-        finally:
-            if not lock_released:
-                _passthrough_pool._lock.release()
-
-        # Assert
-        assert _passthrough_pool.stats.referenced_entries == baseline
+            # Assert
+            assert isinstance(handler.task, Task)
+            assert handler.task.callable is _gen_default_two
+            assert isinstance(handler.decoded, ChainManifest)
+            assert handler.serializer is wool.__serializer__
+            assert handler.streaming is True
 
     @pytest.mark.asyncio
-    async def test___aenter___with_sync_callable_task(
+    async def test___aenter___should_raise_rejected_when_sync_callable(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aenter__` rejects a non-async callable.
@@ -476,7 +469,7 @@ class TestDispatchSession:
         )
 
     @pytest.mark.asyncio
-    async def test___aenter___with_malformed_task_id(
+    async def test___aenter___should_raise_rejected_when_malformed_task_id(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aenter__` rejects a malformed task id.
@@ -506,7 +499,7 @@ class TestDispatchSession:
         assert isinstance(exc_info.value.original, ValueError)
 
     @pytest.mark.asyncio
-    async def test___aenter___with_empty_request_stream(
+    async def test___aenter___should_raise_rejected_when_empty_request_stream(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aenter__` rejects an empty request stream.
@@ -534,7 +527,7 @@ class TestDispatchSession:
         assert "empty request stream" in str(exc_info.value.original)
 
     @pytest.mark.asyncio
-    async def test___aenter___with_first_frame_wrong_oneof(
+    async def test___aenter___should_raise_rejected_when_first_frame_not_task(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aenter__` rejects a first frame whose payload
@@ -562,7 +555,7 @@ class TestDispatchSession:
         assert "first request must carry a Task" in str(exc_info.value.original)
 
     @pytest.mark.asyncio
-    async def test___aenter___with_cancelled_request_iterator(
+    async def test___aenter___should_propagate_cancelled_when_iterator_cancelled(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aenter__` propagates ``CancelledError`` raw.
@@ -588,42 +581,49 @@ class TestDispatchSession:
                 pass
 
     @pytest.mark.asyncio
-    async def test___aenter___with_decode_group_of_exceptions(
+    async def test___aenter___should_wrap_context_decode_error_in_rejected(
         self,
         worker_loop,
         mock_worker_proxy_cache,
         mocker: MockerFixture,
     ):
-        """Test :meth:`__aenter__` wraps an Exception-only decode
-        :class:`BaseExceptionGroup` as :class:`Rejected`.
+        """Test :meth:`__aenter__` wraps a pre-Ack
+        :class:`ChainSerializationError` in :class:`Rejected` for Nack
+        transport.
 
         Given:
             A request stream whose first frame is well-formed but
-            :meth:`Context.from_protobuf` raises a
-            :class:`BaseExceptionGroup` of :class:`Exception` peers
+            :func:`Chain.from_protobuf` raises a
+            :class:`ChainSerializationError` aggregating per-var warnings
+            (strict mode).
         When:
-            The handler is entered via ``async with``
+            The handler is entered via ``async with``.
         Then:
-            It should raise :class:`Rejected` whose ``.original`` is a
-            :class:`BaseExceptionGroup` labeled
-            "request context decode failed".
+            It should raise :class:`Rejected` whose ``.original`` is
+            the :class:`ChainSerializationError` itself — the routine
+            does not run; the dispatch handler ships the error via
+            the Nack channel; the caller catches the same error class
+            symmetrically.
         """
         # Arrange
-        task = _make_task(_coro_returning_default)
-        stream = _stream(_request_for(task))
+        import wool
 
-        # Patch Context.from_protobuf to raise an Exception-only group.
-        # The constructor downgrades Exception-only groups to
-        # ExceptionGroup so the parse-phase ``except Exception`` arm
-        # routes it through Rejected.
-        peer = ValueError("decode peer")
-        eg = BaseExceptionGroup("simulated decode failure", [peer])
-        from wool.runtime.context import base as ctx_base
+        task = _make_task(_coro_returning_default)
+        # Carry a present (but minimal) chain manifest so the lazy-wire-
+        # frame receiver actually invokes
+        # ``ChainManifest.from_protobuf``.
+        request = _request_for(task)
+        request.context.CopyFrom(protocol.ChainManifest())
+        stream = _stream(request)
+
+        peer = wool.SerializationWarning("decode peer")
+        err = wool.ChainSerializationError(peer)
+        from wool.runtime.context.manifest import ChainManifest
 
         mocker.patch.object(
-            ctx_base.Context,
+            ChainManifest,
             "from_protobuf",
-            classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(eg)),
+            classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(err)),
         )
 
         # Act & assert
@@ -632,61 +632,63 @@ class TestDispatchSession:
                 pass
 
         original = exc_info.value.original
-        assert isinstance(original, BaseExceptionGroup)
-        assert "request context decode failed" in original.message
+        assert original is err
+        assert isinstance(original, wool.ChainSerializationError)
+        assert len(original.warnings) == 1
+        assert original.warnings[0] is peer
 
     @pytest.mark.asyncio
-    async def test___aenter___with_decode_group_with_non_exception_peer(
+    async def test___aenter___should_propagate_base_exception_when_decode_raises_base(
         self,
         worker_loop,
         mock_worker_proxy_cache,
         mocker: MockerFixture,
     ):
-        """Test :meth:`__aenter__` propagates a true
-        :class:`BaseExceptionGroup` raw.
+        """Test :meth:`__aenter__` propagates a non-Exception raise
+        from decode raw (no Rejected wrap).
 
         Given:
-            A request stream whose first frame triggers a
-            :class:`BaseExceptionGroup` containing a non-Exception peer
-            (e.g. :class:`asyncio.CancelledError`) from
-            :meth:`Context.from_protobuf`
+            A request stream whose first frame triggers an
+            :class:`asyncio.CancelledError` raised directly from
+            :meth:`ChainManifest.from_protobuf` (e.g. cancellation
+            arriving mid-decode).
         When:
-            The handler is entered via ``async with``
+            The handler is entered via ``async with``.
         Then:
-            It should propagate the :class:`BaseExceptionGroup` raw
-            (not as :class:`Rejected`).
+            It should propagate the :class:`asyncio.CancelledError`
+            raw — the parse-phase ``except Exception`` arm does not
+            catch :class:`BaseException` subclasses; Nack is the wrong
+            channel for cancellation/interrupt signals.
         """
         # Arrange
         task = _make_task(_coro_returning_default)
-        stream = _stream(_request_for(task))
+        # Carry a present chain manifest so the lazy-wire-frame receiver
+        # actually invokes ``ChainManifest.from_protobuf``.
+        request = _request_for(task)
+        request.context.CopyFrom(protocol.ChainManifest())
+        stream = _stream(request)
 
-        # A group with a non-Exception peer stays a
-        # BaseExceptionGroup (no auto-downgrade) and so falls through
-        # the parse-phase ``except Exception`` arm.
-        peer = asyncio.CancelledError()
-        eg = BaseExceptionGroup("simulated decode failure", [peer])
-        from wool.runtime.context import base as ctx_base
+        cancelled = asyncio.CancelledError()
+        from wool.runtime.context.manifest import ChainManifest
 
         mocker.patch.object(
-            ctx_base.Context,
+            ChainManifest,
             "from_protobuf",
-            classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(eg)),
+            classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(cancelled)),
         )
 
         # Act & assert
-        with pytest.raises(BaseExceptionGroup) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             async with DispatchSession(stream, worker_loop):
                 pass
 
-        # The raised group should carry the rewrap label and the
-        # original non-Exception peer, not be wrapped in Rejected.
         assert not isinstance(exc_info.value, Rejected)
-        assert "request context decode failed" in exc_info.value.message
+        assert exc_info.value is cancelled
 
     # -- __aiter__ --------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test___aiter___with_coroutine_routine_yields_single_response(
+    async def test___aiter___should_yield_single_response_when_coroutine_routine(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aiter__` yields exactly one response for a
@@ -694,13 +696,16 @@ class TestDispatchSession:
 
         Given:
             A handler past :meth:`__aenter__` with a coroutine routine
-            returning a value
+            returning a value, dispatched with no caller Wool context
+            state
         When:
             The handler is iterated via ``async for``
         Then:
             It should yield exactly one response whose result is the
-            coroutine's return value and whose context carries the
-            post-step :class:`protocol.Context` snapshot.
+            coroutine's return value and whose chain manifest is a stateless
+            :class:`protocol.ChainManifest` — a stateless dispatch leaves the
+            worker chain unarmed, so the post-step chain manifest carries no
+            variable entries.
         """
         # Arrange
         task = _make_task(_coro_returning_default)
@@ -712,18 +717,46 @@ class TestDispatchSession:
 
         # Assert
         assert len(results) == 1
-        assert results[0].result == "coroutine_value"
-        # The unified driver MUST emit a post-step context snapshot on
-        # every successful step (issue #187 motivation: "snapshot-encode
-        # duplicated across both paths"). The presence of an ``id`` on
-        # the response's :class:`protocol.Context` proves a snapshot
-        # was actually populated (a missing snapshot would surface as
-        # the empty default).
-        assert results[0].context is not None
-        assert results[0].context.id
+        assert results[0].payload == "coroutine_value"
+        # Under lazy-wire-frame semantics the unarmed worker omits
+        # the optional chain-manifest field entirely — the encode site
+        # reads wool.__chain__.get(), which raises LookupError on an
+        # unarmed worker, and maps that to a None wire chain manifest.
+        assert results[0].chain_manifest is None
 
     @pytest.mark.asyncio
-    async def test___aiter___with_async_generator_task_yields_per_request(
+    async def test___aiter___should_yield_default_when_stateless_dispatch(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test a stateless dispatch leaves the worker chain unarmed.
+
+        Given:
+            A coroutine routine dispatched with no caller wool.ContextVar
+            state, whose body offloads a wool.ContextVar read through
+            plain asyncio.to_thread
+        When:
+            The handler is iterated via ``async for``
+        Then:
+            It should yield one response whose result is the variable's
+            constructor default — the worker chain stayed unarmed
+            (context_has_state gating), so the plain to_thread
+            offload ran as a bare contextvars context and never tripped
+            wool.ChainContention.
+        """
+        # Arrange
+        task = _make_task(_coro_offloads_plain_to_thread)
+        stream = _stream(_request_for(task))
+
+        # Act
+        async with DispatchSession(stream, worker_loop) as handler:
+            results = [r async for r in handler]
+
+        # Assert
+        assert len(results) == 1
+        assert results[0].payload == "unset-default"
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_yield_response_per_request_when_async_generator(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aiter__` yields one response per caller request
@@ -752,10 +785,10 @@ class TestDispatchSession:
             results = [r async for r in handler]
 
         # Assert
-        assert [r.result for r in results] == [1, 2, 3]
+        assert [r.payload for r in results] == [1, 2, 3]
 
     @pytest.mark.asyncio
-    async def test___aiter___with_async_generator_yields_per_caller_request(
+    async def test___aiter___should_drive_multi_step_generator_through_caller_requests(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aiter__` drives a multi-step async generator
@@ -783,10 +816,10 @@ class TestDispatchSession:
             results = [r async for r in handler]
 
         # Assert
-        assert [r.result for r in results] == ["a", "b"]
+        assert [r.payload for r in results] == ["a", "b"]
 
     @pytest.mark.asyncio
-    async def test___aiter___called_twice_returns_same_iterator(
+    async def test___aiter___should_return_same_iterator_when_called_twice(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aiter__` is idempotent across calls.
@@ -816,7 +849,7 @@ class TestDispatchSession:
                 pass
 
     @pytest.mark.asyncio
-    async def test___aiter___with_routine_raising_mid_stream(
+    async def test___aiter___should_propagate_exception_when_routine_raises_mid_stream(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aiter__` propagates a routine's mid-stream
@@ -845,7 +878,7 @@ class TestDispatchSession:
                     pass
 
     @pytest.mark.asyncio
-    async def test___aiter___with_streaming_eof_closes_request_queue(
+    async def test___aiter___should_exit_cleanly_when_request_stream_ends(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aiter__` exits cleanly when the request stream
@@ -878,7 +911,7 @@ class TestDispatchSession:
     # -- __aexit__ --------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test___aexit___after_cancel_before_aiter(
+    async def test___aexit___should_not_raise_when_cancelled_before_aiter(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aexit__` does not raise after a pre-iter cancel.
@@ -908,7 +941,7 @@ class TestDispatchSession:
                 [r async for r in handler]
 
     @pytest.mark.asyncio
-    async def test___aexit___swallows_worker_exception(
+    async def test___aexit___should_not_reraise_worker_exception(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aexit__` does not re-raise a worker exception.
@@ -945,10 +978,143 @@ class TestDispatchSession:
         assert len(captured) == 1
         assert isinstance(captured[0], _CustomRoutineError)
 
+    @pytest.mark.asyncio
+    async def test___aexit___should_surface_cancelled_error_when_drain_raises(
+        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
+    ):
+        """Test :meth:`__aexit__` unwinds the exit stack even when the
+        registered :meth:`drain` callback raises ``CancelledError``.
+
+        Given:
+            A :class:`DispatchSession` whose :meth:`drain` is patched
+            to raise :class:`asyncio.CancelledError`
+        When:
+            :meth:`__aenter__` succeeds and the ``async with`` block
+            exits
+        Then:
+            It should surface :class:`asyncio.CancelledError` out of
+            :meth:`__aexit__` while still invoking the registered
+            :meth:`drain` callback — the exit-stack unwind finishes
+            without hanging or raising a different error.
+        """
+        # Arrange — patching :class:`DispatchSession.drain` is the
+        # SUT-of-this-file's own public method; the substitution
+        # injects the cleanup-time re-raise that the exit-stack
+        # registration must tolerate. No cleaner real-boundary
+        # trigger exists. The flag records that the registered
+        # callback actually ran during the unwind.
+        drain_ran = False
+
+        async def raising_drain(self):
+            nonlocal drain_ran
+            drain_ran = True
+            raise asyncio.CancelledError("simulated drain re-raise")
+
+        mocker.patch.object(DispatchSession, "drain", raising_drain)
+
+        task = _make_task(_coro_returning_default)
+        stream = _stream(_request_for(task))
+
+        handler = DispatchSession(stream, worker_loop)
+        await handler.__aenter__()
+
+        # Act & assert — the unwind runs the registered drain
+        # callback and surfaces its CancelledError; the bounded
+        # wait_for proves the unwind completed rather than hung.
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(handler.__aexit__(None, None, None), timeout=5.0)
+
+        assert drain_ran, (
+            "__aexit__ must run the drain callback registered on the "
+            "exit stack even though it raises CancelledError"
+        )
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_run_drain_when_caller_cancelled_mid_teardown(
+        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
+    ):
+        """Test :meth:`__aexit__` runs the registered :meth:`drain`
+        callback to completion when the caller task is cancelled
+        mid-teardown.
+
+        Given:
+            A :class:`DispatchSession` past :meth:`__aenter__` driving
+            a long-running routine, awaited inside a task that is
+            cancelled while suspended in the ``async with`` block exit
+        When:
+            The caller task is cancelled mid-:meth:`__aexit__`
+        Then:
+            It should run the registered :meth:`drain` callback to
+            completion (shielded unwind) before
+            :class:`asyncio.CancelledError` propagates.
+        """
+        # Arrange — patching :class:`DispatchSession.drain` is the
+        # SUT-of-this-file's own public method; the substitution
+        # parks the teardown on a controllable suspension so the
+        # caller task can be cancelled while the exit-stack unwind
+        # is in flight, then delegates to the real drain so the
+        # long-running worker routine is genuinely torn down.
+        original_drain = DispatchSession.drain
+        drain_entered = asyncio.Event()
+        drain_completed = False
+        proceed = asyncio.Event()
+
+        task = _make_task(_slow_gen)
+        stream = _stream(_request_for(task), _next_request())
+
+        async def parked_drain(self):
+            nonlocal drain_completed
+            drain_entered.set()
+            await proceed.wait()
+            # Cancel the still-running worker routine, then run the
+            # real drain so the callback completes for real.
+            await self.cancel()
+            await original_drain(self)
+            drain_completed = True
+
+        mocker.patch.object(DispatchSession, "drain", parked_drain)
+
+        observed: list[BaseException] = []
+
+        async def caller():
+            handler = DispatchSession(stream, worker_loop)
+            await handler.__aenter__()
+            # Kick the worker so a real routine is in flight, then
+            # exit — __aexit__'s shielded unwind suspends inside the
+            # parked drain callback.
+            aiter(handler)
+            try:
+                await handler.__aexit__(None, None, None)
+            except BaseException as e:
+                observed.append(e)
+                raise
+
+        # Act
+        caller_task = asyncio.ensure_future(caller())
+        await drain_entered.wait()
+        caller_task.cancel()
+        # Let the cancellation register against the shielded unwind.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # Release the parked drain so the shielded callback finishes.
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await caller_task
+
+        # Assert — the registered drain callback ran to completion
+        # despite the mid-teardown cancel, and CancelledError still
+        # propagated to the caller.
+        assert drain_completed, (
+            "the shielded exit-stack unwind must run the registered "
+            "drain callback to completion even when the caller task "
+            "is cancelled mid-teardown"
+        )
+        assert any(isinstance(e, asyncio.CancelledError) for e in observed)
+
     # -- drain ------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_drain_called_twice_is_idempotent(
+    async def test_drain_should_return_promptly_when_called_twice(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`drain` returns promptly across repeat calls.
@@ -973,7 +1139,7 @@ class TestDispatchSession:
             # Assert — bounded wait_for ensures both returned promptly.
 
     @pytest.mark.asyncio
-    async def test_drain_propagates_external_cancellation(
+    async def test_drain_should_propagate_cancelled_error_when_awaiting_task_cancelled(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`drain` propagates an externally-injected
@@ -1036,7 +1202,7 @@ class TestDispatchSession:
         )
 
     @pytest.mark.asyncio
-    async def test_drain_swallows_worker_cancellation(
+    async def test_drain_should_swallow_worker_cancellation(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`drain` swallows a worker-side cancellation.
@@ -1053,39 +1219,35 @@ class TestDispatchSession:
             cleanly.
         """
         # Arrange — drive a long-running generator, cancel the worker
-        # task on its own loop, then call drain from the main loop.
+        # via the public :meth:`cancel` (which cancels the worker
+        # task on its own loop), then call drain from the main loop.
         task = _make_task(_slow_gen)
         stream = _stream(_request_for(task), _next_request())
 
         async with DispatchSession(stream, worker_loop) as handler:
             iterator = aiter(handler)
 
-            # Wait for the worker driver to be scheduled — _worker_done
-            # is the public-equivalent observable populated by
-            # _schedule_worker. We poll without referencing it in
-            # the assert body itself to keep the test focused on
-            # the drain behavior.
+            # Wait for the worker driver task to appear on the worker
+            # loop — ``asyncio.all_tasks`` is a public observable of
+            # the scheduled worker task, so ``cancel`` below has a
+            # live worker task to cancel on its own loop.
             for _ in range(200):
-                if handler._worker_done is not None:
+                if asyncio.all_tasks(loop=worker_loop):
                     break
                 await asyncio.sleep(0.01)
 
-            # Cancel every task running on the worker loop. The
-            # cancellation cascades into the routine task and the
-            # session's ``_on_done`` callback, which closes the
-            # response queue and settles ``worker_done``.
-            def _cancel_workers():
-                for t in asyncio.all_tasks(loop=worker_loop):
-                    t.cancel()
+            # Cancel via the public surface. ``cancel`` schedules the
+            # worker task's cancellation on the worker loop; the
+            # cascade settles the worker-completion future with
+            # ``CancelledError`` and closes the response queue, so the
+            # iterator exits.
+            await handler.cancel()
 
-            worker_loop.call_soon_threadsafe(_cancel_workers)
-
-            # Give the worker time to settle; the response queue gets
-            # closed by the done-callback so the iterator exits.
-            # Narrow the catch to ``CancelledError`` — the only
-            # exception this scenario can legitimately produce — so
-            # any unrelated regression that surfaces a different
-            # exception class is not silently absorbed.
+            # Drive the iterator to exit. Narrow the catch to
+            # ``CancelledError`` — the only exception this scenario can
+            # legitimately produce — so any unrelated regression that
+            # surfaces a different exception class is not silently
+            # absorbed.
             try:
                 async for _ in iterator:
                     pass
@@ -1099,7 +1261,9 @@ class TestDispatchSession:
             # Assert — control reached here without raising.
 
     @pytest.mark.asyncio
-    async def test_drain_tolerates_closed_worker_loop(self, mock_worker_proxy_cache):
+    async def test_drain_should_return_when_worker_loop_closed(
+        self, mock_worker_proxy_cache
+    ):
         """Test :meth:`drain` returns when the worker loop is closed.
 
         Given:
@@ -1123,8 +1287,8 @@ class TestDispatchSession:
         handler = DispatchSession(stream, loop)
         await handler.__aenter__()
 
-        # Close the worker loop. With no _worker_done assigned (no
-        # __aiter__ yet), drain's short-circuit path is exercised.
+        # Close the worker loop before any __aiter__, so drain's
+        # short-circuit path (no worker scheduled) is exercised.
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5)
         loop.close()
@@ -1134,21 +1298,20 @@ class TestDispatchSession:
             await asyncio.wait_for(handler.drain(), timeout=2.0)
             # Assert — drain returned without raising.
         finally:
-            # Best-effort cleanup of the exit stack so the
-            # passthrough-pool entry (if any) is released.
+            # Best-effort public teardown.
             try:
-                await handler._stack.aclose()
+                await handler.__aexit__(None, None, None)
             except Exception:
                 pass
 
     @pytest.mark.asyncio
-    async def test_drain_returns_when_worker_create_task_fails(
+    async def test_drain_should_return_when_worker_create_task_fails(
         self, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test :meth:`drain` returns when ``_start`` fails to
         create the worker task on the worker loop.
 
-        Regression test for A8. Pre-fix, ``_start`` (scheduled
+        Regression test. Pre-fix, ``_start`` (scheduled
         via :meth:`asyncio.AbstractEventLoop.call_soon_threadsafe`
         from :meth:`_schedule_worker`) called
         :meth:`asyncio.AbstractEventLoop.create_task` without a
@@ -1168,7 +1331,7 @@ class TestDispatchSession:
             (simulating a late-loop-closure or task-factory
             failure).
         When:
-            :meth:`_schedule_worker` runs ``_start`` on the
+            The first :meth:`__aiter__` schedules ``_start`` on the
             worker loop and :meth:`drain` is awaited.
         Then:
             :meth:`drain` should return within a short timeout —
@@ -1199,11 +1362,12 @@ class TestDispatchSession:
                 ),
             )
 
-            # Trigger scheduling. This calls
-            # ``call_soon_threadsafe(_start)``; _start later runs
-            # on the worker loop where the patched create_task
-            # raises.
-            handler._schedule_worker()
+            # Trigger lazy scheduling through the public iteration
+            # entry point. ``__aiter__`` calls ``_schedule_worker``,
+            # which schedules ``_start`` via
+            # ``call_soon_threadsafe``; _start later runs on the
+            # worker loop where the patched create_task raises.
+            aiter(handler)
 
             # Wait briefly for the worker loop to execute _start.
             await asyncio.sleep(0.1)
@@ -1213,7 +1377,7 @@ class TestDispatchSession:
             await asyncio.wait_for(handler.drain(), timeout=2.0)
         finally:
             try:
-                await handler._stack.aclose()
+                await handler.__aexit__(None, None, None)
             except Exception:
                 pass
             loop.call_soon_threadsafe(loop.stop)
@@ -1224,7 +1388,7 @@ class TestDispatchSession:
     # -- cancel -----------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_cancel_before_aenter_is_safe(
+    async def test_cancel_should_not_raise_when_called_before_aenter(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`cancel` invoked before :meth:`__aenter__` is safe.
@@ -1255,7 +1419,7 @@ class TestDispatchSession:
                 [r async for r in handler]
 
     @pytest.mark.asyncio
-    async def test_cancel_after_iteration_is_safe(
+    async def test_cancel_should_not_raise_when_called_after_iteration(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`cancel` invoked after iteration is a no-op.
@@ -1281,7 +1445,7 @@ class TestDispatchSession:
             # Assert — control reached here without raising.
 
     @pytest.mark.asyncio
-    async def test_cancel_during_iteration_from_different_task(
+    async def test_cancel_should_raise_cancelled_on_iterator_when_different_task(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`cancel` from another task surfaces
@@ -1314,9 +1478,13 @@ class TestDispatchSession:
         # Act
         driver_task = asyncio.create_task(driver())
 
-        # Wait until the iterator is suspended on response_queue.get.
+        # Wait until the worker driver task is scheduled on the worker
+        # loop — ``asyncio.all_tasks`` is a public observable of the
+        # running worker task, which (for the never-yielding
+        # ``_slow_gen``) implies the iterator is suspended on the
+        # response.
         for _ in range(500):
-            if "handler" in captured and captured["handler"]._worker_done is not None:
+            if "handler" in captured and asyncio.all_tasks(loop=worker_loop):
                 break
             await asyncio.sleep(0.01)
         else:
@@ -1336,7 +1504,49 @@ class TestDispatchSession:
         assert results == []
 
     @pytest.mark.asyncio
-    async def test_cancel_during_suspended_iteration_unblocks_iterator(
+    async def test_cancel_should_raise_cancelled_error_when_racing_worker_scheduling(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test :meth:`cancel` racing worker scheduling still cancels
+        the worker.
+
+        Given:
+            A handler whose first :meth:`__aiter__` has queued the
+            worker driver onto the worker loop, with :meth:`cancel`
+            invoked in the same main-loop turn — before the worker
+            loop has run the queued driver
+        When:
+            The iterator's first :meth:`anext` is awaited
+        Then:
+            It should raise :class:`asyncio.CancelledError` and yield
+            no value — the driver's own start-time cancellation
+            re-check observes the flag and cancels the freshly
+            created worker task, so a routine never runs to natural
+            completion after a cancel that raced its scheduling.
+        """
+        # Arrange — a long-running routine so a missed start-time
+        # cancellation would otherwise let the worker run for real.
+        task = _make_task(_slow_coro)
+        stream = _stream(_request_for(task))
+
+        async with DispatchSession(stream, worker_loop) as handler:
+            # ``__aiter__`` runs ``_schedule_worker`` synchronously,
+            # queuing the worker driver onto the worker loop via
+            # ``call_soon_threadsafe``. ``cancel`` is synchronous up to
+            # its return, so calling it before any ``await`` yields the
+            # main loop sets the cancel flag while the queued driver
+            # has not yet run on the worker loop — the race the driver
+            # guards against at start time.
+            iterator = aiter(handler)
+            await handler.cancel()
+
+            # Act & assert — the iterator surfaces the cancellation and
+            # the routine never produces a value.
+            with pytest.raises(asyncio.CancelledError):
+                await anext(iterator)
+
+    @pytest.mark.asyncio
+    async def test_cancel_should_raise_cancelled_error_when_iterator_suspended(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`cancel` unblocks an iterator suspended on a
@@ -1370,9 +1580,12 @@ class TestDispatchSession:
         # Act
         driver_task = asyncio.create_task(driver())
 
-        # Wait for the iterator to be suspended.
+        # Wait for the worker driver task to be scheduled on the
+        # worker loop — ``asyncio.all_tasks`` is a public observable
+        # of the running worker task; for the never-yielding
+        # ``_slow_gen`` this implies the iterator is suspended.
         for _ in range(500):
-            if "handler" in captured and captured["handler"]._worker_done is not None:
+            if "handler" in captured and asyncio.all_tasks(loop=worker_loop):
                 break
             await asyncio.sleep(0.01)
         else:
@@ -1402,7 +1615,7 @@ class TestDispatchSession:
         assert captured.get("cancelled") is True
 
     @pytest.mark.asyncio
-    async def test_cancel_called_twice_is_idempotent(
+    async def test_cancel_should_not_raise_when_called_twice(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`cancel` is idempotent across repeat calls.
@@ -1426,60 +1639,125 @@ class TestDispatchSession:
             # Assert — control reached here without raising.
 
     @pytest.mark.asyncio
-    async def test___aiter___streaming_rewraps_mid_stream_context_decode_failure(
+    async def test_cancel_should_preempt_routine_when_suspended_mid_step(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test :meth:`cancel` preempts a routine suspended inside a step.
+
+        Given:
+            A handler whose streaming routine has been forwarded its
+            first request and is suspended inside ``_drive_step``'s
+            per-step ``await`` (a long sleep).
+        When:
+            :meth:`cancel` is awaited.
+        Then:
+            It should preempt the routine rather than let it run to
+            natural completion — the iterator surfaces
+            :class:`asyncio.CancelledError` and :meth:`drain` returns
+            promptly instead of awaiting the routine's full sleep.
+        """
+        # Arrange — forward the first Next to the worker. ``anext``
+        # forwards the request (the put precedes the response await)
+        # then suspends on the response that never arrives, so the
+        # worker enters its first step. The routine sets a module-level
+        # Event the moment it is inside that step.
+        _STEP_BLOCKING.clear()
+        task = _make_task(_gen_blocks_in_step)
+        stream = _stream(_request_for(task), _next_request())
+
+        async with DispatchSession(stream, worker_loop) as handler:
+            iterator = aiter(handler)
+            pull = asyncio.ensure_future(anext(iterator))
+            try:
+                # Wait until the routine signals it is suspended *inside*
+                # the step (it sets the Event right before its in-step
+                # ``await``), so the cancel below lands while the
+                # per-step task is in flight. Awaiting the blocking wait
+                # in the default executor keeps the main loop free to
+                # pump ``pull``'s request forward to the worker.
+                entered = await asyncio.get_running_loop().run_in_executor(
+                    None, _STEP_BLOCKING.wait, 5.0
+                )
+                assert entered, "worker never entered the blocking step"
+
+                # Act — cancel while the step task is still in flight.
+                await handler.cancel()
+
+                # Assert — the suspended pull surfaces cancellation, and
+                # drain returns promptly because the step task was
+                # cancelled rather than awaited to its full sleep.
+                with pytest.raises(asyncio.CancelledError):
+                    await pull
+                await asyncio.wait_for(handler.drain(), timeout=2.0)
+            finally:
+                if not pull.done():
+                    pull.cancel()
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_propagate_context_error_when_mid_stream_decode_fails(
         self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test mid-stream context decode failures are re-wrapped
-        with a labeled message so the dispatch handler can
-        distinguish them from initial-frame decode failures.
+        """Test mid-stream chain-manifest decode failures propagate as
+        :class:`ChainSerializationError` through the routine-exception
+        channel.
 
         Given:
             A streaming session whose first ``next`` request decodes
-            cleanly but whose second ``next`` request's context
-            decode raises a :class:`BaseExceptionGroup` (operator
-            promoted :class:`ContextDecodeWarning` to an exception)
+            cleanly but whose second ``next`` request's chain-manifest
+            decode raises a :class:`ChainSerializationError` aggregating
+            per-var warnings (operator promoted
+            :class:`SerializationWarning` to an exception).
         When:
-            The caller iterates the session past the first response
+            The caller iterates the session past the first response.
         Then:
-            The error should surface as a :class:`BaseExceptionGroup`
-            (or :class:`ExceptionGroup` after constructor downgrade)
-            labeled "mid-stream request context decode failed" so
-            the dispatch handler can distinguish it from
-            initial-frame decode failures that share the same peer
-            type.
+            The :class:`ChainSerializationError` should surface
+            unmolested out of the iterator — under the strict-mode
+            "fail loud" contract the worker ships it via the
+            routine-exception channel; the caller's existing
+            ``except ChainSerializationError`` catches without migrating
+            to ``except*``.
         """
-        from wool.runtime.context import base as ctx_base
+        # Arrange — streaming routine that yields per ``next``. The
+        # mid-stream next-requests carry a present-but-empty chain manifest so
+        # ``RequestFrame.from_protobuf`` routes into
+        # ``ChainManifest.from_protobuf`` (and hence the patched
+        # mock) under lazy-wire-frame semantics — without a present
+        # field, the decode path short-circuits before the mock can
+        # fire. ``__aenter__``'s initial decode does not hit the mock
+        # either because the task-frame fixture omits the optional
+        # context field; so the first patched call corresponds to the
+        # first mid-stream decode.
+        import wool
 
-        # Arrange — streaming routine that yields per ``next``.
         task = _make_task(_gen_three)
         stream = _stream(
             _request_for(task),
-            _next_request(),
-            _next_request(),
+            _next_request(with_context=True),
+            _next_request(with_context=True),
         )
 
-        # Counter-based patch: let the initial __aenter__ decode
-        # and the first per-step decode succeed; the third call
-        # (second mid-stream decode) raises a
-        # ``BaseExceptionGroup`` of Exception-only peers.
-        original = ctx_base.Context.from_protobuf
-        calls = {"n": 0}
-        peer = ValueError("decode peer")
+        # Counter-based patch: let the first per-step decode succeed;
+        # the second mid-stream decode raises a ChainSerializationError.
+        from wool.runtime.context.manifest import ChainManifest
 
-        def fake_from_protobuf(cls, proto_ctx, *, serializer):
+        original = ChainManifest.from_protobuf
+        calls = {"n": 0}
+        peer = wool.SerializationWarning("decode peer")
+
+        def fake_from_protobuf(cls, wire, *, serializer=None):
             calls["n"] += 1
-            if calls["n"] >= 3:
-                raise BaseExceptionGroup("simulated decode failure", [peer])
-            return original.__func__(cls, proto_ctx, serializer=serializer)
+            if calls["n"] >= 2:
+                raise wool.ChainSerializationError(peer)
+            return original(wire, serializer=serializer)
 
         mocker.patch.object(
-            ctx_base.Context,
+            ChainManifest,
             "from_protobuf",
             classmethod(fake_from_protobuf),
         )
 
-        # Act — iterate; the second step raises the re-wrapped
-        # group, which surfaces out of the iterator.
+        # Act — iterate; the second step raises ChainSerializationError,
+        # which surfaces out of the iterator.
         captured: list[BaseException] = []
         async with DispatchSession(stream, worker_loop) as handler:
             try:
@@ -1488,56 +1766,15 @@ class TestDispatchSession:
             except BaseException as e:
                 captured.append(e)
 
-        # Assert
+        # Assert: typed ChainSerializationError carrying the original
+        # warning on .warnings.
         assert len(captured) == 1
-        eg = captured[0]
-        assert isinstance(eg, BaseExceptionGroup)
-        assert "mid-stream request context decode failed" in eg.message
+        primary = captured[0]
+        assert isinstance(primary, wool.ChainSerializationError)
+        assert primary.warnings == (peer,)
 
     @pytest.mark.asyncio
-    async def test___aenter___propagates_keyboard_interrupt_during_aclose(
-        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
-    ):
-        """Test the safe-aclose helper does not swallow
-        :class:`KeyboardInterrupt` during cleanup.
-
-        Given:
-            A handler whose ``__aenter__`` is failing (empty request
-            stream → :class:`Rejected`) and whose cleanup
-            ``_stack.aclose()`` raises :class:`KeyboardInterrupt`
-            (simulating a Ctrl-C landing mid-cleanup)
-        When:
-            The handler is entered
-        Then:
-            :class:`KeyboardInterrupt` should propagate raw out of
-            the helper rather than being swallowed by the
-            ``except Exception`` arm.
-        """
-
-        # Arrange — an empty stream forces __aenter__ to raise
-        # StopAsyncIteration and route through the safe-aclose
-        # error path.
-        async def empty_stream():
-            if False:
-                yield  # pragma: no cover
-
-        handler = DispatchSession(empty_stream(), worker_loop)
-
-        # Patch the exit stack's aclose so the cleanup raises
-        # KeyboardInterrupt — the safe-aclose helper must re-raise
-        # this rather than swallow it under ``except Exception``.
-        mocker.patch.object(
-            handler._stack,
-            "aclose",
-            side_effect=KeyboardInterrupt("simulated Ctrl-C"),
-        )
-
-        # Act & assert
-        with pytest.raises(KeyboardInterrupt):
-            await handler.__aenter__()
-
-    @pytest.mark.asyncio
-    async def test___aiter___streaming_breaks_on_cancel_between_requests(
+    async def test___aiter___should_break_pump_when_cancelled_between_requests(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test the streaming pump observes a mid-pump cancel and
@@ -1627,10 +1864,10 @@ class TestDispatchSession:
         # worker would advance the generator to ``3``, and the
         # response would appear in ``observed["responses"]``.
         assert len(observed.get("responses", [])) == 1
-        assert observed["responses"][0].result == 1
+        assert observed["responses"][0].payload == 1
 
     @pytest.mark.asyncio
-    async def test_cancel_tolerates_closed_worker_loop(
+    async def test_cancel_should_return_when_worker_loop_closed(
         self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
     ):
         """Test :meth:`cancel` swallows ``RuntimeError`` from a torn-down
@@ -1648,96 +1885,43 @@ class TestDispatchSession:
             closed")`` is swallowed because the dispatch is no
             longer serviceable.
         """
-        # Arrange
+        # Arrange — drive a real dispatch to completion so the worker
+        # driver task is genuinely scheduled (and recorded) on the
+        # worker loop. Once it has run, ``cancel`` still routes through
+        # the worker-task-cancel branch (the task reference is set), so
+        # the patched ``call_soon_threadsafe`` exercises the
+        # closed-loop swallow rather than the early-return path that a
+        # never-scheduled worker would take.
         task = _make_task(_coro_returning_default)
         stream = _stream(_request_for(task))
 
         async with DispatchSession(stream, worker_loop) as handler:
-            # Bind a mock worker task without scheduling a real one
-            # so we exercise the ``call_soon_threadsafe`` branch of
-            # cancel() directly.
-            handler._worker_task = mocker.MagicMock()
+            # Consume the result so the worker driver task settles —
+            # this avoids the teardown blocking on a live routine while
+            # still leaving the worker-task reference in place for
+            # cancel to act on.
+            results = [r async for r in handler]
+            assert results[0].payload == "coroutine_value"
+
             # Patch the worker loop's ``call_soon_threadsafe`` to
-            # simulate a torn-down loop ("Event loop is closed").
+            # simulate a torn-down loop ("Event loop is closed") — the
+            # boundary cancel must schedule across. This affects only
+            # the worker-task-cancel path; the response queue close
+            # rides the main loop.
             mocker.patch.object(
                 worker_loop,
                 "call_soon_threadsafe",
                 side_effect=RuntimeError("Event loop is closed"),
             )
 
-            # Act
+            # Act & assert — cancel returns without raising; the
+            # ``call_soon_threadsafe`` RuntimeError is swallowed.
             await handler.cancel()
 
-            # Assert — cancel returned without raising; the
-            # RuntimeError was swallowed.
-            assert handler._cancelled is True
-
-    # -- Migrated from test_service.py::TestWorkerService (F17) -----------
+    # -- Migrated from test_service.py::TestWorkerService -----------------
 
     @pytest.mark.asyncio
-    async def test___aenter___preserves_parse_error_when_aclose_raises(
-        self, worker_loop, mock_worker_proxy_cache
-    ):
-        """Test :meth:`__aenter__` preserves the original parse error as
-        :class:`Rejected` even when ``_stack.aclose()`` raises during
-        cleanup.
-
-        Regression test: pre-fix, the parse-phase ``except Exception as
-        e: await self._stack.aclose(); raise Rejected(e) from None``
-        ran ``aclose`` un-guarded. If the stack's exit chain raised
-        (e.g. a registered resource's ``__aexit__`` failing), the new
-        exception replaced ``e`` and ``Rejected(e)`` was never
-        constructed — the dispatch handler's Nack-with-exception
-        channel observed the cleanup failure instead of the typed
-        parse error. The fix swallows aclose failures so the parse
-        error always reaches the caller.
-
-        Given:
-            A request that fails parse-phase validation (a non-async
-            callable) AND a stack whose ``aclose`` raises during the
-            resulting cleanup
-        When:
-            :meth:`__aenter__` is invoked
-        Then:
-            It should raise :class:`Rejected` whose ``original``
-            attribute carries the parse-phase :class:`ValueError`, not
-            the simulated aclose failure.
-        """
-        # Arrange — non-async callable triggers a ValueError in the
-        # __aenter__ validation step AFTER the passthrough-pool entry
-        # has been pushed onto the stack. Without a passthrough
-        # serializer the entry would be skipped and the test would
-        # pass trivially because the stack would be empty when aclose
-        # runs.
-        serializer = PassthroughSerializer()
-        task = _make_task(_sync_callable)
-        stream = _stream(_request_for(task, serializer=serializer))
-        handler = DispatchSession(stream, worker_loop)
-
-        # Patch ``_stack.aclose`` directly: the underlying
-        # :class:`AsyncExitStack` is not exposed through any public
-        # hook, so the cleanup-failure path can only be exercised by
-        # replacing this attribute. The substitution mirrors the
-        # operational failure mode (a registered resource's
-        # ``__aexit__`` raising).
-        async def raising_aclose():
-            raise RuntimeError("simulated aclose failure during cleanup")
-
-        handler._stack.aclose = raising_aclose
-
-        # Act + Assert
-        with pytest.raises(Rejected) as exc_info:
-            await handler.__aenter__()
-
-        assert isinstance(exc_info.value.original, ValueError), (
-            f"Rejected.original must carry the parse-phase ValueError, "
-            f"not the aclose failure — observed "
-            f"{type(exc_info.value.original).__name__}"
-        )
-        assert "Expected coroutine function" in str(exc_info.value.original)
-
-    @pytest.mark.asyncio
-    async def test___aiter___defers_worker_scheduling(
+    async def test___aiter___should_defer_worker_scheduling(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`__aiter__` defers worker scheduling until the
@@ -1745,15 +1929,14 @@ class TestDispatchSession:
         :meth:`__aenter__`.
 
         Regression test for the race between dispatch's backpressure
-        hook and the worker for :meth:`Context._guard` ownership.
-        Pre-fix :meth:`__aenter__` scheduled the worker eagerly; with
-        a backpressure hook that yielded the main loop while holding
-        ``attached(handler.context)``, the worker thread would race
-        to acquire the same Context's guard and spuriously raise
-        ``RuntimeError("wool.Context is already running...")``. The
-        invariant tested here — :meth:`__aenter__` is parse-only —
-        guarantees no contention regardless of how long any
-        post-parse main-loop work holds the Context.
+        hook and the worker for chain ownership. Pre-fix
+        :meth:`__aenter__` scheduled the worker eagerly; with a
+        backpressure hook that yielded the main loop while reading the
+        decoded chain manifest, the worker thread would race to re-stamp the
+        same chain's owner. The invariant tested here —
+        :meth:`__aenter__` is parse-only — guarantees no contention
+        regardless of how long any post-parse main-loop work holds the
+        chain.
 
         Given:
             A :class:`DispatchSession` constructed around a parsed
@@ -1772,114 +1955,128 @@ class TestDispatchSession:
         stream = _stream(_request_for(task))
 
         async with DispatchSession(stream, worker_loop) as handler:
-            # ``_worker_done`` is the private marker created by
-            # :meth:`_schedule_worker`. Probed directly because no
-            # public observable can witness "worker not yet
-            # scheduled" without producing or consuming a Response —
-            # which itself would force scheduling. The marker is the
-            # narrowest stand-in.
-            assert handler._worker_done is None, (
+            # The worker driver runs as a task on the worker loop;
+            # ``asyncio.all_tasks`` is the public observable of
+            # whether it has been scheduled. After parse-only
+            # ``__aenter__`` (no ``__aiter__`` yet) the worker loop
+            # carries no driver task.
+            assert not asyncio.all_tasks(loop=worker_loop), (
                 "DispatchSession.__aenter__ must defer worker scheduling"
             )
 
             # Act
             iterator = aiter(handler)
 
-            # Assert
-            assert handler._worker_done is not None, (
-                "DispatchSession.__aiter__ must schedule the worker on first call"
-            )
+            # Assert — the first ``__aiter__`` schedules the worker
+            # driver task on the worker loop. Scheduling crosses
+            # loops via ``call_soon_threadsafe``, so poll until the
+            # driver task appears.
+            for _ in range(500):
+                if asyncio.all_tasks(loop=worker_loop):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(
+                    "DispatchSession.__aiter__ must schedule the worker on first call"
+                )
             response = await anext(iterator)
-            assert response.result == "coroutine_value"
+            assert response.payload == "coroutine_value"
 
     @pytest.mark.asyncio
-    async def test___aiter___swallows_request_queue_runtime_error_mid_stream(
-        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
+    async def test_streaming_should_end_stream_when_put_to_closed_worker_loop(
+        self, mock_worker_proxy_cache
     ):
-        """Test :meth:`_iterate` swallows :class:`RuntimeError` from
-        ``_RequestQueue.put`` so a closed worker loop mid-stream
-        terminates the iterator cleanly instead of surfacing the
-        loop-teardown error as a routine failure.
-
-        Regression test: pre-fix, the streaming branch of
-        :meth:`_iterate` called ``request_queue.put(protobuf_request)``
-        un-guarded. :meth:`_RequestQueue.put` schedules onto the
-        worker loop via ``call_soon_threadsafe``; if the worker loop
-        has been torn down (graceful shutdown teardown landing
-        between two main-loop pumps), put raises ``RuntimeError(
-        "Event loop is closed")``. The unguarded propagation
-        surfaced the runtime error out of :meth:`_iterate` — but the
-        routine never failed; the worker loop did. The fix mirrors
-        :meth:`drain`'s pattern: catch ``RuntimeError`` at the put
-        site and break cleanly.
+        """Test forwarding a request after the worker loop closed ends
+        the stream cleanly.
 
         Given:
-            A streaming session with :meth:`_RequestQueue.put` patched
-            to succeed on the first call and raise ``RuntimeError``
-            on the second
+            A streaming dispatch whose worker loop is torn down after
+            the worker is scheduled but before the next request is
+            forwarded — the graceful-shutdown race where the loop pool
+            reclaims the worker loop between two main-loop pumps.
         When:
-            The iterator is driven for the second response — the
-            patched put triggers the runtime error mid-stream
+            The session forwards the next request onto the closed loop.
         Then:
-            The iterator should terminate cleanly without surfacing
-            a synthetic :class:`RuntimeError` as a routine failure.
+            ``_RequestQueue.put`` should surface the closed loop as the
+            typed ``_WorkerLoopClosed`` signal and the iterator should
+            end with no responses, rather than shipping the transport
+            teardown as a routine failure.
         """
-        from wool.runtime.worker.session import _RequestQueue
+        # Arrange — a dedicated worker loop we can close
+        # deterministically. It is never run, so ``__aenter__`` (on the
+        # main loop) and the scheduling in ``__aiter__`` (a queued,
+        # never-executed ``call_soon`` on this loop) leave no worker
+        # task to orphan. The session is driven without ``async with``:
+        # closing the worker loop leaves the worker-completion future
+        # unresolved, so the registered ``drain`` teardown would block
+        # awaiting it — the production graceful-shutdown path tolerates
+        # this, and the closed loop plus pending future are GC-clean.
+        worker_loop = asyncio.new_event_loop()
+        try:
+            task = _make_task(_gen_default_two)
+            stream = _stream(_request_for(task), _next_request())
+            handler = DispatchSession(stream, worker_loop)
+            await handler.__aenter__()
+            iterator = aiter(handler)
 
-        # Arrange — patching :class:`_RequestQueue.put` is justified
-        # here: the "real boundary" alternative (closing the worker
-        # loop mid-stream) has a semantic obstacle. Closing the
-        # worker loop while the worker task is suspended on
-        # ``request_queue.get`` leaves the worker-completion future
-        # ``_worker_done`` unresolved (the ``_on_done`` callback
-        # never fires), hanging the subsequent :meth:`drain` call
-        # from ``__aexit__``. The patch injects the exact failure
-        # mode the fix targets — a ``call_soon_threadsafe`` raise on
-        # a torn-down loop — without leaking the worker task.
-        call_count = 0
-        original_put = _RequestQueue.put
+            # Act — tear the worker loop down before the next request is
+            # forwarded.
+            worker_loop.close()
+            responses = [response async for response in iterator]
+        finally:
+            if not worker_loop.is_closed():
+                worker_loop.close()
 
-        def patched_put(self, request):
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 2:
-                raise RuntimeError("simulated closed worker loop during put")
-            return original_put(self, request)
-
-        mocker.patch.object(_RequestQueue, "put", patched_put)
-
-        task = _make_task(_gen_default_two)
-        stream = _stream(
-            _request_for(task),
-            _next_request(),
-            _next_request(),
-        )
-
-        # Act
-        responses: list = []
-        async with DispatchSession(stream, worker_loop) as handler:
-            try:
-                async for response in handler:
-                    responses.append(response)
-            except RuntimeError as e:
-                if "simulated closed worker loop" in str(e):
-                    pytest.fail(
-                        "_iterate must catch RuntimeError from "
-                        "request_queue.put and terminate the stream "
-                        "cleanly; the unguarded raise surfaced "
-                        "the synthetic loop-teardown error as a "
-                        "routine failure"
-                    )
-                raise
-
-        # Assert — iterator terminated cleanly. The first put
-        # succeeded so one response was yielded; the second put
-        # raised and was swallowed.
-        assert len(responses) == 1
-        assert responses[0].result == "a"
+        # Assert — the closed-loop put surfaced the typed signal and the
+        # stream ended cleanly with no responses.
+        assert responses == []
 
     @pytest.mark.asyncio
-    async def test___aexit___drains_on_terminal_exception(
+    async def test_coroutine_should_end_stream_when_put_to_closed_worker_loop(
+        self, mock_worker_proxy_cache
+    ):
+        """Test forwarding a coroutine's prime after the worker loop
+        closed ends the stream cleanly.
+
+        Given:
+            A coroutine dispatch whose worker loop is torn down after
+            the worker is scheduled but before the prime request is
+            forwarded — the graceful-shutdown race where the loop pool
+            reclaims the worker loop between two main-loop pumps.
+        When:
+            The session forwards the prime request onto the closed loop.
+        Then:
+            ``_RequestQueue.put`` should surface the closed loop as the
+            typed ``_WorkerLoopClosed`` signal and the iterator should
+            end with no responses, rather than shipping the transport
+            teardown as a routine failure.
+        """
+        # Arrange — a dedicated worker loop we can close deterministically.
+        # As with the streaming twin, the session is driven without
+        # ``async with`` so closing the worker loop (leaving the
+        # worker-completion future unresolved) does not block the
+        # registered ``drain`` teardown.
+        worker_loop = asyncio.new_event_loop()
+        try:
+            task = _make_task(_coro_returning_default)
+            stream = _stream(_request_for(task), _next_request())
+            handler = DispatchSession(stream, worker_loop)
+            await handler.__aenter__()
+            iterator = aiter(handler)
+
+            # Act — tear the worker loop down before the prime is forwarded.
+            worker_loop.close()
+            responses = [response async for response in iterator]
+        finally:
+            if not worker_loop.is_closed():
+                worker_loop.close()
+
+        # Assert — the closed-loop put surfaced the typed signal and the
+        # stream ended cleanly with no responses.
+        assert responses == []
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_call_drain_twice_on_terminal_exception(
         self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
     ):
         """Test :class:`DispatchSession.drain` is called both from the
@@ -1891,10 +2088,11 @@ class TestDispatchSession:
         terminal-exception clause is reached while the worker is
         still alive. Main-loop handler-level failures (e.g.
         ``response.to_protobuf`` raising on dump) reach the except
-        clause with the worker mid-``_step`` mutating ``work_ctx``.
-        Without an explicit drain before the snapshot,
-        ``handler.context.to_protobuf(...)`` reads ``_data`` while
-        the worker writes it. The fix calls
+        clause with the worker mid-``_step`` mutating the work
+        chain. Without an explicit drain before reading
+        ``session._final_wire_chain_manifest``, the handler would read the
+        worker-published chain manifest before the worker task has
+        finished encoding it inside its own Chain. The fix calls
         :meth:`DispatchSession.drain` from dispatch's terminal-
         exception clause; :meth:`__aexit__` also calls drain (via
         its exit stack, idempotent) so the spy observes two calls
@@ -1920,7 +2118,7 @@ class TestDispatchSession:
         first_request = protocol.Request(task=task.to_protobuf())
         next_request = protocol.Request(
             next=protocol.Void(),
-            context=protocol.Context(id=uuid4().hex),
+            context=protocol.ChainManifest(id=uuid4().hex),
         )
 
         drain_spy = mocker.spy(DispatchSession, "drain")
@@ -1946,84 +2144,17 @@ class TestDispatchSession:
         # dispatch handler's terminal-exception clause (the fix) and
         # once from :meth:`__aexit__`'s exit-stack unwind. Without
         # the fix, drain is called only from ``__aexit__`` and the
-        # context snapshot races the still-alive worker.
+        # read of ``session._final_wire_chain_manifest`` races the
+        # still-alive worker.
         assert drain_spy.call_count >= 2, (
             f"Expected dispatch's terminal-exception clause to call "
-            f"DispatchSession.drain before snapshotting "
-            f"DispatchSession.context (plus __aexit__'s call); "
-            f"observed {drain_spy.call_count} call(s)."
+            f"DispatchSession.drain before reading "
+            f"DispatchSession._final_wire_chain_manifest (plus __aexit__'s "
+            f"call); observed {drain_spy.call_count} call(s)."
         )
 
     @pytest.mark.asyncio
-    async def test___aexit___releases_passthrough_pool_when_drain_raises(
-        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
-    ):
-        """Test :meth:`__aexit__` releases the passthrough-pool entry
-        even when :meth:`drain` raises.
-
-        Regression test for the resource leak in :meth:`__aexit__`'s
-        no-``try/finally`` pattern. Pre-fix, ``await self.drain();
-        _stack.__aexit__(...)`` skipped the stack unwind whenever
-        :meth:`drain` raised — most notably when drain re-raised
-        :class:`asyncio.CancelledError` on the
-        ``current.cancelling() > 0`` path during graceful shutdown.
-        The ``_passthrough_pool.get(task_id)`` entry registered on
-        the self-dispatch path leaked. The fix registers drain as an
-        async exit-stack callback in :meth:`__aenter__` so the
-        unwind always runs, regardless of drain's outcome.
-
-        Given:
-            A :class:`DispatchSession` driving a passthrough self-
-            dispatch, with :meth:`drain` patched to raise
-            :class:`asyncio.CancelledError`
-        When:
-            :meth:`__aenter__` succeeds (acquiring a
-            ``_passthrough_pool`` entry) and :meth:`__aexit__` is
-            invoked
-        Then:
-            It should release the passthrough-pool entry — the
-            pool's ``referenced_entries`` count must return to its
-            baseline despite drain raising.
-        """
-        # Arrange — patching :class:`DispatchSession.drain` is the
-        # SUT-of-this-file's own public method; the substitution
-        # injects the cleanup-time failure mode that the regression
-        # targets (drain re-raise during graceful shutdown). No
-        # cleaner real-boundary trigger exists.
-        baseline = _passthrough_pool.stats.referenced_entries
-        serializer = PassthroughSerializer()
-
-        async def raising_drain(self):
-            raise asyncio.CancelledError("simulated drain re-raise")
-
-        # Patch drain at the class level BEFORE __aenter__ runs so
-        # the fix's ``push_async_callback(self.drain)`` registers
-        # the raising version on the exit stack.
-        mocker.patch.object(DispatchSession, "drain", raising_drain)
-
-        task = _make_task(_coro_returning_default)
-        stream = _stream(_request_for(task, serializer=serializer))
-
-        handler = DispatchSession(stream, worker_loop)
-        await handler.__aenter__()
-
-        assert _passthrough_pool.stats.referenced_entries == baseline + 1, (
-            "__aenter__ should acquire a passthrough-pool entry on self-dispatch"
-        )
-
-        # Act
-        with pytest.raises(asyncio.CancelledError):
-            await handler.__aexit__(None, None, None)
-
-        # Assert
-        assert _passthrough_pool.stats.referenced_entries == baseline, (
-            "DispatchSession.__aexit__ must release the passthrough-"
-            "pool entry even when drain raises — pre-fix, drain's "
-            "re-raise skipped _stack.__aexit__ and leaked the entry"
-        )
-
-    @pytest.mark.asyncio
-    async def test___aexit___does_not_mask_routine_exception_when_cancel_raises(
+    async def test___aexit___should_ship_routine_exception_when_cancel_raises(
         self,
         grpc_aio_stub,
         mock_worker_proxy_cache,
@@ -2093,7 +2224,7 @@ class TestDispatchSession:
         )
 
     @pytest.mark.asyncio
-    async def test_drain_with_closed_worker_loop_pre_schedule(
+    async def test_drain_should_return_when_worker_loop_closed_pre_schedule(
         self, mock_worker_proxy_cache
     ):
         """Test :meth:`drain` returns promptly when the worker loop is
@@ -2159,12 +2290,14 @@ class TestDispatchSession:
             await asyncio.wait_for(handler.drain(), timeout=2.0)
         finally:
             try:
-                await handler._stack.aclose()
+                await handler.__aexit__(None, None, None)
             except Exception:
                 pass
 
     @pytest.mark.asyncio
-    async def test_cancel_before_aiter(self, worker_loop, mock_worker_proxy_cache):
+    async def test_cancel_should_short_circuit_scheduling_when_called_before_aiter(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
         """Test :meth:`cancel` invoked before :meth:`__aiter__` short-
         circuits worker scheduling and surfaces
         :class:`asyncio.CancelledError` on the iterator's first
@@ -2188,10 +2321,9 @@ class TestDispatchSession:
             :meth:`cancel` is called and then :meth:`__aiter__` is
             invoked
         Then:
-            It should not schedule the worker (``_request_queue`` /
-            ``_worker_done`` remain ``None``) and the iterator's
-            first ``anext`` should raise
-            :class:`asyncio.CancelledError`.
+            It should not schedule the worker driver task on the
+            worker loop and the iterator's first ``anext`` should
+            raise :class:`asyncio.CancelledError`.
         """
         # Arrange
         task = _make_task(_coro_returning_default)
@@ -2202,17 +2334,17 @@ class TestDispatchSession:
             await handler.cancel()
             iterator = aiter(handler)
 
-            # Assert — worker was not scheduled. The two private
-            # markers stand in for "no scheduling occurred"; no
-            # public observable can witness the absence of
-            # scheduling without forcing it.
-            assert handler._request_queue is None, (
-                "cancel() before __aiter__ must short-circuit "
-                "_schedule_worker — _request_queue should remain None"
-            )
-            assert handler._worker_done is None, (
-                "cancel() before __aiter__ must short-circuit "
-                "_schedule_worker — _worker_done should remain None"
+            # Give any cross-loop scheduling a chance to land so the
+            # absence below is meaningful rather than merely early.
+            await asyncio.sleep(0.05)
+
+            # Assert — the cancel short-circuit means no worker driver
+            # task is ever scheduled on the worker loop.
+            # ``asyncio.all_tasks`` is the public observable of that
+            # absence.
+            assert not asyncio.all_tasks(loop=worker_loop), (
+                "cancel() before __aiter__ must short-circuit worker "
+                "scheduling — no driver task should run on the worker loop"
             )
 
             # The iterator surfaces the cancellation immediately.
@@ -2220,7 +2352,7 @@ class TestDispatchSession:
                 await anext(iterator)
 
     @pytest.mark.asyncio
-    async def test_cancel_from_different_task(
+    async def test_cancel_should_not_raise_when_called_from_different_task(
         self, worker_loop, mock_worker_proxy_cache
     ):
         """Test :meth:`cancel` is safe to call from a task other than
@@ -2264,13 +2396,12 @@ class TestDispatchSession:
 
         driver_task = asyncio.create_task(driver())
 
-        # Wait until the worker has been scheduled — proves
-        # ``__aiter__`` ran and ``_iterate`` is suspended at
-        # ``response_queue.get`` waiting on the slow coroutine.
-        # Polling ``_worker_done`` matches the existing pattern in
-        # this test class for "iterator suspended" detection
-        # (see :func:`test_cancel_during_iteration_from_different_task`).
-        while "handler" not in captured or captured["handler"]._worker_done is None:
+        # Wait until the worker driver task is scheduled on the
+        # worker loop — ``asyncio.all_tasks`` is the public observable
+        # of the running worker task. For the never-returning
+        # ``_slow_coro`` this proves ``__aiter__`` ran and ``_iterate``
+        # is suspended at ``response_queue.get``.
+        while "handler" not in captured or not asyncio.all_tasks(loop=worker_loop):
             await asyncio.sleep(0)
 
         # Act — cancel from this task while driver_task drives the

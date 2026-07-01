@@ -10,6 +10,7 @@ Routines are organized by dimension:
 """
 
 import asyncio
+import contextvars
 import functools
 import inspect
 from enum import Enum
@@ -34,6 +35,7 @@ class ContextVarPattern(Enum):
     DOWNSTREAM_RESET = auto()
     UPSTREAM_RESET = auto()
     PER_YIELD = auto()
+    MID_STREAM_FORWARD = auto()
 
 
 # Module-level wool.ContextVars used by the propagation integration tests.
@@ -41,7 +43,7 @@ class ContextVarPattern(Enum):
 # worker when it unpickles a routine defined here. The import causes
 # the worker's own wool.ContextVar instances to self-register in the
 # process-wide registry under their ``"<namespace>:<name>"`` keys;
-# caller-side snapshots with matching keys resolve to the same logical
+# caller-side contexts with matching keys resolve to the same logical
 # var on the worker.
 TENANT_ID: wool.ContextVar[str] = wool.ContextVar("tenant_id", default="unknown")
 REGION: wool.ContextVar[str] = wool.ContextVar("region", default="global")
@@ -58,7 +60,7 @@ TEST_PATTERNS: wool.ContextVar[dict] = wool.ContextVar("_test_patterns", default
 _RESET_TOKENS: wool.ContextVar[dict] = wool.ContextVar("_reset_tokens", default={})
 
 
-def _resolve_var(name: str) -> "wool.ContextVar":
+def _resolve_var(name: str) -> wool.ContextVar:
     """Look up a wool.ContextVar by logical name at call time.
 
     Resolves against the module's live globals each call. This
@@ -87,6 +89,18 @@ def _execute_patterns(patterns, *, step=None):
             case ContextVarPattern.PER_YIELD:
                 if step is not None:
                     var.set(f"step-{step}")
+            case ContextVarPattern.MID_STREAM_FORWARD:
+                # Forward pattern: the caller mutates the var to a
+                # per-step value before each ``__anext__``; the worker
+                # asserts the forward-propagated value reached this
+                # frame. A mismatch raises, surfacing as a dispatch
+                # exception on the caller's ``__anext__``.
+                if step is not None:
+                    observed = var.get()
+                    assert observed == f"step-{step}", (
+                        f"MID_STREAM_FORWARD {var_name}: worker expected "
+                        f"forward-propagated 'step-{step}', got {observed!r}"
+                    )
             case ContextVarPattern.DOWNSTREAM_OVERWRITE:
                 var.set(f"inner-overwrite-{var_name}")
             case ContextVarPattern.DOWNSTREAM_RESET:
@@ -130,14 +144,15 @@ def _pre_nested_setup(patterns):
 def _post_nested_teardown(patterns):
     """Clean up after a nested dispatch returns (outer worker side).
 
-    For UPSTREAM_RESET the outer worker resets the var that the inner
-    worker set, using a token captured before the nested call.
+    For UPSTREAM_RESET the outer worker overwrites the var that the
+    inner worker set with a sentinel value, signalling that the outer
+    worker has completed its post-nested teardown step.
     """
     for var_name, pattern in patterns.items():
         var = _resolve_var(var_name)
         if pattern is ContextVarPattern.UPSTREAM_RESET:
             # The inner worker set this var; the outer worker now
-            # resets it back to whatever it was before.
+            # overwrites it with a sentinel to mark teardown.
             var.set(f"outer-reset-{var_name}")
 
 
@@ -146,6 +161,18 @@ NESTED_PATTERNS: frozenset[ContextVarPattern] = frozenset(
         ContextVarPattern.DOWNSTREAM_OVERWRITE,
         ContextVarPattern.DOWNSTREAM_RESET,
         ContextVarPattern.UPSTREAM_RESET,
+    }
+)
+
+# Patterns executed once per generator step (with a ``step`` index)
+# rather than once before the first yield. ``PER_YIELD`` mutates the
+# var per step (back-propagation direction); ``MID_STREAM_FORWARD``
+# asserts the caller's per-step mutation reached the worker frame
+# (forward-propagation direction).
+_PER_STEP_PATTERNS: frozenset[ContextVarPattern] = frozenset(
+    {
+        ContextVarPattern.PER_YIELD,
+        ContextVarPattern.MID_STREAM_FORWARD,
     }
 )
 
@@ -209,18 +236,14 @@ def context_pattern_aware(fn):
                 inner_patterns["_inner"] = True
                 TEST_PATTERNS.set(inner_patterns)
 
-            # Execute simple patterns (except PER_YIELD).
+            # Execute simple patterns (except the per-step ones).
             non_yield_simple = {
-                k: v
-                for k, v in non_nested.items()
-                if v is not ContextVarPattern.PER_YIELD
+                k: v for k, v in non_nested.items() if v not in _PER_STEP_PATTERNS
             }
             if non_yield_simple:
                 _execute_patterns(non_yield_simple)
 
-            per_yield = {
-                k: v for k, v in non_nested.items() if v is ContextVarPattern.PER_YIELD
-            }
+            per_yield = {k: v for k, v in non_nested.items() if v in _PER_STEP_PATTERNS}
             step = 0
             try:
                 value = await gen.__anext__()
@@ -631,7 +654,7 @@ async def streaming_nested_get_tenant_id(count: int):
 
     Mutates TENANT_ID to a per-iteration value, dispatches
     ``get_tenant_id`` (nested), and yields the observed value.
-    Verifies that the ``_current_task`` and ``wool.Context`` set by
+    Verifies that the ``_current_task`` and chain context set by
     the worker for the streaming routine remain active across the
     generator's lifespan — without that, the nested dispatch cannot
     find the caller's task and the propagation chain breaks.
@@ -662,7 +685,7 @@ async def read_multi_vars() -> tuple[str, str]:
     """Coroutine that reads TENANT_ID and REGION simultaneously.
 
     Used to verify that multiple wool.ContextVars in the registry are
-    all snapshotted and restored correctly through a single dispatch.
+    all propagated and restored correctly through a single dispatch.
     """
     return TENANT_ID.get(), REGION.get()
 
@@ -701,90 +724,78 @@ async def mutate_on_each_yield(count: int):
 
 
 @wool.routine
-async def return_current_context_id_hex() -> str:
-    """Coroutine that returns ``wool.current_context().id.hex`` from the worker.
+async def return_current_chain_id_hex() -> str:
+    """Coroutine that returns the worker-side context ``chain_id`` hex.
 
-    Used to verify that the caller's context id propagates through a
-    dispatch boundary — the worker should observe the same id as the
-    caller captured pre-dispatch.
+    Used to verify that a dispatch boundary correctly arms the worker
+    on the caller's chain. The worker installs the caller's decoded
+    context via ``install_context``, so its ``chain_id`` equals the
+    caller's (or the child's, when dispatched from an asyncio child
+    task that has forked the chain).
     """
-    return wool.current_context().id.hex
+
+    context = wool.__chain__.get(None)
+    assert context is not None
+    return context.id.hex
 
 
 @wool.routine
-async def accept_token_and_reset(token: wool.Token) -> str:
-    """Coroutine that calls ``var.reset(token)`` on the worker and returns var.get().
+async def stream_chain_id_hex(count: int):
+    """Async generator that yields the worker-side context ``chain_id`` hex.
 
-    The caller sets ``TENANT_ID`` before dispatch and passes the
-    resulting Token. On the worker, ``reset`` restores the pre-set
-    value. The returned value is the post-reset read, which should
-    equal the default (or prior value) captured at ``set`` time.
+    The streaming counterpart of :func:`return_current_chain_id_hex`. A
+    ``sleep(0)`` between yields forces the generator to suspend, so each
+    read happens after a genuine resume across an ``__anext__``
+    boundary. Used to verify that two interleaved async-generator
+    dispatches both observe the caller's shared chain id.
     """
-    TENANT_ID.reset(token)
-    return TENANT_ID.get()
+
+    for _ in range(count):
+        context = wool.__chain__.get(None)
+        assert context is not None
+        yield context.id.hex
+        await asyncio.sleep(0)
 
 
 @wool.routine
-async def accept_token_and_double_reset(token: wool.Token) -> str:
-    """Coroutine that calls ``reset(token)`` twice, the second call raising.
+async def append_to_list(items: list, value) -> list:
+    """Coroutine that appends *value* to *items* in place and returns it.
 
-    Returns the caught exception's repr so the caller can verify a
-    RuntimeError ("Token has already been used") was raised inside the
-    routine.
+    Used by the unified-driver argument-copy tests. The worker receives
+    a serialized copy of *items*, so the in-place ``append`` mutates
+    only the worker's copy and the caller's original list object is
+    left unchanged.
     """
-    TENANT_ID.reset(token)
-    try:
-        TENANT_ID.reset(token)
-    except RuntimeError as exc:
-        return repr(exc)
-    return "no-error"
+    items.append(value)
+    return items
 
 
 @wool.routine
-async def accept_token_and_reset_on_yield(token: wool.Token):
-    """Async generator that resets *token* between two yields.
+async def append_on_each_yield(items: list, values: list):
+    """Async generator that appends each value in *values* to *items*
+    across successive yields.
 
-    Yields "before" first, then consumes the token via
-    ``TENANT_ID.reset(token)``, then yields "after". The caller can
-    observe per-yield back-propagation of the consumed-token state
-    across the reset boundary.
+    On every iteration it appends the next value in *values* to
+    *items* in place and yields a snapshot of the worker-side list.
+    The caller's original *items* object is unaffected because the
+    worker operates on a serialized copy of the argument.
     """
-    yield "before"
-    TENANT_ID.reset(token)
-    yield "after"
+    for value in values:
+        items.append(value)
+        yield list(items)
+        await asyncio.sleep(0)
 
 
 @wool.routine
-async def read_value_and_attempt_reset(token: wool.Token) -> tuple[str, str]:
-    """Coroutine that reads ``TENANT_ID`` and attempts to reset with *token*.
+async def touch_argument(argument):
+    """Coroutine that returns its single argument unchanged.
 
-    Returns a ``(value, reset_outcome)`` pair. ``value`` is the
-    worker-side observation of ``TENANT_ID.get()`` before any reset
-    attempt; ``reset_outcome`` is the repr of the RuntimeError raised
-    when ``TENANT_ID.reset(token)`` is invoked against an
-    already-consumed Token, or the literal ``"no-error"`` string if
-    no exception was raised. Used to verify that a single dispatch
-    carrying both a value binding and the corresponding
-    consumed-token id under the same wire entry round-trips both
-    pieces of state to the worker.
+    A trivial single-argument routine used by the unpicklable-argument
+    dispatch tests — the routine body never runs when the argument
+    cannot be serialized, since the failure happens at the dispatch
+    serialization boundary.
     """
-    value = TENANT_ID.get()
-    try:
-        TENANT_ID.reset(token)
-    except RuntimeError as exc:
-        return value, repr(exc)
-    return value, "no-error"
-
-
-@wool.routine
-async def mint_tenant_token(value: str) -> wool.Token:
-    """Coroutine that mints a Token via ``TENANT_ID.set`` and returns it.
-
-    Returns the Token straight to the caller so cross-process
-    lifecycle scenarios can begin from a worker-minted Token
-    instead of a caller-minted one.
-    """
-    return TENANT_ID.set(value)
+    return argument
 
 
 @wool.routine
@@ -792,7 +803,7 @@ async def mutate_then_raise_tenant_id(value: str) -> str:
     """Coroutine that sets ``TENANT_ID`` to *value* then raises ValueError.
 
     Used by exception-path back-propagation tests — the worker's mutation
-    should reach the caller via the exception's snapshot path.
+    should reach the caller via the exception's context path.
     """
     TENANT_ID.set(value)
     raise ValueError("mutate_then_raise_tenant_id")
@@ -805,7 +816,7 @@ async def yield_then_mutate_and_raise(sentinel: str):
     Yields ``"ready"`` first so the caller can iterate once, then sets
     ``TENANT_ID`` to *sentinel* before raising ``ValueError``. Used to
     verify that mid-stream mutations are back-propagated through the
-    exception snapshot.
+    exception context.
     """
     yield "ready"
     TENANT_ID.set(sentinel)
@@ -928,7 +939,7 @@ async def declare_and_read_unregistered_key(
 
     Exercises the stub-promotion path: the wire frame creates a stub
     in the registry with the caller's value applied to the active
-    Context; the in-routine ``ContextVar(name, namespace=...)`` call
+    context; the in-routine ``ContextVar(name, namespace=...)`` call
     finds the stub and promotes it in place, preserving the
     wire-applied value on the new authoritative declaration.
     """
@@ -940,12 +951,12 @@ async def declare_and_read_unregistered_key(
 async def read_dispatch_timeout() -> float | None:
     """Return the worker-side value of the ambient ``dispatch_timeout``.
 
-    Verifies that a caller-side :class:`wool.RuntimeContext` snapshot
+    Verifies that a caller-side :class:`wool.RuntimeContext`
     rides through the dispatch wire frame and is restored on the
     worker before the routine body executes — independent of the
     :class:`wool.ContextVar` propagation path.
     """
-    from wool.runtime.context import dispatch_timeout
+    from wool.runtime.context.runtime import dispatch_timeout
 
     return dispatch_timeout.get()
 
@@ -961,3 +972,236 @@ async def mutate_then_nested_get_tenant_id(mid_value: str) -> str:
     """
     TENANT_ID.set(mid_value)
     return await get_tenant_id()
+
+
+def _decode_bomb_rebuild():
+    """Rebuild callable referenced by :class:`DecodeBomb`'s ``__reduce__``.
+
+    Raises unconditionally — when a pickled :class:`DecodeBomb` is
+    unpickled (the worker-side ``decode_context`` step), this fires
+    and the per-entry decode fails. The caller never unpickles its own
+    outgoing context, so the failure is worker-side only.
+    """
+    raise RuntimeError("decode bomb detonated on unpickle")
+
+
+class DecodeBomb:
+    """A value that pickles cleanly but raises when unpickled.
+
+    Models a version-skew payload: ``encode_context`` on the caller
+    pickles it without error (``__reduce__`` just stores the rebuild
+    tuple), but the worker's ``decode_context`` calls
+    :func:`_decode_bomb_rebuild`, which raises. Used to drive the
+    worker-side context-decode-failure → Nack path.
+    """
+
+    def __reduce__(self):
+        return (_decode_bomb_rebuild, ())
+
+
+@wool.routine
+async def set_tenant_then_crash_worker(value: str) -> str:
+    """Set ``TENANT_ID`` then hard-crash the worker process.
+
+    Sets the var (arming the chain), then calls ``os._exit`` so the
+    worker subprocess dies mid-dispatch without a graceful response.
+    The caller should observe an ``RpcError`` / ``UnexpectedResponse``
+    and its own context state must stay intact — no half-merged
+    back-propagation from the crashed worker.
+    """
+    import os
+
+    TENANT_ID.set(value)
+    os._exit(70)
+
+
+@wool.routine
+async def set_tenant_then_sleep(value: str, sentinel_path: str, duration: float = 30.0):
+    """Set ``TENANT_ID`` then sleep — for armed-context cancellation.
+
+    Writes ``"started"`` to *sentinel_path* immediately before
+    suspending on :func:`asyncio.sleep` so the caller can poll for
+    suspension. On :class:`asyncio.CancelledError` the marker is
+    overwritten with ``"cancelled"``. The var mutation is the partial
+    state whose fate under cancellation the caller pins.
+    """
+    TENANT_ID.set(value)
+    try:
+        with open(sentinel_path, "w") as f:
+            f.write("started")
+        await asyncio.sleep(duration)
+    except asyncio.CancelledError:
+        with open(sentinel_path, "w") as f:
+            f.write("cancelled")
+        raise
+
+
+@wool.routine
+async def set_and_reset_tenant_across_yield(value: str):
+    """Async generator that sets ``TENANT_ID``, yields, resets, yields.
+
+    First sets ``TENANT_ID`` to *value* and yields ``"set"``; then
+    resets the var via the token from that set and yields ``"reset"``.
+    The caller observes the per-yield back-propagation across the
+    set→reset boundary: its own ``TENANT_ID`` tracks the value after
+    the first yield and reverts after the second.
+    """
+    token = TENANT_ID.set(value)
+    yield "set"
+    TENANT_ID.reset(token)
+    yield "reset"
+
+
+@wool.routine
+async def read_unbound_default_less_var(namespace: str, name: str) -> str:
+    """Declare a default-less :class:`wool.ContextVar` and ``get()`` it.
+
+    The var has no constructor default and is unbound, so ``get()``
+    with no argument raises :class:`LookupError`. The exception must
+    surface to the caller through the exception back-propagation path.
+    """
+    var = wool.ContextVar(name, namespace=namespace)
+    return var.get()
+
+
+@wool.routine
+async def count_wool_context_vars() -> int:
+    """Return the count of wool-owned ``contextvars.ContextVar``s.
+
+    Enumerates ``contextvars.copy_context()`` and counts entries whose
+    name carries the ``__wool`` prefix — the context variable plus one
+    backing variable per bound :class:`wool.ContextVar`.
+    """
+    import contextvars as _cv
+
+    return sum(1 for var in _cv.copy_context() if var.name.startswith("__wool"))
+
+
+@wool.routine
+async def reenter_armed_chain_off_owner_thread(value: str) -> str:
+    """Arm the routine's chain, then read the var off the owner thread.
+
+    Sets ``TENANT_ID`` (arming the routine's chain on the worker's
+    loop thread), then hands a ``wool.ContextVar`` access to a worker
+    thread via :func:`asyncio.to_thread`. ``asyncio.to_thread`` copies
+    the surrounding ``contextvars`` context — chain UUID and owner
+    included — into the executor thread, so the off-thread ``get()``
+    re-enters an armed chain from a thread other than its owner and
+    raises :class:`wool.ChainContention`. The exception surfaces
+    to the caller through the exception back-propagation path.
+    """
+    TENANT_ID.set(value)
+    return await asyncio.to_thread(TENANT_ID.get)
+
+
+@wool.routine
+async def read_var_off_thread_via_wool_to_thread(value: str) -> str:
+    """Arm the routine's chain, then read the var off-thread via wool.to_thread.
+
+    Sets ``TENANT_ID`` (arming the routine's chain on the worker's loop
+    thread), then offloads the var read to a worker thread via
+    :func:`wool.to_thread`. Unlike :func:`asyncio.to_thread` — which
+    copies the armed chain verbatim and trips
+    :class:`wool.ChainContention` off the owner thread —
+    ``wool.to_thread`` forks the chain onto a fresh, detached chain
+    owned by the worker thread, so the off-thread ``get()`` re-arms
+    cleanly and observes the forked copy of the value.
+    """
+    TENANT_ID.set(value)
+    return await wool.to_thread(TENANT_ID.get)
+
+
+async def _drive_proxy_collision_on_worker() -> wool.ChainContention:
+    """Drive two tasks sharing one fresh context into a proxy collision.
+
+    Runs inside a dispatched routine, whose own chain is already armed
+    and owned by the routine task. A FRESH `contextvars.Context` is used
+    — not `contextvars.copy_context` — so it starts unarmed and is shared
+    (not forked) by the two child tasks: the first child enters a proxy
+    in it and owns it, and the second child's entry into that context it
+    does not own raises `wool.ChainContention` with kind ``"task"``. The
+    events serialize the interleave so the first always enters first and
+    stays live until the second has contended. The proxies are lazy, so
+    entry incurs no discovery or worker startup.
+    """
+    wool.install_task_factory()
+    loop = asyncio.get_running_loop()
+    shared = contextvars.Context()
+    armed = asyncio.Event()
+    first_can_finish = asyncio.Event()
+
+    async def first() -> None:
+        async with wool.WorkerProxy("proxy-collision-pool", lazy=True):
+            armed.set()
+            await first_can_finish.wait()
+
+    async def second():
+        await armed.wait()
+        try:
+            async with wool.WorkerProxy("proxy-collision-pool", lazy=True):
+                return None
+        except wool.ChainContention as exc:
+            return exc
+        finally:
+            first_can_finish.set()
+
+    first_task = loop.create_task(first(), context=shared)
+    second_task = loop.create_task(second(), context=shared)
+    observed, _ = await asyncio.gather(second_task, first_task)
+    assert isinstance(observed, wool.ChainContention)
+    return observed
+
+
+@wool.routine
+async def report_proxy_collision_in_shared_context() -> str:
+    """Trigger a worker-side proxy collision and return its contention kind.
+
+    Drives two tasks sharing one fresh context into a `wool.WorkerProxy`
+    collision on the worker, catches the resulting `wool.ChainContention`,
+    and returns its ``kind`` (``"task"``) as a plain string — proving the
+    guard fired on the worker without relying on the exception crossing
+    the wire.
+    """
+    return (await _drive_proxy_collision_on_worker()).kind
+
+
+@wool.routine
+async def raise_proxy_collision_in_shared_context() -> None:
+    """Trigger a worker-side proxy collision and re-raise it to the caller.
+
+    Lets the worker-side `wool.ChainContention` propagate through the
+    routine-exception back-propagation channel so the caller observes it
+    directly (relies on the contention being wire-safe).
+    """
+    raise await _drive_proxy_collision_on_worker()
+
+
+@wool.routine
+async def stream_proxy_collision_in_shared_context():
+    """Stream a worker-side proxy collision: yield ``"ready"``, then its kind.
+
+    Async-generator variant of
+    `report_proxy_collision_in_shared_context`: yields ``"ready"`` first,
+    then drives the worker-side collision and yields its contention
+    ``kind`` (``"task"``) — exercising the async-generator dispatch
+    driver.
+    """
+    yield "ready"
+    yield (await _drive_proxy_collision_on_worker()).kind
+
+
+@wool.routine
+async def enter_proxies_in_separate_tasks_on_worker() -> str:
+    """Enter two proxies in separate forked tasks on the worker (no collision).
+
+    Each ``asyncio.gather`` child forks a fresh, child-owned chain via
+    the task factory, so concurrent proxy entries inside a dispatched
+    routine never contend. Returns ``"ok"``.
+    """
+
+    async def use_proxy() -> None:
+        async with wool.WorkerProxy("proxy-collision-pool", lazy=True):
+            await asyncio.sleep(0)
+
+    await asyncio.gather(use_proxy(), use_proxy())
+    return "ok"

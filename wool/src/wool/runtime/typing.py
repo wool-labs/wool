@@ -16,6 +16,7 @@ Wrapper = Callable[[F], W]
 PassthroughWrapper = Callable[[F], F]
 
 
+# public
 @final
 class UndefinedType(Enum):
     Undefined = "Undefined"

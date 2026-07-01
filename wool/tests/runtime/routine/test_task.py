@@ -1,4 +1,6 @@
+import _thread
 import asyncio
+import pickle
 from typing import AsyncGenerator
 from typing import Callable
 from typing import Coroutine
@@ -14,15 +16,13 @@ from hypothesis import strategies as st
 
 import wool
 from wool import protocol
-from wool.runtime.context import RuntimeContext
-from wool.runtime.context import dispatch_timeout
+from wool.runtime.context.runtime import RuntimeContext
+from wool.runtime.context.runtime import dispatch_timeout
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
 from wool.runtime.routine.task import current_task
 from wool.runtime.routine.task import do_dispatch
 from wool.runtime.routine.task import routine_scope
-from wool.runtime.serializer import PassthroughSerializer
-from wool.runtime.serializer import Serializer
 
 
 class _PicklableProxy:
@@ -45,6 +45,27 @@ def _restore_picklable_proxy(proxy_id):
     return proxy
 
 
+def _arbitrary_payloads():
+    """Recursive Hypothesis strategy covering nested cloudpickle-picklable values."""
+    primitives = st.one_of(
+        st.none(),
+        st.booleans(),
+        st.text(),
+        st.integers(),
+        st.binary(),
+        st.floats(allow_nan=False),
+    )
+    return st.recursive(
+        primitives,
+        lambda children: st.one_of(
+            st.lists(children),
+            st.tuples(children, children),
+            st.dictionaries(st.text(), children),
+        ),
+        max_leaves=20,
+    )
+
+
 class _GuardedProxy(_PicklableProxy):
     """Proxy test double that adopts the Wool pickling protocol.
 
@@ -64,7 +85,7 @@ class _GuardedProxy(_PicklableProxy):
 class TestWorkerProxyLike:
     """Tests for :py:class:`WorkerProxyLike` protocol conformance."""
 
-    def test_positive_conformance(self, sample_task):
+    def test_positive_conformance_should_instantiate_task(self, sample_task):
         """Test that a conforming proxy is accepted by Task.
 
         Given:
@@ -98,7 +119,7 @@ class TestWorkerProxyLike:
         assert hasattr(task.proxy, "id")
         assert callable(task.proxy.dispatch)
 
-    def test_negative_conformance(self, sample_async_callable):
+    def test_negative_conformance_should_raise(self, sample_async_callable):
         """Test that a non-conforming proxy is rejected by Task.
 
         Given:
@@ -131,7 +152,7 @@ class TestWorkerProxyLike:
             )
 
 
-def test_do_dispatch_with_default_context():
+def test_do_dispatch_should_return_true_when_no_active_context():
     """Test do_dispatch returns True with no active context.
 
     Given:
@@ -145,7 +166,7 @@ def test_do_dispatch_with_default_context():
     assert do_dispatch() is True
 
 
-def test_do_dispatch_with_false_flag():
+def test_do_dispatch_should_return_false_when_inside_false_context():
     """Test do_dispatch returns False inside a False context.
 
     Given:
@@ -162,7 +183,7 @@ def test_do_dispatch_with_false_flag():
     assert do_dispatch()
 
 
-def test_do_dispatch_with_nested_contexts():
+def test_do_dispatch_should_return_innermost_value_when_nested():
     """Test do_dispatch tracks the innermost nested context.
 
     Given:
@@ -184,7 +205,9 @@ def test_do_dispatch_with_nested_contexts():
 
 
 @pytest.mark.asyncio
-async def test_current_task_inside_task_context(sample_task, mock_worker_proxy_cache):
+async def test_current_task_should_return_current_task_when_inside_task_context(
+    sample_task, mock_worker_proxy_cache
+):
     """Test current_task returns the active Task during dispatch.
 
     Given:
@@ -209,7 +232,7 @@ async def test_current_task_inside_task_context(sample_task, mock_worker_proxy_c
     assert result == task
 
 
-def test_current_task_outside_task_context():
+def test_current_task_should_return_none_when_outside_task_context():
     """Test current_task returns None outside any task context.
 
     Given:
@@ -227,7 +250,7 @@ def test_current_task_outside_task_context():
 
 
 @pytest.mark.asyncio
-async def test_current_task_with_nested_task_contexts(sample_task):
+async def test_current_task_should_set_caller_to_outer_task_when_nested(sample_task):
     """Test nested task contexts set caller to the outer task.
 
     Given:
@@ -256,7 +279,9 @@ async def test_current_task_with_nested_task_contexts(sample_task):
 )
 @given(depth=st.integers(min_value=2, max_value=5))
 @pytest.mark.asyncio
-async def test_current_task_with_variable_nesting_depth(depth, sample_task):
+async def test_current_task_should_track_caller_when_variable_nesting_depth(
+    depth, sample_task
+):
     """Test nested task context tracking at variable depth.
 
     Given:
@@ -297,7 +322,9 @@ class TestTask:
     """Tests for :py:class:`Task`."""
 
     @pytest.mark.asyncio
-    async def test___post_init___inside_task_context(self, sample_task):
+    async def test___post_init___should_set_caller_when_inside_task_context(
+        self, sample_task
+    ):
         """Test post-init sets caller inside a task context.
 
         Given:
@@ -318,7 +345,9 @@ class TestTask:
         # Assert
         assert inner_task.caller == outer_task.id
 
-    def test___post_init___outside_task_context(self, sample_task):
+    def test___post_init___should_leave_caller_none_when_outside_task_context(
+        self, sample_task
+    ):
         """Test post-init leaves caller as None without context.
 
         Given:
@@ -334,7 +363,9 @@ class TestTask:
         # Assert
         assert task.caller is None
 
-    def test___post_init___without_explicit_context(self, sample_async_callable):
+    def test___post_init___should_capture_caller_runtime_context(
+        self, sample_async_callable
+    ):
         """Test post-init auto-captures the caller's RuntimeContext.
 
         Given:
@@ -367,7 +398,9 @@ class TestTask:
             assert dispatch_timeout.get() == 1.25
 
     @pytest.mark.asyncio
-    async def test___enter___with_coroutine_callable(self, sample_task):
+    async def test___enter___should_bind_current_task_when_coroutine_callable(
+        self, sample_task
+    ):
         """Test __enter__ returns a callable for coroutine tasks.
 
         Given:
@@ -387,7 +420,9 @@ class TestTask:
             assert current_task() is task
 
     @pytest.mark.asyncio
-    async def test___enter___with_async_generator(self, sample_task):
+    async def test___enter___should_bind_current_task_when_async_generator(
+        self, sample_task
+    ):
         """Test __enter__ binds ``_current_task`` for an async-gen task.
 
         Given:
@@ -411,7 +446,7 @@ class TestTask:
             assert current_task() is task
 
     @pytest.mark.asyncio
-    async def test___exit___without_exception(self, sample_task):
+    async def test___exit___should_exit_cleanly_when_no_exception(self, sample_task):
         """Test __exit__ completes cleanly without exceptions.
 
         Given:
@@ -428,8 +463,55 @@ class TestTask:
         with task:
             pass
 
+    def test___enter___should_raise_when_already_active(self, sample_task):
+        """Test re-entering an already-active Task raises.
+
+        Given:
+            A :py:class:`Task` currently inside an active ``with``
+            block.
+        When:
+            The same instance is entered as a context manager a
+            second time.
+        Then:
+            It should raise RuntimeError — Task instances are
+            block-scoped and single-use as context managers.
+        """
+        # Arrange
+        task = sample_task()
+
+        # Act & assert
+        with task:
+            with pytest.raises(RuntimeError, match="already active"):
+                with task:
+                    pass
+
+    def test___exit___should_return_false_when_never_entered(self, sample_task):
+        """Test __exit__ on a never-entered Task is a no-op.
+
+        Given:
+            A :py:class:`Task` whose ``__enter__`` was never invoked.
+        When:
+            ``__exit__`` is invoked directly with no exception
+            propagating.
+        Then:
+            It should return False (exceptions propagate) and leave
+            state untouched — symmetric with ``__enter__``'s double-
+            entry guard so misuse is well-defined rather than
+            crashing on the underlying ``Token.reset(None)``.
+        """
+        # Arrange
+        task = sample_task()
+
+        # Act
+        # No ``with`` idiom can invoke ``__exit__`` without a matching
+        # ``__enter__``, so the misuse guard is exercised by a direct call.
+        result = task.__exit__(None, None, None)
+
+        # Assert
+        assert result is False
+
     @pytest.mark.asyncio
-    async def test___exit___with_value_error(self, sample_task):
+    async def test___exit___should_capture_exception_when_value_error(self, sample_task):
         """Test __exit__ captures ValueError as TaskException.
 
         Given:
@@ -458,7 +540,9 @@ class TestTask:
         assert any("test error" in line for line in task.exception.traceback)
 
     @pytest.mark.asyncio
-    async def test___exit___with_runtime_error(self, sample_task):
+    async def test___exit___should_capture_exception_when_runtime_error(
+        self, sample_task
+    ):
         """Test __exit__ captures RuntimeError as TaskException.
 
         Given:
@@ -495,7 +579,7 @@ class TestTask:
         tag=st.one_of(st.none(), st.text(min_size=1, max_size=100)),
     )
     @pytest.mark.asyncio
-    async def test_to_protobuf_with_picklable_proxy(
+    async def test_to_protobuf_should_preserve_all_attributes_when_round_tripped(
         self,
         task_id,
         timeout,
@@ -547,6 +631,208 @@ class TestTask:
         assert deserialized_task.timeout == original_task.timeout
         assert deserialized_task.tag == original_task.tag
 
+    def test_to_protobuf_should_produce_distinct_objects_when_round_tripped(self):
+        """Test the protobuf round-trip returns independent copies.
+
+        Given:
+            A :py:class:`Task` with picklable callable, args, kwargs,
+            and proxy.
+        When:
+            The task is round-tripped via
+            ``Task.from_protobuf(task.to_protobuf())``.
+        Then:
+            The restored ``callable``, ``args``, ``kwargs``, and
+            ``proxy`` are each distinct objects from the originals —
+            cloudpickle round-trips produce copies.
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        proxy = _PicklableProxy()
+        args = (1, "test", [1, 2, 3])
+        kwargs = {"key": "value"}
+        original = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=args,
+            kwargs=kwargs,
+            proxy=proxy,
+        )
+
+        # Act
+        restored = Task.from_protobuf(original.to_protobuf())
+
+        # Assert
+        assert restored.callable is not original.callable
+        assert restored.args is not original.args
+        assert restored.kwargs is not original.kwargs
+        assert restored.proxy is not original.proxy
+
+    def test_to_protobuf_should_copy_mutable_args_when_round_tripped(self):
+        """Test the protobuf round-trip yields independent mutable args.
+
+        Given:
+            A :py:class:`Task` whose args contain a mutable list.
+        When:
+            The task is round-tripped and the restored arg is
+            mutated.
+        Then:
+            The original arg is unaffected — the round-trip produced
+            an independent copy, not a shared reference.
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        original_list = [1, 2, 3]
+        original = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=(original_list,),
+            kwargs={},
+            proxy=_PicklableProxy(),
+        )
+
+        # Act
+        restored = Task.from_protobuf(original.to_protobuf())
+        restored.args[0].append(4)
+
+        # Assert
+        assert restored.args[0] == [1, 2, 3, 4]
+        assert original_list == [1, 2, 3]
+
+    def test_to_protobuf_should_raise_when_arg_uncloudpicklable(self, picklable_proxy):
+        """Test to_protobuf raises for a non-cloudpicklable positional arg.
+
+        Given:
+            A :py:class:`Task` whose ``args`` tuple contains a value
+            that cloudpickle cannot serialize (a thread lock).
+        When:
+            ``to_protobuf()`` is called.
+        Then:
+            It should raise a pickling error.
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        task = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=(_thread.allocate_lock(),),
+            kwargs={},
+            proxy=picklable_proxy,
+        )
+
+        # Act & assert
+        with pytest.raises((TypeError, pickle.PicklingError)):
+            task.to_protobuf()
+
+    def test_to_protobuf_should_raise_when_kwarg_uncloudpicklable(self, picklable_proxy):
+        """Test to_protobuf raises for a non-cloudpicklable keyword arg.
+
+        Given:
+            A :py:class:`Task` whose ``kwargs`` dict contains a value
+            that cloudpickle cannot serialize (a thread lock).
+        When:
+            ``to_protobuf()`` is called.
+        Then:
+            It should raise a pickling error.
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        task = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=(),
+            kwargs={"lock": _thread.allocate_lock()},
+            proxy=picklable_proxy,
+        )
+
+        # Act & assert
+        with pytest.raises((TypeError, pickle.PicklingError)):
+            task.to_protobuf()
+
+    def test_to_protobuf_should_omit_serializer_field(
+        self, sample_async_callable, picklable_proxy
+    ):
+        """Test to_protobuf produces a message without a serializer field.
+
+        Given:
+            A fully-populated :py:class:`Task`.
+        When:
+            ``to_protobuf()`` is called and the message is inspected.
+        Then:
+            The message has no ``serializer`` field.
+        """
+        # Arrange
+        task = Task(
+            id=uuid4(),
+            callable=sample_async_callable,
+            args=(1, 2),
+            kwargs={"key": "value"},
+            proxy=picklable_proxy,
+            caller=uuid4(),
+            timeout=30,
+            tag="test_tag",
+        )
+
+        # Act
+        task_msg = task.to_protobuf()
+
+        # Assert
+        field_names = [f.name for f in task_msg.DESCRIPTOR.fields]
+        assert "serializer" not in field_names
+        with pytest.raises(ValueError):
+            task_msg.HasField("serializer")
+
+    @settings(max_examples=50, deadline=None)
+    @given(payload=_arbitrary_payloads())
+    def test_to_protobuf_should_copy_arbitrary_payloads(self, payload):
+        """Test the protobuf round-trip copies arbitrary nested payloads.
+
+        Given:
+            Any nested cloudpicklable structure used as a
+            :py:class:`Task`'s ``args`` and ``kwargs``.
+        When:
+            The task is round-tripped via
+            ``Task.from_protobuf(task.to_protobuf())``.
+        Then:
+            The restored ``args`` and ``kwargs`` equal the originals
+            yet are non-identical objects — the copy invariant holds
+            for arbitrary payloads.
+        """
+
+        # Arrange
+        async def test_callable():
+            return "result"
+
+        args = (payload,)
+        kwargs = {"payload": payload}
+        original = Task(
+            id=uuid4(),
+            callable=test_callable,
+            args=args,
+            kwargs=kwargs,
+            proxy=_PicklableProxy(),
+        )
+
+        # Act
+        restored = Task.from_protobuf(original.to_protobuf())
+
+        # Assert
+        assert restored.args == original.args
+        assert restored.kwargs == original.kwargs
+        assert restored.args is not original.args
+        assert restored.kwargs is not original.kwargs
+
     @pytest.mark.asyncio
     @settings(
         max_examples=20,
@@ -554,7 +840,7 @@ class TestTask:
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @given(value_count=st.integers(min_value=0, max_value=10))
-    async def test_dispatch_with_async_generator(
+    async def test_dispatch_should_yield_all_values_when_async_generator(
         self,
         value_count,
         mock_worker_proxy_cache,
@@ -595,7 +881,7 @@ class TestTask:
         assert results == list(range(value_count))
 
     @pytest.mark.asyncio
-    async def test_from_protobuf_all_fields(
+    async def test_from_protobuf_should_deserialize_all_fields(
         self, sample_async_callable, picklable_proxy
     ):
         """Test from_protobuf deserializes all fields correctly.
@@ -642,7 +928,7 @@ class TestTask:
         assert task.tag == "test_tag"
 
     @pytest.mark.asyncio
-    async def test_from_protobuf_empty_optionals(
+    async def test_from_protobuf_should_default_optionals_when_empty(
         self, sample_async_callable, picklable_proxy
     ):
         """Test from_protobuf handles empty optional fields.
@@ -682,7 +968,7 @@ class TestTask:
         assert task.tag is None
 
     @pytest.mark.asyncio
-    async def test_from_protobuf_with_runtime_context(
+    async def test_from_protobuf_should_read_runtime_context(
         self, sample_async_callable, picklable_proxy
     ):
         """Test from_protobuf reads the RuntimeContext submessage.
@@ -721,7 +1007,7 @@ class TestTask:
             assert dispatch_timeout.get() == 12.5
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_dispatch_timeout_on_coroutine(
+    async def test_dispatch_should_apply_dispatch_timeout_when_coroutine(
         self, mock_worker_proxy_cache
     ):
         """Test coroutine dispatch applies context dispatch_timeout.
@@ -759,7 +1045,7 @@ class TestTask:
         assert captured == [7.5]
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_dispatch_timeout_on_async_generator(
+    async def test_dispatch_should_apply_dispatch_timeout_each_iteration(
         self, mock_worker_proxy_cache
     ):
         """Test async-gen dispatch applies context dispatch_timeout each iteration.
@@ -800,7 +1086,9 @@ class TestTask:
         # Assert
         assert captured == [3.0, 3.0]
 
-    def test_to_protobuf_all_fields(self, sample_async_callable, picklable_proxy):
+    def test_to_protobuf_should_serialize_all_fields(
+        self, sample_async_callable, picklable_proxy
+    ):
         """Test to_protobuf serializes all fields correctly.
 
         Given:
@@ -843,7 +1131,9 @@ class TestTask:
         assert task_msg.timeout == 30
         assert task_msg.tag == "test_tag"
 
-    def test_to_protobuf_none_optionals(self, sample_async_callable, picklable_proxy):
+    def test_to_protobuf_should_serialize_defaults_when_optionals_none(
+        self, sample_async_callable, picklable_proxy
+    ):
         """Test to_protobuf serializes None optionals as defaults.
 
         Given:
@@ -875,7 +1165,7 @@ class TestTask:
         assert task_msg.timeout == 0
         assert task_msg.tag == ""
 
-    def test_to_protobuf_with_version_field(
+    def test_to_protobuf_should_include_version(
         self, sample_async_callable, picklable_proxy
     ):
         """Test to_protobuf includes the protocol version.
@@ -910,7 +1200,7 @@ class TestTask:
     @given(
         version=st.from_regex(r"\d{1,3}\.\d{1,3}(rc\d{1,3}|\.\d{1,3})", fullmatch=True),
     )
-    def test_from_protobuf_with_version_roundtrip(self, version):
+    def test_from_protobuf_should_preserve_version_when_round_tripped(self, version):
         """Test protobuf round-trip preserves the version field.
 
         Given:
@@ -949,7 +1239,7 @@ class TestTask:
         assert parsed.version == version
 
     @pytest.mark.asyncio
-    async def test_dispatch_successful_execution(
+    async def test_dispatch_should_return_result(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -982,7 +1272,7 @@ class TestTask:
         assert result == 8
 
     @pytest.mark.asyncio
-    async def test_dispatch_without_proxy_pool_raises_error(self, sample_task):
+    async def test_dispatch_should_raise_when_no_proxy_pool(self, sample_task):
         """Test dispatch raises RuntimeError without a proxy pool.
 
         Given:
@@ -1005,7 +1295,7 @@ class TestTask:
             async with routine_scope(task) as routine:
                 await cast(Coroutine, routine)
 
-    def test_to_protobuf_with_unpicklable_callable_fails(self, picklable_proxy):
+    def test_to_protobuf_should_raise_when_callable_unpicklable(self, picklable_proxy):
         """Test to_protobuf fails with an unpicklable callable.
 
         Given:
@@ -1017,8 +1307,6 @@ class TestTask:
             ``AttributeError``.
         """
         # Arrange
-        import _thread
-
         unpicklable_obj = _thread.allocate_lock()
 
         async def unpicklable_callable():
@@ -1039,7 +1327,7 @@ class TestTask:
             task.to_protobuf()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_async_generator_callable(
+    async def test_dispatch_should_yield_all_values_when_async_generator_callable(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1073,7 +1361,7 @@ class TestTask:
         assert results == ["value_0", "value_1", "value_2"]
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_coroutine_callable(
+    async def test_dispatch_should_return_result_when_coroutine_callable(
         self,
         sample_task: Callable[..., Task],
         mock_worker_proxy_cache,
@@ -1103,7 +1391,7 @@ class TestTask:
         assert result == "coroutine_result"
 
     @pytest.mark.asyncio
-    async def test_routine_scope_with_invalid_callable(
+    async def test_routine_scope_should_raise_when_invalid_callable(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1134,7 +1422,7 @@ class TestTask:
                 pass
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_without_proxy_pool_raises_error(
+    async def test_dispatch_should_raise_when_async_generator_no_proxy_pool(
         self,
         sample_task,
     ):
@@ -1166,7 +1454,7 @@ class TestTask:
                     pass
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_raises_during_iteration(
+    async def test_dispatch_should_propagate_exception_when_generator_raises(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1200,7 +1488,7 @@ class TestTask:
         assert results == ["first"]
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_early_termination(
+    async def test_dispatch_should_stop_when_early_break(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1234,7 +1522,7 @@ class TestTask:
         assert results == ["value_0", "value_1"]
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_multiple_values(
+    async def test_dispatch_should_yield_multiple_values_in_order(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1268,7 +1556,7 @@ class TestTask:
         assert results == [0, 10, 20, 30, 40]
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_empty(
+    async def test_dispatch_should_yield_nothing_when_generator_empty(
         self,
         sample_task,
         mock_worker_proxy_cache,
@@ -1301,47 +1589,17 @@ class TestTask:
         # Assert
         assert results == []
 
-    def test_to_protobuf_without_serializer(
-        self, sample_async_callable, picklable_proxy
-    ):
-        """Test to_protobuf without serializer omits the serializer field.
-
-        Given:
-            A Task instance
-        When:
-            ``to_protobuf()`` is called with no serializer argument
-        Then:
-            It should not set the ``serializer`` field on the
-            protobuf message
-        """
-        # Arrange
-        task = Task(
-            id=uuid4(),
-            callable=sample_async_callable,
-            args=(),
-            kwargs={},
-            proxy=picklable_proxy,
-        )
-
-        # Act
-        task_msg = task.to_protobuf()
-
-        # Assert
-        assert not task_msg.HasField("serializer")
-
-    def test_to_protobuf_without_serializer_with_guarded_proxy(
-        self, sample_async_callable
-    ):
-        """Test the default Serializer respects __wool_reduce__ on the proxy.
+    def test_to_protobuf_should_serialize_guarded_proxy(self, sample_async_callable):
+        """Test to_protobuf serializes a guarded proxy via wool.__serializer__.
 
         Given:
             A Task whose proxy adopts the Wool pickling protocol.
         When:
-            to_protobuf() is called without an explicit serializer.
+            to_protobuf() is called.
         Then:
-            It should serialize the proxy via wool.__serializer__ — the
-            default fallback honors __wool_reduce__ instead of tripping
-            the __reduce_ex__ guard.
+            It should serialize the proxy via wool.__serializer__, which
+            honors __wool_reduce__ instead of tripping the __reduce_ex__
+            guard.
         """
         # Arrange
         proxy = _GuardedProxy()
@@ -1360,86 +1618,14 @@ class TestTask:
         assert task_msg.proxy
         assert task_msg.proxy_id == str(proxy.id)
 
-    def test_to_protobuf_with_custom_serializer_with_guarded_proxy(
-        self, sample_async_callable
-    ):
-        """Test custom Serializer routes the proxy through wool.__serializer__.
-
-        Given:
-            A Task whose proxy is a guarded type and a user-supplied
-            Serializer that is not PassthroughSerializer; the user
-            serializer counts dumps invocations so the test can verify
-            its participation in payload-field serialization.
-        When:
-            to_protobuf(serializer=...) is called.
-        Then:
-            It should pickle the user serializer into the protobuf
-            serializer field, route the four payload fields (callable,
-            args, kwargs) through the user serializer, and route the
-            proxy field through wool.__serializer__ so the proxy bytes
-            are decodable via cloudpickle.loads even though the user
-            serializer would otherwise mishandle guarded types.
-        """
-
-        # Arrange
-        class _RecordingSerializer:
-            """User serializer that records dumps invocations."""
-
-            def __init__(self):
-                self.dumps_calls = []
-
-            def __hash__(self):
-                return hash(_RecordingSerializer)
-
-            def __eq__(self, other):
-                return isinstance(other, _RecordingSerializer)
-
-            def __reduce__(self):
-                return (_RecordingSerializer, ())
-
-            def dumps(self, obj):
-                self.dumps_calls.append(obj)
-                return cloudpickle.dumps(obj)
-
-            def loads(self, data):
-                return cloudpickle.loads(data)
-
-        proxy = _GuardedProxy()
-        task = Task(
-            id=uuid4(),
-            callable=sample_async_callable,
-            args=(),
-            kwargs={},
-            proxy=proxy,
-        )
-        user_serializer = _RecordingSerializer()
-
-        # Act — must not raise even though the user serializer would
-        task_msg = task.to_protobuf(serializer=user_serializer)
-
-        # Assert — proxy bytes round-trip via stock cloudpickle.loads
-        assert task_msg.proxy
-        restored_proxy = cloudpickle.loads(task_msg.proxy)
-        assert isinstance(restored_proxy, _PicklableProxy)
-        # Assert — protobuf carries the user serializer
-        assert task_msg.HasField("serializer")
-        # Assert — user serializer received callable/args/kwargs but not the proxy
-        assert sample_async_callable in user_serializer.dumps_calls
-        assert () in user_serializer.dumps_calls
-        assert {} in user_serializer.dumps_calls
-        assert proxy not in user_serializer.dumps_calls
-
-    def test_from_protobuf_without_serializer_with_guarded_proxy(
-        self, sample_async_callable
-    ):
-        """Test the to_protobuf / from_protobuf round-trip with no explicit serializer.
+    def test_from_protobuf_should_restore_guarded_proxy(self, sample_async_callable):
+        """Test the to_protobuf / from_protobuf round-trip with a guarded proxy.
 
         Given:
             A Task whose proxy is a guarded type.
         When:
             The Task is serialized via to_protobuf() and deserialized via
-            from_protobuf(), both with the default fallback (no explicit
-            Serializer).
+            from_protobuf().
         Then:
             The restored Task's proxy and proxy_id should match the
             original.
@@ -1462,46 +1648,17 @@ class TestTask:
         assert isinstance(restored.proxy, _PicklableProxy)
         assert restored.proxy.id == proxy.id
 
-    def test_to_protobuf_with_serializer(self, sample_async_callable, picklable_proxy):
-        """Test to_protobuf with serializer sets the serializer field.
-
-        Given:
-            A Task instance and a PassthroughSerializer
-        When:
-            ``to_protobuf(serializer=...)`` is called
-        Then:
-            It should set the ``serializer`` field on the protobuf
-            message
-        """
-        # Arrange
-        task = Task(
-            id=uuid4(),
-            callable=sample_async_callable,
-            args=(),
-            kwargs={},
-            proxy=picklable_proxy,
-        )
-        serializer = PassthroughSerializer()
-
-        # Act
-        task_msg = task.to_protobuf(serializer=serializer)
-
-        # Assert
-        assert task_msg.HasField("serializer")
-
-    def test_from_protobuf_without_serializer_field(
+    def test_from_protobuf_should_deserialize_cloudpickle_fields(
         self, sample_async_callable, picklable_proxy
     ):
-        """Test from_protobuf without serializer field uses cloudpickle.
+        """Test from_protobuf deserializes cloudpickle-encoded payload fields.
 
         Given:
-            A protobuf Task with no serializer field (standard
-            cloudpickle encoding)
+            A protobuf Task whose payload fields are cloudpickle-encoded.
         When:
-            ``from_protobuf()`` is called
+            ``from_protobuf()`` is called.
         Then:
-            It should deserialize all fields correctly using
-            cloudpickle
+            It should deserialize all fields correctly using cloudpickle.
         """
         # Arrange
         task_id = uuid4()
@@ -1529,75 +1686,42 @@ class TestTask:
         assert task.args == args
         assert task.kwargs == kwargs
 
-    @settings(max_examples=50, deadline=None)
-    @given(
-        task_id=st.uuids(),
-        timeout=st.integers(min_value=0, max_value=3600),
-        caller_id=st.one_of(st.none(), st.uuids()),
-        tag=st.one_of(st.none(), st.text(min_size=1, max_size=100)),
-    )
-    @pytest.mark.asyncio
-    async def test_from_protobuf_with_passthrough_serializer(
-        self,
-        task_id,
-        timeout,
-        caller_id,
-        tag,
-    ):
-        """Test from_protobuf restores identity with PassthroughSerializer.
+    def test_from_protobuf_should_raise_when_invalid_payload(self, picklable_proxy):
+        """Test from_protobuf raises for a non-cloudpickle payload.
 
         Given:
-            A Task serialized via ``to_protobuf(serializer=...)``
-            with a PassthroughSerializer
+            A :py:class:`protocol.Task` message whose ``callable``
+            field holds bytes that are not a valid cloudpickle
+            payload.
         When:
-            ``from_protobuf()`` is called on the resulting message
+            ``Task.from_protobuf()`` is called.
         Then:
-            It should produce a deserialized task equal to the
-            original in all public attributes, and the protobuf
-            ``serializer`` field should be present
+            It should raise an unpickling error.
         """
-
         # Arrange
-        async def test_callable():
-            return "result"
-
-        proxy = _PicklableProxy()
-        args = (1, "test", [1, 2, 3])
-        kwargs = {"key": "value", "number": 42}
-
-        original_task = Task(
-            id=task_id,
-            callable=test_callable,
-            args=args,
-            kwargs=kwargs,
-            proxy=proxy,
-            timeout=timeout,
-            caller=caller_id,
-            tag=tag,
+        task_msg = protocol.Task(
+            version="0.1.0",
+            id=str(uuid4()),
+            callable=b"not-a-pickle",
+            args=cloudpickle.dumps(()),
+            kwargs=cloudpickle.dumps({}),
+            caller="",
+            proxy=cloudpickle.dumps(picklable_proxy),
+            proxy_id=str(picklable_proxy.id),
+            timeout=0,
+            tag="",
         )
-        serializer = PassthroughSerializer()
-        task_msg = original_task.to_protobuf(serializer=serializer)
 
-        # Act
-        deserialized_task = Task.from_protobuf(task_msg)
-
-        # Assert
-        assert task_msg.HasField("serializer")
-        assert deserialized_task.id == original_task.id
-        assert deserialized_task.callable is original_task.callable
-        assert deserialized_task.args is original_task.args
-        assert deserialized_task.kwargs is original_task.kwargs
-        assert deserialized_task.caller == original_task.caller
-        assert deserialized_task.proxy is original_task.proxy
-        assert deserialized_task.timeout == original_task.timeout
-        assert deserialized_task.tag == original_task.tag
+        # Act & assert
+        with pytest.raises((pickle.UnpicklingError, EOFError, ValueError, TypeError)):
+            Task.from_protobuf(task_msg)
 
 
 class TestRoutineScope:
     """Tests for :func:`wool.runtime.routine.task.routine_scope`."""
 
     @pytest.mark.asyncio
-    async def test_routine_scope_with_null_runtime_context_asserts(
+    async def test_routine_scope_should_raise_when_null_runtime_context(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test :func:`routine_scope` asserts a non-None runtime context.
@@ -1631,7 +1755,7 @@ class TestRoutineScope:
                 pass
 
     @pytest.mark.asyncio
-    async def test_routine_scope_without_proxy_pool(self, sample_task):
+    async def test_routine_scope_should_raise_when_no_proxy_pool(self, sample_task):
         """Test routine_scope raises when wool.__proxy_pool__ is unset.
 
         Given:
@@ -1654,7 +1778,7 @@ class TestRoutineScope:
                 pass
 
     @pytest.mark.asyncio
-    async def test_routine_scope_with_coroutine_callable(
+    async def test_routine_scope_should_yield_coroutine_when_coroutine_callable(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope yields an awaitable coroutine for coroutine tasks.
@@ -1685,7 +1809,7 @@ class TestRoutineScope:
         assert result == "coro_result"
 
     @pytest.mark.asyncio
-    async def test_routine_scope_with_async_generator_callable(
+    async def test_routine_scope_should_yield_async_generator_when_generator_callable(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope yields an iterable async generator for stream tasks.
@@ -1719,7 +1843,7 @@ class TestRoutineScope:
         assert results == [1, 2, 3]
 
     @pytest.mark.asyncio
-    async def test_routine_scope_establishes_task_scope(
+    async def test_routine_scope_should_bind_task_scope(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope binds current_task and disables dispatch routing.
@@ -1756,7 +1880,7 @@ class TestRoutineScope:
         assert do_dispatch() is outer_dispatch_before
 
     @pytest.mark.asyncio
-    async def test_routine_scope_resets_proxy_token_on_exit(
+    async def test_routine_scope_should_restore_proxy_on_exit(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope restores wool.__proxy__ on exit.
@@ -1791,7 +1915,7 @@ class TestRoutineScope:
         assert wool.__proxy__.get() is None
 
     @pytest.mark.asyncio
-    async def test_routine_scope_applies_runtime_context(
+    async def test_routine_scope_should_apply_runtime_context(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope applies the Task's RuntimeContext.
@@ -1825,7 +1949,7 @@ class TestRoutineScope:
         assert observed["dispatch_timeout"] == 4.5
 
     @pytest.mark.asyncio
-    async def test_routine_scope_aclose_unconsumed_async_gen(
+    async def test_routine_scope_should_aclose_when_async_gen_unconsumed(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope acloses an async generator never iterated.
@@ -1856,7 +1980,7 @@ class TestRoutineScope:
         assert captured_routine.ag_frame is None
 
     @pytest.mark.asyncio
-    async def test_routine_scope_swallows_generator_exit_during_aclose(
+    async def test_routine_scope_should_exit_cleanly_when_routine_reraises_ge(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope exits cleanly when the routine reacts to GeneratorExit.
@@ -1891,7 +2015,7 @@ class TestRoutineScope:
         assert routine.ag_frame is None
 
     @pytest.mark.asyncio
-    async def test_routine_scope_propagates_internal_cancelled_during_aclose(
+    async def test_routine_scope_should_propagate_cancellation_when_routine_internal(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope propagates routine-internal CancelledError on aclose.
@@ -1901,7 +2025,7 @@ class TestRoutineScope:
         :class:`asyncio.CancelledError` during its cleanup, the
         exception propagates from :func:`routine_scope`'s exit handler
         unchanged. Paired stdlib parity test
-        :meth:`test_stdlib_aclose_propagates_internal_cancelled`
+        :meth:`test_stdlib_aclose_should_propagate_internal_cancelled`
         pins the stdlib behavior so a future stdlib change
         signals that wool's parity needs revisiting.
 
@@ -1938,7 +2062,7 @@ class TestRoutineScope:
                 await it.__anext__()
 
     @pytest.mark.asyncio
-    async def test_routine_scope_propagates_external_cancellation_during_aclose(
+    async def test_routine_scope_should_propagate_cancellation_when_externally_cancelled(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope re-raises CancelledError when externally cancelled.
@@ -1988,7 +2112,7 @@ class TestRoutineScope:
             await wrapped
 
     @pytest.mark.asyncio
-    async def test_routine_scope_propagates_runtime_error_when_routine_yields_during_ge(
+    async def test_routine_scope_should_propagate_runtime_error_when_yields_during_ge(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope propagates the synthesized RuntimeError when
@@ -2000,7 +2124,7 @@ class TestRoutineScope:
         ``RuntimeError("async generator ignored GeneratorExit")``
         from ``aclose``. Wool propagates this unchanged. Paired
         stdlib parity test
-        :meth:`test_stdlib_aclose_raises_runtime_error_when_yielding_during_ge`
+        :meth:`test_stdlib_aclose_should_raise_runtime_error_when_yields_during_ge`
         pins the stdlib behavior.
 
         Given:
@@ -2031,7 +2155,7 @@ class TestRoutineScope:
                 await it.__anext__()
 
     @pytest.mark.asyncio
-    async def test_routine_scope_with_coroutine_does_not_aclose(
+    async def test_routine_scope_should_not_aclose_when_coroutine(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope does not invoke aclose teardown for coroutines.
@@ -2071,7 +2195,7 @@ class TestRoutineScope:
         assert events == ["enter", "finally"]
 
     @pytest.mark.asyncio
-    async def test_routine_scope_propagates_caller_body_exception(
+    async def test_routine_scope_should_propagate_exception_when_caller_body_raises(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope propagates exceptions raised in the caller body.
@@ -2110,7 +2234,7 @@ class TestRoutineScope:
         assert aexit_mock.await_count >= 1
 
     @pytest.mark.asyncio
-    async def test_routine_scope_propagates_routine_exception_transparently(
+    async def test_routine_scope_should_propagate_exception_when_routine_raises(
         self, sample_task, mock_worker_proxy_cache
     ):
         """Test routine_scope propagates routine-raised exceptions unchanged.
@@ -2142,10 +2266,83 @@ class TestRoutineScope:
         assert results == [1]
 
 
+class TestAsyncGenAcloseParity:
+    """Stdlib parity pins for ``async-generator.aclose`` semantics.
+
+    These tests assert observations about CPython's own
+    ``await agen.aclose()`` behavior. They are intentionally NOT tests
+    of any wool code — they pin stdlib semantics so that a future
+    change in CPython's async-generator close protocol fails here
+    first, signaling that the paired :class:`TestRoutineScope`
+    regression tests (and :func:`routine_scope`'s contract) may need
+    to be revisited.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stdlib_aclose_should_propagate_internal_cancelled(self):
+        """Test ``aclose`` propagates internal CancelledError.
+
+        Given:
+            A direct ``asyncio`` async generator that raises
+            :class:`asyncio.CancelledError` during aclose unwind
+            while the awaiting task's ``cancelling()`` count is 0.
+        When:
+            ``await agen.aclose()`` is invoked after one iteration.
+        Then:
+            It should raise :class:`asyncio.CancelledError`.
+        """
+
+        # Arrange
+        async def naughty_gen():
+            try:
+                yield 1
+                yield 2
+            except GeneratorExit:
+                raise asyncio.CancelledError()
+
+        agen = naughty_gen()
+        await agen.__anext__()
+
+        # Act & assert
+        with pytest.raises(asyncio.CancelledError):
+            await agen.aclose()
+
+    @pytest.mark.asyncio
+    async def test_stdlib_aclose_should_raise_runtime_error_when_yields_during_ge(self):
+        """Test ``aclose`` raises RuntimeError when the routine yields
+        during ``GeneratorExit``.
+
+        Given:
+            A direct ``asyncio`` async generator that catches
+            :class:`GeneratorExit` and yields a value (a PEP 525
+            protocol violation).
+        When:
+            ``await agen.aclose()`` is invoked after one iteration.
+        Then:
+            It should raise
+            ``RuntimeError("async generator ignored GeneratorExit")``.
+        """
+
+        # Arrange
+        async def yielding_gen():
+            try:
+                yield 1
+                yield 2
+            except GeneratorExit:
+                yield "rude"
+
+        agen = yielding_gen()
+        await agen.__anext__()
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="ignored GeneratorExit"):
+            await agen.aclose()
+
+
 class TestRuntimeContext:
     """Tests for :py:class:`RuntimeContext`."""
 
-    def test___enter___and___exit___apply_inner_and_restore_outer_dispatch_timeout(self):
+    def test___enter___should_apply_inner_and_restore_outer_dispatch_timeout(self):
         """Test RuntimeContext sets and restores dispatch_timeout.
 
         Given:
@@ -2167,7 +2364,7 @@ class TestRuntimeContext:
         finally:
             dispatch_timeout.reset(outer_token)
 
-    def test___enter___when_dispatch_timeout_unset(self):
+    def test___enter___should_not_touch_dispatch_timeout_when_unset(self):
         """Test an empty RuntimeContext does not touch dispatch_timeout.
 
         Given:
@@ -2188,7 +2385,7 @@ class TestRuntimeContext:
         finally:
             dispatch_timeout.reset(outer_token)
 
-    def test_get_current_with_dispatch_timeout_set(self):
+    def test_get_current_should_snapshot_dispatch_timeout(self):
         """Test get_current snapshots the current dispatch_timeout.
 
         Given:
@@ -2211,7 +2408,7 @@ class TestRuntimeContext:
         with captured:
             assert dispatch_timeout.get() == 4.0
 
-    def test_to_protobuf_with_dispatch_timeout_set(self):
+    def test_to_protobuf_should_serialize_dispatch_timeout(self):
         """Test to_protobuf serializes dispatch_timeout on the wire.
 
         Given:
@@ -2229,7 +2426,7 @@ class TestRuntimeContext:
         assert pb.HasField("dispatch_timeout")
         assert pb.dispatch_timeout == 6.0
 
-    def test_to_protobuf_when_dispatch_timeout_unset(self):
+    def test_to_protobuf_should_fall_back_to_current_var_when_unset(self):
         """Test to_protobuf falls back to the current var when unset.
 
         Given:
@@ -2253,7 +2450,7 @@ class TestRuntimeContext:
         assert pb.HasField("dispatch_timeout")
         assert pb.dispatch_timeout == 9.25
 
-    def test_to_protobuf_without_value(self):
+    def test_to_protobuf_should_omit_dispatch_timeout_when_none(self):
         """Test to_protobuf omits dispatch_timeout when it is None.
 
         Given:
@@ -2269,7 +2466,7 @@ class TestRuntimeContext:
         # Assert
         assert not pb.HasField("dispatch_timeout")
 
-    def test_from_protobuf_roundtrip(self):
+    def test_from_protobuf_should_reconstruct_runtime_context(self):
         """Test from_protobuf reconstructs a usable RuntimeContext.
 
         Given:
@@ -2291,182 +2488,10 @@ class TestRuntimeContext:
             assert dispatch_timeout.get() == 8.5
 
 
-class TestPassthroughSerializer:
-    """Tests for :py:class:`PassthroughSerializer`."""
-
-    def test_dumps_with_object(self):
-        """Test dumps returns a 16-byte token.
-
-        Given:
-            An arbitrary Python object.
-        When:
-            ``dumps`` is called.
-        Then:
-            It should return a 16-byte bytes token.
-        """
-        # Arrange
-        serializer = PassthroughSerializer()
-        obj = {"key": [1, 2, 3]}
-
-        # Act
-        data = serializer.dumps(obj)
-
-        # Assert
-        assert isinstance(data, bytes)
-        assert len(data) == 16
-
-    def test_dumps_with_distinct_objects(self):
-        """Test dumps returns unique tokens for distinct objects.
-
-        Given:
-            Two distinct Python objects.
-        When:
-            ``dumps`` is called on each.
-        Then:
-            It should return different tokens for each object.
-        """
-        # Arrange
-        serializer = PassthroughSerializer()
-        obj_a = "alpha"
-        obj_b = "beta"
-
-        # Act
-        token_a = serializer.dumps(obj_a)
-        token_b = serializer.dumps(obj_b)
-
-        # Assert
-        assert token_a != token_b
-
-    def test_loads_with_stored_object(self):
-        """Test loads retrieves the original object by identity.
-
-        Given:
-            An arbitrary Python object stored via ``dumps``.
-        When:
-            ``loads`` is called with the returned token.
-        Then:
-            It should return the exact same object (identity, not
-            equality).
-        """
-        # Arrange
-        serializer = PassthroughSerializer()
-        obj = {"key": [1, 2, 3]}
-        data = serializer.dumps(obj)
-
-        # Act
-        result = serializer.loads(data)
-
-        # Assert
-        assert result is obj
-
-    def test_loads_after_prior_consumption(self):
-        """Test loads consumes the stored entry.
-
-        Given:
-            An object serialized via ``dumps``.
-        When:
-            ``loads`` is called twice with the same data.
-        Then:
-            It should raise ``KeyError`` on the second call because
-            the entry was consumed.
-        """
-        # Arrange
-        serializer = PassthroughSerializer()
-        data = serializer.dumps("ephemeral")
-
-        # Act
-        serializer.loads(data)
-
-        # Act & assert
-        with pytest.raises(KeyError):
-            serializer.loads(data)
-
-    def test___instancecheck___with_serializer_protocol(self):
-        """Test PassthroughSerializer satisfies the Serializer protocol.
-
-        Given:
-            A PassthroughSerializer instance.
-        When:
-            isinstance is evaluated against the runtime-checkable
-            Serializer protocol.
-        Then:
-            It should return True.
-        """
-        # Arrange, act, & assert
-        assert isinstance(PassthroughSerializer(), Serializer)
-
-    def test_hash_and_equality_contract(self):
-        """Test all PassthroughSerializer instances are interchangeable.
-
-        Given:
-            Two distinct PassthroughSerializer instances and an arbitrary
-            object of a different type.
-        When:
-            Their hashes and equality are evaluated.
-        Then:
-            The two PassthroughSerializer instances should compare equal,
-            share a hash (so the LRU cache deduplicates them), and not
-            compare equal to the other-type object.
-        """
-        # Arrange
-        first = PassthroughSerializer()
-        second = PassthroughSerializer()
-
-        # Act & assert
-        assert first == second
-        assert hash(first) == hash(second)
-        assert first != object()
-
-    def test_dumps_with_guarded_proxy(self):
-        """Test PassthroughSerializer stores guarded objects by identity.
-
-        Given:
-            A PassthroughSerializer instance and a proxy that adopts the
-            Wool pickling protocol (__wool_reduce__ + __reduce_ex__ guard).
-        When:
-            The serializer dumps and loads the proxy.
-        Then:
-            It should return the exact same object (identity), bypassing
-            __wool_reduce__ and __reduce_ex__ entirely — passthrough
-            never invokes pickle on the payload.
-        """
-        # Arrange
-        serializer = PassthroughSerializer()
-        proxy = _GuardedProxy()
-
-        # Act
-        restored = serializer.loads(serializer.dumps(proxy))
-
-        # Assert
-        assert restored is proxy
-
-    def test_cloudpickle_roundtrip(self):
-        """Test PassthroughSerializer survives cloudpickle serialization.
-
-        Given:
-            A PassthroughSerializer instance.
-        When:
-            Serialized and deserialized via cloudpickle.
-        Then:
-            It should produce a functional PassthroughSerializer.
-        """
-        # Arrange
-        original = PassthroughSerializer()
-
-        # Act
-        restored = cloudpickle.loads(cloudpickle.dumps(original))
-        obj = {"test": True}
-        data = restored.dumps(obj)
-        result = restored.loads(data)
-
-        # Assert
-        assert result is obj
-
-
 class TestTaskException:
     """Tests for :py:class:`TaskException`."""
 
-    def test___init___with_type_and_traceback(self):
+    def test___init___should_store_type_and_traceback(self):
         """Test TaskException stores type and traceback correctly.
 
         Given:

@@ -14,6 +14,7 @@ caller's own ``var.get()`` after the dispatch returns.
 """
 
 import asyncio
+import socket
 import warnings
 
 import pytest
@@ -26,7 +27,6 @@ from . import routines
 from .conftest import BackpressureMode
 from .conftest import PoolMode
 from .conftest import RoutineShape
-from .conftest import SerializerKind
 from .conftest import StrictWarnings
 from .conftest import build_pool_from_scenario
 from .conftest import default_scenario
@@ -38,7 +38,7 @@ class TestUnifiedDriverShape:
     async def test_coroutine_dispatch_completes_across_process_boundary(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test a single coroutine dispatch round-trips across the gRPC + worker-process boundary.
+        """Test a single coroutine dispatch round-trips across the worker boundary.
 
         Given:
             A coroutine routine with no caller-side wool.ContextVar
@@ -69,7 +69,7 @@ class TestUnifiedDriverShape:
             # Assert
             assert result == 5
             # The routine never set TENANT_ID/REGION on the worker, so
-            # the caller's snapshot must equal its pre-dispatch value
+            # the caller's context must equal its pre-dispatch value
             # — the back-propagation path is silent when the worker
             # made no mutations.
             assert routines.TENANT_ID.get() == tenant_before
@@ -81,7 +81,7 @@ class TestUnifiedDriverShape:
     async def test_async_gen_dispatch_exhausts_after_single_yield(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test an async-generator that yields exactly once terminates with StopAsyncIteration.
+        """Test an async-generator yielding once terminates with StopAsyncIteration.
 
         Given:
             An async-generator routine that yields a single value and
@@ -272,21 +272,21 @@ class TestUnifiedDriverShape:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_coroutine_dispatch_uses_passthrough_serializer_in_self_dispatch(
+    async def test_coroutine_dispatch_uses_cloudpickle_serializer_in_self_dispatch(
         self, credentials_map, retry_grpc_internal
     ):
         """Test self-dispatch through DEFAULT pool round-trips a coroutine.
 
         Given:
             A coroutine routine and a DEFAULT pool (single in-process
-            worker so the dispatch target matches the caller process,
-            structurally selecting the passthrough serializer for the
-            payload).
+            worker so the dispatch target matches the caller process;
+            self-dispatch serializes the payload through cloudpickle,
+            the same path as cross-process dispatch).
         When:
             The caller awaits the routine once.
         Then:
-            The routine result should round-trip through the
-            in-process serialization path without raising.
+            The routine result should round-trip through cloudpickle
+            without raising.
         """
 
         async def body():
@@ -294,7 +294,6 @@ class TestUnifiedDriverShape:
             scenario = default_scenario(
                 shape=RoutineShape.COROUTINE,
                 pool_mode=PoolMode.DEFAULT,
-                serializer=SerializerKind.PASSTHROUGH,
             )
 
             # Act
@@ -329,7 +328,6 @@ class TestUnifiedDriverShape:
             scenario = default_scenario(
                 shape=RoutineShape.COROUTINE,
                 pool_mode=PoolMode.EPHEMERAL,
-                serializer=SerializerKind.CLOUDPICKLE,
             )
 
             # Act
@@ -342,22 +340,21 @@ class TestUnifiedDriverShape:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_async_gen_dispatch_uses_passthrough_serializer_in_self_dispatch(
+    async def test_async_gen_dispatch_uses_cloudpickle_serializer_in_self_dispatch(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test self-dispatch streams an async-generator without re-pickling per frame.
+        """Test self-dispatch streams an async-generator through cloudpickle.
 
         Given:
             An async-generator routine yielding three values and a
-            DEFAULT pool (single in-process worker so the passthrough
-            serializer is structurally selected and held for the
-            generator's lifetime).
+            DEFAULT pool (single in-process worker so the dispatch
+            target matches the caller process; self-dispatch serializes
+            each frame through cloudpickle).
         When:
             The caller iterates the proxy to exhaustion.
         Then:
             All three frames should be observed in order and the
-            iterator should terminate cleanly, proving the
-            in-process serializer remains valid across every step.
+            iterator should terminate cleanly.
         """
 
         async def body():
@@ -365,7 +362,6 @@ class TestUnifiedDriverShape:
             scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ANEXT,
                 pool_mode=PoolMode.DEFAULT,
-                serializer=SerializerKind.PASSTHROUGH,
             )
             collected: list[int] = []
 
@@ -389,13 +385,13 @@ class TestUnifiedDriverShape:
             A coroutine routine with caller-side wool.ContextVars set
             to fully-decodable values and a DEFAULT pool, with
             ``warnings.simplefilter("error",
-            category=wool.ContextDecodeWarning)`` active for the
+            category=wool.SerializationWarning)`` active for the
             dispatch.
         When:
             The caller dispatches the routine.
         Then:
             The dispatch should complete without raising and without
-            emitting a single ``wool.ContextDecodeWarning``, since
+            emitting a single ``wool.SerializationWarning``, since
             every shipped var is decodable on the worker.
         """
 
@@ -414,7 +410,7 @@ class TestUnifiedDriverShape:
                 try:
                     with warnings.catch_warnings(record=True) as captured:
                         warnings.simplefilter(
-                            "error", category=wool.ContextDecodeWarning
+                            "error", category=wool.SerializationWarning
                         )
                         result = await routines.get_tenant_id()
                 finally:
@@ -424,10 +420,10 @@ class TestUnifiedDriverShape:
             # Assert
             assert result == "strict-tenant"
             decode_warnings = [
-                w for w in captured if issubclass(w.category, wool.ContextDecodeWarning)
+                w for w in captured if issubclass(w.category, wool.SerializationWarning)
             ]
             assert decode_warnings == [], (
-                f"Expected no ContextDecodeWarning under strict mode "
+                f"Expected no SerializationWarning under strict mode "
                 f"with decodable vars, got {decode_warnings!r}"
             )
 
@@ -448,7 +444,7 @@ class TestUnifiedDriverShape:
         Then:
             Each yielded value should equal the per-step value the
             outer worker set, proving ``_current_task`` and
-            ``wool.Context`` stay live across the streaming routine's
+            ``wool.Chain`` stay live across the streaming routine's
             lifespan and every nested dispatch finds the streaming
             task as the caller.
         """
@@ -798,5 +794,208 @@ class TestUnifiedDriverShape:
                 assert collected == ["alive"]
                 assert sentinel.read_text() == "cleaned_up"
                 assert connection._channel_pool.stats.referenced_entries == baseline
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_coroutine_dispatch_copies_mutable_argument_in_self_dispatch(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test self-dispatch hands the routine a copy of a mutable argument.
+
+        Given:
+            An in-place-mutating coroutine routine and a DEFAULT pool
+            (single in-process worker so the dispatch target matches
+            the caller process).
+        When:
+            The caller dispatches the routine passing a list it still
+            holds a reference to.
+        Then:
+            The returned worker-side list should contain the appended
+            value while the caller's original list object stays
+            unchanged — proving self-dispatch copies its arguments.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DEFAULT,
+            )
+            caller_list = [1, 2, 3]
+
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                returned = await routines.append_to_list(caller_list, 99)
+
+            # Assert
+            assert returned == [1, 2, 3, 99]
+            assert caller_list == [1, 2, 3]
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_coroutine_dispatch_copies_mutable_argument_cross_process(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test cross-process dispatch hands the routine a copy of a mutable argument.
+
+        Given:
+            An in-place-mutating coroutine routine and an EPHEMERAL
+            pool (subprocess workers so the dispatch target does not
+            match the caller process and the argument is necessarily
+            serialized).
+        When:
+            The caller dispatches the routine passing a list it still
+            holds a reference to.
+        Then:
+            The returned worker-side list should contain the appended
+            value while the caller's original list object stays
+            unchanged — the baseline that self-dispatch must match.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.EPHEMERAL,
+            )
+            caller_list = [1, 2, 3]
+
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                returned = await routines.append_to_list(caller_list, 99)
+
+            # Assert
+            assert returned == [1, 2, 3, 99]
+            assert caller_list == [1, 2, 3]
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_coroutine_dispatch_with_unpicklable_argument_in_self_dispatch(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test self-dispatch raises when an argument cannot be serialized.
+
+        Given:
+            A single-argument coroutine routine and a DEFAULT pool
+            (single in-process worker), with the argument set to an
+            open socket — an object cloudpickle cannot serialize.
+        When:
+            The caller dispatches the routine passing the unpicklable
+            argument.
+        Then:
+            The dispatch should raise :class:`TypeError` at the
+            serialization boundary — self-dispatch serializes the
+            payload exactly like cross-process dispatch.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DEFAULT,
+            )
+            unpicklable = socket.socket()
+
+            # Act & assert
+            try:
+                async with build_pool_from_scenario(scenario, credentials_map):
+                    with pytest.raises(TypeError):
+                        await routines.touch_argument(unpicklable)
+            finally:
+                unpicklable.close()
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_coroutine_dispatch_with_unpicklable_argument_cross_process(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test cross-process dispatch raises when an argument cannot be serialized.
+
+        Given:
+            A single-argument coroutine routine and an EPHEMERAL pool
+            (subprocess workers), with the argument set to an open
+            socket — an object cloudpickle cannot serialize.
+        When:
+            The caller dispatches the routine passing the unpicklable
+            argument.
+        Then:
+            The dispatch should raise :class:`TypeError` at the
+            serialization boundary — the baseline failure mode that
+            self-dispatch must match in kind.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.EPHEMERAL,
+            )
+            unpicklable = socket.socket()
+
+            # Act & assert
+            try:
+                async with build_pool_from_scenario(scenario, credentials_map):
+                    with pytest.raises(TypeError):
+                        await routines.touch_argument(unpicklable)
+            finally:
+                unpicklable.close()
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_async_gen_dispatch_copies_mutable_argument_across_yields(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a streaming dispatch copies a mutable argument mutated across yields.
+
+        Given:
+            An async-generator routine that appends to a mutable list
+            argument on each yield, dispatched once through a DEFAULT
+            pool (self-dispatch) and once through an EPHEMERAL pool
+            (cross-process).
+        When:
+            The caller iterates each dispatch to exhaustion while
+            holding a reference to the list it passed in.
+        Then:
+            Both dispatches should yield the same growing snapshots
+            and leave the caller's original list object unchanged
+            after full iteration.
+        """
+
+        async def body():
+            # Arrange
+            scenarios = [
+                default_scenario(
+                    shape=RoutineShape.ASYNC_GEN_ANEXT,
+                    pool_mode=PoolMode.DEFAULT,
+                ),
+                default_scenario(
+                    shape=RoutineShape.ASYNC_GEN_ANEXT,
+                    pool_mode=PoolMode.EPHEMERAL,
+                ),
+            ]
+            results: list[list[list[int]]] = []
+
+            # Act & assert
+            for scenario in scenarios:
+                caller_list: list[int] = [0]
+                async with build_pool_from_scenario(scenario, credentials_map):
+                    collected = [
+                        snapshot
+                        async for snapshot in routines.append_on_each_yield(
+                            caller_list, [1, 2, 3]
+                        )
+                    ]
+                # The caller's own list object is never mutated.
+                assert caller_list == [0]
+                results.append(collected)
+
+            # Assert
+            assert results[0] == [[0, 1], [0, 1, 2], [0, 1, 2, 3]]
+            assert results[0] == results[1]
 
         await retry_grpc_internal(body)

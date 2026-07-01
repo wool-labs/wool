@@ -1,10 +1,10 @@
 import pytest
 
 from wool import AdvertiseHostError
-from wool import ContextDecodeWarning
 from wool import IneffectiveLeaseWarning
 from wool import IneffectiveQuorumTimeoutWarning
 from wool import LoopbackAdvertisementWarning
+from wool import SerializationWarning
 from wool import WoolError
 from wool import WoolWarning
 
@@ -12,10 +12,10 @@ from wool import WoolWarning
 class TestWoolError:
     """Tests for WoolError umbrella membership.
 
-    Fully qualified name: wool.exception.WoolError
+    Fully qualified name: wool.exceptions.WoolError
     """
 
-    def test___init___with_wool_exception_types(self):
+    def test___init___should_subclass_wool_error(self):
         """Test wool's typed exceptions descend from WoolError.
 
         Given:
@@ -33,19 +33,21 @@ class TestWoolError:
 class TestWoolWarning:
     """Tests for WoolWarning umbrella membership.
 
-    Fully qualified name: wool.exception.WoolWarning
+    Fully qualified name: wool.exceptions.WoolWarning
     """
 
     @pytest.mark.parametrize(
         "category",
         [
-            ContextDecodeWarning,
             IneffectiveLeaseWarning,
             IneffectiveQuorumTimeoutWarning,
             LoopbackAdvertisementWarning,
+            SerializationWarning,
         ],
     )
-    def test___init___with_wool_warning_categories(self, category):
+    def test___init___should_subclass_wool_warning_and_not_stdlib_warnings(
+        self, category
+    ):
         """Test wool's warning categories descend from WoolWarning.
 
         Given:

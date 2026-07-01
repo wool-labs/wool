@@ -19,12 +19,13 @@ from grpc.aio import ServicerContext
 
 import wool
 from wool import protocol
-from wool.runtime.context import attached
-from wool.runtime.context import install_task_factory
+from wool.runtime.context.exceptions import SerializationError
+from wool.runtime.context.factory import install_task_factory
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
-from wool.runtime.serializer import Serializer
+from wool.runtime.worker.frame import AckResponseFrame
+from wool.runtime.worker.frame import NackResponseFrame
 from wool.runtime.worker.session import DispatchSession
 from wool.runtime.worker.session import Rejected
 
@@ -32,140 +33,21 @@ _log = logging.getLogger(__name__)
 
 _DRAIN_TIMEOUT: Final[float] = 5.0
 """Wall-clock timeout in seconds for the multi-generation task drain
-in :meth:`WorkerService._destroy_worker_loop`. Generous enough for a
+in `WorkerService._destroy_worker_loop`. Generous enough for a
 normal chain of ``finally``-scheduled cleanup tasks to unwind, short
 enough not to stall worker-loop teardown; past this timeout the drain
 gives up, with the daemon-thread reap as the backstop."""
 
 
-def _safely_serialize_exception(
-    serializer: Serializer,
-    exc: BaseException,
-) -> bytes:
-    """Serialize *exc*, preserving the exception class when the
-    original instance carries un-picklable state.
-
-    Prevents un-picklable exception state from converting a
-    wool-class failure on the wire into a generic gRPC stream
-    error on the caller side. The negotiated serializer is
-    always either :class:`PassthroughSerializer` (which can
-    never fail — it stashes by reference and returns a token)
-    or :class:`CloudpickleSerializer` (which fails on
-    un-picklable input via :class:`pickle.PickleError`,
-    :class:`TypeError` for un-picklable C types,
-    :class:`AttributeError` for un-picklable local closures, or
-    :class:`RecursionError` for deeply self-referential graphs).
-
-    **Type-preserving fallback.** Stdlib exception pickling
-    round-trips ``(type, args, __dict__)``, dropping
-    :attr:`__traceback__`, :attr:`__cause__`, :attr:`__context__`,
-    and :attr:`__suppress_context__` — those four are not part of
-    the exception's identity. :attr:`__notes__` and other
-    ``__dict__`` attributes (including the wool-private
-    ``__wool_context_warnings__`` set by the dispatch handler when
-    strict-mode :class:`wool.ContextDecodeWarning` peers fire on
-    snapshot encode) survive the round-trip. When a routine-level
-    exception accumulates state that drags an un-picklable C-level
-    object into the graph (e.g. a worker-thread frame on
-    :attr:`__traceback__` reachable via :attr:`__cause__`), the
-    first ``dumps`` raises but the exception's *class* and *args*
-    are still picklable on their own. Reconstruct a clean instance
-    and reship — the caller's ``except RoutineError`` still
-    matches, mirroring the stdlib pickle contract for exceptions.
-    Side-channel attachments (notes, ``__wool_context_warnings__``)
-    are lost on the reconstructed instance because the fallback
-    builds a fresh ``cls(*exc.args)``; the wire-survival guarantee
-    holds only on the primary path.
-
-    If even ``cls(*exc.args)`` cannot be constructed or pickled
-    (constructor side effects, unpicklable args), demote to a
-    stdlib :class:`RuntimeError` carrying the original class
-    name and message — always picklable, so the third ``dumps``
-    cannot fail.
-    """
-    try:
-        return serializer.dumps(exc)
-    except (pickle.PickleError, TypeError, AttributeError, RecursionError):
-        pass
-    try:
-        cls = type(exc)
-        clean = cls(*exc.args)
-        return serializer.dumps(clean)
-    except Exception:
-        # Honor the docstring's "third dumps cannot fail" promise:
-        # any reconstruction failure (over-eager ``__init__``
-        # validation, custom ``__new__``, un-picklable args, etc.)
-        # — not just the narrow pickle/type/recursion set — must
-        # fall through to the always-picklable ``RuntimeError``
-        # demotion. ``KeyboardInterrupt``/``SystemExit`` still
-        # propagate since they are ``BaseException``-only.
-        cls_name = type(exc).__name__
-        # Guard the f-string. ``__str__`` is user-overridable and
-        # can raise (touches per-instance state, delegates to a
-        # buggy ``__repr__``, etc.). The bare class name is a
-        # string attribute lookup and cannot raise — last resort
-        # so the safety net always succeeds.
-        try:
-            message = f"{cls_name}: {exc!s}"
-        except Exception:
-            message = cls_name
-        return serializer.dumps(RuntimeError(message))
-
-
-def _attach_strict_mode_warnings(exc: BaseException, encode_exc: BaseException) -> None:
-    """Attach strict-mode :class:`wool.ContextDecodeWarning` peers to a
-    routine exception.
-
-    When strict mode promotes :class:`wool.ContextDecodeWarning` to an
-    exception, the post-run snapshot encode (``session.context.to_protobuf``)
-    raises a :class:`BaseExceptionGroup` of warning peers. Attach the peers
-    to *exc* via PEP 678 ``__notes__`` (visible in tracebacks) and a
-    ``__wool_context_warnings__`` attribute (programmatic access). The
-    routine exception's type is preserved, so the caller's existing
-    ``except RoutineError:`` clause continues to catch — no migration to
-    ``except*`` or ``except ExceptionGroup`` required.
-
-    Both attachment paths are best-effort. ``add_note`` may raise on a
-    subclass with an overridden ``__setattr__`` or an unusual C-level
-    storage policy; ``setattr`` may raise ``AttributeError`` on frozen
-    dataclass exceptions or slotted layouts without ``__dict__``. Either
-    is swallowed so the routine's primary signal still ships — the
-    warnings simply will not ride on a type that rejects them.
-
-    Lifted out of the dispatch handler's terminal-exception clause as a
-    flat sync helper so coverage tooling on Python 3.11 (``sys.settrace``)
-    can track it; the deeply nested original lived inside an async
-    generator's nested except arm and was opaque to pre-PEP-669 tracing.
-
-    :param exc:
-        The routine's primary exception, annotated in place.
-    :param encode_exc:
-        The encode-time failure carrying the warning peers.
-    """
-    if isinstance(encode_exc, BaseExceptionGroup):
-        context_warnings: list[BaseException] = list(encode_exc.exceptions)
-    else:
-        context_warnings = [encode_exc]
-    try:
-        for w in context_warnings:
-            exc.add_note(f"wool context warning: {w}")
-    except (AttributeError, TypeError):
-        pass
-    try:
-        setattr(exc, "__wool_context_warnings__", context_warnings)
-    except AttributeError:
-        pass
-
-
 # public
 @dataclass(frozen=True)
 class BackpressureContext:
-    """Snapshot of worker state provided to backpressure hooks.
+    """Worker state provided to backpressure hooks.
 
     :param active_task_count:
         Number of tasks currently executing on this worker.
     :param task:
-        The incoming :class:`~wool.runtime.routine.task.Task` being
+        The incoming `~wool.runtime.routine.task.Task` being
         evaluated for admission.
     """
 
@@ -188,13 +70,6 @@ class BackpressureLike(Protocol):
 
     Pass ``None`` (the default) to accept all tasks unconditionally.
 
-    The hook runs after the caller's wire-shipped ContextVar snapshot
-    is applied to the handler's context, so a hook that reads a
-    :class:`wool.ContextVar` (e.g., a tenant id) observes the caller's
-    value for that dispatch. This enables tenant- or request-scoped
-    admission decisions without plumbing values through the
-    :class:`BackpressureContext` explicitly.
-
     Both sync and async implementations are supported::
 
         def sync_hook(ctx: BackpressureContext) -> bool:
@@ -209,8 +84,8 @@ class BackpressureLike(Protocol):
         """Evaluate whether to reject the incoming task.
 
         :param ctx:
-            Snapshot of the worker's current state and the incoming
-            task.
+            The worker's current dispatch state (active task count,
+            the incoming task).
         :returns:
             ``True`` to reject the task, ``False`` to accept it.
         """
@@ -218,13 +93,13 @@ class BackpressureLike(Protocol):
 
 
 class _ReadOnlyEvent:
-    """A read-only wrapper around :class:`asyncio.Event`.
+    """A read-only wrapper around `asyncio.Event`.
 
     Provides access to check if an event is set and wait for it to be
     set, but prevents external code from setting or clearing the event.
 
     :param event:
-        The underlying :class:`asyncio.Event` to wrap.
+        The underlying `asyncio.Event` to wrap.
     """
 
     def __init__(self, event: asyncio.Event):
@@ -243,6 +118,7 @@ class _ReadOnlyEvent:
         await self._event.wait()
 
 
+# public
 class WorkerService(protocol.WorkerServicer):
     """gRPC service for task execution.
 
@@ -251,12 +127,12 @@ class WorkerService(protocol.WorkerServicer):
     results back to the client.
 
     Handles graceful shutdown by rejecting new tasks while allowing
-    in-flight tasks to complete. Exposes :attr:`stopping` and
-    :attr:`stopped` events for lifecycle monitoring.
+    in-flight tasks to complete. Exposes `stopping` and
+    `stopped` events for lifecycle monitoring.
 
     :param backpressure:
         Optional admission control hook. See
-        :class:`BackpressureLike`. ``None`` (default) accepts all
+        `BackpressureLike`. ``None`` (default) accepts all
         tasks unconditionally.
     """
 
@@ -270,7 +146,15 @@ class WorkerService(protocol.WorkerServicer):
         self._stopping = asyncio.Event()
         self._docket = set()
         self._backpressure = backpressure
-        # Budget for the loop-teardown join, set by :meth:`_stop`
+        # Strong refs to live ``session.cancel()`` tasks scheduled
+        # from ``_propagate_cancel_on_done`` (a gRPC-internal-thread
+        # callback that hops the cancel onto the main loop). Without
+        # a strong ref the task is eligible for GC mid-flight,
+        # causing "Task was destroyed but it is pending" and "exception
+        # was never retrieved" hazards. The done-callback discards
+        # the task once the cancel propagation has completed.
+        self._cancel_propagators: set[asyncio.Task[None]] = set()
+        # Budget for the loop-teardown join, set by `_stop`
         # from the StopRequest's ``timeout``. ``0`` means "do not
         # synchronously wait" (worker thread closes its own loop
         # after ``run_forever`` returns; ``daemon=True`` reaps it
@@ -293,7 +177,7 @@ class WorkerService(protocol.WorkerServicer):
         """Read-only event signaling that the service is stopping.
 
         :returns:
-            A :class:`_ReadOnlyEvent`.
+            A `_ReadOnlyEvent`.
         """
         return _ReadOnlyEvent(self._stopping)
 
@@ -302,7 +186,7 @@ class WorkerService(protocol.WorkerServicer):
         """Read-only event signaling that the service has stopped.
 
         :returns:
-            A :class:`_ReadOnlyEvent`.
+            A `_ReadOnlyEvent`.
         """
         return _ReadOnlyEvent(self._stopped)
 
@@ -313,35 +197,34 @@ class WorkerService(protocol.WorkerServicer):
     ) -> AsyncIterator[protocol.Response]:
         """Execute a task in the current event loop.
 
-        Reads the first :class:`~wool.protocol.Request` from
-        the bidirectional stream to obtain the :class:`Task`, then
+        Reads the first `~wool.protocol.Request` from
+        the bidirectional stream to obtain the `Task`, then
         schedules it for execution. For async generators, subsequent
         ``Message`` frames are forwarded into the generator via
         ``asend()``.
 
-        **Context serialization failures (worker-side).**
-        Wire context is **ancillary state** under wool's protocol
-        contract: a failure to serialize the post-run snapshot or to
-        deserialize an incoming context (initial request or
+        **Chain serialization failures (worker-side).**
+        The chain manifest is **ancillary state** under wool's protocol
+        contract: a failure to serialize the post-run chain manifest or to
+        decode the incoming chain manifest (initial request or
         mid-stream frame) is non-fatal in non-strict mode but fatal
         in strict mode. Both modes emit a
-        :class:`wool.ContextDecodeWarning` for each failure.
+        `wool.SerializationWarning` for each failure.
 
-        *Non-strict mode (default).* The routine still runs — with a
-        fresh empty context as fallback when initial-frame
-        deserialization fails — and the back-propagated snapshot is
-        replaced with an empty context when post-run serialization
-        fails. A snapshot serialization failure that coincides with
-        a routine exception rides back as peers in a
-        :class:`BaseExceptionGroup` (extending an existing group
-        when the routine exception is already grouped) rather than
-        as nested causes, so the caller observes both signals at
-        the same level.
+        *Non-strict mode (default).* The routine still runs — when
+        initial-frame deserialization fails, each unreadable entry is
+        dropped with a warning and the routine runs under whatever
+        partial chain decoded (an entirely unreadable frame leaves
+        the worker chain unarmed) — and the back-propagated chain manifest
+        is replaced with an empty chain manifest when post-run serialization
+        fails. Caller-side per-var warnings emit through the standard
+        warnings machinery; there is no aggregated error to ride
+        back alongside the routine's signal.
 
         *Strict mode* (e.g.,
-        ``PYTHONWARNINGS=error::wool.ContextDecodeWarning``). The
+        ``PYTHONWARNINGS=error::wool.SerializationWarning``). The
         warning promotes to an exception. The dispatch handler
-        catches :class:`wool.ContextDecodeWarning` raised before the
+        catches `wool.SerializationWarning` raised before the
         routine starts and ships it via the routine-exception
         channel — the routine does not run — so the caller catches
         the same warning class symmetrically with caller-side strict
@@ -354,12 +237,12 @@ class WorkerService(protocol.WorkerServicer):
         terminal signals ride on ``Response.exception``. The dispatch
         FSM is ``Ack? (Result* (Exception | ε)) | Nack``. Code that
         emits a Nack after an Ack would violate the caller-side
-        consumer contract in :class:`WorkerConnection`.
+        consumer contract in `WorkerConnection`.
 
         :param request_iterator:
             The incoming bidirectional request stream.
         :param context:
-            The :class:`grpc.aio.ServicerContext` for this request.
+            The `grpc.aio.ServicerContext` for this request.
         :yields:
             One of four terminal shapes per dispatch.
 
@@ -367,10 +250,9 @@ class WorkerService(protocol.WorkerServicer):
             ``nack`` payload carries the parse-time failure (with
             ``exception`` set to the dumped original cause). No
             preceding ``Ack``. Triggered by malformed task id,
-            unpicklable serializer hint, strict-mode
-            :class:`wool.ContextDecodeWarning`, cloudpickle errors
-            on the task callable, ImportError on a missing module,
-            or non-async callable.
+            strict-mode `wool.SerializationWarning`,
+            cloudpickle errors on the task callable, ImportError on
+            a missing module, or non-async callable.
 
             **Routine-success path** — an ``Ack`` Response, then
             one (coroutine) or many (async-generator) ``result``
@@ -380,17 +262,17 @@ class WorkerService(protocol.WorkerServicer):
             optionally followed by zero or more ``result``
             Responses, then a single terminal ``exception``
             Response carrying the dumped routine / handler-level
-            failure plus a ``context`` snapshot.
+            failure plus a ``context`` frame.
 
             **Routine-failure-with-encode-failure variant** — same
             as the routine-failure path except the terminal
             ``Response`` drops the ``context`` field. The post-run
-            snapshot itself failed to serialize (strict-mode
-            :class:`wool.ContextDecodeWarning`); the encode peers
-            are attached to the routine exception via PEP 678
-            ``__notes__`` and a ``__wool_context_warnings__``
-            attribute, so the caller-visible exception class is
-            preserved.
+            chain manifest itself failed to serialize (strict-mode
+            `wool.ChainSerializationError` aggregating per-var
+            warnings); the encode error rides on the routine
+            exception as ``__cause__`` via ``raise from`` chaining,
+            so the caller-visible exception class is preserved and
+            the encode error remains visible in the traceback.
 
             **Operator pre-emption.** A worker-side graceful
             shutdown cancels in-flight dispatches and the underlying
@@ -410,11 +292,10 @@ class WorkerService(protocol.WorkerServicer):
 
         async with self._loop_pool.get("worker") as (loop, _):
             # Instantiate before ``async with`` so a ``Rejected`` raised
-            # from :meth:`DispatchSession.__aenter__` (parse-phase failure)
+            # from `DispatchSession.__aenter__` (parse-phase failure)
             # leaves ``session`` bound for the ``except Rejected`` arm's
-            # access to ``session.serializer`` (initialized to the default
-            # cloudpickle in :meth:`__init__`, replaced with the negotiated
-            # serializer only on successful parse).
+            # access to ``session.serializer`` (always ``wool.__serializer__``,
+            # cloudpickle, set in `__init__`).
             session = DispatchSession(request_iterator, loop)
 
             # Register a deterministic cancellation propagation hook
@@ -429,10 +310,10 @@ class WorkerService(protocol.WorkerServicer):
             # thread when the RPC reaches a terminal state; on a
             # client-side cancellation it fires with
             # ``context.cancelled()`` == True, and we schedule
-            # :meth:`DispatchSession.cancel` on the main loop via
+            # `DispatchSession.cancel` on the main loop via
             # ``call_soon_threadsafe`` so the routine task is
             # cancelled cross-loop on the same path
-            # ``WorkerService._cancel`` uses for graceful shutdown.
+            # ``WorkerService._preempt`` uses for graceful shutdown.
             # ``DispatchSession.cancel`` is idempotent, so the
             # dispatch handler's own except-clause cancel is a no-op
             # if this callback raced ahead. Avoids the watcher-task
@@ -445,10 +326,19 @@ class WorkerService(protocol.WorkerServicer):
             def _propagate_cancel_on_done(ctx) -> None:
                 if not ctx.cancelled():
                     return
+
+                def _spawn() -> None:
+                    # Hold a strong ref to the cancel-propagator task
+                    # so it is not GC'd mid-flight (which would emit
+                    # "Task was destroyed but it is pending" and
+                    # "exception was never retrieved" warnings). The
+                    # done-callback discards once the task completes.
+                    task = main_loop.create_task(session.cancel())
+                    self._cancel_propagators.add(task)
+                    task.add_done_callback(self._cancel_propagators.discard)
+
                 try:
-                    main_loop.call_soon_threadsafe(
-                        lambda: main_loop.create_task(session.cancel())
-                    )
+                    main_loop.call_soon_threadsafe(_spawn)
                 except RuntimeError:
                     # Main loop already closed (graceful shutdown
                     # raced us). Nothing to propagate to; the
@@ -456,7 +346,7 @@ class WorkerService(protocol.WorkerServicer):
                     # surrounding context-manager unwind.
                     pass
 
-            # grpc.aio's :meth:`ServicerContext.add_done_callback` is
+            # grpc.aio's `ServicerContext.add_done_callback` is
             # typed in typeshed as
             # ``Callable[[_DoneCallback[_TRequest, _TResponse]], None]``
             # where ``_DoneCallback`` is a generic callable *class*.
@@ -472,25 +362,23 @@ class WorkerService(protocol.WorkerServicer):
                 async with session:
                     if self._backpressure is not None:
                         backpressure = self._backpressure
-                        # ``guarded=False`` — the dispatch task is not
-                        # running the routine itself, only reading
-                        # caller-shipped wool.ContextVar values for the
-                        # hook. The single-task ownership of
-                        # ``session.context`` belongs to the worker
-                        # task scheduled lazily on the first
-                        # ``__aiter__`` call below; entering the
-                        # guard here would race that scheduling
-                        # under ``Context._lock``.
+                        # The hook observes dispatch-time worker
+                        # state (active task count, the incoming
+                        # task). Caller-shipped wool.ContextVar
+                        # values are not exposed: under the
+                        # per-frame architecture the Task frame
+                        # carries no chain manifest, so the
+                        # decoded manifest at admission time is
+                        # always empty.
                         try:
-                            with attached(session.context, guarded=False):
-                                decision = backpressure(
-                                    BackpressureContext(
-                                        active_task_count=len(self._docket),
-                                        task=session.task,
-                                    )
+                            decision = backpressure(
+                                BackpressureContext(
+                                    active_task_count=len(self._docket),
+                                    task=session.task,
                                 )
-                                if isawaitable(decision):
-                                    decision = await decision
+                            )
+                            if isawaitable(decision):
+                                decision = await decision
                         except Exception:
                             # User-supplied backpressure hook crashed.
                             # Log so the operator notices, then abort
@@ -512,12 +400,35 @@ class WorkerService(protocol.WorkerServicer):
                             )
 
                     async with self._tracked(session, context):
-                        yield protocol.Response(
-                            ack=protocol.Ack(version=protocol.__version__)
-                        )
+                        # Under the per-frame architecture, boundary
+                        # frames (Ack/Nack/Task) carry no chain manifest —
+                        # the chain manifest lives only on mid-stream payload
+                        # frames (Next/Send/Throw/Result/Exception). The
+                        # dispatch handler is on the main loop and never
+                        # carries the worker's chain itself.
+                        yield AckResponseFrame.for_send(
+                            serializer=session.serializer,
+                        ).to_protobuf()
                         try:
                             async for response in session:
-                                yield response.to_protobuf(serializer=session.serializer)
+                                # Wrap the main-loop encode in a
+                                # try/except for pickle/type errors so a
+                                # mid-stream encode failure is shipped as
+                                # a typed terminal SerializationError
+                                # rather than misclassified as a routine
+                                # raise. Worker-shipped
+                                # ExceptionResponseFrames continue
+                                # to flow unchanged: only the main-loop
+                                # ``response.to_protobuf()`` is wrapped.
+                                try:
+                                    wire = response.to_protobuf()
+                                except (pickle.PickleError, TypeError) as ee:
+                                    raise SerializationError(
+                                        f"Failed to encode result payload: {ee}",
+                                        cause=ee,
+                                        value_repr=repr(response.payload),
+                                    ) from ee
+                                yield wire
                         except (Exception, asyncio.CancelledError) as e:
                             # Cancel the session before drain on the
                             # error path so a routine suspended
@@ -537,121 +448,71 @@ class WorkerService(protocol.WorkerServicer):
                             # the cancel failure to the caller.
                             try:
                                 await session.cancel()
+                            except (KeyboardInterrupt, SystemExit):
+                                # A process-exit signal must win even over
+                                # the routine's primary ``e`` — the
+                                # dispatch is being torn down regardless.
+                                raise
                             except BaseException:
                                 pass
                             # All worker-side and main-side failures
                             # land here: routine exceptions raised in
-                            # :func:`_step` propagate through the
+                            # `_drive_step` propagate through the
                             # response queue and out of
-                            # :meth:`DispatchSession.__aiter__` raw;
+                            # `DispatchSession.__aiter__` raw;
                             # pre-stream worker setup failures surface
-                            # via :meth:`_ResponseQueue.get` raising on
-                            # close; mid-stream context-decode /
-                            # update failures escape :func:`_step` the
-                            # same way; handler-level failures (e.g.
+                            # via `_ResponseQueue.get` raising on
+                            # close; mid-stream chain-manifest-decode /
+                            # update failures escape `_drive_step` the
+                            # same way; handler-level failures (e.g.,
                             # ``response.to_protobuf`` raising) raise
                             # directly here; gRPC stream cancellation
                             # raises ``CancelledError`` mid-iteration.
-                            # Drain the worker before snapshotting
-                            # ``session.context``: worker-failure
-                            # paths arrive with the worker already
-                            # finalized (so drain is a no-op), but
-                            # cancellation and main-loop handler-
-                            # level failures leave the worker mid-
-                            # ``_step``, racing the snapshot's read
-                            # of ``_data`` against the worker's
-                            # ``work_ctx.update`` /
-                            # ``work_ctx.to_protobuf`` writes.
-                            # :meth:`DispatchSession.drain` is
-                            # idempotent — :meth:`__aexit__` will
+                            # Drain the worker before reading
+                            # ``session._final_wire_chain_manifest``: the
+                            # worker task encodes it inside its own
+                            # Chain and publishes it from its
+                            # ``finally``, so the read must wait for
+                            # the worker task to finish. Worker-failure
+                            # paths arrive already finalized (drain is
+                            # a no-op); cancellation and main-loop
+                            # handler-level failures leave the worker
+                            # mid-``_drive_step``, so the drain is what
+                            # guarantees the publish has happened.
+                            # `DispatchSession.drain` is
+                            # idempotent — `__aexit__` will
                             # call it again on the way out. On the
                             # external-cancellation path drain may
                             # re-raise ``CancelledError`` before
-                            # the snapshot can be built; the gRPC
+                            # the chain manifest can be built; the gRPC
                             # stream is being torn down anyway, so
                             # losing the terminal Response is
                             # acceptable — the caller has no
                             # consumer left.
                             await session.drain()
-                            # Unwrap PEP 525's auto-conversion for
-                            # coroutine routines so the caller's
-                            # ``await routine()`` surfaces the
-                            # original :class:`StopAsyncIteration`
-                            # raw — matching stdlib coroutine
-                            # semantics. The wrap happens in
-                            # :meth:`DispatchSession._iterate` (the
-                            # asyncgen transport layer): when a
-                            # coroutine raises StopAsyncIteration,
-                            # _ResponseQueue.get re-raises it inside
-                            # _iterate's body, and PEP 525 converts
-                            # it to ``RuntimeError("async generator
-                            # raised StopAsyncIteration")`` with the
-                            # original SAI on ``__cause__``.
-                            # Streaming routines keep the
-                            # RuntimeError shape — that already
-                            # matches stdlib ``async for x in
-                            # agen()`` semantics.
-                            if (
-                                not session.streaming
-                                and isinstance(e, RuntimeError)
-                                and isinstance(e.__cause__, StopAsyncIteration)
-                            ):
-                                e = e.__cause__
-                            try:
-                                wire_context = session.context.to_protobuf(
-                                    serializer=session.serializer
-                                )
-                            except Exception as encode_exc:
-                                # Strict-mode-only path: attach the
-                                # encoded ``ContextDecodeWarning``
-                                # peers to ``e`` so the caller's
-                                # ``except RoutineError`` clause keeps
-                                # matching. See
-                                # :func:`_attach_strict_mode_warnings`
-                                # for the attachment contract and
-                                # rationale. Drops the post-run
-                                # ``context`` field on the wire (the
-                                # snapshot itself failed); peers ride
-                                # on the routine exception via PEP 678
-                                # ``__notes__`` and
-                                # ``__wool_context_warnings__``.
-                                _attach_strict_mode_warnings(e, encode_exc)
-                                yield protocol.Response(
-                                    exception=protocol.Message(
-                                        dump=_safely_serialize_exception(
-                                            session.serializer, e
-                                        )
-                                    ),
-                                )
-                            else:
-                                yield protocol.Response(
-                                    exception=protocol.Message(
-                                        dump=_safely_serialize_exception(
-                                            session.serializer, e
-                                        )
-                                    ),
-                                    context=wire_context,
-                                )
+                            # Encode-error vs. lazy-wire-frame
+                            # routing (plus the PEP 525 SAI unwrap
+                            # for coroutine routines) lives on
+                            # `DispatchSession.terminal_response`.
+                            # That single call keeps session._final_*
+                            # access encapsulated rather than read
+                            # here.
+                            yield session.terminal_response(
+                                e, serializer=session.serializer
+                            ).to_protobuf()
             except Rejected as e:
                 # Parse-phase failure (malformed task payload).
                 # Reported via Nack so the client deserializes the
                 # dumped exception and re-raises it as the actual
                 # failure class rather than an opaque RpcError. The
-                # dump uses ``session.serializer`` — the negotiated
-                # serializer if parse got past serializer setup,
-                # falling back to ``wool.__serializer__``
-                # (cloudpickle) for early-fail paths. Same path as
+                # dump uses ``session.serializer`` — always
+                # ``wool.__serializer__`` (cloudpickle). Same path as
                 # ``Response.exception`` post-Ack — symmetry on the
                 # wire.
-                yield protocol.Response(
-                    nack=protocol.Nack(
-                        exception=protocol.Message(
-                            dump=_safely_serialize_exception(
-                                session.serializer, e.original
-                            )
-                        ),
-                    ),
-                )
+                yield NackResponseFrame.for_send(
+                    e.original,
+                    serializer=session.serializer,
+                ).to_protobuf()
                 return
             except AbortError:
                 # Intentional ``context.abort(...)`` calls inside the
@@ -687,7 +548,7 @@ class WorkerService(protocol.WorkerServicer):
         :param request:
             The protobuf stop request containing the wait timeout.
         :param context:
-            The :class:`grpc.aio.ServicerContext` for this request.
+            The `grpc.aio.ServicerContext` for this request.
         :returns:
             An empty protobuf response indicating completion.
         """
@@ -702,16 +563,16 @@ class WorkerService(protocol.WorkerServicer):
     ) -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
         """Create a new event loop running on a dedicated daemon thread.
 
-        The thread target wraps :meth:`asyncio.AbstractEventLoop.run_forever`
-        in a ``try/finally`` that calls :meth:`asyncio.AbstractEventLoop.close`
+        The thread target wraps `asyncio.AbstractEventLoop.run_forever`
+        in a ``try/finally`` that calls `asyncio.AbstractEventLoop.close`
         once ``run_forever`` returns. Closing the loop from the worker
         thread (rather than the caller's thread inside
-        :meth:`_destroy_worker_loop`) eliminates the race that produced
+        `_destroy_worker_loop`) eliminates the race that produced
         ``RuntimeError("Cannot close a running event loop")`` when a
         caller-side close raced the still-active ``run_forever``.
 
         :param key:
-            The :class:`ResourcePool` cache key (unused).
+            The `ResourcePool` cache key (unused).
         :returns:
             A tuple of the event loop and the thread running it.
         """
@@ -728,7 +589,7 @@ class WorkerService(protocol.WorkerServicer):
         thread.start()
         return loop, thread
 
-    def _destroy_worker_loop(
+    async def _destroy_worker_loop(
         self,
         loop_thread: tuple[asyncio.AbstractEventLoop, threading.Thread],
     ) -> None:
@@ -737,20 +598,20 @@ class WorkerService(protocol.WorkerServicer):
         Drains successive generations of pending tasks on the
         worker loop, then signals the loop to stop. A cancelled
         task's ``finally`` clause can schedule a second generation
-        of tasks (e.g. follow-up cleanup, fire-and-forget logging,
+        of tasks (e.g., follow-up cleanup, fire-and-forget logging,
         further cancellations, etc.); the drain cancels and awaits
         successive generations until none remain or
-        :data:`_DRAIN_TIMEOUT` elapses, so the loop closes without
+        `_DRAIN_TIMEOUT` elapses, so the loop closes without
         leaking ``Task was destroyed but it is pending!`` warnings.
         If a routine schedules cleanup-of-cleanup past the budget,
         the drain stops anyway and the daemon-thread reap remains
         the backstop. The loop is closed by the worker
-        thread itself (see :meth:`_create_worker_loop`'s
+        thread itself (see `_create_worker_loop`'s
         ``_run_then_close`` target), not from this caller's thread —
         eliminating the close-while-running race.
 
-        Joins the worker thread for up to :attr:`_stop_timeout`
-        seconds (set by :meth:`_stop` from the StopRequest's
+        Joins the worker thread for up to `_stop_timeout`
+        seconds (set by `_stop` from the StopRequest's
         ``timeout``). ``timeout=0`` means "do not wait"; positive
         values bound the synchronous wait; ``None`` means "wait
         indefinitely" (caller asked for unlimited graceful shutdown).
@@ -807,7 +668,12 @@ class WorkerService(protocol.WorkerServicer):
 
         timeout = self._stop_timeout
         if timeout is None or timeout > 0:
-            thread.join(timeout=timeout)
+            # Offload the synchronous ``thread.join`` to a worker
+            # thread so the main loop keeps pumping while we wait.
+            # ``ResourcePool._await`` already dispatches coroutine
+            # finalizers, so changing this function to ``async def``
+            # is transparent at the call site.
+            await asyncio.get_running_loop().run_in_executor(None, thread.join, timeout)
 
     @asynccontextmanager
     async def _tracked(
@@ -815,19 +681,19 @@ class WorkerService(protocol.WorkerServicer):
         session: DispatchSession,
         context: ServicerContext,
     ) -> AsyncIterator[None]:
-        """Add *session* to :attr:`_docket` for the duration of the
+        """Add *session* to `_docket` for the duration of the
         yield, removing it on exit.
 
         The docket is the registry of in-flight
-        :class:`DispatchSession` instances that :meth:`_stop`
+        `DispatchSession` instances that `_stop`
         pre-empts on graceful shutdown. The CM scope mirrors the
         dispatch handler's iteration scope, so an in-flight
         dispatch is always either tracked or already finalized.
 
-        Re-checks :attr:`_stopping` on entry to close the
-        check-to-register window in :meth:`dispatch` — a concurrent
-        :meth:`_stop` between the entry gate and docket registration
-        would otherwise admit a session that :meth:`_preempt` never
+        Re-checks `_stopping` on entry to close the
+        check-to-register window in `dispatch` — a concurrent
+        `_stop` between the entry gate and docket registration
+        would otherwise admit a session that `_preempt` never
         sees, leaving it to be torn down indirectly by loop-pool
         teardown rather than the explicit cancel path.
         """
@@ -846,7 +712,7 @@ class WorkerService(protocol.WorkerServicer):
         if timeout is not None and timeout < 0:
             timeout = None
         # Stash the StopRequest's timeout for the loop-teardown
-        # finalizer (read by :meth:`_destroy_worker_loop`) before
+        # finalizer (read by `_destroy_worker_loop`) before
         # any ``await`` so it is always set when ``_loop_pool.clear``
         # later invokes the finalizer. ``timeout=0`` (the default)
         # → don't synchronously join; positive → bound the join;
@@ -869,9 +735,9 @@ class WorkerService(protocol.WorkerServicer):
 
         The service-wide pre-emption entry point. Waits for running
         tasks to complete or cancels them depending on the timeout
-        value. Calls :meth:`DispatchSession.cancel` on each session
+        value. Calls `DispatchSession.cancel` on each session
         in the docket when forced cancellation is required, which
-        propagates :class:`asyncio.CancelledError` to the routine.
+        propagates `asyncio.CancelledError` to the routine.
         The caller observes ``CancelledError`` from
         ``await routine()``, matching stdlib's ``task.cancel()``
         semantics — operator pre-emption is indistinguishable from

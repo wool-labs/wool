@@ -4,7 +4,7 @@ from wool import protocol
 
 EXPECTED_MESSAGE_EXPORTS = [
     "Ack",
-    "Context",
+    "ChainManifest",
     "Message",
     "Nack",
     "Request",
@@ -91,27 +91,29 @@ class TestMessageConstruction:
         assert task.kwargs == b"kwargs-bytes"
         assert task.timeout == 30
 
-    def test_context_fields(self):
-        """Test Context message field round-trip.
+    def test_chain_manifest_fields(self):
+        """Test ChainManifest message field round-trip.
 
         Given:
             An id hex string and a list of ContextVar entries.
         When:
-            A Context message is constructed.
+            A ChainManifest message is constructed.
         Then:
             Both fields round-trip correctly and each ContextVar
-            entry preserves its namespace, name, value, and
-            consumed_tokens.
+            entry preserves its namespace, name, and value. The
+            previous ``consumed_tokens`` repeated field is removed
+            from the wire schema (cross-process token transport is
+            deferred to a separate Wool Token wrapper ride; see
+            issue #231).
         """
         # Arrange, act, & assert
-        ctx = protocol.Context(
+        ctx = protocol.ChainManifest(
             id="abc",
             vars=[
                 protocol.ContextVar(
                     namespace="ns",
                     name="key",
                     value=b"value",
-                    consumed_tokens=["abc123"],
                 )
             ],
         )
@@ -120,7 +122,6 @@ class TestMessageConstruction:
         entry = ctx.vars[0]
         assert (entry.namespace, entry.name) == ("ns", "key")
         assert entry.value == b"value"
-        assert list(entry.consumed_tokens) == ["abc123"]
 
     def test_runtime_context_fields_with_dispatch_timeout(self):
         """Test RuntimeContext exposes dispatch_timeout when supplied.
@@ -400,6 +401,6 @@ class TestProtobufImportError:
         Then:
             It should be a subclass of ImportError.
         """
-        from wool.protocol.exception import ProtobufImportError
+        from wool.protocol.exceptions import ProtobufImportError
 
         assert issubclass(ProtobufImportError, ImportError)

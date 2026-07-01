@@ -5,6 +5,7 @@ from functools import partial
 
 import pytest
 
+import wool
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
@@ -33,7 +34,7 @@ from .conftest import invoke_routine
 @pytest.mark.integration
 class TestPoolComposition:
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_default_mode(
+    async def test_build_pool_from_scenario_should_return_result_when_default_mode(
         self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with DEFAULT mode.
@@ -76,7 +77,7 @@ class TestPoolComposition:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_ephemeral_mode(
+    async def test_build_pool_from_scenario_should_return_result_when_ephemeral_mode(
         self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with EPHEMERAL mode and size=2.
@@ -119,7 +120,7 @@ class TestPoolComposition:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_durable_mode(
+    async def test_build_pool_from_scenario_should_return_result_when_durable_mode(
         self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with DURABLE mode.
@@ -162,7 +163,7 @@ class TestPoolComposition:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_hybrid_mode(
+    async def test_build_pool_from_scenario_should_return_result_when_hybrid_mode(
         self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with HYBRID mode and LOCAL_CALLABLE discovery.
@@ -205,7 +206,7 @@ class TestPoolComposition:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_durable_joined_local(
+    async def test_build_pool_from_scenario_should_return_result_when_durable_joined(
         self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with DURABLE_JOINED mode and LOCAL_CALLABLE.
@@ -250,7 +251,7 @@ class TestPoolComposition:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_restrictive_opts(
+    async def test_build_pool_from_scenario_should_return_result_when_restrictive_opts(
         self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with restrictive message size options.
@@ -293,7 +294,7 @@ class TestPoolComposition:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_keepalive_opts(
+    async def test_build_pool_from_scenario_should_return_result_when_keepalive_opts(
         self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with keepalive worker options.
@@ -337,18 +338,24 @@ class TestPoolComposition:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_dispatch_timeout(
+    async def test_build_pool_from_scenario_should_propagate_dispatch_timeout_to_worker(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test building a pool with dispatch_timeout set in the context.
+        """Test the VIA_DISPATCH_TIMEOUT_VAR dimension propagates to the worker.
 
         Given:
-            A complete scenario using VIA_DISPATCH_TIMEOUT_VAR timeout.
+            A complete scenario using VIA_DISPATCH_TIMEOUT_VAR timeout,
+            which makes ``build_pool_from_scenario`` set the ambient
+            ``dispatch_timeout`` var before the dispatch.
         When:
-            A pool is built with dispatch_timeout set in the ambient
-            context and a coroutine is dispatched.
+            A pool is built and a coroutine is dispatched, then a
+            routine that returns the worker-side ``dispatch_timeout``
+            value is dispatched.
         Then:
-            It should return the correct result with the timeout active.
+            The first dispatch should return its result and the
+            second should report the builder's ``dispatch_timeout``
+            value — proving the dimension's ambient var rides the wire
+            and is restored on the worker.
         """
 
         async def body():
@@ -373,14 +380,72 @@ class TestPoolComposition:
             # Act
             async with build_pool_from_scenario(scenario, credentials_map):
                 result = await invoke_routine(scenario)
+                worker_timeout = await routines.read_dispatch_timeout()
 
             # Assert
             assert result == 3
+            # ``build_pool_from_scenario`` sets dispatch_timeout=30.0
+            # for the VIA_DISPATCH_TIMEOUT_VAR dimension; the worker
+            # must observe that value through the wire-shipped
+            # RuntimeContext.
+            assert worker_timeout == 30.0
 
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_shared_discovery(
+    async def test_runtime_context_manager_should_propagate_dispatch_timeout(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a caller-side wool.RuntimeContext rides the dispatch wire.
+
+        Given:
+            A default-timeout scenario pool and a caller that wraps a
+            dispatch in ``with wool.RuntimeContext(dispatch_timeout=X)``.
+        When:
+            A routine reading the worker-side ``dispatch_timeout`` is
+            dispatched inside the block.
+        Then:
+            The worker should observe ``X`` — ``RuntimeContext.__enter__``
+            sets the ambient timeout, which rides the wire — and the
+            ambient ``dispatch_timeout`` should be restored to its prior
+            value once the block exits (``__exit__``).
+        """
+        from wool.runtime.context.runtime import dispatch_timeout
+
+        async def body():
+            # Arrange
+            scenario = Scenario(
+                shape=RoutineShape.COROUTINE,
+                pool_mode=PoolMode.DEFAULT,
+                discovery=DiscoveryFactory.NONE,
+                lb=LbFactory.CLASS_REF,
+                credential=CredentialType.INSECURE,
+                options=WorkerOptionsKind.DEFAULT,
+                timeout=TimeoutKind.NONE,
+                binding=RoutineBinding.MODULE_FUNCTION,
+                lazy=LazyMode.LAZY,
+                backpressure=BackpressureMode.NONE,
+                ctx_var_1=ContextVarPattern.NONE,
+                ctx_var_2=ContextVarPattern.NONE,
+                ctx_var_3=ContextVarPattern.NONE,
+                quorum=QuorumMode.DEFAULT,
+            )
+            before = dispatch_timeout.get()
+
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                with wool.RuntimeContext(dispatch_timeout=7.5):
+                    worker_timeout = await routines.read_dispatch_timeout()
+                restored = dispatch_timeout.get()
+
+            # Assert
+            assert worker_timeout == 7.5
+            assert restored == before
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_build_pool_from_scenario_should_return_result_when_shared_discovery(
         self, credentials_map, retry_grpc_internal
     ):
         """Test two pools sharing the same discovery subscriber.
@@ -426,7 +491,7 @@ class TestPoolComposition:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_sync_backpressure(
+    async def test_build_pool_from_scenario_should_return_result_when_sync_backpressure(
         self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with a sync backpressure accept hook.
@@ -470,7 +535,7 @@ class TestPoolComposition:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_build_pool_from_scenario_with_async_backpressure(
+    async def test_build_pool_from_scenario_should_return_result_when_async_backpressure(
         self, credentials_map, retry_grpc_internal
     ):
         """Test building a pool with an async backpressure accept hook.
@@ -527,7 +592,9 @@ async def _async_reject_hook(ctx):
 @pytest.mark.integration
 class TestBackpressureRejection:
     @pytest.mark.asyncio
-    async def test_sync_backpressure_rejection(self, retry_grpc_internal):
+    async def test_sync_backpressure_should_raise_no_workers_available(
+        self, retry_grpc_internal
+    ):
         """Test sync backpressure hook rejects task end-to-end.
 
         Given:
@@ -556,7 +623,9 @@ class TestBackpressureRejection:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_async_backpressure_rejection(self, retry_grpc_internal):
+    async def test_async_backpressure_should_raise_no_workers_available(
+        self, retry_grpc_internal
+    ):
         """Test async backpressure hook rejects task end-to-end.
 
         Given:
@@ -585,7 +654,9 @@ class TestBackpressureRejection:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_backpressure_fallback_to_accepting_worker(self, retry_grpc_internal):
+    async def test_backpressure_should_fall_through_to_accepting_worker(
+        self, retry_grpc_internal
+    ):
         """Test load balancer falls through to an accepting worker.
 
         Given:

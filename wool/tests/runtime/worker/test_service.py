@@ -1,5 +1,4 @@
 import asyncio
-import pickle
 import threading
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -19,7 +18,6 @@ import wool
 from wool import protocol
 from wool.protocol import WorkerStub
 from wool.protocol import add_WorkerServicer_to_server
-from wool.runtime.context import install_task_factory
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
 from wool.runtime.worker.interceptor import VersionInterceptor
@@ -27,6 +25,17 @@ from wool.runtime.worker.service import WorkerService
 from wool.runtime.worker.session import DispatchSession
 
 from .conftest import PicklableMock
+
+
+def make_task(callable, *, proxy_id="test-proxy-id"):
+    """Build a `wool.Task` wrapping *callable* with a throwaway worker proxy."""
+    return Task(
+        id=uuid4(),
+        callable=callable,
+        args=(),
+        kwargs={},
+        proxy=PicklableMock(spec=WorkerProxyLike, id=proxy_id),
+    )
 
 
 @pytest.fixture(scope="function")
@@ -59,7 +68,7 @@ def grpc_stub_cls():
 #
 # Assumes serial test execution within this module: each test that
 # uses the event takes responsibility for setting it to a fresh
-# :class:`threading.Event` in its arrange phase and resetting it to
+# `threading.Event` in its arrange phase and resetting it to
 # ``None`` in its finally clause. If the test suite is ever run with
 # parallel collection within this module, these globals must be
 # re-keyed (e.g., a dict keyed by ``task.id``) to avoid races.
@@ -79,35 +88,37 @@ async def _controllable_task():
     return "task_completed"
 
 
-# Cross-loop side-channel for A1 regression: routine on the worker
-# loop signals via this threading.Event when it observes
-# CancelledError; the test asserts on it from the main loop.
-_a1_cancellation_observed: threading.Event | None = None
+# Cross-loop side-channel for the mid-stream cancellation regression:
+# routine on the worker loop signals via this threading.Event when it
+# observes CancelledError; the test asserts on it from the main loop.
+_midstream_cancellation_observed: threading.Event | None = None
 
-# Side-channel for the A1 regression test to confirm the worker
-# routine is actually running before the test cancels the stream.
+# Side-channel for the mid-stream cancellation regression test
+# to confirm the worker routine is actually running before the
+# test cancels the stream.
 # The dispatch ``ack`` only confirms the handler reached its
 # ``yield ack`` — the worker task is scheduled lazily on the
 # handler's first ``async for`` iteration. Cancelling before the
-# routine starts races :meth:`DispatchSession._schedule_worker`,
+# routine starts races `DispatchSession._schedule_worker`,
 # which short-circuits on ``_cancelled`` and never dispatches the
 # routine, leaving nothing for the cancellation to interrupt. The
 # routine sets this event as its first statement; the test waits
 # for it before cancelling.
-_a1_routine_started: threading.Event | None = None
+_midstream_routine_started: threading.Event | None = None
 
 # Cross-loop side-channel for the stop+cancel regression tests
-# (``test_stop_and_cancel`` and ``test_stop_and_cancel_streaming_routine``).
-# The routine on the worker loop signals via this :class:`threading.Event`
-# when it observes :class:`asyncio.CancelledError`; the test asserts on it
-# from the main loop. Separate from ``_a1_cancellation_observed`` so the
+# (``test_stop_should_cancel_active_coroutine_routine`` and
+# ``test_stop_should_cancel_active_streaming_routine``).
+# The routine on the worker loop signals via this `threading.Event`
+# when it observes `asyncio.CancelledError`; the test asserts on it
+# from the main loop. Separate from ``_midstream_cancellation_observed`` so the
 # tests do not interfere when running concurrently or in arbitrary order.
 _stop_cancellation_observed: threading.Event | None = None
 
 # Side-channel used by the stop+cancel regression tests to confirm
 # the routine has actually started running before the test sends
 # ``stop``. Without this barrier the test races
-# :meth:`DispatchSession.__aiter__`'s lazy worker scheduling: on
+# `DispatchSession.__aiter__`'s lazy worker scheduling: on
 # slower Python versions/runtimes, ``stop`` can land before the
 # worker task is created, so ``session.cancel()`` has no
 # ``_worker_task`` to cancel and the routine never observes
@@ -117,9 +128,9 @@ _stop_cancellation_observed: threading.Event | None = None
 _stop_routine_started: threading.Event | None = None
 
 # Cross-loop side-channel for the issue #202 worker-loop drain test
-# (``test_stop_with_orphaned_cleanup_chain``). The second-generation
-# cleanup task runs on the worker loop and sets this
-# :class:`threading.Event`; the test asserts on it from the main loop.
+# (``test_stop_should_drain_every_generation_of_orphaned_cleanup_chain``).
+# The second-generation cleanup task runs on the worker loop and sets this
+# `threading.Event`; the test asserts on it from the main loop.
 # The probe routine schedules a two-generation cleanup chain whose
 # second generation is observed only when worker-loop teardown drains
 # every generation, not just the first.
@@ -142,7 +153,7 @@ async def _drain_probe_routine():
 
 
 async def _drain_probe_first_gen():
-    """First-generation orphan scheduled by :func:`_drain_probe_routine`.
+    """First-generation orphan scheduled by `_drain_probe_routine`.
 
     Awaits indefinitely until worker-loop teardown cancels it, then
     schedules the second generation from its own ``finally`` clause.
@@ -154,9 +165,9 @@ async def _drain_probe_first_gen():
 
 
 async def _drain_probe_second_gen():
-    """Second-generation orphan scheduled by :func:`_drain_probe_first_gen`.
+    """Second-generation orphan scheduled by `_drain_probe_first_gen`.
 
-    Sets :data:`_drain_cleanup_observed` from its ``finally`` clause.
+    Sets `_drain_cleanup_observed` from its ``finally`` clause.
     The event is set only when worker-loop teardown drains every
     generation, not just the first.
     """
@@ -168,9 +179,9 @@ async def _drain_probe_second_gen():
 
 
 class _AttributeRejectingRoutineError(Exception):
-    """Module-level exception class for the A4 regression test.
+    """Module-level exception class for the attribute-rejection regression test.
 
-    Overrides ``__setattr__`` to raise :class:`AttributeError` for
+    Overrides ``__setattr__`` to raise `AttributeError` for
     arbitrary attribute writes — modeling exception types whose
     storage layout (e.g., ``__slots__`` derived from a slotted
     parent, or C-extension types with custom attribute machinery)
@@ -181,8 +192,7 @@ class _AttributeRejectingRoutineError(Exception):
     The override forwards the standard ``args``/``__cause__``/
     ``__context__``/``__traceback__``/``__notes__`` slots so
     ``BaseException`` machinery and PEP 678 ``add_note`` continue
-    to work — only arbitrary attribute writes (like
-    ``__wool_context_warnings__``) raise.
+    to work — only arbitrary attribute writes raise.
     """
 
     _ALLOWED = frozenset(
@@ -206,23 +216,23 @@ class _AttributeRejectingRoutineError(Exception):
             )
 
 
-async def _a1_long_routine():
-    """Module-level routine for the A1 regression test.
+async def _midstream_long_routine():
+    """Module-level routine for the mid-stream cancellation regression test.
 
     Defined at module level so cloudpickle can serialize the
-    callable for dispatch. Signals :data:`_a1_routine_started` as
+    callable for dispatch. Signals `_midstream_routine_started` as
     its first statement so the test can wait for the routine to be
     running before cancelling. Sleeps long enough that the test
-    will have given up; signals :data:`_a1_cancellation_observed`
-    if interrupted by :class:`asyncio.CancelledError`.
+    will have given up; signals `_midstream_cancellation_observed`
+    if interrupted by `asyncio.CancelledError`.
     """
-    if _a1_routine_started is not None:
-        _a1_routine_started.set()
+    if _midstream_routine_started is not None:
+        _midstream_routine_started.set()
     try:
         await asyncio.sleep(30)
     except asyncio.CancelledError:
-        if _a1_cancellation_observed is not None:
-            _a1_cancellation_observed.set()
+        if _midstream_cancellation_observed is not None:
+            _midstream_cancellation_observed.set()
         raise
     return "should_not_complete"
 
@@ -230,12 +240,12 @@ async def _a1_long_routine():
 async def _stop_long_coroutine():
     """Module-level coroutine for the stop+cancel regression test.
 
-    Signals :data:`_stop_routine_started` so the test can wait for
+    Signals `_stop_routine_started` so the test can wait for
     the routine to actually start before sending ``stop`` (avoids
-    racing :meth:`DispatchSession.__aiter__`'s lazy worker
+    racing `DispatchSession.__aiter__`'s lazy worker
     scheduling), then sleeps long enough that the test will have
-    given up; signals :data:`_stop_cancellation_observed` if
-    interrupted by :class:`asyncio.CancelledError`. Defined at
+    given up; signals `_stop_cancellation_observed` if
+    interrupted by `asyncio.CancelledError`. Defined at
     module level so cloudpickle can serialize the callable for
     dispatch.
     """
@@ -254,19 +264,19 @@ async def _stop_streaming_routine():
     """Module-level async generator for the stop+cancel streaming
     regression test.
 
-    Signals :data:`_stop_routine_started`, yields one value, then
+    Signals `_stop_routine_started`, yields one value, then
     sleeps long enough that the test will have given up; signals
-    :data:`_stop_cancellation_observed` if interrupted by
-    :class:`asyncio.CancelledError` or :class:`GeneratorExit`.
+    `_stop_cancellation_observed` if interrupted by
+    `asyncio.CancelledError` or `GeneratorExit`.
     Defined at module level so cloudpickle can serialize the
     callable for dispatch.
 
     Both exception types signal cancellation from the worker side:
     operator-preempt cancels the worker driver task; depending on
     where the routine is suspended (mid-await vs at a yield) the
-    teardown path either propagates :class:`asyncio.CancelledError`
-    through the await or injects :class:`GeneratorExit` via
-    :func:`routine_scope`'s ``aclose``. Either is a valid
+    teardown path either propagates `asyncio.CancelledError`
+    through the await or injects `GeneratorExit` via
+    `routine_scope`'s ``aclose``. Either is a valid
     observation of cancellation reaching the routine.
     """
     if _stop_routine_started is not None:
@@ -298,15 +308,7 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
     service = WorkerService()
     _control_event = threading.Event()
 
-    mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-    wool_task = Task(
-        id=uuid4(),
-        callable=_controllable_task,
-        args=(),
-        kwargs={},
-        proxy=mock_proxy,
-    )
+    wool_task = make_task(_controllable_task)
 
     request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -334,13 +336,13 @@ async def service_fixture(mocker: MockerFixture, grpc_aio_stub):
 
 
 class TestWorkerService:
-    def test___init___with_defaults(self):
-        """Test :class:`WorkerService` initialization.
+    def test___init___should_expose_unset_lifecycle_events(self):
+        """Test `WorkerService` initialization.
 
         Given:
             No preconditions
         When:
-            :class:`WorkerService` is instantiated
+            `WorkerService` is instantiated
         Then:
             It should initialize successfully and expose its stopping and stopped events
         """
@@ -354,14 +356,14 @@ class TestWorkerService:
         assert not service.stopped.is_set()
 
     @pytest.mark.asyncio
-    async def test_dispatch_task_that_returns(
+    async def test_dispatch_should_return_result_when_task_returns(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch successfully executes task that returns
+        """Test `WorkerService` dispatch successfully executes task that returns
         a value.
 
         Given:
-            A gRPC :class:`WorkerService` that is not stopping or stopped
+            A gRPC `WorkerService` that is not stopping or stopped
         When:
             Dispatch RPC is called with a task that returns a value
         Then:
@@ -372,15 +374,7 @@ class TestWorkerService:
         async def sample_task():
             return "test_result"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
 
         request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -398,14 +392,14 @@ class TestWorkerService:
         assert cloudpickle.loads(reponse.result.dump) == "test_result"
 
     @pytest.mark.asyncio
-    async def test_dispatch_task_that_raises(
+    async def test_dispatch_should_return_exception_when_task_raises(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch successfully executes task
+        """Test `WorkerService` dispatch successfully executes task
         that raises an exception.
 
         Given:
-            A gRPC :class:`WorkerService` that is not stopping or stopped
+            A gRPC `WorkerService` that is not stopping or stopped
         When:
             Dispatch RPC is called with a task that raises an exception
         Then:
@@ -416,15 +410,7 @@ class TestWorkerService:
         async def failing_task():
             raise ValueError("test_exception")
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=failing_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(failing_task)
 
         request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -439,23 +425,26 @@ class TestWorkerService:
         ack, response = responses
         assert ack.HasField("ack")
         assert response.HasField("exception")
-        assert response.HasField("context")
+        # Under lazy-wire-frame semantics, an unarmed worker (this
+        # task never touched a wool.ContextVar) omits the optional
+        # context field — there's nothing to propagate.
+        assert not response.HasField("context")
         exception = cloudpickle.loads(response.exception.dump)
         assert isinstance(exception, ValueError)
         assert str(exception) == "test_exception"
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_corrupt_context_under_strict_filter(
+    async def test_dispatch_should_nack_when_corrupt_context_under_strict_filter(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch under strict mode for
-        :class:`ContextDecodeWarning` when the caller's context
+        """Test `WorkerService` dispatch under strict mode for
+        `SerializationWarning` when the caller's context
         carries a corrupt var payload.
 
         Given:
             A dispatch Request whose ``context.vars`` map carries a
             corrupt byte payload, and the worker-side warning filter
-            promotes :class:`ContextDecodeWarning` to an exception
+            promotes `SerializationWarning` to an exception
             (modeling
             ``warnings.filterwarnings("error", category=...)`` set
             via ``PYTHONWARNINGS`` or programmatic config in the
@@ -463,14 +452,14 @@ class TestWorkerService:
         When:
             The dispatch RPC is invoked with that request
         Then:
-            It should reply with exactly one :class:`Nack` response
+            It should reply with exactly one `Nack` response
             (no preceding Ack) whose ``exception`` field decodes to
-            a :class:`BaseExceptionGroup` carrying the promoted
-            :class:`ContextDecodeWarning` as its sole peer — so
-            worker-side strict mode preserves the same uniform
-            group shape that caller-side strict mode produces, and
-            the leaf class identity remains addressable via
-            ``except*`` regardless of peer cardinality.
+            a typed `wool.ChainSerializationError` aggregating the
+            promoted warnings on ``.warnings``, each carrying the
+            corrupt variable's key and the decode direction across
+            the wire. The caller's existing
+            ``except wool.ChainSerializationError`` clause matches without
+            needing ``except*`` migration.
         """
         import warnings as _warnings
 
@@ -478,17 +467,10 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_execute"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         namespace = f"strict_corrupt_{uuid4().hex}"
         var: wool.ContextVar[str] = wool.ContextVar("x", namespace=namespace)
-        context_pb = protocol.Context(id=uuid4().hex)
+        context_pb = protocol.ChainManifest(id=uuid4().hex)
         context_pb.vars.add(
             namespace=var.namespace,
             name=var.name,
@@ -501,7 +483,7 @@ class TestWorkerService:
 
         # Act
         with _warnings.catch_warnings():
-            _warnings.simplefilter("error", category=wool.ContextDecodeWarning)
+            _warnings.simplefilter("error", category=wool.SerializationWarning)
             async with grpc_aio_stub() as stub:
                 stream = stub.dispatch()
                 await stream.write(request)
@@ -514,29 +496,97 @@ class TestWorkerService:
         assert nack.HasField("nack")
         assert nack.nack.HasField("exception")
         raised = cloudpickle.loads(nack.nack.exception.dump)
-        assert isinstance(raised, BaseExceptionGroup)
-        assert len(raised.exceptions) == 1
-        peer = raised.exceptions[0]
-        assert isinstance(peer, wool.ContextDecodeWarning)
-        assert "Failed to deserialize" in str(peer)
+        assert isinstance(raised, wool.ChainSerializationError)
+        assert "failed to serialize across the wire" in str(raised)
+        assert "Failed to deserialize" in str(raised.warnings[0])
+        # Warnings aggregated on .warnings, structured fields intact
+        # after the wire round trip.
+        assert len(raised.warnings) == 1
+        assert isinstance(raised.warnings[0], wool.SerializationWarning)
+        assert raised.warnings[0].var_key == (var.namespace, var.name)
+        assert raised.warnings[0].direction == "decode"
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_malformed_task_id(
+    async def test_dispatch_should_nack_when_multiple_corrupt_vars_under_strict_filter(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch when the wire-shipped
+        """Test pre-Ack strict-mode attaches multiple peers symmetrically.
+
+        Given:
+            A dispatch Request whose ``context.vars`` carries two
+            corrupt var payloads, and the worker-side warning filter
+            promotes `SerializationWarning` to an exception.
+        When:
+            The dispatch RPC is invoked with that request.
+        Then:
+            It should reply with exactly one `Nack` whose
+            ``exception`` decodes to a typed
+            `wool.ChainSerializationError` aggregating every
+            promoted warning on ``.warnings``, so callers handle
+            multi-failure decoding with one ``except
+            ChainSerializationError`` clause.
+        """
+        import warnings as _warnings
+
+        # Arrange
+        async def sample_task():
+            return "should_not_execute"
+
+        wool_task = make_task(sample_task)
+        namespace = f"strict_multi_{uuid4().hex}"
+        var_a: wool.ContextVar[str] = wool.ContextVar("a", namespace=namespace)
+        var_b: wool.ContextVar[str] = wool.ContextVar("b", namespace=namespace)
+        context_pb = protocol.ChainManifest(id=uuid4().hex)
+        context_pb.vars.add(
+            namespace=var_a.namespace,
+            name=var_a.name,
+            value=b"\x00garbage-a\x00",
+        )
+        context_pb.vars.add(
+            namespace=var_b.namespace,
+            name=var_b.name,
+            value=b"\x00garbage-b\x00",
+        )
+        request = protocol.Request(
+            task=wool_task.to_protobuf(),
+            context=context_pb,
+        )
+
+        # Act
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", category=wool.SerializationWarning)
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(request)
+                await stream.done_writing()
+                responses = [r async for r in stream]
+
+        # Assert
+        assert len(responses) == 1
+        nack = responses[0]
+        assert nack.HasField("nack")
+        raised = cloudpickle.loads(nack.nack.exception.dump)
+        assert isinstance(raised, wool.ChainSerializationError)
+        assert len(raised.warnings) == 2
+        assert all(isinstance(w, wool.SerializationWarning) for w in raised.warnings)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_nack_with_value_error_when_task_id_malformed(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test `WorkerService` dispatch when the wire-shipped
         task id cannot be parsed as a UUID.
 
         Given:
             A dispatch Request whose ``task.id`` field is a
             non-hex / non-UUID string, so ``UUID(request.task.id)``
-            raises :class:`ValueError` inside the parse phase
+            raises `ValueError` inside the parse phase
         When:
             The dispatch RPC is invoked with that request
         Then:
-            It should reply with exactly one :class:`Nack` response
+            It should reply with exactly one `Nack` response
             (no preceding Ack) whose ``exception`` field decodes to
-            the original :class:`ValueError`, surfacing the actual
+            the original `ValueError`, surfacing the actual
             parse-failure class to the caller rather than an opaque
             gRPC error.
         """
@@ -545,14 +595,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_execute"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         task_pb = wool_task.to_protobuf()
         task_pb.id = "not-a-valid-uuid"
         request = protocol.Request(task=task_pb)
@@ -573,20 +616,20 @@ class TestWorkerService:
         assert isinstance(raised, ValueError)
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_corrupt_task_callable(
+    async def test_dispatch_should_nack_with_unpickling_error_when_task_callable_corrupt(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch when the wire-shipped
+        """Test `WorkerService` dispatch when the wire-shipped
         task callable bytes cannot be deserialized by cloudpickle.
 
         Given:
             A dispatch Request whose ``task.callable`` field carries
-            corrupt bytes, so :meth:`Task.from_protobuf` raises
+            corrupt bytes, so `Task.from_protobuf` raises
             during cloudpickle.loads inside the parse phase
         When:
             The dispatch RPC is invoked with that request
         Then:
-            It should reply with exactly one :class:`Nack` response
+            It should reply with exactly one `Nack` response
             (no preceding Ack) whose ``exception`` field decodes to
             the underlying cloudpickle / unpickling error, surfacing
             the actual parse-failure class to the caller.
@@ -596,14 +639,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_execute"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         task_pb = wool_task.to_protobuf()
         task_pb.callable = b"\x00not a valid pickle stream\x00"
         request = protocol.Request(task=task_pb)
@@ -624,13 +660,13 @@ class TestWorkerService:
         assert isinstance(raised, Exception)
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_corrupt_context_var_value(
+    async def test_dispatch_should_run_routine_and_warn_when_context_var_value_corrupt(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch runs the routine when a
+        """Test `WorkerService` dispatch runs the routine when a
         caller-shipped ``request.context.vars`` entry cannot be
         deserialized, falling back to a fresh empty context and
-        emitting a :class:`ContextDecodeWarning`.
+        emitting a `SerializationWarning`.
 
         Given:
             A dispatch Request whose ``context.vars`` map carries a
@@ -641,7 +677,7 @@ class TestWorkerService:
             The dispatch RPC is invoked with that request
         Then:
             The routine still runs and returns its value, a
-            :class:`ContextDecodeWarning` is emitted on the worker,
+            `SerializationWarning` is emitted on the worker,
             and the response is delivered normally — context
             propagation is ancillary state and a decode failure here
             does not preempt the primary signal
@@ -651,17 +687,10 @@ class TestWorkerService:
         async def sample_task():
             return "routine_ran"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         namespace = f"corrupt_val_{uuid4().hex}"
         var: wool.ContextVar[str] = wool.ContextVar("x", namespace=namespace)
-        context_pb = protocol.Context(id=uuid4().hex)
+        context_pb = protocol.ChainManifest(id=uuid4().hex)
         context_pb.vars.add(
             namespace=var.namespace,
             name=var.name,
@@ -673,7 +702,7 @@ class TestWorkerService:
         )
 
         # Act
-        with pytest.warns(wool.ContextDecodeWarning, match="Failed to deserialize"):
+        with pytest.warns(wool.SerializationWarning, match="Failed to deserialize"):
             async with grpc_aio_stub() as stub:
                 stream = stub.dispatch()
                 await stream.write(request)
@@ -686,68 +715,12 @@ class TestWorkerService:
         assert cloudpickle.loads(result_responses[0].result.dump) == "routine_ran"
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_malformed_context_id(
+    async def test_dispatch_should_warn_when_mid_stream_context_corrupt(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch runs the routine when the
-        caller's ``request.context.id`` is not a valid hex UUID,
-        falling back to a fresh empty context and emitting a
-        :class:`ContextDecodeWarning`.
-
-        Given:
-            A dispatch Request whose ``context.id`` field is a
-            non-hex string (e.g., ``"not-a-uuid"``)
-        When:
-            The dispatch RPC is invoked with that request
-        Then:
-            The routine still runs and returns its value, a
-            :class:`ContextDecodeWarning` is emitted, and the
-            response is delivered normally — malformed wire context
-            is treated as ancillary state lost, not a request
-            rejection
-        """
-
-        # Arrange
-        async def sample_task():
-            return "routine_ran"
-
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
-        # carries_state requires a non-empty vars list for
-        # from_protobuf to even attempt parsing the id, so seed a
-        # ContextVar entry carrying a consumed-token id alongside
-        # the malformed Context id.
-        bad_ctx = protocol.Context(id="not-a-uuid")
-        bad_ctx.vars.add(namespace="", name="", consumed_tokens=[uuid4().hex])
-        task_pb = wool_task.to_protobuf()
-        request = protocol.Request(task=task_pb, context=bad_ctx)
-
-        # Act
-        with pytest.warns(wool.ContextDecodeWarning):
-            async with grpc_aio_stub() as stub:
-                stream = stub.dispatch()
-                await stream.write(request)
-                await stream.done_writing()
-                responses = [r async for r in stream]
-
-        # Assert
-        result_responses = [r for r in responses if r.HasField("result")]
-        assert len(result_responses) == 1
-        assert cloudpickle.loads(result_responses[0].result.dump) == "routine_ran"
-
-    @pytest.mark.asyncio
-    async def test_dispatch_streaming_with_mid_stream_corrupt_context(
-        self, grpc_aio_stub, mock_worker_proxy_cache
-    ):
-        """Test :class:`WorkerService` dispatch continues an async-generator
+        """Test `WorkerService` dispatch continues an async-generator
         iteration when a mid-stream frame carries a corrupt context,
-        emitting a :class:`ContextDecodeWarning` instead of failing
+        emitting a `SerializationWarning` instead of failing
         the dispatch.
 
         Given:
@@ -760,7 +733,7 @@ class TestWorkerService:
             stream
         Then:
             The generator's second yield is delivered as a normal
-            result frame and a :class:`ContextDecodeWarning` is
+            result frame and a `SerializationWarning` is
             emitted on the worker — the corrupt mid-stream context
             is treated as ancillary state lost rather than a
             terminal failure
@@ -771,20 +744,13 @@ class TestWorkerService:
             for i in range(5):
                 yield f"value_{i}"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=streamer,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(streamer)
         first_request = protocol.Request(task=wool_task.to_protobuf())
         good_next = protocol.Request(
             next=protocol.Void(),
-            context=protocol.Context(id=uuid4().hex),
+            context=protocol.ChainManifest(id=uuid4().hex),
         )
-        bad_ctx = protocol.Context(id=uuid4().hex)
+        bad_ctx = protocol.ChainManifest(id=uuid4().hex)
         bad_ctx.vars.add(
             namespace="test",
             name="corrupt_key",
@@ -810,7 +776,7 @@ class TestWorkerService:
                 await stream.done_writing()
                 return second
 
-        with pytest.warns(wool.ContextDecodeWarning):
+        with pytest.warns(wool.SerializationWarning):
             second = await asyncio.wait_for(drive(), timeout=5.0)
 
         # Assert
@@ -818,28 +784,28 @@ class TestWorkerService:
         assert cloudpickle.loads(second.result.dump) == "value_1"
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_with_unpicklable_worker_mutation(
+    async def test_dispatch_should_warn_when_streaming_worker_mutation_unpicklable(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch delivers the next yield
-        when a worker-side snapshot serialization fails between
-        iterations, emitting a :class:`ContextDecodeWarning` instead
+        """Test `WorkerService` dispatch delivers the next yield
+        when a worker-side context serialization fails between
+        iterations, emitting a `SerializationWarning` instead
         of failing the dispatch.
 
         Given:
             An async-generator routine that, between yields, sets a
-            :class:`wool.ContextVar` to a value whose ``__reduce__``
-            raises — the wool back-prop snapshot
-            (``Context.to_protobuf``) on the next iteration cannot
+            `wool.ContextVar` to a value whose ``__reduce__``
+            raises — the wool back-prop encode
+            (`ChainManifest.to_protobuf`) on the next iteration cannot
             serialize the var
         When:
             The caller drives the generator past the unpicklable
             assignment
         Then:
             The next yield is delivered as a normal result frame
-            with an empty wire context, and a
-            :class:`ContextDecodeWarning` is emitted on the worker —
-            the snapshot failure is ancillary state and does not
+            with an empty chain manifest, and a
+            `SerializationWarning` is emitted on the worker —
+            the chain-manifest failure is ancillary state and does not
             preempt the routine's primary signal
         """
         # Arrange
@@ -855,14 +821,7 @@ class TestWorkerService:
             var.set(_Unpicklable())
             yield "second"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=streamer,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(streamer)
         first_request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
 
@@ -884,7 +843,7 @@ class TestWorkerService:
                 await stream.done_writing()
                 return second
 
-        with pytest.warns(wool.ContextDecodeWarning):
+        with pytest.warns(wool.SerializationWarning):
             second = await asyncio.wait_for(drive(), timeout=5.0)
 
         # Assert
@@ -892,27 +851,27 @@ class TestWorkerService:
         assert cloudpickle.loads(second.result.dump) == "second"
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_unpicklable_worker_mutation(
+    async def test_dispatch_should_warn_when_coroutine_worker_mutation_unpicklable(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch delivers the routine's
+        """Test `WorkerService` dispatch delivers the routine's
         return value on the coroutine path when a worker-side
-        snapshot serialization fails, emitting a
-        :class:`ContextDecodeWarning` instead of failing the
+        context serialization fails, emitting a
+        `SerializationWarning` instead of failing the
         dispatch.
 
         Given:
-            A coroutine routine that sets a :class:`wool.ContextVar`
+            A coroutine routine that sets a `wool.ContextVar`
             to a value whose ``__reduce__`` raises before
-            returning — the wool back-prop snapshot
-            (``Context.to_protobuf``) in the done-callback cannot
+            returning — the wool back-prop encode
+            (`ChainManifest.to_protobuf`) in the done-callback cannot
             serialize the post-run state
         When:
             The caller dispatches the routine
         Then:
             The routine's return value is delivered as a normal
-            result frame with an empty wire context, and a
-            :class:`ContextDecodeWarning` is emitted on the worker
+            result frame with an empty chain manifest, and a
+            `SerializationWarning` is emitted on the worker
         """
         # Arrange
         namespace = f"unpicklable_coro_{uuid4().hex}"
@@ -926,14 +885,7 @@ class TestWorkerService:
             var.set(_Unpicklable())
             return "ok"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=coroutine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(coroutine)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         # Act
@@ -944,7 +896,7 @@ class TestWorkerService:
                 await stream.done_writing()
                 return [r async for r in stream]
 
-        with pytest.warns(wool.ContextDecodeWarning):
+        with pytest.warns(wool.SerializationWarning):
             responses = await asyncio.wait_for(drive(), timeout=5.0)
 
         # Assert
@@ -953,35 +905,81 @@ class TestWorkerService:
         assert cloudpickle.loads(result_responses[0].result.dump) == "ok"
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_routine_raise_and_unpicklable_mutation(
+    async def test_dispatch_should_ship_serialization_error_when_result_unpicklable(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch ships the routine
-        exception bare with the worker-side snapshot failure
-        attached as PEP 678 ``__notes__`` and a structured
-        ``__wool_context_warnings__`` attribute when both occur
+        """Test `WorkerService` dispatch ships a typed
+        `wool.SerializationError` when the routine succeeds
+        but its return value cannot be encoded for the wire.
+
+        Given:
+            A coroutine routine that succeeds but returns an
+            unpicklable value (a `threading.Lock`), with no
+            strict warning filter installed.
+        When:
+            The dispatch RPC is invoked and the response stream is
+            consumed.
+        Then:
+            The terminal exception frame should decode to a
+            `wool.SerializationError` — not the
+            `wool.ChainSerializationError` aggregator —
+            whose message names the result-payload encode failure,
+            with the underlying encode error attached as ``cause``
+            and a ``value_repr`` preview of the offending value.
+        """
+
+        # Arrange
+        async def lock_returning_task():
+            return threading.Lock()
+
+        wool_task = make_task(lock_returning_task)
+        request = protocol.Request(task=wool_task.to_protobuf())
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            responses = [r async for r in stream]
+
+        # Assert
+        assert responses[0].HasField("ack")
+        exc_responses = [r for r in responses if r.HasField("exception")]
+        assert len(exc_responses) == 1
+        raised = cloudpickle.loads(exc_responses[0].exception.dump)
+        assert isinstance(raised, wool.SerializationError)
+        assert not isinstance(raised, wool.ChainSerializationError)
+        assert "Failed to encode result payload" in str(raised)
+        assert raised.cause is not None
+        assert isinstance(raised.value_repr, str)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_chain_encode_failure_as_cause_when_routine_raises_and_mutation_unpicklable(  # noqa: E501
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test `WorkerService` dispatch ships the routine
+        exception bare with the worker-side chain failure
+        attached as PEP 678 ``__notes__`` when both occur
         in the same done-callback on the coroutine path under
         strict mode.
 
         Given:
-            A coroutine routine that sets a :class:`wool.ContextVar`
+            A coroutine routine that sets a `wool.ContextVar`
             to a value whose ``__reduce__`` raises and then itself
             raises an unrelated exception, with the worker-side
-            warnings filter promoting :class:`ContextDecodeWarning`
+            warnings filter promoting `SerializationWarning`
             to an exception — both the routine's failure and the
-            wool back-prop snapshot's failure occur in the same
+            wool back-prop chain's failure occur in the same
             done-callback
         When:
             The caller dispatches the routine
         Then:
             The dispatch ships the routine exception's type bare
             (so the caller's existing ``except RoutineError``
-            keeps catching), with the snapshot encode failure
-            attached via PEP 678 ``__notes__`` (visible in
-            tracebacks) and a ``__wool_context_warnings__``
-            attribute (programmatic access to the
-            :class:`ContextDecodeWarning` peers naming the
-            offending var)
+            keeps catching), with the strict-mode
+            `wool.ChainSerializationError` chained as
+            ``__cause__`` via ``raise routine_exc from encode_err``
+            so the encode failure remains visible in the traceback.
         """
         import warnings as _warnings
 
@@ -997,14 +995,7 @@ class TestWorkerService:
             var.set(_Unpicklable())
             raise ValueError("routine failure")
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=coroutine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(coroutine)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         # Act
@@ -1016,7 +1007,7 @@ class TestWorkerService:
                 return [r async for r in stream]
 
         with _warnings.catch_warnings():
-            _warnings.simplefilter("error", category=wool.ContextDecodeWarning)
+            _warnings.simplefilter("error", category=wool.SerializationWarning)
             responses = await asyncio.wait_for(drive(), timeout=5.0)
 
         # Assert
@@ -1032,63 +1023,65 @@ class TestWorkerService:
         )
         assert "routine failure" in str(raised)
 
-        # PEP 678 notes carry the warning(s) for traceback
-        # diagnostic.
-        assert hasattr(raised, "__notes__")
-        notes_text = "\n".join(raised.__notes__)
-        assert "synthetic unpicklable" in notes_text, (
-            f"snapshot failure must appear in __notes__; observed: {raised.__notes__}"
+        # The strict-mode encode failure rides on ``__cause__``
+        # via ``raise from`` chaining — visible in tracebacks and
+        # accessible programmatically as a typed
+        # ``wool.ChainSerializationError`` aggregating the warning(s).
+        cause = raised.__cause__
+        assert isinstance(cause, wool.ChainSerializationError), (
+            f"encode failure must appear on ``__cause__``; observed: "
+            f"{type(cause).__name__}"
         )
-
-        # __wool_context_warnings__ provides structured access.
-        warnings = raised.__wool_context_warnings__
-        snapshot_warnings = [
-            w
-            for w in warnings
-            if isinstance(w, wool.ContextDecodeWarning)
-            and "synthetic unpicklable" in str(w)
-        ]
-        assert len(snapshot_warnings) == 1, (
-            "snapshot ContextDecodeWarning must appear in __wool_context_warnings__"
+        assert any("synthetic unpicklable" in str(w) for w in cause.warnings), (
+            f"warning must name the offending var; got {cause.warnings!r}"
         )
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_attribute_rejecting_routine_exception_under_strict_mode(
+    async def test_dispatch_should_preserve_exception_type_when_exception_rejects_attribute_writes_under_strict_mode(  # noqa: E501
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch ships a routine
-        exception whose class rejects arbitrary attribute writes
-        unchanged under strict mode.
+        """Test `WorkerService` dispatch ships an attribute-
+        rejecting routine exception with its type preserved under
+        strict mode.
 
-        Regression test for A4. Pre-fix,
-        ``e.__wool_context_warnings__ = warnings`` raised
-        :class:`AttributeError` for exception classes that reject
-        arbitrary attribute writes (e.g., overridden
-        ``__setattr__``, or layouts that disable ``__dict__``) —
+        Regression test for the primary-class-preservation invariant:
+        the routine exception's class must reach the caller bare even
+        when wool's structured side-channels can't ride on it.
+        Attaching wool's structured side-channel onto an exception that
+        rejects arbitrary writes once raised `AttributeError`,
         converting the routine's primary signal into a stray
-        :class:`AttributeError` shipped to the caller. Post-fix,
-        the assignment is best-effort: PEP 678 ``__notes__``
-        carries the warnings (always available) and the structured
-        attribute is silently skipped when the exception class
-        does not support the write.
+        `AttributeError` shipped to the caller. The attachment is
+        now best-effort: it falls through cleanly when the class rejects
+        it, and the routine exception type still ships.
+
+        Under the new "raise from" chaining design the encode error's
+        wire survival depends on tblib's ``pickling_support`` finding
+        a class-compatible reduce path. For an
+        `Exception` subclass with no custom ``__init__`` that
+        rejects ``__dict__`` writes, tblib's
+        ``unpickle_exception_with_attrs`` path fails to restore the
+        chain — the class itself round-trips fine but ``__cause__``
+        does not survive. This test pins the primary-class
+        invariant; chain survival is a best-effort observable on
+        cooperating classes (the common case — see the routine-raise
+        siblings).
 
         Given:
-            A coroutine routine that sets a :class:`wool.ContextVar`
+            A coroutine routine that sets a `wool.ContextVar`
             to a value whose ``__reduce__`` raises (forcing the
-            wool snapshot encode failure path) and then raises an
+            wool chain encode failure path) and then raises an
             exception whose ``__setattr__`` rejects arbitrary
             attribute writes, with worker-side strict mode
-            promoting :class:`wool.ContextDecodeWarning` to an
+            promoting `wool.SerializationWarning` to an
             exception.
         When:
             The caller dispatches the routine.
         Then:
-            The wire ships the routine exception type unchanged
-            with PEP 678 ``__notes__`` carrying the warnings;
-            ``__wool_context_warnings__`` is not present (the
-            best-effort attribute set silently skipped). Pre-fix
-            the wire shipped an :class:`AttributeError` from the
-            failed attribute write instead.
+            The wire ships the routine exception type unchanged.
+            The wire frame omits the post-run ``context`` field
+            because encode failed. The caller's existing
+            ``except`` against the routine class keeps matching —
+            no migration required.
         """
         import warnings as _warnings
 
@@ -1104,14 +1097,7 @@ class TestWorkerService:
             var.set(_Unpicklable())
             raise _AttributeRejectingRoutineError("attribute-rejecting routine failure")
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=coroutine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(coroutine)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         # Act
@@ -1123,7 +1109,7 @@ class TestWorkerService:
                 return [r async for r in stream]
 
         with _warnings.catch_warnings():
-            _warnings.simplefilter("error", category=wool.ContextDecodeWarning)
+            _warnings.simplefilter("error", category=wool.SerializationWarning)
             responses = await asyncio.wait_for(drive(), timeout=5.0)
 
         # Assert
@@ -1141,52 +1127,34 @@ class TestWorkerService:
         )
         assert "attribute-rejecting routine failure" in str(raised)
 
-        # __notes__ carries the warning (always available — it's
-        # part of BaseException's API regardless of __slots__).
-        notes_text = "\n".join(getattr(raised, "__notes__", []))
-        assert "synthetic unpicklable" in notes_text, (
-            f"snapshot failure must appear in __notes__; observed: "
-            f"{getattr(raised, '__notes__', None)}"
-        )
-
-        # __wool_context_warnings__ is not set on
-        # attribute-rejecting exception types — the best-effort
-        # attribute write was skipped.
-        assert not hasattr(raised, "__wool_context_warnings__"), (
-            "attribute-rejecting exception classes cannot accept "
-            "arbitrary attribute writes; the best-effort set "
-            "should be skipped"
-        )
-
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_with_routine_raise_and_unpicklable_mutation(
+    async def test_dispatch_should_chain_encode_failure_as_cause_when_streaming_routine_raises_and_mutation_unpicklable(  # noqa: E501
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch ships the routine
-        exception bare with the worker-side snapshot failure
-        attached as PEP 678 ``__notes__`` and
-        ``__wool_context_warnings__`` when both occur in the
+        """Test `WorkerService` dispatch ships the routine
+        exception bare with the worker-side chain failure
+        attached as PEP 678 ``__notes__`` when both occur in the
         same iteration on the streaming path under strict mode.
         Symmetric with the coroutine path's contract.
 
         Given:
             An async-generator routine that yields once
-            successfully, then sets a :class:`wool.ContextVar`
+            successfully, then sets a `wool.ContextVar`
             to a value whose ``__reduce__`` raises and itself
             raises an unrelated exception on the next iteration,
             with the worker-side warnings filter promoting
-            :class:`ContextDecodeWarning` to an exception — both
-            the routine's failure and the back-prop snapshot's
+            `SerializationWarning` to an exception — both
+            the routine's failure and the back-prop chain's
             failure occur in the same iteration
         When:
             The caller drives the generator past the yielded
             value and into the failing iteration
         Then:
             The dispatch ships the routine exception type bare
-            with the snapshot encode failure attached via
-            PEP 678 ``__notes__`` and a structured
-            ``__wool_context_warnings__`` attribute, symmetric
-            with the coroutine path's contract
+            with the strict-mode `wool.ChainSerializationError`
+            chained as ``__cause__`` via ``raise routine_exc from
+            encode_err``, symmetric with the coroutine path's
+            contract.
         """
         import warnings as _warnings
 
@@ -1203,14 +1171,7 @@ class TestWorkerService:
             var.set(_Unpicklable())
             raise ValueError("routine failure")
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=streamer,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(streamer)
         first_request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
 
@@ -1232,7 +1193,7 @@ class TestWorkerService:
                 return [r async for r in stream]
 
         with _warnings.catch_warnings():
-            _warnings.simplefilter("error", category=wool.ContextDecodeWarning)
+            _warnings.simplefilter("error", category=wool.SerializationWarning)
             responses = await asyncio.wait_for(drive(), timeout=5.0)
 
         # Assert
@@ -1247,112 +1208,21 @@ class TestWorkerService:
         )
         assert "routine failure" in str(raised)
 
-        # PEP 678 notes carry the warning for traceback diagnostic.
-        assert hasattr(raised, "__notes__")
-        notes_text = "\n".join(raised.__notes__)
-        assert "synthetic unpicklable" in notes_text, (
-            f"snapshot failure must appear in __notes__; observed: {raised.__notes__}"
+        # The strict-mode encode failure rides on ``__cause__`` via
+        # ``raise from`` chaining — typed
+        # ``wool.ChainSerializationError`` aggregating the warning.
+        cause = raised.__cause__
+        assert isinstance(cause, wool.ChainSerializationError), (
+            f"encode failure must appear on ``__cause__``; observed: "
+            f"{type(cause).__name__}"
         )
-
-        # __wool_context_warnings__ provides structured access.
-        warnings = raised.__wool_context_warnings__
-        snapshot_warnings = [
-            w
-            for w in warnings
-            if isinstance(w, wool.ContextDecodeWarning)
-            and "synthetic unpicklable" in str(w)
-        ]
-        assert len(snapshot_warnings) == 1, (
-            "snapshot ContextDecodeWarning must appear in __wool_context_warnings__"
-        )
+        assert any("synthetic unpicklable" in str(w) for w in cause.warnings)
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_when_update_raises(
+    async def test_dispatch_should_ship_exception_when_streaming_pre_loop_setup_fails(
         self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test :class:`WorkerService` dispatch surfaces unhandled
-        iteration-body errors as a terminal error rather than hanging
-        the streaming dispatch.
-
-        Given:
-            An async-generator dispatch where the second ``next``
-            frame carries a state-bearing context, but
-            ``Context.update`` is patched to raise on invocation —
-            the unprotected merge that would otherwise strand the
-            worker task
-        When:
-            The caller sends the second request and consumes the
-            stream
-        Then:
-            The dispatch must terminate within the asyncio timeout
-            window with the synthetic error surfaced as an exception
-            Response — the iteration-body catch-all guarantees
-            that any exception escaping the precise handlers is
-            still pushed to the result queue
-        """
-        # Arrange
-        from wool.runtime.context import Context
-
-        async def streamer():
-            for i in range(5):
-                yield f"value_{i}"
-
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=streamer,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
-        first_request = protocol.Request(task=wool_task.to_protobuf())
-        good_next = protocol.Request(
-            next=protocol.Void(),
-            context=protocol.Context(id=uuid4().hex),
-        )
-        # State-bearing context (carries_state True) so the worker
-        # invokes update on receive.
-        bad_ctx = protocol.Context(id=uuid4().hex)
-        bad_ctx.vars.add(namespace="", name="", consumed_tokens=[uuid4().hex])
-        bad_next = protocol.Request(next=protocol.Void(), context=bad_ctx)
-
-        mocker.patch.object(
-            Context,
-            "update",
-            side_effect=RuntimeError("synthetic update failure"),
-        )
-
-        # Act
-        async def drive():
-            async with grpc_aio_stub() as stub:
-                stream = stub.dispatch()
-                await stream.write(first_request)
-                ack = await anext(aiter(stream))
-                assert ack.HasField("ack")
-
-                await stream.write(good_next)
-                first = await anext(aiter(stream))
-                assert first.HasField("result")
-                assert cloudpickle.loads(first.result.dump) == "value_0"
-
-                await stream.write(bad_next)
-                await stream.done_writing()
-                return [r async for r in stream]
-
-        responses = await asyncio.wait_for(drive(), timeout=5.0)
-
-        # Assert
-        assert any(r.HasField("exception") for r in responses)
-        exc_response = next(r for r in responses if r.HasField("exception"))
-        raised = cloudpickle.loads(exc_response.exception.dump)
-        assert isinstance(raised, RuntimeError)
-        assert "synthetic update failure" in str(raised)
-
-    @pytest.mark.asyncio
-    async def test_dispatch_streaming_surfaces_pre_loop_setup_failure(
-        self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
-    ):
-        """Test :class:`WorkerService` streaming dispatch surfaces a
+        """Test `WorkerService` streaming dispatch surfaces a
         worker-task setup failure as a terminal exception frame
         rather than hanging the caller.
 
@@ -1372,23 +1242,16 @@ class TestWorkerService:
             silently swallowing it.
         """
         # Arrange
-        from wool.runtime.context import RuntimeContext
+        from wool.runtime.context.runtime import RuntimeContext
 
         async def streamer():
             yield "unreachable"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=streamer,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(streamer)
         first_request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(
             next=protocol.Void(),
-            context=protocol.Context(id=uuid4().hex),
+            context=protocol.ChainManifest(id=uuid4().hex),
         )
 
         mocker.patch.object(
@@ -1422,10 +1285,10 @@ class TestWorkerService:
         assert "synthetic pre-loop failure" in str(raised)
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_with_teardown_failure_after_completion(
+    async def test_dispatch_should_not_append_exception_when_streaming_teardown_fails_after_completion(  # noqa: E501
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` streaming dispatch when the
+        """Test `WorkerService` streaming dispatch when the
         async generator's teardown raises after the primary signal
         has already reached the caller.
 
@@ -1451,18 +1314,11 @@ class TestWorkerService:
             finally:
                 raise RuntimeError("synthetic teardown failure")
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=streamer,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(streamer)
         first_request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(
             next=protocol.Void(),
-            context=protocol.Context(id=uuid4().hex),
+            context=protocol.ChainManifest(id=uuid4().hex),
         )
 
         # Act
@@ -1490,13 +1346,13 @@ class TestWorkerService:
         )
 
     @pytest.mark.asyncio
-    async def test_dispatch_while_stopping(
+    async def test_dispatch_should_abort_unavailable_when_stopping(
         self, service_fixture, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test :class:`WorkerService` dispatch aborts when stopping.
+        """Test `WorkerService` dispatch aborts when stopping.
 
         Given:
-            A :class:`WorkerService` with an active task, transitioning to stopping state
+            A `WorkerService` with an active task, transitioning to stopping state
         When:
             stop is called and another dispatch RPC is attempted
         Then:
@@ -1515,15 +1371,7 @@ class TestWorkerService:
             async def another_task():
                 return "should_not_execute"
 
-            mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id-2")
-
-            wool_task = Task(
-                id=uuid4(),
-                callable=another_task,
-                args=(),
-                kwargs={},
-                proxy=mock_proxy,
-            )
+            wool_task = make_task(another_task, proxy_id="test-proxy-id-2")
 
             request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -1542,27 +1390,27 @@ class TestWorkerService:
             await stop_task
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_stop_arriving_between_entry_gate_and_tracking(
+    async def test_dispatch_should_abort_unavailable_when_stop_races_entry_gate_and_tracking(  # noqa: E501
         self,
         grpc_aio_stub,
         grpc_servicer,
         mock_worker_proxy_cache,
         mocker: MockerFixture,
     ):
-        """Test :class:`WorkerService.dispatch` aborts ``UNAVAILABLE`` when
+        """Test `WorkerService.dispatch` aborts ``UNAVAILABLE`` when
         the ``_stopping`` event is set after the entry-gate check but before
         the session is registered in the docket.
 
         Regression test for the ``_tracked`` check-to-register race window.
         ``WorkerService.dispatch`` checks ``_stopping`` on entry and again
         on docket registration; without the second check, a concurrent
-        :meth:`_stop` between the gate and registration would admit a
-        session that :meth:`_preempt` never sees, leaving it to be torn
+        `_stop` between the gate and registration would admit a
+        session that `_preempt` never sees, leaving it to be torn
         down indirectly by loop-pool teardown rather than the explicit
         cancel path.
 
         Given:
-            A :class:`WorkerService` whose ``_stopping.is_set`` returns
+            A `WorkerService` whose ``_stopping.is_set`` returns
             ``False`` on the entry-gate check and ``True`` on the
             ``_tracked`` check, simulating a stop arrival in the race
             window
@@ -1587,14 +1435,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_execute"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         # Act & assert
@@ -1612,11 +1453,13 @@ class TestWorkerService:
         assert exc_info.value.code() == StatusCode.UNAVAILABLE
 
     @pytest.mark.asyncio
-    async def test_dispatch_while_stopped(self, service_fixture, mocker: MockerFixture):
-        """Test :class:`WorkerService` dispatch aborts when stopped.
+    async def test_dispatch_should_abort_unavailable_when_stopped(
+        self, service_fixture, mocker: MockerFixture
+    ):
+        """Test `WorkerService` dispatch aborts when stopped.
 
         Given:
-            A :class:`WorkerService` that has been stopped
+            A `WorkerService` that has been stopped
         When:
             dispatch RPC is called with a task request
         Then:
@@ -1636,15 +1479,7 @@ class TestWorkerService:
             async def another_task():
                 return "should_not_execute"
 
-            mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id-2")
-
-            wool_task = Task(
-                id=uuid4(),
-                callable=another_task,
-                args=(),
-                kwargs={},
-                proxy=mock_proxy,
-            )
+            wool_task = make_task(another_task, proxy_id="test-proxy-id-2")
 
             request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -1659,10 +1494,10 @@ class TestWorkerService:
             assert exc_info.value.code() == StatusCode.UNAVAILABLE
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_sync_callable(
+    async def test_dispatch_should_nack_with_value_error_when_callable_synchronous(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` dispatch when the task's
+        """Test `WorkerService` dispatch when the task's
         callable is a plain synchronous function (not a coroutine
         function or async-generator function).
 
@@ -1672,9 +1507,9 @@ class TestWorkerService:
         When:
             The dispatch RPC is invoked with that request
         Then:
-            It should reply with exactly one :class:`Nack` response
+            It should reply with exactly one `Nack` response
             (no preceding Ack) whose ``exception`` field decodes to
-            a :class:`ValueError` describing the routine-type
+            a `ValueError` describing the routine-type
             violation.
         """
 
@@ -1682,15 +1517,7 @@ class TestWorkerService:
         def sync_function():
             return "sync_result"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=sync_function,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sync_function)
 
         request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -1711,52 +1538,45 @@ class TestWorkerService:
         assert "coroutine function or async generator function" in str(raised)
 
     @pytest.mark.asyncio
-    async def test_stop_and_cancel(
+    async def test_stop_should_cancel_active_coroutine_routine(
         self,
         grpc_aio_stub,
         grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
     ):
-        """Test :class:`WorkerService` stop pre-empts an active
+        """Test `WorkerService` stop pre-empts an active
         coroutine routine.
 
         Verifies the operator-preempt contract on the routine side
-        via a side-channel :class:`threading.Event`. In production,
+        via a side-channel `threading.Event`. In production,
         the worker subprocess exits after stop and the gRPC
         connection drops — callers do not observe a terminal
         ``CancelledError`` wire frame, they observe an
-        :class:`RpcError` (transport-closed). Asserting on a wire
+        `RpcError` (transport-closed). Asserting on a wire
         frame after stop tests an in-process-only artifact (the
         gRPC server stays alive in the fixture); asserting on the
         routine's own observation of cancellation is the
         production-realistic check.
 
         Given:
-            A running :class:`WorkerService` with an active
+            A running `WorkerService` with an active
             coroutine awaiting a long sleep
         When:
             stop RPC is called with a timeout of 0
         Then:
-            The routine should observe :class:`asyncio.CancelledError`
+            The routine should observe `asyncio.CancelledError`
             within the test's budget — operator-preempt cancels the
             worker driver task on its loop, propagating cancellation
-            into the routine's :func:`asyncio.sleep`. The service
+            into the routine's `asyncio.sleep`. The service
             should signal stopped state and call
-            :meth:`proxy_pool.clear`.
+            `proxy_pool.clear`.
         """
         global _stop_cancellation_observed, _stop_routine_started
         _stop_cancellation_observed = threading.Event()
         _stop_routine_started = threading.Event()
         try:
-            mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-            wool_task = Task(
-                id=uuid4(),
-                callable=_stop_long_coroutine,
-                args=(),
-                kwargs={},
-                proxy=mock_proxy,
-            )
+            wool_task = make_task(_stop_long_coroutine)
             request = protocol.Request(task=wool_task.to_protobuf())
 
             # Act
@@ -1765,6 +1585,13 @@ class TestWorkerService:
                 await stream.write(request)
                 ack = await anext(aiter(stream))
                 assert ack.HasField("ack")
+                # Under the per-frame architecture, the coroutine
+                # branch reads its prime ``Next`` from the request
+                # iterator. Writing the Next here is what triggers
+                # the routine — without it the worker driver hangs
+                # waiting for the prime frame and the routine never
+                # starts.
+                await stream.write(protocol.Request(next=protocol.Void()))
 
                 # Wait for the routine to actually start before
                 # sending stop. Without this barrier the test races
@@ -1772,7 +1599,7 @@ class TestWorkerService:
                 # slower Python versions/CI runners, stop can land
                 # before ``_worker_task`` is created, so
                 # ``session.cancel()`` has nothing to cancel and
-                # the routine never observes :class:`CancelledError`.
+                # the routine never observes `CancelledError`.
                 loop = asyncio.get_running_loop()
                 started = await loop.run_in_executor(
                     None, _stop_routine_started.wait, 10.0
@@ -1808,32 +1635,32 @@ class TestWorkerService:
             _stop_routine_started = None
 
     @pytest.mark.asyncio
-    async def test_stop_and_cancel_streaming_routine(
+    async def test_stop_should_cancel_active_streaming_routine(
         self,
         grpc_aio_stub,
         grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
     ):
-        """Test :class:`WorkerService` stop pre-empts an active
+        """Test `WorkerService` stop pre-empts an active
         async-generator routine mid-stream.
 
         Verifies the operator-preempt contract on the routine side
-        via a side-channel :class:`threading.Event`. See the
+        via a side-channel `threading.Event`. See the
         coroutine variant's docstring for why we assert on the
         routine's observation of cancellation rather than on a
         terminal wire frame.
 
         Given:
-            A running :class:`WorkerService` with an active
+            A running `WorkerService` with an active
             async-generator task suspended between yields
         When:
             stop RPC is called with a timeout of 0
         Then:
-            The routine should observe :class:`asyncio.CancelledError`
+            The routine should observe `asyncio.CancelledError`
             within the test's budget — operator-preempt cancels the
             worker driver task on its loop, propagating cancellation
-            into the routine's :func:`asyncio.sleep` between yields.
+            into the routine's `asyncio.sleep` between yields.
         """
         global _stop_cancellation_observed, _stop_routine_started
         _stop_cancellation_observed = threading.Event()
@@ -1845,14 +1672,7 @@ class TestWorkerService:
         # routine body.
         _stop_routine_started = threading.Event()
         try:
-            mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-            wool_task = Task(
-                id=uuid4(),
-                callable=_stop_streaming_routine,
-                args=(),
-                kwargs={},
-                proxy=mock_proxy,
-            )
+            wool_task = make_task(_stop_streaming_routine)
             request = protocol.Request(task=wool_task.to_protobuf())
 
             # Act
@@ -1889,17 +1709,17 @@ class TestWorkerService:
             _stop_routine_started = None
 
     @pytest.mark.asyncio
-    async def test_stop_and_wait(
+    async def test_stop_should_await_tasks_and_signal_stopped_when_positive_timeout(
         self,
         grpc_aio_stub,
         grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
     ):
-        """Test :class:`WorkerService` stop method gracefully shuts down.
+        """Test `WorkerService` stop method gracefully shuts down.
 
         Given:
-            A running :class:`WorkerService` with active tasks
+            A running `WorkerService` with active tasks
         When:
             stop RPC is called with a positive timeout ("wait")
         Then:
@@ -1911,15 +1731,7 @@ class TestWorkerService:
         async def quick_task():
             return "completed"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=quick_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(quick_task)
 
         request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -1950,16 +1762,16 @@ class TestWorkerService:
             mock_worker_proxy_cache.clear.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_dispatch_task_that_self_cancels(
+    async def test_dispatch_should_return_cancelled_error_when_task_self_cancels(
         self,
         grpc_aio_stub,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
     ):
-        """Test :class:`WorkerService` dispatch handles task that cancels itself.
+        """Test `WorkerService` dispatch handles task that cancels itself.
 
         Given:
-            A gRPC :class:`WorkerService` that is not stopping or stopped
+            A gRPC `WorkerService` that is not stopping or stopped
         When:
             Dispatch RPC is called with a task that cancels itself on the worker loop
         Then:
@@ -1972,15 +1784,7 @@ class TestWorkerService:
             await asyncio.sleep(0)
             return "should_not_return"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=self_cancelling_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(self_cancelling_task)
 
         request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -1999,24 +1803,24 @@ class TestWorkerService:
         assert isinstance(exception, asyncio.CancelledError)
 
     @pytest.mark.asyncio
-    async def test_dispatch_client_cancellation_propagates_to_routine(
+    async def test_dispatch_should_cancel_routine_when_client_cancels_mid_stream(
         self,
         grpc_aio_stub,
         mock_worker_proxy_cache,
     ):
-        """Test :meth:`WorkerService.dispatch` cancels the worker
+        """Test `WorkerService.dispatch` cancels the worker
         routine when the client cancels mid-stream.
 
-        Regression test for A1. Pre-fix,
-        :meth:`DispatchSession.cancel` only set ``_cancelled = True``
+        Regression test. Pre-fix,
+        `DispatchSession.cancel` only set ``_cancelled = True``
         and pushed ``_EOS`` on the response queue; the worker
         driver task itself was never cancelled. A routine
-        mid-``_step`` (e.g. ``await asyncio.sleep(...)``) ran to
+        mid-``_step`` (e.g., ``await asyncio.sleep(...)``) ran to
         natural completion regardless of whether the caller had
-        gone away. Post-fix, :meth:`cancel` schedules
+        gone away. Post-fix, `cancel` schedules
         ``self._worker_task.cancel`` on the worker loop, so a
         compute-bound or sleeping routine receives a
-        :class:`asyncio.CancelledError` and unwinds rather than
+        `asyncio.CancelledError` and unwinds rather than
         holding the worker until shutdown.
 
         Given:
@@ -2024,29 +1828,22 @@ class TestWorkerService:
             seconds — long enough that the test will have given
             up and asserted before it could complete naturally.
             The routine signals observation of
-            :class:`asyncio.CancelledError` via a cross-loop
+            `asyncio.CancelledError` via a cross-loop
             ``threading.Event``.
         When:
             The gRPC client cancels the dispatch stream while the
             routine is mid-``await asyncio.sleep``.
         Then:
-            The routine observes :class:`asyncio.CancelledError`
+            The routine observes `asyncio.CancelledError`
             within a short timeout — pre-fix this assertion timed
-            out because :meth:`cancel` left the worker driver
+            out because `cancel` left the worker driver
             task running.
         """
-        global _a1_cancellation_observed, _a1_routine_started
-        _a1_cancellation_observed = threading.Event()
-        _a1_routine_started = threading.Event()
+        global _midstream_cancellation_observed, _midstream_routine_started
+        _midstream_cancellation_observed = threading.Event()
+        _midstream_routine_started = threading.Event()
         try:
-            mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-            wool_task = Task(
-                id=uuid4(),
-                callable=_a1_long_routine,
-                args=(),
-                kwargs={},
-                proxy=mock_proxy,
-            )
+            wool_task = make_task(_midstream_long_routine)
             request = protocol.Request(task=wool_task.to_protobuf())
 
             # Act
@@ -2055,6 +1852,12 @@ class TestWorkerService:
                 await stream.write(request)
                 ack = await anext(aiter(stream))
                 assert ack.HasField("ack")
+                # Under the per-frame architecture, the coroutine
+                # branch reads its prime ``Next`` from the request
+                # iterator. Writing the Next here is what triggers
+                # the routine — without it the worker driver hangs
+                # waiting for the prime frame.
+                await stream.write(protocol.Request(next=protocol.Void()))
 
                 # Barrier: wait until the worker routine is actually
                 # running before cancelling. The ``ack`` only
@@ -2062,7 +1865,7 @@ class TestWorkerService:
                 # ``yield ack``; the worker task is scheduled lazily
                 # on the handler's first ``async for`` iteration.
                 # Cancelling before the routine starts races
-                # :meth:`DispatchSession._schedule_worker`, which
+                # `DispatchSession._schedule_worker`, which
                 # short-circuits on ``_cancelled`` and never
                 # dispatches the routine — leaving nothing for the
                 # cancellation to interrupt and failing this test
@@ -2070,7 +1873,7 @@ class TestWorkerService:
                 # ``_stop_routine_started``.
                 loop = asyncio.get_running_loop()
                 started = await loop.run_in_executor(
-                    None, _a1_routine_started.wait, 10.0
+                    None, _midstream_routine_started.wait, 10.0
                 )
                 assert started, (
                     "Worker routine did not start within 10s — "
@@ -2105,7 +1908,7 @@ class TestWorkerService:
                 # if the chain is actually broken (regression would
                 # see the routine sleep the full 30s).
                 observed = await loop.run_in_executor(
-                    None, _a1_cancellation_observed.wait, 10.0
+                    None, _midstream_cancellation_observed.wait, 10.0
                 )
 
             # Assert
@@ -2118,17 +1921,17 @@ class TestWorkerService:
                 "cancelled."
             )
         finally:
-            _a1_cancellation_observed = None
-            _a1_routine_started = None
+            _midstream_cancellation_observed = None
+            _midstream_routine_started = None
 
     @pytest.mark.asyncio
-    async def test_stop_timeout_then_cancel(
+    async def test_stop_should_cancel_tasks_when_timeout_expires(
         self, service_fixture, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` stop cancels tasks after timeout expires.
+        """Test `WorkerService` stop cancels tasks after timeout expires.
 
         Given:
-            A :class:`WorkerService` with an active task that outlasts the stop timeout
+            A `WorkerService` with an active task that outlasts the stop timeout
         When:
             stop RPC is called with a small positive timeout
         Then:
@@ -2148,13 +1951,13 @@ class TestWorkerService:
             assert service.stopped.is_set()
 
     @pytest.mark.asyncio
-    async def test_stop_while_idle(
+    async def test_stop_should_signal_stopped_when_idle(
         self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` stop method gracefully shuts down.
+        """Test `WorkerService` stop method gracefully shuts down.
 
         Given:
-            A running :class:`WorkerService` with no active tasks
+            A running `WorkerService` with no active tasks
         When:
             stop RPC is called
         Then:
@@ -2175,11 +1978,13 @@ class TestWorkerService:
         mock_worker_proxy_cache.clear.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_stop_while_stopping(self, service_fixture, mock_worker_proxy_cache):
-        """Test :class:`WorkerService` stop is idempotent.
+    async def test_stop_should_return_immediately_when_already_stopping(
+        self, service_fixture, mock_worker_proxy_cache
+    ):
+        """Test `WorkerService` stop is idempotent.
 
         Given:
-            A :class:`WorkerService` that is already stopping
+            A `WorkerService` that is already stopping
         When:
             stop RPC is called again
         Then:
@@ -2209,11 +2014,13 @@ class TestWorkerService:
             assert service.stopped.is_set()
 
     @pytest.mark.asyncio
-    async def test_stop_while_stopped(self, service_fixture, mock_worker_proxy_cache):
-        """Test :class:`WorkerService` stop when already stopped.
+    async def test_stop_should_return_immediately_when_already_stopped(
+        self, service_fixture, mock_worker_proxy_cache
+    ):
+        """Test `WorkerService` stop when already stopped.
 
         Given:
-            A :class:`WorkerService` that is already stopped
+            A `WorkerService` that is already stopped
         When:
             stop RPC is called again
         Then:
@@ -2238,13 +2045,13 @@ class TestWorkerService:
             assert service.stopped.is_set()
 
     @pytest.mark.asyncio
-    async def test_stop_negative_timeout_waits_indefinitely(
+    async def test_stop_should_wait_indefinitely_when_timeout_negative(
         self, service_fixture, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` stop with negative timeout waits indefinitely.
+        """Test `WorkerService` stop with negative timeout waits indefinitely.
 
         Given:
-            A :class:`WorkerService` with an active task
+            A `WorkerService` with an active task
         When:
             stop RPC is called with a negative timeout
         Then:
@@ -2271,10 +2078,10 @@ class TestWorkerService:
             assert service.stopped.is_set()
 
     @pytest.mark.asyncio
-    async def test_stop_with_orphaned_cleanup_chain(
+    async def test_stop_should_drain_every_generation_of_orphaned_cleanup_chain(
         self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` stop drains every generation of
+        """Test `WorkerService` stop drains every generation of
         orphaned worker-loop tasks.
 
         Given:
@@ -2292,14 +2099,7 @@ class TestWorkerService:
         # Arrange
         _drain_cleanup_observed = threading.Event()
         try:
-            mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-            wool_task = Task(
-                id=uuid4(),
-                callable=_drain_probe_routine,
-                args=(),
-                kwargs={},
-                proxy=mock_proxy,
-            )
+            wool_task = make_task(_drain_probe_routine)
             request = protocol.Request(task=wool_task.to_protobuf())
 
             # Act
@@ -2318,7 +2118,7 @@ class TestWorkerService:
             _drain_cleanup_observed = None
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_task(
+    async def test_dispatch_should_yield_results_in_order_when_async_generator(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() with async generator yields multiple results.
@@ -2332,19 +2132,11 @@ class TestWorkerService:
         """
 
         # Arrange
-        async def test_generator():
+        async def gen():
             for i in range(3):
                 yield f"gen_value_{i}"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=test_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(gen)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -2376,16 +2168,16 @@ class TestWorkerService:
         assert len(remaining) == 0
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_with_dispatch_timeout(
+    async def test_dispatch_should_restore_dispatch_timeout_per_iteration_when_streaming(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService` streaming dispatch restores the
+        """Test `WorkerService` streaming dispatch restores the
         caller's ``dispatch_timeout`` for every iteration of an
         async-generator routine.
 
         Given:
-            An async-generator :class:`Task` whose
-            :class:`RuntimeContext` carries a non-default
+            An async-generator `Task` whose
+            `RuntimeContext` carries a non-default
             ``dispatch_timeout`` and whose routine reads
             ``wool.runtime.context.dispatch_timeout.get()`` on each
             iteration
@@ -2395,7 +2187,7 @@ class TestWorkerService:
         Then:
             Every yielded value equals the caller-supplied
             ``dispatch_timeout`` — confirming that the unified
-            :class:`DispatchSession` driver enters
+            `DispatchSession` driver enters
             ``work_task.runtime_context`` once for the lifetime of
             the generator. Regression guard for #176, where the
             pre-#187 ``_stream_from_worker`` code path dropped the
@@ -2403,10 +2195,10 @@ class TestWorkerService:
             ``dispatch_timeout`` at its default on subsequent frames.
         """
         # Arrange
-        from wool.runtime.context import RuntimeContext
+        from wool.runtime.context.runtime import RuntimeContext
 
         async def capture_timeout():
-            from wool.runtime.context import dispatch_timeout
+            from wool.runtime.context.runtime import dispatch_timeout
 
             yield dispatch_timeout.get()
             yield dispatch_timeout.get()
@@ -2450,7 +2242,7 @@ class TestWorkerService:
         assert captured == [2.5, 2.5, 2.5]
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_raises_during_iteration(
+    async def test_dispatch_should_yield_exception_when_async_generator_raises(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() with async generator that raises yields exception.
@@ -2469,15 +2261,7 @@ class TestWorkerService:
             yield "first_value"
             raise ValueError("Generator error")
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=failing_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(failing_generator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -2501,13 +2285,78 @@ class TestWorkerService:
             await stream.write(next_request)
             response = await anext(aiter(stream))
             assert response.HasField("exception")
-            assert response.HasField("context")
+            # Lazy-wire-frame: the unarmed worker omits the context
+            # field — the routine never touched a wool.ContextVar.
+            assert not response.HasField("context")
             exception = cloudpickle.loads(response.exception.dump)
             assert isinstance(exception, ValueError)
             assert str(exception) == "Generator error"
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_completes_normally(
+    async def test_dispatch_should_ship_exception_frame_when_mid_stream_decode_fails(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test a mid-stream wire decode failure ships an exception terminal.
+
+        Given:
+            A streaming dispatch whose first NextRequest succeeds and
+            yields a value, followed by a structurally-malformed wire
+            request (a `protocol.Request` with no payload oneof
+            set — `Frame.from_protobuf` rejects it with
+            ``ValueError``).
+        When:
+            The caller sends the malformed request and consumes the
+            stream.
+        Then:
+            The worker's per-frame decode catches the failure and
+            queues an `ExceptionResponseFrame` carrying the
+            decode error, then breaks out of the driver loop — the
+            dispatch is no longer serviceable after the framing
+            broke, so the typed terminal frame is the contract
+            instead of an opaque task death.
+        """
+
+        # Arrange
+        async def gen():
+            for i in range(2):
+                yield i
+
+        wool_task = make_task(gen)
+
+        task_request = protocol.Request(task=wool_task.to_protobuf())
+        next_request = protocol.Request(next=protocol.Void())
+        # Malformed: no payload oneof set at all. Frame.from_protobuf
+        # raises ValueError("wire envelope has no payload set").
+        malformed_request = protocol.Request()
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(task_request)
+            ack = await anext(aiter(stream))
+            assert ack.HasField("ack")
+
+            await stream.write(next_request)
+            first = await anext(aiter(stream))
+            assert first.HasField("result")
+            assert cloudpickle.loads(first.result.dump) == 0
+
+            await stream.write(malformed_request)
+            await stream.done_writing()
+            remaining = [r async for r in stream]
+
+        # Assert — the terminal frame is an ExceptionResponseFrame
+        # carrying the decode-time failure; no further frames after.
+        terminals = [r for r in remaining if r.HasField("exception")]
+        assert len(terminals) == 1
+        shipped = cloudpickle.loads(terminals[0].exception.dump)
+        # The decode error class is ValueError (the bare-Frame raise);
+        # the caller observes the exception type rather than an
+        # opaque RpcError.
+        assert isinstance(shipped, ValueError)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_end_stream_cleanly_when_async_generator_completes(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() with async generator completes cleanly.
@@ -2521,19 +2370,11 @@ class TestWorkerService:
         """
 
         # Arrange
-        async def test_generator():
+        async def gen():
             for i in range(2):
                 yield i
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=test_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(gen)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -2566,7 +2407,7 @@ class TestWorkerService:
             assert len(remaining) == 0
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_empty(
+    async def test_dispatch_should_end_stream_without_results_when_async_generator_empty(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() with empty async generator.
@@ -2584,15 +2425,7 @@ class TestWorkerService:
             return
             yield  # unreachable, but makes it a generator
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=empty_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(empty_generator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -2615,7 +2448,7 @@ class TestWorkerService:
         assert len(remaining) == 0
 
     @pytest.mark.asyncio
-    async def test_dispatch_coroutine_for_comparison(
+    async def test_dispatch_should_yield_single_result_when_coroutine(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() with coroutine task for comparison with async generator.
@@ -2629,18 +2462,10 @@ class TestWorkerService:
         """
 
         # Arrange
-        async def test_coroutine():
+        async def coro():
             return "coroutine_result"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=test_coroutine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(coro)
 
         request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -2659,17 +2484,17 @@ class TestWorkerService:
         assert result == "coroutine_result"
 
     @pytest.mark.asyncio
-    async def test_stop_cancels_async_generator_task(
+    async def test_stop_should_cancel_active_async_generator_task(
         self,
         grpc_aio_stub,
         grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
     ):
-        """Test :class:`WorkerService` stop cancels an active async generator task.
+        """Test `WorkerService` stop cancels an active async generator task.
 
         Given:
-            A running :class:`WorkerService` with an active async generator task
+            A running `WorkerService` with an active async generator task
         When:
             stop RPC is called with a timeout of 0
         Then:
@@ -2682,15 +2507,7 @@ class TestWorkerService:
             await asyncio.sleep(100)
             yield "should_not_reach"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=blocking_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(blocking_generator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -2723,7 +2540,7 @@ class TestWorkerService:
             assert grpc_servicer.stopped.is_set()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_version_in_ack(
+    async def test_dispatch_should_return_protocol_version_in_ack(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch returns Ack with protocol version.
@@ -2740,15 +2557,7 @@ class TestWorkerService:
         async def sample_task():
             return "test_result"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
 
         request = protocol.Request(task=wool_task.to_protobuf())
 
@@ -2765,7 +2574,7 @@ class TestWorkerService:
         assert ack_response.ack.version == protocol.__version__
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_empty_client_version(
+    async def test_dispatch_should_abort_failed_precondition_when_client_version_empty(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch rejects tasks with empty version field.
@@ -2783,15 +2592,7 @@ class TestWorkerService:
         async def sample_task():
             return "test_result"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         request.task.ClearField("version")
@@ -2817,7 +2618,7 @@ class TestWorkerService:
         client_major=st.integers(min_value=0, max_value=100),
     )
     @pytest.mark.asyncio
-    async def test_dispatch_with_incompatible_major_version(
+    async def test_dispatch_should_abort_when_major_version_incompatible(
         self,
         grpc_aio_stub,
         mocker: MockerFixture,
@@ -2845,15 +2646,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_execute"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         # Override version field to simulate incompatible client
@@ -2881,7 +2674,7 @@ class TestWorkerService:
         client_minor=st.integers(min_value=1, max_value=100),
     )
     @pytest.mark.asyncio
-    async def test_dispatch_with_newer_client_same_major(
+    async def test_dispatch_should_abort_when_client_newer_same_major(
         self,
         grpc_aio_stub,
         mocker: MockerFixture,
@@ -2890,7 +2683,7 @@ class TestWorkerService:
         local_minor,
         client_minor,
     ):
-        """Test dispatch aborts with FAILED_PRECONDITION when client is newer than worker.
+        """Test dispatch aborts with FAILED_PRECONDITION on newer client.
 
         Given:
             A worker with version X.a.0 and a client with version
@@ -2909,15 +2702,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_execute"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         request.task.version = f"{major}.{client_minor}.0"
@@ -2934,7 +2719,7 @@ class TestWorkerService:
         assert "Incompatible version" in (excinfo.value.details() or "")
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_unparseable_client_version(
+    async def test_dispatch_should_abort_when_client_version_unparseable(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch rejects tasks with unparseable version.
@@ -2952,15 +2737,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_execute"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         request.task.version = "not-a-version"
@@ -2977,7 +2754,7 @@ class TestWorkerService:
         assert "Unparseable version" in (excinfo.value.details() or "")
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_with_send(
+    async def test_dispatch_should_forward_send_values_via_asend_when_async_generator(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() forwards send requests into async generator via asend().
@@ -2998,15 +2775,7 @@ class TestWorkerService:
             while value is not None:
                 value = yield f"echo:{value}"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=echo_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(echo_generator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -3054,7 +2823,7 @@ class TestWorkerService:
             assert len(remaining) == 0
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_send_then_close(
+    async def test_dispatch_should_stop_advancing_when_client_closes_after_sends(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() handles client closing stream after sends.
@@ -3078,15 +2847,7 @@ class TestWorkerService:
                 else:
                     count += 1
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=counting_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(counting_generator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -3121,7 +2882,7 @@ class TestWorkerService:
             assert len(remaining) == 0
 
     @pytest.mark.asyncio
-    async def test_dispatch_pull_only_async_generator(
+    async def test_dispatch_should_yield_values_in_order_when_pull_only_generator(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() with a pull-only async generator (no send type).
@@ -3140,15 +2901,7 @@ class TestWorkerService:
             yield "beta"
             yield "gamma"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=pull_only,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(pull_only)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -3180,7 +2933,7 @@ class TestWorkerService:
         assert len(remaining) == 0
 
     @pytest.mark.asyncio
-    async def test_dispatch_pull_only_async_generator_partial_consumption(
+    async def test_dispatch_should_yield_only_consumed_values_when_pull_only_generator_partial(  # noqa: E501
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() with partial consumption of a pull-only async generator.
@@ -3199,15 +2952,7 @@ class TestWorkerService:
             for i in range(5):
                 yield i
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=five_values,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(five_values)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -3238,7 +2983,7 @@ class TestWorkerService:
         assert len(remaining) == 0
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_interleaved_next_and_send(
+    async def test_dispatch_should_advance_correctly_when_next_and_send_interleaved(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() with interleaved next and send requests.
@@ -3262,15 +3007,7 @@ class TestWorkerService:
                 else:
                     total += 1
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=accumulator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(accumulator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -3309,7 +3046,7 @@ class TestWorkerService:
             await stream.done_writing()
 
     @pytest.mark.asyncio
-    async def test_dispatch_async_generator_throw_terminates(
+    async def test_dispatch_should_yield_exception_when_throw_terminates_generator(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() with a throw request that terminates the generator.
@@ -3328,15 +3065,7 @@ class TestWorkerService:
             yield "first"
             yield "second"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=simple_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(simple_generator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -3368,7 +3097,7 @@ class TestWorkerService:
             assert str(exception) == "injected"
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_with_proxy_and_dispatch_context(
+    async def test_dispatch_should_set_proxy_and_disable_dispatch_when_streaming(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() sets proxy and do_dispatch(False) for streaming.
@@ -3394,15 +3123,7 @@ class TestWorkerService:
                 "has_proxy": wool.__proxy__.get() is not None,
             }
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=capturing_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(capturing_generator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -3429,20 +3150,22 @@ class TestWorkerService:
         assert result["has_proxy"] is True
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_without_proxy_pool(self, grpc_aio_stub):
-        """Test :class:`WorkerService` streaming dispatch when
-        :data:`wool.__proxy_pool__` is not configured on the worker.
+    async def test_dispatch_should_ship_runtime_error_when_proxy_pool_unset(
+        self, grpc_aio_stub
+    ):
+        """Test `WorkerService` streaming dispatch when
+        `wool.__proxy_pool__` is not configured on the worker.
 
         Given:
-            A worker process where :data:`wool.__proxy_pool__` is
+            A worker process where `wool.__proxy_pool__` is
             unset — the worker cannot lease a proxy and therefore
-            cannot bind :data:`wool.__proxy__` for the routine
+            cannot bind `wool.__proxy__` for the routine
         When:
             The dispatch RPC is invoked
         Then:
             It should reply with a terminal exception Response
-            carrying the :class:`RuntimeError` raised by
-            :func:`routine_scope`'s precondition check —
+            carrying the `RuntimeError` raised by
+            `routine_scope`'s precondition check —
             proxy-less execution is broken by construction (no
             nested-dispatch capability) and the handler surfaces
             the precondition violation rather than silently
@@ -3454,14 +3177,7 @@ class TestWorkerService:
         async def capturing_generator():
             yield {"has_proxy": wool.__proxy__.get() is not None}
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=capturing_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(capturing_generator)
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
 
@@ -3485,7 +3201,7 @@ class TestWorkerService:
         assert "wool.__proxy_pool__ is not initialized" in str(raised)
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_proxy_cleanup_on_error(
+    async def test_dispatch_should_clean_up_proxy_context_when_generator_errors(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() cleans up proxy context on generator error.
@@ -3505,15 +3221,7 @@ class TestWorkerService:
             yield "before_error"
             raise ValueError("generator_error")
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=failing_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(failing_generator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -3547,7 +3255,7 @@ class TestWorkerService:
         mock_worker_proxy_cache.get.return_value.__aexit__.assert_called()
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_asend_with_proxy_context(
+    async def test_dispatch_should_forward_asend_in_proxy_context_when_streaming(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() forwards asend() within do_dispatch(False) context.
@@ -3573,15 +3281,7 @@ class TestWorkerService:
             while value is not None:
                 value = yield {"echo": value, "do_dispatch": _dd()}
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=echo_with_capture,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(echo_with_capture)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -3629,7 +3329,7 @@ class TestWorkerService:
         assert result2 == {"echo": "world", "do_dispatch": False}
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_athrow_with_proxy_context(
+    async def test_dispatch_should_forward_athrow_in_proxy_context_when_streaming(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
         """Test dispatch() forwards athrow() within do_dispatch(False) context.
@@ -3657,15 +3357,7 @@ class TestWorkerService:
                     "has_proxy": wool.__proxy__.get() is not None,
                 }
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        wool_task = Task(
-            id=uuid4(),
-            callable=resilient_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(resilient_generator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -3702,7 +3394,7 @@ class TestWorkerService:
         assert result["do_dispatch"] is False
         assert result["has_proxy"] is True
 
-    def test___init___with_backpressure_hook(self):
+    def test___init___should_expose_unset_lifecycle_events_when_backpressure_given(self):
         """Test WorkerService initialization with a backpressure hook.
 
         Given:
@@ -3725,146 +3417,13 @@ class TestWorkerService:
         assert not service.stopped.is_set()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_caller_context_var_and_backpressure_hook(
-        self, grpc_aio_stub, mock_worker_proxy_cache
-    ):
-        """Test the backpressure hook observes caller-shipped ContextVar
-        values when it evaluates admission.
-
-        Given:
-            A :class:`WorkerService` whose backpressure hook reads a
-            :class:`wool.ContextVar` to decide admission, and a
-            dispatch Request whose ``context.vars`` carries a value
-            for that var
-        When:
-            The dispatch RPC is invoked
-        Then:
-            The hook should observe the caller-shipped value (not
-            ``LookupError``), because the dispatch handler scopes the
-            caller-state Context via ``Context.run`` for the duration
-            of hook evaluation — the handler does not install it
-            against the main-loop task and so does not leak ownership
-            across the main/worker boundary
-        """
-        # Arrange
-        namespace = f"bp_ctxvar_{uuid4().hex}"
-        tenant = wool.ContextVar("tenant", namespace=namespace)
-        observed: list[str] = []
-
-        def hook(ctx):
-            observed.append(tenant.get("<unset>"))
-            return False
-
-        async def sample_task():
-            return "accepted"
-
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
-        context_pb = protocol.Context(id=uuid4().hex)
-        context_pb.vars.add(
-            namespace=tenant.namespace,
-            name=tenant.name,
-            value=cloudpickle.dumps("acme-corp"),
-        )
-        request = protocol.Request(task=wool_task.to_protobuf(), context=context_pb)
-
-        service = WorkerService(backpressure=hook)
-
-        # Act
-        async with grpc_aio_stub(servicer=service) as stub:
-            stream = stub.dispatch()
-            await stream.write(request)
-            await stream.done_writing()
-            responses = [r async for r in stream]
-
-        # Assert
-        ack, response = responses
-        assert ack.HasField("ack")
-        assert response.HasField("result")
-        assert cloudpickle.loads(response.result.dump) == "accepted"
-        assert observed == ["acme-corp"]
-
-    @pytest.mark.asyncio
-    async def test_dispatch_async_backpressure_hook_observes_caller_context_vars(
-        self, grpc_aio_stub, mock_worker_proxy_cache
-    ):
-        """Test an async backpressure hook observes caller-shipped
-        ContextVar values across its await suspension.
-
-        Given:
-            A :class:`WorkerService` whose backpressure hook is
-            ``async def`` and reads a :class:`wool.ContextVar` after
-            an ``await asyncio.sleep(0)`` checkpoint, and a dispatch
-            Request whose ``context.vars`` carries a value for that
-            var
-        When:
-            The dispatch RPC is invoked
-        Then:
-            The hook should observe the caller-shipped value after
-            the suspension — the dispatch handler must keep the
-            caller-state Context attached across the await of the
-            hook coroutine, not just the synchronous body that
-            constructs it
-        """
-        # Arrange
-        namespace = f"async_bp_ctxvar_{uuid4().hex}"
-        tenant = wool.ContextVar("tenant", namespace=namespace)
-        observed: list[str] = []
-
-        async def hook(ctx):
-            await asyncio.sleep(0)
-            observed.append(tenant.get("<unset>"))
-            return False
-
-        async def sample_task():
-            return "accepted"
-
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
-        context_pb = protocol.Context(id=uuid4().hex)
-        context_pb.vars.add(
-            namespace=tenant.namespace,
-            name=tenant.name,
-            value=cloudpickle.dumps("acme-corp"),
-        )
-        request = protocol.Request(task=wool_task.to_protobuf(), context=context_pb)
-
-        service = WorkerService(backpressure=hook)
-
-        # Act
-        async with grpc_aio_stub(servicer=service) as stub:
-            stream = stub.dispatch()
-            await stream.write(request)
-            await stream.done_writing()
-            responses = [r async for r in stream]
-
-        # Assert
-        ack, response = responses
-        assert ack.HasField("ack")
-        assert response.HasField("result")
-        assert cloudpickle.loads(response.result.dump) == "accepted"
-        assert observed == ["acme-corp"]
-
-    @pytest.mark.asyncio
-    async def test_dispatch_with_sync_backpressure_accepting(
+    async def test_dispatch_should_accept_task_when_sync_backpressure_returns_false(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test dispatch succeeds when sync backpressure hook returns False.
 
         Given:
-            A :class:`WorkerService` with a sync backpressure hook that returns False
+            A `WorkerService` with a sync backpressure hook that returns False
         When:
             Dispatch RPC is called
         Then:
@@ -3875,14 +3434,7 @@ class TestWorkerService:
         async def sample_task():
             return "accepted"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         def hook(ctx):
@@ -3904,13 +3456,13 @@ class TestWorkerService:
         assert cloudpickle.loads(response.result.dump) == "accepted"
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_sync_backpressure_rejecting(
+    async def test_dispatch_should_abort_when_sync_backpressure_returns_true(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test dispatch aborts when sync backpressure hook returns True.
 
         Given:
-            A :class:`WorkerService` with a sync backpressure hook that returns True
+            A `WorkerService` with a sync backpressure hook that returns True
         When:
             Dispatch RPC is called
         Then:
@@ -3921,14 +3473,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_reach"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         def hook(ctx):
@@ -3947,13 +3492,13 @@ class TestWorkerService:
             assert exc_info.value.code() == StatusCode.RESOURCE_EXHAUSTED
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_async_backpressure_rejecting(
+    async def test_dispatch_should_abort_when_async_backpressure_returns_true(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test dispatch aborts when async backpressure hook returns True.
 
         Given:
-            A :class:`WorkerService` with an async backpressure hook that returns True
+            A `WorkerService` with an async backpressure hook that returns True
         When:
             Dispatch RPC is called
         Then:
@@ -3964,14 +3509,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_reach"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         async def async_hook(ctx):
@@ -3990,13 +3528,13 @@ class TestWorkerService:
             assert exc_info.value.code() == StatusCode.RESOURCE_EXHAUSTED
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_async_backpressure_accepting(
+    async def test_dispatch_should_accept_task_when_async_backpressure_returns_false(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test dispatch succeeds when async backpressure hook returns False.
 
         Given:
-            A :class:`WorkerService` with an async backpressure hook that returns False
+            A `WorkerService` with an async backpressure hook that returns False
         When:
             Dispatch RPC is called
         Then:
@@ -4007,14 +3545,7 @@ class TestWorkerService:
         async def sample_task():
             return "async_accepted"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         async def async_hook(ctx):
@@ -4036,18 +3567,18 @@ class TestWorkerService:
         assert cloudpickle.loads(response.result.dump) == "async_accepted"
 
     @pytest.mark.asyncio
-    async def test_dispatch_ships_stop_async_iteration_raw_for_coroutine_routine(
+    async def test_dispatch_should_ship_stop_async_iteration_raw_when_coroutine_raises(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test the wire surfaces :class:`StopAsyncIteration` raw
+        """Test the wire surfaces `StopAsyncIteration` raw
         when a coroutine routine raises it at the top level —
         matching stdlib ``await coro()`` semantics.
 
-        Regression test for F5. Pre-fix, the wire shipped
-        :class:`RuntimeError` because :meth:`DispatchSession._iterate`
+        Regression test. Pre-fix, the wire shipped
+        `RuntimeError` because `DispatchSession._iterate`
         is an async generator: when the worker's
         ``_ResponseQueue.get`` re-raised the routine's
-        :class:`StopAsyncIteration` inside _iterate's body, PEP
+        `StopAsyncIteration` inside _iterate's body, PEP
         525 converted it to ``RuntimeError("async generator
         raised StopAsyncIteration")`` at the asyncgen boundary
         before the dispatch handler's terminal-exception clause
@@ -4058,26 +3589,19 @@ class TestWorkerService:
         coroutine had been local.
 
         Given:
-            A coroutine routine that raises :class:`StopAsyncIteration`
+            A coroutine routine that raises `StopAsyncIteration`
         When:
             The dispatch RPC ships its terminal-exception
             Response
         Then:
-            It should carry :class:`StopAsyncIteration`, not
-            :class:`RuntimeError`.
+            It should carry `StopAsyncIteration`, not
+            `RuntimeError`.
         """
 
         async def coro_raising_sai():
             raise StopAsyncIteration("from coroutine")
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=coro_raising_sai,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(coro_raising_sai)
         first_request = protocol.Request(task=wool_task.to_protobuf())
 
         # Act
@@ -4105,33 +3629,33 @@ class TestWorkerService:
         )
 
     @pytest.mark.asyncio
-    async def test_dispatch_ships_runtime_error_for_async_generator_raising_sai(
+    async def test_dispatch_should_ship_runtime_error_when_generator_raises_stop_async_iteration(  # noqa: E501
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test the wire surfaces :class:`RuntimeError` (not
-        :class:`StopAsyncIteration`) when an async generator
-        routine raises :class:`StopAsyncIteration` from its body
+        """Test the wire surfaces `RuntimeError` (not
+        `StopAsyncIteration`) when an async generator
+        routine raises `StopAsyncIteration` from its body
         — matching stdlib ``async for x in agen()`` semantics
         (PEP 525).
 
         Companion to the coroutine StopAsyncIteration regression
-        test (F5). The fix targeted the coroutine path (unwrap
+        test. The fix targeted the coroutine path (unwrap
         PEP 525's auto-conversion); the async generator path was
         already correct because the user's asyncgen runtime does
         the conversion before the worker ever sees SAI — the
-        dispatch handler observes a :class:`RuntimeError` from
+        dispatch handler observes a `RuntimeError` from
         ``gen.asend`` and ships it. This test pins the desired
         behavior so a future change to the unwrap logic does not
         accidentally widen and corrupt the asyncgen contract.
 
         Given:
             An async generator routine whose body raises
-            :class:`StopAsyncIteration` mid-iteration
+            `StopAsyncIteration` mid-iteration
         When:
             The dispatch RPC ships its terminal-exception
             Response
         Then:
-            It should carry :class:`RuntimeError` whose
+            It should carry `RuntimeError` whose
             ``__cause__`` preserves the original SAI.
         """
 
@@ -4139,18 +3663,11 @@ class TestWorkerService:
             raise StopAsyncIteration("from agen")
             yield 1
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=agen_raising_sai,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(agen_raising_sai)
         first_request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(
             next=protocol.Void(),
-            context=protocol.Context(id=uuid4().hex),
+            context=protocol.ChainManifest(id=uuid4().hex),
         )
 
         # Act
@@ -4183,77 +3700,64 @@ class TestWorkerService:
         assert shipped.__cause__.args == ("from agen",)
 
     @pytest.mark.asyncio
-    async def test_dispatch_attaches_strict_mode_context_warnings_as_notes(
+    async def test_dispatch_should_chain_strict_mode_encode_failure_as_cause(
         self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test the dispatch handler attaches strict-mode
-        :class:`ContextDecodeWarning` peers to the routine's
-        exception via PEP 678 ``__notes__`` and a
-        ``__wool_context_warnings__`` attribute, preserving the
-        routine exception's type.
+        """Test the dispatch handler chains a strict-mode
+        `wool.ChainSerializationError` onto the routine's
+        exception as ``__cause__`` via ``raise from``, preserving
+        the routine exception's type.
 
-        Regression test for the user-facing contract pinned by
-        F11's redesign. Pre-redesign, when a routine failed AND
-        ``handler.context.to_protobuf`` raised (only possible
-        when the operator promoted :class:`ContextDecodeWarning`
-        to an exception via
-        ``warnings.filterwarnings("error",
-        category=ContextDecodeWarning)``), :func:`merge_exceptions`
-        wrapped the routine failure and the encode peers in a
-        :class:`BaseExceptionGroup` — forcing strict-mode users
-        to migrate their existing ``except RoutineError`` clauses
-        to ``except*`` or ``except ExceptionGroup``. The redesign
-        attaches peers to the routine exception via PEP 678
-        notes (visible in tracebacks) and a
-        ``__wool_context_warnings__`` attribute (programmatic
-        access), so existing exception-handling code keeps
-        working unchanged.
+        Regression test for the user-facing contract around a
+        strict-mode context-encode failure. Under the "fail loud"
+        design the routine exception keeps its primary class so
+        callers don't migrate their existing ``except RoutineError``
+        clauses; the encode error rides on ``__cause__`` for
+        traceback visibility.
 
         Given:
             A coroutine routine that raises a custom exception,
-            and ``handler.context.to_protobuf`` patched to raise
-            a :class:`BaseExceptionGroup` of synthetic
-            :class:`ContextDecodeWarning` peers (simulating
-            strict-mode encode failure)
+            and the worker driver's final
+            `ChainManifest.to_protobuf` patched to raise a
+            `wool.ChainSerializationError` aggregating per-var
+            warnings (simulating strict-mode encode failure).
         When:
             The dispatch RPC ships its terminal-exception
-            Response
+            Response.
         Then:
             It should ship the routine's exception type bare
-            (not wrapped in any group), with the warnings
-            attached as ``__notes__`` and
-            ``__wool_context_warnings__``.
+            (not wrapped in any group), with the
+            `wool.ChainSerializationError` chained on
+            ``__cause__``. The worker arms its post-run encode by
+            touching `wool.ContextVar` inside the routine
+            so the encode path runs.
         """
-        from wool.runtime.context import Context
-        from wool.runtime.context import ContextDecodeWarning
+        from wool.runtime.context.manifest import ChainManifest as _Context
 
-        class _RoutineFailure(Exception):
-            pass
+        namespace = f"chain_cause_{uuid4().hex}"
+        arm_var: wool.ContextVar[str] = wool.ContextVar("arm", namespace=namespace)
 
         async def failing_task():
-            raise _RoutineFailure("primary signal")
+            # Touch a ContextVar so the worker arms; the patched
+            # encode then fires on the post-run path.
+            arm_var.set("arm")
+            # Use a stdlib exception that tblib registered at wool
+            # import time — cause-chain preservation across the wire
+            # depends on the routine exception's class having a
+            # tblib-compatible reduce.
+            raise ValueError("primary signal")
 
-        original_to_protobuf = Context.to_protobuf
+        original_encode = _Context.to_protobuf
 
         def encode_with_strict_failure(self, *args, **kwargs):
-            raise BaseExceptionGroup(
-                "strict-mode context encode failure",
-                [
-                    ContextDecodeWarning("var-1 unencodable"),
-                    ContextDecodeWarning("var-2 unencodable"),
-                ],
+            raise wool.ChainSerializationError(
+                wool.SerializationWarning("var-1 unencodable"),
+                wool.SerializationWarning("var-2 unencodable"),
             )
 
-        mocker.patch.object(Context, "to_protobuf", encode_with_strict_failure)
+        mocker.patch.object(_Context, "to_protobuf", encode_with_strict_failure)
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=failing_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(failing_task)
         first_request = protocol.Request(task=wool_task.to_protobuf())
 
         # Act
@@ -4264,8 +3768,8 @@ class TestWorkerService:
             responses = [r async for r in stream]
 
         # Restore so the gRPC fixture's teardown does not
-        # explode on Context.to_protobuf calls during cleanup.
-        mocker.patch.object(Context, "to_protobuf", original_to_protobuf)
+        # explode on ChainManifest.to_protobuf calls during cleanup.
+        mocker.patch.object(_Context, "to_protobuf", original_encode)
 
         # Assert
         ack, terminal = responses
@@ -4274,49 +3778,34 @@ class TestWorkerService:
         shipped = cloudpickle.loads(terminal.exception.dump)
 
         # The routine's exception type is preserved — caller's
-        # existing ``except _RoutineFailure`` continues to catch.
-        assert isinstance(shipped, _RoutineFailure), (
+        # existing ``except ValueError`` continues to catch.
+        assert isinstance(shipped, ValueError), (
             f"wire must ship the routine's exception type bare, "
             f"not a wrapper group — observed {type(shipped).__name__}"
         )
         assert shipped.args == ("primary signal",)
 
-        # PEP 678 notes carry the warnings as human-readable
-        # diagnostic — they show up in tracebacks naturally.
-        assert hasattr(shipped, "__notes__"), (
-            "shipped exception must have __notes__ populated"
+        # The strict-mode encode failure rides on ``__cause__``
+        # via ``raise from`` chaining.
+        cause = shipped.__cause__
+        assert isinstance(cause, wool.ChainSerializationError), (
+            f"encode failure must appear on ``__cause__``; observed: "
+            f"{type(cause).__name__}"
         )
-        notes_text = "\n".join(shipped.__notes__)
-        assert "var-1 unencodable" in notes_text, (
-            "first ContextDecodeWarning must appear in "
-            f"__notes__; observed: {shipped.__notes__}"
-        )
-        assert "var-2 unencodable" in notes_text, (
-            "second ContextDecodeWarning must appear in "
-            f"__notes__; observed: {shipped.__notes__}"
-        )
-
-        # __wool_context_warnings__ provides structured access
-        # for programmatic inspection.
-        assert hasattr(shipped, "__wool_context_warnings__"), (
-            "shipped exception must carry __wool_context_warnings__"
-        )
-        warnings = shipped.__wool_context_warnings__
-        assert len(warnings) == 2
-        assert all(isinstance(w, ContextDecodeWarning) for w in warnings)
-        assert {str(w) for w in warnings} == {
+        warning_messages = {str(w) for w in cause.warnings}
+        assert warning_messages == {
             "var-1 unencodable",
             "var-2 unencodable",
         }
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_backpressure_receiving_context(
+    async def test_dispatch_should_pass_backpressure_context_to_hook(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test backpressure hook receives correct context.
 
         Given:
-            A :class:`WorkerService` with a backpressure hook that captures its argument
+            A `WorkerService` with a backpressure hook that captures its argument
         When:
             Dispatch RPC is called
         Then:
@@ -4328,14 +3817,7 @@ class TestWorkerService:
         async def sample_task():
             return "result"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         captured = []
@@ -4361,13 +3843,13 @@ class TestWorkerService:
         assert ctx.task.id == wool_task.id
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_backpressure_and_active_tasks(
+    async def test_dispatch_should_report_active_task_count_to_backpressure_hook(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test backpressure hook sees correct active task count.
 
         Given:
-            A :class:`WorkerService` with one active task already dispatched
+            A `WorkerService` with one active task already dispatched
         When:
             A second dispatch RPC is called with a backpressure hook
         Then:
@@ -4377,27 +3859,13 @@ class TestWorkerService:
         global _control_event
         _control_event = threading.Event()
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-
-        first_task = Task(
-            id=uuid4(),
-            callable=_controllable_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        first_task = make_task(_controllable_task)
         first_request = protocol.Request(task=first_task.to_protobuf())
 
         async def second_fn():
             return "second"
 
-        second_task = Task(
-            id=uuid4(),
-            callable=second_fn,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        second_task = make_task(second_fn)
         second_request = protocol.Request(task=second_task.to_protobuf())
 
         captured_count = []
@@ -4438,13 +3906,13 @@ class TestWorkerService:
         assert captured_count == [0, 1]
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_backpressure_hook_raising_exception(
+    async def test_dispatch_should_propagate_grpc_failure_when_backpressure_hook_raises(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test dispatch surfaces error when backpressure hook raises.
 
         Given:
-            A :class:`WorkerService` with a backpressure hook that
+            A `WorkerService` with a backpressure hook that
             raises RuntimeError
         When:
             Dispatch RPC is called
@@ -4456,14 +3924,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_reach"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         def hook(ctx):
@@ -4481,21 +3942,25 @@ class TestWorkerService:
                     pass
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_caller_vars_for_coroutine_task(
+    async def test_dispatch_should_apply_caller_vars_before_running_coroutine(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test dispatch applies caller-side vars before running a coroutine.
 
         Given:
-            A Request carrying a non-empty ``vars`` map (a
-            wool.ContextVar set on the caller, serialized via _dumps)
-            and a coroutine Task that reads the var
+            A coroutine Task plus a first mid-stream
+            `NextRequest` carrying a non-empty ``vars`` map (a
+            ``wool.ContextVar`` set on the caller, serialized via
+            cloudpickle). Under the per-frame architecture the
+            initial `TaskRequest` ships only dispatch
+            metadata; per-step manifests ride on subsequent
+            mid-stream frames.
         When:
             The dispatch RPC is invoked end-to-end via the gRPC stub
         Then:
             The Response's result equals the caller-side var value —
-            the worker applied the wire-shipped snapshot before running
-            the task.
+            the worker mounted the wire-shipped manifest before
+            running the task.
         """
         # Arrange
         var = wool.ContextVar("srv001_caller_var", namespace="test_srv_vars")
@@ -4503,32 +3968,28 @@ class TestWorkerService:
         async def reader_task():
             return var.get()
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=reader_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(reader_task)
 
-        request = protocol.Request(
-            task=wool_task.to_protobuf(),
-            context=protocol.Context(
+        task_request = protocol.Request(task=wool_task.to_protobuf())
+        next_request = protocol.Request(
+            next=protocol.Void(),
+            context=protocol.ChainManifest(
+                id=uuid4().hex,
                 vars=[
                     protocol.ContextVar(
                         namespace=var.namespace,
                         name=var.name,
                         value=cloudpickle.dumps("caller-side-value"),
                     )
-                ]
+                ],
             ),
         )
 
         # Act
         async with grpc_aio_stub() as stub:
             stream = stub.dispatch()
-            await stream.write(request)
+            await stream.write(task_request)
+            await stream.write(next_request)
             await stream.done_writing()
             responses = [r async for r in stream]
 
@@ -4539,108 +4000,27 @@ class TestWorkerService:
         assert cloudpickle.loads(response.result.dump) == "caller-side-value"
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_per_frame_caller_vars_for_async_gen(
+    async def test_dispatch_should_end_cleanly_when_routine_raises_cancelled_during_aclose(  # noqa: E501
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test streaming dispatch applies per-frame vars before each asend.
-
-        Given:
-            An async-generator Task whose frames yield the current
-            value of a caller-side wool.ContextVar, with subsequent
-            next Requests carrying updated ``vars`` maps each iteration
-        When:
-            The stream is iterated with changing ``vars`` on each frame
-        Then:
-            Each response's result reflects the per-frame ``vars``
-            applied on the worker — forward-propagation is honored at
-            every streaming frame, not just the first.
-        """
-        # Arrange
-        var = wool.ContextVar("srv002_frame_var", namespace="test_srv_vars")
-
-        async def streaming_task():
-            while True:
-                yield var.get()
-
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=streaming_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
-
-        initial_request = protocol.Request(
-            task=wool_task.to_protobuf(),
-            context=protocol.Context(
-                vars=[
-                    protocol.ContextVar(
-                        namespace=var.namespace,
-                        name=var.name,
-                        value=cloudpickle.dumps("first"),
-                    )
-                ]
-            ),
-        )
-
-        # Act
-        async with grpc_aio_stub() as stub:
-            stream = stub.dispatch()
-            await stream.write(initial_request)
-
-            response = await anext(aiter(stream))
-            assert response.HasField("ack")
-
-            results: list = []
-            for frame_value in ("first", "second", "third"):
-                await stream.write(
-                    protocol.Request(
-                        next=protocol.Void(),
-                        context=protocol.Context(
-                            vars=[
-                                protocol.ContextVar(
-                                    namespace=var.namespace,
-                                    name=var.name,
-                                    value=cloudpickle.dumps(frame_value),
-                                )
-                            ],
-                        ),
-                    )
-                )
-                response = await anext(aiter(stream))
-                assert response.HasField("result")
-                results.append(cloudpickle.loads(response.result.dump))
-
-            await stream.done_writing()
-            async for _ in stream:
-                pass
-
-        # Assert
-        assert results == ["first", "second", "third"]
-
-    @pytest.mark.asyncio
-    async def test_dispatch_with_routine_raising_cancelled_during_aclose(
-        self, grpc_aio_stub, mock_worker_proxy_cache
-    ):
-        """Test :class:`WorkerService` streaming dispatch ends
+        """Test `WorkerService` streaming dispatch ends
         cleanly when the routine raises CancelledError during
         ``aclose`` on a natural-end iteration.
 
-        :func:`routine_scope` propagates aclose-time exceptions
+        `routine_scope` propagates aclose-time exceptions
         (matching stdlib ``await agen.aclose()`` semantics — see
         the unit tests in ``tests/runtime/routine/test_task.py``
         for direct coverage). For natural-end iteration, the consumer's
         ``_iterate`` has already returned by the time the worker
-        runs aclose, and :meth:`drain` swallows the worker-side
-        :class:`asyncio.CancelledError` when the dispatch task
+        runs aclose, and `drain` swallows the worker-side
+        `asyncio.CancelledError` when the dispatch task
         itself isn't being cancelled. Net wire-level result:
         clean stream end with no terminal exception response.
 
         Given:
             A streaming async-generator routine whose teardown
-            handler catches :class:`GeneratorExit` during aclose
-            and re-raises as :class:`asyncio.CancelledError`, plus
+            handler catches `GeneratorExit` during aclose
+            and re-raises as `asyncio.CancelledError`, plus
             a dispatch that ends naturally (caller closes the
             stream without invoking service.stop).
         When:
@@ -4661,14 +4041,7 @@ class TestWorkerService:
             except GeneratorExit:
                 raise asyncio.CancelledError() from None
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=teardown_cancelling_generator,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(teardown_cancelling_generator)
 
         request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
@@ -4697,54 +4070,44 @@ class TestWorkerService:
         assert remaining == []
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_passthrough_loads_for_streaming_self_dispatch(
+    async def test_dispatch_should_apply_caller_var_updates_per_frame_when_streaming(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test streaming self-dispatch applies PassthroughSerializer.loads for vars.
+        """Test a streaming dispatch applies caller var updates per frame.
 
         Given:
-            An async-generator Task configured with a
-            PassthroughSerializer whose streaming next-frames carry
-            var updates serialized via PassthroughSerializer.dumps
+            An async-generator Task whose streaming next-frames carry
+            cloudpickle-encoded var updates
         When:
-            The stream is iterated with changing vars on each frame
+            The stream is iterated with a changing var on each frame
         Then:
-            Each response reflects the updated value — proving that
-            the worker-side _apply_vars uses PassthroughSerializer.loads
-            rather than cloudpickle.loads for passthrough self-dispatch
-            frames.
+            Each response should reflect the updated value, proving the
+            worker applies the per-frame var updates.
         """
-        from wool.runtime.serializer import PassthroughSerializer
-
         # Arrange
-        var = wool.ContextVar(
-            "passthrough_stream_var", namespace="test_passthrough_stream"
-        )
-        serializer = PassthroughSerializer()
+        var = wool.ContextVar("stream_var", namespace="test_streaming_var_updates")
 
         async def streaming_task():
             while True:
                 yield var.get()
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=streaming_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(streaming_task)
 
+        # Fix the chain id across every wire frame so the worker arms
+        # onto it on the initial mount and subsequent updates route to
+        # the same per-chain cached context keyed by that chain id.
+        caller_chain = uuid4()
         initial_request = protocol.Request(
-            task=wool_task.to_protobuf(serializer=serializer),
-            context=protocol.Context(
+            task=wool_task.to_protobuf(),
+            context=protocol.ChainManifest(
+                id=caller_chain.hex,
                 vars=[
                     protocol.ContextVar(
                         namespace=var.namespace,
                         name=var.name,
-                        value=serializer.dumps("alpha"),
+                        value=cloudpickle.dumps("alpha"),
                     )
-                ]
+                ],
             ),
         )
 
@@ -4761,12 +4124,13 @@ class TestWorkerService:
                 await stream.write(
                     protocol.Request(
                         next=protocol.Void(),
-                        context=protocol.Context(
+                        context=protocol.ChainManifest(
+                            id=caller_chain.hex,
                             vars=[
                                 protocol.ContextVar(
                                     namespace=var.namespace,
                                     name=var.name,
-                                    value=serializer.dumps(frame_value),
+                                    value=cloudpickle.dumps(frame_value),
                                 )
                             ],
                         ),
@@ -4774,7 +4138,7 @@ class TestWorkerService:
                 )
                 response = await anext(aiter(stream))
                 assert response.HasField("result")
-                results.append(serializer.loads(response.result.dump))
+                results.append(cloudpickle.loads(response.result.dump))
 
             await stream.done_writing()
             async for _ in stream:
@@ -4784,57 +4148,54 @@ class TestWorkerService:
         assert results == ["alpha", "bravo", "charlie"]
 
     @pytest.mark.asyncio
-    async def test_dispatch_attaches_strict_mode_warnings_for_single_peer(
+    async def test_dispatch_should_ship_strict_mode_encode_error_when_routine_succeeds(
         self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test :class:`WorkerService.dispatch` attaches a single bare
-        :class:`ContextDecodeWarning` to the routine's exception via
-        ``__notes__`` and ``__wool_context_warnings__``.
+        """Test `WorkerService.dispatch` ships a strict-mode
+        `wool.ChainSerializationError` as the terminal exception
+        when the routine succeeded but the per-step encode failed.
 
         Implementation note: the routine itself returns ``"ok"``, but
-        :meth:`Context.to_protobuf` is patched to raise on every
-        call. The per-step encode (which runs inside ``_step`` to
-        build the success :class:`_Response`) therefore raises the
-        warning, which routes through ``DispatchSession`` and surfaces
-        in :meth:`WorkerService.dispatch`'s terminal-exception clause
-        — the same code path that attaches strict-mode warnings as
-        ``__notes__`` / ``__wool_context_warnings__`` on the
-        exception before serializing it back to the caller.
+        `ChainManifest.to_protobuf` is patched to raise on every call.
+        The per-step encode (which runs inside ``_step`` to build
+        the success `_Response`) therefore raises a
+        `wool.ChainSerializationError`, which propagates through
+        `DispatchSession` and surfaces in
+        `WorkerService.dispatch`'s terminal-exception clause.
+        The worker arms its encode path by having the routine touch
+        a `wool.ContextVar`.
 
         Given:
-            A coroutine routine AND :meth:`Context.to_protobuf` patched
-            to raise a single bare :class:`ContextDecodeWarning` (not
-            a group) on every call
+            A coroutine routine that touches a wool ContextVar AND
+            `ChainManifest.to_protobuf` patched to raise a
+            `wool.ChainSerializationError` on every call.
         When:
-            The dispatch RPC ships its terminal-exception Response
+            The dispatch RPC ships its terminal-exception Response.
         Then:
-            It should ship an exception payload with ``__notes__``
-            containing the single warning and
-            ``__wool_context_warnings__`` of length 1.
+            It should ship the `wool.ChainSerializationError`
+            directly as the routine's terminal failure — the
+            "fail loud" contract means the routine's success value
+            is dropped because the post-run chain manifest didn't ship.
         """
-        from wool.runtime.context import Context
-        from wool.runtime.context import ContextDecodeWarning
+        from wool.runtime.context.manifest import ChainManifest as _Context
 
         # Arrange
+        namespace = f"single_encode_{uuid4().hex}"
+        arm_var: wool.ContextVar[str] = wool.ContextVar("arm", namespace=namespace)
+
         async def succeeding_task():
+            arm_var.set("arm")
             return "ok"
 
-        original_to_protobuf = Context.to_protobuf
-        single_warning = ContextDecodeWarning("single bare peer")
+        original_session_encode = _Context.to_protobuf
+        single_warning = wool.SerializationWarning("single bare peer")
 
         def encode_with_single_failure(self, *args, **kwargs):
-            raise single_warning
+            raise wool.ChainSerializationError(single_warning)
 
-        mocker.patch.object(Context, "to_protobuf", encode_with_single_failure)
+        mocker.patch.object(_Context, "to_protobuf", encode_with_single_failure)
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=succeeding_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(succeeding_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         # Act
@@ -4845,86 +4206,84 @@ class TestWorkerService:
             responses = [r async for r in stream]
 
         # Restore so the gRPC fixture's teardown does not explode on
-        # subsequent Context.to_protobuf calls during cleanup.
-        mocker.patch.object(Context, "to_protobuf", original_to_protobuf)
+        # subsequent ChainManifest.to_protobuf calls during cleanup.
+        mocker.patch.object(_Context, "to_protobuf", original_session_encode)
 
         # Assert
         ack, terminal = responses
         assert ack.HasField("ack")
         assert terminal.HasField("exception")
         shipped = cloudpickle.loads(terminal.exception.dump)
-        assert hasattr(shipped, "__notes__")
-        notes_text = "\n".join(shipped.__notes__)
-        assert "single bare peer" in notes_text
-        assert hasattr(shipped, "__wool_context_warnings__")
-        warnings = shipped.__wool_context_warnings__
-        assert len(warnings) == 1
-        assert isinstance(warnings[0], ContextDecodeWarning)
-        assert str(warnings[0]) == "single bare peer"
+        assert isinstance(shipped, wool.ChainSerializationError)
+        assert len(shipped.warnings) == 1
+        assert str(shipped.warnings[0]) == "single bare peer"
 
     @pytest.mark.asyncio
-    async def test_dispatch_attaches_strict_mode_warnings_on_async_generator_path(
+    async def test_dispatch_should_chain_encode_failure_as_cause_when_streaming(
         self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test :class:`WorkerService.dispatch` attaches strict-mode
-        warning peers to the routine's exception on the
-        async-generator path.
+        """Test `WorkerService.dispatch` chains the
+        strict-mode encode error onto the routine's exception via
+        ``__cause__`` on the async-generator path.
 
         Given:
-            An async-generator routine that raises a custom exception
-            mid-stream AND :meth:`Context.to_protobuf` patched to
-            raise a :class:`BaseExceptionGroup` of two
-            :class:`ContextDecodeWarning` peers
+            An async-generator routine that touches a wool
+            ContextVar (arming the worker) and raises a custom
+            exception mid-stream, AND `ChainManifest.to_protobuf`
+            patched to raise `wool.ChainSerializationError` on
+            the post-run encode.
         When:
             The dispatch RPC ships its terminal-exception Response
-            after one successful yield
+            after one successful yield.
         Then:
             It should ship the routine's exception type bare with
-            both warnings on ``__notes__`` and
-            ``__wool_context_warnings__`` of length 2.
+            the `wool.ChainSerializationError` chained on
+            ``__cause__``.
         """
-        from wool.runtime.context import Context
-        from wool.runtime.context import ContextDecodeWarning
+        from wool.runtime.context.manifest import ChainManifest as _Context
 
         # Arrange
-        class _RoutineFailure(Exception):
-            pass
+        namespace = f"agen_chain_{uuid4().hex}"
+        arm_var: wool.ContextVar[str] = wool.ContextVar("arm", namespace=namespace)
 
         async def streamer():
+            arm_var.set("arm")  # arm the worker so encode runs
             yield "first"
-            raise _RoutineFailure("mid-stream signal")
+            # Stdlib exception so tblib's reduce preserves the
+            # __cause__ chain across the wire.
+            raise RuntimeError("mid-stream signal")
 
-        original_to_protobuf = Context.to_protobuf
+        original_session_encode = _Context.to_protobuf
         # Let the first per-yield encode succeed so the streamer
         # delivers ``"first"`` over the wire; subsequent invocations
-        # (including the dispatch handler's terminal-exception
-        # snapshot) raise the strict-mode encode group.
+        # (including the worker driver's terminal-exception
+        # context) raise the strict-mode ChainSerializationError.
         call_count = {"n": 0}
 
         def encode_with_strict_failure(self, *args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return original_to_protobuf(self, *args, **kwargs)
-            raise BaseExceptionGroup(
-                "strict-mode encode failure",
-                [
-                    ContextDecodeWarning("agen-peer-1"),
-                    ContextDecodeWarning("agen-peer-2"),
-                ],
+                return original_session_encode(self, *args, **kwargs)
+            raise wool.ChainSerializationError(
+                wool.SerializationWarning("agen-peer-1"),
+                wool.SerializationWarning("agen-peer-2"),
             )
 
-        mocker.patch.object(Context, "to_protobuf", encode_with_strict_failure)
+        mocker.patch.object(_Context, "to_protobuf", encode_with_strict_failure)
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=streamer,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(streamer)
         first_request = protocol.Request(task=wool_task.to_protobuf())
-        next_request = protocol.Request(next=protocol.Void())
+        # Caller-supplied chain id propagated on every mid-stream
+        # frame — under the per-frame architecture the worker keys
+        # its cached `contextvars.Context` registry by chain
+        # id, so omitting the manifest on subsequent NextRequests
+        # would allocate a fresh ``copy_context()`` per iteration
+        # and lose the streamer's prior ``arm_var.set`` (which is
+        # exactly what arms the chain so the post-step encode runs).
+        chain_id = uuid4().hex
+        next_request = protocol.Request(
+            next=protocol.Void(), context=protocol.ChainManifest(id=chain_id)
+        )
 
         # Act
         async with grpc_aio_stub() as stub:
@@ -4943,38 +4302,35 @@ class TestWorkerService:
             remaining = [r async for r in stream]
 
         # Restore so the gRPC fixture's teardown does not explode on
-        # subsequent Context.to_protobuf calls during cleanup.
-        mocker.patch.object(Context, "to_protobuf", original_to_protobuf)
+        # subsequent ChainManifest.to_protobuf calls during cleanup.
+        mocker.patch.object(_Context, "to_protobuf", original_session_encode)
 
         # Assert
         terminals = [r for r in remaining if r.HasField("exception")]
         assert len(terminals) == 1
         shipped = cloudpickle.loads(terminals[0].exception.dump)
-        assert isinstance(shipped, _RoutineFailure)
-        assert hasattr(shipped, "__notes__")
-        notes_text = "\n".join(shipped.__notes__)
-        assert "agen-peer-1" in notes_text
-        assert "agen-peer-2" in notes_text
-        warnings = shipped.__wool_context_warnings__
-        assert len(warnings) == 2
-        assert all(isinstance(w, ContextDecodeWarning) for w in warnings)
+        assert isinstance(shipped, RuntimeError)
+        cause = shipped.__cause__
+        assert isinstance(cause, wool.ChainSerializationError)
+        warning_messages = {str(w) for w in cause.warnings}
+        assert warning_messages == {"agen-peer-1", "agen-peer-2"}
 
     @pytest.mark.asyncio
-    async def test_dispatch_does_not_unwrap_runtime_error_with_unrelated_cause(
+    async def test_dispatch_should_ship_runtime_error_raw_when_cause_unrelated(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService.dispatch` ships
-        :class:`RuntimeError` raw when its ``__cause__`` is not a
-        :class:`StopAsyncIteration`.
+        """Test `WorkerService.dispatch` ships
+        `RuntimeError` raw when its ``__cause__`` is not a
+        `StopAsyncIteration`.
 
         Given:
             A coroutine routine raising
             ``RuntimeError("not async iter")`` whose ``__cause__`` is
-            NOT a :class:`StopAsyncIteration`
+            NOT a `StopAsyncIteration`
         When:
             The dispatch RPC ships its terminal-exception Response
         Then:
-            It should ship the :class:`RuntimeError` raw (not
+            It should ship the `RuntimeError` raw (not
             unwrapped to ``__cause__``).
         """
 
@@ -4985,14 +4341,7 @@ class TestWorkerService:
             except ValueError as cause:
                 raise RuntimeError("not async iter") from cause
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=raising_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(raising_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         # Act
@@ -5012,24 +4361,24 @@ class TestWorkerService:
         assert "not async iter" in str(shipped)
 
     @pytest.mark.asyncio
-    async def test_dispatch_does_not_unwrap_runtime_error_for_async_generator(
+    async def test_dispatch_should_ship_runtime_error_raw_when_generator_cause_stop_async_iteration(  # noqa: E501
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService.dispatch` keeps
-        :class:`RuntimeError` un-unwrapped on the async-generator
+        """Test `WorkerService.dispatch` keeps
+        `RuntimeError` un-unwrapped on the async-generator
         path even when ``__cause__`` is a
-        :class:`StopAsyncIteration`.
+        `StopAsyncIteration`.
 
         Given:
             An async-generator routine that raises a PEP 525
-            :class:`RuntimeError` whose ``__cause__`` is a
-            :class:`StopAsyncIteration`
+            `RuntimeError` whose ``__cause__`` is a
+            `StopAsyncIteration`
         When:
             The dispatch RPC ships its terminal-exception Response
         Then:
-            It should ship the :class:`RuntimeError` un-unwrapped —
-            the wire payload is :class:`RuntimeError`, not
-            :class:`StopAsyncIteration`.
+            It should ship the `RuntimeError` un-unwrapped —
+            the wire payload is `RuntimeError`, not
+            `StopAsyncIteration`.
         """
 
         # Arrange
@@ -5037,14 +4386,7 @@ class TestWorkerService:
             raise StopAsyncIteration("from agen")
             yield 1
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=agen_raising_sai,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(agen_raising_sai)
         first_request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
 
@@ -5067,10 +4409,10 @@ class TestWorkerService:
         assert not isinstance(shipped, StopAsyncIteration)
 
     @pytest.mark.asyncio
-    async def test_dispatch_drains_handler_on_terminal_exception_path_for_coroutine(
+    async def test_dispatch_should_drain_handler_on_terminal_exception_when_coroutine(
         self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test :class:`WorkerService.dispatch` drains the handler on
+        """Test `WorkerService.dispatch` drains the handler on
         the coroutine terminal-exception path before yielding the
         terminal Response.
 
@@ -5082,35 +4424,34 @@ class TestWorkerService:
         When:
             The dispatch RPC reaches its terminal-exception clause
         Then:
-            It should call :meth:`DispatchSession.drain` at least twice
+            It should call `DispatchSession.drain` at least twice
             (verified via spy) before yielding the terminal Response.
         """
-        from wool.runtime.worker import session as handler_module
+        from wool.runtime.worker.frame import Frame as _Frame
+        from wool.runtime.worker.frame import ResultResponseFrame as _ResultResponseFrame
 
         # Arrange
         async def succeeding_coroutine():
             return "value"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=succeeding_coroutine,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(succeeding_coroutine)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         drain_spy = mocker.spy(DispatchSession, "drain")
 
-        def failing_to_protobuf(self, *, serializer):
-            raise RuntimeError("synthetic dump failure")
+        # Patch the result-frame encode to raise — the dispatch handler
+        # routes the result-bearing `ResultResponseFrame` from
+        # ``_step`` through ``frame.to_protobuf()`` to ship it, and a
+        # raise there exercises the terminal-exception clause path
+        # that re-encodes via `ExceptionResponseFrame.for_send`.
+        original_to_protobuf = _Frame.to_protobuf
 
-        mocker.patch.object(
-            handler_module._Response,
-            "to_protobuf",
-            failing_to_protobuf,
-        )
+        def failing_to_protobuf(self):
+            if isinstance(self, _ResultResponseFrame):
+                raise RuntimeError("synthetic dump failure")
+            return original_to_protobuf(self)
+
+        mocker.patch.object(_Frame, "to_protobuf", failing_to_protobuf)
 
         # Act
         async with grpc_aio_stub() as stub:
@@ -5125,20 +4466,20 @@ class TestWorkerService:
         assert terminal.HasField("exception")
         assert drain_spy.call_count >= 2, (
             f"Expected dispatch's terminal-exception clause to call "
-            f"handler.drain() before snapshotting handler.context "
+            f"handler.drain() before reading handler's final wire context "
             f"(plus __aexit__'s call); observed {drain_spy.call_count} "
             f"call(s)."
         )
 
     @pytest.mark.asyncio
-    async def test_dispatch_skips_backpressure_evaluation_when_no_hook(
+    async def test_dispatch_should_skip_backpressure_evaluation_when_no_hook(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService.dispatch` skips backpressure
+        """Test `WorkerService.dispatch` skips backpressure
         evaluation entirely when no hook is configured.
 
         Given:
-            A :class:`WorkerService` with no backpressure hook
+            A `WorkerService` with no backpressure hook
         When:
             ``dispatch`` is invoked with a normally-completing
             coroutine task
@@ -5151,14 +4492,7 @@ class TestWorkerService:
         async def sample_task():
             return "no_hook_result"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
         service = WorkerService()
         assert service._backpressure is None  # sanity: no hook configured
@@ -5178,10 +4512,10 @@ class TestWorkerService:
         assert cloudpickle.loads(result.result.dump) == "no_hook_result"
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_rejecting_backpressure_leaves_no_docket_entry(
+    async def test_dispatch_should_leave_no_docket_entry_when_backpressure_rejects(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService.dispatch` leaves no docket entry
+        """Test `WorkerService.dispatch` leaves no docket entry
         when backpressure rejects the task.
 
         Given:
@@ -5200,14 +4534,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_reach"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         def hook(ctx):
@@ -5237,13 +4564,13 @@ class TestWorkerService:
         assert service.stopping.is_set()
         assert service.stopped.is_set()
 
-    def test_stopping_and_stopped_reflect_lifecycle(self):
-        """Test :attr:`WorkerService.stopping` and
-        :attr:`WorkerService.stopped` reflect the service lifecycle
+    def test_stopping_should_reflect_lifecycle_via_is_set(self):
+        """Test `WorkerService.stopping` and
+        `WorkerService.stopped` reflect the service lifecycle
         through their ``is_set()`` accessor.
 
         Given:
-            A new :class:`WorkerService` and accesses to the
+            A new `WorkerService` and accesses to the
             ``stopping`` and ``stopped`` properties
         When:
             The properties are read pre/post-stop
@@ -5269,19 +4596,19 @@ class TestWorkerService:
         assert service.stopping.is_set() is True
         assert service.stopped.is_set() is True
 
-    def test_stopping_wrapper_does_not_expose_mutators(self):
-        """Test the :attr:`WorkerService.stopping` wrapper exposes
+    def test_stopping_should_raise_attribute_error_when_mutators_called(self):
+        """Test the `WorkerService.stopping` wrapper exposes
         only read access — calling mutators raises
-        :class:`AttributeError`.
+        `AttributeError`.
 
         Given:
-            A :class:`WorkerService` whose ``stopping`` accessor is
+            A `WorkerService` whose ``stopping`` accessor is
             exposed
         When:
             The caller attempts to call ``.set()`` or ``.clear()`` on
             the returned wrapper
         Then:
-            It should raise :class:`AttributeError` (the read-only
+            It should raise `AttributeError` (the read-only
             wrapper does not expose mutators).
         """
         # Arrange
@@ -5295,15 +4622,17 @@ class TestWorkerService:
             wrapper.clear()
 
     @pytest.mark.asyncio
-    async def test_stop_with_empty_docket_completes_cleanly(self, grpc_aio_stub):
-        """Test :meth:`WorkerService.stop` with ``timeout=0`` and an
+    async def test_stop_should_complete_cleanly_when_docket_empty_and_no_proxy_pool(
+        self, grpc_aio_stub
+    ):
+        """Test `WorkerService.stop` with ``timeout=0`` and an
         empty docket completes cleanly without a configured proxy
         pool.
 
         Given:
-            A :class:`WorkerService.stop` invocation with
+            A `WorkerService.stop` invocation with
             ``timeout=0`` while the docket is empty AND
-            :data:`wool.__proxy_pool__` is unset
+            `wool.__proxy_pool__` is unset
         When:
             The stop RPC is invoked
         Then:
@@ -5316,14 +4645,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_reach"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
 
         service = WorkerService()
         # Sanity: the autouse _clear_proxy_context fixture leaves the
@@ -5351,15 +4673,15 @@ class TestWorkerService:
             assert exc_info.value.code() == StatusCode.UNAVAILABLE
 
     @pytest.mark.asyncio
-    async def test_stop_clears_loop_pool_when_proxy_pool_clear_raises(
+    async def test_stop_should_set_stopped_when_proxy_pool_clear_raises(
         self, grpc_aio_stub, mocker: MockerFixture
     ):
-        """Test :meth:`WorkerService.stop` still sets
-        :attr:`stopped` when the proxy-pool's ``clear`` coroutine
+        """Test `WorkerService.stop` still sets
+        `stopped` when the proxy-pool's ``clear`` coroutine
         raises — the loop-pool clear runs in the ``finally``.
 
         Given:
-            A :class:`WorkerService.stop` invocation while the
+            A `WorkerService.stop` invocation while the
             proxy-pool ``clear`` coroutine raises
         When:
             The stop RPC is invoked
@@ -5401,11 +4723,11 @@ class TestWorkerService:
             wool.__proxy_pool__.reset(token)
 
     @pytest.mark.asyncio
-    async def test_dispatch_ships_synthesized_runtime_error_for_unpicklable_routine_exception(  # noqa: E501
+    async def test_dispatch_should_ship_synthesized_runtime_error_when_routine_exception_unpicklable(  # noqa: E501
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService.dispatch` ships a synthesized
-        stdlib :class:`RuntimeError` for an un-picklable routine
+        """Test `WorkerService.dispatch` ships a synthesized
+        stdlib `RuntimeError` for an un-picklable routine
         exception.
 
         Given:
@@ -5413,7 +4735,7 @@ class TestWorkerService:
         When:
             The dispatch RPC ships its terminal-exception Response
         Then:
-            It should ship a synthesized stdlib :class:`RuntimeError`
+            It should ship a synthesized stdlib `RuntimeError`
             whose message names the original exception type and args.
         """
 
@@ -5425,14 +4747,7 @@ class TestWorkerService:
         async def raising_task():
             raise _UnpicklableError("unpicklable signal")
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=raising_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(raising_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         # Act
@@ -5452,11 +4767,11 @@ class TestWorkerService:
         assert "unpicklable signal" in str(shipped)
 
     @pytest.mark.asyncio
-    async def test_dispatch_streaming_ships_synthesized_runtime_error_for_unpicklable_exception(  # noqa: E501
+    async def test_dispatch_should_ship_synthesized_runtime_error_when_streaming_exception_unpicklable(  # noqa: E501
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService.dispatch` ships a synthesized
-        :class:`RuntimeError` and a valid context snapshot when an
+        """Test `WorkerService.dispatch` ships a synthesized
+        `RuntimeError` and a valid context when an
         async-generator raises an un-picklable exception after one
         yield.
 
@@ -5468,7 +4783,7 @@ class TestWorkerService:
             after the first result
         Then:
             The terminal Response carries a synthesized
-            :class:`RuntimeError` and a valid context snapshot.
+            `RuntimeError` and a valid context.
         """
 
         # Arrange
@@ -5480,14 +4795,7 @@ class TestWorkerService:
             yield "first"
             raise _UnpicklableError("agen unpicklable signal")
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=streamer,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(streamer)
         first_request = protocol.Request(task=wool_task.to_protobuf())
         next_request = protocol.Request(next=protocol.Void())
 
@@ -5511,18 +4819,20 @@ class TestWorkerService:
         terminals = [r for r in remaining if r.HasField("exception")]
         assert len(terminals) == 1
         terminal = terminals[0]
-        assert terminal.HasField("context")
+        # Lazy-wire-frame: the unarmed worker omits the context
+        # field — the routine never touched a wool.ContextVar.
+        assert not terminal.HasField("context")
         shipped = cloudpickle.loads(terminal.exception.dump)
         assert type(shipped) is RuntimeError
         assert "_UnpicklableError" in str(shipped)
         assert "agen unpicklable signal" in str(shipped)
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_unpicklable_exception_whose_str_raises(
+    async def test_dispatch_should_ship_class_name_only_when_exception_unpicklable_and_str_raises(  # noqa: E501
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService.dispatch` ships a synthesized
-        :class:`RuntimeError` containing only the exception class name
+        """Test `WorkerService.dispatch` ships a synthesized
+        `RuntimeError` containing only the exception class name
         when the routine's exception is un-picklable AND its ``__str__``
         raises.
 
@@ -5533,7 +4843,7 @@ class TestWorkerService:
         When:
             The dispatch RPC ships its terminal-exception Response
         Then:
-            It should ship a synthesized :class:`RuntimeError` whose
+            It should ship a synthesized `RuntimeError` whose
             message carries only the class name (the message-with-args
             f-string fallback short-circuited because ``__str__``
             raised), exercising the defensive
@@ -5559,14 +4869,7 @@ class TestWorkerService:
         async def raising_task():
             raise _BadStrError(_Unpicklable())
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=raising_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(raising_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         # Act
@@ -5592,14 +4895,14 @@ class TestWorkerService:
         assert shipped.args == ("_BadStrError",)
 
     @pytest.mark.asyncio
-    async def test_backpressure_with_truthy_non_bool_return_rejects(
+    async def test_backpressure_should_abort_when_hook_returns_truthy_non_bool(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
-        """Test :class:`WorkerService.dispatch` rejects the task when
+        """Test `WorkerService.dispatch` rejects the task when
         the backpressure hook returns a truthy non-bool value.
 
         Given:
-            A :class:`BackpressureLike` hook that returns a non-bool
+            A `BackpressureLike` hook that returns a non-bool
             truthy value (e.g., a non-empty string)
         When:
             The dispatch RPC is invoked
@@ -5611,14 +4914,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_reach"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         def truthy_string_hook(ctx):
@@ -5637,19 +4933,19 @@ class TestWorkerService:
             assert exc_info.value.code() == StatusCode.RESOURCE_EXHAUSTED
 
     @pytest.mark.asyncio
-    async def test_dispatch_rejects_empty_request_stream(
+    async def test_dispatch_should_nack_with_value_error_when_request_stream_empty(
         self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test :class:`WorkerService.dispatch` replies with a single
-        :class:`Nack` when the request stream is empty.
+        """Test `WorkerService.dispatch` replies with a single
+        `Nack` when the request stream is empty.
 
         Given:
             A dispatch call whose request stream yields no frames
         When:
             The dispatch RPC is consumed
         Then:
-            It should respond with a single :class:`Nack` whose
-            exception decodes to a :class:`ValueError` naming the
+            It should respond with a single `Nack` whose
+            exception decodes to a `ValueError` naming the
             empty-stream rejection.
         """
 
@@ -5679,11 +4975,11 @@ class TestWorkerService:
         assert "empty" in str(raised).lower()
 
     @pytest.mark.asyncio
-    async def test_dispatch_rejects_first_frame_with_wrong_oneof(
+    async def test_dispatch_should_nack_with_value_error_when_first_frame_wrong_oneof(
         self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test :class:`WorkerService.dispatch` replies with a single
-        :class:`Nack` when the first frame's payload is the wrong
+        """Test `WorkerService.dispatch` replies with a single
+        `Nack` when the first frame's payload is the wrong
         oneof variant.
 
         Given:
@@ -5692,8 +4988,8 @@ class TestWorkerService:
         When:
             The dispatch RPC is consumed
         Then:
-            It should respond with a single :class:`Nack` whose
-            exception decodes to a :class:`ValueError` naming the
+            It should respond with a single `Nack` whose
+            exception decodes to a `ValueError` naming the
             payload oneof violation.
         """
 
@@ -5727,22 +5023,22 @@ class TestWorkerService:
         assert "payload" in message and "task" in message
 
     @pytest.mark.asyncio
-    async def test_dispatch_nack_with_unpicklable_rejected_original(
+    async def test_dispatch_should_ship_synthesized_runtime_error_in_nack_when_rejected_unpicklable(  # noqa: E501
         self, grpc_aio_stub, mock_worker_proxy_cache, mocker: MockerFixture
     ):
-        """Test :class:`WorkerService.dispatch` ships a synthesized
-        :class:`RuntimeError` for the Nack ``exception`` payload when
-        :attr:`Rejected.original` is itself un-picklable.
+        """Test `WorkerService.dispatch` ships a synthesized
+        `RuntimeError` for the Nack ``exception`` payload when
+        `Rejected.original` is itself un-picklable.
 
         Given:
-            A :class:`WorkerService.dispatch` whose
-            :attr:`Rejected.original` is itself an un-picklable
+            A `WorkerService.dispatch` whose
+            `Rejected.original` is itself an un-picklable
             exception
         When:
-            The dispatch RPC ships its :class:`Nack` Response
+            The dispatch RPC ships its `Nack` Response
         Then:
             The ``Nack.exception`` decodes to the synthesized stdlib
-            :class:`RuntimeError`.
+            `RuntimeError`.
         """
         from wool.runtime.worker import session as handler_module
 
@@ -5754,14 +5050,7 @@ class TestWorkerService:
         async def sample_task():
             return "should_not_reach"
 
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
-        wool_task = Task(
-            id=uuid4(),
-            callable=sample_task,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        wool_task = make_task(sample_task)
         request = protocol.Request(task=wool_task.to_protobuf())
 
         original_aenter = handler_module.DispatchSession.__aenter__
@@ -5798,34 +5087,27 @@ class TestWorkerService:
 
 
 class TestBackpressureContext:
-    """Tests for :class:`wool.runtime.worker.service.BackpressureContext`."""
+    """Tests for `wool.runtime.worker.service.BackpressureContext`."""
 
-    def test_backpressure_context_is_frozen(self):
-        """Test :class:`BackpressureContext` rejects mutation of its
+    def test_backpressure_context_should_reject_mutation_after_construction(self):
+        """Test `BackpressureContext` rejects mutation of its
         fields after construction.
 
         Given:
-            A :class:`BackpressureContext` instance with assigned
+            A `BackpressureContext` instance with assigned
             ``active_task_count`` and ``task``
         When:
             The caller attempts to mutate
             ``ctx.active_task_count = 5``
         Then:
-            It should raise :class:`dataclasses.FrozenInstanceError`.
+            It should raise `dataclasses.FrozenInstanceError`.
         """
         import dataclasses
 
         from wool.runtime.worker.service import BackpressureContext
 
         # Arrange
-        mock_proxy = PicklableMock(spec=WorkerProxyLike, id="frozen-test")
-        task = Task(
-            id=uuid4(),
-            callable=lambda: None,
-            args=(),
-            kwargs={},
-            proxy=mock_proxy,
-        )
+        task = make_task(lambda: None, proxy_id="frozen-test")
         ctx = BackpressureContext(active_task_count=0, task=task)
 
         # Act & assert
@@ -5834,11 +5116,11 @@ class TestBackpressureContext:
 
 
 class TestBackpressureLike:
-    """Tests for :class:`wool.runtime.worker.service.BackpressureLike`."""
+    """Tests for `wool.runtime.worker.service.BackpressureLike`."""
 
-    def test_backpressure_like_runtime_checkable(self):
-        """Test :class:`BackpressureLike` accepts callables and
-        rejects non-callables under :func:`isinstance`.
+    def test_backpressure_like_should_accept_callables_and_reject_non_callables(self):
+        """Test `BackpressureLike` accepts callables and
+        rejects non-callables under `isinstance`.
 
         Given:
             A sync callable ``def hook(ctx): ...``, an async callable

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import functools
+import contextvars
 import logging
 import traceback
 from collections.abc import Callable
@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from dataclasses import field
 from inspect import isasyncgen
 from inspect import isasyncgenfunction
 from inspect import iscoroutinefunction
@@ -31,34 +32,13 @@ import cloudpickle
 
 import wool
 from wool import protocol
-from wool.runtime.context import RuntimeContext
-from wool.runtime.serializer import PassthroughSerializer
-from wool.runtime.serializer import Serializer
+from wool.runtime.context.runtime import RuntimeContext
 
 Args = Tuple
 Kwargs = Dict
 Timeout = SupportsInt
 Routine: TypeAlias = Coroutine | AsyncGenerator
 W = TypeVar("W", bound=Routine)
-
-
-@functools.lru_cache(maxsize=8)
-def _pickle_serializer(serializer: Serializer) -> bytes:
-    """Pickle a :class:`Serializer` instance for transport on the wire.
-
-    Cached via :func:`functools.lru_cache` keyed on the serializer
-    instance.  :class:`PassthroughSerializer` and
-    :class:`CloudpickleSerializer` deliberately collapse all instances to
-    one cache slot via ``__hash__`` and ``__eq__``; user implementations
-    that hash uniquely will fill the cache one entry per instance and
-    evict in LRU order.
-    """
-    return wool.__serializer__.dumps(serializer)
-
-
-@functools.lru_cache(maxsize=8)
-def _unpickle_serializer(data: bytes) -> Serializer:
-    return cloudpickle.loads(data)
 
 
 _do_dispatch: ContextVar[bool] = ContextVar("_do_dispatch", default=True)
@@ -98,7 +78,6 @@ def do_dispatch(flag: bool | None = None, /) -> bool | ContextManager[None]:
         return _do_dispatch_context_manager(flag)
 
 
-# public
 @runtime_checkable
 class WorkerProxyLike(Protocol):
     """Protocol defining the interface required by Task for proxy objects.
@@ -146,8 +125,8 @@ class Task(Generic[W]):
         Descriptive label identifying the call site, formatted as
         ``module.qualname:lineno`` by the ``@routine`` wrapper.
     :param runtime_context:
-        Snapshot of the active :class:`RuntimeContext` at construction
-        time, captured by :meth:`__post_init__` if not supplied. Ships
+        The active :class:`RuntimeContext` captured at construction
+        time by :meth:`__post_init__` if not supplied. Ships
         with the dispatch frame so the worker side can restore wire
         defaults (notably ``dispatch_timeout``) for the routine's
         execution.
@@ -163,10 +142,18 @@ class Task(Generic[W]):
     exception: TaskException | None = None
     tag: str | None = None
     runtime_context: RuntimeContext | None = None
+    # Declare the single-entry guard slot at class scope, matching
+    # :class:`RuntimeContext._dispatch_timeout_token`'s precedent.
+    # ``init=False`` keeps the constructor surface unchanged; ``repr=False``
+    # / ``compare=False`` keep the field out of repr() and equality so
+    # internal lifecycle state doesn't leak into either.
+    _task_token: contextvars.Token[Task | None] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self):
         """Validate the proxy, capture the calling task's id, and seed
-        a :class:`RuntimeContext` snapshot if one was not supplied.
+        a :class:`RuntimeContext` if one was not supplied.
 
         The runtime-context seed lets a Task built outside an active
         :class:`RuntimeContext` scope still ship the wire defaults
@@ -176,7 +163,12 @@ class Task(Generic[W]):
             raise TypeError(
                 f"proxy must conform to WorkerProxyLike, got {type(self.proxy).__name__}"
             )
-        if caller := _current_task.get():
+        # Auto-capture the calling task's id only when ``caller`` was
+        # not supplied explicitly — match the ``runtime_context`` seed
+        # pattern below. Unconditionally overwriting an explicit
+        # constructor argument violates the principle of least
+        # surprise for a public dataclass field.
+        if self.caller is None and (caller := _current_task.get()):
             self.caller = caller.id
         if self.runtime_context is None:
             self.runtime_context = RuntimeContext.get_current()
@@ -187,8 +179,20 @@ class Task(Generic[W]):
         Bind this task to the current context. On exit, re-binds
         the calling task and records any propagating exception
         on :attr:`exception` for wire transport.
+
+        :raises RuntimeError:
+            If the instance is already inside a ``with`` block
+            (``self._task_token is not None``). ``Task`` is
+            block-scoped and single-use as a context manager;
+            re-entering would leak the outer token.
         """
         logging.debug(f"Entering {self.__class__.__name__} with ID {self.id}")
+        if self._task_token is not None:
+            raise RuntimeError(
+                f"{self.__class__.__name__} is already active in a `with` "
+                "block; instances are block-scoped and single-use as context "
+                "managers"
+            )
         self._task_token = _current_task.set(self)
         return self
 
@@ -225,18 +229,27 @@ class Task(Generic[W]):
                     for y in x.split("\n")
                 ],
             )
-        _current_task.reset(self._task_token)
+        # Guard against __exit__ invoked without a preceding
+        # successful __enter__. ``_task_token`` is ``None`` until
+        # __enter__ runs; without this guard, ``_current_task.reset(None)``
+        # raises ``TypeError: instance of Token expected`` at runtime
+        # and pyright (rightly) flags the type as
+        # ``Token | None`` → ``Token``. Mirrors __enter__'s
+        # re-entry guard symmetrically: __enter__ raises on double-
+        # enter, __exit__ no-ops on double-exit.
+        token = self._task_token
+        if token is None:
+            return False
+        _current_task.reset(token)
+        self._task_token = None
         return False
 
     @classmethod
     def from_protobuf(cls, task: protocol.Task) -> Task:
         """Deserialize a Task from a protobuf message.
 
-        When the protobuf carries a ``serializer`` field, it is unpickled
-        and cached for subsequent calls; the resulting :class:`Serializer`
-        deserializes the payload fields.  When the field is unset (the
-        default emitted by :meth:`to_protobuf` for the no-serializer case),
-        :func:`cloudpickle.loads` is used directly — payloads produced by
+        The payload fields are deserialized with :func:`cloudpickle.loads`
+        — payloads produced by
         :class:`~wool.runtime.serializer.CloudpickleSerializer` are
         standard reduce tuples that stock unpickling executes natively.
 
@@ -245,11 +258,7 @@ class Task(Generic[W]):
         :returns:
             A :class:`Task` instance with all fields restored.
         """
-        if task.HasField("serializer"):
-            s = _unpickle_serializer(task.serializer)
-            loads = s.loads
-        else:
-            loads = cloudpickle.loads
+        loads = cloudpickle.loads
         runtime_context = (
             RuntimeContext.from_protobuf(task.runtime_context)
             if task.HasField("runtime_context")
@@ -267,36 +276,24 @@ class Task(Generic[W]):
             runtime_context=runtime_context,
         )
 
-    def to_protobuf(self, serializer: Serializer | None = None) -> protocol.Task:
+    def to_protobuf(self) -> protocol.Task:
         """Serialize this Task to a protobuf message.
 
-        :param serializer:
-            Optional serializer for the callable and its arguments.  When
-            ``None`` (the default), :data:`wool.__serializer__` is used
-            and the protobuf ``serializer`` field is left unset.  When
-            provided, the serializer is pickled into the ``serializer``
-            field so that :meth:`from_protobuf` can use it on the
-            receiving side.  The proxy is always pickled with
-            :data:`wool.__serializer__` unless ``serializer`` is a
-            :class:`PassthroughSerializer`, in which case the proxy uses
-            the same serializer as the rest of the payload.
+        The callable, arguments, and proxy are serialized with
+        :data:`wool.__serializer__`.
+
         :returns:
             A :class:`protocol.Task` message.
         """
-        dumps = serializer.dumps if serializer is not None else wool.__serializer__.dumps
-        proxy_dumps = (
-            dumps
-            if isinstance(serializer, PassthroughSerializer)
-            else wool.__serializer__.dumps
-        )
-        task_msg = protocol.Task(
+        dumps = wool.__serializer__.dumps
+        return protocol.Task(
             version=protocol.__version__,
             id=str(self.id),
             callable=dumps(self.callable),
             args=dumps(self.args),
             kwargs=dumps(self.kwargs),
             caller=str(self.caller) if self.caller else "",
-            proxy=proxy_dumps(self.proxy),
+            proxy=dumps(self.proxy),
             proxy_id=str(self.proxy.id),
             timeout=int(self.timeout) if self.timeout else 0,
             tag=self.tag if self.tag else "",
@@ -304,9 +301,6 @@ class Task(Generic[W]):
                 self.runtime_context.to_protobuf() if self.runtime_context else None
             ),
         )
-        if serializer is not None:
-            task_msg.serializer = _pickle_serializer(serializer)
-        return task_msg
 
 
 # public
