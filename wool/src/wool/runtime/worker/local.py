@@ -5,14 +5,12 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Final
 
-import grpc.aio
-
-from wool import protocol
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.process import WorkerProcess
 
 if TYPE_CHECKING:
@@ -153,11 +151,11 @@ class LocalWorker(Worker):
         if self._info is None:
             raise RuntimeError("Worker process failed to start - no metadata")
 
-    async def _stop(self, timeout: float | None):
+    async def _stop(self, grace: float | None):
         """Stop the worker process gracefully, then reap it.
 
         Sends the worker a stop RPC bounded by a deadline derived from
-        ``timeout`` (see `_STOP_RPC_MARGIN`), then — however the RPC
+        ``grace`` (see `_STOP_RPC_MARGIN`), then — however the RPC
         fared — reaps the subprocess; see `WorkerProcess.reap` for the
         escalation. The reap runs in an executor thread so it
         completes even when this coroutine is cancelled; only a second
@@ -165,41 +163,35 @@ class LocalWorker(Worker):
         can skip it, in which case the worker-side parent watchdog
         remains the backstop against orphans.
 
-        For workers configured with `WorkerCredentials`, uses the
-        client credentials to establish a secure connection for the
-        stop operation. For insecure workers, uses an insecure
-        channel.
+        Credential and secure-channel handling for the stop RPC lives
+        on `WorkerConnection.stop`.
 
-        :param timeout:
+        :param grace:
             Bound on the worker's graceful drain, forwarded in the
-            stop request. ``None`` waits unbounded for the drain.
+            stop request; see `WorkerConnection.stop` for its
+            semantics.
         """
         try:
             if self._worker_process.is_alive():
                 assert self.address
 
-                # Create appropriate channel based on available credentials
-                if self._credentials is not None:
-                    credentials = self._credentials.client_credentials()
-                    channel = grpc.aio.secure_channel(self.address, credentials)
-                else:
-                    channel = grpc.aio.insecure_channel(self.address)
-
+                # Route the stop RPC through WorkerConnection; ``close``
+                # releases the pooled channel this stop acquired.
+                credentials = (
+                    self._credentials.client_credentials()
+                    if self._credentials is not None
+                    else None
+                )
+                connection = WorkerConnection(self.address, credentials=credentials)
                 try:
-                    stub = protocol.WorkerStub(channel)
-                    # `timeout=None` preserves the caller's explicit
-                    # unbounded-graceful contract; see
+                    # ``grace=None`` keeps the RPC unbounded; see
                     # `_STOP_RPC_MARGIN` for the finite deadline.
-                    deadline = (
-                        timeout + _STOP_RPC_MARGIN if timeout is not None else None
-                    )
-                    await stub.stop(
-                        protocol.StopRequest(timeout=timeout), timeout=deadline
-                    )
+                    deadline = grace + _STOP_RPC_MARGIN if grace is not None else None
+                    await connection.stop(grace=grace, timeout=deadline)
                 finally:
-                    await channel.close()
+                    await connection.close()
         finally:
             # `reap` blocks on `join`, so it must run off-loop; see
             # the docstring for the cancellation contract.
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._worker_process.reap, timeout)
+            await loop.run_in_executor(None, self._worker_process.reap, grace)

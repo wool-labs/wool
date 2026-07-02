@@ -397,7 +397,9 @@ class WorkerConnection:
                 raise RpcError(code, details) from error
         return response.seconds
 
-    async def stop(self, *, grace: float | None = None) -> None:
+    async def stop(
+        self, *, grace: float | None = None, timeout: float | None = None
+    ) -> None:
         """Stop the remote worker.
 
         Sends the stop RPC over a channel drawn from this connection's
@@ -409,6 +411,10 @@ class WorkerConnection:
             cancels in-flight tasks immediately; a positive value
             waits that long for a graceful drain; a negative value
             waits indefinitely.
+        :param timeout:
+            gRPC call deadline in seconds for the stop call. ``None``
+            applies no deadline. The worker drains for up to ``grace``
+            before responding, so a finite deadline must exceed it.
         :raises TransientRpcError:
             If the worker returns a transient RPC error
             (``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, or
@@ -418,7 +424,9 @@ class WorkerConnection:
         """
         async with _channel_pool.get(self._key) as channel:
             try:
-                await channel.stub.stop(protocol.StopRequest(timeout=grace))
+                await channel.stub.stop(
+                    protocol.StopRequest(timeout=grace), timeout=timeout
+                )
             except grpc.RpcError as error:
                 code = error.code()
                 details = error.details() or str(error)
