@@ -60,7 +60,22 @@ _displaced_loops: weakref.WeakSet[asyncio.AbstractEventLoop] = weakref.WeakSet()
 # the context for every task it creates and registers it here — not only
 # explicitly-passed ones — so re-passing a live task's own context to a
 # second create_task is caught.
-_task_contexts: dict[int, asyncio.Future[Any]] = {}
+#
+# Values are held *weakly*: an entry drops the moment its task is
+# garbage-collected, even if the `_release` done-callback never fires
+# (e.g., the worker loop was torn down before the callback ran, so the
+# `add_done_callback` was stranded). This keeps the registry bounded to
+# in-flight dispatches regardless of the worker event-loop lifecycle:
+# the weak values are the primary reclaim bound, and `_release` is a
+# best-effort eager cleanup rather than the sole reclaim path (see its
+# docstring for the backstop role it also plays). A live weak entry
+# implies its task is alive, and a live task pins its context, so the id
+# cannot be reused while the entry resolves. `_PENDING` is strongly
+# referenced at its definition, so a reserved slot's weak value never
+# evaporates from under the reservation logic.
+_task_contexts: weakref.WeakValueDictionary[int, asyncio.Future[Any]] = (
+    weakref.WeakValueDictionary()
+)
 
 
 class _PendingSentinel:
