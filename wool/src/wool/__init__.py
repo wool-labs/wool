@@ -59,6 +59,7 @@ from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.connection import HandshakeError
+from wool.runtime.worker.connection import IdleUnavailable
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
@@ -131,6 +132,7 @@ __all__ = [
     "DispatchingLoadBalancerLike",
     "Factory",
     "HandshakeError",
+    "IdleUnavailable",
     "IneffectiveLeaseWarning",
     "IneffectiveQuorumTimeoutWarning",
     "LanDiscovery",
