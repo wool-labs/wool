@@ -9,6 +9,8 @@ import signal
 import socket
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from contextlib import contextmanager
 from functools import partial
@@ -43,6 +45,10 @@ Process = _ctx.Process
 logger = logging.getLogger(__name__)
 
 _HAS_UDS: Final[bool] = hasattr(socket, "AF_UNIX")
+
+_REAP_GRACE: Final[float] = 5.0
+"""Seconds to wait for a terminated worker process to exit before
+escalating to SIGKILL in `WorkerProcess.reap`."""
 
 
 class WorkerProcess(Process):
@@ -202,12 +208,42 @@ class WorkerProcess(Process):
             assert self._metadata is not None
             self._port = int(self._metadata.address.rsplit(":", 1)[1])
         else:
-            self.terminate()
-            self.join()
+            self.reap(timeout=0)
             raise RuntimeError(
                 f"Worker process failed to start within {timeout} seconds"
             )
         self._get_metadata.close()
+
+    def reap(self, timeout: float | None = None) -> None:
+        """Ensure the worker process has fully terminated.
+
+        Joins the process, escalating to `terminate` (SIGTERM)
+        and then `kill` (SIGKILL) if it does not exit within
+        the given bound, so a worker can never outlive its manager
+        regardless of how graceful shutdown fared. Blocks the calling
+        thread; a no-op if the process was never started.
+
+        :param timeout:
+            Maximum time in seconds to wait for the process to exit
+            on its own before escalating. Defaults to the worker's
+            shutdown grace period, the upper bound on legitimate
+            post-stop work in the subprocess.
+        """
+        if self.pid is None:
+            return
+        self.join(timeout if timeout is not None else self._shutdown_grace_period)
+        if self.is_alive():
+            logger.warning(
+                f"Worker process {self.pid} did not exit gracefully; terminating"
+            )
+            self.terminate()
+            self.join(_REAP_GRACE)
+            if self.is_alive():
+                logger.warning(
+                    f"Worker process {self.pid} survived termination; killing"
+                )
+                self.kill()
+                self.join()
 
     def run(self) -> None:
         """Run the worker process.
@@ -243,9 +279,10 @@ class WorkerProcess(Process):
         """Run the worker's gRPC server for the lifetime of the process.
 
         Creates the gRPC server with the configured channel options,
-        registers the worker service, installs credential and signal-
-        handler context managers, and blocks until a shutdown signal
-        fires.
+        registers the worker service, ties the process's lifetime to
+        its parent via the parent-death watchdog, installs credential
+        and signal-handler context managers, and blocks until a
+        shutdown signal fires.
         """
         creds_ctx = (
             CredentialContext(self._credentials)
@@ -327,6 +364,10 @@ class WorkerProcess(Process):
 
             install_task_factory()
 
+            _parent_watchdog(
+                asyncio.get_running_loop(), service, self._shutdown_grace_period
+            )
+
             with _signal_handlers(service):
                 try:
                     await server.start()
@@ -378,6 +419,49 @@ class WorkerProcess(Process):
         return f"{host}:{port}"
 
 
+def _parent_watchdog(
+    loop: asyncio.AbstractEventLoop,
+    service: WorkerService,
+    grace: float,
+) -> threading.Thread | None:
+    """Tie the worker process's lifetime to its parent process.
+
+    Starts a daemon thread that blocks until the parent process
+    exits — including abrupt deaths such as SIGKILL, which bypass
+    every parent-side teardown path — then initiates the same
+    graceful shutdown as SIGTERM and, if the process is still alive
+    once the grace window elapses, hard-exits via `os._exit`.
+    Without this, a worker whose parent never completes the stop RPC
+    reparents to init and accumulates as an orphan across runs.
+
+    :param loop:
+        The worker's running event loop.
+    :param service:
+        The `WorkerService` to stop when the parent dies.
+    :param grace:
+        Seconds to allow graceful shutdown after parent death before
+        hard-exiting.
+    :returns:
+        The started watchdog thread, or ``None`` when the process
+        was not spawned by `multiprocessing` (e.g., in-process
+        test invocations of `WorkerProcess.run`).
+    """
+    parent = _mp.parent_process()
+    if parent is None:
+        return None
+
+    def watch():
+        parent.join()
+        logger.warning("Parent process exited; shutting down worker")
+        _schedule_stop(loop, service, timeout=0)
+        time.sleep(grace)
+        os._exit(1)
+
+    thread = threading.Thread(target=watch, name="wool-parent-watchdog", daemon=True)
+    thread.start()
+    return thread
+
+
 @contextmanager
 def _signal_handlers(service: WorkerService):
     """Context manager for setting up signal handlers for graceful shutdown.
@@ -402,21 +486,47 @@ def _signal_handlers(service: WorkerService):
 
 
 def _sigterm_handler(loop, service, signum, frame):
-    if loop.is_running():
-        loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(
-                service.stop(protocol.StopRequest(timeout=0), None)
-            )
-        )
+    """Stop the service immediately, cancelling in-flight tasks."""
+    _schedule_stop(loop, service, timeout=0)
 
 
 def _sigint_handler(loop, service, signum, frame):
+    """Stop the service, draining in-flight tasks indefinitely."""
+    _schedule_stop(loop, service, timeout=-1)
+
+
+def _schedule_stop(
+    loop: asyncio.AbstractEventLoop,
+    service: WorkerService,
+    timeout: float,
+) -> None:
+    """Dispatch a graceful service stop onto the worker's event loop.
+
+    Safe to call from any thread, including signal handlers and the
+    parent-death watchdog. A ``timeout`` of ``0`` cancels in-flight
+    tasks immediately; a negative value drains them indefinitely (see
+    `WorkerService.stop`).
+
+    :param loop:
+        The worker's event loop.
+    :param service:
+        The `WorkerService` to stop.
+    :param timeout:
+        Drain bound forwarded in the ``StopRequest``.
+    """
     if loop.is_running():
-        loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(
-                service.stop(protocol.StopRequest(timeout=-1), None)
+        # The loop can close between `is_running` and the dispatch; a
+        # closed loop has nothing left to stop gracefully, so callers'
+        # fallbacks (e.g. the watchdog's hard exit) must survive the
+        # race.
+        try:
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(
+                    service.stop(protocol.StopRequest(timeout=timeout), None)
+                )
             )
-        )
+        except RuntimeError:
+            pass
 
 
 async def _proxy_factory(
