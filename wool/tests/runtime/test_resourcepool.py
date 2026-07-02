@@ -1,36 +1,17 @@
 import asyncio
+import gc
 import time
-from collections import defaultdict
+import warnings
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
-from unittest.mock import patch
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies
 
-import wool.runtime.resourcepool as rp
 from wool.runtime.resourcepool import Resource
 from wool.runtime.resourcepool import ResourcePool
-
-# Global tracking for factory and finalizer calls using function names as keys
-call_tracker = defaultdict(lambda: {"factory_calls": [], "finalizer_calls": []})
-
-
-def reset_call_tracker():
-    """Reset the global call tracker."""
-    call_tracker.clear()
-
-
-def track_factory_call(func_name, key, result):
-    """Track a factory function call."""
-    call_tracker[func_name]["factory_calls"].append({"key": key, "result": result})
-
-
-def track_finalizer_call(func_name, obj):
-    """Track a finalizer function call."""
-    call_tracker[func_name]["finalizer_calls"].append({"obj": obj})
 
 
 @strategies.composite
@@ -55,7 +36,6 @@ def factory_functions(draw):
             obj = Mock()
             obj.name = f"sync-{key}"
             obj.created_by = "sync_simple"
-            track_factory_call("sync_simple", key, obj)
             return obj
 
         return sync_factory
@@ -66,7 +46,6 @@ def factory_functions(draw):
             obj = Mock()
             obj.name = f"async-{key}"
             obj.created_by = "async_simple"
-            track_factory_call("async_simple", key, obj)
             return obj
 
         return async_factory
@@ -74,18 +53,14 @@ def factory_functions(draw):
     elif factory_type == "sync_lambda":
 
         def sync_lambda_factory(key):
-            obj = SimpleNamespace(name=f"lambda-{key}", created_by="sync_lambda")
-            track_factory_call("sync_lambda", key, obj)
-            return obj
+            return SimpleNamespace(name=f"lambda-{key}", created_by="sync_lambda")
 
         return lambda key: sync_lambda_factory(key)
 
     elif factory_type == "async_lambda":
 
         async def async_lambda_factory(key):
-            obj = SimpleNamespace(name=f"async-lambda-{key}", created_by="async_lambda")
-            track_factory_call("async_lambda", key, obj)
-            return obj
+            return SimpleNamespace(name=f"async-lambda-{key}", created_by="async_lambda")
 
         return lambda key: async_lambda_factory(key)
 
@@ -93,13 +68,12 @@ def factory_functions(draw):
 
         class CallableLike:
             def __call__(self, key):
-                self.sync_factory(key)
+                return self.sync_factory(key)
 
             def sync_factory(self, key):
                 obj = Mock()
                 obj.name = f"callable-{key}"
                 obj.created_by = "callable"
-                track_factory_call("callable", key, obj)
                 return obj
 
         return CallableLike()
@@ -117,7 +91,6 @@ def factory_functions(draw):
                 obj = Mock()
                 obj.name = f"awaitable-{self.key}"
                 obj.created_by = "awaitable"
-                track_factory_call("awaitable", self.key, obj)
                 return obj
 
         return AwaitableLike
@@ -144,19 +117,14 @@ def finalizer_functions(draw):
     elif finalizer_type == "sync_simple":
 
         def simple_sync_finalizer(obj):
-            # Simple finalizer that just validates it was called with an object
             assert obj is not None
-            track_finalizer_call("sync_simple", obj)
 
-        # Store the type on the function for easy identification
         return simple_sync_finalizer
 
     elif finalizer_type == "async_simple":
 
         async def simple_async_finalizer(obj):
-            # Simple finalizer that just validates it was called with an object
             assert obj is not None
-            track_finalizer_call("async_simple", obj)
 
         return simple_async_finalizer
 
@@ -164,7 +132,6 @@ def finalizer_functions(draw):
 
         def sync_lambda_finalizer(obj):
             assert obj is not None
-            track_finalizer_call("sync_lambda", obj)
 
         return lambda obj: sync_lambda_finalizer(obj)
 
@@ -172,12 +139,10 @@ def finalizer_functions(draw):
 
         async def async_lambda_finalizer(obj):
             assert obj is not None
-            track_finalizer_call("async_lambda", obj)
 
         return lambda obj: async_lambda_finalizer(obj)
 
 
-# Reusable fixtures for simplified test setup
 @pytest.fixture
 def mock_resource_factory():
     """Create a mock factory with consistent behavior."""
@@ -193,15 +158,63 @@ def mock_finalizer():
 
 
 @pytest.fixture
-def resource_pool_with_ttl(mock_resource_factory, mock_finalizer):
-    """Create a resource pool configured for TTL testing."""
-    return ResourcePool(factory=mock_resource_factory, finalizer=mock_finalizer, ttl=0.1)
-
-
-@pytest.fixture
 def resource_pool_immediate_cleanup(mock_resource_factory, mock_finalizer):
     """Create a resource pool with TTL=0 for immediate cleanup testing."""
     return ResourcePool(factory=mock_resource_factory, finalizer=mock_finalizer, ttl=0)
+
+
+@pytest.fixture
+def expiry_race_pool(mocker):
+    """Build a short-TTL pool whose lock can be parked via a blocker key.
+
+    Returns the pool, its finalizer mock, the list of factory calls,
+    and the event that releases the parked ``blocker`` acquire.
+    """
+    release_blocker = asyncio.Event()
+    factory_calls = []
+
+    async def factory(key):
+        factory_calls.append(key)
+        if key == "blocker":
+            await release_blocker.wait()
+        return f"obj-{key}"
+
+    finalizer = mocker.AsyncMock()
+    pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=0.05)
+    return pool, finalizer, factory_calls, release_blocker
+
+
+async def _queue_behind_fired_cleanup(pool, factory_calls, queued_coroutine):
+    """Race a fired TTL cleanup against an operation queued on the pool lock.
+
+    Caches and releases ``expired`` so its TTL timer arms, parks an
+    acquire of ``blocker`` inside its factory — the factory runs under
+    the pool lock, so the lock stays held — then queues the given
+    operation on the (FIFO) lock and waits for the timer to fire so
+    its cleanup task queues behind that operation. Returns the blocker
+    and queued-operation tasks.
+    """
+    async with pool.get("expired"):
+        pass
+
+    blocker_task = asyncio.create_task(pool.acquire("blocker"))
+
+    async def blocker_parked():
+        while "blocker" not in factory_calls:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(blocker_parked(), timeout=2.0)
+
+    queued_task = asyncio.create_task(queued_coroutine)
+
+    async def cleanup_task_spawned():
+        # The armed timer already counts as pending; wait until the
+        # pending work is the fired timer's cleanup *task*.
+        while not isinstance(pool.pending_cleanup.get("expired"), asyncio.Task):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(cleanup_task_spawned(), timeout=2.0)
+    return blocker_task, queued_task
 
 
 @pytest.fixture
@@ -243,9 +256,6 @@ class TestResourcePool:
         keys = []
 
         async def setup():
-            # Reset call tracker for this test run
-            reset_call_tracker()
-
             for i in range(draw(strategies.integers(0, max_key_count))):
                 key = f"resource-{i}"
                 keys.append(key)
@@ -283,7 +293,6 @@ class TestResourcePool:
         assert isinstance(resource_acquisition, Resource)
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
     async def test_release_should_decrement_reference_counts(self):
         """Test releasing resources decrements reference counts properly.
 
@@ -323,13 +332,10 @@ class TestResourcePool:
         assert pool.stats.referenced_entries == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency(
-        "TestResourcePool::test_release_should_decrement_reference_counts"
-    )
     async def test_release_should_not_affect_existing_resources_when_key_nonexistent(
         self, counting_factory
     ):
-        """Test releasing nonexistent key raises KeyError.
+        """Test releasing a nonexistent key is a silent no-op.
 
         Given:
             A pool with some existing resources
@@ -359,9 +365,6 @@ class TestResourcePool:
         assert pool.stats.referenced_entries == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency(
-        "TestResourcePool::test_release_should_decrement_reference_counts"
-    )
     async def test_release_should_raise_value_error_when_zero_reference_count(self):
         """Test releasing key with zero ref count raises ValueError.
 
@@ -449,27 +452,25 @@ class TestResourcePool:
             assert resource.name == "second"
         assert factory.call_count == 2
 
-    def test_acquire_should_cancel_cross_loop_cleanup_task_threadsafe(self):
-        """Test acquire cancels a foreign-loop cleanup task cross-loop.
+    def test_acquire_should_cancel_cross_loop_timer_threadsafe(self, mocker):
+        """Test acquire cancels a foreign-loop TTL timer cross-loop.
 
         Given:
-            A pool whose cached entry has a pending TTL cleanup task
+            A pool whose cached entry has an unfired TTL timer
             scheduled on one event loop, which has since closed.
         When:
             The same key is re-acquired from a different event loop.
         Then:
-            The cleanup should be cancelled on its own (now-closed) loop
-            via call_soon_threadsafe rather than awaited cross-loop, the
-            resulting RuntimeError should be swallowed, the cached object
-            should be returned, and the pending cleanup should be
-            cleared.
+            The timer should be cancelled on its own (now-closed) loop
+            via call_soon_threadsafe, the resulting RuntimeError
+            should be swallowed, the cached object should be returned,
+            and the pending cleanup should be cleared.
         """
         # Arrange
-        pool = ResourcePool(factory=Mock(return_value="obj"), ttl=60)
+        pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=60)
 
-        # Acquire and release on a dedicated loop so a TTL cleanup task is
-        # scheduled and bound to that loop, then close it. The pending task is
-        # held by reference so it survives until the cross-loop cancel runs.
+        # Acquire and release on a dedicated loop so a TTL timer is
+        # scheduled and bound to that loop, then close it.
         foreign_loop = asyncio.new_event_loop()
 
         async def schedule_cleanup_on_foreign_loop():
@@ -492,29 +493,28 @@ class TestResourcePool:
             acquiring_loop.close()
             del pending_cleanup
 
-    def test_clear_should_cancel_cross_loop_cleanup_task_threadsafe(self):
-        """Test clear cancels a foreign-loop cleanup task cross-loop.
+    def test_clear_should_cancel_cross_loop_timer_threadsafe(self, mocker):
+        """Test clear cancels a foreign-loop TTL timer cross-loop.
 
         Given:
-            A pool whose cached entry has a pending TTL cleanup task
+            A pool whose cached entry has an unfired TTL timer
             scheduled on one event loop, which has since closed.
         When:
             The key is cleared from a different event loop.
         Then:
-            The cleanup should be cancelled on its own (now-closed) loop
-            via call_soon_threadsafe, the resulting RuntimeError should be
-            swallowed, the finalizer should still run, and the entry
-            should be evicted.
+            The timer should be cancelled on its own (now-closed) loop
+            via call_soon_threadsafe, the resulting RuntimeError
+            should be swallowed, the finalizer should still run, and
+            the entry should be evicted.
         """
         # Arrange
-        finalizer = AsyncMock()
+        finalizer = mocker.AsyncMock()
         pool = ResourcePool(
-            factory=Mock(return_value="obj"), finalizer=finalizer, ttl=60
+            factory=mocker.Mock(return_value="obj"), finalizer=finalizer, ttl=60
         )
 
-        # Acquire and release on a dedicated loop so a TTL cleanup task is
-        # scheduled and bound to that loop, then close it. The pending task is
-        # held by reference so it survives until the cross-loop cancel runs.
+        # Acquire and release on a dedicated loop so a TTL timer is
+        # scheduled and bound to that loop, then close it.
         foreign_loop = asyncio.new_event_loop()
 
         async def schedule_cleanup_on_foreign_loop():
@@ -537,8 +537,163 @@ class TestResourcePool:
             clearing_loop.close()
             del pending_cleanup
 
+    def test_release_should_leave_no_pending_task_when_loop_closes_before_ttl(
+        self, mocker
+    ):
+        """Test release defers cleanup without parking a task on the loop.
+
+        Given:
+            A pool with a positive TTL whose resource is released on
+            a dedicated event loop.
+        When:
+            The loop is closed and garbage-collected before the TTL
+            elapses.
+        Then:
+            It should leave no pending task on the loop and emit no
+            RuntimeWarning when the deferred cleanup is collected.
+        """
+        # Arrange
+        loop = asyncio.new_event_loop()
+
+        def create_release_and_drop():
+            pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=60)
+
+            async def acquire_release():
+                async with pool.get("key"):
+                    pass
+
+            loop.run_until_complete(acquire_release())
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            create_release_and_drop()
+            pending = asyncio.all_tasks(loop)
+            loop.close()
+            gc.collect()
+
+        # Assert
+        assert pending == set()
+        assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
+    async def test_acquire_should_cancel_in_flight_cleanup_when_reacquired_after_expiry(
+        self, expiry_race_pool
+    ):
+        """Test acquire cancels a fired cleanup racing on the pool lock.
+
+        Given:
+            A pool whose expired key's TTL timer has fired while the
+            pool lock is held by another key's acquire, so the
+            spawned cleanup task and a queued re-acquire of the
+            expired key both wait on the lock with the re-acquire
+            first
+        When:
+            The lock holder completes and the queued re-acquire runs
+        Then:
+            It should cancel the in-flight cleanup, return the cached
+            object without re-invoking the factory or finalizer, and
+            leave the key without pending cleanup
+        """
+        # Arrange
+        pool, finalizer, factory_calls, release_blocker = expiry_race_pool
+        blocker_task, reacquire_task = await _queue_behind_fired_cleanup(
+            pool, factory_calls, pool.acquire("expired")
+        )
+
+        # Act
+        release_blocker.set()
+        acquired = await reacquire_task
+        await blocker_task
+
+        # Assert
+        assert acquired == "obj-expired"
+        assert factory_calls.count("expired") == 1
+        finalizer.assert_not_awaited()
+        assert "expired" not in pool.pending_cleanup
+        assert pool.stats.total_entries == 2
+
+    @pytest.mark.asyncio
+    async def test_clear_should_cancel_in_flight_cleanup_when_cleared_after_expiry(
+        self, expiry_race_pool
+    ):
+        """Test clear cancels a fired cleanup racing on the pool lock.
+
+        Given:
+            A pool whose expired key's TTL timer has fired while the
+            pool lock is held by another key's acquire, so the
+            spawned cleanup task and a queued clear of the expired
+            key both wait on the lock with the clear first
+        When:
+            The lock holder completes and the queued clear runs
+        Then:
+            It should cancel the in-flight cleanup, still run the
+            finalizer exactly once, and evict the entry
+        """
+        # Arrange
+        pool, finalizer, factory_calls, release_blocker = expiry_race_pool
+        blocker_task, clear_task = await _queue_behind_fired_cleanup(
+            pool, factory_calls, pool.clear("expired")
+        )
+
+        # Act
+        release_blocker.set()
+        await clear_task
+        await blocker_task
+
+        # Assert
+        finalizer.assert_awaited_once_with("obj-expired")
+        assert "expired" not in pool.pending_cleanup
+        assert pool.stats.total_entries == 1
+
+    @pytest.mark.asyncio
+    @given(
+        operations=strategies.lists(
+            strategies.tuples(
+                strategies.sampled_from(["acquire", "release"]),
+                strategies.sampled_from(["a", "b", "c"]),
+            ),
+            max_size=30,
+        )
+    )
+    async def test_release_should_maintain_bookkeeping_invariants(self, operations):
+        """Test acquire and release keep TTL bookkeeping consistent.
+
+        Given:
+            Any interleaved sequence of acquire and release
+            operations over a small key domain, where releases are
+            applied only while a reference is held
+        When:
+            The sequence is applied step by step to a long-TTL pool
+        Then:
+            It should keep total entries equal to the keys ever
+            acquired, referenced entries equal to the keys with live
+            references, and pending cleanup on exactly the keys whose
+            references all released
+        """
+        # Arrange
+        pool = ResourcePool(factory=lambda key: f"obj-{key}", ttl=60)
+        model_refcount = {}
+
+        # Act & assert
+        for operation, key in operations:
+            if operation == "acquire":
+                await pool.acquire(key)
+                model_refcount[key] = model_refcount.get(key, 0) + 1
+            elif model_refcount.get(key, 0) > 0:
+                await pool.release(key)
+                model_refcount[key] -= 1
+
+            stats = pool.stats
+            assert stats.total_entries == len(model_refcount)
+            assert stats.referenced_entries == sum(
+                1 for count in model_refcount.values() if count > 0
+            )
+            assert set(pool.pending_cleanup) == {
+                key for key, count in model_refcount.items() if count == 0
+            }
+
+    @pytest.mark.asyncio
     async def test_clear_should_finalize_all_resources(self):
         """Test clearing the pool calls finalizer on all resources.
 
@@ -577,7 +732,6 @@ class TestResourcePool:
         assert mock_finalizer.call_count == 3
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
     async def test_clear_should_remove_specific_resource_when_key_given(
         self, mock_finalizer
     ):
@@ -661,7 +815,6 @@ class TestResourcePool:
         mock_finalizer.assert_not_called()
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
     async def test_ttl_cleanup_should_schedule_resource_removal(self):
         """Test TTL-based cleanup schedules and executes properly.
 
@@ -682,38 +835,23 @@ class TestResourcePool:
 
         key = "ttl-test"
 
-        # Create an event to control when the mocked sleep completes
-        sleep_event = asyncio.Event()
-
-        async def mock_sleep(_delay):
-            # Wait for the test to signal that sleep should complete
-            await sleep_event.wait()
-
-        with patch.object(rp.asyncio, "sleep", side_effect=mock_sleep):
-            # Act
-            # Acquire and immediately release
-            async with pool.get(key) as resource:
-                assert resource is mock_resource
-                assert pool.stats.total_entries == 1
-                assert pool.stats.referenced_entries == 1
-
-            # Resource should still be in cache but with cleanup task scheduled
+        # Act
+        # Acquire and immediately release
+        async with pool.get(key) as resource:
+            assert resource is mock_resource
             assert pool.stats.total_entries == 1
-            assert pool.stats.referenced_entries == 0
-            assert pool.stats.pending_cleanup == 1
+            assert pool.stats.referenced_entries == 1
 
-            # At this point, cleanup task is waiting for our mocked sleep
-            # Resource should still be in cache
-            assert pool.stats.total_entries == 1
-            mock_finalizer.assert_not_called()
-
-            # Signal that sleep should complete
-            sleep_event.set()
+        # Resource should still be in cache with cleanup deferred
+        assert pool.stats.total_entries == 1
+        assert pool.stats.referenced_entries == 0
+        assert pool.stats.pending_cleanup == 1
+        mock_finalizer.assert_not_called()
 
         # Assert
         # Wait for cleanup to complete using polling with timeout
         start_time = time.time()
-        while (key in pool.pending_cleanup) and (time.time() - start_time < 0.5):
+        while (key in pool.pending_cleanup) and (time.time() - start_time < 2.0):
             await asyncio.sleep(0.01)
 
         # Resource should now be cleaned up
@@ -721,7 +859,6 @@ class TestResourcePool:
         mock_finalizer.assert_called_once_with(mock_resource)
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
     async def test_ttl_cleanup_should_be_cancelled_when_reacquired(self):
         """Test TTL cleanup is cancelled when resource is reacquired.
 
@@ -767,7 +904,6 @@ class TestResourcePool:
         assert pool.stats.referenced_entries == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
     async def test_stats_should_return_accurate_counts(self):
         """Test stats method returns accurate cache statistics.
 
@@ -777,14 +913,14 @@ class TestResourcePool:
             Stats property is accessed
         Then:
             Should return accurate counts for entries, references, and pending
-            tasks
+            timers or tasks
         """
         # Arrange
         mock_factory = Mock()
         mock_finalizer = AsyncMock()
         pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=0.1)
 
-        # Start with empty pool
+        # Guard: a fresh pool reports zero across all stats.
         stats = pool.stats
         assert stats.total_entries == 0
         assert stats.referenced_entries == 0
@@ -804,7 +940,6 @@ class TestResourcePool:
                     assert stats.pending_cleanup == 0  # None scheduled yet
 
     @pytest.mark.asyncio
-    @pytest.mark.dependency("TestResourcePool::test_get_should_return_resource_instance")
     async def test_async_context_manager_should_clear_resources(self):
         """Test ResourcePool as async context manager clears all on exit.
 
@@ -834,72 +969,34 @@ class TestResourcePool:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("ttl", [0, 0.1, 1, 1.1, 10, 10.1])
     async def test_ttl_should_schedule_cleanup_based_on_value(self, ttl):
-        """Test specific TTL values with controlled sleep mocking.
+        """Test specific TTL values defer or run cleanup accordingly.
 
         Given:
             A pool with specific TTL value
         When:
             A resource is acquired and released
         Then:
-            Should schedule cleanup based on TTL value
+            It should finalize immediately for TTL 0 and defer
+            cleanup for positive TTLs
         """
         # Arrange
-        sleep_calls = []
-        cleanup_started = asyncio.Event()
-        finalizer_called = asyncio.Event()
+        mock_factory = Mock(return_value=Mock(name="test-obj"))
+        mock_finalizer = Mock()
+        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=ttl)
 
-        async def mock_sleep(delay):
-            sleep_calls.append(delay)
-            if delay != 0:  # Only signal for non-zero delays (actual TTL sleeps)
-                cleanup_started.set()
-                # Wait briefly to ensure the test can check the finalizer state
-                await finalizer_called.wait()
-            # Don't actually sleep, just record the call
+        # Act
+        async with pool.get("test-key"):
+            pass
 
-        # Act & assert
-        # Patch asyncio.sleep globally to ensure it captures calls from background tasks
-        with patch("asyncio.sleep", side_effect=mock_sleep):
-            mock_factory = Mock(return_value=Mock(name="test-obj"))
-
-            def mock_finalizer_func(obj):
-                finalizer_called.set()
-
-            mock_finalizer = Mock(side_effect=mock_finalizer_func)
-
-            pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=ttl)
-
-            async with pool.get("test-key"):
-                pass
-
-            if ttl == 0:
-                # Filter out our own sleep(0) call
-                filtered_calls = [call for call in sleep_calls if call != 0]
-                assert len(filtered_calls) == 0
-                mock_finalizer.assert_called_once()
-            else:
-                # Wait for the background task to actually call sleep with the TTL value
-                try:
-                    await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
-                    # At this point cleanup task is waiting for finalizer_called
-                    # Finalizer should not have been called yet
-                    mock_finalizer.assert_not_called()
-
-                    # Now allow cleanup to proceed
-                    finalizer_called.set()
-
-                    # Wait a bit for cleanup to complete
-                    await asyncio.sleep(0.1)
-                except asyncio.TimeoutError:
-                    # If timeout, just check that sleep was called with TTL
-                    pass
-
-                # Filter out our own sleep(0) calls and any wait_for internal calls
-                filtered_calls = [
-                    call for call in sleep_calls if call != 0 and call == ttl
-                ]
-                assert len(filtered_calls) > 0, (
-                    f"Expected TTL {ttl} not found in sleep calls: {sleep_calls}"
-                )
+        # Assert
+        if ttl == 0:
+            mock_finalizer.assert_called_once()
+            assert pool.stats.total_entries == 0
+            assert pool.stats.pending_cleanup == 0
+        else:
+            mock_finalizer.assert_not_called()
+            assert pool.stats.total_entries == 1
+            assert pool.stats.pending_cleanup == 1
 
     @pytest.mark.asyncio
     async def test_finalizer_should_catch_exception_and_remove_resource(self):
@@ -1203,8 +1300,6 @@ class TestResource:
         mock_pool = AsyncMock()
         mock_pool.acquire.side_effect = RuntimeError("Acquire failed")
 
-        from wool.runtime.resourcepool import Resource
-
         resource = Resource(pool=mock_pool, key="test-key")
 
         # Act & assert
@@ -1228,8 +1323,6 @@ class TestResource:
         """
         # Arrange
         mock_pool = AsyncMock()
-        from wool.runtime.resourcepool import Resource
-
         resource = Resource(pool=mock_pool, key="test-key")
 
         # Act & assert - manually call __aexit__ without calling __aenter__
@@ -1255,8 +1348,6 @@ class TestResource:
         mock_pool = AsyncMock()
         mock_resource = Mock()
         mock_pool.acquire.return_value = mock_resource
-
-        from wool.runtime.resourcepool import Resource
 
         resource = Resource(pool=mock_pool, key="test-key")
 

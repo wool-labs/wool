@@ -1,10 +1,42 @@
-"""Integration tests for worker-loop teardown task draining."""
+"""Integration tests for worker shutdown, reaping, and orphan prevention."""
 
+import asyncio
+import contextlib
+import multiprocessing
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import grpc
+import grpc.aio
 import pytest
+
+from wool.runtime.worker.local import LocalWorker
+from wool.runtime.worker.pool import WorkerPool
+from wool.runtime.worker.process import WorkerProcess
 
 from . import routines
 from .conftest import build_pool_from_scenario
 from .conftest import default_scenario
+
+_PARENT_SCRIPT = """
+import asyncio
+
+from wool.runtime.worker.local import LocalWorker
+
+
+async def main():
+    worker = LocalWorker(shutdown_grace_period=5.0)
+    await worker.start(timeout=30)
+    assert worker.metadata is not None
+    print(worker.metadata.pid, flush=True)
+    await asyncio.sleep(300)
+
+
+asyncio.run(main())
+"""
 
 
 @pytest.mark.integration
@@ -40,3 +72,222 @@ class TestWorkerLoopDrain:
 
         # Assert
         assert sentinel.read_text() == "drained"
+
+
+@pytest.mark.integration
+class TestWorkerOrphanPrevention:
+    @pytest.mark.asyncio
+    async def test_stop_should_leave_no_live_worker_process(self):
+        """Test stop fully reaps the worker subprocess before returning.
+
+        Given:
+            A started LocalWorker backed by a real subprocess.
+        When:
+            stop() is called.
+        Then:
+            It should return only once the worker subprocess no
+            longer exists.
+        """
+        # Arrange
+        worker = LocalWorker(shutdown_grace_period=30.0)
+        await worker.start(timeout=30)
+        assert worker.metadata is not None
+        pid = worker.metadata.pid
+        assert _pid_alive(pid)
+
+        try:
+            # Act
+            await worker.stop(timeout=30)
+
+            # Assert
+            assert not _pid_alive(pid)
+        finally:
+            _ensure_killed(pid)
+
+    def test_worker_should_exit_when_parent_is_killed(self):
+        """Test a worker never outlives an abruptly killed parent.
+
+        Given:
+            A parent process that started a LocalWorker and holds no
+            teardown path.
+        When:
+            The parent is killed with SIGKILL, bypassing all graceful
+            shutdown.
+        Then:
+            The orphaned worker subprocess should detect parent death
+            and exit within the grace window.
+        """
+        # Arrange
+        helper = subprocess.Popen(
+            [sys.executable, "-c", _PARENT_SCRIPT],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        worker_pid = None
+        try:
+            assert helper.stdout is not None
+            worker_pid = int(helper.stdout.readline().strip())
+            assert _pid_alive(worker_pid)
+
+            # Act
+            helper.kill()
+            helper.wait(timeout=10)
+
+            # Assert
+            deadline = time.monotonic() + 15.0
+            while _pid_alive(worker_pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert not _pid_alive(worker_pid)
+        finally:
+            if helper.poll() is None:
+                helper.kill()
+                helper.wait(timeout=10)
+            _ensure_killed(worker_pid)
+
+    @pytest.mark.asyncio
+    async def test_pool_exit_should_leave_no_live_worker_processes(self):
+        """Test pool teardown reaps every spawned worker process.
+
+        Given:
+            An ephemeral WorkerPool with two spawned local workers.
+        When:
+            The pool context exits normally.
+        Then:
+            It should leave no worker subprocess alive.
+        """
+        # Arrange
+        before = {child.pid for child in multiprocessing.active_children()}
+        spawned = []
+
+        try:
+            # Act
+            async with WorkerPool("orphan-test", spawn=2):
+                spawned = [
+                    child.pid
+                    for child in multiprocessing.active_children()
+                    if child.pid not in before
+                ]
+                assert len(spawned) == 2
+
+            # Assert
+            for pid in spawned:
+                assert not _pid_alive(pid)
+        finally:
+            for pid in spawned:
+                _ensure_killed(pid)
+
+    @pytest.mark.asyncio
+    async def test_pool_exit_should_tolerate_crashed_worker(self):
+        """Test pool teardown survives a worker that already died.
+
+        Given:
+            An entered single-worker pool whose worker subprocess was
+            killed mid-context.
+        When:
+            The pool context exits.
+        Then:
+            It should complete teardown without raising and leave the
+            worker's corpse reaped.
+        """
+        # Arrange
+        before = {child.pid for child in multiprocessing.active_children()}
+        spawned = []
+
+        try:
+            # Act
+            async with WorkerPool("orphan-test", spawn=1):
+                spawned = [
+                    child.pid
+                    for child in multiprocessing.active_children()
+                    if child.pid not in before
+                ]
+                assert len(spawned) == 1
+                os.kill(spawned[0], signal.SIGKILL)
+                await asyncio.sleep(0.2)
+
+            # Assert
+            assert not _pid_alive(spawned[0])
+        finally:
+            for pid in spawned:
+                _ensure_killed(pid)
+
+    def test_reap_should_terminate_worker_without_stop_rpc(self):
+        """Test reap force-terminates a worker that was never stopped.
+
+        Given:
+            A started real WorkerProcess that never receives a stop
+            RPC.
+        When:
+            reap() is called with a short timeout.
+        Then:
+            It should return with the worker subprocess terminated.
+        """
+        # Arrange
+        process = WorkerProcess(shutdown_grace_period=5.0)
+        process.start(timeout=30)
+        pid = process.pid
+        assert pid is not None
+        assert _pid_alive(pid)
+
+        # Act
+        try:
+            process.reap(timeout=0.5)
+
+            # Assert
+            assert not _pid_alive(pid)
+        finally:
+            _ensure_killed(pid)
+
+    @pytest.mark.asyncio
+    async def test_stop_should_kill_unresponsive_worker(self):
+        """Test stop force-kills a worker that cannot respond.
+
+        Given:
+            A started LocalWorker whose subprocess is suspended with
+            SIGSTOP, so it can neither serve the stop RPC nor honor
+            SIGTERM.
+        When:
+            stop() is awaited with a short timeout.
+        Then:
+            It should surface the RPC deadline within a bound and
+            leave the worker subprocess killed, rather than hang on
+            the deadline-less stop RPC.
+        """
+        # Arrange
+        worker = LocalWorker(shutdown_grace_period=5.0)
+        await worker.start(timeout=30)
+        assert worker.metadata is not None
+        pid = worker.metadata.pid
+        assert _pid_alive(pid)
+
+        try:
+            os.kill(pid, signal.SIGSTOP)
+
+            # Act
+            with pytest.raises(grpc.aio.AioRpcError) as excinfo:
+                await asyncio.wait_for(worker.stop(timeout=0.5), timeout=30)
+
+            # Assert
+            assert excinfo.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+            assert not _pid_alive(pid)
+        finally:
+            _ensure_killed(pid)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return whether a process with the given pid currently exists."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _ensure_killed(pid: int | None) -> None:
+    """Best-effort SIGKILL so a failing run cannot leak the orphan under test."""
+    if pid is not None and _pid_alive(pid):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
