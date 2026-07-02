@@ -104,6 +104,7 @@ message Nack {
 service Worker {
     rpc dispatch (stream Request) returns (stream Response);
     rpc stop (StopRequest) returns (Void);
+    rpc idle (Void) returns (IdleTime);
 }
 
 message Request {
@@ -133,6 +134,13 @@ message Response {
 
 message StopRequest {
     float timeout = 1;
+}
+
+message IdleTime {
+    // Seconds the worker has been continuously idle: time since the
+    // in-flight task set last emptied (startup counts as empty).
+    // 0 while any task is in flight; measured on a monotonic clock.
+    double seconds = 1;
 }
 
 message WorkerMetadata {
