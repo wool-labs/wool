@@ -1,8 +1,12 @@
+import asyncio
+from types import MappingProxyType
 from uuid import uuid4
 
 import grpc.aio
 import pytest
+from hypothesis import HealthCheck
 from hypothesis import given
+from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool import protocol
@@ -25,6 +29,28 @@ def _make_metadata(address="127.0.0.1:50051", pid=12345, secure=False) -> Worker
         version="1.0.0",
         secure=secure,
     )
+
+
+def _make_started_process(mocker, *, alive=True):
+    """Build a WorkerProcess mock and patch it into local_module."""
+    mock_process = mocker.MagicMock(spec=WorkerProcess)
+    mock_process.address = "127.0.0.1:50051"
+    mock_process.metadata = _make_metadata()
+    mock_process.start.return_value = None
+    mock_process.is_alive.return_value = alive
+    mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
+    return mock_process
+
+
+def _mock_stop_channel(mocker, *, stop_side_effect=None):
+    """Mock the insecure channel and stub behind the graceful stop RPC."""
+    mock_channel = mocker.MagicMock()
+    mock_channel.close = mocker.AsyncMock()
+    mock_stub = mocker.MagicMock()
+    mock_stub.stop = mocker.AsyncMock(side_effect=stop_side_effect)
+    mocker.patch.object(grpc.aio, "insecure_channel", return_value=mock_channel)
+    mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+    return mock_channel, mock_stub
 
 
 class TestLocalWorker:
@@ -262,10 +288,6 @@ class TestLocalWorker:
             It should use the WorkerMetadata returned by the process
         """
         # Arrange
-        from types import MappingProxyType
-
-        from wool.runtime.worker.metadata import WorkerMetadata
-
         expected_metadata = WorkerMetadata(
             uid=uuid4(),
             address="192.168.1.100:50051",
@@ -352,24 +374,11 @@ class TestLocalWorker:
             It should send gRPC stop request
         """
         # Arrange
-        mock_process = mocker.MagicMock(spec=WorkerProcess)
-        mock_process.address = "127.0.0.1:50051"
-        mock_process.metadata = _make_metadata()
-        mock_process.start.return_value = None
-        mock_process.is_alive.return_value = True
-
-        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
+        _make_started_process(mocker)
+        _, mock_stub = _mock_stop_channel(mocker)
 
         worker = LocalWorker()
         await worker.start()
-
-        mock_channel = mocker.MagicMock()
-        mock_channel.close = mocker.AsyncMock()
-        mock_stub = mocker.MagicMock()
-        mock_stub.stop = mocker.AsyncMock()
-
-        mocker.patch.object(grpc.aio, "insecure_channel", return_value=mock_channel)
-        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
         # Act
         await worker.stop()
@@ -378,24 +387,121 @@ class TestLocalWorker:
         mock_stub.stop.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_stop_does_nothing_if_process_not_alive(self, mocker):
-        """Test _stop does nothing if worker process is not alive.
+    async def test_stop_should_reap_process_after_graceful_stop(self, mocker):
+        """Test stop reaps the worker process after the graceful RPC.
 
         Given:
-            A started LocalWorker with dead process
+            A started LocalWorker whose graceful stop RPC succeeds
+        When:
+            stop() is called with a timeout
+        Then:
+            It should send a stop request carrying that timeout, then
+            reap the worker process with it
+        """
+        # Arrange
+        mock_process = _make_started_process(mocker)
+        _, mock_stub = _mock_stop_channel(mocker)
+
+        worker = LocalWorker()
+        await worker.start()
+
+        teardown = mocker.MagicMock()
+        teardown.attach_mock(mock_stub.stop, "rpc_stop")
+        teardown.attach_mock(mock_process.reap, "reap")
+
+        # Act
+        await worker.stop(timeout=12.5)
+
+        # Assert
+        mock_stub.stop.assert_awaited_once()
+        request = mock_stub.stop.await_args.args[0]
+        assert request.timeout == 12.5
+        mock_process.reap.assert_called_once_with(12.5)
+        # Reap must follow the graceful request: reap-first would park
+        # in join with no stop ever asked of the worker, then SIGTERM
+        # a healthy process.
+        call_names = [name for name, _, _ in teardown.mock_calls]
+        assert call_names.index("rpc_stop") < call_names.index("reap")
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=25,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(timeout=st.floats(min_value=0.125, max_value=4096.0, width=32))
+    async def test_stop_should_bound_rpc_deadline_when_timeout_finite(
+        self, mocker, timeout
+    ):
+        """Test any finite stop timeout yields a strictly larger deadline.
+
+        Given:
+            Any finite positive stop timeout
+        When:
+            stop() is called with it
+        Then:
+            It should forward the timeout in the stop request, bound
+            the RPC by deadline = timeout + _STOP_RPC_MARGIN, and reap
+            with the same timeout
+        """
+        # Arrange
+        mock_process = _make_started_process(mocker)
+        _, mock_stub = _mock_stop_channel(mocker)
+
+        worker = LocalWorker()
+        await worker.start()
+
+        # Act
+        await worker.stop(timeout=timeout)
+
+        # Assert
+        request = mock_stub.stop.await_args.args[0]
+        assert request.timeout == timeout
+        deadline = mock_stub.stop.await_args.kwargs["timeout"]
+        assert deadline == timeout + local_module._STOP_RPC_MARGIN
+        assert deadline > timeout
+        mock_process.reap.assert_called_once_with(timeout)
+
+    @pytest.mark.asyncio
+    async def test_stop_should_reap_process_when_grpc_stop_fails(self, mocker):
+        """Test stop reaps the worker process even if the RPC fails.
+
+        Given:
+            A started LocalWorker whose graceful stop RPC raises
         When:
             stop() is called
         Then:
-            It should not attempt gRPC call
+            It should propagate the error and still reap the process
         """
         # Arrange
-        mock_process = mocker.MagicMock(spec=WorkerProcess)
-        mock_process.address = "127.0.0.1:50051"
-        mock_process.metadata = _make_metadata()
-        mock_process.start.return_value = None
-        mock_process.is_alive.return_value = False
+        mock_process = _make_started_process(mocker)
+        mock_channel, _ = _mock_stop_channel(
+            mocker, stop_side_effect=Exception("gRPC error")
+        )
 
-        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
+        worker = LocalWorker()
+        await worker.start()
+
+        # Act & assert
+        with pytest.raises(Exception, match="gRPC error"):
+            await worker.stop()
+
+        mock_process.reap.assert_called_once_with(None)
+        mock_channel.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_should_reap_process_when_not_alive(self, mocker):
+        """Test stop reaps the worker process even when already dead.
+
+        Given:
+            A started LocalWorker whose process is no longer alive
+        When:
+            stop() is called
+        Then:
+            It should skip the RPC but still reap the process
+        """
+        # Arrange
+        mock_process = _make_started_process(mocker, alive=False)
 
         worker = LocalWorker()
         await worker.start()
@@ -407,43 +513,71 @@ class TestLocalWorker:
 
         # Assert
         mock_channel_fn.assert_not_called()
+        mock_process.reap.assert_called_once_with(None)
 
     @pytest.mark.asyncio
-    async def test_stop_handles_grpc_errors_gracefully(self, mocker):
-        """Test _stop handles gRPC errors without crashing.
+    async def test_stop_should_not_set_rpc_deadline_when_timeout_none(self, mocker):
+        """Test stop leaves the graceful RPC unbounded without a timeout.
 
         Given:
-            A started LocalWorker where gRPC call fails
+            A started LocalWorker whose graceful stop RPC succeeds
         When:
-            stop() is called
+            stop() is called without a timeout
         Then:
-            It should handle the error gracefully
+            It should send the stop request with no gRPC deadline and
+            reap without a bound override
         """
         # Arrange
-        mock_process = mocker.MagicMock(spec=WorkerProcess)
-        mock_process.address = "127.0.0.1:50051"
-        mock_process.metadata = _make_metadata()
-        mock_process.start.return_value = None
-        mock_process.is_alive.return_value = True
-
-        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
+        mock_process = _make_started_process(mocker)
+        _, mock_stub = _mock_stop_channel(mocker)
 
         worker = LocalWorker()
         await worker.start()
 
-        mock_channel = mocker.MagicMock()
-        mock_channel.close = mocker.AsyncMock()
-        mock_stub = mocker.MagicMock()
-        mock_stub.stop = mocker.AsyncMock(side_effect=Exception("gRPC error"))
+        # Act
+        await worker.stop()
 
-        mocker.patch.object(grpc.aio, "insecure_channel", return_value=mock_channel)
-        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        # Assert
+        mock_stub.stop.assert_awaited_once()
+        assert mock_stub.stop.await_args.kwargs["timeout"] is None
+        mock_process.reap.assert_called_once_with(None)
 
-        # Act & assert
-        with pytest.raises(Exception, match="gRPC error"):
-            await worker.stop()
+    @pytest.mark.asyncio
+    async def test_stop_should_reap_process_when_cancelled_mid_rpc(self, mocker):
+        """Test stop reaps the worker even when cancelled mid-RPC.
 
-    # === NEW CREDENTIAL TESTS ===
+        Given:
+            A started LocalWorker whose graceful stop RPC never
+            completes
+        When:
+            The stop() task is cancelled while the RPC is in flight
+        Then:
+            It should raise CancelledError to the awaiter and still
+            reap the worker process with the stop timeout
+        """
+        # Arrange
+        mock_process = _make_started_process(mocker)
+
+        worker = LocalWorker()
+        await worker.start()
+
+        rpc_started = asyncio.Event()
+
+        async def hang_forever(request, timeout=None):
+            rpc_started.set()
+            await asyncio.Event().wait()
+
+        _mock_stop_channel(mocker, stop_side_effect=hang_forever)
+
+        # Act
+        stop_task = asyncio.create_task(worker.stop(timeout=3.0))
+        await rpc_started.wait()
+        stop_task.cancel()
+
+        # Assert
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+        mock_process.reap.assert_called_once_with(3.0)
 
     def test___init___with_worker_credentials(self, worker_credentials):
         """Test LocalWorker with WorkerCredentials.
