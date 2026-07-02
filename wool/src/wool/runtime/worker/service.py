@@ -4,6 +4,7 @@ import asyncio
 import logging
 import pickle
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from inspect import isawaitable
@@ -154,11 +155,17 @@ class WorkerService(protocol.WorkerServicer):
     _stopped: asyncio.Event
     _stopping: asyncio.Event
     _loop_pool: ResourcePool[tuple[asyncio.AbstractEventLoop, threading.Thread]]
+    # Monotonic timestamp at which the docket last became empty, or
+    # ``None`` while any task is in flight.
+    _idle_since: float | None
 
     def __init__(self, *, backpressure: BackpressureLike | None = None):
         self._stopped = asyncio.Event()
         self._stopping = asyncio.Event()
         self._docket = set()
+        # Worker startup counts as the initial empty state, so idle is
+        # measured from construction.
+        self._idle_since = time.monotonic()
         self._backpressure = backpressure
         # Strong refs to live ``session.cancel()`` tasks scheduled
         # from ``_propagate_cancel_on_done`` (a gRPC-internal-thread
@@ -571,6 +578,36 @@ class WorkerService(protocol.WorkerServicer):
         await self._stop(timeout=request.timeout)
         return protocol.Void()
 
+    async def idle(
+        self,
+        request: protocol.Void,
+        context: ServicerContext | None,
+    ) -> protocol.IdleTime:
+        """Report how long the worker has been continuously idle.
+
+        Idle is the number of seconds since the in-flight task set
+        (`_docket`) last became empty, with worker startup counting as
+        the initial empty state. While any task is in flight the
+        reported idle time is zero, and the count resets whenever work
+        resumes. Measured against a monotonic clock so a wall-clock
+        adjustment cannot distort it.
+
+        Polling this RPC creates no `DispatchSession` and never touches
+        the docket, so a caller cannot disturb the measurement it reads.
+
+        :param request:
+            The empty protobuf request.
+        :param context:
+            The `grpc.aio.ServicerContext` for this request.
+        :returns:
+            An `IdleTime` carrying the continuous idle duration in
+            seconds.
+        """
+        seconds = (
+            0.0 if self._idle_since is None else time.monotonic() - self._idle_since
+        )
+        return protocol.IdleTime(seconds=seconds)
+
     @staticmethod
     def _create_worker_loop(
         key,
@@ -717,10 +754,21 @@ class WorkerService(protocol.WorkerServicer):
                 StatusCode.UNAVAILABLE, "Worker service is shutting down"
             )
         self._docket.add(session)
+        # Empty -> non-empty edge: work has resumed, so the worker is
+        # no longer idle. The add and this check share a single
+        # main-loop turn (no ``await`` between), so the transition is
+        # race-free against concurrent dispatches.
+        if len(self._docket) == 1:
+            self._idle_since = None
         try:
             yield
         finally:
             self._docket.discard(session)
+            # Non-empty -> empty edge: the in-flight set just drained,
+            # so start counting idle from now. Same single-turn
+            # atomicity as the add-side edge above.
+            if not self._docket:
+                self._idle_since = time.monotonic()
 
     async def _stop(self, *, timeout: float | None = 0) -> None:
         if timeout is not None and timeout < 0:
