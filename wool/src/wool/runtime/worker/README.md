@@ -139,14 +139,14 @@ class ResilientWorker(LocalWorker):
         await super()._start(timeout=timeout)
         self._monitor_task = asyncio.create_task(self._monitor())
 
-    async def _stop(self, timeout=None):
+    async def _stop(self, grace=None):
         if self._monitor_task:
             self._monitor_task.cancel()
             try:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
-        await super()._stop(timeout=timeout)
+        await super()._stop(grace=grace)
 
     async def _restart(self):
         """Replace the dead process, reusing the original port."""

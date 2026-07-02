@@ -752,7 +752,7 @@ class WorkerPool:
                         # The stop outlives the cancellation above, bounded by
                         # what remains of the deadline — see the docstring's
                         # implementation notes.
-                        await worker.stop(timeout=remaining())
+                        await worker.stop(grace=remaining())
 
                 task = asyncio.create_task(start(worker))
                 tasks.append(task)
