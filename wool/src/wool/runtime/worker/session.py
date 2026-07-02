@@ -680,6 +680,18 @@ class DispatchSession:
                 # nudge to escape an otherwise-indefinite await on
                 # a frame that will never arrive.
                 response_queue.close()
+                # Drop the session's strong reference to the completed
+                # worker task. ``_run`` closes over ``self``, so
+                # ``session -> _worker_task -> coro -> session`` forms a
+                # cycle reclaimable only by the cyclic GC; clearing the
+                # reference here breaks it so refcounting reclaims the
+                # session, task, and per-fork contexts promptly instead
+                # of letting them accumulate between GC passes. Safe
+                # because ``_worker_task`` is already ``None`` before
+                # scheduling and on a scheduling failure, so every reader
+                # must already tolerate ``None``; clearing it here adds no
+                # state a correct reader isn't already guarding against.
+                self._worker_task = None
 
             task.add_done_callback(_on_done)
 
