@@ -11,7 +11,9 @@ so the handler can drive a real :func:`scoped` routine across loops.
 from __future__ import annotations
 
 import asyncio
+import gc
 import threading
+import weakref
 from uuid import uuid4
 
 import pytest
@@ -908,6 +910,181 @@ class TestDispatchSession:
         # "drain returns promptly" assertion — the test would hang
         # otherwise.
         assert results == []
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_reclaim_worker_task_on_natural_completion(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test a completed worker driver task is reclaimed by
+        refcounting alone when a coroutine routine runs to natural
+        completion.
+
+        Given:
+            A handler driving a coroutine routine, with the session
+            strongly retained for the whole test (modelling a completed
+            session a separate holder keeps alive) and automatic cyclic
+            GC disabled
+        When:
+            The dispatch runs to natural (non-cancelled) completion and
+            the last external reference to the worker driver task is
+            dropped
+        Then:
+            It should let refcounting reclaim the worker driver task — a
+            weakref to it clears without a forced ``gc.collect()`` and
+            without automatic collection — proving the completed task's
+            done-callback severed the ``session -> worker task ->
+            coroutine -> session`` cycle so the retained session no
+            longer pins the task (and its per-fork contexts) through the
+            reference cycle until the next GC pass.
+        """
+        # Arrange
+        task = _make_task(_coro_returning_default)
+        stream = _stream(_request_for(task))
+        handler = DispatchSession(stream, worker_loop)
+        await handler.__aenter__()
+        try:
+            iterator = aiter(handler)
+
+            # Capture the worker driver task as a public observable while
+            # it is suspended on the request queue, before the dispatch
+            # drives it — ``asyncio.all_tasks`` exposes the scheduled
+            # worker task and the driver runs ``_run``, so its coroutine
+            # qualname distinguishes it from any in-flight per-step task.
+            driver = None
+            for _ in range(500):
+                drivers = [
+                    t
+                    for t in asyncio.all_tasks(loop=worker_loop)
+                    if "_run" in t.get_coro().__qualname__
+                ]
+                if drivers:
+                    driver = drivers[0]
+                    break
+                await asyncio.sleep(0.01)
+            assert driver is not None, "worker driver task was never scheduled"
+            worker_task_ref = weakref.ref(driver)
+            del driver, drivers
+
+            # Act — with automatic GC disabled, only refcounting can
+            # reclaim the finished task. Drive the coroutine to natural
+            # completion, release the produced responses, and drain so the
+            # driver returns normally (its done-callback drops the
+            # session's reference to it).
+            gc.disable()
+            try:
+                results = [r async for r in iterator]
+                assert len(results) == 1
+                assert results[0].payload == "coroutine_value"
+                del results
+                await asyncio.wait_for(handler.drain(), timeout=2.0)
+
+                # Assert — the session is still strongly held; if it kept
+                # pointing at the task (the pre-fix cycle) the weakref
+                # would survive with GC off. The fix drops that reference
+                # on natural completion, so refcounting clears the weakref.
+                for _ in range(200):
+                    if worker_task_ref() is None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert worker_task_ref() is None, (
+                    "a retained session must not pin its naturally "
+                    "completed worker driver task — refcounting should "
+                    "reclaim it without a forced gc.collect() or an "
+                    "automatic collection"
+                )
+            finally:
+                gc.enable()
+        finally:
+            await handler.__aexit__(None, None, None)
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_reclaim_worker_task_without_forced_gc_when_retained(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test a completed worker driver task is reclaimed by
+        refcounting alone even while the session is retained.
+
+        Given:
+            A handler whose worker driver task is live on the worker
+            loop, with the session strongly retained for the whole test
+            (modelling a completed session a separate holder keeps
+            alive) and automatic cyclic GC disabled
+        When:
+            The dispatch completes and the last external reference to
+            the worker driver task is dropped
+        Then:
+            It should let refcounting reclaim the worker driver task
+            immediately — a weakref to it clears without a forced
+            ``gc.collect()`` and without automatic collection — proving
+            the retained session no longer pins the task (and its
+            per-fork contexts) through the reference cycle until the
+            next GC pass.
+        """
+        # Arrange — a never-returning coroutine keeps the worker driver
+        # task live on the worker loop long enough to capture a public
+        # handle to it via ``asyncio.all_tasks``.
+        task = _make_task(_slow_coro)
+        stream = _stream(_request_for(task))
+        handler = DispatchSession(stream, worker_loop)
+        await handler.__aenter__()
+        try:
+            iterator = aiter(handler)
+            pull = asyncio.ensure_future(anext(iterator))
+
+            # Capture the worker driver task as a public observable —
+            # ``asyncio.all_tasks`` exposes the scheduled worker task and
+            # the driver runs ``_run``, so its coroutine qualname
+            # distinguishes it from any in-flight per-step task.
+            driver = None
+            for _ in range(500):
+                drivers = [
+                    t
+                    for t in asyncio.all_tasks(loop=worker_loop)
+                    if "_run" in t.get_coro().__qualname__
+                ]
+                if drivers:
+                    driver = drivers[0]
+                    break
+                await asyncio.sleep(0.01)
+            assert driver is not None, "worker driver task was never scheduled"
+            worker_task_ref = weakref.ref(driver)
+            del driver, drivers
+
+            # Act — with automatic GC disabled, only refcounting can
+            # reclaim the finished task. Complete the dispatch (cancel
+            # drives the worker driver task to completion, whose
+            # done-callback drops the session's reference to it) and
+            # release the last external handle to the iterator's pull.
+            gc.disable()
+            try:
+                await handler.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pull
+                del pull
+                await asyncio.wait_for(handler.drain(), timeout=2.0)
+
+                # Assert — the session is still strongly held; if it kept
+                # pointing at the task (the pre-fix cycle) the weakref
+                # would survive with GC off. The fix drops that
+                # reference, so refcounting clears the weakref.
+                for _ in range(200):
+                    if worker_task_ref() is None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert worker_task_ref() is None, (
+                    "a retained session must not pin its completed worker "
+                    "driver task — refcounting should reclaim it without a "
+                    "forced gc.collect() or an automatic collection"
+                )
+            finally:
+                gc.enable()
+
+            # The session was strongly referenced throughout, so the
+            # reclamation above is attributable to the severed cycle, not
+            # to the session itself being collected.
+            assert handler is not None
+        finally:
+            await handler.__aexit__(None, None, None)
 
     # -- __aexit__ --------------------------------------------------------
 
