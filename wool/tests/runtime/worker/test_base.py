@@ -366,7 +366,7 @@ class ConcreteWorker(Worker):
             extra=MappingProxyType(self._extra),
         )
 
-    async def _stop(self, timeout: float | None):
+    async def _stop(self, grace: float | None):
         """Mock stop implementation."""
         pass
 
@@ -638,10 +638,39 @@ class TestWorker:
         )
 
         # Act
-        await worker.stop(timeout=60.0)
+        await worker.stop(grace=60.0)
 
         # Assert
         mock_stop.assert_called_once_with(60.0)
+
+    @pytest.mark.asyncio
+    async def test_stop_forwards_deprecated_timeout_as_grace(self, mocker):
+        """Test stop accepts the deprecated timeout alias for grace.
+
+        Given:
+            A started Worker with a mocked _stop
+        When:
+            stop is called with the deprecated timeout keyword
+        Then:
+            It should emit a DeprecationWarning and forward the value to
+            _stop as the grace period, preserving backwards
+            compatibility.
+        """
+        # Arrange
+        worker = ConcreteWorker()
+        await worker.start()
+        mock_stop = mocker.patch.object(
+            worker,
+            "_stop",
+            new_callable=mocker.AsyncMock,
+        )
+
+        # Act
+        with pytest.warns(DeprecationWarning):
+            await worker.stop(timeout=7.5)
+
+        # Assert
+        mock_stop.assert_called_once_with(7.5)
 
     @pytest.mark.asyncio
     async def test_stop_allows_restart(self):

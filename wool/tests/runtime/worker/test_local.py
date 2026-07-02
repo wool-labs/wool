@@ -387,16 +387,43 @@ class TestLocalWorker:
         mock_stub.stop.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_stop_forwards_grace_timeout(self, mocker):
+        """Test _stop forwards its grace timeout onto the StopRequest.
+
+        Given:
+            A started LocalWorker with an alive process
+        When:
+            stop() is called with a grace timeout
+        Then:
+            It should send a StopRequest carrying that timeout through
+            the pooled WorkerConnection.
+        """
+        # Arrange
+        _make_started_process(mocker)
+        _, mock_stub = _mock_stop_channel(mocker)
+
+        worker = LocalWorker()
+        await worker.start()
+
+        # Act
+        await worker.stop(grace=7.5)
+
+        # Assert
+        sent = mock_stub.stop.await_args.args[0]
+        assert isinstance(sent, protocol.StopRequest)
+        assert sent.timeout == 7.5
+
+    @pytest.mark.asyncio
     async def test_stop_should_reap_process_after_graceful_stop(self, mocker):
         """Test stop reaps the worker process after the graceful RPC.
 
         Given:
             A started LocalWorker whose graceful stop RPC succeeds
         When:
-            stop() is called with a timeout
+            stop() is called with a grace period
         Then:
-            It should send a stop request carrying that timeout, then
-            reap the worker process with it
+            It should send a stop request carrying that grace period,
+            then reap the worker process with it
         """
         # Arrange
         mock_process = _make_started_process(mocker)
@@ -410,7 +437,7 @@ class TestLocalWorker:
         teardown.attach_mock(mock_process.reap, "reap")
 
         # Act
-        await worker.stop(timeout=12.5)
+        await worker.stop(grace=12.5)
 
         # Assert
         mock_stub.stop.assert_awaited_once()
@@ -429,20 +456,18 @@ class TestLocalWorker:
         deadline=None,
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
-    @given(timeout=st.floats(min_value=0.125, max_value=4096.0, width=32))
-    async def test_stop_should_bound_rpc_deadline_when_timeout_finite(
-        self, mocker, timeout
-    ):
-        """Test any finite stop timeout yields a strictly larger deadline.
+    @given(grace=st.floats(min_value=0.125, max_value=4096.0, width=32))
+    async def test_stop_should_bound_rpc_deadline_when_grace_finite(self, mocker, grace):
+        """Test any finite grace period yields a strictly larger deadline.
 
         Given:
-            Any finite positive stop timeout
+            Any finite positive grace period
         When:
             stop() is called with it
         Then:
-            It should forward the timeout in the stop request, bound
-            the RPC by deadline = timeout + _STOP_RPC_MARGIN, and reap
-            with the same timeout
+            It should forward the grace period in the stop request,
+            bound the RPC by deadline = grace + _STOP_RPC_MARGIN, and
+            reap with the same grace period
         """
         # Arrange
         mock_process = _make_started_process(mocker)
@@ -452,15 +477,15 @@ class TestLocalWorker:
         await worker.start()
 
         # Act
-        await worker.stop(timeout=timeout)
+        await worker.stop(grace=grace)
 
         # Assert
         request = mock_stub.stop.await_args.args[0]
-        assert request.timeout == timeout
+        assert request.timeout == grace
         deadline = mock_stub.stop.await_args.kwargs["timeout"]
-        assert deadline == timeout + local_module._STOP_RPC_MARGIN
-        assert deadline > timeout
-        mock_process.reap.assert_called_once_with(timeout)
+        assert deadline == grace + local_module._STOP_RPC_MARGIN
+        assert deadline > grace
+        mock_process.reap.assert_called_once_with(grace)
 
     @pytest.mark.asyncio
     async def test_stop_should_reap_process_when_grpc_stop_fails(self, mocker):
@@ -516,13 +541,13 @@ class TestLocalWorker:
         mock_process.reap.assert_called_once_with(None)
 
     @pytest.mark.asyncio
-    async def test_stop_should_not_set_rpc_deadline_when_timeout_none(self, mocker):
-        """Test stop leaves the graceful RPC unbounded without a timeout.
+    async def test_stop_should_not_set_rpc_deadline_when_grace_none(self, mocker):
+        """Test stop leaves the graceful RPC unbounded without a grace period.
 
         Given:
             A started LocalWorker whose graceful stop RPC succeeds
         When:
-            stop() is called without a timeout
+            stop() is called without a grace period
         Then:
             It should send the stop request with no gRPC deadline and
             reap without a bound override
@@ -553,7 +578,7 @@ class TestLocalWorker:
             The stop() task is cancelled while the RPC is in flight
         Then:
             It should raise CancelledError to the awaiter and still
-            reap the worker process with the stop timeout
+            reap the worker process with the grace period
         """
         # Arrange
         mock_process = _make_started_process(mocker)
@@ -570,7 +595,7 @@ class TestLocalWorker:
         _mock_stop_channel(mocker, stop_side_effect=hang_forever)
 
         # Act
-        stop_task = asyncio.create_task(worker.stop(timeout=3.0))
+        stop_task = asyncio.create_task(worker.stop(grace=3.0))
         await rpc_started.wait()
         stop_task.cancel()
 
@@ -747,7 +772,8 @@ class TestLocalWorker:
         await worker.stop()
 
         # Assert
-        mock_insecure_channel.assert_called_once_with("127.0.0.1:50051")
+        mock_insecure_channel.assert_called_once()
+        assert mock_insecure_channel.call_args[0][0] == "127.0.0.1:50051"
 
     @pytest.mark.asyncio
     async def test_stop_with_one_way_tls(self, mocker, worker_credentials_one_way):
