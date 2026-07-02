@@ -1,10 +1,14 @@
 import pytest
+from hypothesis import given
+from hypothesis import settings
+from hypothesis import strategies as st
 
 from wool import protocol
 
 EXPECTED_MESSAGE_EXPORTS = [
     "Ack",
     "ChainManifest",
+    "IdleTime",
     "Message",
     "Nack",
     "Request",
@@ -268,6 +272,43 @@ class TestMessageConstruction:
         parsed = protocol.Nack()
         parsed.ParseFromString(nack.SerializeToString())
         assert parsed.HasField("exception") is False
+
+    def test_idle_time_fields(self):
+        """Test IdleTime carries the idle duration in seconds.
+
+        Given:
+            A seconds value, and the default construction.
+        When:
+            An IdleTime message is constructed with and without a value.
+        Then:
+            The seconds field should hold the value and default to 0.0.
+        """
+        # Arrange, act, & assert
+        assert protocol.IdleTime(seconds=42.5).seconds == 42.5
+        assert protocol.IdleTime().seconds == 0.0
+
+    @settings(max_examples=100)
+    @given(seconds=st.floats(width=64, allow_nan=False, allow_infinity=False))
+    def test_idle_time_roundtrip(self, seconds):
+        """Test IdleTime.seconds survives the wire-format round-trip.
+
+        Given:
+            Any finite double value for the idle duration.
+        When:
+            An IdleTime message is serialized and re-parsed.
+        Then:
+            The seconds field should equal the original exactly — a
+            proto double round-trips losslessly.
+        """
+        # Arrange
+        message = protocol.IdleTime(seconds=seconds)
+
+        # Act
+        parsed = protocol.IdleTime()
+        parsed.ParseFromString(message.SerializeToString())
+
+        # Assert
+        assert parsed.seconds == seconds
 
 
 class TestOneofBehavior:

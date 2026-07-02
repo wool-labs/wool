@@ -184,9 +184,7 @@ class LocalWorker(Worker):
                 # releases the pooled channel this stop acquired. The
                 # provider rides along so the connection resolves
                 # current credential material per call.
-                connection = WorkerConnection(
-                    self.address, credentials=self._provider
-                )
+                connection = WorkerConnection(self.address, credentials=self._provider)
                 try:
                     # Only a bounded drain (positive grace) admits a
                     # finite deadline; a negative grace drains
