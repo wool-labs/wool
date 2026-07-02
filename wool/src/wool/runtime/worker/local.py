@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Final
 
 import grpc.aio
 
@@ -14,6 +15,14 @@ from wool.runtime.worker.process import WorkerProcess
 
 if TYPE_CHECKING:
     from wool.runtime.worker.service import BackpressureLike
+
+_STOP_RPC_MARGIN: Final[float] = 5.0
+"""Seconds added to a finite stop timeout to form the graceful stop
+RPC's deadline. The worker drains in-flight tasks for up to the full
+stop timeout before responding, so the deadline must exceed it; the
+margin covers transport and response overhead. Without a deadline, a
+wedged worker would hang ``stop()`` forever and the force-terminate
+fallback would never be reached."""
 
 
 # public
@@ -117,14 +126,16 @@ class LocalWorker(Worker):
         return self._worker_process.address
 
     async def _start(self, timeout: float | None):
-        """Start the worker process and register it with the pool.
+        """Start the worker subprocess and adopt its metadata.
 
-        Initializes the registrar service, starts the worker process
-        with its gRPC server, and registers the worker's network
-        address with the registrar for discovery by client sessions.
+        Runs the blocking `WorkerProcess.start` in an executor thread
+        and, once the subprocess reports back over its pipe, adopts
+        the reported metadata as this worker's own.
 
         :param timeout:
             Maximum time in seconds to wait for worker process startup.
+        :raises RuntimeError:
+            If the worker process starts without reporting metadata.
         """
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
@@ -135,29 +146,52 @@ class LocalWorker(Worker):
             raise RuntimeError("Worker process failed to start - no metadata")
 
     async def _stop(self, timeout: float | None):
-        """Stop the worker process and unregister it from the pool.
+        """Stop the worker process gracefully, then reap it.
 
-        Unregisters the worker from the registrar service, gracefully
-        shuts down the worker process using a gRPC stop request, and cleans
-        up the registrar service. If graceful shutdown fails, the process
-        is forcefully terminated.
+        Sends the worker a stop RPC bounded by a deadline derived from
+        ``timeout`` (see `_STOP_RPC_MARGIN`), then — however the RPC
+        fared — reaps the subprocess; see `WorkerProcess.reap` for the
+        escalation. The reap runs in an executor thread so it
+        completes even when this coroutine is cancelled; only a second
+        cancellation landing while the executor job is still queued
+        can skip it, in which case the worker-side parent watchdog
+        remains the backstop against orphans.
 
-        For workers configured with :class:`WorkerCredentials`, uses
-        the client credentials to establish a secure connection for the
-        stop operation. For insecure workers, uses an insecure channel.
+        For workers configured with `WorkerCredentials`, uses the
+        client credentials to establish a secure connection for the
+        stop operation. For insecure workers, uses an insecure
+        channel.
+
+        :param timeout:
+            Bound on the worker's graceful drain, forwarded in the
+            stop request. ``None`` waits unbounded for the drain.
         """
-        if self._worker_process.is_alive():
-            assert self.address
+        try:
+            if self._worker_process.is_alive():
+                assert self.address
 
-            # Create appropriate channel based on available credentials
-            if self._credentials is not None:
-                credentials = self._credentials.client_credentials()
-                channel = grpc.aio.secure_channel(self.address, credentials)
-            else:
-                channel = grpc.aio.insecure_channel(self.address)
+                # Create appropriate channel based on available credentials
+                if self._credentials is not None:
+                    credentials = self._credentials.client_credentials()
+                    channel = grpc.aio.secure_channel(self.address, credentials)
+                else:
+                    channel = grpc.aio.insecure_channel(self.address)
 
-            try:
-                stub = protocol.WorkerStub(channel)
-                await stub.stop(protocol.StopRequest(timeout=timeout))
-            finally:
-                await channel.close()
+                try:
+                    stub = protocol.WorkerStub(channel)
+                    # `timeout=None` preserves the caller's explicit
+                    # unbounded-graceful contract; see
+                    # `_STOP_RPC_MARGIN` for the finite deadline.
+                    deadline = (
+                        timeout + _STOP_RPC_MARGIN if timeout is not None else None
+                    )
+                    await stub.stop(
+                        protocol.StopRequest(timeout=timeout), timeout=deadline
+                    )
+                finally:
+                    await channel.close()
+        finally:
+            # `reap` blocks on `join`, so it must run off-loop; see
+            # the docstring for the cancellation contract.
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._worker_process.reap, timeout)

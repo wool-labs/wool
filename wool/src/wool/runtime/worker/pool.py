@@ -242,9 +242,11 @@ class WorkerPool:
         ``shutdown_timeout`` as its per-worker bound, the gather waits
         for whatever time remains, and publisher cleanup gets whatever
         is left. When the deadline elapses, abandoned worker UIDs are
-        logged via ``logging.warning`` and teardown proceeds. ``None``
-        disables the bound and restores the legacy unbounded wait.
-        Must be positive when provided. Defaults to ``60.0``.
+        logged via ``logging.warning`` and teardown proceeds — an
+        abandoned `LocalWorker` is still reaped off-loop (see
+        `LocalWorker._stop`), which can hold ``__aexit__`` past the
+        deadline by up to the reap escalation. ``None`` disables the
+        bound. Must be positive when provided. Defaults to ``60.0``.
     :param lazy:
         When ``True`` (default), defer discovery setup and the quorum
         wait to the first `WorkerProxy.dispatch`.  When ``False``,
@@ -609,9 +611,10 @@ class WorkerPool:
         bind host (see `~wool.DiscoveryPublisherLike.bind_host`);
         bound factories own their binding. Teardown applies the
         pool's ``shutdown_timeout`` as a single deadline across worker
-        stops and publisher cleanup, logging any workers it abandons,
-        and runs even when publisher validation or worker construction
-        fails, so an entered publisher context is never leaked.
+        stops and publisher cleanup, logging any workers it abandons
+        (see ``shutdown_timeout``), and runs even when publisher
+        validation or worker construction fails, so an entered
+        publisher context is never leaked.
 
         :yields:
             Metadata for the spawned workers.

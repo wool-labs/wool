@@ -1,4 +1,7 @@
+import asyncio
+import multiprocessing.context
 import signal
+import threading
 import uuid
 from types import MappingProxyType
 
@@ -18,9 +21,55 @@ from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.process import WorkerProcess
+from wool.runtime.worker.process import _parent_watchdog
 from wool.runtime.worker.process import _sigint_handler
 from wool.runtime.worker.process import _signal_handlers
 from wool.runtime.worker.process import _sigterm_handler
+
+
+def _run_scheduled_callback(scheduled):
+    """Execute the single captured loop callback on a real event loop."""
+    assert len(scheduled) == 1
+
+    async def run():
+        scheduled[0]()
+        # Yield so the task the callback spawned runs to completion.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+@pytest.fixture
+def watchdog_env(mocker):
+    """Arrange a watchdog environment with a dead parent and patched exit.
+
+    Patches parent_process to a mock whose join returns immediately
+    (the parent is already dead) and os._exit to set an event instead
+    of killing the test process. Returns the parent mock, the exit
+    mock, and the exited event.
+    """
+    mock_parent = mocker.MagicMock()
+    mock_parent.join.return_value = None
+    mocker.patch.object(process_module._mp, "parent_process", return_value=mock_parent)
+
+    exited = threading.Event()
+    mock_exit = mocker.patch.object(
+        process_module.os, "_exit", side_effect=lambda code: exited.set()
+    )
+    return mock_parent, mock_exit, exited
+
+
+def _join_watchdog(thread, exited):
+    """Wait out a watchdog thread through its patched hard exit.
+
+    Waiting for the exit event before joining guarantees the patched
+    os._exit is not restored while the thread could still reach it —
+    the real os._exit would kill the test process.
+    """
+    assert thread is not None
+    assert exited.wait(timeout=5.0)
+    thread.join(timeout=5.0)
 
 
 def test__sigterm_handler_calls_service_stop_when_loop_is_running(mocker):
@@ -29,27 +78,30 @@ def test__sigterm_handler_calls_service_stop_when_loop_is_running(mocker):
     Given:
         A running event loop and WorkerService
     When:
-        _sigterm_handler is called with SIGTERM
+        _sigterm_handler is called with SIGTERM and the callback it
+        scheduled on the loop executes
     Then:
-        It should schedule service.stop with timeout=0 via call_soon_threadsafe
+        It should await service.stop with a zero-timeout StopRequest
+        and no context
     """
     # Arrange
+    scheduled = []
     mock_loop = mocker.MagicMock()
     mock_loop.is_running.return_value = True
+    mock_loop.call_soon_threadsafe.side_effect = scheduled.append
     mock_service = mocker.MagicMock()
-
-    mock_stop_request = mocker.MagicMock()
-    mocker.patch(
-        "wool.runtime.worker.process.protocol.StopRequest",
-        return_value=mock_stop_request,
-    )
+    mock_service.stop = mocker.AsyncMock()
 
     # Act
     _sigterm_handler(mock_loop, mock_service, signal.SIGTERM, None)
+    _run_scheduled_callback(scheduled)
 
     # Assert
     mock_loop.is_running.assert_called_once()
-    mock_loop.call_soon_threadsafe.assert_called_once()
+    mock_service.stop.assert_awaited_once()
+    request, context = mock_service.stop.await_args.args
+    assert request.timeout == 0
+    assert context is None
 
 
 def test__sigterm_handler_does_nothing_when_loop_is_not_running(mocker):
@@ -81,27 +133,30 @@ def test__sigint_handler_calls_service_stop_when_loop_is_running(mocker):
     Given:
         A running event loop and WorkerService
     When:
-        _sigint_handler is called with SIGINT
+        _sigint_handler is called with SIGINT and the callback it
+        scheduled on the loop executes
     Then:
-        It should schedule service.stop with timeout=None via call_soon_threadsafe
+        It should await service.stop with a negative-timeout
+        StopRequest — an unbounded drain — and no context
     """
     # Arrange
+    scheduled = []
     mock_loop = mocker.MagicMock()
     mock_loop.is_running.return_value = True
+    mock_loop.call_soon_threadsafe.side_effect = scheduled.append
     mock_service = mocker.MagicMock()
-
-    mock_stop_request = mocker.MagicMock()
-    mocker.patch(
-        "wool.runtime.worker.process.protocol.StopRequest",
-        return_value=mock_stop_request,
-    )
+    mock_service.stop = mocker.AsyncMock()
 
     # Act
     _sigint_handler(mock_loop, mock_service, signal.SIGINT, None)
+    _run_scheduled_callback(scheduled)
 
     # Assert
     mock_loop.is_running.assert_called_once()
-    mock_loop.call_soon_threadsafe.assert_called_once()
+    mock_service.stop.assert_awaited_once()
+    request, context = mock_service.stop.await_args.args
+    assert request.timeout == -1
+    assert context is None
 
 
 def test__sigint_handler_does_nothing_when_loop_is_not_running(mocker):
@@ -213,6 +268,157 @@ async def test__signal_handlers_restores_handlers_even_on_exception(mocker):
     assert signal_calls[3] == (signal.SIGINT, old_sigint)
 
 
+def test__parent_watchdog_should_do_nothing_when_no_parent_process(mocker):
+    """Test _parent_watchdog does nothing outside a multiprocessing child.
+
+    Given:
+        A process that was not spawned by multiprocessing
+    When:
+        _parent_watchdog is called
+    Then:
+        It should return None without starting a watchdog thread
+    """
+    # Arrange
+    mock_loop = mocker.MagicMock()
+    mock_service = mocker.MagicMock()
+    mocker.patch.object(process_module._mp, "parent_process", return_value=None)
+
+    # Act
+    thread = _parent_watchdog(mock_loop, mock_service, 1.0)
+
+    # Assert
+    assert thread is None
+    mock_loop.call_soon_threadsafe.assert_not_called()
+
+
+def test__parent_watchdog_should_stop_service_and_exit_when_parent_dies(
+    mocker, watchdog_env
+):
+    """Test _parent_watchdog shuts the worker down on parent death.
+
+    Given:
+        A watchdog whose parent process exits immediately and a
+        running event loop
+    When:
+        _parent_watchdog is called
+    Then:
+        It should run on a daemon thread, schedule the service stop
+        on the loop, and hard-exit the process once the grace window
+        elapses
+    """
+    # Arrange
+    mock_parent, mock_exit, exited = watchdog_env
+    mock_loop = mocker.MagicMock()
+    mock_loop.is_running.return_value = True
+    mock_service = mocker.MagicMock()
+
+    # Act
+    thread = _parent_watchdog(mock_loop, mock_service, 0.01)
+
+    # Assert
+    assert thread is not None
+    # The daemon flag is load-bearing: a non-daemon watchdog blocked
+    # on parent.join() would keep every gracefully stopped worker
+    # process alive for as long as its parent lives.
+    assert thread.daemon is True
+    _join_watchdog(thread, exited)
+    mock_parent.join.assert_called_once()
+    mock_loop.call_soon_threadsafe.assert_called_once()
+    mock_exit.assert_called_once_with(1)
+
+
+def test__parent_watchdog_should_still_exit_when_loop_not_running(mocker, watchdog_env):
+    """Test _parent_watchdog hard-exits even with a stopped loop.
+
+    Given:
+        A watchdog whose parent process exits immediately and an
+        event loop that is no longer running
+    When:
+        _parent_watchdog is called
+    Then:
+        It should skip the service stop and still hard-exit the
+        process after the grace window
+    """
+    # Arrange
+    _, mock_exit, exited = watchdog_env
+    mock_loop = mocker.MagicMock()
+    mock_loop.is_running.return_value = False
+    mock_service = mocker.MagicMock()
+
+    # Act
+    thread = _parent_watchdog(mock_loop, mock_service, 0.01)
+
+    # Assert
+    _join_watchdog(thread, exited)
+    mock_loop.call_soon_threadsafe.assert_not_called()
+    mock_exit.assert_called_once_with(1)
+
+
+def test__parent_watchdog_should_dispatch_stop_request_with_zero_timeout(
+    mocker, watchdog_env
+):
+    """Test _parent_watchdog's scheduled callback stops the service.
+
+    Given:
+        A watchdog whose parent process exits immediately and a
+        running event loop
+    When:
+        The callback the watchdog scheduled on the loop executes
+    Then:
+        It should await service.stop with a zero-timeout StopRequest
+        and no context, matching SIGTERM semantics
+    """
+    # Arrange
+    _, _, exited = watchdog_env
+    scheduled = []
+    mock_loop = mocker.MagicMock()
+    mock_loop.is_running.return_value = True
+    mock_loop.call_soon_threadsafe.side_effect = scheduled.append
+    mock_service = mocker.MagicMock()
+    mock_service.stop = mocker.AsyncMock()
+
+    thread = _parent_watchdog(mock_loop, mock_service, 0.01)
+    _join_watchdog(thread, exited)
+
+    # Act
+    _run_scheduled_callback(scheduled)
+
+    # Assert
+    mock_service.stop.assert_awaited_once()
+    request, context = mock_service.stop.await_args.args
+    assert request.timeout == 0
+    assert context is None
+
+
+def test__parent_watchdog_should_still_exit_when_loop_closed_concurrently(
+    mocker, watchdog_env
+):
+    """Test _parent_watchdog survives a loop closing mid-dispatch.
+
+    Given:
+        A watchdog whose parent process exits immediately and a loop
+        that reports running but raises RuntimeError on scheduling
+    When:
+        _parent_watchdog runs through the grace window
+    Then:
+        It should swallow the scheduling error and still hard-exit
+        the process
+    """
+    # Arrange
+    _, mock_exit, exited = watchdog_env
+    mock_loop = mocker.MagicMock()
+    mock_loop.is_running.return_value = True
+    mock_loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
+    mock_service = mocker.MagicMock()
+
+    # Act
+    thread = _parent_watchdog(mock_loop, mock_service, 0.01)
+
+    # Assert
+    _join_watchdog(thread, exited)
+    mock_exit.assert_called_once_with(1)
+
+
 class TestWorkerProcess:
     """Test suite for WorkerProcess."""
 
@@ -283,8 +489,6 @@ class TestWorkerProcess:
         Then:
             It should be an instance of SpawnProcess from the spawn context
         """
-        import multiprocessing.context
-
         # Act
         process = WorkerProcess()
 
@@ -633,7 +837,7 @@ class TestWorkerProcess:
         When:
             start() is called
         Then:
-            It should raise RuntimeError and terminate the process
+            It should raise RuntimeError and reap the process
         """
         # Arrange
         mock_get_meta = mocker.MagicMock()
@@ -647,8 +851,7 @@ class TestWorkerProcess:
         mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
-        mock_terminate = mocker.patch.object(process, "terminate")
-        mock_join = mocker.patch.object(process, "join")
+        mock_reap = mocker.patch.object(process, "reap")
 
         # Act & assert
         with pytest.raises(
@@ -656,8 +859,7 @@ class TestWorkerProcess:
         ):
             process.start(timeout=1.0)
 
-        mock_terminate.assert_called_once()
-        mock_join.assert_called_once()
+        mock_reap.assert_called_once_with(timeout=0)
 
     def test_start_closes_pipe_after_receiving_port(self, mocker):
         """Test start closes the pipe connection after receiving port.
@@ -806,6 +1008,53 @@ class TestWorkerProcess:
         mock_close.assert_called_once()
         mock_service.stopped.wait.assert_called_once()
         mock_server.stop.assert_called_once_with(grace=30.0)
+
+    def test_run_should_install_parent_watchdog(self, mocker):
+        """Test run installs the parent-death watchdog.
+
+        Given:
+            A WorkerProcess with a custom shutdown grace period
+        When:
+            run() is called
+        Then:
+            It should install the parent watchdog once with the
+            running event loop, the worker service, and the grace
+            period
+        """
+        # This pins only the wiring; the behavioral contract is owned
+        # by tests/integration/test_worker_shutdown.py's
+        # test_worker_should_exit_when_parent_is_killed.
+        # Arrange
+        process = WorkerProcess(shutdown_grace_period=30.0)
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch("wool.runtime.worker.process.ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
+
+        mocker.patch.object(process_module, "_signal_handlers")
+        mock_watchdog = mocker.patch.object(process_module, "_parent_watchdog")
+
+        mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        mock_watchdog.assert_called_once()
+        loop_arg, service_arg, grace_arg = mock_watchdog.call_args.args
+        assert isinstance(loop_arg, asyncio.AbstractEventLoop)
+        assert service_arg is mock_service
+        assert grace_arg == 30.0
 
     def test_run_sends_port_through_pipe(self, mocker):
         """Test run sends assigned port through multiprocessing pipe.
@@ -1040,8 +1289,6 @@ class TestWorkerProcess:
             process.run()
 
         mock_stop.assert_called_once_with(grace=45.0)
-
-    # === SINGLE-PORT ARCHITECTURE TESTS ===
 
     def test_serve_insecure_worker_single_port(self, mocker):
         """Test single insecure TCP port for insecure workers.
@@ -1922,3 +2169,168 @@ class TestWorkerProcess:
         # Assert
         assert len(captured_current) == 1
         assert captured_current[0] is None
+
+    def test_reap_should_do_nothing_when_never_started(self, mocker):
+        """Test reap is a no-op for a process that was never started.
+
+        Given:
+            A WorkerProcess that has not been started
+        When:
+            reap() is called
+        Then:
+            It should return without joining or signalling the process
+        """
+        # Arrange
+        process = WorkerProcess()
+        mock_join = mocker.patch.object(process, "join")
+        mock_terminate = mocker.patch.object(process, "terminate")
+
+        # Act
+        process.reap()
+
+        # Assert
+        mock_join.assert_not_called()
+        mock_terminate.assert_not_called()
+
+    def test_reap_should_return_when_process_exits_within_timeout(self, mocker):
+        """Test reap returns without escalating when the process exits.
+
+        Given:
+            A started WorkerProcess that exits within the join timeout
+        When:
+            reap() is called with a timeout
+        Then:
+            It should join with that timeout and not terminate or kill
+        """
+        # Arrange
+        process = WorkerProcess()
+        mocker.patch.object(
+            WorkerProcess, "pid", new_callable=mocker.PropertyMock, return_value=12345
+        )
+        mock_join = mocker.patch.object(process, "join")
+        mocker.patch.object(process, "is_alive", return_value=False)
+        mock_terminate = mocker.patch.object(process, "terminate")
+        mock_kill = mocker.patch.object(process, "kill")
+
+        # Act
+        process.reap(timeout=1.5)
+
+        # Assert
+        mock_join.assert_called_once_with(1.5)
+        mock_terminate.assert_not_called()
+        mock_kill.assert_not_called()
+
+    def test_reap_should_default_timeout_to_grace_period_when_none(self, mocker):
+        """Test reap falls back to the shutdown grace period as its bound.
+
+        Given:
+            A started WorkerProcess with a custom shutdown grace period
+        When:
+            reap() is called without a timeout
+        Then:
+            It should join with the shutdown grace period
+        """
+        # Arrange
+        process = WorkerProcess(shutdown_grace_period=30.0)
+        mocker.patch.object(
+            WorkerProcess, "pid", new_callable=mocker.PropertyMock, return_value=12345
+        )
+        mock_join = mocker.patch.object(process, "join")
+        mocker.patch.object(process, "is_alive", return_value=False)
+
+        # Act
+        process.reap()
+
+        # Assert
+        mock_join.assert_called_once_with(30.0)
+
+    def test_reap_should_not_default_timeout_when_zero(self, mocker):
+        """Test reap treats a zero timeout as an immediate poll.
+
+        Given:
+            A started WorkerProcess with a custom shutdown grace period
+        When:
+            reap() is called with timeout=0
+        Then:
+            It should join with 0 rather than the grace period
+        """
+        # Arrange
+        process = WorkerProcess(shutdown_grace_period=30.0)
+        mocker.patch.object(
+            WorkerProcess, "pid", new_callable=mocker.PropertyMock, return_value=12345
+        )
+        mock_join = mocker.patch.object(process, "join")
+        mocker.patch.object(process, "is_alive", return_value=False)
+
+        # Act
+        process.reap(timeout=0)
+
+        # Assert
+        mock_join.assert_called_once_with(0)
+
+    def test_reap_should_terminate_process_when_graceful_join_times_out(self, mocker):
+        """Test reap escalates to terminate when the process lingers.
+
+        Given:
+            A started WorkerProcess still alive after the graceful join
+        When:
+            reap() is called
+        Then:
+            It should terminate the process and join again with a
+            finite bound, without kill
+        """
+        # Arrange
+        process = WorkerProcess()
+        mocker.patch.object(
+            WorkerProcess, "pid", new_callable=mocker.PropertyMock, return_value=12345
+        )
+        mock_join = mocker.patch.object(process, "join")
+        mocker.patch.object(process, "is_alive", side_effect=[True, False])
+        mock_terminate = mocker.patch.object(process, "terminate")
+        mock_kill = mocker.patch.object(process, "kill")
+
+        # Act
+        process.reap(timeout=0.1)
+
+        # Assert
+        mock_terminate.assert_called_once()
+        assert mock_join.call_args_list[0] == mocker.call(0.1)
+        # A SIGTERM-ignoring worker must not stall reap before the
+        # kill rung, so the post-terminate join must be bounded.
+        post_terminate_bound = mock_join.call_args_list[1].args[0]
+        assert post_terminate_bound is not None
+        assert 0 < post_terminate_bound < float("inf")
+        mock_kill.assert_not_called()
+
+    def test_reap_should_kill_process_when_terminate_fails(self, mocker):
+        """Test reap escalates to kill when termination is ignored.
+
+        Given:
+            A started WorkerProcess still alive after terminate
+        When:
+            reap() is called
+        Then:
+            It should kill the process after terminating it and join
+            a final, unbounded time
+        """
+        # Arrange
+        process = WorkerProcess()
+        mocker.patch.object(
+            WorkerProcess, "pid", new_callable=mocker.PropertyMock, return_value=12345
+        )
+        mock_join = mocker.patch.object(process, "join")
+        mocker.patch.object(process, "is_alive", side_effect=[True, True])
+        mock_terminate = mocker.patch.object(process, "terminate")
+        mock_kill = mocker.patch.object(process, "kill")
+        escalation = mocker.MagicMock()
+        escalation.attach_mock(mock_terminate, "terminate")
+        escalation.attach_mock(mock_kill, "kill")
+
+        # Act
+        process.reap(timeout=0.1)
+
+        # Assert
+        assert escalation.mock_calls == [mocker.call.terminate(), mocker.call.kill()]
+        assert mock_join.call_args_list[0] == mocker.call(0.1)
+        assert mock_join.call_args_list[1].args[0] is not None
+        assert mock_join.call_args_list[2] == mocker.call()
