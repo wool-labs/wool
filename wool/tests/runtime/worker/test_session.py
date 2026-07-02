@@ -216,8 +216,9 @@ def grpc_add_to_server():
 def grpc_servicer():
     service = WorkerService()
     yield service
-    for entry in service._loop_pool._cache.values():
-        service._destroy_worker_loop(entry.obj)
+    # The autouse ``_reap_worker_loops`` fixture (see conftest) reaps
+    # any worker loop a dispatch left warm; see `_WORKER_LOOP_TTL` for
+    # why the pool keeps one warm.
 
 
 @pytest.fixture(scope="function")

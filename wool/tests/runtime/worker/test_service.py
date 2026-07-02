@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import threading
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -52,8 +53,9 @@ def grpc_add_to_server():
 def grpc_servicer():
     service = WorkerService()
     yield service
-    for entry in service._loop_pool._cache.values():
-        service._destroy_worker_loop(entry.obj)
+    # The autouse ``_reap_worker_loops`` fixture (see conftest) reaps
+    # any worker loop a dispatch left warm; see `_WORKER_LOOP_TTL` for
+    # why the pool keeps one warm.
 
 
 @pytest.fixture(scope="function")
@@ -288,6 +290,25 @@ async def _stop_streaming_routine():
         if _stop_cancellation_observed is not None:
             _stop_cancellation_observed.set()
         raise
+
+
+async def _worker_loop_identity_probe():
+    """Report an identity fingerprint of the worker event-loop and its
+    daemon thread that this routine runs on.
+
+    The routine runs on the pooled worker loop — a distinct daemon
+    thread from the gRPC handler loop — so two sequential dispatches
+    through the same service report an identical fingerprint only when
+    the worker loop was kept warm and reused rather than recreated per
+    dispatch. The thread name embeds a monotonic counter that never
+    repeats across thread creations, so it distinguishes a reused
+    thread from a fresh one even if object ids or thread idents are
+    recycled. Defined at module level so cloudpickle can serialize the
+    callable for dispatch.
+    """
+    loop = asyncio.get_running_loop()
+    thread = threading.current_thread()
+    return (id(loop), thread.ident, thread.name)
 
 
 @pytest.fixture
@@ -2116,6 +2137,163 @@ class TestWorkerService:
             assert _drain_cleanup_observed.wait(timeout=5)
         finally:
             _drain_cleanup_observed = None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_reuse_worker_loop_across_sequential_dispatches(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test `WorkerService.dispatch` runs sequential dispatches on a
+        single reused worker event-loop.
+
+        Given:
+            A running `WorkerService` and a routine that reports the
+            identity of the worker event-loop and daemon thread it runs
+            on
+        When:
+            Two dispatches are driven sequentially through the same
+            service
+        Then:
+            It should run both on the same worker loop and daemon
+            thread, proving the loop is kept warm and reused across
+            dispatches rather than created and destroyed per call
+        """
+
+        # Arrange
+        async def dispatch_once(stub):
+            wool_task = make_task(_worker_loop_identity_probe)
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+            return cloudpickle.loads(result.result.dump)
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            first = await dispatch_once(stub)
+            second = await dispatch_once(stub)
+
+        # Assert
+        assert first == second, (
+            "both dispatches must run on the same warm worker loop and "
+            f"daemon thread; observed {first!r} then {second!r} — a "
+            "differing fingerprint means the loop was recreated per "
+            "dispatch instead of reused"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_should_reap_warm_worker_loop_thread(
+        self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache, caplog
+    ):
+        """Test `WorkerService.stop` tears down the warm worker loop and
+        its daemon thread.
+
+        Given:
+            A `WorkerService` that has serviced a dispatch, leaving one
+            worker event-loop and its daemon thread warm across the call
+        When:
+            The stop RPC is invoked
+        Then:
+            It should reap the warm daemon thread so no worker-loop
+            thread outlives the service, signal stopped state, and log
+            no task-factory displacement warning
+        """
+        # Arrange — one dispatch warms a worker loop; the probe reports
+        # the daemon thread it runs on.
+        wool_task = make_task(_worker_loop_identity_probe)
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+            _, _, worker_thread_name = cloudpickle.loads(result.result.dump)
+
+            # The warm loop's daemon thread is still alive after the
+            # dispatch returns — the pool kept it warm across the call.
+            live_before = {t.name for t in threading.enumerate() if t.is_alive()}
+            assert worker_thread_name in live_before
+
+            # Act
+            with caplog.at_level(logging.WARNING, logger="wool.runtime.context.factory"):
+                stop_result = await asyncio.wait_for(
+                    stub.stop(protocol.StopRequest(timeout=5)), 10
+                )
+
+        # Assert
+        assert isinstance(stop_result, protocol.Void)
+        assert grpc_servicer.stopped.is_set()
+        # The warm daemon thread was reaped — no worker-loop thread
+        # leaks past the stopped service.
+        live_after = {t.name for t in threading.enumerate() if t.is_alive()}
+        assert worker_thread_name not in live_after
+        # Clean teardown emits no task-factory displacement warning.
+        assert not any(
+            "task factory has been displaced" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_reap_idle_worker_loop_after_ttl_expiry(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test `WorkerService` reaps the warm worker loop once its idle
+        TTL elapses without an explicit stop.
+
+        Given:
+            A `WorkerService` whose loop pool holds one worker loop warm
+            for a short idle TTL after a dispatch
+        When:
+            The idle TTL elapses with no further dispatch and no stop RPC
+        Then:
+            It should finalize the idle worker loop and reap its daemon
+            thread so no worker-loop thread lingers past the TTL window
+        """
+        # Arrange — a short idle TTL so the warm loop is reaped
+        # promptly. The pool captures the TTL at construction, so patch
+        # the constant before building the service.
+        mocker.patch("wool.runtime.worker.service._WORKER_LOOP_TTL", 0.2)
+        service = WorkerService()
+
+        # Act — one dispatch warms a worker loop on a daemon thread; the
+        # probe reports the thread it runs on.
+        wool_task = make_task(_worker_loop_identity_probe)
+        async with grpc_aio_stub(servicer=service) as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+            _, _, worker_thread_name = cloudpickle.loads(result.result.dump)
+
+            # The warm loop's daemon thread is alive right after the
+            # dispatch returns, well before the short idle TTL elapses.
+            live_names = {t.name for t in threading.enumerate() if t.is_alive()}
+            assert worker_thread_name in live_names
+
+            # The pool schedules its idle reap on the main loop, so
+            # yield to it and poll until the daemon thread is reaped.
+            # Bounded so a regression (idle loop never reaped) fails
+            # rather than hangs.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.0
+            while loop.time() < deadline:
+                await asyncio.sleep(0.05)
+                live_names = {t.name for t in threading.enumerate() if t.is_alive()}
+                if worker_thread_name not in live_names:
+                    break
+
+        # Assert — the idle worker loop was finalized and its daemon
+        # thread reaped once the TTL expired, with no explicit stop.
+        live_after = {t.name for t in threading.enumerate() if t.is_alive()}
+        assert worker_thread_name not in live_after, (
+            "the warm worker loop's daemon thread must be reaped once "
+            "the idle TTL elapses; it is still alive, so the positive "
+            "TTL did not finalize the idle loop"
+        )
 
     @pytest.mark.asyncio
     async def test_dispatch_should_yield_results_in_order_when_async_generator(

@@ -38,6 +38,20 @@ normal chain of ``finally``-scheduled cleanup tasks to unwind, short
 enough not to stall worker-loop teardown; past this timeout the drain
 gives up, with the daemon-thread reap as the backstop."""
 
+_WORKER_LOOP_TTL: Final[float] = 30.0
+"""Idle time-to-live in seconds for the worker event-loop held by
+`WorkerService._loop_pool`. The loop pool is keyed by a single
+constant (``"worker"``), so a positive TTL keeps one worker loop +
+daemon thread warm across dispatches instead of creating and tearing
+one down on every call; recreating the loop per dispatch would add its
+setup/teardown to dispatch latency and strand cleanup callbacks
+scheduled on the torn-down loop. The TTL only bounds how long an
+*idle* loop lingers before automatic teardown; an explicit `stop`
+clears the pool immediately regardless of this value, so no daemon
+thread outlives the service. The 30s window is generous enough to span
+the gap between bursts of dispatches on a healthy worker while still
+reaping a loop that has gone quiet."""
+
 
 # public
 @dataclass(frozen=True)
@@ -169,7 +183,7 @@ class WorkerService(protocol.WorkerServicer):
         self._loop_pool = ResourcePool(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
-            ttl=0,
+            ttl=_WORKER_LOOP_TTL,
         )
 
     @property

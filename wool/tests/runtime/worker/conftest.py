@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import multiprocessing.shared_memory
 import threading
+import time
 import uuid
 from types import MappingProxyType
 from typing import Any
@@ -19,6 +20,7 @@ from pytest_mock import MockerFixture
 
 import wool.runtime.worker.pool as wp
 from tests.helpers import scoped_context
+from wool.runtime.context.factory import _loops_with_factory
 from wool.runtime.context.factory import install_task_factory
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.worker.auth import WorkerCredentials
@@ -98,6 +100,75 @@ def _clear_worker_context():
     wool.__worker_metadata__ = None
     wool.__worker_uds_address__ = None
     wool.__worker_service__.reset(svc_token)
+
+
+@pytest.fixture(autouse=True)
+def _reap_worker_loops():
+    """Stop worker event-loops that a dispatch left warm.
+
+    A test that dispatches through a `WorkerService` without stopping
+    it leaves the service's warm worker loop running on its daemon
+    thread (see `_WORKER_LOOP_TTL` for why the loop pool keeps a loop
+    warm across dispatches). Reap any such loop after the test so it
+    neither leaks a thread across tests nor survives to interpreter
+    exit, where wool's task-factory finalizer logs a spurious
+    displacement warning against the still-running loop.
+
+    Runs as an autouse teardown after the test's explicitly-requested
+    fixtures, so a loop those fixtures already closed (e.g.,
+    `worker_loop`) reads back closed and is skipped — only genuinely
+    leaked worker loops are stopped. A multi-generation residual-task
+    drain — matching the production finalizer
+    `WorkerService._destroy_worker_loop`, so a cancelled task's
+    follow-up cleanup is drained rather than stranded — then a stop is
+    scheduled onto the loop, and the worker thread closes it once
+    ``run_forever`` returns.
+    """
+    yield
+    leaked = [
+        loop
+        for loop in list(_loops_with_factory)
+        if loop.is_running() and not loop.is_closed()
+    ]
+    for loop in leaked:
+
+        async def _shutdown():
+            # Drain successive generations of pending tasks, mirroring
+            # the production finalizer's ``_shutdown``: a cancelled
+            # task's ``finally`` can schedule a second generation, so
+            # cancel -> await -> repeat until none remain (or a bounded
+            # budget elapses), then stop. A single pass would strand
+            # that second generation, surfacing the intermittent
+            # "Task was destroyed but it is pending!" warning.
+            current = asyncio.current_task()
+            deadline = asyncio.get_running_loop().time() + 5.0
+            try:
+                while True:
+                    pending = [t for t in asyncio.all_tasks() if t is not current]
+                    if not pending:
+                        break
+                    for task in pending:
+                        task.cancel()
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending, return_exceptions=True),
+                            timeout=remaining,
+                        )
+                    except TimeoutError:
+                        break
+            finally:
+                asyncio.get_running_loop().stop()
+
+        try:
+            loop.call_soon_threadsafe(lambda loop=loop: loop.create_task(_shutdown()))
+        except RuntimeError:
+            continue
+        deadline = time.monotonic() + 5.0
+        while loop.is_running() and time.monotonic() < deadline:
+            time.sleep(0.005)
 
 
 @pytest.fixture
