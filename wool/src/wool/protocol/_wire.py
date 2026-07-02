@@ -14,6 +14,7 @@ try:
     from wool.protocol.wire_pb2 import ChainManifest
     from wool.protocol.wire_pb2 import ChannelOptions
     from wool.protocol.wire_pb2 import ContextVar
+    from wool.protocol.wire_pb2 import IdleTime
     from wool.protocol.wire_pb2 import Message
     from wool.protocol.wire_pb2 import Nack
     from wool.protocol.wire_pb2 import Request
@@ -57,6 +58,7 @@ __all__ = [
     "ChainManifest",
     "ChannelOptions",
     "ContextVar",
+    "IdleTime",
     "Message",
     "Nack",
     "Request",
