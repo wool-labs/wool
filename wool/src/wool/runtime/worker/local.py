@@ -5,15 +5,13 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Final
 
-import grpc.aio
-
-from wool import protocol
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.process import WorkerProcess
 
 if TYPE_CHECKING:
@@ -158,11 +156,11 @@ class LocalWorker(Worker):
         if self._info is None:
             raise RuntimeError("Worker process failed to start - no metadata")
 
-    async def _stop(self, timeout: float | None):
+    async def _stop(self, grace: float | None):
         """Stop the worker process gracefully, then reap it.
 
         Sends the worker a stop RPC bounded by a deadline derived from
-        ``timeout`` (see `_STOP_RPC_MARGIN`), then — however the RPC
+        ``grace`` (see `_STOP_RPC_MARGIN`), then — however the RPC
         fared — reaps the subprocess; see `WorkerProcess.reap` for the
         escalation. The reap runs in an executor thread so it
         completes even when this coroutine is cancelled; only a second
@@ -170,45 +168,45 @@ class LocalWorker(Worker):
         can skip it, in which case the worker-side parent watchdog
         remains the backstop against orphans.
 
-        For secure workers, resolves the current credentials and dials with
-        the identity-derived channel options (see
-        `WorkerCredentials.identity_channel_options`); for insecure
-        workers, uses an insecure channel.
+        Credential and secure-channel handling for the stop RPC lives
+        on `WorkerConnection.stop`.
 
-        :param timeout:
+        :param grace:
             Bound on the worker's graceful drain, forwarded in the
-            stop request. ``None`` waits unbounded for the drain.
+            stop request; see `WorkerConnection.stop` for its
+            semantics.
         """
         try:
             if self._worker_process.is_alive():
                 assert self.address
 
-                # Create appropriate channel based on available credentials
-                if self._provider is not None:
-                    resolved = await self._provider.credentials
-                    channel = grpc.aio.secure_channel(
-                        self.address,
-                        resolved.client_credentials(),
-                        options=resolved.identity_channel_options(),
-                    )
-                else:
-                    channel = grpc.aio.insecure_channel(self.address)
-
+                # Route the stop RPC through WorkerConnection; ``close``
+                # releases the pooled channel this stop acquired. The
+                # provider rides along so the connection resolves
+                # current credential material per call.
+                connection = WorkerConnection(
+                    self.address, credentials=self._provider
+                )
                 try:
-                    stub = protocol.WorkerStub(channel)
-                    # `timeout=None` preserves the caller's explicit
-                    # unbounded-graceful contract; see
-                    # `_STOP_RPC_MARGIN` for the finite deadline.
-                    deadline = (
-                        timeout + _STOP_RPC_MARGIN if timeout is not None else None
-                    )
-                    await stub.stop(
-                        protocol.StopRequest(timeout=timeout), timeout=deadline
-                    )
+                    # Only a bounded drain (positive grace) admits a
+                    # finite deadline; a negative grace drains
+                    # indefinitely, and ``None`` keeps the pre-existing
+                    # unbounded call. See `_STOP_RPC_MARGIN` for the
+                    # finite deadline.
+                    if grace is None or grace < 0:
+                        deadline = None
+                    else:
+                        deadline = grace + _STOP_RPC_MARGIN
+                    await connection.stop(grace=grace, timeout=deadline)
                 finally:
-                    await channel.close()
+                    await connection.close()
         finally:
             # `reap` blocks on `join`, so it must run off-loop; see
-            # the docstring for the cancellation contract.
+            # the docstring for the cancellation contract. A negative
+            # grace (indefinite drain) must not reach `reap` — a
+            # negative join bound elapses immediately and would
+            # escalate to SIGTERM a worker that just drained cleanly;
+            # `None` falls back to reap's post-stop grace period.
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._worker_process.reap, timeout)
+            reap_timeout = None if grace is not None and grace < 0 else grace
+            await loop.run_in_executor(None, self._worker_process.reap, reap_timeout)
