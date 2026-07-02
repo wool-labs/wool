@@ -17,6 +17,7 @@ import grpc.aio
 
 import wool
 from wool import protocol
+from wool.exceptions import WoolError
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import Serializer
@@ -122,8 +123,28 @@ class TransientRpcError(RpcError):
 
 
 # public
+class IdleUnavailable(WoolError):
+    """Raised when a worker does not implement the idle RPC.
+
+    A worker that predates the idle capability answers the idle RPC
+    with gRPC ``UNIMPLEMENTED``; `WorkerConnection.idle_time`
+    translates that into this typed signal so a polling client can
+    detect an old worker and treat idle reporting as unavailable,
+    distinct from a transient hiccup or an unhealthy peer. It descends
+    from `wool.WoolError` — not `RpcError` — because an absent
+    capability is not an RPC-health fault, so ``except RpcError`` does
+    not catch it.
+    """
+
+
+# public
 class WorkerConnection:
-    """gRPC connection to a worker for task dispatch.
+    """Direct single-worker control surface over a pooled gRPC channel.
+
+    Exposes `dispatch` (task execution), `idle_time` (poll the worker's
+    continuous idle duration), and `stop` (shut the remote worker
+    down). ``close`` is distinct: it releases this connection's local
+    pooled channel, whereas `stop` terminates the remote worker.
 
     Acquires pooled gRPC channels keyed by ``(target, credentials,
     options)``.  Each `dispatch` call obtains a reference-counted
@@ -334,6 +355,76 @@ class WorkerConnection:
                 await _channel_pool.clear(self._uds_key)
             except KeyError:
                 pass
+
+    async def idle_time(self, *, timeout: float | None = None) -> float:
+        """Query how long the remote worker has been continuously idle.
+
+        Returns the worker's reported continuous idle duration; see
+        `WorkerService.idle` for how idle is defined and measured. The
+        call draws a channel from this connection's pool, inheriting
+        its credential and secure-channel handling.
+
+        :param timeout:
+            gRPC call deadline in seconds for the poll. ``None``
+            applies no deadline.
+        :returns:
+            The worker's continuous idle duration in seconds.
+        :raises ValueError:
+            If ``timeout`` is not positive.
+        :raises IdleUnavailable:
+            If the worker predates the idle RPC (gRPC ``UNIMPLEMENTED``).
+        :raises TransientRpcError:
+            If the worker returns a transient RPC error
+            (``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, or
+            ``RESOURCE_EXHAUSTED``).
+        :raises RpcError:
+            If the worker returns any other non-transient RPC error.
+        """
+        if timeout is not None and timeout <= 0:
+            raise ValueError("Idle timeout must be positive")
+        async with _channel_pool.get(self._key) as channel:
+            try:
+                response = await channel.stub.idle(protocol.Void(), timeout=timeout)
+            except grpc.RpcError as error:
+                code = error.code()
+                details = error.details() or str(error)
+                if code == grpc.StatusCode.UNIMPLEMENTED:
+                    raise IdleUnavailable(
+                        "Worker does not implement idle reporting"
+                    ) from error
+                if code in self.TRANSIENT_ERRORS:
+                    raise TransientRpcError(code, details) from error
+                raise RpcError(code, details) from error
+        return response.seconds
+
+    async def stop(self, *, grace: float | None = None) -> None:
+        """Stop the remote worker.
+
+        Sends the stop RPC over a channel drawn from this connection's
+        pool, inheriting its credential and secure-channel handling.
+
+        :param grace:
+            The worker's shutdown grace period in seconds, carried in
+            the stop request. ``None`` (the wire default of ``0``)
+            cancels in-flight tasks immediately; a positive value
+            waits that long for a graceful drain; a negative value
+            waits indefinitely.
+        :raises TransientRpcError:
+            If the worker returns a transient RPC error
+            (``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, or
+            ``RESOURCE_EXHAUSTED``).
+        :raises RpcError:
+            If the worker returns any other non-transient RPC error.
+        """
+        async with _channel_pool.get(self._key) as channel:
+            try:
+                await channel.stub.stop(protocol.StopRequest(timeout=grace))
+            except grpc.RpcError as error:
+                code = error.code()
+                details = error.details() or str(error)
+                if code in self.TRANSIENT_ERRORS:
+                    raise TransientRpcError(code, details) from error
+                raise RpcError(code, details) from error
 
     async def _handshake(
         self,
