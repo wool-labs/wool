@@ -163,10 +163,11 @@ class WorkerPool:
         and the worker stopped regardless — discovery cannot strand a
         worker, but a hanging announcement can consume the deadline and
         cost that worker its graceful drain. A finite value overrides a
-        worker's own shutdown grace period; ``None`` disables the bound,
-        in which case a hanging announcement blocks teardown
-        indefinitely, in keeping with that value's unbounded-wait
-        contract. Must be positive when provided. Defaults to ``60.0``.
+        worker's own shutdown grace period; ``None`` disables the bound
+        and requests an indefinite drain from each worker, in keeping
+        with that value's unbounded-wait contract — a hanging
+        announcement (or task) then blocks teardown indefinitely. Must
+        be positive when provided. Defaults to ``60.0``.
 
         .. caution::
 
@@ -756,8 +757,13 @@ class WorkerPool:
                     finally:
                         # The stop outlives the cancellation above, bounded by
                         # what remains of the deadline — see the docstring's
-                        # implementation notes.
-                        await worker.stop(timeout=remaining())
+                        # implementation notes. An unbounded teardown
+                        # (``shutdown_timeout=None``) asks the worker for an
+                        # indefinite drain, which the stop surface spells as
+                        # a negative grace — ``grace=None`` would mean no
+                        # grace at all.
+                        grace = remaining()
+                        await worker.stop(grace=-1.0 if grace is None else grace)
 
                 task = asyncio.create_task(start(worker))
                 tasks.append(task)

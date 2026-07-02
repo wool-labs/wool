@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import inspect
 import uuid
+import warnings
 from abc import ABC
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -296,11 +297,18 @@ class WorkerLike(Protocol):
         """
         ...
 
-    async def stop(self, *, timeout: float | None = None):
+    async def stop(self, *, grace: float | None = None, timeout: float | None = None):
         """Stop the worker and unregister it from the pool.
 
+        :param grace:
+            The worker's shutdown grace period in seconds — how long to
+            wait for in-flight tasks to drain before cancelling them.
+            ``None`` (the default) applies no grace: in-flight tasks
+            are cancelled immediately. A negative value waits
+            indefinitely for the drain.
         :param timeout:
-            Maximum time in seconds to wait for worker shutdown.
+            Deprecated alias for ``grace``, retained for backwards
+            compatibility; passing it emits a ``DeprecationWarning``.
         :raises RuntimeError:
             If the worker has not been started.
         """
@@ -328,7 +336,7 @@ class Worker(ABC):
                 # Start your worker process
                 self._info = WorkerMetadata(...)
 
-            async def _stop(self, timeout):
+            async def _stop(self, grace):
                 # Clean shutdown
                 ...
 
@@ -408,17 +416,36 @@ class Worker(ABC):
         assert self._info
 
     @final
-    async def stop(self, *, timeout: float | None = None):
+    async def stop(self, *, grace: float | None = None, timeout: float | None = None):
         """Stop the worker and unregister it from the pool.
 
         This method is a final implementation that calls the abstract
         `_stop` method to gracefully shut down the worker process and
         unregister it from the registrar service.
+
+        :param grace:
+            The worker's shutdown grace period in seconds — how long to
+            wait for in-flight tasks to drain before cancelling them.
+            ``None`` (the default) applies no grace: in-flight tasks
+            are cancelled immediately. A negative value waits
+            indefinitely for the drain.
+        :param timeout:
+            Deprecated alias for ``grace``, retained for backwards
+            compatibility; passing it emits a ``DeprecationWarning``.
         """
+        if timeout is not None:
+            warnings.warn(
+                "The 'timeout' parameter of Worker.stop is deprecated; "
+                "use 'grace' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if grace is None:
+                grace = timeout
         if not self._started:
             raise RuntimeError("Worker has not been started")
         try:
-            await self._stop(timeout)
+            await self._stop(grace)
         finally:
             self._started = False
 
@@ -435,10 +462,15 @@ class Worker(ABC):
         ...
 
     @abstractmethod
-    async def _stop(self, timeout: float | None):
+    async def _stop(self, grace: float | None):
         """Implementation-specific worker shutdown logic.
 
         Subclasses must implement this method to handle the graceful
         shutdown of their worker process and cleanup of resources.
+
+        :param grace:
+            The shutdown grace period forwarded by `stop`; see `stop`
+            for the ``None``/positive/negative domain, which
+            implementations must honor.
         """
         ...
