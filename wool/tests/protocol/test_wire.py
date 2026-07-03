@@ -95,18 +95,21 @@ class TestMessageConstruction:
         """Test ChainManifest message field round-trip.
 
         Given:
-            An id hex string and a list of ContextVar entries.
+            An id hex string and a ContextVar entry carrying both its
+            spent wool.Token ids and its unspent (live) wool.Token ids.
         When:
-            A ChainManifest message is constructed.
+            A ChainManifest message is constructed and round-tripped
+            through ``SerializeToString`` / ``ParseFromString``.
         Then:
-            Both fields round-trip correctly and each ContextVar
-            entry preserves its namespace, name, and value. The
-            previous ``consumed_tokens`` repeated field is removed
-            from the wire schema (cross-process token transport is
-            deferred to a separate Wool Token wrapper ride; see
-            issue #231).
+            All fields round-trip correctly: each ContextVar entry
+            preserves its namespace, name, value, and its per-var spent
+            and unspent token ids. Cross-process wool.Token transport
+            rides the chain manifest — each ContextVar entry carries the
+            spent ids for its var (``spent_tokens``) and the ids the
+            receiver's mount may anchor (``unspent_tokens``); there is
+            no manifest-level token field.
         """
-        # Arrange, act, & assert
+        # Arrange
         ctx = protocol.ChainManifest(
             id="abc",
             vars=[
@@ -114,6 +117,8 @@ class TestMessageConstruction:
                     namespace="ns",
                     name="key",
                     value=b"value",
+                    spent_tokens=["tok-1", "tok-2"],
+                    unspent_tokens=["tok-3"],
                 )
             ],
         )
@@ -122,6 +127,19 @@ class TestMessageConstruction:
         entry = ctx.vars[0]
         assert (entry.namespace, entry.name) == ("ns", "key")
         assert entry.value == b"value"
+
+        # Act
+        parsed = protocol.ChainManifest()
+        parsed.ParseFromString(ctx.SerializeToString())
+
+        # Assert
+        assert parsed.id == "abc"
+        assert len(parsed.vars) == 1
+        roundtripped = parsed.vars[0]
+        assert (roundtripped.namespace, roundtripped.name) == ("ns", "key")
+        assert roundtripped.value == b"value"
+        assert list(roundtripped.spent_tokens) == ["tok-1", "tok-2"]
+        assert list(roundtripped.unspent_tokens) == ["tok-3"]
 
     def test_runtime_context_fields_with_dispatch_timeout(self):
         """Test RuntimeContext exposes dispatch_timeout when supplied.

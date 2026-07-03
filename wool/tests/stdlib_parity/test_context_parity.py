@@ -17,7 +17,9 @@ fixture in ``conftest.py``; the ``1 + N``-width tests are pure
 :class:`contextvars.Context` enumeration and need no running loop.
 """
 
+import asyncio
 import contextvars
+import re
 import uuid
 
 import pytest
@@ -31,6 +33,20 @@ pytestmark = pytest.mark.stdlib_parity
 def _unique(stem: str) -> str:
     """Return a process-unique variable name to avoid registry collisions."""
     return f"{stem}_{uuid.uuid4().hex}"
+
+
+def _masked(message: str) -> str:
+    """Mask variable reprs and hex addresses in a reset error message.
+
+    The ``var=<...>`` segment is masked greedily up to the token
+    repr's trailing `` at `` so a nested ``>`` inside the variable
+    repr (wool's carries a namespace) cannot truncate the mask; the
+    remaining ``0x...`` id is masked separately. What survives is the
+    canonical stdlib message skeleton, so masked equality proves the
+    wool message reads identically to stdlib's.
+    """
+    masked = re.sub(r"var=<.*> at ", "var=<VAR> at ", message)
+    return re.sub(r"0x[0-9a-f]+", "0xADDR", masked)
 
 
 def _wool_owned(context: contextvars.Context) -> list[contextvars.ContextVar]:
@@ -124,7 +140,7 @@ class TestResetCrossContextRejection:
         foreign = contextvars.copy_context()
 
         # Act & assert
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="was created in a different Context"):
             foreign.run(lambda: var.reset(token))
 
     @pytest.mark.asyncio
@@ -152,6 +168,72 @@ class TestResetCrossContextRejection:
 
         # Assert
         assert var.get("unset") == "unset"
+
+    @pytest.mark.asyncio
+    async def test_reset_should_succeed_when_minted_and_reset_in_sibling_context(
+        self, make_var
+    ):
+        """Test a token minted and reset inside one sibling context succeeds.
+
+        Given:
+            A context variable and a copy_context() sibling of the
+            current context.
+        When:
+            A token is minted and reset by the same function invoked
+            through the sibling's run().
+        Then:
+            It should reset without raising — the minting context is
+            the resetting context — and the outer context should never
+            observe the value, identically for a stdlib and a wool
+            variable.
+        """
+        # Arrange
+        var = make_var("reset_sibling")
+        sibling = contextvars.copy_context()
+
+        def mint_and_reset() -> str:
+            token = var.set("inner")
+            var.reset(token)
+            return var.get("fallback")
+
+        # Act
+        inner = sibling.run(mint_and_reset)
+
+        # Assert
+        assert inner == "fallback"
+        assert var.get("fallback") == "fallback"
+
+    @pytest.mark.asyncio
+    async def test_reset_should_raise_value_error_when_in_child_task(self, make_var):
+        """Test reset of a parent-minted token in a child task is rejected.
+
+        Given:
+            A context variable set in the parent task, yielding a
+            token.
+        When:
+            A child task created with asyncio.create_task resets the
+            token, and the parent then resets the same token.
+        Then:
+            The child's reset should raise ValueError ("was created in
+            a different Context") while the parent's subsequent reset
+            still succeeds — the rejection consumed nothing —
+            identically for a stdlib and a wool variable.
+        """
+        # Arrange
+        var = make_var("reset_child_task")
+        token = var.set("value")
+
+        async def child() -> None:
+            with pytest.raises(ValueError, match="was created in a different Context"):
+                var.reset(token)
+
+        # Act & assert — the child's reset is rejected, consuming nothing,
+        # so the parent's subsequent reset still succeeds.
+        await asyncio.create_task(child())
+        var.reset(token)
+
+        # Assert
+        assert var.get("fallback") == "fallback"
 
 
 class TestResetWrongVariableRejection:
@@ -200,8 +282,222 @@ class TestTokenSingleUse:
         var.reset(token)
 
         # Act & assert
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="has already been used once"):
             var.reset(token)
+
+
+class TestResetOrderIndependence:
+    @pytest.mark.asyncio
+    async def test_reset_should_apply_captured_state_when_older_token_reset_first(
+        self, make_var
+    ):
+        """Test out-of-order reset applies each token's captured state.
+
+        Given:
+            A context variable set twice, minting token t1 (before
+            "a") and token t2 (before "b").
+        When:
+            t1 is reset first, then t2.
+        Then:
+            It should restore t1's captured unset state first, then
+            t2's captured prior value "a" — each reset applies its own
+            token's snapshot regardless of minting order, identically
+            for a stdlib and a wool variable.
+        """
+        # Arrange
+        var = make_var("order_older_first")
+        token_one = var.set("a")
+        token_two = var.set("b")
+
+        # Act & assert — t1's snapshot is the unset state.
+        var.reset(token_one)
+        assert var.get("fallback") == "fallback"
+
+        # Act & assert — t2's snapshot is the prior value "a".
+        var.reset(token_two)
+        assert var.get("fallback") == "a"
+
+    @pytest.mark.asyncio
+    async def test_reset_should_apply_captured_state_when_newer_token_reset_first(
+        self, make_var
+    ):
+        """Test in-order reset applies each token's captured state.
+
+        Given:
+            A context variable set twice, minting token t1 (before
+            "a") and token t2 (before "b").
+        When:
+            t2 is reset first, then t1.
+        Then:
+            It should restore t2's captured prior value "a" first,
+            then t1's captured unset state, identically for a stdlib
+            and a wool variable.
+        """
+        # Arrange
+        var = make_var("order_newer_first")
+        token_one = var.set("a")
+        token_two = var.set("b")
+
+        # Act & assert — t2's snapshot is the prior value "a".
+        var.reset(token_two)
+        assert var.get("fallback") == "a"
+
+        # Act & assert — t1's snapshot is the unset state.
+        var.reset(token_one)
+        assert var.get("fallback") == "fallback"
+
+    @pytest.mark.asyncio
+    async def test_reset_should_succeed_when_token_superseded_by_later_set(
+        self, make_var
+    ):
+        """Test resetting a token superseded by a later set succeeds.
+
+        Given:
+            A context variable set to "a" yielding a token, then set
+            again to "b" with the newer token discarded.
+        When:
+            The older token alone is reset.
+        Then:
+            It should succeed and restore the token's captured unset
+            state — a later set does not invalidate an outstanding
+            token, identically for a stdlib and a wool variable.
+        """
+        # Arrange
+        var = make_var("order_superseded")
+        token = var.set("a")
+        var.set("b")
+
+        # Act
+        var.reset(token)
+
+        # Assert
+        assert var.get("fallback") == "fallback"
+
+
+class TestResetErrorMessageParity:
+    def test_reset_should_match_stdlib_message_when_arg_is_not_a_token(self):
+        """Test the non-token reset TypeError matches stdlib byte-for-byte.
+
+        Given:
+            A stdlib and a wool context variable.
+        When:
+            reset is called on each with a plain string instead of a
+            token.
+        Then:
+            It should raise TypeError with the exact stdlib message —
+            "expected an instance of Token, got 'x'" — with no masking
+            required.
+        """
+        # Arrange
+        stdlib_var = contextvars.ContextVar(_unique("msg_type"))
+        wool_var = ContextVar(_unique("msg_type"))
+
+        # Act
+        with pytest.raises(TypeError) as stdlib_exc:
+            stdlib_var.reset("x")  # type: ignore[arg-type]
+        with pytest.raises(TypeError) as wool_exc:
+            wool_var.reset("x")  # type: ignore[arg-type]
+
+        # Assert
+        assert str(stdlib_exc.value) == "expected an instance of Token, got 'x'"
+        assert str(wool_exc.value) == str(stdlib_exc.value)
+
+    def test_reset_should_match_stdlib_message_when_token_already_used(self):
+        """Test the double-reset RuntimeError matches stdlib after masking.
+
+        Given:
+            A stdlib and a wool context variable, each set and reset
+            once so its token is consumed.
+        When:
+            Each consumed token is reset a second time.
+        Then:
+            It should raise RuntimeError whose masked message equals
+            the freshly captured stdlib message — including the
+            ``used`` marker inside the token repr.
+        """
+        # Arrange
+        stdlib_var = contextvars.ContextVar(_unique("msg_used"))
+        stdlib_token = stdlib_var.set("value")
+        stdlib_var.reset(stdlib_token)
+        wool_var = ContextVar(_unique("msg_used"))
+        wool_token = wool_var.set("value")
+        wool_var.reset(wool_token)
+
+        # Act
+        with pytest.raises(RuntimeError) as stdlib_exc:
+            stdlib_var.reset(stdlib_token)
+        with pytest.raises(RuntimeError) as wool_exc:
+            wool_var.reset(wool_token)
+
+        # Assert
+        assert "<Token used var=" in str(stdlib_exc.value)
+        assert "<Token used var=" in str(wool_exc.value)
+        assert _masked(str(wool_exc.value)) == _masked(str(stdlib_exc.value))
+
+    def test_reset_should_match_stdlib_message_when_token_from_another_variable(
+        self,
+    ):
+        """Test the wrong-variable ValueError matches stdlib after masking.
+
+        Given:
+            Two stdlib and two wool context variables, with a token
+            minted by the first variable of each pair.
+        When:
+            The second variable of each pair is reset with the first
+            variable's token.
+        Then:
+            It should raise ValueError whose masked message equals the
+            freshly captured stdlib message — "... was created by a
+            different ContextVar".
+        """
+        # Arrange
+        stdlib_minter = contextvars.ContextVar(_unique("msg_wrong_a"))
+        stdlib_other = contextvars.ContextVar(_unique("msg_wrong_b"))
+        stdlib_token = stdlib_minter.set("a")
+        wool_minter = ContextVar(_unique("msg_wrong_a"))
+        wool_other = ContextVar(_unique("msg_wrong_b"))
+        wool_token = wool_minter.set("a")
+
+        # Act
+        with pytest.raises(ValueError) as stdlib_exc:
+            stdlib_other.reset(stdlib_token)
+        with pytest.raises(ValueError) as wool_exc:
+            wool_other.reset(wool_token)
+
+        # Assert
+        assert "was created by a different ContextVar" in str(stdlib_exc.value)
+        assert _masked(str(wool_exc.value)) == _masked(str(stdlib_exc.value))
+
+    def test_reset_should_match_stdlib_message_when_in_foreign_context(self):
+        """Test the cross-context ValueError matches stdlib after masking.
+
+        Given:
+            A stdlib and a wool context variable, each set in the
+            current context, and a copy_context() taken afterwards.
+        When:
+            Each token is reset inside the copy's run() — a different
+            contextvars.Context than the one it was minted in.
+        Then:
+            It should raise ValueError whose masked message equals the
+            freshly captured stdlib message — "... was created in a
+            different Context".
+        """
+        # Arrange
+        stdlib_var = contextvars.ContextVar(_unique("msg_ctx"))
+        stdlib_token = stdlib_var.set("value")
+        wool_var = ContextVar(_unique("msg_ctx"))
+        wool_token = wool_var.set("value")
+        foreign = contextvars.copy_context()
+
+        # Act
+        with pytest.raises(ValueError) as stdlib_exc:
+            foreign.run(lambda: stdlib_var.reset(stdlib_token))
+        with pytest.raises(ValueError) as wool_exc:
+            foreign.run(lambda: wool_var.reset(wool_token))
+
+        # Assert
+        assert "was created in a different Context" in str(stdlib_exc.value)
+        assert _masked(str(wool_exc.value)) == _masked(str(stdlib_exc.value))
 
 
 class TestCopyContextPropagation:
