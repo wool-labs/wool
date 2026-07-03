@@ -641,6 +641,196 @@ async def get_tenant_id() -> str:
 
 
 @wool.routine
+async def reset_tenant_id_token(token) -> str:
+    """Reset a caller-minted TENANT_ID token on the worker.
+
+    The token crosses the wire as an argument; resetting it on the worker
+    both restores TENANT_ID (returned for inspection) and records the token
+    as consumed, which the response frame propagates back so the caller's
+    original token also reads as used — cross-process single-use.
+    """
+    TENANT_ID.reset(token)
+    return TENANT_ID.get()
+
+
+@wool.routine
+async def describe_tenant_id_token(token) -> tuple:
+    """Receive a TENANT_ID token without resetting it.
+
+    Exercises lossless token transport: any token — including an orphan
+    minted in a context the worker is not continuing — must cross the wire,
+    reconstitute into a usable object, and travel back, without raising.
+    Returns the token itself alongside its var's name so the caller can
+    assert the reconstituted object is fully usable.
+    """
+    return token, token.var.name
+
+
+async def _reset_and_report(token) -> tuple:
+    """Reset TENANT_ID by *token* and report the outcome as a two-tuple.
+
+    Shared tail for the report-style token routines: ``("ok",
+    restored_value)`` when the reset succeeds, or ``(type_name, message)``
+    when it raises — so a caller can assert the failure without relying on a
+    builtin exception type surviving the wire.
+    """
+    try:
+        TENANT_ID.reset(token)
+    except Exception as error:
+        return type(error).__name__, str(error)
+    return "ok", TENANT_ID.get()
+
+
+@wool.routine
+async def set_tenant_id_and_return_token(value: str):
+    """Set TENANT_ID on the worker and return the minted token.
+
+    The token rides the response frame back to the caller, whose context
+    continues the worker's (the routine was awaited), so the caller may
+    reset it — restoring the pre-call value — exactly as if the set had
+    happened in an awaited local coroutine.
+    """
+    return TENANT_ID.set(value)
+
+
+@wool.routine
+async def reset_tenant_id_token_report(token) -> tuple:
+    """Attempt to reset a TENANT_ID token on the worker and report the outcome.
+
+    Catch-and-report variant of `reset_tenant_id_token` for cases where
+    the reset is expected to fail — the caller asserts on the reported
+    exception type name and message rather than relying on a builtin
+    exception type surviving the wire. Returns ``(pid, "ok", restored_value)``
+    on success or ``(pid, type_name, message)`` on failure.
+    """
+    return os.getpid(), *await _reset_and_report(token)
+
+
+@wool.routine
+async def reset_and_return_tenant_id_token(token):
+    """Reset a caller-minted TENANT_ID token on the worker and return it.
+
+    The token arrives live, is consumed by the reset, and travels back in
+    the return value already marked used — the caller can assert the used
+    state is visible on the returned copy and that resetting either copy
+    raises the single-use RuntimeError.
+    """
+    TENANT_ID.reset(token)
+    return token
+
+
+@wool.routine
+async def mint_orphan_tenant_id_token():
+    """Mint a TENANT_ID token inside a sibling stdlib context on the worker.
+
+    The set runs inside ``contextvars.copy_context().run``, so no live
+    context continues the minting context — the token is an orphan by
+    construction. It travels back in the return value so the caller can
+    assert lossless transport and the different-Context reset failure.
+    """
+    sibling = contextvars.copy_context()
+    return sibling.run(TENANT_ID.set, "worker-sibling")
+
+
+@wool.routine
+async def relay_reset_tenant_id_token(token) -> str:
+    """Relay a TENANT_ID token through a nested dispatch that resets it.
+
+    The token crosses two hops — caller to outer worker, outer worker to
+    inner worker — before `reset_tenant_id_token` consumes it. The
+    consumed state rides each response frame back so the caller's original
+    token also reads as used.
+    """
+    return await reset_tenant_id_token(token)
+
+
+@wool.routine
+async def nested_reset_then_report(token) -> tuple:
+    """Consume a token via nested dispatch, then retry the reset locally.
+
+    The inner dispatch resets the token; its response frame carries the
+    consumed state back one hop, so the outer worker's local retry must
+    fail the single-use gate. Returns ``(inner_value, type_name, message)``
+    on retry failure or ``(inner_value, "ok", current_value)`` if the retry
+    unexpectedly succeeds.
+    """
+    inner = await reset_tenant_id_token(token)
+    return inner, *await _reset_and_report(token)
+
+
+@wool.routine
+async def outer_mint_inner_reset() -> tuple:
+    """Mint a token on the outer worker and consume it via nested dispatch.
+
+    The outer routine sets TENANT_ID, sends the minted token to
+    `reset_tenant_id_token` on an inner worker (an awaited dispatch,
+    so the inner worker continues the minting context), then retries the
+    reset locally. Returns ``(inner_value, type_name, message)`` on retry
+    failure or ``(inner_value, "ok", current_value)`` if the retry
+    unexpectedly succeeds.
+    """
+    token = TENANT_ID.set("outer-mint")
+    inner = await reset_tenant_id_token(token)
+    return inner, *await _reset_and_report(token)
+
+
+@wool.routine
+async def stream_reset_tenant_id_token(token):
+    """Async generator that resets a caller-minted token between yields.
+
+    Yields the pre-reset TENANT_ID value, resets the token, then yields
+    the restored value. The consumed state rides the step frame back to
+    the caller mid-stream, before the generator is exhausted.
+    """
+    yield TENANT_ID.get()
+    TENANT_ID.reset(token)
+    yield TENANT_ID.get()
+
+
+@wool.routine
+async def set_tenant_id_and_yield_token(value: str, count: int):
+    """Async generator that sets TENANT_ID and yields the minted token first.
+
+    After yielding the token, suspends and yields the current TENANT_ID
+    value *count* times. The token's live anchor must survive each
+    per-yield re-mount so the caller can reset it exactly once after
+    exhaustion.
+    """
+    token = TENANT_ID.set(value)
+    yield token
+    for _ in range(count):
+        await asyncio.sleep(0)
+        yield TENANT_ID.get()
+
+
+@wool.routine
+async def stream_reset_token_twice(token):
+    """Async generator that resets the same token before two yields.
+
+    The first reset consumes the token; the second violates single-use and
+    raises before the second yield, surfacing as a mid-stream dispatch
+    error on the caller's ``__anext__``.
+    """
+    TENANT_ID.reset(token)
+    yield "first"
+    TENANT_ID.reset(token)
+    yield "never"
+
+
+@wool.routine
+async def stream_recv_and_reset():
+    """Async generator that receives a token via ``asend`` and resets it.
+
+    Yields ``"ready"``, receives a caller-minted token on the mid-stream
+    ``asend`` frame, resets it, and yields the restored TENANT_ID value.
+    Exercises token transport and consumption on the ``asend`` path.
+    """
+    received = yield "ready"
+    TENANT_ID.reset(received)
+    yield TENANT_ID.get()
+
+
+@wool.routine
 @context_pattern_aware
 async def stream_tenant_id(count: int):
     """Async generator that yields TENANT_ID.get() *count* times.
