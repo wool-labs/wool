@@ -1,5 +1,4 @@
 import contextvars
-from contextvars import Token
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
 from typing import TYPE_CHECKING
@@ -18,6 +17,7 @@ from wool.runtime.context.exceptions import TaskFactoryDisplaced
 from wool.runtime.context.factory import install_task_factory
 from wool.runtime.context.runtime import RuntimeContext
 from wool.runtime.context.threading import to_thread
+from wool.runtime.context.token import Token
 from wool.runtime.context.var import ContextVar
 from wool.runtime.discovery.base import Discovery
 from wool.runtime.discovery.base import DiscoveryEvent
