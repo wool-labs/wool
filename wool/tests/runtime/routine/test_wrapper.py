@@ -2,6 +2,8 @@ import asyncio
 import warnings
 from inspect import getsourcelines
 from inspect import isasyncgen
+from inspect import isasyncgenfunction
+from inspect import iscoroutinefunction
 
 import pytest
 from hypothesis import HealthCheck
@@ -10,6 +12,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
+import wool
 from wool.runtime.routine.task import do_dispatch
 from wool.runtime.routine.wrapper import routine
 
@@ -198,20 +201,36 @@ def test_routine_with_unavailable_source(
     assert callable(wrapped)
 
 
-@settings(
-    max_examples=20,
-    deadline=None,
-    suppress_health_check=[HealthCheck.function_scoped_fixture],
+def _sync_function(x):
+    """A plain synchronous function — not a valid routine target."""
+    return x * 2
+
+
+def _sync_generator(x):
+    """A synchronous generator function — not a valid routine target."""
+    yield x * 3
+
+
+class _NonRoutineClass:
+    """A class — not a valid routine target."""
+
+
+@settings(max_examples=20, deadline=None)
+@given(
+    invalid=st.sampled_from(
+        [_sync_function, lambda x: x * 2, _sync_generator, _NonRoutineClass]
+    )
 )
-@given(function_type=st.sampled_from(["function", "generator", "class"]))
-def test_routine_with_invalid_types(function_type):
-    """Test @routine rejects invalid callable types.
+def test_routine_with_invalid_types(invalid):
+    """Test @routine rejects non-async callables.
 
     Given:
-        The @routine decorator applied to invalid function types
-        (non-coroutine, sync generator, class).
+        The @routine decorator applied to callables that are neither
+        coroutine nor async generator functions — a plain function, a
+        lambda (always synchronous), a synchronous generator function,
+        and a class.
     When:
-        The decorator is applied.
+        The decorator is applied to the callable.
     Then:
         It should raise ``ValueError``.
     """
@@ -219,23 +238,7 @@ def test_routine_with_invalid_types(function_type):
     with pytest.raises(
         ValueError, match="Expected a coroutine function or async generator function"
     ):
-        match function_type:
-            case "function":
-
-                @routine  # type: ignore[arg-type]
-                def invalid_foo(x: int):
-                    return x * 2
-
-            case "generator":
-
-                @routine  # type: ignore[arg-type]
-                def invalid_bar(x: int):
-                    yield x * 3
-
-            case "class":
-
-                @routine  # type: ignore[arg-type]
-                class InvalidFoo: ...
+        routine(invalid)  # type: ignore[arg-type]
 
 
 @settings(
@@ -1305,3 +1308,451 @@ async def test_routine_with_no_arguments(
     task = mock_proxy_context.dispatch.call_args[0][0]
     expected = f"{bar.__module__}.{bar.__qualname__}:{expected_lineno}"
     assert task.tag == expected
+
+
+@routine
+async def nested_inner(x):
+    """Inner routine awaited by the nested outer routines."""
+    return x + 1
+
+
+@routine
+async def nested_outer(x):
+    """Outer coroutine routine that awaits a nested routine."""
+    return f"outer:{await nested_inner(x)}"
+
+
+@routine
+async def nested_outer_gen(x):
+    """Outer async generator routine that awaits a nested routine."""
+    value = await nested_inner(x)
+    yield f"outer:{value}"
+
+
+@pytest.mark.asyncio
+async def test_routine_with_dispatched_coroutine_callable(
+    mocker: MockerFixture,
+    mock_proxy_context,
+):
+    """Test a dispatched coroutine task carries the decorated wrapper.
+
+    Given:
+        A @routine-decorated module-level coroutine function and a
+        mock proxy bound in context.
+    When:
+        The routine is awaited and dispatched.
+    Then:
+        The task callable should be the decorated wrapper itself,
+        not the raw undecorated function, so the worker-side
+        invocation re-enters the wrapper and nested routines
+        re-dispatch to the pool.
+    """
+
+    # Arrange
+    async def mock_stream():
+        yield 3
+
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
+
+    # Act
+    await foo(1, 2)
+
+    # Assert
+    task = mock_proxy_context.dispatch.call_args[0][0]
+    assert task.callable is foo
+
+
+@pytest.mark.asyncio
+async def test_routine_with_dispatched_async_generator_callable(
+    mocker: MockerFixture,
+    mock_proxy_context,
+):
+    """Test a dispatched async generator task carries the decorated wrapper.
+
+    Given:
+        A @routine-decorated module-level async generator function
+        and a mock proxy bound in context.
+    When:
+        The routine is iterated and dispatched.
+    Then:
+        The task callable should be the decorated wrapper itself —
+        still an async generator function — not the raw undecorated
+        function.
+    """
+
+    # Arrange
+    async def mock_stream():
+        yield 0
+
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
+
+    # Act
+    async for _ in foo_gen(1):
+        pass
+
+    # Assert
+    task = mock_proxy_context.dispatch.call_args[0][0]
+    assert task.callable is foo_gen
+    assert isasyncgenfunction(task.callable)
+
+
+@pytest.mark.parametrize(
+    "call_factory",
+    [
+        lambda: Foo().foo(5),
+        lambda: Foo.bar(5),
+        lambda: Foo.baz(5),
+    ],
+    ids=["instance-method", "classmethod", "staticmethod"],
+)
+@pytest.mark.asyncio
+async def test_routine_with_dispatched_method_callable(
+    call_factory,
+    mocker: MockerFixture,
+    mock_proxy_context,
+):
+    """Test dispatched method tasks carry the decorated wrapper.
+
+    Given:
+        @routine-decorated instance, class, and static methods and a
+        mock proxy bound in context.
+    When:
+        The method is awaited and dispatched.
+    Then:
+        The task callable should be the decorated wrapper object —
+        carrying a ``__wrapped__`` reference — rather than the raw
+        undecorated function.
+    """
+
+    # Arrange
+    async def mock_stream():
+        yield 0
+
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
+
+    # Act
+    await call_factory()
+
+    # Assert
+    task = mock_proxy_context.dispatch.call_args[0][0]
+    assert hasattr(task.callable, "__wrapped__")
+    assert task.callable is not task.callable.__wrapped__
+
+
+@pytest.mark.parametrize(
+    "target, is_async_gen",
+    [(foo, False), (foo_gen, True)],
+    ids=["coroutine", "async-generator"],
+)
+@pytest.mark.asyncio
+async def test_routine_with_by_reference_serialization(
+    target,
+    is_async_gen,
+    mocker: MockerFixture,
+    mock_proxy_context,
+):
+    """Test a dispatched module-level wrapper serializes by reference.
+
+    Given:
+        A dispatched @routine-decorated module-level coroutine or
+        async generator whose task callable was captured from the
+        mock proxy.
+    When:
+        The captured callable is roundtripped through
+        wool.__serializer__.
+    Then:
+        The loaded wrapper should be the routine itself — identity
+        preserved.
+    """
+
+    # Arrange
+    async def mock_stream():
+        yield 0
+
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
+    if is_async_gen:
+        async for _ in target(1):
+            pass
+    else:
+        await target(1, 2)
+    task = mock_proxy_context.dispatch.call_args[0][0]
+
+    # Act
+    loaded = wool.__serializer__.loads(wool.__serializer__.dumps(task.callable))
+
+    # Assert
+    assert loaded is target
+
+
+@pytest.mark.parametrize(
+    "target",
+    [foo, foo_gen],
+    ids=["coroutine", "async-generator"],
+)
+def test_routine_with_raw_function_by_value_serialization(target):
+    """Test a routine's raw undecorated function degrades to a by-value copy.
+
+    Given:
+        The raw undecorated function beneath a @routine-decorated
+        module-level coroutine or async generator, reached through
+        ``__wrapped__``.
+    When:
+        The raw function is roundtripped through wool.__serializer__.
+    Then:
+        It should not survive by reference — its qualname resolves to
+        the wrapper, so it degrades to an unwrapped by-value copy
+        carrying no ``__wrapped__``, which is precisely why dispatching
+        the raw function was the #278 bug.
+    """
+    # Arrange
+    raw = target.__wrapped__
+
+    # Act
+    raw_loaded = wool.__serializer__.loads(wool.__serializer__.dumps(raw))
+
+    # Assert
+    assert raw_loaded is not raw
+    assert not hasattr(raw_loaded, "__wrapped__")
+
+
+def _closure_coroutine_routine():
+    """Build a @routine coroutine that closes over a captured value.
+
+    Its wrapper is not importable, so it serializes by value — the closed-over
+    cell must survive the roundtrip.
+    """
+    captured = 7
+
+    @routine
+    async def closure_coroutine(x):
+        return x + captured
+
+    return closure_coroutine
+
+
+def _closure_async_generator_routine():
+    """Build a @routine async generator that closes over a captured value."""
+    captured = 3
+
+    @routine
+    async def closure_async_generator(x):
+        for i in range(x):
+            yield i + captured
+
+    return closure_async_generator
+
+
+# The callable shapes a routine takes in the wild, each paired with whether its
+# wrapper serializes by reference. A module-level function and an instance or
+# static method resolve to the wrapper by qualname and roundtrip by reference; a
+# classmethod resolves through a fresh bound method and a closure is not
+# importable, so both roundtrip by value. Lambdas are absent by construction —
+# a lambda is synchronous, so @routine rejects it before it can reach here.
+_ROUTINE_KINDS = [
+    (foo, True),
+    (foo_gen, True),
+    (nested_outer, True),
+    (Foo.foo, True),
+    (Foo.foo_gen, True),
+    (Foo.bar.__func__, False),
+    (Foo.bar_gen.__func__, False),
+    (Foo.baz, True),
+    (Foo.baz_gen, True),
+    (_closure_coroutine_routine(), False),
+    (_closure_async_generator_routine(), False),
+]
+
+
+@settings(max_examples=50, deadline=None)
+@given(kind=st.sampled_from(_ROUTINE_KINDS))
+def test_routine_should_roundtrip_to_a_wrapped_routine(kind):
+    """Test a routine of any callable shape roundtrips back wrapped.
+
+    Given:
+        A @wool.routine covering the callable shapes seen in the wild —
+        module-level coroutines and async generators, instance, class,
+        and static methods, and closures capturing a value — each the
+        wrapper object that dispatch ships as the task callable.
+    When:
+        The wrapper is serialized through wool.__serializer__ and loaded
+        back.
+    Then:
+        The loaded object should still be a decorated routine wrapper of
+        the same async flavor, carrying ``__wrapped__`` and never
+        degrading to the raw undecorated function — and, for the
+        importable shapes, the same wrapper by reference.
+    """
+    # Arrange
+    wrapper, by_reference = kind
+    is_async_gen = isasyncgenfunction(wrapper)
+
+    # Act
+    loaded = wool.__serializer__.loads(wool.__serializer__.dumps(wrapper))
+
+    # Assert
+    assert hasattr(loaded, "__wrapped__")
+    assert loaded.__wrapped__ is not loaded
+    assert isasyncgenfunction(loaded) is is_async_gen
+    assert iscoroutinefunction(loaded) is (not is_async_gen)
+    if by_reference:
+        assert loaded is wrapper
+
+
+@pytest.mark.asyncio
+async def test_routine_with_nested_coroutine_dispatch(
+    mocker: MockerFixture,
+    mock_proxy_context,
+):
+    """Test a nested coroutine routine re-dispatches from a local outer body.
+
+    Given:
+        An outer @routine coroutine awaiting an inner @routine, with
+        dispatch disabled via do_dispatch(False) and a mock proxy
+        bound in context.
+    When:
+        The outer routine is awaited.
+    Then:
+        The outer body should run locally while the inner routine
+        dispatches exactly once with the inner decorated wrapper as
+        the task callable.
+    """
+
+    # Arrange
+    async def mock_stream():
+        yield "inner-result"
+
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
+
+    # Act
+    with do_dispatch(False):
+        result = await nested_outer(1)
+
+    # Assert
+    assert result == "outer:inner-result"
+    mock_proxy_context.dispatch.assert_called_once()
+    task = mock_proxy_context.dispatch.call_args[0][0]
+    assert task.callable is nested_inner
+
+
+@pytest.mark.asyncio
+async def test_routine_with_nested_async_generator_dispatch(
+    mocker: MockerFixture,
+    mock_proxy_context,
+):
+    """Test a nested routine re-dispatches from a local async generator.
+
+    Given:
+        An outer @routine async generator awaiting an inner @routine
+        before yielding, with dispatch disabled via do_dispatch(False)
+        and a mock proxy bound in context.
+    When:
+        The outer generator is iterated.
+    Then:
+        The outer body should run locally while the inner routine
+        dispatches exactly once with the inner decorated wrapper as
+        the task callable.
+    """
+
+    # Arrange
+    async def mock_stream():
+        yield "inner-result"
+
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
+
+    # Act
+    with do_dispatch(False):
+        result = []
+        async for value in nested_outer_gen(1):
+            result.append(value)
+
+    # Assert
+    assert result == ["outer:inner-result"]
+    mock_proxy_context.dispatch.assert_called_once()
+    task = mock_proxy_context.dispatch.call_args[0][0]
+    assert task.callable is nested_inner
+
+
+@pytest.mark.asyncio
+async def test_routine_with_closure_serialization(
+    mocker: MockerFixture,
+    mock_proxy_context,
+):
+    """Test a non-importable closure routine survives by-value serialization.
+
+    Given:
+        A @routine-decorated coroutine defined inside the test body,
+        closing over a local variable, whose dispatched task callable
+        was captured from the mock proxy.
+    When:
+        The captured callable is roundtripped through
+        wool.__serializer__ and the loaded wrapper is awaited with
+        dispatch disabled.
+    Then:
+        The loaded wrapper should execute the original body and
+        return the closure-derived value.
+    """
+    # Arrange
+    offset = 10
+
+    @routine
+    async def closure_routine(x):
+        return x + offset
+
+    async def mock_stream():
+        yield 0
+
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_stream())
+    await closure_routine(1)
+    task = mock_proxy_context.dispatch.call_args[0][0]
+
+    # Act
+    loaded = wool.__serializer__.loads(wool.__serializer__.dumps(task.callable))
+    with do_dispatch(False):
+        result = await loaded(5)
+
+    # Assert
+    assert result == 15
+
+
+@pytest.mark.asyncio
+async def test_routine_with_loaded_closure_dispatch(
+    mocker: MockerFixture,
+    mock_proxy_context,
+):
+    """Test a deserialized closure wrapper dispatches itself as the callable.
+
+    Given:
+        A closure @routine's dispatched task callable, roundtripped
+        through wool.__serializer__ into a loaded wrapper.
+    When:
+        The loaded wrapper is awaited under the default dispatch flag
+        with the mock proxy bound in context.
+    Then:
+        It should dispatch exactly once, and the dispatched task
+        callable should be the loaded wrapper itself.
+    """
+    # Arrange
+    offset = 10
+
+    @routine
+    async def closure_routine(x):
+        return x + offset
+
+    async def mock_stream():
+        yield 0
+
+    mock_proxy_context.dispatch = mocker.AsyncMock(
+        side_effect=lambda *args, **kwargs: mock_stream()
+    )
+    await closure_routine(1)
+    task = mock_proxy_context.dispatch.call_args[0][0]
+    loaded = wool.__serializer__.loads(wool.__serializer__.dumps(task.callable))
+    mock_proxy_context.dispatch.reset_mock()
+
+    # Act
+    await loaded(5)
+
+    # Assert
+    mock_proxy_context.dispatch.assert_called_once()
+    dispatched = mock_proxy_context.dispatch.call_args[0][0]
+    assert dispatched.callable is loaded

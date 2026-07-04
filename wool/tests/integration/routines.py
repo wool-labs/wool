@@ -13,6 +13,7 @@ import asyncio
 import contextvars
 import functools
 import inspect
+import os
 from enum import Enum
 from enum import auto
 
@@ -532,6 +533,26 @@ async def nested_gen(n: int):
     """Async generator that yields from ``gen_range``, nested streaming."""
     async for item in gen_range(n):
         yield item
+
+
+@wool.routine
+async def get_pid() -> int:
+    """Coroutine that returns the worker process id.
+
+    Used to observe which worker process executed a dispatch.
+    """
+    return os.getpid()
+
+
+@wool.routine
+async def nested_pid_fanout(n: int) -> tuple:
+    """Report the outer worker's pid and the pids of ``n`` nested dispatches.
+
+    Each nested `get_pid` dispatch goes through the pool rather than
+    self-executing on the outer worker. Returns
+    ``(outer_pid, [inner_pids...])``.
+    """
+    return os.getpid(), [await get_pid() for _ in range(n)]
 
 
 class Routines:
