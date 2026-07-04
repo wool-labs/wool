@@ -10,7 +10,6 @@ import asyncio
 import datetime
 import ipaddress
 import uuid
-from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import fields
@@ -1492,83 +1491,5 @@ def retry_grpc_internal():
                     await asyncio.sleep(_GRPC_INTERNAL_BACKOFF * (2**attempt))
                     continue
                 raise
-
-    return run
-
-
-def _needs_picklable_token(scenario: Scenario) -> bool:
-    """Report whether the scenario resets a token across a nested dispatch.
-
-    The DOWNSTREAM_RESET pattern deposits a reset token for the inner
-    worker via the `_RESET_TOKENS` ContextVar (see ``routines.py``).
-    Now that nested routines genuinely dispatch to the pool (#278), that
-    token must cross the wire — which only succeeds with the picklable
-    `wool.Token` from #231. Until #231 lands, the stdlib
-    `contextvars.Token` cannot pickle, so the reset is dropped at the
-    serialization boundary and the caller observes the un-reset value.
-
-    Gate the affected cases here; remove this guard with #231.
-    """
-    if scenario.shape not in _NESTED_SHAPES:
-        return False
-    patterns = (scenario.ctx_var_1, scenario.ctx_var_2, scenario.ctx_var_3)
-    return ContextVarPattern.DOWNSTREAM_RESET in patterns
-
-
-@dataclass(frozen=True)
-class _KnownBug:
-    """A scenario region that hits a known, still-open bug.
-
-    ``match`` selects the affected scenarios, ``raises`` constrains the
-    expected failure mode so that an unrelated regression in the same
-    region still surfaces as a real failure, and ``reason`` cites the
-    tracking issue. ``retries``/``backoff``/``retryable`` let a transient
-    known bug be retried before it is marked ``xfail``; the default
-    zero-retry entry marks on the first matching failure.
-    """
-
-    match: Callable[[Scenario], bool]
-    raises: tuple[type[BaseException], ...]
-    reason: str
-    retries: int = 0
-    backoff: float = 0.5
-    retryable: Callable[[BaseException], bool] = lambda _: False
-
-
-_KNOWN_BUGS: list[_KnownBug] = [
-    _KnownBug(
-        match=_needs_picklable_token,
-        raises=(AssertionError,),
-        reason="nested DOWNSTREAM_RESET needs the picklable wool.Token (#231)",
-    ),
-]
-
-
-@pytest.fixture
-def xfail_known_bugs():
-    """Run a test body under the known-bug registry.
-
-    Returns an async callable used as ``await xfail_known_bugs(scenario,
-    body)`` where ``body`` is a no-argument async callable holding the
-    test logic. When the scenario matches a ``_KnownBug`` and ``body``
-    raises the registered failure mode, the test is marked ``xfail``
-    (retrying transient matches with exponential backoff first); once the
-    bug is fixed the body passes and the test goes green. Scenarios with
-    no matching bug run ``body`` unguarded, and any exception outside a
-    registered failure mode propagates as a real failure.
-    """
-
-    async def run(scenario, body):
-        bug = next((b for b in _KNOWN_BUGS if b.match(scenario)), None)
-        if bug is None:
-            return await body()
-        for attempt in range(bug.retries + 1):
-            try:
-                return await body()
-            except bug.raises as exc:
-                if bug.retryable(exc) and attempt < bug.retries:
-                    await asyncio.sleep(bug.backoff * (2**attempt))
-                    continue
-                pytest.xfail(bug.reason)
 
     return run
