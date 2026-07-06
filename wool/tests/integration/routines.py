@@ -37,6 +37,11 @@ class ContextVarPattern(Enum):
     UPSTREAM_RESET = auto()
     PER_YIELD = auto()
     MID_STREAM_FORWARD = auto()
+    # The caller mints a token and ferries it via _RESET_TOKENS; the worker
+    # consumes it and immediately re-sets the var. The caller then asserts
+    # the stale token stays rejected — the fresh set must not erase the
+    # consumed id from the chain's spent ledger.
+    TOKEN_REMOTE_RESET_THEN_FRESH_SET = auto()
 
 
 # Module-level wool.ContextVars used by the propagation integration tests.
@@ -112,6 +117,16 @@ def _execute_patterns(patterns, *, step=None):
                     var.reset(tokens[var_name])
             case ContextVarPattern.UPSTREAM_RESET:
                 var.set(f"inner-set-{var_name}")
+            case ContextVarPattern.TOKEN_REMOTE_RESET_THEN_FRESH_SET:
+                # Consume the caller-minted token ferried via
+                # _RESET_TOKENS, then immediately re-set the var. The
+                # fresh set must not erase the consumed id from the
+                # spent ledger — the caller asserts its stale copy
+                # still raises after the response merges home.
+                tokens = _RESET_TOKENS.get()
+                if var_name in tokens:
+                    var.reset(tokens[var_name])
+                var.set(f"fresh-{var_name}")
 
 
 def _pre_nested_setup(patterns):

@@ -710,18 +710,27 @@ def _build_patterns_dict(scenario):
 def _setup_caller_vars(patterns):
     """Set caller-side initial values for patterns that need them.
 
-    Returns a dict of {var_name: token} for cleanup, and a dict of
-    {var_name: initial_value} for later assertion.
+    Returns a dict of {var_name: token} for cleanup, a dict of
+    {var_name: initial_value} for later assertion, and the
+    _RESET_TOKENS reset token (or None) minted when a
+    TOKEN_REMOTE_RESET_THEN_FRESH_SET pattern deposits caller-minted
+    tokens for the worker to consume.
     """
     tokens = {}
     initial_values = {}
+    ferry = {}
     for var_name, pattern in patterns.items():
         var = _CALLER_VARS[var_name]
         if pattern is not ContextVarPattern.NONE:
             initial = f"caller-initial-{var_name}"
             tokens[var_name] = var.set(initial)
             initial_values[var_name] = initial
-    return tokens, initial_values
+        if pattern is ContextVarPattern.TOKEN_REMOTE_RESET_THEN_FRESH_SET:
+            # Mint the token the worker will consume; it rides to the
+            # worker nested inside _RESET_TOKENS' propagated value.
+            ferry[var_name] = var.set(f"remote-reset-{var_name}")
+    ferry_token = routines._RESET_TOKENS.set(ferry) if ferry else None
+    return tokens, initial_values, ferry_token
 
 
 def _assert_caller_vars(patterns, initial_values, *, shape=None):
@@ -803,6 +812,22 @@ def _assert_caller_vars(patterns, initial_values, *, shape=None):
                 # Forward propagation is asserted worker-side per
                 # frame — a mismatch raises a dispatch exception.
                 pass  # validated worker-side during iteration
+            case ContextVarPattern.TOKEN_REMOTE_RESET_THEN_FRESH_SET:
+                # The worker consumed the ferried token (restoring the
+                # caller's initial value) then re-set the var; the
+                # fresh set back-propagates home.
+                assert var.get() == f"fresh-{var_name}", (
+                    f"TOKEN_REMOTE_RESET_THEN_FRESH_SET: expected the "
+                    f"worker's fresh value, got {var.get()!r}"
+                )
+                # The regression this pattern pins: the worker's fresh
+                # set must not have erased the consumed id from the
+                # spent ledger, so the caller's stale copy still
+                # raises. Read the ferry dict back from the var — the
+                # post-merge copy carries the same token id either way.
+                stale = routines._RESET_TOKENS.get()[var_name]
+                with pytest.raises(RuntimeError, match="has already been used once"):
+                    var.reset(stale)
 
 
 def _cleanup_caller_vars(tokens):
@@ -822,9 +847,10 @@ async def invoke_routine(scenario):
     patterns_token = None
     caller_tokens = {}
     initial_values = {}
+    ferry_token = None
     if patterns:
         patterns_token = routines.TEST_PATTERNS.set(patterns)
-        caller_tokens, initial_values = _setup_caller_vars(patterns)
+        caller_tokens, initial_values, ferry_token = _setup_caller_vars(patterns)
 
     try:
         obj = (
@@ -993,6 +1019,8 @@ async def invoke_routine(scenario):
     finally:
         if caller_tokens:
             _cleanup_caller_vars(caller_tokens)
+        if ferry_token is not None:
+            routines._RESET_TOKENS.reset(ferry_token)
         if patterns_token is not None:
             routines.TEST_PATTERNS.reset(patterns_token)
 
@@ -1114,7 +1142,10 @@ def _pairwise_filter(row):
     - D11/D12/D13 (ctx_var_1/2/3): DOWNSTREAM_OVERWRITE,
       DOWNSTREAM_RESET, UPSTREAM_RESET only valid with NESTED_* shapes;
       PER_YIELD and MID_STREAM_FORWARD only valid with ASYNC_GEN_*
-      shapes
+      shapes; TOKEN_REMOTE_RESET_THEN_FRESH_SET only valid with
+      non-nested shapes (on nested shapes non-nested patterns execute
+      on BOTH outer and inner workers, and its ferried token is
+      single-use)
     - D14 (quorum) ABOVE_DEFAULT (quorum=2) requires PoolMode.EPHEMERAL —
       every other pool mode in the builder produces only one worker, so
       quorum=2 would block forever.
@@ -1175,6 +1206,15 @@ def _pairwise_filter(row):
             if (
                 pattern is ContextVarPattern.MID_STREAM_FORWARD
                 and shape not in _MID_STREAM_FORWARD_SHAPES
+            ):
+                return False
+            # TOKEN_REMOTE_RESET_THEN_FRESH_SET's ferried token is
+            # single-use; on nested shapes non-nested patterns execute
+            # on both the outer and inner workers, so the second reset
+            # would raise mid-dispatch.
+            if (
+                pattern is ContextVarPattern.TOKEN_REMOTE_RESET_THEN_FRESH_SET
+                and shape in _NESTED_SHAPES
             ):
                 return False
             # NESTED_ASYNC_GEN_READBACK's routine self-mutates
@@ -1331,6 +1371,15 @@ def scenarios_strategy(draw):
             valid = [p for p in valid if p is not ContextVarPattern.PER_YIELD]
         if shape not in _MID_STREAM_FORWARD_SHAPES:
             valid = [p for p in valid if p is not ContextVarPattern.MID_STREAM_FORWARD]
+        if shape in _NESTED_SHAPES:
+            # Mirrors ``_pairwise_filter``: the ferried token is
+            # single-use, but nested shapes execute non-nested
+            # patterns on both the outer and inner workers.
+            valid = [
+                p
+                for p in valid
+                if p is not ContextVarPattern.TOKEN_REMOTE_RESET_THEN_FRESH_SET
+            ]
         return draw(st.sampled_from(valid))
 
     ctx_var_1 = _draw_ctx_var_pattern(draw)
