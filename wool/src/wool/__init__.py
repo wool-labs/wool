@@ -1,4 +1,6 @@
 import contextvars
+from contextvars import Context
+from contextvars import copy_context
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
 from typing import TYPE_CHECKING
@@ -101,6 +103,7 @@ __all__ = [
     "BoundWorkerFactory",
     "ChainContention",
     "ChainSerializationError",
+    "Context",
     "ContextVar",
     "ContextVarCollision",
     "Discovery",
@@ -144,6 +147,7 @@ __all__ = [
     "WorkerPool",
     "WorkerProxy",
     "WorkerService",
+    "copy_context",
     "current_task",
     "install_task_factory",
     "routine",

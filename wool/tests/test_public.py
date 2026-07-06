@@ -1,3 +1,5 @@
+import contextvars
+
 import wool
 
 
@@ -38,8 +40,10 @@ def test_public_api_completeness_should_match_expected_surface():
         "ChainContention",
         "ChainSerializationError",
         "TaskFactoryDisplaced",
+        "Context",
         "ContextVar",
         "ContextVarCollision",
+        "copy_context",
         "RuntimeContext",
         "SerializationError",
         "SerializationWarning",
@@ -103,13 +107,12 @@ def test_removed_symbols_should_not_be_accessible():
     When:
         Checking for the presence of each removed symbol by name.
     Then:
-        It should not expose any of the five removed symbols as attributes.
+        It should not expose any of the four removed symbols as attributes.
     """
     # Arrange
     removed_names = [
         "Chain",
         "current_context",
-        "copy_context",
         "create_task",
         "ContextAlreadyBound",
     ]
@@ -119,6 +122,41 @@ def test_removed_symbols_should_not_be_accessible():
         assert not hasattr(wool, name), (
             f"Removed symbol '{name}' is still accessible on the wool package"
         )
+
+
+def test_context_primitives_should_be_verbatim_stdlib_reexports():
+    """Test wool.Context and wool.copy_context are the stdlib objects themselves.
+
+    Given:
+        The wool package, which builds on contextvars rather than
+        replacing it.
+    When:
+        wool.Context and wool.copy_context are compared by identity to
+        their contextvars counterparts.
+    Then:
+        Each should be the very same object — verbatim re-exports, not
+        wool-native wrappers — so a contextvars-to-wool migration keeps
+        stdlib Context semantics exactly.
+    """
+    # Arrange, act, & assert
+    assert wool.Context is contextvars.Context
+    assert wool.copy_context is contextvars.copy_context
+
+
+def test_token_should_not_be_the_stdlib_token_alias():
+    """Test wool.Token is a distinct wrapper, not the stdlib Token.
+
+    Given:
+        The wool package, whose wool.Token is a picklable wrapper rather
+        than a re-export of contextvars.Token.
+    When:
+        wool.Token is compared by identity to contextvars.Token.
+    Then:
+        It should not be the very same object — wool.Token must never
+        regress into an alias of the stdlib token.
+    """
+    # Arrange, act, & assert
+    assert wool.Token is not contextvars.Token
 
 
 def test_wool_error_should_subclass_exception_not_runtime_error():
