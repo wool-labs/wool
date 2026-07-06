@@ -10,6 +10,7 @@ import asyncio
 import datetime
 import ipaddress
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import fields
@@ -296,8 +297,13 @@ class _DirectDiscovery:
         return self._discovery.subscribe(filter)
 
 
+# The return annotation is load-bearing for tooling, not just docs: pyright's
+# inference gives up on this large unannotated async generator and models it
+# as a plain coroutine, breaking ``async with`` analysis at every call site.
 @asynccontextmanager
-async def build_pool_from_scenario(scenario, credentials_map, *, backpressure=None):
+async def build_pool_from_scenario(
+    scenario, credentials_map, *, backpressure=None
+) -> AsyncIterator[WorkerPool]:
     """Build and enter a WorkerPool from a complete Scenario.
 
     Resolves each dimension to its concrete runtime value and yields the

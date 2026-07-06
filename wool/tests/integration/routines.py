@@ -1416,3 +1416,139 @@ async def enter_proxies_in_separate_tasks_on_worker() -> str:
 
     await asyncio.gather(use_proxy(), use_proxy())
     return "ok"
+
+
+# Key-addressed oracle routines used by the token-parity op scripts
+# (tests/integration/_token_ops.py). Each addresses a wool.ContextVar
+# by its ``(namespace, name)`` key so tests can mint per-test variables
+# without touching the module-level ones above.
+
+#: Sentinel reported by the oracle routines when the addressed variable
+#: is unbound. A distinctive string (script values are picklable
+#: primitives) rather than an object sentinel so it compares equal
+#: across process boundaries.
+ORACLE_UNSET = "<wool-oracle-unset>"
+
+# Per-process cache backing ``_resolve_oracle_var``. A second
+# ``wool.ContextVar`` declaration for an already-declared (non-stub)
+# key raises ContextVarCollision, so repeated dispatches to the same
+# worker must reuse the instance minted by the first resolution.
+_ORACLE_VARS: dict = {}
+
+
+def _resolve_oracle_var(namespace: str, name: str) -> wool.ContextVar:
+    """Get-or-create the :class:`wool.ContextVar` keyed (*namespace*, *name*).
+
+    The first resolution in a process declares the variable — promoting
+    a wire-seeded stub in place when the dispatch frame registered the
+    key before the routine body ran (the
+    :func:`declare_and_read_unregistered_key` path) — and caches it;
+    every later resolution returns the cached instance, keeping
+    worker-side resolution idempotent across repeated dispatches.
+    """
+    key = (namespace, name)
+    var = _ORACLE_VARS.get(key)
+    if var is None:
+        var = wool.ContextVar(name, namespace=namespace)
+        _ORACLE_VARS[key] = var
+    return var
+
+
+async def _oracle_reset_outcome(namespace: str, name: str, token) -> tuple:
+    """Reset the (*namespace*, *name*) oracle var by *token*; report the outcome.
+
+    Shared tail for the oracle reset routines — never raises for the
+    documented reset rejections. Returns ``("ok", "", value_after)`` on
+    success or ``(type_name, str(error), value_after)`` when the reset
+    raises RuntimeError, ValueError, or TypeError, where ``value_after``
+    is the variable's current value or :data:`ORACLE_UNSET` when unbound.
+    """
+    var = _resolve_oracle_var(namespace, name)
+    try:
+        var.reset(token)
+    except (RuntimeError, ValueError, TypeError) as error:
+        return type(error).__name__, str(error), var.get(ORACLE_UNSET)
+    return "ok", "", var.get(ORACLE_UNSET)
+
+
+@wool.routine
+async def oracle_set(namespace: str, name: str, value):
+    """Set the (*namespace*, *name*) oracle var on the worker; return the token.
+
+    The minted :class:`wool.Token` rides home on the response frame.
+    The awaiting caller's context continues the minting context, so the
+    token may later be reset caller-side — or dispatched onward and
+    reset on another worker — exactly as if the set had happened in an
+    awaited local coroutine.
+    """
+    return _resolve_oracle_var(namespace, name).set(value)
+
+
+@wool.routine
+async def oracle_reset(namespace: str, name: str, token) -> tuple:
+    """Attempt to reset the (*namespace*, *name*) oracle var by *token*.
+
+    Never raises transport-side. Returns
+    ``(outcome_kind, message, value_after)`` where ``outcome_kind`` is
+    ``"ok"``, ``"RuntimeError"``, ``"ValueError"``, or ``"TypeError"``,
+    ``message`` is ``str(exception)`` (empty on success), and
+    ``value_after`` is the variable's current worker-side value or
+    :data:`ORACLE_UNSET` when unbound.
+    """
+    return await _oracle_reset_outcome(namespace, name, token)
+
+
+@wool.routine
+async def oracle_get(namespace: str, name: str, default=None):
+    """Return the (*namespace*, *name*) oracle var's worker-side value.
+
+    Falls back to *default* when the variable is unbound — callers that
+    need to distinguish "unbound" pass a sentinel such as
+    :data:`ORACLE_UNSET`.
+    """
+    return _resolve_oracle_var(namespace, name).get(default)
+
+
+@wool.routine
+async def oracle_set_report(namespace: str, name: str, value) -> tuple:
+    """Set the (*namespace*, *name*) oracle var; return ``(pid, token)``.
+
+    Attributed variant of :func:`oracle_set` — the worker's
+    ``os.getpid()`` rides alongside the minted token so multi-worker
+    tests can attribute each mint to the process that performed it.
+    """
+    return os.getpid(), _resolve_oracle_var(namespace, name).set(value)
+
+
+@wool.routine
+async def oracle_reset_report(namespace: str, name: str, token) -> tuple:
+    """Attempt a (*namespace*, *name*) oracle reset; report with the worker pid.
+
+    Attributed variant of :func:`oracle_reset`: returns
+    ``(pid, outcome_kind, message, value_after)`` so multi-worker tests
+    can attribute the reset attempt to the process that performed it.
+    """
+    return os.getpid(), *await _oracle_reset_outcome(namespace, name, token)
+
+
+@wool.routine
+async def nested_oracle_set(namespace: str, name: str, value):
+    """Mint a (*namespace*, *name*) token on an inner worker via nested dispatch.
+
+    The outer worker dispatches :func:`oracle_set` back into the pool, so
+    the token is minted one hop deeper and rides home through both
+    response frames — the "inner worker mints, caller resets" topology.
+    """
+    return await oracle_set(namespace, name, value)
+
+
+@wool.routine
+async def nested_oracle_set_report(namespace: str, name: str, value) -> tuple:
+    """Nested-mint a (*namespace*, *name*) token; report both worker pids.
+
+    Attributed variant of :func:`nested_oracle_set`: returns
+    ``(outer_pid, inner_pid, token)`` so tests can attribute the mint to
+    the inner process the outer worker dispatched to.
+    """
+    inner_pid, token = await oracle_set_report(namespace, name, value)
+    return os.getpid(), inner_pid, token
