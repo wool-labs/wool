@@ -192,6 +192,44 @@ class TestCallerMintedTokenLocalReset:
 
         await retry_grpc_internal(body)
 
+    @pytest.mark.asyncio
+    async def test_returned_clone_should_equal_the_original(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a token carried to a worker and back equals the original.
+
+        Given:
+            TENANT_ID set on the caller, with the token carried to a worker
+            and returned unreset while the original is still held.
+        When:
+            The returned token is compared with the original.
+        Then:
+            It should compare equal to and hash alike the original — the two
+            handles denote one token, so a round-tripped token is equal to the
+            one the caller still holds, as stdlib's single token object would
+            be.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                prior = routines.TENANT_ID.set("a")
+                try:
+                    token = routines.TENANT_ID.set("b")
+
+                    # Act
+                    returned, _ = await routines.describe_tenant_id_token(token)
+
+                    # Assert
+                    assert returned == token
+                    assert hash(returned) == hash(token)
+                    routines.TENANT_ID.reset(token)
+                finally:
+                    routines.TENANT_ID.reset(prior)
+
+        await retry_grpc_internal(body)
+
 
 @pytest.mark.integration
 class TestCallerMintedTokenRemoteReset:

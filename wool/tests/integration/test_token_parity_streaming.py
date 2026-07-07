@@ -77,6 +77,95 @@ async def streaming_pool(credentials_map):
 @pytest.mark.integration
 class TestStreamingTokenParity:
     @pytest.mark.asyncio
+    async def test_streaming_should_keep_worker_and_caller_ledgers_bounded(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a streaming set/reset routine bounds both worker and caller ledgers.
+
+        Given:
+            A worker pool driving a streaming routine that performs many
+            set-then-reset cycles on a fresh per-test wool.ContextVar, one per
+            yield, reporting the worker-side spent-token ledger size after each
+            cycle and back-propagating each consumed id to the caller's chain.
+        When:
+            The caller drives the async-generator dispatch to exhaustion, then
+            reads its own chain's spent-token ledger for that var's key.
+        Then:
+            Every reported worker-side size should stay at most one — the single
+            in-flight consumed id — and the caller's own ledger should stay a
+            small constant, not growing with the cycle count, so a long-lived
+            streaming chain reaps each collected token on both sides instead of
+            accumulating one entry per cycle for the chain's lifetime.
+        """
+
+        async def body():
+            # Arrange
+            var = wool.ContextVar(f"a5_{uuid.uuid4().hex}")
+            key = (var.namespace, var.name)
+            n = 128
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ANEXT)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                # Act
+                sizes = [
+                    size async for size in routines.stream_spent_ledger_size_for(*key, n)
+                ]
+                caller_spent = wool.__chain__.get().spent_tokens.get(key, frozenset())
+
+                # Assert
+                assert len(sizes) == n
+                assert max(sizes) <= 1, f"worker ledger grew unbounded: {sizes}"
+                assert len(caller_spent) <= 2, (
+                    f"caller ledger grew across {n} cycles: {len(caller_spent)}"
+                )
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_interleaved_streams_should_each_keep_the_ledger_bounded(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test two interleaved streams on one chain each keep the ledger bounded.
+
+        Given:
+            Two async-generator dispatches open concurrently on one armed caller
+            chain, each performing per-yield set-then-reset-then-drop cycles on
+            its own distinct variable and reporting its per-key spent size.
+        When:
+            The caller advances both generators in strict alternation to
+            exhaustion.
+        Then:
+            Each stream's reported per-key size should stay at most one, and the
+            caller's own ledger for each key stays bounded — the reap keeps each
+            key O(1) even as two runners fold consumed ids into one shared chain
+            across alternating re-mounts.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            n = 40
+            var_a = wool.ContextVar(f"a5_{uuid.uuid4().hex}")
+            var_b = wool.ContextVar(f"a5_{uuid.uuid4().hex}")
+            key_a = (var_a.namespace, var_a.name)
+            key_b = (var_b.namespace, var_b.name)
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ANEXT)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                gen_a = routines.stream_spent_ledger_size_for(*key_a, n)
+                gen_b = routines.stream_spent_ledger_size_for(*key_b, n)
+                sizes_a: list[int] = []
+                sizes_b: list[int] = []
+                for _ in range(n):
+                    sizes_a.append(await anext(gen_a))
+                    sizes_b.append(await anext(gen_b))
+                assert len(sizes_a) == n and len(sizes_b) == n
+                assert max(sizes_a) <= 1, f"stream A grew unbounded: {sizes_a}"
+                assert max(sizes_b) <= 1, f"stream B grew unbounded: {sizes_b}"
+                caller = wool.__chain__.get()
+                assert len(caller.spent_tokens.get(key_a, frozenset())) <= 2
+                assert len(caller.spent_tokens.get(key_b, frozenset())) <= 2
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
     async def test_caller_reset_mid_stream_should_forward_propagate_to_later_yields(
         self, credentials_map, retry_grpc_internal
     ):

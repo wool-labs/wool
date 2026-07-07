@@ -594,3 +594,47 @@ class TestStdlibMessageShapeParity:
                 assert _trailing_phrase(message) == "was created in a different Context"
 
         await retry_grpc_internal(body)
+
+
+@pytest.mark.integration
+class TestTokenCarriedInException:
+    @pytest.mark.asyncio
+    async def test_token_carried_in_exception_should_transport_and_stay_single_use(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a token raised inside an exception transports and stays single-use.
+
+        Given:
+            A DEFAULT pool whose worker sets a fresh wool.ContextVar, captures
+            the minted token, and raises a TokenCarrier exception carrying it, so
+            the token rides home on the exception frame rather than a return
+            value.
+        When:
+            The caller catches the exception, extracts the token, resets it, then
+            attempts to reset it a second time.
+        Then:
+            The extracted token should be a live wool.Token whose first reset is
+            honored — anchored home exactly as a returned token would be — and a
+            second reset should raise the single-use RuntimeError, proving token
+            transport and single-use hold uniformly across the exception channel.
+        """
+
+        async def body():
+            # Arrange
+            var = _fresh_var()
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                # Act
+                with pytest.raises(routines.TokenCarrier) as exc_info:
+                    await routines.set_var_and_raise_with_token(
+                        var.namespace, var.name, "exc-value"
+                    )
+                token = exc_info.value.token
+
+                # Assert
+                assert isinstance(token, wool.Token)
+                var.reset(token)
+                with pytest.raises(RuntimeError, match="has already been used once"):
+                    var.reset(token)
+
+        await retry_grpc_internal(body)
