@@ -37,6 +37,11 @@ class ContextVarPattern(Enum):
     UPSTREAM_RESET = auto()
     PER_YIELD = auto()
     MID_STREAM_FORWARD = auto()
+    # The caller mints a token and ferries it via _RESET_TOKENS; the worker
+    # consumes it and immediately re-sets the var. The caller then asserts
+    # the stale token stays rejected — the fresh set must not erase the
+    # consumed id from the chain's spent ledger.
+    TOKEN_REMOTE_RESET_THEN_FRESH_SET = auto()
 
 
 # Module-level wool.ContextVars used by the propagation integration tests.
@@ -112,6 +117,16 @@ def _execute_patterns(patterns, *, step=None):
                     var.reset(tokens[var_name])
             case ContextVarPattern.UPSTREAM_RESET:
                 var.set(f"inner-set-{var_name}")
+            case ContextVarPattern.TOKEN_REMOTE_RESET_THEN_FRESH_SET:
+                # Consume the caller-minted token ferried via
+                # _RESET_TOKENS, then immediately re-set the var. The
+                # fresh set must not erase the consumed id from the
+                # spent ledger — the caller asserts its stale copy
+                # still raises after the response merges home.
+                tokens = _RESET_TOKENS.get()
+                if var_name in tokens:
+                    var.reset(tokens[var_name])
+                var.set(f"fresh-{var_name}")
 
 
 def _pre_nested_setup(patterns):
@@ -638,6 +653,196 @@ async def get_tenant_id() -> str:
     propagated into the worker's context before the routine runs.
     """
     return TENANT_ID.get()
+
+
+@wool.routine
+async def reset_tenant_id_token(token) -> str:
+    """Reset a caller-minted TENANT_ID token on the worker.
+
+    The token crosses the wire as an argument; resetting it on the worker
+    both restores TENANT_ID (returned for inspection) and records the token
+    as consumed, which the response frame propagates back so the caller's
+    original token also reads as used — cross-process single-use.
+    """
+    TENANT_ID.reset(token)
+    return TENANT_ID.get()
+
+
+@wool.routine
+async def describe_tenant_id_token(token) -> tuple:
+    """Receive a TENANT_ID token without resetting it.
+
+    Exercises lossless token transport: any token — including an orphan
+    minted in a context the worker is not continuing — must cross the wire,
+    reconstitute into a usable object, and travel back, without raising.
+    Returns the token itself alongside its var's name so the caller can
+    assert the reconstituted object is fully usable.
+    """
+    return token, token.var.name
+
+
+async def _reset_and_report(token) -> tuple:
+    """Reset TENANT_ID by *token* and report the outcome as a two-tuple.
+
+    Shared tail for the report-style token routines: ``("ok",
+    restored_value)`` when the reset succeeds, or ``(type_name, message)``
+    when it raises — so a caller can assert the failure without relying on a
+    builtin exception type surviving the wire.
+    """
+    try:
+        TENANT_ID.reset(token)
+    except Exception as error:
+        return type(error).__name__, str(error)
+    return "ok", TENANT_ID.get()
+
+
+@wool.routine
+async def set_tenant_id_and_return_token(value: str):
+    """Set TENANT_ID on the worker and return the minted token.
+
+    The token rides the response frame back to the caller, whose context
+    continues the worker's (the routine was awaited), so the caller may
+    reset it — restoring the pre-call value — exactly as if the set had
+    happened in an awaited local coroutine.
+    """
+    return TENANT_ID.set(value)
+
+
+@wool.routine
+async def reset_tenant_id_token_report(token) -> tuple:
+    """Attempt to reset a TENANT_ID token on the worker and report the outcome.
+
+    Catch-and-report variant of `reset_tenant_id_token` for cases where
+    the reset is expected to fail — the caller asserts on the reported
+    exception type name and message rather than relying on a builtin
+    exception type surviving the wire. Returns ``(pid, "ok", restored_value)``
+    on success or ``(pid, type_name, message)`` on failure.
+    """
+    return os.getpid(), *await _reset_and_report(token)
+
+
+@wool.routine
+async def reset_and_return_tenant_id_token(token):
+    """Reset a caller-minted TENANT_ID token on the worker and return it.
+
+    The token arrives live, is consumed by the reset, and travels back in
+    the return value already marked used — the caller can assert the used
+    state is visible on the returned copy and that resetting either copy
+    raises the single-use RuntimeError.
+    """
+    TENANT_ID.reset(token)
+    return token
+
+
+@wool.routine
+async def mint_orphan_tenant_id_token():
+    """Mint a TENANT_ID token inside a sibling stdlib context on the worker.
+
+    The set runs inside ``contextvars.copy_context().run``, so no live
+    context continues the minting context — the token is an orphan by
+    construction. It travels back in the return value so the caller can
+    assert lossless transport and the different-Context reset failure.
+    """
+    sibling = contextvars.copy_context()
+    return sibling.run(TENANT_ID.set, "worker-sibling")
+
+
+@wool.routine
+async def relay_reset_tenant_id_token(token) -> str:
+    """Relay a TENANT_ID token through a nested dispatch that resets it.
+
+    The token crosses two hops — caller to outer worker, outer worker to
+    inner worker — before `reset_tenant_id_token` consumes it. The
+    consumed state rides each response frame back so the caller's original
+    token also reads as used.
+    """
+    return await reset_tenant_id_token(token)
+
+
+@wool.routine
+async def nested_reset_then_report(token) -> tuple:
+    """Consume a token via nested dispatch, then retry the reset locally.
+
+    The inner dispatch resets the token; its response frame carries the
+    consumed state back one hop, so the outer worker's local retry must
+    fail the single-use gate. Returns ``(inner_value, type_name, message)``
+    on retry failure or ``(inner_value, "ok", current_value)`` if the retry
+    unexpectedly succeeds.
+    """
+    inner = await reset_tenant_id_token(token)
+    return inner, *await _reset_and_report(token)
+
+
+@wool.routine
+async def outer_mint_inner_reset() -> tuple:
+    """Mint a token on the outer worker and consume it via nested dispatch.
+
+    The outer routine sets TENANT_ID, sends the minted token to
+    `reset_tenant_id_token` on an inner worker (an awaited dispatch,
+    so the inner worker continues the minting context), then retries the
+    reset locally. Returns ``(inner_value, type_name, message)`` on retry
+    failure or ``(inner_value, "ok", current_value)`` if the retry
+    unexpectedly succeeds.
+    """
+    token = TENANT_ID.set("outer-mint")
+    inner = await reset_tenant_id_token(token)
+    return inner, *await _reset_and_report(token)
+
+
+@wool.routine
+async def stream_reset_tenant_id_token(token):
+    """Async generator that resets a caller-minted token between yields.
+
+    Yields the pre-reset TENANT_ID value, resets the token, then yields
+    the restored value. The consumed state rides the step frame back to
+    the caller mid-stream, before the generator is exhausted.
+    """
+    yield TENANT_ID.get()
+    TENANT_ID.reset(token)
+    yield TENANT_ID.get()
+
+
+@wool.routine
+async def set_tenant_id_and_yield_token(value: str, count: int):
+    """Async generator that sets TENANT_ID and yields the minted token first.
+
+    After yielding the token, suspends and yields the current TENANT_ID
+    value *count* times. The token's live anchor must survive each
+    per-yield re-mount so the caller can reset it exactly once after
+    exhaustion.
+    """
+    token = TENANT_ID.set(value)
+    yield token
+    for _ in range(count):
+        await asyncio.sleep(0)
+        yield TENANT_ID.get()
+
+
+@wool.routine
+async def stream_reset_token_twice(token):
+    """Async generator that resets the same token before two yields.
+
+    The first reset consumes the token; the second violates single-use and
+    raises before the second yield, surfacing as a mid-stream dispatch
+    error on the caller's ``__anext__``.
+    """
+    TENANT_ID.reset(token)
+    yield "first"
+    TENANT_ID.reset(token)
+    yield "never"
+
+
+@wool.routine
+async def stream_recv_and_reset():
+    """Async generator that receives a token via ``asend`` and resets it.
+
+    Yields ``"ready"``, receives a caller-minted token on the mid-stream
+    ``asend`` frame, resets it, and yields the restored TENANT_ID value.
+    Exercises token transport and consumption on the ``asend`` path.
+    """
+    received = yield "ready"
+    TENANT_ID.reset(received)
+    yield TENANT_ID.get()
 
 
 @wool.routine
@@ -1226,3 +1431,139 @@ async def enter_proxies_in_separate_tasks_on_worker() -> str:
 
     await asyncio.gather(use_proxy(), use_proxy())
     return "ok"
+
+
+# Key-addressed oracle routines used by the token-parity op scripts
+# (tests/integration/_token_ops.py). Each addresses a wool.ContextVar
+# by its ``(namespace, name)`` key so tests can mint per-test variables
+# without touching the module-level ones above.
+
+#: Sentinel reported by the oracle routines when the addressed variable
+#: is unbound. A distinctive string (script values are picklable
+#: primitives) rather than an object sentinel so it compares equal
+#: across process boundaries.
+ORACLE_UNSET = "<wool-oracle-unset>"
+
+# Per-process cache backing ``_resolve_oracle_var``. A second
+# ``wool.ContextVar`` declaration for an already-declared (non-stub)
+# key raises ContextVarCollision, so repeated dispatches to the same
+# worker must reuse the instance minted by the first resolution.
+_ORACLE_VARS: dict = {}
+
+
+def _resolve_oracle_var(namespace: str, name: str) -> wool.ContextVar:
+    """Get-or-create the :class:`wool.ContextVar` keyed (*namespace*, *name*).
+
+    The first resolution in a process declares the variable — promoting
+    a wire-seeded stub in place when the dispatch frame registered the
+    key before the routine body ran (the
+    :func:`declare_and_read_unregistered_key` path) — and caches it;
+    every later resolution returns the cached instance, keeping
+    worker-side resolution idempotent across repeated dispatches.
+    """
+    key = (namespace, name)
+    var = _ORACLE_VARS.get(key)
+    if var is None:
+        var = wool.ContextVar(name, namespace=namespace)
+        _ORACLE_VARS[key] = var
+    return var
+
+
+async def _oracle_reset_outcome(namespace: str, name: str, token) -> tuple:
+    """Reset the (*namespace*, *name*) oracle var by *token*; report the outcome.
+
+    Shared tail for the oracle reset routines — never raises for the
+    documented reset rejections. Returns ``("ok", "", value_after)`` on
+    success or ``(type_name, str(error), value_after)`` when the reset
+    raises RuntimeError, ValueError, or TypeError, where ``value_after``
+    is the variable's current value or :data:`ORACLE_UNSET` when unbound.
+    """
+    var = _resolve_oracle_var(namespace, name)
+    try:
+        var.reset(token)
+    except (RuntimeError, ValueError, TypeError) as error:
+        return type(error).__name__, str(error), var.get(ORACLE_UNSET)
+    return "ok", "", var.get(ORACLE_UNSET)
+
+
+@wool.routine
+async def oracle_set(namespace: str, name: str, value):
+    """Set the (*namespace*, *name*) oracle var on the worker; return the token.
+
+    The minted :class:`wool.Token` rides home on the response frame.
+    The awaiting caller's context continues the minting context, so the
+    token may later be reset caller-side — or dispatched onward and
+    reset on another worker — exactly as if the set had happened in an
+    awaited local coroutine.
+    """
+    return _resolve_oracle_var(namespace, name).set(value)
+
+
+@wool.routine
+async def oracle_reset(namespace: str, name: str, token) -> tuple:
+    """Attempt to reset the (*namespace*, *name*) oracle var by *token*.
+
+    Never raises transport-side. Returns
+    ``(outcome_kind, message, value_after)`` where ``outcome_kind`` is
+    ``"ok"``, ``"RuntimeError"``, ``"ValueError"``, or ``"TypeError"``,
+    ``message`` is ``str(exception)`` (empty on success), and
+    ``value_after`` is the variable's current worker-side value or
+    :data:`ORACLE_UNSET` when unbound.
+    """
+    return await _oracle_reset_outcome(namespace, name, token)
+
+
+@wool.routine
+async def oracle_get(namespace: str, name: str, default=None):
+    """Return the (*namespace*, *name*) oracle var's worker-side value.
+
+    Falls back to *default* when the variable is unbound — callers that
+    need to distinguish "unbound" pass a sentinel such as
+    :data:`ORACLE_UNSET`.
+    """
+    return _resolve_oracle_var(namespace, name).get(default)
+
+
+@wool.routine
+async def oracle_set_report(namespace: str, name: str, value) -> tuple:
+    """Set the (*namespace*, *name*) oracle var; return ``(pid, token)``.
+
+    Attributed variant of :func:`oracle_set` — the worker's
+    ``os.getpid()`` rides alongside the minted token so multi-worker
+    tests can attribute each mint to the process that performed it.
+    """
+    return os.getpid(), _resolve_oracle_var(namespace, name).set(value)
+
+
+@wool.routine
+async def oracle_reset_report(namespace: str, name: str, token) -> tuple:
+    """Attempt a (*namespace*, *name*) oracle reset; report with the worker pid.
+
+    Attributed variant of :func:`oracle_reset`: returns
+    ``(pid, outcome_kind, message, value_after)`` so multi-worker tests
+    can attribute the reset attempt to the process that performed it.
+    """
+    return os.getpid(), *await _oracle_reset_outcome(namespace, name, token)
+
+
+@wool.routine
+async def nested_oracle_set(namespace: str, name: str, value):
+    """Mint a (*namespace*, *name*) token on an inner worker via nested dispatch.
+
+    The outer worker dispatches :func:`oracle_set` back into the pool, so
+    the token is minted one hop deeper and rides home through both
+    response frames — the "inner worker mints, caller resets" topology.
+    """
+    return await oracle_set(namespace, name, value)
+
+
+@wool.routine
+async def nested_oracle_set_report(namespace: str, name: str, value) -> tuple:
+    """Nested-mint a (*namespace*, *name*) token; report both worker pids.
+
+    Attributed variant of :func:`nested_oracle_set`: returns
+    ``(outer_pid, inner_pid, token)`` so tests can attribute the mint to
+    the inner process the outer worker dispatched to.
+    """
+    inner_pid, token = await oracle_set_report(namespace, name, value)
+    return os.getpid(), inner_pid, token

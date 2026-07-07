@@ -58,9 +58,7 @@ def test_pairwise_scenarios_cover_all_discovery_members():
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", PAIRWISE_SCENARIOS, ids=str)
-async def test_dispatch_pairwise(
-    scenario, credentials_map, retry_grpc_internal, xfail_known_bugs
-):
+async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal):
     """Test routine dispatch across pairwise scenario combinations.
 
     Given:
@@ -87,10 +85,7 @@ async def test_dispatch_pairwise(
                 isolated = contextvars.copy_context()
                 await asyncio.create_task(invoke_routine(scenario), context=isolated)
 
-    async def guarded():
-        await retry_grpc_internal(body)
-
-    await xfail_known_bugs(scenario, guarded)
+    await retry_grpc_internal(body)
 
 
 @pytest.mark.integration
@@ -158,9 +153,7 @@ async def test_dispatch_pairwise(
     )
 )
 @given(scenario=scenarios_strategy())
-async def test_dispatch_hypothesis(
-    scenario, credentials_map, retry_grpc_internal, xfail_known_bugs
-):
+async def test_dispatch_hypothesis(scenario, credentials_map, retry_grpc_internal):
     """Test routine dispatch with Hypothesis-generated scenarios.
 
     Given:
@@ -181,10 +174,7 @@ async def test_dispatch_hypothesis(
                 isolated = contextvars.copy_context()
                 await asyncio.create_task(invoke_routine(scenario), context=isolated)
 
-    async def guarded():
-        await retry_grpc_internal(body)
-
-    await xfail_known_bugs(scenario, guarded)
+    await retry_grpc_internal(body)
 
 
 @pytest.mark.integration

@@ -33,11 +33,13 @@ from wool.runtime.context.chain import Chain
 from wool.runtime.context.exceptions import ChainSerializationError
 from wool.runtime.context.exceptions import SerializationWarning
 from wool.runtime.context.manifest import ChainManifest
+from wool.runtime.context.token import token_sink
 from wool.runtime.routine.task import Task
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 
 if TYPE_CHECKING:
+    from wool.runtime.context.token import Token
     from wool.runtime.serializer import Serializer
 
 
@@ -72,6 +74,11 @@ class Frame(Generic[T]):
         default=None, init=False, repr=False
     )
     _serializer: Serializer | None = field(default=None, init=False, repr=False)
+    # Wire tokens reconstituted while decoding this frame, handed to `mount` so
+    # it anchors the ones live in the mounted chain; the rest are orphans (see
+    # `~wool.runtime.context.token.token_sink` for the frame-scoping and
+    # leak-avoidance rationale).
+    _wire_tokens: list[Token] = field(default_factory=list, init=False, repr=False)
     _frame_by_field: ClassVar[dict[str, type[Frame]]] = {}
     _chain_exceptions: ClassVar[bool] = False
 
@@ -139,21 +146,27 @@ class Frame(Generic[T]):
         # invariant violation (registry/schema drift) and fails loudly
         # via ``KeyError`` rather than being a reachable input error.
         frame_cls = cls._frame_by_field[field_name]
-        payload = frame_cls._decode_payload(wire, serializer=serializer)
-        chain_manifest: ChainManifest | ChainSerializationError | None
-        if wire.HasField("context"):
-            try:
-                chain_manifest = ChainManifest.from_protobuf(
-                    wire.context, serializer=serializer
-                )
-            except ChainSerializationError as decode_err:
-                # Defer the strict-mode failure: carry it as the manifest
-                # value so `mount` raises it (or chains it onto an
-                # exception payload) instead of preempting the payload here.
-                chain_manifest = decode_err
-        else:
-            chain_manifest = None
-        return frame_cls(payload=payload, chain_manifest=chain_manifest)
+        # Collect wire tokens reconstituted anywhere in this decode — the
+        # payload graph and the manifest's variable values alike — so the
+        # frame's mount can anchor the ones live in the mounted chain.
+        with token_sink() as wire_tokens:
+            payload = frame_cls._decode_payload(wire, serializer=serializer)
+            chain_manifest: ChainManifest | ChainSerializationError | None
+            if wire.HasField("context"):
+                try:
+                    chain_manifest = ChainManifest.from_protobuf(
+                        wire.context, serializer=serializer
+                    )
+                except ChainSerializationError as decode_err:
+                    # Defer the strict-mode failure: carry it as the manifest
+                    # value so `mount` raises it (or chains it onto an
+                    # exception payload) instead of preempting the payload here.
+                    chain_manifest = decode_err
+            else:
+                chain_manifest = None
+        frame = frame_cls(payload=payload, chain_manifest=chain_manifest)
+        frame._wire_tokens = wire_tokens
+        return frame
 
     def to_protobuf(self) -> protocol.Request | protocol.Response:
         """Encode this frame as its wire envelope.
@@ -294,9 +307,9 @@ class Frame(Generic[T]):
             # `from_protobuf`. Raising routes it through `mount`'s
             # raise-or-chain handler.
             raise self.chain_manifest
-        # Short-circuit a manifest that decoded successfully but binds
-        # no vars and records no resets — nothing to install.
-        if not (self.chain_manifest.vars or self.chain_manifest.resets):
+        # Short-circuit a manifest that decoded successfully but carries no
+        # observable state — nothing to install (see ChainManifest.has_state).
+        if not self.chain_manifest.has_state:
             return
 
         if ctx is None:
@@ -308,6 +321,7 @@ class Frame(Generic[T]):
                 self.chain_manifest,
                 owned=True,
                 merge_with=wool.__chain__.get(None),
+                wire_tokens=self._wire_tokens,
             )
         else:
             # Worker-side: install inside the chain's cached
@@ -315,11 +329,13 @@ class Frame(Generic[T]):
             # successive step-tasks, so the chain is armed
             # task-agnostically (``owned=False``); the factory is still
             # ensured (a no-op on the worker loop, but the displacement
-            # tripwire).
+            # tripwire). Anchoring the pending tokens runs inside ``ctx``
+            # too, so each anchor binds to the mount's context.
             ctx.run(
                 Chain.from_manifest,
                 self.chain_manifest,
                 owned=False,
+                wire_tokens=self._wire_tokens,
             )
 
 

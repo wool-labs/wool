@@ -11,9 +11,12 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 import wool
+from tests.helpers import _unique
 from tests.helpers import scoped_context
 from wool import protocol
 from wool.runtime.context.exceptions import SerializationWarning
+from wool.runtime.context.manifest import ChainManifest
+from wool.runtime.context.var import ContextVar
 from wool.runtime.worker.frame import AckResponseFrame
 from wool.runtime.worker.frame import ExceptionResponseFrame
 from wool.runtime.worker.frame import Frame
@@ -641,6 +644,147 @@ class TestFrameToProtobuf:
 
         # Assert
         assert isinstance(restored, AckResponseFrame)
+
+
+class TestFrameMount:
+    """Tests for `Frame.mount` token-bookkeeping ingress."""
+
+    def test_mount_should_ingest_ledger_when_manifest_carries_only_spent_tokens(self):
+        """Test a ledger-only manifest still transits the mount.
+
+        Given:
+            An armed context holding one live token, and a result
+            frame whose manifest carries no vars or resets — only the
+            live token's id in spent_tokens under its variable's key.
+        When:
+            frame.mount() runs caller-side.
+        Then:
+            The context should remain armed and a reset of the
+            original token should raise RuntimeError — the ledger-only
+            manifest was not short-circuited, so the consumption
+            ingested.
+        """
+        # Arrange
+        var = ContextVar(_unique("mount_ledger_only"))
+
+        with scoped_context():
+            token = var.set("v")
+            chain = wool.__chain__.get()
+            key = (var.namespace, var.name)
+            token_id = next(iter(chain.to_manifest().unspent_tokens[key]))
+            manifest = ChainManifest(
+                id=chain.id,
+                vars={},
+                resets=frozenset(),
+                stubs=frozenset(),
+                spent_tokens={key: frozenset({token_id})},
+            )
+            frame = ResultResponseFrame(payload="ok", chain_manifest=manifest)
+
+            # Act
+            frame.mount()
+
+            # Assert
+            assert wool.__chain__.get(None) is not None
+            with pytest.raises(RuntimeError, match="has already been used once"):
+                var.reset(token)
+
+    def test_mount_should_anchor_wire_token_when_manifest_carries_unspent_id(self):
+        """Test a manifest carrying a var's unspent id anchors its wire token.
+
+        Given:
+            An armed context holding one live token and a wire Response
+            carrying that token in its payload and, in its context, the
+            chain id and a value entry for the token's var carrying that
+            token's id in unspent_tokens.
+        When:
+            The response is decoded via Frame.from_protobuf — which
+            reconstitutes and collects the payload token — and mounted.
+        Then:
+            Resetting the reconstituted token should succeed and rewind
+            the variable to unset — the manifest's per-var unspent id
+            transited the mount, which anchored the collected wire token.
+        """
+        # Arrange
+        var = ContextVar(_unique("mount_live_only"))
+        sentinel = object()
+
+        with scoped_context():
+            token = var.set("v")
+            chain = wool.__chain__.get()
+            key = (var.namespace, var.name)
+            token_id = next(iter(chain.to_manifest().unspent_tokens[key]))
+            response = protocol.Response(
+                result=protocol.Message(dump=wool.__serializer__.dumps(token))
+            )
+            response.context.CopyFrom(
+                protocol.ChainManifest(
+                    id=chain.id.hex,
+                    vars=[
+                        protocol.ContextVar(
+                            namespace=var.namespace,
+                            name=var.name,
+                            value=wool.__serializer__.dumps("v"),
+                            unspent_tokens=[token_id],
+                        )
+                    ],
+                )
+            )
+
+            # Act
+            frame = Frame.from_protobuf(response)
+            frame.mount()
+
+            # Assert
+            var.reset(frame.payload)
+            assert var.get(sentinel) is sentinel
+
+    def test_mount_should_noop_when_manifest_carries_no_state(self):
+        """Test an all-empty manifest mounts as a no-op.
+
+        Given:
+            An unarmed context and a result frame carrying
+            ChainManifest.empty() — no vars, resets, or token
+            bookkeeping.
+        When:
+            frame.mount() runs caller-side.
+        Then:
+            The context should remain unarmed — a state-less manifest
+            short-circuits before any install.
+        """
+        # Arrange
+        frame = ResultResponseFrame(payload="ok", chain_manifest=ChainManifest.empty())
+
+        with scoped_context():
+            assert wool.__chain__.get(None) is None
+
+            # Act
+            frame.mount()
+
+            # Assert
+            assert wool.__chain__.get(None) is None
+
+    def test_mount_should_noop_when_frame_has_no_chain_manifest(self):
+        """Test a frame with no chain manifest mounts without raising.
+
+        Given:
+            An unarmed context and a result frame whose chain_manifest
+            is None — the wire envelope carried no context field.
+        When:
+            frame.mount() runs caller-side.
+        Then:
+            It should return without raising and leave the context
+            unarmed.
+        """
+        # Arrange
+        frame = ResultResponseFrame(payload="ok", chain_manifest=None)
+
+        with scoped_context():
+            # Act
+            frame.mount()
+
+            # Assert
+            assert wool.__chain__.get(None) is None
 
 
 class TestChainsDecodeErrorOntoPayload:

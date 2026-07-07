@@ -37,6 +37,7 @@ from __future__ import annotations
 import contextvars
 import warnings
 from dataclasses import dataclass
+from dataclasses import field
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Generic
@@ -112,23 +113,23 @@ class ContextVarManifest(Generic[T]):
     def __reduce_ex__(self, _protocol: SupportsIndex) -> NoReturn:
         """Reject vanilla pickling.
 
-        ContextVar identity is registered against the process-wide
-        `~wool.runtime.context.registry.var_registry`; restoring an
-        instance outside Wool's dispatch path bypasses the stub-
-        promotion and collision-detection that
-        `~wool.runtime.context.var.ContextVar._reconstitute` relies on.
-        Wool's own pickler consults ``reducer_override`` (and therefore
-        `~wool.runtime.context.var.ContextVar.__wool_reduce__`) before
-        ``__reduce_ex__``, so this guard is invisible to Wool's
-        serialization.
-
-        `copy.copy` and `copy.deepcopy` also route
-        through ``__reduce_ex__`` and are rejected for the same
-        reason — a registry-bound ContextVar has no meaningful copy
-        semantics.
+        `copy.copy` and `copy.deepcopy` route through ``__reduce_ex__`` and
+        are rejected too.
 
         :raises TypeError:
             Always.
+
+        .. rubric:: Implementation notes
+
+        ContextVar identity is registered against the process-wide
+        `~wool.runtime.context.registry.var_registry`; restoring an instance
+        outside Wool's dispatch path bypasses the stub-promotion and
+        collision-detection that
+        `~wool.runtime.context.var.ContextVar._reconstitute` relies on, and a
+        registry-bound ContextVar has no meaningful copy semantics. Wool's own
+        pickler consults ``reducer_override`` (and therefore
+        `~wool.runtime.context.var.ContextVar.__wool_reduce__`) before
+        ``__reduce_ex__``, so this guard is invisible to Wool's serialization.
         """
         raise TypeError(
             "wool.ContextVar cannot be pickled via vanilla pickle/cloudpickle; "
@@ -156,17 +157,20 @@ class ContextVarManifest(Generic[T]):
     ) -> ContextVarManifest[Any]:
         """Construct a `ContextVarManifest` instance with field assignment.
 
-        Single source of truth for the
-        ``object.__new__`` + per-field-assignment idiom shared by
+        Single source of truth for the ``object.__new__`` +
+        per-field-assignment idiom shared by
         `~wool.runtime.context.var.ContextVar.__new__` (the user-facing
         construction path, which builds the subtype) and `resolve_stub`
         (the wire-boundary path). The instance is *not* registered in
         `~wool.runtime.context.registry.var_registry` — callers do that
-        under the registry lock. The backing stdlib variable is created
-        once and shared by every chain for the process lifetime; it
-        carries no ``contextvars``-level default —
-        `~wool.runtime.context.var.ContextVar.get` owns the default-
-        resolution ladder, and "unset" is the
+        under the registry lock.
+
+        .. rubric:: Implementation notes
+
+        The backing stdlib variable is created once and shared by every
+        chain for the process lifetime; it carries no ``contextvars``-level
+        default — `~wool.runtime.context.var.ContextVar.get` owns the
+        default-resolution ladder, and "unset" is the
         `~wool.runtime.typing.Undefined` sentinel value.
         """
         namespace, name = key
@@ -199,6 +203,12 @@ def resolve_stub(
     instance per key regardless of whether the value arrived as a bare
     wire entry or embedded in a pickled variable reference.
 
+    Pass *default* to seed the constructor default before promotion when
+    that information is available on the ingress side (the pickle path
+    carries it; the chain-manifest path does not).
+
+    .. rubric:: Implementation notes
+
     A freshly created stub is registered in
     `~wool.runtime.context.registry.var_registry` (a
     `weakref.WeakValueDictionary`, so it needs a strong referent to
@@ -212,10 +222,6 @@ def resolve_stub(
     is a process-wide singleton anyway. If the receiver never declares
     the variable, it is collected with whatever held it and the
     propagated value is dropped.
-
-    Pass *default* to seed the constructor default before promotion when
-    that information is available on the ingress side (the pickle path
-    carries it; the chain-manifest path does not).
     """
     with lock:
         existing = var_registry.get(key)
@@ -252,30 +258,71 @@ class ChainManifest:
     `~wool.runtime.context.exceptions.ChainSerializationError` instead.
 
     Present on a `Frame` iff the frame carried non-empty receive-side
-    state: a chain manifest with bindings or resets. An empty chain
-    manifest decodes to ``None`` so `Frame.mount` can no-op.
+    state: a chain manifest with bindings, resets, or token bookkeeping
+    (spent or unspent token IDs). An empty chain manifest decodes to
+    ``None`` so `Frame.mount` can no-op.
 
     The transition into a live `Chain` is one-way and lives on `Chain`:
     `Chain.from_manifest` drains `vars` into the backing variables,
     merges the decoded state onto a live receiver (or seeds a fresh chain
     when unarmed), and arms the result. `Frame.mount` is the entry point.
+
+    :param spent_tokens:
+        Spent (consumed) `~wool.runtime.context.token.Token` IDs per var key
+        — the cross-process single-use ledger (see
+        `~wool.runtime.context.chain.Chain.spent_tokens` for the contract).
+    :param unspent_tokens:
+        Live (unspent) `~wool.runtime.context.token.Token` IDs per var key,
+        consulted by the receiver's mount to anchor wire tokens (see
+        `~wool.runtime.context.token.anchor_tokens`).
+
+    .. rubric:: Implementation notes
+
+    ``spent_tokens`` and ``unspent_tokens`` are chain-local and ride every
+    frame, snapshotted by `~wool.runtime.context.chain.Chain.to_manifest`
+    and unioned by `~wool.runtime.context.chain.Chain.from_manifest`. Each
+    piggybacks on the var entry that already exists for the value or reset it
+    accompanies, never emitting a standalone entry (a value-less entry is
+    unambiguously a reset).
     """
 
     id: UUID
     vars: dict[ContextVarManifest[Any], Any]
     resets: frozenset[tuple[str, str]]
     stubs: frozenset[ContextVarManifest[Any]]
+    spent_tokens: dict[tuple[str, str], frozenset[str]] = field(default_factory=dict)
+    unspent_tokens: dict[tuple[str, str], frozenset[str]] = field(default_factory=dict)
+
+    @property
+    def has_state(self) -> bool:
+        """Report whether this manifest carries observable state to install.
+
+        Bindings, resets, or token bookkeeping (spent or unspent IDs) all
+        count; an all-empty manifest has nothing to install and mounts as a
+        no-op.
+
+        .. rubric:: Implementation notes
+
+        Token bookkeeping counts because the ledger ingest and the
+        pending-anchor drain live inside the mount, so a manifest carrying
+        only bookkeeping must still transit it.
+        """
+        return bool(self.vars or self.resets or self.spent_tokens or self.unspent_tokens)
 
     @classmethod
     def empty(cls) -> ChainManifest:
-        """Return a fresh empty manifest carrying a new chain id.
+        """Return a fresh empty manifest carrying a new chain ID.
 
-        The default for `DispatchSession.decoded` when the initial
-        dispatch frame carries no chain manifest. A present-but-empty
-        manifest keeps ``session.decoded.vars`` an empty dict so the
-        backpressure hook's attribute access stays shape-consistent
-        whether or not the inbound frame carried chain state. Returned
-        fresh per call to avoid sharing mutable state across dispatches.
+        The default for `DispatchSession.decoded` when the initial dispatch
+        frame carries no chain manifest.
+
+        .. rubric:: Implementation notes
+
+        A present-but-empty manifest keeps ``session.decoded.vars`` an empty
+        dict so the backpressure hook's attribute access stays
+        shape-consistent whether or not the inbound frame carried chain
+        state. Returned fresh per call to avoid sharing mutable state across
+        dispatches.
         """
         return cls(
             id=uuid4(),
@@ -307,21 +354,25 @@ class ChainManifest:
         A malformed wire chain ID falls back to a fresh UUID. Under
         strict mode the failures aggregate into a single
         `ChainSerializationError` raised after the decode loop — no
-        partial manifest is surfaced. `Frame.from_protobuf` captures
-        that error as the frame's ``chain_manifest`` value instead of
-        letting it propagate, so `Frame.mount` (and, for the initial
-        dispatch frame, `DispatchSession.__aenter__`) can raise it or
-        walk-and-append it onto an exception payload's ``__context__``
-        chain rather than preempting the payload.
+        partial manifest is surfaced.
 
         :raises ChainSerializationError:
             Under strict mode, when one or more entries fail to decode.
+
+        .. rubric:: Implementation notes
+
+        `Frame.from_protobuf` captures a raised `ChainSerializationError`
+        as the frame's ``chain_manifest`` value instead of letting it
+        propagate, so `Frame.mount` (and, for the initial dispatch frame,
+        `DispatchSession.__aenter__`) can raise it or walk-and-append it
+        onto an exception payload's ``__context__`` chain rather than
+        preempting the payload.
         """
         failures: list[SerializationWarning] = []
-        # Chain-id parse failure is a *structural* protocol
+        # Chain-ID parse failure is a *structural* protocol
         # error, distinct from per-var data errors. Raise
         # unconditionally regardless of strict-mode warning filter:
-        # without a valid chain id the receiver cannot correlate
+        # without a valid chain ID the receiver cannot correlate
         # subsequent frames against the same logical caller, and a
         # silently-replaced ``uuid4()`` would route follow-up frames
         # to a fresh cached contextvars.Context (silent state loss).
@@ -330,7 +381,7 @@ class ChainManifest:
         except ValueError as e:
             raise ChainSerializationError(
                 SerializationWarning(
-                    f"Failed to decode chain id {wire.id!r}: {e}",
+                    f"Failed to decode chain ID {wire.id!r}: {e}",
                     cause=e,
                     direction="decode",
                 ),
@@ -338,6 +389,8 @@ class ChainManifest:
         vars: dict[ContextVarManifest[Any], Any] = {}
         resets: set[tuple[str, str]] = set()
         stubs: set[ContextVarManifest[Any]] = set()
+        spent_tokens: dict[tuple[str, str], frozenset[str]] = {}
+        unspent_tokens: dict[tuple[str, str], frozenset[str]] = {}
         failed_keys: set[tuple[str, str]] = set()
         seen_keys: set[tuple[str, str]] = set()
         for entry in wire.vars:
@@ -363,6 +416,13 @@ class ChainManifest:
                     failures.append(raised)
                 continue
             seen_keys.add(var_key)
+            # Spent/unspent token IDs ride independently of the value/reset
+            # state, so capture them before any value-decode failure can
+            # ``continue`` past this entry.
+            if entry.spent_tokens:
+                spent_tokens[var_key] = frozenset(entry.spent_tokens)
+            if entry.unspent_tokens:
+                unspent_tokens[var_key] = frozenset(entry.unspent_tokens)
             var = resolve_stub(var_key)
             if var._stub:
                 stubs.add(var)
@@ -409,6 +469,8 @@ class ChainManifest:
             vars=vars,
             resets=frozenset(resets),
             stubs=frozenset(stubs),
+            spent_tokens=spent_tokens,
+            unspent_tokens=unspent_tokens,
         )
 
     def to_protobuf(
@@ -435,13 +497,20 @@ class ChainManifest:
         aggregate into a single `ChainSerializationError` raised after the
         loop.
 
-        Encoding is deterministic: entries are emitted in sorted key order,
-        so identical manifest state encodes to byte-identical frames across
-        processes — preserving content-addressed caching and replay-style
-        fingerprinting despite hash-randomised set iteration.
+        Encoding is deterministic — identical manifest state encodes to
+        byte-identical frames across processes, preserving content-addressed
+        caching and replay-style fingerprinting.
 
         :raises ChainSerializationError:
             Under strict mode, when one or more variables fail to encode.
+
+        .. rubric:: Implementation notes
+
+        Determinism comes from sorted emission: entries in sorted key order,
+        and each entry's ``spent_tokens`` and ``unspent_tokens`` ID lists
+        likewise sorted — there is no manifest-level ID list — so the frame
+        is byte-identical despite hash-randomised ``frozenset``/``set``
+        iteration.
         """
         if serializer is None:
             serializer = wool.__serializer__
@@ -474,6 +543,15 @@ class ChainManifest:
             entry = wire.vars.add(namespace=namespace, name=name)
             if var_key in encoded_values:
                 entry.value = encoded_values[var_key]
+            # Spent/unspent IDs ride on the entry that already exists for
+            # this key (a spent key is in vars∪resets; an unspent key is
+            # value-bearing → both have an entry). Sorted per the docstring.
+            spent = self.spent_tokens.get(var_key)
+            if spent:
+                entry.spent_tokens.extend(sorted(spent))
+            unspent = self.unspent_tokens.get(var_key)
+            if unspent:
+                entry.unspent_tokens.extend(sorted(unspent))
         if failures:
             raise ChainSerializationError(*failures)
         return wire

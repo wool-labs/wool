@@ -10,7 +10,7 @@ import asyncio
 import datetime
 import ipaddress
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import fields
@@ -297,8 +297,13 @@ class _DirectDiscovery:
         return self._discovery.subscribe(filter)
 
 
+# The return annotation is load-bearing for tooling, not just docs: pyright's
+# inference gives up on this large unannotated async generator and models it
+# as a plain coroutine, breaking ``async with`` analysis at every call site.
 @asynccontextmanager
-async def build_pool_from_scenario(scenario, credentials_map, *, backpressure=None):
+async def build_pool_from_scenario(
+    scenario, credentials_map, *, backpressure=None
+) -> AsyncIterator[WorkerPool]:
     """Build and enter a WorkerPool from a complete Scenario.
 
     Resolves each dimension to its concrete runtime value and yields the
@@ -705,18 +710,27 @@ def _build_patterns_dict(scenario):
 def _setup_caller_vars(patterns):
     """Set caller-side initial values for patterns that need them.
 
-    Returns a dict of {var_name: token} for cleanup, and a dict of
-    {var_name: initial_value} for later assertion.
+    Returns a dict of {var_name: token} for cleanup, a dict of
+    {var_name: initial_value} for later assertion, and the
+    _RESET_TOKENS reset token (or None) minted when a
+    TOKEN_REMOTE_RESET_THEN_FRESH_SET pattern deposits caller-minted
+    tokens for the worker to consume.
     """
     tokens = {}
     initial_values = {}
+    ferry = {}
     for var_name, pattern in patterns.items():
         var = _CALLER_VARS[var_name]
         if pattern is not ContextVarPattern.NONE:
             initial = f"caller-initial-{var_name}"
             tokens[var_name] = var.set(initial)
             initial_values[var_name] = initial
-    return tokens, initial_values
+        if pattern is ContextVarPattern.TOKEN_REMOTE_RESET_THEN_FRESH_SET:
+            # Mint the token the worker will consume; it rides to the
+            # worker nested inside _RESET_TOKENS' propagated value.
+            ferry[var_name] = var.set(f"remote-reset-{var_name}")
+    ferry_token = routines._RESET_TOKENS.set(ferry) if ferry else None
+    return tokens, initial_values, ferry_token
 
 
 def _assert_caller_vars(patterns, initial_values, *, shape=None):
@@ -798,6 +812,22 @@ def _assert_caller_vars(patterns, initial_values, *, shape=None):
                 # Forward propagation is asserted worker-side per
                 # frame — a mismatch raises a dispatch exception.
                 pass  # validated worker-side during iteration
+            case ContextVarPattern.TOKEN_REMOTE_RESET_THEN_FRESH_SET:
+                # The worker consumed the ferried token (restoring the
+                # caller's initial value) then re-set the var; the
+                # fresh set back-propagates home.
+                assert var.get() == f"fresh-{var_name}", (
+                    f"TOKEN_REMOTE_RESET_THEN_FRESH_SET: expected the "
+                    f"worker's fresh value, got {var.get()!r}"
+                )
+                # The regression this pattern pins: the worker's fresh
+                # set must not have erased the consumed id from the
+                # spent ledger, so the caller's stale copy still
+                # raises. Read the ferry dict back from the var — the
+                # post-merge copy carries the same token id either way.
+                stale = routines._RESET_TOKENS.get()[var_name]
+                with pytest.raises(RuntimeError, match="has already been used once"):
+                    var.reset(stale)
 
 
 def _cleanup_caller_vars(tokens):
@@ -817,9 +847,10 @@ async def invoke_routine(scenario):
     patterns_token = None
     caller_tokens = {}
     initial_values = {}
+    ferry_token = None
     if patterns:
         patterns_token = routines.TEST_PATTERNS.set(patterns)
-        caller_tokens, initial_values = _setup_caller_vars(patterns)
+        caller_tokens, initial_values, ferry_token = _setup_caller_vars(patterns)
 
     try:
         obj = (
@@ -988,6 +1019,8 @@ async def invoke_routine(scenario):
     finally:
         if caller_tokens:
             _cleanup_caller_vars(caller_tokens)
+        if ferry_token is not None:
+            routines._RESET_TOKENS.reset(ferry_token)
         if patterns_token is not None:
             routines.TEST_PATTERNS.reset(patterns_token)
 
@@ -1109,7 +1142,10 @@ def _pairwise_filter(row):
     - D11/D12/D13 (ctx_var_1/2/3): DOWNSTREAM_OVERWRITE,
       DOWNSTREAM_RESET, UPSTREAM_RESET only valid with NESTED_* shapes;
       PER_YIELD and MID_STREAM_FORWARD only valid with ASYNC_GEN_*
-      shapes
+      shapes; TOKEN_REMOTE_RESET_THEN_FRESH_SET only valid with
+      non-nested shapes (on nested shapes non-nested patterns execute
+      on BOTH outer and inner workers, and its ferried token is
+      single-use)
     - D14 (quorum) ABOVE_DEFAULT (quorum=2) requires PoolMode.EPHEMERAL —
       every other pool mode in the builder produces only one worker, so
       quorum=2 would block forever.
@@ -1170,6 +1206,15 @@ def _pairwise_filter(row):
             if (
                 pattern is ContextVarPattern.MID_STREAM_FORWARD
                 and shape not in _MID_STREAM_FORWARD_SHAPES
+            ):
+                return False
+            # TOKEN_REMOTE_RESET_THEN_FRESH_SET's ferried token is
+            # single-use; on nested shapes non-nested patterns execute
+            # on both the outer and inner workers, so the second reset
+            # would raise mid-dispatch.
+            if (
+                pattern is ContextVarPattern.TOKEN_REMOTE_RESET_THEN_FRESH_SET
+                and shape in _NESTED_SHAPES
             ):
                 return False
             # NESTED_ASYNC_GEN_READBACK's routine self-mutates
@@ -1326,6 +1371,15 @@ def scenarios_strategy(draw):
             valid = [p for p in valid if p is not ContextVarPattern.PER_YIELD]
         if shape not in _MID_STREAM_FORWARD_SHAPES:
             valid = [p for p in valid if p is not ContextVarPattern.MID_STREAM_FORWARD]
+        if shape in _NESTED_SHAPES:
+            # Mirrors ``_pairwise_filter``: the ferried token is
+            # single-use, but nested shapes execute non-nested
+            # patterns on both the outer and inner workers.
+            valid = [
+                p
+                for p in valid
+                if p is not ContextVarPattern.TOKEN_REMOTE_RESET_THEN_FRESH_SET
+            ]
         return draw(st.sampled_from(valid))
 
     ctx_var_1 = _draw_ctx_var_pattern(draw)
@@ -1492,83 +1546,5 @@ def retry_grpc_internal():
                     await asyncio.sleep(_GRPC_INTERNAL_BACKOFF * (2**attempt))
                     continue
                 raise
-
-    return run
-
-
-def _needs_picklable_token(scenario: Scenario) -> bool:
-    """Report whether the scenario resets a token across a nested dispatch.
-
-    The DOWNSTREAM_RESET pattern deposits a reset token for the inner
-    worker via the `_RESET_TOKENS` ContextVar (see ``routines.py``).
-    Now that nested routines genuinely dispatch to the pool (#278), that
-    token must cross the wire — which only succeeds with the picklable
-    `wool.Token` from #231. Until #231 lands, the stdlib
-    `contextvars.Token` cannot pickle, so the reset is dropped at the
-    serialization boundary and the caller observes the un-reset value.
-
-    Gate the affected cases here; remove this guard with #231.
-    """
-    if scenario.shape not in _NESTED_SHAPES:
-        return False
-    patterns = (scenario.ctx_var_1, scenario.ctx_var_2, scenario.ctx_var_3)
-    return ContextVarPattern.DOWNSTREAM_RESET in patterns
-
-
-@dataclass(frozen=True)
-class _KnownBug:
-    """A scenario region that hits a known, still-open bug.
-
-    ``match`` selects the affected scenarios, ``raises`` constrains the
-    expected failure mode so that an unrelated regression in the same
-    region still surfaces as a real failure, and ``reason`` cites the
-    tracking issue. ``retries``/``backoff``/``retryable`` let a transient
-    known bug be retried before it is marked ``xfail``; the default
-    zero-retry entry marks on the first matching failure.
-    """
-
-    match: Callable[[Scenario], bool]
-    raises: tuple[type[BaseException], ...]
-    reason: str
-    retries: int = 0
-    backoff: float = 0.5
-    retryable: Callable[[BaseException], bool] = lambda _: False
-
-
-_KNOWN_BUGS: list[_KnownBug] = [
-    _KnownBug(
-        match=_needs_picklable_token,
-        raises=(AssertionError,),
-        reason="nested DOWNSTREAM_RESET needs the picklable wool.Token (#231)",
-    ),
-]
-
-
-@pytest.fixture
-def xfail_known_bugs():
-    """Run a test body under the known-bug registry.
-
-    Returns an async callable used as ``await xfail_known_bugs(scenario,
-    body)`` where ``body`` is a no-argument async callable holding the
-    test logic. When the scenario matches a ``_KnownBug`` and ``body``
-    raises the registered failure mode, the test is marked ``xfail``
-    (retrying transient matches with exponential backoff first); once the
-    bug is fixed the body passes and the test goes green. Scenarios with
-    no matching bug run ``body`` unguarded, and any exception outside a
-    registered failure mode propagates as a real failure.
-    """
-
-    async def run(scenario, body):
-        bug = next((b for b in _KNOWN_BUGS if b.match(scenario)), None)
-        if bug is None:
-            return await body()
-        for attempt in range(bug.retries + 1):
-            try:
-                return await body()
-            except bug.raises as exc:
-                if bug.retryable(exc) and attempt < bug.retries:
-                    await asyncio.sleep(bug.backoff * (2**attempt))
-                    continue
-                pytest.xfail(bug.reason)
 
     return run

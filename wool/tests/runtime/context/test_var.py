@@ -5,7 +5,7 @@ import gc
 import pickle
 import threading
 import uuid
-from contextvars import Token
+from typing import Any
 
 import cloudpickle
 import pytest
@@ -17,6 +17,7 @@ from hypothesis import strategies as st
 import wool
 from tests.helpers import _unique
 from tests.helpers import scoped_context
+from wool import Token
 from wool import protocol
 
 # ``Chain`` is imported so the task-adoption test can seed an ownerless
@@ -36,6 +37,15 @@ loads = cloudpickle.loads
 # argument supplied" from a supplied ``None``, which is itself a valid
 # default value.
 _NOTHING = object()
+
+
+def _outcome(reset, token):
+    """Return the exception type raised by ``reset(token)``, or None on success."""
+    try:
+        reset(token)
+    except (RuntimeError, ValueError) as error:
+        return type(error)
+    return None
 
 
 class TestContextVar:
@@ -484,18 +494,16 @@ class TestContextVar:
             # Assert
             assert isinstance(token, Token)
 
-    def test_set_should_return_token_whose_var_is_not_the_wool_var(self):
-        """Test the returned token does not reference the wool ContextVar.
+    def test_set_should_return_token_whose_var_is_the_wool_var(self):
+        """Test the returned token references the wool ContextVar.
 
         Given:
             A ContextVar in an armed context.
         When:
             set is called and the returned token's ``var`` is inspected.
         Then:
-            ``token.var`` should not be the wool ContextVar — the
-            deliberate, disclosed divergence from stdlib, where
-            ``var.set(x).var is var`` holds. The supported reset path is
-            ``var.reset(token)``.
+            ``token.var`` should be the wool ContextVar itself, so
+            ``var.set(x).var is var`` holds as it does in stdlib.
         """
         # Arrange
         var = ContextVar(_unique("set_token_var"))
@@ -505,8 +513,7 @@ class TestContextVar:
             token = var.set("x")
 
             # Assert
-            assert token.var is not var
-            assert token.var is var._backing
+            assert token.var is var
 
     def test_set_should_rebuild_the_context_on_each_call(self):
         """Test each set rebuilds a new immutable context.
@@ -715,8 +722,9 @@ class TestContextVar:
         When:
             reset() is called with the same token again.
         Then:
-            It should raise RuntimeError — the reset routes through the
-            backing variable's native single-use bit.
+            It should raise RuntimeError — the wool-level single-use gate
+            (local used flag or the cross-process consumed ledger) fires
+            first.
         """
         # Arrange
         var = ContextVar(_unique("once"), default=0)
@@ -736,7 +744,7 @@ class TestContextVar:
         When:
             reset() is called on one with the other's token.
         Then:
-            Stdlib's `contextvars.ContextVar.reset` raises
+            `ContextVar.reset` raises
             `ValueError` naming the different ContextVar.
         """
         # Arrange
@@ -752,22 +760,31 @@ class TestContextVar:
                 b.reset(token)
 
     @pytest.mark.parametrize(
-        "not_a_token",
-        ["a-string", 42, None],
-        ids=["str", "int", "none"],
+        "make_not_a_token",
+        [
+            lambda: "a-string",
+            lambda: 42,
+            lambda: None,
+            lambda: contextvars.ContextVar(_unique("stdlib_native")).set("native"),
+        ],
+        ids=["str", "int", "none", "native-token"],
     )
-    def test_reset_should_raise_type_error_when_argument_not_token(self, not_a_token):
-        """Test ContextVar.reset rejects an argument that is not a Token.
+    def test_reset_should_raise_type_error_when_argument_not_token(
+        self, make_not_a_token
+    ):
+        """Test ContextVar.reset rejects an argument that is not a wool Token.
 
         Given:
             An armed ContextVar and an argument that is not a
-            wool.Token — a string, an int, or None.
+            wool.Token — a string, an int, None, or a native
+            contextvars.Token minted by a stdlib variable's set().
         When:
             reset() is called with that argument.
         Then:
-            Stdlib's `contextvars.ContextVar.reset` raises
+            `ContextVar.reset` raises
             `TypeError` naming Token — the type check guards
-            reset before any token-state inspection.
+            reset before any token-state inspection, and even the
+            stdlib token type is rejected.
         """
         # Arrange
         var = ContextVar(_unique("reset_not_token"))
@@ -775,8 +792,8 @@ class TestContextVar:
         # Act & assert
         with scoped_context():
             var.set("x")
-            with pytest.raises(TypeError, match="instance of Token"):
-                var.reset(not_a_token)
+            with pytest.raises(TypeError, match="expected an instance of Token"):
+                var.reset(make_not_a_token())
 
     def test_reset_should_raise_runtime_error_when_used_token_for_different_var(self):
         """Test ContextVar.reset rejects an already-used token even on a different var.
@@ -789,7 +806,7 @@ class TestContextVar:
         When:
             reset() is called with that token on the other var.
         Then:
-            Stdlib's `contextvars.ContextVar.reset` raises
+            `ContextVar.reset` raises
             `RuntimeError` for the used token — the used-token
             check runs first, before the different-ContextVar check.
         """
@@ -854,6 +871,269 @@ class TestContextVar:
                 copy_ctx.run(var.reset, token)
             var.reset(token)
             assert var.get("<unset>") == "<unset>"
+
+    def test_reset_should_raise_runtime_error_when_used_token_reset_in_copied_context(
+        self,
+    ):
+        """Test resetting an already-used token in a copied context.
+
+        Given:
+            A Token consumed by reset() in its own context, and a copy
+            of that context taken via contextvars.copy_context.
+        When:
+            reset() is called with the consumed token inside the copy —
+            where a live token would already fail the context check.
+        Then:
+            It should raise RuntimeError — the used-token gate fires
+            before the different-Context gate.
+        """
+        # Arrange
+        var = ContextVar(_unique("reset_used_in_copy"))
+
+        # Act & assert
+        with scoped_context():
+            token = var.set("x")
+            var.reset(token)
+            copied = contextvars.copy_context()
+            with pytest.raises(RuntimeError, match="has already been used once"):
+                copied.run(var.reset, token)
+
+    def test_reset_should_raise_value_error_when_other_vars_token_reset_in_copy(self):
+        """Test resetting another variable's token in a copied context.
+
+        Given:
+            A Token minted by one ContextVar, a second distinct
+            ContextVar, and a copy of the context taken via
+            contextvars.copy_context.
+        When:
+            The second variable's reset() is called with the first
+            variable's token inside the copy — where even the right
+            variable would fail the context check.
+        Then:
+            It should raise ValueError naming the different ContextVar —
+            the wrong-variable gate fires before the different-Context
+            gate.
+        """
+        # Arrange
+        a = ContextVar(_unique("cross_copy_a"))
+        b = ContextVar(_unique("cross_copy_b"))
+
+        # Act & assert
+        with scoped_context():
+            token = a.set("x")
+            copied = contextvars.copy_context()
+            with pytest.raises(
+                ValueError, match="was created by a different ContextVar"
+            ):
+                copied.run(b.reset, token)
+
+    def test_reset_should_raise_value_error_when_token_roundtripped_without_mount(
+        self,
+    ):
+        """Test resetting an unmounted wool-roundtripped token clone.
+
+        Given:
+            A ContextVar set to "x" whose token is roundtripped through
+            the Wool serializer in-process, with no intervening set to
+            mount the chain and anchor the clone.
+        When:
+            reset() is called with the clone immediately, then with the
+            original token.
+        Then:
+            The clone's reset should raise ValueError — it arrived as an
+            orphan with no anchor in this context — leaving the value
+            intact, while the original token's reset still succeeds.
+        """
+        # Arrange
+        var = ContextVar(_unique("reset_orphan_clone"))
+
+        # Act & assert
+        with scoped_context():
+            token = var.set("x")
+            clone = loads(dumps(token))
+            with pytest.raises(ValueError, match="was created in a different Context"):
+                var.reset(clone)
+            assert var.get() == "x"
+            var.reset(token)
+            assert var.get("<unset>") == "<unset>"
+
+    def test_reset_should_raise_runtime_error_when_token_consumed_before_clone_taken(
+        self,
+    ):
+        """Test resetting a clone of a token consumed before serialization.
+
+        Given:
+            A Token consumed by reset() and only then roundtripped
+            through the Wool serializer, so the used flag rides the
+            wire onto the clone.
+        When:
+            reset() is called with the clone.
+        Then:
+            It should raise RuntimeError — the serialized used flag
+            fires the used-token gate before the orphan context check.
+        """
+        # Arrange
+        var = ContextVar(_unique("reset_clone_used_flag"))
+
+        # Act & assert
+        with scoped_context():
+            token = var.set("x")
+            var.reset(token)
+            clone = loads(dumps(token))
+            with pytest.raises(RuntimeError, match="has already been used once"):
+                var.reset(clone)
+
+    def test_reset_should_raise_runtime_error_when_original_consumed_after_clone_taken(
+        self,
+    ):
+        """Test resetting a live-taken clone after the original is consumed.
+
+        Given:
+            A clone of a live Token taken via a wool-serializer
+            roundtrip, after which the original token is consumed by
+            reset().
+        When:
+            reset() is called with the clone, whose own used flag is
+            still False.
+        Then:
+            It should raise RuntimeError — the consumed-token ledger
+            blocks every copy of a consumed token id, not just the
+            object that was reset.
+        """
+        # Arrange
+        var = ContextVar(_unique("reset_clone_ledger"))
+
+        # Act & assert
+        with scoped_context():
+            token = var.set("x")
+            clone = loads(dumps(token))
+            var.reset(token)
+            with pytest.raises(RuntimeError, match="has already been used once"):
+                var.reset(clone)
+
+    def test_reset_should_raise_runtime_error_when_consumed_elsewhere_for_wrong_var(
+        self,
+    ):
+        """Test a ledger-consumed token reset on the wrong var reports used.
+
+        Given:
+            A clone of a live Token whose id was recorded in the
+            cross-process consumed ledger — the original was reset after
+            the clone was taken, so the clone's own used flag is still
+            False — passed to reset on a different ContextVar, so the
+            clone is BOTH consumed elsewhere AND created by a different
+            variable.
+        When:
+            reset() is called with that clone on the other variable.
+        Then:
+            It should raise RuntimeError for the consumed token — the
+            used-gate keys on the token's own variable and fires before
+            the different-ContextVar check, matching stdlib's order.
+        """
+        # Arrange
+        a = ContextVar(_unique("consumed_elsewhere_a"), default=0)
+        b = ContextVar(_unique("consumed_elsewhere_b"), default=0)
+
+        # Act & assert
+        with scoped_context():
+            token = a.set(1)
+            clone = loads(dumps(token))
+            a.reset(token)
+            with pytest.raises(RuntimeError, match="has already been used once"):
+                b.reset(clone)
+
+    @pytest.mark.parametrize(
+        "rejection, expected",
+        [
+            ("not_a_token", TypeError),
+            ("different_var", ValueError),
+            ("consumed", RuntimeError),
+        ],
+        ids=["type-error", "value-error", "runtime-error"],
+    )
+    def test_reset_should_leave_state_intact_when_rejected(self, rejection, expected):
+        """Test a rejected reset leaves the variable and its tokens intact.
+
+        Given:
+            A ContextVar set to "outer" then "inner" with the inner
+            token held, and a reset argument doomed to rejection — a
+            non-token object, another variable's token, or an
+            already-consumed token of this variable.
+        When:
+            reset() is called with the doomed argument.
+        Then:
+            It should raise the matching TypeError, ValueError, or
+            RuntimeError while the value stays "inner" and the held
+            inner token still resets the variable back to "outer".
+        """
+        # Arrange
+        var = ContextVar(_unique("reset_atomicity"))
+
+        # Act & assert
+        with scoped_context():
+            var.set("outer")
+            inner_token = var.set("inner")
+            doomed: Any
+            if rejection == "not_a_token":
+                doomed = "not-a-token"
+            elif rejection == "different_var":
+                other = ContextVar(_unique("reset_atomicity_other"))
+                doomed = other.set("other")
+            else:
+                doomed = var.set("stale")
+                var.reset(doomed)
+            with pytest.raises(expected):
+                var.reset(doomed)
+            assert var.get() == "inner"
+            var.reset(inner_token)
+            assert var.get() == "outer"
+
+    @given(
+        ops=st.lists(
+            st.one_of(
+                st.tuples(st.just("set"), st.integers() | st.text()),
+                st.tuples(st.just("reset"), st.integers(min_value=0, max_value=11)),
+            ),
+            max_size=12,
+        )
+    )
+    @settings(max_examples=50, deadline=None)
+    def test_reset_should_agree_with_stdlib_over_drawn_op_sequences(self, ops):
+        """Test wool set/reset agree with a stdlib contextvars oracle.
+
+        Given:
+            Any sequence of at most 12 operations, each either a set of
+            a drawn value or a reset of a randomly chosen
+            previously-minted token (drawn with replacement, so
+            consumed tokens are retried), applied in lockstep to one
+            wool ContextVar and one stdlib contextvars.ContextVar in a
+            single context.
+        When:
+            Each operation is applied to both variables in turn.
+        Then:
+            After every operation the two variables should observe the
+            same value (or both be unset) and every reset should either
+            succeed on both or raise the same exception type on both.
+        """
+        # Arrange
+        wool_var = ContextVar(_unique("oracle_wool"))
+        stdlib_var = contextvars.ContextVar(_unique("oracle_stdlib"))
+        sentinel = object()
+        wool_tokens = []
+        stdlib_tokens = []
+
+        # Act & assert
+        with scoped_context():
+            for op, argument in ops:
+                if op == "set":
+                    wool_tokens.append(wool_var.set(argument))
+                    stdlib_tokens.append(stdlib_var.set(argument))
+                elif wool_tokens:
+                    index = argument % len(wool_tokens)
+                    wool_outcome = _outcome(wool_var.reset, wool_tokens[index])
+                    stdlib_outcome = _outcome(stdlib_var.reset, stdlib_tokens[index])
+                    assert wool_outcome is stdlib_outcome
+                assert wool_var.get(sentinel) == stdlib_var.get(sentinel)
 
     def test_reset_should_not_raise_when_chain_unarmed_after_native_reset(self, mocker):
         """Test reset no-ops when the active context reads unarmed post-native-reset.
