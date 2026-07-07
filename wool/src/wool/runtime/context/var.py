@@ -299,11 +299,13 @@ class ContextVar(ContextVarManifest[T]):
         consumption is known here only through the chain's
         ``spent_tokens`` ledger — so pruning the key's spent IDs on a
         re-set would let the caller reset a token already consumed on
-        another process a second time. The ledger therefore grows one
-        entry per consumed token for the chain's lifetime; bounding that
-        growth to token lifespan is issue #226's ownership model, not a
-        prune that forgets consumptions. The freshly minted ID is never
-        spent, so it always survives the subtraction that keeps
+        another process a second time. A re-set therefore never forgets a
+        consumption; instead each spent ID's lifetime is bounded by the
+        `wool.Token` instances carrying it — `_mint` counts this instance
+        (see `~wool.runtime.context.token._register_token`), and
+        `~wool.runtime.context.chain.Chain.mount` reaps the ID once no
+        instance of it survives in this process. The freshly minted ID is
+        never spent, so it always survives the subtraction that keeps
         ``unspent_tokens`` free of dead IDs.
 
         The bookkeeping delta folds into mount's single owner-stamp
@@ -436,10 +438,12 @@ class ContextVar(ContextVarManifest[T]):
         the token's ID moves from the variable's ``unspent_tokens`` set
         (dropping the key once it empties) into ``spent_tokens`` — which
         rides the next frame so the consumption propagates across the
-        wire — and the token is flagged used locally. The spent ID then
-        persists for the chain's lifetime (see
-        `~wool.runtime.context.chain.Chain`); a later set never prunes it,
-        since an off-origin consumption is witnessed only by this ledger.
+        wire — and the token is flagged used locally. The spent ID's lifetime is
+        then bounded by the live `wool.Token` instances carrying it — a
+        later set never prunes it (an off-origin consumption is witnessed
+        only by this ledger), and `~wool.runtime.context.chain.Chain.mount`
+        reaps it once no instance of it remains (see
+        `~wool.runtime.context.chain.Chain`).
         """
         # Guard the installed chain first (see set); bind it once for reuse.
         context = wool.__chain__.get(None)
