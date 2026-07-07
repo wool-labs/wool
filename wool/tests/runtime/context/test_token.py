@@ -1,4 +1,5 @@
 import copy
+import gc
 import pickle
 import uuid
 
@@ -11,6 +12,7 @@ from hypothesis import strategies as st
 import wool
 from tests.helpers import scoped_context
 from wool.runtime.context.token import Token
+from wool.runtime.context.token import dead_token_ids
 from wool.runtime.context.token import token_sink
 from wool.runtime.context.var import ContextVar
 from wool.runtime.typing import Undefined
@@ -293,7 +295,8 @@ class TestToken:
             The restored token's var should be the original ContextVar
             and its old_value should equal the original token's — with
             the Undefined sentinel preserved by identity when the var
-            was previously unset.
+            was previously unset. The restored token should also compare
+            equal to and hash alike the original token.
         """
         # Arrange
         var = ContextVar(_unique("token_roundtrip_prior"))
@@ -307,6 +310,8 @@ class TestToken:
 
         # Assert
         assert restored.var is var
+        assert restored == token
+        assert hash(restored) == hash(token)
         if prior is _UNSET:
             assert token.old_value is Undefined
             assert restored.old_value is Undefined
@@ -339,6 +344,90 @@ class TestToken:
             with pytest.raises(ValueError, match="was created in a different Context"):
                 var.reset(clone)
 
+    def test___eq___should_hold_when_a_token_round_trips_through_serialization(self):
+        """Test a round-tripped token compares equal to the original.
+
+        Given:
+            A token minted by set() and still held by the caller.
+        When:
+            It is serialized, reconstituted, and compared with the original.
+        Then:
+            The reconstituted token should be a distinct object that compares
+            equal to and hashes alike the original — the held handle and the
+            one that comes back denote one token, as a contextvars.Token
+            compares equal to itself.
+        """
+        # Arrange
+        var = ContextVar(_unique("eq_round_trip"))
+
+        # Act & assert
+        with scoped_context():
+            original = var.set("x")
+            clone = loads(dumps(original))
+            assert clone is not original
+            assert clone == original
+            assert hash(clone) == hash(original)
+
+    def test___eq___should_not_hold_when_tokens_minted_by_distinct_sets(self):
+        """Test tokens minted by distinct set() calls are unequal.
+
+        Given:
+            Two tokens minted by separate set() calls, each with its own id.
+        When:
+            They are compared for equality.
+        Then:
+            They should be unequal — equality is by token id and each set()
+            mints a fresh id.
+        """
+        # Arrange
+        var = ContextVar(_unique("eq_distinct"))
+
+        # Act & assert
+        with scoped_context():
+            first = var.set("a")
+            second = var.set("b")
+            assert first != second
+
+    def test___eq___should_not_hold_when_compared_to_a_non_token(self):
+        """Test a Token is unequal to a non-Token rather than raising.
+
+        Given:
+            A token minted by set().
+        When:
+            It is compared for equality with objects that are not tokens.
+        Then:
+            It should be unequal and not raise — equality is defined only
+            against other tokens.
+        """
+        # Arrange
+        var = ContextVar(_unique("eq_non_token"))
+
+        # Act & assert
+        with scoped_context():
+            token = var.set("x")
+            assert token != object()
+            assert token != "not a token"
+
+    def test___hash___should_collapse_equal_tokens_in_a_set(self):
+        """Test equal tokens hash alike and collapse to one set member.
+
+        Given:
+            A token and its round-tripped counterpart, which compare equal.
+        When:
+            Both are added to a set.
+        Then:
+            The set should hold a single element — equal tokens hash alike,
+            so the returned token is not a distinct member.
+        """
+        # Arrange
+        var = ContextVar(_unique("hash_set"))
+
+        # Act & assert
+        with scoped_context():
+            original = var.set("x")
+            clone = loads(dumps(original))
+            assert {original, clone} == {original}
+
 
 def test_token_should_keep_its_wool_var_reachable():
     """Test a live Token keeps its wool variable reachable.
@@ -352,8 +441,6 @@ def test_token_should_keep_its_wool_var_reachable():
         The token's ``var`` should still resolve to the wool ContextVar with
         the original namespace and name.
     """
-    import gc
-
     # Arrange
     namespace = uuid.uuid4().hex
     with scoped_context():
@@ -377,7 +464,7 @@ def test_token_sink_should_scope_wire_token_capture_to_the_decode():
         outside any scope.
     Then:
         The in-scope reconstitution should be captured for the frame's mount to
-        anchor, while an out-of-scope reconstitution is captured by nothing — a
+        anchor, while an out-of-scope reconstitution appends to no sink — a
         token whose frame never mounts is reclaimed with the frame's list rather
         than accumulating in a process-global registry.
     """
@@ -394,4 +481,57 @@ def test_token_sink_should_scope_wire_token_capture_to_the_decode():
     # Assert
     assert collected == [clone]
     assert isinstance(outside, Token)
-    assert outside not in collected
+    # An out-of-scope decode is captured by no sink: it is a distinct object
+    # (equal to the captured clone by id, but never appended to the closed
+    # sink's list).
+    assert not any(outside is captured for captured in collected)
+
+
+def test_dead_token_ids_should_report_only_ids_with_no_live_instance():
+    """Test dead_token_ids returns exactly the ids whose tokens are gone.
+
+    Given:
+        Two set tokens under distinct keys — one still held, one dropped and
+        collected — with their ids read from the public chain manifest.
+    When:
+        dead_token_ids is queried with both ids.
+    Then:
+        It should return the dropped token's id and not the held one — the reap
+        oracle reports an id dead once no instance of it remains live.
+    """
+    # Arrange
+    var_held = ContextVar(_unique("dead_ids_held"))
+    var_dropped = ContextVar(_unique("dead_ids_dropped"))
+    key_held = (var_held.namespace, var_held.name)
+    key_dropped = (var_dropped.namespace, var_dropped.name)
+    with scoped_context():
+        held = var_held.set("x")
+        dropped = var_dropped.set("y")
+        manifest = wool.__chain__.get().to_manifest()
+        held_id = next(iter(manifest.unspent_tokens[key_held]))
+        dropped_id = next(iter(manifest.unspent_tokens[key_dropped]))
+
+        # Act
+        del dropped
+        gc.collect()
+        result = dead_token_ids({held_id, dropped_id})
+
+        # Assert
+        assert dropped_id in result
+        assert held_id not in result
+        assert isinstance(held, Token)  # keep the held instance alive
+
+
+def test_dead_token_ids_should_return_empty_when_given_no_ids():
+    """Test dead_token_ids over no ids returns an empty set.
+
+    Given:
+        No token ids — the degenerate empty input the reap passes on every
+        mount of a chain that carries no spent tokens.
+    When:
+        dead_token_ids is queried with an empty iterable.
+    Then:
+        It should return an empty frozenset without error.
+    """
+    # Arrange, act, & assert
+    assert dead_token_ids(frozenset()) == frozenset()

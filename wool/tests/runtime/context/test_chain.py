@@ -2,6 +2,7 @@
 
 import asyncio
 import contextvars
+import gc
 import threading
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ from tests.helpers import _unique
 from tests.helpers import scoped_context
 from wool.runtime.context.chain import Chain
 from wool.runtime.context.manifest import ChainManifest
+from wool.runtime.context.token import Token
 from wool.runtime.context.token import token_sink
 from wool.runtime.context.var import ContextVar
 
@@ -616,23 +618,25 @@ class TestChain:
         """Test from_manifest seeds the manifest's spent ids on a fresh receiver.
 
         Given:
-            A manifest snapshotted from a sender scope that set a variable
-            and reset its token, recording a spent id, and a fresh unarmed
-            receiver context.
+            A manifest snapshotted from a sender scope that set a variable and
+            reset its token — recording a spent id whose token instance is kept
+            alive — and a fresh unarmed receiver context.
         When:
             Chain.from_manifest installs the manifest with no merge target.
         Then:
             The receiver chain's snapshot should carry exactly the sender's
-            per-var spent token ids — the seed branch mirrors the unspent one.
+            per-var spent token ids — the seed branch mirrors the unspent one,
+            and the live instance keeps the id from being reaped on ingress.
         """
         # Arrange
         var = ContextVar(_unique("seed_spent"))
 
-        def _sender() -> ChainManifest:
-            var.reset(var.set("v"))
-            return wool.__chain__.get().to_manifest()
+        def _sender() -> tuple[ChainManifest, Token]:
+            token = var.set("v")
+            var.reset(token)
+            return wool.__chain__.get().to_manifest(), token
 
-        manifest = contextvars.Context().run(_sender)
+        manifest, token = contextvars.Context().run(_sender)
         assert manifest.spent_tokens
 
         def _receiver() -> dict[tuple[str, str], frozenset[str]]:
@@ -645,6 +649,7 @@ class TestChain:
 
         # Assert
         assert received == manifest.spent_tokens
+        assert isinstance(token, Token)  # hold the instance so the seed is not reaped
 
     def test_from_manifest_should_block_local_reset_when_ledger_ingested(self):
         """Test an ingested consumed-token ledger blocks the local reset.
@@ -684,20 +689,21 @@ class TestChain:
             with pytest.raises(RuntimeError, match="has already been used once"):
                 var.reset(token)
 
-    def test_to_manifest_should_retain_spent_tokens_when_var_re_set(self):
-        """Test re-setting a variable retains its spent-token ledger entry.
+    def test_to_manifest_should_retain_spent_tokens_when_instance_held(self):
+        """Test a re-set retains the spent entry while its instance is held.
 
         Given:
             A variable whose token has been consumed by reset, leaving its
-            id in the chain snapshot's spent_tokens for that key.
+            id in the chain snapshot's spent_tokens for that key, with the
+            consumed token still referenced.
         When:
             The variable is set again, minting a fresh token.
         Then:
             The new snapshot's spent_tokens should still carry the consumed
             id under the key — a copy of the consumed token may live on any
             process the id reached with its used flag unset, so this ledger
-            is the only witness rejecting a cross-process double reset.
-            (Bounding the ledger to token lifespan is issue #226.)
+            is the only witness rejecting a cross-process double reset, and
+            the reap holds off while an instance is alive.
         """
         # Arrange
         var = ContextVar(_unique("retain_spent_tokens"))
@@ -714,6 +720,513 @@ class TestChain:
             # Assert
             spent = wool.__chain__.get().to_manifest().spent_tokens
             assert token_id in spent[key]
+            assert isinstance(token, Token)  # keep the instance alive to the assertion
+
+    def test_mount_should_keep_spent_ledger_bounded_across_a_set_reset_loop(self):
+        """Test the spent ledger stays bounded across many set/reset cycles.
+
+        Given:
+            A single long-lived chain driving many set-then-reset cycles,
+            each discarding the consumed token — the streaming routine's
+            growth pattern.
+        When:
+            The cycle repeats N times and the per-key spent-token count is
+            sampled each iteration.
+        Then:
+            The count should stay pinned at the single in-flight consumed id
+            rather than growing with N — each cycle's collected token is reaped
+            instead of accumulating one entry per cycle for the chain's life.
+        """
+        # Arrange
+        n = 64
+        var = ContextVar(_unique("loop_bound"))
+        key = (var.namespace, var.name)
+        sizes: list[int] = []
+
+        def _loop() -> None:
+            for i in range(n):
+                token = var.set(i)
+                var.reset(token)
+                del token
+                gc.collect()
+                chain = wool.__chain__.get()
+                sizes.append(len(chain.spent_tokens.get(key, frozenset())))
+
+        # Act
+        contextvars.Context().run(_loop)
+
+        # Assert — one in-flight consumed id per iteration, independent of N.
+        assert max(sizes) <= 1
+
+    @given(
+        cycles=st.lists(
+            st.tuples(st.integers(), st.booleans()),
+            max_size=16,
+        )
+    )
+    @settings(max_examples=30, deadline=None)
+    def test_mount_should_keep_spent_ledger_bounded_when_arbitrary_set_reset_cycles(
+        self, cycles
+    ):
+        """Test the spent ledger stays bounded across arbitrary set/reset cycles.
+
+        Given:
+            A single var in an isolated context and an arbitrary-length
+            sequence of cycles, each carrying a value to set and a flag for
+            whether to reset the token it mints, with the token
+            deterministically dropped and collected after every cycle.
+        When:
+            Each cycle sets the var, optionally resets the minted token, then
+            drops and collects it, sampling the per-key spent-token count.
+        Then:
+            The count should never exceed one however many cycles run — each
+            cycle's collected consumed id is reaped on the next mount instead
+            of accumulating one entry per cycle for the chain's life.
+        """
+        # Arrange
+        var = ContextVar(_unique("loop_bound_prop"))
+        key = (var.namespace, var.name)
+        sizes: list[int] = []
+
+        def _drive() -> None:
+            for value, do_reset in cycles:
+                token = var.set(value)
+                if do_reset:
+                    var.reset(token)
+                del token
+                gc.collect()
+                chain = wool.__chain__.get()
+                sizes.append(len(chain.spent_tokens.get(key, frozenset())))
+
+        # Act
+        contextvars.Context().run(_drive)
+
+        # Assert — at most one in-flight consumed id, independent of length.
+        assert all(size <= 1 for size in sizes)
+
+    def test_mount_should_reap_a_reconstituted_token_when_dropped(self):
+        """Test a wire-reconstituted token's consumed id is reaped once dropped.
+
+        Given:
+            A live token minted in an origin scope and shipped home, its origin
+            instance then collected, and a receiver that reconstitutes it,
+            anchors it, resets it — recording the id in spent_tokens — then
+            drops it and re-arms the chain.
+        When:
+            The re-arm transits the reap.
+        Then:
+            The consumed id should be reaped once the receiver holds no
+            instance of it — the ledger is bounded by token lifespan, not the
+            chain's.
+        """
+        # Arrange
+        var = ContextVar(_unique("reconstituted_reap"))
+        key = (var.namespace, var.name)
+
+        def _origin() -> tuple[ChainManifest, bytes]:
+            token = var.set("v")
+            return wool.__chain__.get().to_manifest(), wool.__serializer__.dumps(token)
+
+        manifest, payload = contextvars.Context().run(_origin)
+        tok_id = next(iter(manifest.unspent_tokens[key]))
+        gc.collect()  # drop the origin-side instance
+
+        def _receiver() -> frozenset[str]:
+            with token_sink() as pending:
+                wire = cloudpickle.loads(payload)
+            Chain.from_manifest(manifest, owned=True, wire_tokens=pending)
+            var.reset(wire)
+            assert tok_id in wool.__chain__.get().spent_tokens.get(key, frozenset())
+            # Drop every reference to the instance — the sink list still holds it.
+            del wire
+            del pending
+            gc.collect()
+            var.set("bump")
+            return wool.__chain__.get().spent_tokens.get(key, frozenset())
+
+        # Act
+        spent_after = contextvars.Context().run(_receiver)
+
+        # Assert
+        assert tok_id not in spent_after
+
+    def test_from_manifest_should_reap_a_spent_id_without_a_live_instance(self):
+        """Test a wire-arrived spent id with no live instance is reaped on ingress.
+
+        Given:
+            A fresh receiver that ingests a manifest carrying a consumed id in
+            spent_tokens for which it holds no token instance.
+        When:
+            Chain.from_manifest installs it, transiting the reap.
+        Then:
+            The id should be reaped — with no instance in this process nothing
+            can reset or forward it, so the ledger need not retain it; it
+            re-arrives with its own instance if the token is ever forwarded
+            here, keeping single-use intact.
+        """
+        # Arrange
+        var = ContextVar(_unique("external_reap"))
+        key = (var.namespace, var.name)
+        external_id = uuid4().hex
+
+        def _receiver() -> frozenset[str]:
+            manifest = ChainManifest(
+                id=uuid4(),
+                vars={},
+                resets=frozenset(),
+                stubs=frozenset(),
+                spent_tokens={key: frozenset({external_id})},
+            )
+            Chain.from_manifest(manifest, owned=True)
+            return wool.__chain__.get().spent_tokens.get(key, frozenset())
+
+        # Act
+        spent = contextvars.Context().run(_receiver)
+
+        # Assert
+        assert external_id not in spent
+
+    def test_mount_should_not_reap_spent_token_while_a_round_trip_clone_lives(self):
+        """Test the reap holds a consumed id while a returned clone still lives.
+
+        Given:
+            A round-trip where a variable is set and the same token rides home
+            as a live, anchored clone, so two instances share one id in this
+            process; the original is then reset and dropped, and the chain is
+            re-armed by a fresh set.
+        When:
+            The still-live returned clone is reset.
+        Then:
+            It should raise RuntimeError reporting the token was already used —
+            the reap must not drop the consumed id while any instance of it
+            survives, so single-use holds and the freshly-set value stays
+            intact.
+        """
+        # Arrange
+        var = ContextVar(_unique("round_trip_reap"))
+
+        with scoped_context():
+            origin = var.set("v1")
+            manifest = wool.__chain__.get().to_manifest()
+            payload = wool.__serializer__.dumps(origin)
+            # The token rides home on a frame — a live, anchored clone.
+            with token_sink() as pending:
+                clone = cloudpickle.loads(payload)
+            Chain.from_manifest(
+                manifest,
+                owned=True,
+                merge_with=wool.__chain__.get(),
+                wire_tokens=pending,
+            )
+            # Consume via the original, then drop it and re-arm the chain.
+            var.reset(origin)
+            del origin
+            gc.collect()
+            var.set("v2")
+
+            # Act & assert — the clone still lives, so the id must not be reaped.
+            with pytest.raises(RuntimeError, match="has already been used once"):
+                var.reset(clone)
+            assert var.get() == "v2"
+
+    def test_from_manifest_should_reap_dropped_but_keep_held_when_merging(self):
+        """Test the merge-path reap discriminates by instance liveness.
+
+        Given:
+            An armed receiver with two consumed ids — one whose token instance
+            has been dropped and collected, one whose instance is still held.
+        When:
+            A manifest is merged onto the receiver via Chain.from_manifest,
+            transiting the reap on the wire-ingress path.
+        Then:
+            The dropped id should be reaped from spent_tokens while the held id
+            is retained — the merge reap bounds only ids with no live instance.
+        """
+        # Arrange
+        var_a = ContextVar(_unique("merge_dropped"))
+        var_b = ContextVar(_unique("merge_held"))
+        key_a = (var_a.namespace, var_a.name)
+        key_b = (var_b.namespace, var_b.name)
+
+        def _receiver() -> tuple[str, str, frozenset[str], frozenset[str], Token]:
+            dropped = var_a.set("a")
+            id_a = next(iter(wool.__chain__.get().to_manifest().unspent_tokens[key_a]))
+            var_a.reset(dropped)
+            del dropped
+            gc.collect()
+            held = var_b.set("b")
+            id_b = next(iter(wool.__chain__.get().to_manifest().unspent_tokens[key_b]))
+            var_b.reset(held)
+            receiver = wool.__chain__.get()
+            manifest = ChainManifest(
+                id=receiver.id,
+                vars={},
+                resets=frozenset(),
+                stubs=frozenset(),
+            )
+            Chain.from_manifest(manifest, owned=True, merge_with=receiver)
+            chain = wool.__chain__.get()
+            return (
+                id_a,
+                id_b,
+                chain.spent_tokens.get(key_a, frozenset()),
+                chain.spent_tokens.get(key_b, frozenset()),
+                held,
+            )
+
+        # Act
+        id_a, id_b, spent_a, spent_b, held = contextvars.Context().run(_receiver)
+
+        # Assert
+        assert id_a not in spent_a  # instance dropped → reaped on merge
+        assert id_b in spent_b  # instance held → retained
+        assert isinstance(held, Token)  # keep the held instance alive
+
+    def test_mount_should_reap_a_consumed_token_when_dropped_on_worker_side(self):
+        """Test a worker-side (owned=False) mount reaps a consumed id on drop.
+
+        Given:
+            A worker-side install (owned=False) of a reconstituted token that
+            is reset, held live, then dropped and collected.
+        When:
+            A second worker-side mount transits the reap.
+        Then:
+            The consumed id should be retained while the instance is held and
+            reaped once it is dropped — the reap runs on the owned=False
+            per-step driver path too.
+        """
+        # Arrange
+        var = ContextVar(_unique("worker_reap"))
+        key = (var.namespace, var.name)
+
+        def _origin() -> tuple[ChainManifest, bytes]:
+            token = var.set("v")
+            return wool.__chain__.get().to_manifest(), wool.__serializer__.dumps(token)
+
+        manifest, payload = contextvars.Context().run(_origin)
+        tok_id = next(iter(manifest.unspent_tokens[key]))
+        gc.collect()
+
+        def _worker() -> tuple[frozenset[str], frozenset[str]]:
+            with token_sink() as pending:
+                wire = cloudpickle.loads(payload)
+            # Worker-side install: owned=False (driven by step-tasks, not a task).
+            Chain.from_manifest(manifest, owned=False, wire_tokens=pending)
+            var.reset(wire)
+            held = wool.__chain__.get().spent_tokens.get(key, frozenset())
+            # Drop the instance, then transit another owned=False mount.
+            del wire
+            del pending
+            gc.collect()
+            live = wool.__chain__.get()
+            empty = ChainManifest(
+                id=live.id, vars={}, resets=frozenset(), stubs=frozenset()
+            )
+            Chain.from_manifest(empty, owned=False, merge_with=live)
+            reaped = wool.__chain__.get().spent_tokens.get(key, frozenset())
+            return held, reaped
+
+        # Act
+        held, reaped = contextvars.Context().run(_worker)
+
+        # Assert
+        assert tok_id in held  # consumed, retained while held
+        assert tok_id not in reaped  # reaped once dropped, on an owned=False mount
+
+    def test_mount_should_never_prune_unspent_ids(self):
+        """Test the reap never removes an id from the anchor (unspent) ledger.
+
+        Given:
+            A variable set once — its id live in unspent_tokens — and never
+            reset, with its token then dropped and collected.
+        When:
+            A different variable is set, transiting the reap.
+        Then:
+            The first id should remain in unspent_tokens — the reap is
+            restricted to spent ids, so it never prunes an unspent (in-flight)
+            token by instance collection.
+        """
+        # Arrange
+        var_a = ContextVar(_unique("unspent_survive_a"))
+        var_b = ContextVar(_unique("unspent_survive_b"))
+        key_a = (var_a.namespace, var_a.name)
+
+        def _run() -> tuple[str, frozenset[str]]:
+            token = var_a.set("a")  # id_a in unspent, never reset
+            id_a = next(iter(wool.__chain__.get().to_manifest().unspent_tokens[key_a]))
+            del token
+            gc.collect()
+            var_b.set("b")  # a mount transiting the reap
+            return id_a, wool.__chain__.get().unspent_tokens.get(key_a, frozenset())
+
+        # Act
+        id_a, unspent_a = contextvars.Context().run(_run)
+
+        # Assert
+        assert id_a in unspent_a
+
+    def test_mount_should_reap_only_the_dead_id_within_a_shared_key(self):
+        """Test a partial reap drops the dead id and keeps the live one per key.
+
+        Given:
+            One variable reset twice under a single key, so spent_tokens[key]
+            holds two consumed ids, with the first token dropped and collected
+            (dead) and the second still held live.
+        When:
+            A fresh set transits mount's reap.
+        Then:
+            spent_tokens[key] should retain exactly the surviving id under the
+            same key — the reap subtracts only the dead id from the key rather
+            than dropping the whole key when any of its ids is dead.
+        """
+        # Arrange
+        var = ContextVar(_unique("partial_reap"))
+        key = (var.namespace, var.name)
+
+        with scoped_context():
+            first = var.set("a")
+            id1 = next(iter(wool.__chain__.get().to_manifest().unspent_tokens[key]))
+            var.reset(first)
+            second = var.set("b")
+            id2 = next(iter(wool.__chain__.get().to_manifest().unspent_tokens[key]))
+            var.reset(second)
+            spent = wool.__chain__.get().spent_tokens.get(key, frozenset())
+            assert spent == frozenset({id1, id2})
+
+            # Act — drop only the first instance, then transit a reaping mount.
+            del first
+            gc.collect()
+            var.set("c")
+
+            # Assert — only the dead id is reaped; the survivor stays under the key.
+            reaped = wool.__chain__.get().spent_tokens.get(key, frozenset())
+            assert reaped == frozenset({id2})
+            assert isinstance(second, Token)  # keep the survivor alive
+
+    def test_mount_should_drop_a_spent_key_entirely_when_all_ids_reaped(self):
+        """Test a fully-reaped key is removed, not left as an empty frozenset.
+
+        Given:
+            A variable set and reset (its key holding one consumed id), then the
+            token dropped and collected so the key's only id is dead.
+        When:
+            A re-arming mount transits the reap.
+        Then:
+            The key should be absent from spent_tokens entirely — a fully reaped
+            key is dropped, not retained as an empty frozenset that would
+            accumulate one dead key per reaped variable over a chain's life.
+        """
+        # Arrange
+        var = ContextVar(_unique("key_drop"))
+        key = (var.namespace, var.name)
+
+        with scoped_context():
+            token = var.set("v")
+            token_id = next(iter(wool.__chain__.get().to_manifest().unspent_tokens[key]))
+            var.reset(token)
+            assert key in wool.__chain__.get().spent_tokens
+
+            # Act
+            del token
+            gc.collect()
+            var.set("again")
+
+            # Assert — the whole key is gone (not an empty frozenset), so the id is too.
+            chain = wool.__chain__.get()
+            assert key not in chain.spent_tokens
+            assert token_id not in chain.spent_tokens.get(key, frozenset())
+
+    def test_mount_should_not_reap_while_token_only_transitively_reachable(self):
+        """Test the reap holds while a token is reachable only transitively.
+
+        Given:
+            A wire-reconstituted token reset (its consumed id in spent_tokens)
+            whose only surviving reference is the token_sink capture list, the
+            direct name having been dropped and collected.
+        When:
+            A mount transits the reap while the sink list still holds the token,
+            then again after the sink list is dropped.
+        Then:
+            The id should stay in spent_tokens while the sink list keeps the
+            token reachable, and be reaped only once that last reference is
+            dropped — liveness counts every reference, not just named ones.
+        """
+        # Arrange
+        var = ContextVar(_unique("transitive_reach"))
+        key = (var.namespace, var.name)
+
+        def _origin() -> tuple[ChainManifest, bytes]:
+            token = var.set("v")
+            return wool.__chain__.get().to_manifest(), wool.__serializer__.dumps(token)
+
+        manifest, payload = contextvars.Context().run(_origin)
+        tok_id = next(iter(manifest.unspent_tokens[key]))
+        gc.collect()  # drop the origin-side instance
+
+        def _receiver() -> tuple[frozenset[str], frozenset[str]]:
+            with token_sink() as pending:
+                wire = cloudpickle.loads(payload)
+            Chain.from_manifest(manifest, owned=True, wire_tokens=pending)
+            var.reset(wire)
+            assert tok_id in wool.__chain__.get().spent_tokens.get(key, frozenset())
+            # Drop the direct name only; the sink list ``pending`` still holds it.
+            del wire
+            gc.collect()
+            var.set("bump")  # a reaping mount while ``pending`` keeps it reachable
+            held = wool.__chain__.get().spent_tokens.get(key, frozenset())
+            # Now drop the last reference and transit another reaping mount.
+            del pending
+            gc.collect()
+            var.set("bump2")
+            reaped = wool.__chain__.get().spent_tokens.get(key, frozenset())
+            return held, reaped
+
+        # Act
+        held, reaped = contextvars.Context().run(_receiver)
+
+        # Assert
+        assert held  # retained while the sink list kept the token reachable
+        assert not reaped  # reaped once the last reference was dropped
+
+    def test_mount_should_reap_a_token_dropped_on_another_thread(self):
+        """Test a token dropped on another thread is still reaped.
+
+        Given:
+            An armed chain with a variable set and reset (its consumed id in
+            spent_tokens), the token handed to a worker thread inside a
+            container.
+        When:
+            The worker thread drops the token and runs a collection, then a
+            mount on the main thread transits the reap.
+        Then:
+            The consumed id should be reaped — a finalizer firing on a different
+            thread than the one that minted the token still releases its count,
+            so the reap sees no live instance.
+        """
+        # Arrange
+        var = ContextVar(_unique("cross_thread_reap"))
+        key = (var.namespace, var.name)
+
+        with scoped_context():
+            token = var.set("v")
+            var.reset(token)
+            assert key in wool.__chain__.get().spent_tokens
+            box = [token]
+            del token
+
+            # Act — drop the token's last reference on a different thread.
+            def _drop() -> None:
+                box.clear()
+                gc.collect()
+
+            worker = threading.Thread(target=_drop)
+            worker.start()
+            worker.join()
+            gc.collect()
+            var.set("again")  # a reaping mount on the main thread
+
+            # Assert
+            assert key not in wool.__chain__.get().spent_tokens
 
     def test_from_manifest_should_restore_prior_value_when_wire_token_anchored(self):
         """Test an anchored wire token restores a real prior value on reset.
