@@ -24,6 +24,7 @@ sibling lane files:
   to reset (``nested_oracle_set_report``).
 """
 
+import gc
 import os
 import uuid
 
@@ -441,6 +442,114 @@ class TestWorkerMintedTokenLedgerRelay:
                 with pytest.raises(RuntimeError, match="has already been used once"):
                     var.reset(token)
                 assert var.get(UNSET) == UNSET
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_consumed_token_forwarded_onward_should_be_rejected_downstream(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a consumed token forwarded onward is rejected by the ledger.
+
+        Given:
+            An EPHEMERAL two-worker pool and a worker-minted token returned
+            home, dispatched to a routine that consumes it via a nested reset
+            and then forwards the still-unused token onward through a further
+            reset dispatch.
+        When:
+            The caller drives that relay, retrying with a fresh token until the
+            consuming reset and the onward forward provably land on different
+            worker processes.
+        Then:
+            On every attempt the nested reset should report ok and the onward
+            reset should report the single-use RuntimeError; and at least one
+            attempt should forward to a process distinct from the one that
+            consumed the token — proving the consumed-token signal rode the
+            request frame across the process boundary rather than being served
+            by an intra-process ledger, so the reap never dropped the entry
+            while a downstream dispatch still needed it.
+        """
+
+        async def body():
+            # Arrange
+            var = _fresh_var()
+            scenario = default_scenario(
+                pool_mode=PoolMode.EPHEMERAL,
+                lazy=LazyMode.EAGER,
+                quorum=QuorumMode.ABOVE_DEFAULT,
+            )
+            async with build_pool_from_scenario(scenario, credentials_map):
+                # Act — a fresh token each attempt; single-use must hold every
+                # time, and round-robin reaches a distinct onward process within
+                # a few attempts.
+                crossed = False
+                for i in range(8):
+                    _, token = await routines.oracle_set_report(
+                        var.namespace, var.name, f"onward-{i}"
+                    )
+                    inner, downstream = await routines.relay_consume_then_forward_report(
+                        var.namespace, var.name, token
+                    )
+
+                    # Assert — the nested reset consumes; the onward reset is
+                    # rejected by the consumed-token ledger on the request frame.
+                    assert inner[1] == "ok"
+                    assert downstream[1] == "RuntimeError"
+                    assert "has already been used once" in downstream[2]
+                    if inner[0] != downstream[0]:
+                        crossed = True
+                        break
+
+                # Assert — the onward hop reached a distinct process at least
+                # once, so the consumed signal provably rode the wire.
+                assert crossed, (
+                    "the onward hop never reached a process distinct from the "
+                    "consuming reset, so cross-process forwarding was not "
+                    "exercised"
+                )
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_caller_ledger_should_stay_bounded_across_a_worker_mint_reset_loop(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test the caller's ledger stays bounded across many worker-mint resets.
+
+        Given:
+            A DEFAULT pool and a single caller context in which the caller
+            repeatedly has a worker mint a token, resets it, and drops it.
+        When:
+            The loop runs many times, each minting a fresh worker token,
+            resetting it, then dropping the instance and collecting.
+        Then:
+            The caller's own spent-token ledger for the variable's key should
+            stay bounded — a small constant, not growing with the loop count —
+            since the caller reaps each consumed token it no longer holds an
+            instance of rather than accumulating one entry per iteration.
+        """
+
+        async def body():
+            # Arrange
+            var = _fresh_var()
+            key = (var.namespace, var.name)
+            k = 64
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                # Act
+                for i in range(k):
+                    _, token = await routines.oracle_set_report(
+                        var.namespace, var.name, f"loop-{i}"
+                    )
+                    var.reset(token)
+                    del token
+                    gc.collect()
+
+                # Assert
+                caller_spent = wool.__chain__.get().spent_tokens.get(key, frozenset())
+                assert len(caller_spent) <= 2, (
+                    f"caller ledger grew across {k} iterations: {len(caller_spent)}"
+                )
 
         await retry_grpc_internal(body)
 

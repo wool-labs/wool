@@ -15,14 +15,17 @@ chain's ``spent_tokens`` ledger (see `~wool.runtime.context.chain.Chain`).
 
 .. rubric:: Implementation notes
 
-A token ID is recorded in the ``spent_tokens`` ledger on reset, retained for
-the chain's lifetime (never pruned by a re-set, since an off-origin
-consumption is witnessed only by that ledger), and propagated on every frame.
+A token ID is recorded in the ``spent_tokens`` ledger on reset and propagated
+on every frame; its retention is bounded to the lifespan of the `wool.Token`
+instances carrying it, reaped by `~wool.runtime.context.chain.Chain.mount` once
+none remains (see `~wool.runtime.context.chain.Chain`).
 """
 
 from __future__ import annotations
 
 import contextvars
+import threading
+import weakref
 from collections.abc import Generator
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -62,6 +65,17 @@ _token_sink: Final[contextvars.ContextVar[list["Token"] | None]] = (
     contextvars.ContextVar("__wool_token_sink__", default=None)
 )
 
+#: Count of live `Token` instances per ID, consulted by
+#: `~wool.runtime.context.chain.Chain`'s ledger reap to bound ``spent_tokens``
+#: to token lifespan (see `_register_token` and `dead_token_ids`).
+_token_counts: Final[dict[str, int]] = {}
+
+#: Serialises the read-modify-write on `_token_counts` so a register on one
+#: thread and a `weakref.finalize` release on another (finalizers fire during
+#: GC on whatever thread drops the token) cannot lose an increment — a lost
+#: increment could zero a count early and reap an ID whose token is still live.
+_token_lock: Final[threading.Lock] = threading.Lock()
+
 
 @contextmanager
 def token_sink() -> Generator[list[Token]]:
@@ -77,6 +91,51 @@ def token_sink() -> Generator[list[Token]]:
         yield collected
     finally:
         _token_sink.reset(reset)
+
+
+def _register_token(token: Token) -> None:
+    """Record *token* as a live instance of its ID for ledger reaping.
+
+    Increments the ID's live-instance count and attaches a `weakref.finalize`
+    that decrements it when this instance is collected. Counts each instance
+    rather than a single canonical one, so coexisting copies of one ID (a
+    returned clone alongside its origin, or a token both held and re-decoded)
+    keep the ID live until the last is collected.
+    """
+    with _token_lock:
+        _token_counts[token._id] = _token_counts.get(token._id, 0) + 1
+    weakref.finalize(token, _release_token, token._id)
+
+
+def _release_token(token_id: str) -> None:
+    """Decrement *token_id*'s live-instance count, dropping the key at zero.
+
+    The `weakref.finalize` callback `_register_token` attaches to each instance;
+    it fires during garbage collection when that instance is reclaimed.
+    """
+    with _token_lock:
+        remaining = _token_counts.get(token_id, 0) - 1
+        if remaining > 0:
+            _token_counts[token_id] = remaining
+        else:
+            _token_counts.pop(token_id, None)
+
+
+def dead_token_ids(ids: Iterable[str]) -> frozenset[str]:
+    """Return the *ids* whose tokens no longer live in this process.
+
+    The reap oracle for `~wool.runtime.context.chain.Chain.mount`: an ID absent
+    from `_token_counts` has no surviving instance, so nothing local can reset
+    or forward it and its consumed-token entry can be dropped. Keeps the
+    registry encapsulated here: callers pass the spent IDs and get back the
+    dead ones.
+
+    .. rubric:: Implementation notes
+
+    The membership read needs no lock: a transient miscount can only retain an
+    ID one mount longer, never reap one early.
+    """
+    return frozenset(id for id in ids if id not in _token_counts)
 
 
 def anchor_tokens(wire_tokens: Iterable[Token], chain: Chain) -> None:
@@ -124,7 +183,14 @@ class Token(Generic[T]):
     pickler.
     """
 
-    __slots__ = ("_var", "_old_value", "_native", "_id", "_used")
+    __slots__ = (
+        "_var",
+        "_old_value",
+        "_native",
+        "_id",
+        "_used",
+        "__weakref__",
+    )
 
     _var: ContextVar[T]
     _old_value: T | UndefinedType
@@ -162,6 +228,25 @@ class Token(Generic[T]):
         # this token's `wool.ContextVar` (the failure is about the wool token).
         used = "used " if self._used else ""
         return f"<Token {used}var={self._var!r} at 0x{id(self):x}>"
+
+    def __eq__(self, other: object) -> bool:
+        """Return whether *other* is a `Token` for the same underlying token.
+
+        Two `wool.Token` handles are equal when they share an ID, so the handle
+        a caller holds and the one returned from a dispatch round-trip compare
+        equal — as a `contextvars.Token` compares equal to itself. Direct
+        construction is refused and an ID is minted per `set`, so the ID is a
+        faithful token identity.
+        """
+        return isinstance(other, Token) and other._id == self._id
+
+    def __hash__(self) -> int:
+        """Hash by token ID so equal tokens hash alike and survive a round-trip.
+
+        The ID is fixed for the token's life, so the hash is stable even as the
+        ``used`` flag settles.
+        """
+        return hash(self._id)
 
     def __reduce__(self) -> NoReturn:
         """Reject vanilla pickling; the dispatch pickler uses `__wool_reduce__`.
@@ -247,7 +332,9 @@ class Token(Generic[T]):
         The sole mint path — `~wool.runtime.context.var.ContextVar.set` and
         dispatch reconstitution (`_reconstitute`) — building the token from its
         wire and anchor state directly rather than through the refusing
-        ``__init__``.
+        ``__init__``. Every minted instance is counted for ledger reaping via
+        `_register_token`, so a consumed ID is reclaimed once no instance of it
+        remains live in this process.
         """
         token: Token[T] = object.__new__(cls)
         token._var = var
@@ -255,6 +342,7 @@ class Token(Generic[T]):
         token._native = native
         token._id = id
         token._used = used
+        _register_token(token)
         return token
 
 
@@ -281,6 +369,10 @@ def _reconstitute(
     reference — a classmethod's dotted qualname resolves to a fresh bound
     method that fails cloudpickle's identity check, forcing a by-value pickle
     that would capture this module's `~wool.runtime.context.registry.lock`.
+
+    `Token._mint` counts this instance in `_token_counts`, so while the
+    reconstituted token lives its ID's consumed-token entry is retained for
+    reaping (see `dead_token_ids`) and reclaimed once it is collected.
     """
     token = Token._mint(
         var=var,

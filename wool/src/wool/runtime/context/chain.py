@@ -8,6 +8,7 @@ ships across the wire, forks per task, and polices for contention.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import threading
 import weakref
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from wool.runtime.context.factory import ensure_task_factory_installed
 from wool.runtime.context.manifest import ChainManifest
 from wool.runtime.context.registry import var_registry
 from wool.runtime.context.token import anchor_tokens
+from wool.runtime.context.token import dead_token_ids
 from wool.runtime.typing import Undefined
 
 if TYPE_CHECKING:
@@ -122,10 +124,17 @@ class Chain:
     by `from_manifest`), so token bookkeeping rides every frame. A `reset`
     adds the consumed ID to ``spent_tokens``, and a fresh `set` of that var
     retains it: a token consumed off-origin leaves its local ``_used`` flag
-    unset, so this ledger is the sole witness of the consumption and pruning
-    it would readmit a double reset. The ledger therefore grows for the
-    chain's lifetime; bounding that growth to token lifespan is issue #226's
-    ownership model.
+    unset, so this ledger is the sole witness of the consumption, and pruning
+    it on a re-set would readmit a double reset. Its growth is instead bounded
+    by *token* lifespan: `mount` reaps a spent ID once *no* live
+    `wool.Token` instance of it remains in this process (see
+    `~wool.runtime.context.token.dead_token_ids`), since nothing local can then
+    reset or forward it. The ID re-arrives with its own instance if the token
+    is ever forwarded back, so single-use is preserved — including when a token
+    and its returned clone coexist in one process (a round-trip), where the ID
+    is held until both instances are collected. Counting every instance is also
+    what keeps a long-lived streaming set/reset chain from accumulating a dead
+    ID per cycle even as consumed IDs round-trip through the caller's frames.
     """
 
     id: UUID = field(default_factory=uuid4)
@@ -294,10 +303,24 @@ class Chain:
                 task = asyncio.current_task()
             except RuntimeError:
                 pass
-        # Single evolve: fold the owner stamp and *changes* into one Chain.
+        # Fold the owner stamp, *changes*, and the ledger reap into one evolve.
+        # Reap consumed IDs whose tokens are gone — see the class "Token
+        # ledgers" rubric. The reap only ever shrinks ``spent_tokens``; it
+        # never introduces a key, so ``unspent_tokens`` and the "spent key in
+        # vars or resets" invariant are untouched.
+        spent_tokens = changes.pop("spent_tokens", self.spent_tokens)
+        if spent_tokens:
+            dead = dead_token_ids(itertools.chain.from_iterable(spent_tokens.values()))
+            if dead:
+                spent_tokens = {
+                    key: live
+                    for key, ids in spent_tokens.items()
+                    if (live := ids - dead)
+                }
         installed = self._evolve(
             thread=threading.get_ident(),
             task=weakref.ref(task) if task is not None else None,
+            spent_tokens=spent_tokens,
             **changes,
         )
         # Anchor the wire tokens live in this chain; a no-op when empty.

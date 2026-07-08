@@ -12,6 +12,7 @@ Routines are organized by dimension:
 import asyncio
 import contextvars
 import functools
+import gc
 import inspect
 import os
 from enum import Enum
@@ -984,6 +985,30 @@ async def stream_chain_id_hex(count: int):
 
 
 @wool.routine
+async def stream_spent_ledger_size_for(namespace: str, name: str, count: int):
+    """Yield the worker-side spent-ledger size after each set/reset cycle on a var.
+
+    Performs *count* set-then-reset cycles on the (*namespace*, *name*) oracle
+    var, dropping and collecting each consumed token, and yields the number of
+    spent-token ids recorded under that var's key after each cycle. A
+    ``sleep(0)`` between yields forces a genuine suspend across each
+    ``__anext__``. The reap reclaims each collected token, so the size stays
+    bounded rather than growing one id per cycle. Keying on the caller-supplied
+    var lets independent streams share one chain.
+    """
+    var = _resolve_oracle_var(namespace, name)
+    key = (var.namespace, var.name)
+    for i in range(count):
+        token = var.set(f"cycle-{i}")
+        var.reset(token)
+        del token
+        gc.collect()
+        chain = wool.__chain__.get()
+        yield len(chain.spent_tokens.get(key, frozenset()))
+        await asyncio.sleep(0)
+
+
+@wool.routine
 async def append_to_list(items: list, value) -> list:
     """Coroutine that appends *value* to *items* in place and returns it.
 
@@ -1567,3 +1592,48 @@ async def nested_oracle_set_report(namespace: str, name: str, value) -> tuple:
     """
     inner_pid, token = await oracle_set_report(namespace, name, value)
     return os.getpid(), inner_pid, token
+
+
+@wool.routine
+async def relay_consume_then_forward_report(namespace: str, name: str, token) -> tuple:
+    """Consume a token via a nested reset, then forward it onward to reset again.
+
+    The nested inner reset consumes the token on a further worker, so the
+    consumed signal rides home into this worker's chain ledger while this
+    worker's own token instance stays unused. Forwarding that still-unused
+    instance onward must be rejected downstream purely by the consumed-token
+    ledger carried on the request frame. Returns ``(inner_report,
+    downstream_report)`` — each an oracle ``(pid, kind, message, value_after)``
+    tuple.
+    """
+    inner = await oracle_reset_report(namespace, name, token)
+    downstream = await oracle_reset_report(namespace, name, token)
+    return inner, downstream
+
+
+class TokenCarrier(Exception):
+    """Exception that ferries a wool.Token payload for reset on the receiver.
+
+    The token rides in ``args[0]`` so a raised instance pickles through an
+    ExceptionResponseFrame like any other picklable exception payload, and
+    ``token`` reads it back on the receiver. Used to exercise token transport
+    and anchoring on the exception channel rather than the return-value channel.
+    """
+
+    @property
+    def token(self):
+        """Return the wool.Token payload this exception ferried."""
+        return self.args[0]
+
+
+@wool.routine
+async def set_var_and_raise_with_token(namespace: str, name: str, value) -> None:
+    """Set the (*namespace*, *name*) oracle var, then raise carrying its token.
+
+    The minted token rides home inside a raised `TokenCarrier` instead of
+    a return value, so the caller decodes it through the exception frame. The
+    caller catches the exception, extracts the token, and resets it — exercising
+    the token-transport-and-anchor path on the exception channel.
+    """
+    token = _resolve_oracle_var(namespace, name).set(value)
+    raise TokenCarrier(token)
