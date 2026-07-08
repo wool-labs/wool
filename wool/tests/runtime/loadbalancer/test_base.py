@@ -4,8 +4,10 @@ from uuid import uuid4
 from hypothesis import given
 from hypothesis import strategies as st
 
+from wool.runtime.loadbalancer.base import DispatchingLoadBalancerLike
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
+from wool.runtime.loadbalancer.base import LoadBalancerContextView
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -94,14 +96,68 @@ class TestLoadBalancerContextLike:
         assert not isinstance(NonConforming(), LoadBalancerContextLike)
 
 
-class TestLoadBalancerLike:
+class TestLoadBalancerContextView:
+    def test_isinstance_with_conforming_class(self):
+        """Test a conforming class satisfies the protocol.
+
+        Given:
+            A class exposing only a read-only ``workers`` property
+        When:
+            Checked against the LoadBalancerContextView protocol
+        Then:
+            It should satisfy the protocol
+        """
+
+        # Arrange
+        class Conforming:
+            @property
+            def workers(self):
+                return MappingProxyType({})
+
+        # Act & assert
+        assert isinstance(Conforming(), LoadBalancerContextView)
+
+    def test_isinstance_with_non_conforming_class(self):
+        """Test a non-conforming class does not satisfy the protocol.
+
+        Given:
+            A class missing the workers property
+        When:
+            Checked against the LoadBalancerContextView protocol
+        Then:
+            It should not satisfy the protocol
+        """
+
+        # Arrange
+        class NonConforming:
+            pass
+
+        # Act & assert
+        assert not isinstance(NonConforming(), LoadBalancerContextView)
+
+    def test_isinstance_with_concrete_context(self):
+        """Test LoadBalancerContext satisfies LoadBalancerContextView.
+
+        Given:
+            A concrete LoadBalancerContext instance
+        When:
+            Checked against the LoadBalancerContextView protocol
+        Then:
+            It should satisfy the protocol — the mutable context is
+            also a valid read-only view.
+        """
+        # Act & assert
+        assert isinstance(LoadBalancerContext(), LoadBalancerContextView)
+
+
+class TestDispatchingLoadBalancerLike:
     def test_isinstance_with_conforming_class(self):
         """Test a conforming class satisfies the protocol.
 
         Given:
             A class implementing the dispatch method
         When:
-            Checked against the LoadBalancerLike protocol
+            Checked against the DispatchingLoadBalancerLike protocol
         Then:
             It should satisfy the protocol
         """
@@ -112,13 +168,75 @@ class TestLoadBalancerLike:
                 pass
 
         # Act & assert
-        assert isinstance(Conforming(), LoadBalancerLike)
+        assert isinstance(Conforming(), DispatchingLoadBalancerLike)
 
     def test_isinstance_with_non_conforming_class(self):
         """Test a non-conforming class does not satisfy the protocol.
 
         Given:
             A class missing the dispatch method
+        When:
+            Checked against the DispatchingLoadBalancerLike protocol
+        Then:
+            It should not satisfy the protocol
+        """
+
+        # Arrange
+        class NonConforming:
+            pass
+
+        # Act & assert
+        assert not isinstance(NonConforming(), DispatchingLoadBalancerLike)
+
+
+class TestLoadBalancerLike:
+    def test_isinstance_with_delegating_implementation(self):
+        """Test a delegating load balancer satisfies the protocol.
+
+        Given:
+            A class implementing the delegate method
+        When:
+            Checked against the LoadBalancerLike protocol
+        Then:
+            It should satisfy the protocol
+        """
+
+        # Arrange
+        class Delegating:
+            async def delegate(self, task, *, context):
+                if False:
+                    yield  # pragma: no cover
+
+        # Act & assert
+        assert isinstance(Delegating(), LoadBalancerLike)
+
+    def test_isinstance_with_dispatching_only_implementation(self):
+        """Test a dispatch-only load balancer does not satisfy the protocol.
+
+        Given:
+            A class implementing only dispatch, with no delegate
+            method (a DispatchingLoadBalancerLike)
+        When:
+            Checked against the LoadBalancerLike protocol
+        Then:
+            It should not satisfy the protocol — a dispatch-only
+            balancer is a DispatchingLoadBalancerLike, not a
+            LoadBalancerLike.
+        """
+
+        # Arrange
+        class Dispatching:
+            async def dispatch(self, task, *, context, timeout=None):
+                pass
+
+        # Act & assert
+        assert not isinstance(Dispatching(), LoadBalancerLike)
+
+    def test_isinstance_with_non_conforming_class(self):
+        """Test a non-conforming class does not satisfy the protocol.
+
+        Given:
+            A class implementing neither delegate nor dispatch
         When:
             Checked against the LoadBalancerLike protocol
         Then:
@@ -131,6 +249,34 @@ class TestLoadBalancerLike:
 
         # Act & assert
         assert not isinstance(NonConforming(), LoadBalancerLike)
+
+    def test_isinstance_with_dual_implementation(self):
+        """Test a class implementing both protocols satisfies both.
+
+        Given:
+            A class implementing both delegate and dispatch
+        When:
+            Checked against both protocols individually
+        Then:
+            It should satisfy both — this edge case supports
+            balancers that want to implement the new protocol while
+            keeping the old one available for backwards compatibility.
+        """
+
+        # Arrange
+        class Dual:
+            async def delegate(self, task, *, context):
+                if False:
+                    yield  # pragma: no cover
+
+            async def dispatch(self, task, *, context, timeout=None):
+                pass
+
+        dual = Dual()
+
+        # Act & assert
+        assert isinstance(dual, LoadBalancerLike)
+        assert isinstance(dual, DispatchingLoadBalancerLike)
 
 
 class TestLoadBalancerContext:

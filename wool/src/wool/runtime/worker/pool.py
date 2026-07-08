@@ -138,13 +138,16 @@ class WorkerPool:
 
     .. code-block:: python
 
-        from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-
-
-        class PriorityBalancer(RoundRobinLoadBalancer):
-            async def dispatch(self, task, context, timeout=None):
-                # Custom routing logic
-                ...
+        class PriorityBalancer:
+            async def delegate(self, task, *, context):
+                # Yield workers in priority order.
+                for metadata, connection in context.workers.items():
+                    try:
+                        sent = yield metadata, connection
+                    except Exception:
+                        continue
+                    if sent is not None:
+                        return
 
 
         async with WorkerPool(loadbalancer=PriorityBalancer()):

@@ -20,6 +20,7 @@ from typing import Sequence
 from typing import SupportsIndex
 from typing import TypeAlias
 from typing import TypeVar
+from typing import cast
 from typing import overload
 
 from packaging.version import InvalidVersion
@@ -31,14 +32,19 @@ from wool.runtime.context.var import ContextVar
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.loadbalancer.base import DISPATCHING_LOADBALANCER_DEPRECATION_MESSAGE
+from wool.runtime.loadbalancer.base import DispatchingLoadBalancerLike
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerLike
+from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.connection import RpcError
+from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.noreentry import noreentry
@@ -243,18 +249,21 @@ class WorkerProxy:
 
     .. code-block:: python
 
-        from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-
-
-        class CustomBalancer(RoundRobinLoadBalancer):
-            async def dispatch(self, task, context, timeout=None):
-                # Custom routing strategy
-                ...
+        class StickyBalancer:
+            async def delegate(self, task, *, context):
+                # Yield a preferred worker first, then fall back.
+                for metadata, connection in context.workers.items():
+                    try:
+                        sent = yield metadata, connection
+                    except Exception:
+                        continue
+                    if sent is not None:
+                        return
 
 
         async with WorkerProxy(
             discovery=discovery,
-            loadbalancer=CustomBalancer(),
+            loadbalancer=StickyBalancer(),
         ) as proxy:
             result = await task()
 
@@ -440,6 +449,8 @@ class WorkerProxy:
 
         self._id: uuid.UUID = uuid.uuid4()
         self._started = False
+        self._dispatching_deprecation_warned = False
+        self._delegating = False
         self._lazy = lazy
         self._start_lock = asyncio.Lock() if lazy else None
         self._loadbalancer = loadbalancer
@@ -468,6 +479,21 @@ class WorkerProxy:
                 UserWarning,
                 stacklevel=2,
             )
+
+        # Warn here, where the caller's construction frame is reachable, when a
+        # balancer that implements *only* the deprecated dispatch protocol is
+        # passed as an instance. A dual-protocol instance takes the delegate
+        # path and is not warned; a factory only resolves to an instance in
+        # start(), which warns as a fallback.
+        if isinstance(loadbalancer, DispatchingLoadBalancerLike) and not isinstance(
+            loadbalancer, LoadBalancerLike
+        ):
+            warnings.warn(
+                DISPATCHING_LOADBALANCER_DEPRECATION_MESSAGE,
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self._dispatching_deprecation_warned = True
 
         if credentials is Undefined:
             self._credentials = CredentialContext.current()
@@ -697,8 +723,25 @@ class WorkerProxy:
                 self._loadbalancer_service,
                 self._loadbalancer_context_manager,
             ) = await self._enter_context(self._loadbalancer)
-            if not isinstance(self._loadbalancer_service, LoadBalancerLike):
+            if not isinstance(
+                self._loadbalancer_service,
+                (LoadBalancerLike, DispatchingLoadBalancerLike),
+            ):
                 raise ValueError
+            # Classify the balancer once, here, so dispatch() need not
+            # re-run a @runtime_checkable isinstance on the hot path.
+            self._delegating = isinstance(self._loadbalancer_service, LoadBalancerLike)
+            if (
+                not self._delegating
+                and isinstance(self._loadbalancer_service, DispatchingLoadBalancerLike)
+                and not self._dispatching_deprecation_warned
+            ):
+                warnings.warn(
+                    DISPATCHING_LOADBALANCER_DEPRECATION_MESSAGE,
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                self._dispatching_deprecation_warned = True
             stack.push_async_callback(
                 self._exit_context,
                 self._loadbalancer_context_manager,
@@ -811,11 +854,19 @@ class WorkerProxy:
     ) -> AsyncGenerator:
         """Dispatch a task to an available worker.
 
-        Selects a worker via the configured load balancer.  When
-        ``lazy=True``, the proxy is started on first dispatch — which
-        runs the quorum wait.  Subsequent dispatches do not re-check
-        quorum; the load balancer surfaces "no workers available"
-        directly if the worker set later drains.
+        Selects a worker through the configured load balancer and
+        returns its result stream. For `LoadBalancerLike`
+        balancers, the proxy owns the dispatch-retry-evict loop: it
+        calls `WorkerConnection.dispatch` on each candidate,
+        evicts workers on non-transient errors, and reports outcomes
+        back to the balancer via ``asend``/``athrow``.  For the
+        deprecated `DispatchingLoadBalancerLike`, dispatch is
+        delegated to the balancer's legacy ``dispatch`` method.
+
+        When ``lazy=True``, the proxy is started on first dispatch —
+        which runs the quorum wait.  Subsequent dispatches do not
+        re-check quorum; the load balancer surfaces "no workers
+        available" directly if the worker set later drains.
 
         A failed first dispatch (e.g., quorum timeout) leaves the
         proxy un-started: the next dispatch re-runs ``start()`` and
@@ -823,17 +874,20 @@ class WorkerProxy:
         once a worker is admitted, without constructing a new proxy.
 
         :param task:
-            The :class:`Task` to dispatch.
+            The `Task` to dispatch.
         :param timeout:
-            Timeout in seconds for getting a worker.
+            Timeout in seconds for the per-worker dispatch attempt.
         :returns:
-            An async generator yielding result objects from the
-            worker.
+            An async generator streaming task results from the worker.
         :raises RuntimeError:
             If the proxy is not started and ``lazy`` is ``False``.
+        :raises NoWorkersAvailable:
+            If every candidate the balancer yields fails to dispatch.
         :raises asyncio.TimeoutError:
-            If no worker is available within ``timeout``, or if the
-            quorum wait fires during a lazy first dispatch.
+            If the quorum wait fires during a lazy first dispatch. An
+            exceeded per-attempt ``timeout`` does not surface here; the
+            worker connection reports it as an `RpcError` that the
+            dispatch loop handles.
         """
         if not self._started:
             if not self._lazy:
@@ -843,11 +897,112 @@ class WorkerProxy:
                 if not self._started:
                     await self.start()
 
-        assert isinstance(self._loadbalancer_service, LoadBalancerLike)
-        assert self._loadbalancer_context
-        return await self._loadbalancer_service.dispatch(
+        assert self._loadbalancer_context is not None
+        # Balancer kind was resolved in start(); branch on the cached flag
+        # rather than a per-dispatch structural isinstance.
+        if self._delegating:
+            delegating = cast(LoadBalancerLike, self._loadbalancer_service)
+            return await self._delegate_dispatch(delegating, task, timeout)
+        dispatching = cast(DispatchingLoadBalancerLike, self._loadbalancer_service)
+        return await dispatching.dispatch(
             task, context=self._loadbalancer_context, timeout=timeout
         )
+
+    async def _delegate_dispatch(
+        self,
+        loadbalancer: LoadBalancerLike,
+        task: Task,
+        timeout: float | None,
+    ) -> AsyncGenerator:
+        """Drive a delegating load balancer through one dispatch.
+
+        Pulls candidates from ``loadbalancer.delegate(task, context=...)``,
+        calls `WorkerConnection.dispatch` on each, and reports the
+        outcome back via ``asend`` on success or ``athrow`` on failure.
+        Only `RpcError` is treated as a worker-health signal:
+        a non-transient `RpcError` triggers eviction from the
+        context before the balancer is notified, so it observes the
+        capacity change when choosing the next candidate.
+
+        Exceptions that are not worker-health signals — e.g., a
+        strict-mode `wool.ChainSerializationError` or a
+        `ValueError` — propagate to the caller unwrapped,
+        without eviction or retry. Cancellation (``CancelledError``)
+        and other ``BaseException`` subclasses propagate the same way —
+        they are caller intent, not worker failures.
+
+        :param loadbalancer:
+            The load balancer to drive.
+        :param task:
+            The task to dispatch.
+        :param timeout:
+            Per-attempt timeout forwarded to
+            `WorkerConnection.dispatch`.
+        :returns:
+            The result stream from the first successful dispatch.
+        :raises NoWorkersAvailable:
+            If the balancer's generator ends without producing a
+            successful candidate.
+        :raises RuntimeError:
+            If the balancer's generator yields another candidate
+            after receiving a success signal via ``asend``.
+        """
+        assert self._loadbalancer_context is not None
+        ctx = self._loadbalancer_context
+        generator = loadbalancer.delegate(task, context=ctx)
+        try:
+            try:
+                metadata, connection = await generator.__anext__()
+            except StopAsyncIteration:
+                raise NoWorkersAvailable()
+
+            while True:
+                try:
+                    stream = await connection.dispatch(task, timeout=timeout)
+                except RpcError as exc:
+                    # Catch only RpcError: any other exception falls to the
+                    # outer finally, which aclose()s the generator without
+                    # eviction.
+                    if not isinstance(exc, TransientRpcError):
+                        ctx.remove_worker(metadata)
+                    try:
+                        metadata, connection = await generator.athrow(exc)
+                    except StopAsyncIteration:
+                        raise NoWorkersAvailable() from exc
+                    continue
+
+                # Success path: connection.dispatch() returned a live
+                # stream. The proxy owns it until handed off via
+                # `return`. A cancel or a contract-violation RuntimeError
+                # between here and the return would orphan the gRPC
+                # call, so we guard with try/finally and transfer
+                # ownership explicitly by nulling out `stream` on
+                # handoff.
+                try:
+                    try:
+                        trailing = await generator.asend(metadata)
+                    except StopAsyncIteration:
+                        result, stream = stream, None
+                        return result
+                    raise RuntimeError(
+                        f"LoadBalancerLike.delegate yielded "
+                        f"{trailing!r} after receiving a success signal "
+                        f"via asend(); the generator MUST terminate "
+                        f"after acknowledging success."
+                    )
+                finally:
+                    if stream is not None:
+                        # Did not successfully hand off the stream —
+                        # close it so the underlying gRPC call is
+                        # released. Covers both cancellation during
+                        # asend and the contract-violation RuntimeError
+                        # path.
+                        await stream.aclose()
+        finally:
+            # Release any generator-scope resources the balancer holds.
+            # Runs on every exit path: success, NoWorkersAvailable,
+            # cancellation, and contract violations.
+            await generator.aclose()
 
     async def _enter_context(self, factory):
         ctx = None

@@ -1,85 +1,84 @@
 import asyncio
-from unittest.mock import MagicMock
+import gc
+import pickle
+import weakref
 from uuid import uuid4
 
 import pytest
-from hypothesis import HealthCheck
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
-from pytest_mock import MockerFixture
 
 from wool.runtime.loadbalancer.base import LoadBalancerContext
 from wool.runtime.loadbalancer.base import LoadBalancerLike
-from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-from wool.runtime.routine.task import Task
-from wool.runtime.routine.task import WorkerProxyLike
-from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
 
-
-def make_task(callable):
-    """Build a `wool.Task` wrapping *callable* with a throwaway worker proxy."""
-    return Task(
-        id=uuid4(),
-        callable=callable,
-        args=(),
-        kwargs={},
-        proxy=MagicMock(spec=WorkerProxyLike, id="mock-proxy"),
-    )
+# ``delegate`` takes the routed task as its first positional argument.
+# ``RoundRobinLoadBalancer`` ignores it, so a single opaque sentinel
+# stands in for the task across every dispatch in this module.
+_TASK = object()
 
 
-@st.composite
-def dispatch_side_effects(
-    draw, min_size: int, max_size: int, include_transient: bool = True
-):
-    """Generate behavior sequence for a single task dispatch.
-
-    Generates a list of failure side effects drawn from the
-    load-balancer's worker-health exception contract: only
-    `RpcError` and its transient subclass
-    `TransientRpcError` (the LB's documented catch surface).
-    Exceptions outside this contract — e.g., raw `Exception`,
-    `BaseExceptionGroup`, or local `asyncio.TimeoutError`
-    — propagate past the LB to the caller and are exercised
-    separately.
-
-    :param draw:
-        Hypothesis draw function
-    :param min_size:
-        Minimum number of failures to generate
-    :param max_size:
-        Maximum number of failures to generate
-    :param include_transient:
-        Whether to include TransientRpcError in the possible failures.
-        When False, only non-transient errors are generated (useful for
-        testing scenarios where workers should be removed).
+def _make_context(worker_count: int) -> tuple[LoadBalancerContext, list[WorkerMetadata]]:
+    """Build a LoadBalancerContext seeded with ``worker_count`` workers.
 
     :returns:
-        List of side effects (exceptions)
+        Tuple of ``(context, ordered_metadata_list)`` so tests can
+        assert yielded candidates against insertion order.
     """
-    if include_transient:
-        error_types = [RpcError(), TransientRpcError()]
-    else:
-        # Only non-transient errors - workers will be removed after these
-        error_types = [RpcError()]
-
-    return draw(
-        st.lists(
-            st.sampled_from(error_types),
-            min_size=min_size,
-            max_size=max_size,
+    ctx = LoadBalancerContext()
+    ordered: list[WorkerMetadata] = []
+    for i in range(worker_count):
+        metadata = WorkerMetadata(
+            uid=uuid4(),
+            address=f"localhost:{50051 + i}",
+            pid=1000 + i,
+            version="1.0.0",
         )
-    )
+        connection = WorkerConnection(f"localhost:{50051 + i}")
+        ctx.add_worker(metadata, connection)
+        ordered.append(metadata)
+    return ctx, ordered
+
+
+class _ItemsCountingContext:
+    """LoadBalancerContextView that counts workers.items() materializations.
+
+    Wraps a real `LoadBalancerContext` and records how many times
+    the ordered worker mapping is materialized via ``items()``, so a test
+    can prove the balancer snapshots once per wrap rather than rescanning
+    the mapping per candidate.
+    """
+
+    def __init__(self, context: LoadBalancerContext):
+        self._context = context
+        self.items_calls = 0
+
+    @property
+    def workers(self):
+        real = self._context.workers
+        outer = self
+
+        class _CountingMapping:
+            def __len__(self):
+                return len(real)
+
+            def __contains__(self, key):
+                return key in real
+
+            def items(self):
+                outer.items_calls += 1
+                return real.items()
+
+        return _CountingMapping()
 
 
 class TestRoundRobinLoadBalancer:
     def test_isinstance_satisfies_protocol(self):
-        """Test RoundRobinLoadBalancer satisfies the
-        LoadBalancerLike protocol.
+        """Test RoundRobinLoadBalancer satisfies LoadBalancerLike.
 
         Given:
             A concrete RoundRobinLoadBalancer instance
@@ -91,640 +90,475 @@ class TestRoundRobinLoadBalancer:
         # Act & assert
         assert isinstance(RoundRobinLoadBalancer(), LoadBalancerLike)
 
-    def test_pickle_round_trip_yields_a_fresh_balancer(self):
-        """Test a RoundRobinLoadBalancer round-trips through pickle.
+    @pytest.mark.asyncio
+    async def test___reduce___excludes_runtime_state(self):
+        """Test pickle roundtrip resets runtime balancing state.
 
         Given:
-            A RoundRobinLoadBalancer instance.
+            A RoundRobinLoadBalancer that has been driven through one
+            successful delegate cycle on a context
         When:
-            It is pickled and unpickled.
+            Pickled and unpickled
         Then:
-            The result should be a fresh RoundRobinLoadBalancer — the
-            balancer reduces to its bare class, dropping the unpicklable
-            per-process rotation state and lock.
+            The restored instance starts cycling from position zero on
+            the same context — equivalent to a freshly constructed
+            instance, proving the runtime state is not carried over
         """
         # Arrange
-        import pickle
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
 
-        balancer = RoundRobinLoadBalancer()
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first_used, _ = await anext(generator)
+        with pytest.raises(StopAsyncIteration):
+            await generator.asend(first_used)
+        # Original has now advanced past workers[0] on ctx.
 
         # Act
-        restored = pickle.loads(pickle.dumps(balancer))
+        restored = pickle.loads(pickle.dumps(loadbalancer))
 
         # Assert
         assert isinstance(restored, RoundRobinLoadBalancer)
-        assert restored is not balancer
+        restored_generator = restored.delegate(_TASK, context=ctx)
+        first_after_restore, _ = await anext(restored_generator)
+        await restored_generator.aclose()
+        assert first_after_restore == workers[0]
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_empty_context(self):
-        """Test dispatch raises NoWorkersAvailable with empty
-        context.
+    async def test_delegate_with_empty_context(self):
+        """Test delegate ends immediately on an empty context.
 
         Given:
             A load balancer with an empty context (no workers)
         When:
-            A task is dispatched
+            delegate() is driven with anext
         Then:
-            NoWorkersAvailable is raised
+            The first anext raises StopAsyncIteration — signaling
+            exhaustion so the proxy can raise NoWorkersAvailable.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
+        loadbalancer = RoundRobinLoadBalancer()
         ctx = LoadBalancerContext()
-
-        async def routine():
-            return "Hello world!"
-
-        task = make_task(routine)
 
         # Act & assert
-        with pytest.raises(NoWorkersAvailable):
-            await lb.dispatch(task, context=ctx)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        with pytest.raises(StopAsyncIteration):
+            await anext(generator)
+        await generator.aclose()
 
     @pytest.mark.asyncio
-    @settings(
-        max_examples=16,
-        suppress_health_check=[
-            HealthCheck.function_scoped_fixture,
-        ],
-    )
-    @given(data=st.data())
-    async def test_dispatch_with_healthy_workers(
-        self,
-        mocker: MockerFixture,
-        dispatch_side_effect_factory,
-        data: st.DataObject,
-    ):
-        """Test tasks dispatch successfully when there's at least
-        one healthy worker available.
+    async def test_delegate_with_single_worker(self):
+        """Test delegate yields the first worker on initial anext.
 
         Given:
-            A load balancer with one or more workers with randomized
-            behavior
+            A load balancer with a single worker in the context
         When:
-            One or more tasks are dispatched
+            delegate() is driven with anext
         Then:
-            The tasks should be dispatched to workers in round-robin
-            order, with unhealthy workers being removed from the
-            loadbalancer
+            The first yielded candidate is the worker in the context.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
-        ctx = LoadBalancerContext()
-        worker_count = 8
-        mock_workers = {}
-
-        for i in range(worker_count):
-            mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
-            mock_connection.dispatch = mocker.AsyncMock()
-            metadata = WorkerMetadata(
-                uid=uuid4(),
-                address="localhost:50051",
-                pid=1000 + i,
-                version="1.0.0",
-            )
-            mock_workers[metadata] = mock_connection
-            ctx.add_worker(metadata, mock_connection)
-
-        async def routine():
-            return "Hello world!"
-
-        task = make_task(routine)
-
-        # Track dispatch attempts to verify round-robin behavior
-        tasks_dispatched = []
-        previous_worker = None
-        expected_worker = None
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, [worker] = _make_context(1)
 
         # Act
-        i = 0
-        while i < 16 and len(ctx.workers) > 1:
-            i += 1
-            # Capture snapshot of workers at the start of this iteration
-            workers_remaining = list(ctx.workers.keys())
-            workers_remaining_count = len(workers_remaining)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        metadata, connection = await anext(generator)
 
-            workers_attempted = []
-            side_effects = data.draw(
-                dispatch_side_effects(min_size=0, max_size=workers_remaining_count - 1)
-            )
-            side_effects += ["success"]
-            index_of_first_worker_attempted = len(workers_attempted)
-
-            # Draw a random timeout value
-            timeout = data.draw(
-                st.one_of(st.none(), st.integers(min_value=1, max_value=60))
-            )
-
-            if previous_worker:
-                # Get next worker in line
-                expected_worker = workers_remaining[
-                    (workers_remaining.index(previous_worker) + 1)
-                    % len(workers_remaining)
-                ]
-
-            side_effect_iterator = iter(side_effects)
-
-            make_dispatch_side_effect = dispatch_side_effect_factory(
-                workers_attempted, side_effect_iterator, tasks_dispatched
-            )
-
-            # Reset dispatch side effect and call count on all remaining workers
-            for metadata in workers_remaining:
-                mock_connection = mock_workers[metadata]
-                mock_connection.dispatch.reset_mock()
-                mock_connection.dispatch.side_effect = make_dispatch_side_effect(
-                    metadata
-                )
-
-            result = await lb.dispatch(task, context=ctx, timeout=timeout)
-            assert result == "success", "Task should complete successfully"
-
-            # Verify dispatch was called the expected number of times
-            # (number of failures + 1 for success)
-            actual_dispatch_calls = sum(
-                mock_workers[w].dispatch.call_count for w in workers_remaining
-            )
-            expected_dispatch_calls = len(side_effects)
-            assert actual_dispatch_calls == expected_dispatch_calls
-
-            # Verify dispatch was called with correct timeout on attempted workers
-            for worker in workers_attempted:
-                mock_workers[worker].dispatch.assert_called_with(task, timeout=timeout)
-
-            if expected_worker:
-                # Verify the next worker in line following the previous
-                # dispatch was the first worker to attempt dispatching the current task
-                first_worker = workers_attempted[index_of_first_worker_attempted]
-                assert first_worker == expected_worker
-
-            previous_worker = workers_attempted[-1]
-
-            # Verify that a task was successfully dispatched at each iteration
-            assert len(tasks_dispatched) == i
+        # Assert
+        assert metadata == worker
+        assert connection is ctx.workers[worker]
+        await generator.aclose()
 
     @pytest.mark.asyncio
-    @settings(
-        deadline=5000000,
-        max_examples=16,
-        suppress_health_check=[
-            HealthCheck.function_scoped_fixture,
-        ],
-    )
-    @given(data=st.data())
-    async def test_dispatch_with_all_workers_failing(
-        self,
-        mocker: MockerFixture,
-        dispatch_side_effect_factory,
-        data: st.DataObject,
-    ):
-        """Test task dispatch fails when there are no healthy workers
-        available.
+    async def test_delegate_after_prior_success(self):
+        """Test delegate advances the round-robin index after asend.
 
         Given:
-            A load balancer with one or more workers with a
-            randomized failure mode
+            A load balancer with multiple workers and a prior
+            successful dispatch to worker 0
         When:
-            One or more tasks are dispatched
+            delegate() is driven again with anext
         Then:
-            The tasks should be dispatched to workers in round-robin
-            order and raise NoWorkersAvailable, with unhealthy
-            workers being removed from the loadbalancer
+            The next yielded candidate is worker 1 — the index
+            advanced past the previously-successful worker.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
-        ctx = LoadBalancerContext()
-        worker_count = 8
-        mock_workers = {}
-
-        for i in range(worker_count):
-            mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
-            mock_connection.dispatch = mocker.AsyncMock()
-            metadata = WorkerMetadata(
-                uid=uuid4(),
-                address="localhost:50051",
-                pid=1000 + i,
-                version="1.0.0",
-            )
-            mock_workers[metadata] = mock_connection
-            ctx.add_worker(metadata, mock_connection)
-
-        async def routine():
-            return "Hello world!"
-
-        task = make_task(routine)
-
-        # Track dispatch attempts to verify round-robin behavior
-        tasks_dispatched = []
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
 
         # Act
-        i = 0
-        while i < 16 and len(ctx.workers) > 0:
-            i += 1
-            # Capture snapshot of workers at the start of this iteration
-            workers_remaining = list(ctx.workers.keys())
-            workers_remaining_count = len(workers_remaining)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first_metadata, _ = await anext(generator)
+        with pytest.raises(StopAsyncIteration):
+            await generator.asend(first_metadata)
 
-            workers_attempted = []
-            # Use only non-transient errors since transient errors cause retries
-            # and we want exactly one dispatch per worker before NoWorkersAvailable
-            side_effects = data.draw(
-                dispatch_side_effects(
-                    min_size=workers_remaining_count,
-                    max_size=workers_remaining_count,
-                    include_transient=False,
-                )
-            )
-            side_effect_iterator = iter(side_effects)
+        second_generator = loadbalancer.delegate(_TASK, context=ctx)
+        second_metadata, _ = await anext(second_generator)
 
-            # Draw a random timeout value
-            timeout = data.draw(
-                st.one_of(st.none(), st.integers(min_value=1, max_value=60))
-            )
-
-            make_dispatch_side_effect = dispatch_side_effect_factory(
-                workers_attempted, side_effect_iterator, tasks_dispatched
-            )
-
-            # Reset dispatch side effect and call count on all remaining workers
-            for metadata in workers_remaining:
-                mock_connection = mock_workers[metadata]
-                mock_connection.dispatch.reset_mock()
-                mock_connection.dispatch.side_effect = make_dispatch_side_effect(
-                    metadata
-                )
-
-            with pytest.raises(NoWorkersAvailable):
-                await lb.dispatch(task, context=ctx, timeout=timeout)
-
-            # Verify dispatch was called on all remaining workers
-            # (all workers fail, so all should be attempted)
-            actual_dispatch_calls = sum(
-                mock_workers[w].dispatch.call_count for w in workers_remaining
-            )
-            expected_dispatch_calls = workers_remaining_count
-            assert actual_dispatch_calls == expected_dispatch_calls
-
-            # Verify dispatch was called with correct timeout on attempted workers
-            for worker in workers_attempted:
-                mock_workers[worker].dispatch.assert_called_with(task, timeout=timeout)
-
-            # Verify the next worker in line following the previous
-            # dispatch was the first worker to attempt dispatching the current task
-            assert workers_attempted[0] == workers_remaining[0]
-
-            # Verify that no tasks were successfully dispatched
-            assert len(tasks_dispatched) == 0
+        # Assert
+        assert first_metadata == workers[0]
+        assert second_metadata == workers[1]
+        await second_generator.aclose()
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_concurrent_tasks(
-        self,
-        mocker: MockerFixture,
+    async def test_delegate_after_athrow(self):
+        """Test delegate advances the index on athrow (failure).
+
+        Given:
+            A load balancer with multiple workers, the first
+            candidate has just been yielded
+        When:
+            The proxy reports failure via athrow
+        Then:
+            The next yielded candidate is the subsequent worker.
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
+
+        # Act
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first_metadata, _ = await anext(generator)
+        second_metadata, _ = await generator.athrow(TransientRpcError())
+
+        # Assert
+        assert first_metadata == workers[0]
+        assert second_metadata == workers[1]
+        await generator.aclose()
+
+    @pytest.mark.asyncio
+    async def test_delegate_with_all_workers_failing(self):
+        """Test delegate ends after a full cycle of failures.
+
+        Given:
+            A load balancer whose context has N workers, all failing
+        When:
+            athrow is called repeatedly until the generator ends
+        Then:
+            Exactly N candidates are yielded before StopAsyncIteration
+            — the checkpoint-by-UID logic terminates the cycle.
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(5)
+
+        # Act
+        yielded: list[WorkerMetadata] = []
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        metadata, _ = await anext(generator)
+        yielded.append(metadata)
+        while True:
+            try:
+                metadata, _ = await generator.athrow(TransientRpcError())
+            except StopAsyncIteration:
+                break
+            yielded.append(metadata)
+
+        # Assert
+        assert len(yielded) == len(workers)
+        assert set(yielded) == set(workers)
+
+    @pytest.mark.asyncio
+    async def test_delegate_with_context_eviction(self):
+        """Test delegate observes pool mutations between yields.
+
+        Given:
+            A load balancer with multiple workers, the first
+            candidate has been yielded and the proxy (simulated here)
+            evicts it from the context before calling athrow
+        When:
+            The proxy reports failure via athrow
+        Then:
+            The next yielded candidate is drawn from the mutated
+            (smaller) context and is not the evicted worker.
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
+
+        # Act
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first_metadata, _ = await anext(generator)
+        ctx.remove_worker(first_metadata)  # simulate proxy eviction
+        second_metadata, _ = await generator.athrow(Exception("fatal"))
+
+        # Assert
+        assert first_metadata == workers[0]
+        assert second_metadata != first_metadata
+        assert second_metadata in workers
+        assert first_metadata not in ctx.workers
+        await generator.aclose()
+
+    @pytest.mark.asyncio
+    async def test_delegate_with_asend_success(self):
+        """Test delegate terminates after asend signals success.
+
+        Given:
+            A load balancer with multiple workers, the first
+            candidate has just been yielded
+        When:
+            The proxy reports success via asend(metadata)
+        Then:
+            The generator raises StopAsyncIteration — honoring the
+            contract that asend is terminal.
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, _ = _make_context(3)
+
+        # Act
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        metadata, _ = await anext(generator)
+
+        # Assert
+        with pytest.raises(StopAsyncIteration):
+            await generator.asend(metadata)
+
+    @pytest.mark.asyncio
+    @settings(max_examples=32)
+    @given(
+        worker_count=st.integers(min_value=2, max_value=8),
+        failure_count=st.integers(min_value=0, max_value=7),
+    )
+    async def test_delegate_with_failures_then_success(
+        self, worker_count: int, failure_count: int
     ):
-        """Test concurrent dispatches are distributed across
-        different workers.
+        """Test delegate respects round-robin fairness across failures.
+
+        Given:
+            A load balancer with N workers and a prefix of F failures
+            followed by one success (F < N)
+        When:
+            The proxy drives the generator through the sequence
+        Then:
+            The yielded candidates are workers[0..F] in order and the
+            successful one is workers[F].
+        """
+        # Arrange
+        failure_count = min(failure_count, worker_count - 1)
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(worker_count)
+
+        # Act
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        yielded: list[WorkerMetadata] = []
+        metadata, _ = await anext(generator)
+        yielded.append(metadata)
+        for _ in range(failure_count):
+            metadata, _ = await generator.athrow(TransientRpcError())
+            yielded.append(metadata)
+        with pytest.raises(StopAsyncIteration):
+            await generator.asend(yielded[-1])
+
+        # Assert
+        assert yielded == workers[: failure_count + 1]
+
+    @pytest.mark.asyncio
+    @settings(max_examples=32)
+    @given(
+        worker_count=st.integers(min_value=1, max_value=8),
+        dispatch_count=st.integers(min_value=1, max_value=24),
+    )
+    async def test_delegate_with_successive_calls(
+        self, worker_count: int, dispatch_count: int
+    ):
+        """Test delegate rotates the starting worker across calls.
+
+        Given:
+            A load balancer with N workers driven through K successive
+            delegate() calls, each completing with asend
+        When:
+            Each call is driven to its first candidate and then to
+            success
+        Then:
+            Dispatch k starts at workers[k modulo N], wrapping around
+            past the end of the worker list.
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(worker_count)
+
+        # Act
+        starts: list[WorkerMetadata] = []
+        for _ in range(dispatch_count):
+            generator = loadbalancer.delegate(_TASK, context=ctx)
+            metadata, _ = await anext(generator)
+            starts.append(metadata)
+            with pytest.raises(StopAsyncIteration):
+                await generator.asend(metadata)
+
+        # Assert
+        expected = [workers[k % worker_count] for k in range(dispatch_count)]
+        assert starts == expected
+
+    @pytest.mark.asyncio
+    async def test_delegate_with_concurrent_drivers(self):
+        """Test concurrent delegate drivers land on distinct workers.
 
         Given:
             A load balancer with 4 workers
         When:
-            4 tasks are dispatched concurrently (in parallel)
+            4 dispatches are driven concurrently through independent
+            delegate() calls, each completing with asend
         Then:
-            Each task goes to a different worker (not all to
-            worker 0)
+            Each dispatch lands on a distinct worker (fairness).
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
-        ctx = LoadBalancerContext()
-        worker_count = 4
-        mock_workers = {}
-        workers_that_received_dispatch = []
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(4)
 
-        for i in range(worker_count):
-            mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
-            metadata = WorkerMetadata(
-                uid=uuid4(),
-                address=f"localhost:{50051 + i}",
-                pid=1000 + i,
-                version="1.0.0",
-            )
-
-            # Create dispatch function that tracks which worker received it
-            async def dispatch_fn(task, *, timeout=None, m=metadata):
-                workers_that_received_dispatch.append(m)
-                return f"result-{m.address}"
-
-            mock_connection.dispatch = mocker.AsyncMock(side_effect=dispatch_fn)
-            mock_workers[metadata] = mock_connection
-            ctx.add_worker(metadata, mock_connection)
-
-        async def routine():
-            return "Hello world!"
-
-        tasks = [make_task(routine) for _ in range(4)]
+        async def drive_one() -> WorkerMetadata:
+            generator = loadbalancer.delegate(_TASK, context=ctx)
+            metadata, _ = await anext(generator)
+            try:
+                with pytest.raises(StopAsyncIteration):
+                    await generator.asend(metadata)
+            finally:
+                await generator.aclose()
+            return metadata
 
         # Act
-        results = await asyncio.gather(
-            *[lb.dispatch(task, context=ctx) for task in tasks]
-        )
+        results = await asyncio.gather(*[drive_one() for _ in range(4)])
 
         # Assert
-        assert len(results) == 4
-        unique_workers = set(w.uid for w in workers_that_received_dispatch)
-        assert len(unique_workers) == 4, (
-            f"Expected 4 unique workers, got {len(unique_workers)}. "
-            f"Workers used: {[w.address for w in workers_that_received_dispatch]}"
-        )
+        assert set(results) == set(workers)
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_lock_release_on_success(
-        self,
-        mocker: MockerFixture,
-    ):
-        """Test that worker lock is released after successful
-        dispatch.
+    async def test_delegate_terminates_when_checkpoint_evicted(self):
+        """Test delegate ends when the checkpoint worker is evicted.
 
         Given:
-            A load balancer with workers, one dispatch completes
+            A balancer whose first-yielded (checkpoint) candidate is
+            evicted from the context, while every surviving worker keeps
+            failing transiently forever
         When:
-            Another dispatch is initiated
+            The proxy drives the generator with repeated athrow
         Then:
-            The previously-busy worker is available again for
-            selection
+            It should raise StopAsyncIteration rather than spin forever —
+            the cycle boundary is reseeded once the checkpoint worker
+            leaves the pool.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
-        ctx = LoadBalancerContext()
-        mock_workers = {}
-        workers_that_received_dispatch = []
-
-        mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
-        metadata = WorkerMetadata(
-            uid=uuid4(),
-            address="localhost:50051",
-            pid=1000,
-            version="1.0.0",
-        )
-
-        mock_connection.dispatch = mocker.AsyncMock(
-            side_effect=lambda t, timeout=None: (
-                workers_that_received_dispatch.append(metadata),
-                "success",
-            )[-1]
-        )
-        mock_workers[metadata] = mock_connection
-        ctx.add_worker(metadata, mock_connection)
-
-        async def routine():
-            return "Hello world!"
-
-        task1 = make_task(routine)
-        task2 = make_task(routine)
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first, _ = await anext(generator)
+        ctx.remove_worker(first)  # proxy evicts the checkpoint (non-transient)
 
         # Act
-        await lb.dispatch(task1, context=ctx)
-        await lb.dispatch(task2, context=ctx)
+        yielded: list[WorkerMetadata] = [first]
+        terminated = False
+        for _ in range(100):
+            try:
+                metadata, _ = await generator.athrow(TransientRpcError())
+            except StopAsyncIteration:
+                terminated = True
+                break
+            yielded.append(metadata)
 
         # Assert
-        assert len(workers_that_received_dispatch) == 2
-        assert workers_that_received_dispatch[0] == workers_that_received_dispatch[1]
+        assert terminated, "delegate did not terminate after checkpoint eviction"
+        assert first not in ctx.workers
+        assert first not in yielded[1:]
 
     @pytest.mark.asyncio
-    async def test_dispatch_with_transient_error_retry(
-        self,
-        mocker: MockerFixture,
-    ):
-        """Test that worker lock is released after transient error.
+    async def test_delegate_skips_worker_evicted_after_snapshot(self):
+        """Test delegate skips a candidate evicted after the snapshot.
 
         Given:
-            A load balancer with workers, dispatch fails with
-            TransientRpcError
+            A balancer that has snapshotted three workers and then has an
+            ahead-of-cursor worker evicted before the cursor reaches it
         When:
-            The worker is retried on subsequent dispatch
+            The proxy drives the generator to exhaustion via athrow
         Then:
-            Worker remains in pool and lock is released for retry
+            The evicted worker is never yielded — it is skipped against
+            the live pool — and the generator still terminates.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
-        ctx = LoadBalancerContext()
-        mock_workers = {}
-        dispatch_count = [0]
-
-        mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
-        metadata = WorkerMetadata(
-            uid=uuid4(),
-            address="localhost:50051",
-            pid=1000,
-            version="1.0.0",
-        )
-
-        async def dispatch_with_transient_then_success(task, *, timeout=None):
-            dispatch_count[0] += 1
-            if dispatch_count[0] == 1:
-                raise TransientRpcError()
-            return "success"
-
-        mock_connection.dispatch = mocker.AsyncMock(
-            side_effect=dispatch_with_transient_then_success
-        )
-        mock_workers[metadata] = mock_connection
-        ctx.add_worker(metadata, mock_connection)
-
-        async def routine():
-            return "Hello world!"
-
-        task = make_task(routine)
-
-        # Act & assert
-        with pytest.raises(NoWorkersAvailable):
-            await lb.dispatch(task, context=ctx)
-
-        assert dispatch_count[0] == 1
-        assert len(ctx.workers) == 1
-
-        result = await lb.dispatch(task, context=ctx)
-
-        assert result == "success"
-        assert dispatch_count[0] == 2
-        assert len(ctx.workers) == 1
-
-    @pytest.mark.asyncio
-    async def test_dispatch_with_worker_removal(
-        self,
-        mocker: MockerFixture,
-    ):
-        """Test that worker lock is cleaned up when worker is
-        removed.
-
-        Given:
-            A load balancer with workers, dispatch fails with
-            non-transient error
-        When:
-            Worker is removed from the pool
-        Then:
-            Worker lock is cleaned up and subsequent dispatches
-            route correctly
-        """
-        # Arrange
-        lb = RoundRobinLoadBalancer()
-        ctx = LoadBalancerContext()
-        mock_workers = {}
-
-        for i in range(2):
-            mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
-            metadata = WorkerMetadata(
-                uid=uuid4(),
-                address=f"localhost:{50051 + i}",
-                pid=1000 + i,
-                version="1.0.0",
-            )
-
-            if i == 0:
-                mock_connection.dispatch = mocker.AsyncMock(
-                    side_effect=RpcError(details="fatal error")
-                )
-            else:
-                mock_connection.dispatch = mocker.AsyncMock(return_value="success")
-
-            mock_workers[metadata] = mock_connection
-            ctx.add_worker(metadata, mock_connection)
-
-        async def routine():
-            return "Hello world!"
-
-        task = make_task(routine)
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first, _ = await anext(generator)
+        ctx.remove_worker(workers[2])  # evict a not-yet-reached worker
 
         # Act
-        result = await lb.dispatch(task, context=ctx)
+        yielded: list[WorkerMetadata] = [first]
+        terminated = False
+        for _ in range(100):
+            try:
+                metadata, _ = await generator.athrow(TransientRpcError())
+            except StopAsyncIteration:
+                terminated = True
+                break
+            yielded.append(metadata)
 
         # Assert
-        assert result == "success"
-        assert len(ctx.workers) == 1
+        assert terminated, "delegate did not terminate after mid-cycle eviction"
+        assert workers[2] not in ctx.workers
+        assert workers[2] not in yielded
 
     @pytest.mark.asyncio
-    async def test_dispatch_propagates_non_rpc_error_without_worker_removal(
-        self,
-        mocker: MockerFixture,
-    ):
-        """Test exceptions outside the RpcError contract bubble to the caller.
+    async def test_delegate_snapshots_once_per_wrap(self):
+        """Test delegate materializes the worker order once per wrap.
 
         Given:
-            A load balancer with one worker whose dispatch raises a
-            non-`RpcError` exception (modelling e.g., a strict-
-            mode `BaseExceptionGroup` of
-            `wool.SerializationWarning` peers from
-            `ChainManifest.to_protobuf`, or a programming-error
-            `ValueError`).
+            A balancer cycling a 16-worker pool through one full cycle of
+            transient failures, observed through a context view that
+            counts ``workers.items()`` materializations
         When:
-            ``await lb.dispatch(...)`` is called.
+            The generator is driven to exhaustion via athrow
         Then:
-            The exception should propagate unwrapped to the caller and
-            the worker should remain in the context — the LB's
-            worker-health contract treats only `RpcError`
-            instances as worker-health concerns, so a fault that has
-            nothing to do with worker health does not evict the pool.
+            The ordered snapshot is materialized a small constant number
+            of times (once per wrap), not once per candidate — proving the
+            O(1) cursor replaced the former O(index) per-candidate scan.
         """
         # Arrange
-        lb = RoundRobinLoadBalancer()
-        ctx = LoadBalancerContext()
-
-        encode_failure = BaseExceptionGroup(
-            "wool context encode failed",
-            [ValueError("synthetic encode failure for ContextVar 'tenant_id'")],
-        )
-        mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
-        mock_connection.dispatch = mocker.AsyncMock(side_effect=encode_failure)
-        metadata = WorkerMetadata(
-            uid=uuid4(),
-            address="localhost:50051",
-            pid=1000,
-            version="1.0.0",
-        )
-        ctx.add_worker(metadata, mock_connection)
-
-        async def routine():
-            return "Hello world!"
-
-        task = make_task(routine)
-
-        # Act & assert
-        with pytest.raises(BaseExceptionGroup) as exc_info:
-            await lb.dispatch(task, context=ctx)
-        assert exc_info.value is encode_failure
-        assert len(ctx.workers) == 1, "Non-RpcError must not trigger worker eviction"
-
-    @pytest.mark.asyncio
-    async def test_dispatch_with_overflow_tasks(
-        self,
-        mocker: MockerFixture,
-    ):
-        """Test that waiting tasks are assigned to different workers
-        in round-robin.
-
-        Given:
-            A load balancer with 4 workers, dispatches blocked by
-            locks
-        When:
-            8 tasks are dispatched concurrently (more than workers)
-        Then:
-            Each worker receives exactly 2 tasks (round-robin
-            distribution)
-        """
-        # Arrange
-        lb = RoundRobinLoadBalancer()
-        ctx = LoadBalancerContext()
-        worker_count = 4
-        mock_workers = {}
-        workers_that_received_dispatch: list = []
-        dispatch_count = [0]
-        all_dispatches_queued = asyncio.Event()
-        proceed_with_dispatch = asyncio.Event()
-
-        for i in range(worker_count):
-            mock_connection = mocker.create_autospec(WorkerConnection, instance=True)
-            metadata = WorkerMetadata(
-                uid=uuid4(),
-                address=f"localhost:{50051 + i}",
-                pid=1000 + i,
-                version="1.0.0",
-            )
-
-            async def dispatch_fn(task, *, timeout=None, m=metadata):
-                dispatch_count[0] += 1
-                workers_that_received_dispatch.append(m)
-                if dispatch_count[0] >= 8:
-                    all_dispatches_queued.set()
-                await proceed_with_dispatch.wait()
-                return f"result-{m.address}"
-
-            mock_connection.dispatch = mocker.AsyncMock(side_effect=dispatch_fn)
-            mock_workers[metadata] = mock_connection
-            ctx.add_worker(metadata, mock_connection)
-
-        async def routine():
-            return "Hello world!"
-
-        tasks = [make_task(routine) for _ in range(8)]
+        ctx, workers = _make_context(16)
+        counting = _ItemsCountingContext(ctx)
+        loadbalancer = RoundRobinLoadBalancer()
 
         # Act
-        dispatch_futures = [
-            asyncio.create_task(lb.dispatch(task, context=ctx)) for task in tasks
-        ]
-
-        try:
-            await asyncio.wait_for(all_dispatches_queued.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            pass
-
-        proceed_with_dispatch.set()
-        results = await asyncio.gather(*dispatch_futures)
+        generator = loadbalancer.delegate(_TASK, context=counting)
+        yielded: list[WorkerMetadata] = []
+        metadata, _ = await anext(generator)
+        yielded.append(metadata)
+        while True:
+            try:
+                metadata, _ = await generator.athrow(TransientRpcError())
+            except StopAsyncIteration:
+                break
+            yielded.append(metadata)
 
         # Assert
-        assert len(results) == 8
-        worker_task_counts = {}
-        for w in workers_that_received_dispatch:
-            worker_task_counts[w.uid] = worker_task_counts.get(w.uid, 0) + 1
+        assert len(yielded) == len(workers)
+        assert counting.items_calls <= 2
 
-        assert len(worker_task_counts) == 4, (
-            f"Expected 4 workers, got {len(worker_task_counts)}"
-        )
-        for uid, count in worker_task_counts.items():
-            assert count == 2, f"Expected 2 tasks per worker, worker {uid} got {count}"
+    @pytest.mark.asyncio
+    async def test_delegate_does_not_pin_retired_contexts(self):
+        """Test the balancer does not pin retired contexts against GC.
+
+        Given:
+            A shared RoundRobinLoadBalancer that has served a context the
+            caller then drops every strong reference to
+        When:
+            A garbage collection is forced
+        Then:
+            The context is reclaimed — the balancer holds it only weakly,
+            so a weakref to it resolves to None (no per-context leak of
+            the context or the connections it references).
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, _ = _make_context(2)
+        ref = weakref.ref(ctx)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        await anext(generator)  # registers ctx in the balancer's rotation state
+        await generator.aclose()
+
+        # Act
+        del ctx, generator
+        gc.collect()
+
+        # Assert
+        assert ref() is None

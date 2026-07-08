@@ -1,125 +1,126 @@
 from __future__ import annotations
 
-import itertools
-import logging
-from asyncio import Lock
 from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import Final
+from weakref import WeakKeyDictionary
 
-from wool.runtime.worker.connection import RpcError
-from wool.runtime.worker.connection import TransientRpcError
+from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.metadata import WorkerMetadata
 
-from .base import LoadBalancerContextLike
-from .base import LoadBalancerLike
-from .base import NoWorkersAvailable
+from .base import LoadBalancerContextView
 
 if TYPE_CHECKING:
     from wool.runtime.routine.task import Task
 
-logger = logging.getLogger(__name__)
-
 
 # public
-class RoundRobinLoadBalancer(LoadBalancerLike):
+class RoundRobinLoadBalancer:
     """Round-robin load balancer for distributing tasks across workers.
 
-    Cycles through workers in the given
-    :py:class:`LoadBalancerContextLike`, advancing the index after each
-    successful dispatch. When a dispatch attempt fails, transient
-    errors skip to the next worker while non-transient errors remove
-    the worker from the context. One full cycle is attempted per
-    dispatch call.
+    Cycles through workers in the given `LoadBalancerContextView`,
+    advancing the index after each yielded candidate. The `WorkerProxy`
+    owns the dispatch, eviction, and error-classification loop — the
+    balancer's only responsibility is ordering.
 
-    **Worker-health exception contract:** the load balancer treats
-    :class:`~wool.runtime.worker.connection.RpcError` (and its
-    transient subclass
-    :class:`~wool.runtime.worker.connection.TransientRpcError`) as
-    worker-health concerns. Other exceptions raised by
-    :meth:`WorkerConnection.dispatch` — e.g. a strict-mode
-    :class:`wool.ChainSerializationError` from a caller-side
-    encode failure, or a programming-error
-    :class:`ValueError` — propagate to the caller unwrapped, so a
-    fault that has nothing to do with worker health does not evict
-    workers from the pool.
+    After one full cycle without a successful dispatch the generator
+    terminates, causing the proxy to raise `NoWorkersAvailable`.
+
+    .. rubric:: Implementation notes
+
+    The cycle boundary is identified by the UID of the first yielded
+    candidate. If that first candidate is evicted mid-cycle its UID can
+    never recur, so the boundary is reseeded from the next surviving
+    candidate.
+
+    Per-context rotation state lives in a `WeakKeyDictionary` keyed on
+    the context, so a retired pool's cursor — and the connections it
+    references — are reclaimed with the context instead of pinned for
+    the balancer's lifetime.
     """
 
-    _index: Final[dict[LoadBalancerContextLike, int]]
+    _index: Final[WeakKeyDictionary[LoadBalancerContextView, int]]
 
     def __init__(self):
-        self._index = {}
-        self._lock = Lock()
+        self._index = WeakKeyDictionary()
 
     def __reduce__(self):
         return (self.__class__, ())
 
-    async def dispatch(
+    async def delegate(
         self,
         task: Task,
         *,
-        context: LoadBalancerContextLike,
-        timeout: float | None = None,
-    ) -> AsyncGenerator:
-        """Dispatch a task to the next available worker.
+        context: LoadBalancerContextView,
+    ) -> AsyncGenerator[
+        tuple[WorkerMetadata, WorkerConnection],
+        WorkerMetadata | None,
+    ]:
+        """Yield worker candidates in round-robin order.
 
         :param task:
-            The :py:class:`Task` to dispatch.
+            The task being routed. Accepted for protocol conformance
+            and ignored: round-robin is task-agnostic. Task-aware
+            balancers may key on it (e.g., hash-by-tag affinity);
+            round-robin does not.
         :param context:
-            The :py:class:`LoadBalancerContextLike` to select workers
-            from.
-        :param timeout:
-            Timeout in seconds for each dispatch attempt. If ``None``,
-            no timeout is applied.
-        :returns:
-            An async iterator that yields worker responses.
-        :raises NoWorkersAvailable:
-            If no healthy workers are available for dispatch.
+            Read-only view of the worker pool. Eviction is the
+            proxy's responsibility; the balancer only reads
+            ``context.workers`` to pick the next candidate.
+        :yields:
+            ``(metadata, connection)`` pairs. The generator is driven
+            by the proxy via ``anext``/``athrow``/``asend``.
         """
-        checkpoint = None
+        checkpoint: WorkerMetadata | None = None
+        snapshot: list[tuple[WorkerMetadata, WorkerConnection]] = []
+        cursor = 0
+        while True:
+            workers = context.workers
+            if not workers:
+                return
+            # Select the candidate and advance the shared per-context index
+            # in one synchronous step. With no ``await`` between the read and
+            # the write, concurrent dispatches on the same context cannot
+            # interleave here, so each observes a distinct starting worker
+            # (anti-thundering-herd) — the single-threaded event loop provides
+            # the mutual exclusion a lock would, for free.
+            index = self._index.get(context, 0)
+            if cursor >= len(snapshot):
+                # Re-observe membership once per wrap and index the ordered
+                # workers in O(1). Rebuilding the snapshot is the only O(n)
+                # step and amortizes to O(1) per candidate over a cycle.
+                snapshot = list(workers.items())
+                cursor = index % len(snapshot)
+            metadata, connection = snapshot[cursor]
+            cursor += 1
+            self._index[context] = index + 1
 
-        if context not in self._index:
-            self._index[context] = 0
+            if checkpoint is not None and checkpoint not in workers:
+                # The cycle boundary was evicted; its UID can never recur,
+                # so drop it and let the next survivor reseed the boundary.
+                checkpoint = None
+            if metadata not in workers:
+                # Evicted since the snapshot was taken — skip it.
+                continue
+            if checkpoint is None:
+                checkpoint = metadata
+            elif metadata.uid == checkpoint.uid:
+                # One full cycle completed without a successful
+                # dispatch — signal exhaustion.
+                return
 
-        while context.workers:
-            async with self._lock:
-                if self._index[context] >= len(context.workers):
-                    self._index[context] = 0
-
-                metadata, connection = next(
-                    itertools.islice(
-                        context.workers.items(),
-                        self._index[context],
-                        self._index[context] + 1,
-                    )
-                )
-
-                if checkpoint is None:
-                    checkpoint = metadata.uid
-                elif metadata.uid == checkpoint:
-                    break
-
-                try:
-                    stream = await connection.dispatch(task, timeout=timeout)
-                except TransientRpcError as exc:
-                    logger.debug(
-                        "Skipping worker %s on transient error: %s",
-                        metadata.uid,
-                        exc,
-                    )
-                    self._index[context] = self._index[context] + 1
-                    continue
-                except RpcError as exc:
-                    logger.warning(
-                        "Evicting worker %s after non-transient RPC error: %s",
-                        metadata.uid,
-                        exc,
-                    )
-                    context.remove_worker(metadata)
-                    if metadata.uid == checkpoint:
-                        checkpoint = None
-                    continue
-                else:
-                    self._index[context] = self._index[context] + 1
-                    return stream
-
-        raise NoWorkersAvailable("No healthy workers available for dispatch")
+            try:
+                yield (metadata, connection)
+            except Exception:
+                # Proxy reports failure (transient or non-transient).
+                # Advance to the next worker; eviction, if any, has
+                # already happened in the proxy. GeneratorExit and
+                # CancelledError propagate out of the generator so
+                # aclose() and task cancellation work correctly.
+                continue
+            else:
+                # Resumed without an exception: the proxy signaled
+                # success. Round-robin has no per-dispatch state to
+                # record, so terminate. See LoadBalancerLike for the
+                # driver contract.
+                return

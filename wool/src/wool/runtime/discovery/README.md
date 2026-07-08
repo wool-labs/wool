@@ -6,7 +6,7 @@ Wool workers compose a decentralized peer-to-peer network. From a client's persp
 
 Discovery separates **publishing** (announcing worker lifecycle events) from **subscribing** (reacting to them).
 
-A `WorkerPool` initialized with a `discovery` protocol will subscribe to it and consider any discovered workers when routing work. If the pool also spawns any workers (e.g., because it was initialized with a finite `size`), those workers' lifecycle events will be published according to the specified protocol as well, making them available to the network.
+A `WorkerPool` initialized with a `discovery` protocol will subscribe to it and consider any discovered workers when routing work. If the pool also spawns any workers (e.g., because it was initialized with a finite `spawn`), those workers' lifecycle events will be published according to the specified protocol as well, making them available to the network.
 
 Worker lifecycle event types:
 
