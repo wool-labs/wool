@@ -411,6 +411,27 @@ class DispatchSession:
                 # minted chain id, so the back-propagated next frame
                 # (now carrying that id) reuses it.
                 dispatch_ctx: contextvars.Context | None = None
+                # A routine argument can be a live ``wool.Token``. Such tokens
+                # were reconstituted when the initial TaskRequestFrame was
+                # decoded in the parse phase (``__aenter__``), so they sit on
+                # that frame's ``_wire_tokens``. But parse only reads the task
+                # off that frame — it never mounts it, and mounting is what
+                # anchors a token — mints its native reset binding in the
+                # chain's context so the routine can ``reset`` it on this
+                # worker. The only frames mounted here are the mid-stream
+                # Next/Send/Throw ones, and the caller chain those arg tokens
+                # belong to is armed by the *first* of them. So carry the arg
+                # tokens over to that first frame and let its mount anchor them
+                # alongside the chain they rode in on. Once only: after that
+                # mount they are anchored (or, if the caller shipped no chain
+                # to anchor into, left as orphans reclaimed with the dispatch),
+                # and every later frame just re-mounts that same chain —
+                # re-carrying them would be redundant.
+                initial_wire_tokens = (
+                    list(self._initial_frame._wire_tokens)
+                    if self._initial_frame is not None
+                    else []
+                )
 
                 try:
                     async with routine_scope(work_task) as routine:
@@ -488,15 +509,17 @@ class DispatchSession:
                                     chain_registry[manifest.id] = cached
                                 ctx = cached
 
-                            # Single mount entry point. Frame.mount
-                            # routes through the unified
-                            # `Chain.from_manifest` pipeline inside
-                            # ``ctx.run(...)`` and handles the
-                            # exception-frame decode-error-chaining
-                            # (ThrowRequestFrame's
-                            # ``_chain_exceptions`` walk) so
-                            # the worker driver no longer needs the
-                            # hand-rolled apply/walk block.
+                            # First mounted frame only: prepend the arg tokens
+                            # carried over from the initial TaskRequestFrame
+                            # (see above) so this mount anchors them onto the
+                            # caller chain, then clear them so subsequent frames
+                            # don't re-apply them.
+                            if initial_wire_tokens:
+                                request._wire_tokens = [
+                                    *initial_wire_tokens,
+                                    *request._wire_tokens,
+                                ]
+                                initial_wire_tokens = []
                             request.mount(ctx)
 
                             # Drive the step via the top-level

@@ -40,9 +40,27 @@ message ContextVar {
     string namespace = 1;
     // Name component of the ContextVar identity.
     string name = 2;
-    // Cloudpickled value. Unset when the var has no 
+    // Cloudpickled value. Unset when the var has no
     // current value in this snapshot.
     optional bytes value = 3;
+    // Hex ids of this var's wool.Token instances that have been spent
+    // (successfully reset) somewhere in the chain. Propagates
+    // cross-process single-use enforcement: a token whose id appears
+    // here has already been used and any further reset raises. Rides on
+    // both Request and Response frames so the spent state flows in both
+    // directions. Chain-local and ephemeral — carried per-var on the
+    // chain, unioned on ingress, pruned when the var is re-set, and
+    // dropped with the chain (and on an asyncio.create_task fork).
+    repeated string spent_tokens = 4;
+    // Hex ids of this var's live (unspent) wool.Token instances minted
+    // in the context this manifest snapshots. The receiver's mount
+    // anchors a wire-reconstituted token — making it resettable there —
+    // only if its id appears here: a token minted in a sibling context
+    // the sender does not continue is absent and stays an orphan. Like
+    // spent_tokens this is chain-local and ephemeral — dropped on an
+    // asyncio.create_task fork; a spent id is pruned from here so the
+    // live and spent sets stay disjoint.
+    repeated string unspent_tokens = 5;
 }
 
 // wool.Chain wire shape — the manifest of a chain crossing the
@@ -55,8 +73,8 @@ message ChainManifest {
     // asyncio.create_task boundaries. Empty for root dispatches
     // that will start a new chain on the receiver.
     string id = 1;
-    // ContextVar entries — each one carries identity, optional
-    // value, and any consumed-token ids for that var.
+    // ContextVar entries — each one carries identity, optional value,
+    // and its per-var spent/unspent token ids.
     repeated ContextVar vars = 2;
 }
 

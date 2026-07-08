@@ -26,6 +26,10 @@ from wool.runtime.context.manifest import resolve_stub
 from wool.runtime.context.var import ContextVar
 from wool.runtime.typing import Undefined
 
+# Wire-safe token-id strategy shared by the token-bookkeeping property tests —
+# hex-ish strings matching the ids ``ContextVar.set`` mints.
+token_ids = st.text(alphabet="0123456789abcdef", min_size=1, max_size=12)
+
 
 def _decode_manifest(wire: protocol.ChainManifest) -> ChainManifest:
     """Decode a wire `protocol.ChainManifest` into a
@@ -48,7 +52,7 @@ def _mount_manifest(manifest: ChainManifest) -> None:
     fresh-install branch automatically). Used by the tests that exercise
     the decode-then-mount round trip via the public API.
     """
-    if not (manifest.vars or manifest.resets):
+    if not manifest.has_state:
         return
     Chain.from_manifest(
         manifest,
@@ -74,6 +78,44 @@ def _adopt_chain(chain_id: UUID) -> None:
 
 
 class TestChainManifest:
+    def test_empty_should_return_fresh_manifest_with_no_token_bookkeeping(self):
+        """Test ChainManifest.empty mints a blank manifest.
+
+        Given:
+            No prior manifest state.
+        When:
+            ChainManifest.empty is called.
+        Then:
+            The manifest should carry no vars, resets, spent_tokens,
+            or unspent_tokens.
+        """
+        # Act
+        manifest = ChainManifest.empty()
+
+        # Assert
+        assert manifest.vars == {}
+        assert manifest.resets == frozenset()
+        assert manifest.spent_tokens == {}
+        assert manifest.unspent_tokens == {}
+
+    def test_empty_should_mint_a_distinct_id_per_call(self):
+        """Test ChainManifest.empty mints a distinct chain id per call.
+
+        Given:
+            No prior manifest state.
+        When:
+            ChainManifest.empty is called twice.
+        Then:
+            The two calls should mint distinct chain ids — no mutable
+            state is shared across calls.
+        """
+        # Act
+        first = ChainManifest.empty()
+        second = ChainManifest.empty()
+
+        # Assert
+        assert first.id != second.id
+
     def test_from_protobuf_should_round_trip_value(self):
         """Test from_protobuf recovers an encoded variable binding.
 
@@ -412,6 +454,167 @@ class TestChainManifest:
         assert decoded.resets == resets
         assert decoded.id == chain_id
 
+    def test_from_protobuf_should_default_token_fields_when_absent_from_wire(self):
+        """Test decoding a legacy wire manifest defaults the token fields.
+
+        Given:
+            A wire chain manifest carrying only an id and one value
+            entry, with the token-bookkeeping fields untouched.
+        When:
+            from_protobuf decodes it.
+        Then:
+            The decoded manifest should carry an empty spent_tokens
+            mapping and an empty unspent_tokens mapping — frames from
+            pre-token senders decode cleanly.
+        """
+        # Arrange
+        var = ContextVar(_unique("legacy_wire"))
+        wire = protocol.ChainManifest(id=uuid4().hex)
+        wire.vars.add(
+            namespace=var.namespace,
+            name=var.name,
+            value=wool.__serializer__.dumps("v"),
+        )
+
+        # Act
+        decoded = _decode_manifest(wire)
+
+        # Assert
+        assert decoded.spent_tokens == {}
+        assert decoded.unspent_tokens == {}
+        assert decoded.vars[var] == "v"
+
+    def test_from_protobuf_should_retain_ledger_when_value_decode_fails(self):
+        """Test a failed value entry still contributes its spent and unspent ids.
+
+        Given:
+            A wire entry whose value bytes are not valid pickle data
+            but which carries both spent and unspent token ids, under
+            non-strict warning filtering.
+        When:
+            from_protobuf decodes it.
+        Then:
+            The decoded manifest should retain the entry's spent and
+            unspent ids under its key — the token bookkeeping rides
+            independently of value state — while the key stays absent
+            from both vars and resets.
+        """
+        # Arrange
+        var = ContextVar(_unique("bad_value_ledger"))
+        wire = protocol.ChainManifest(id=uuid4().hex)
+        wire.vars.add(
+            namespace=var.namespace,
+            name=var.name,
+            value=b"not-pickle",
+            spent_tokens=["aa", "bb"],
+            unspent_tokens=["cc"],
+        )
+
+        # Act
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            decoded = _decode_manifest(wire)
+
+        # Assert
+        key = (var.namespace, var.name)
+        assert decoded.spent_tokens[key] == frozenset({"aa", "bb"})
+        assert decoded.unspent_tokens[key] == frozenset({"cc"})
+        assert var not in decoded.vars
+        assert key not in decoded.resets
+
+    def test_from_protobuf_should_raise_when_strict_mode_with_token_fields(self):
+        """Test strict mode raises even when token fields decode cleanly.
+
+        Given:
+            A wire manifest whose single entry has undecodable value
+            bytes alongside both spent and unspent token ids, under
+            strict SerializationWarning filtering.
+        When:
+            from_protobuf decodes it.
+        Then:
+            It should raise ChainSerializationError and surface no
+            partial manifest — the cleanly-decodable token bookkeeping
+            does not rescue a strict-mode failure.
+        """
+        # Arrange
+        var = ContextVar(_unique("strict_ledger"))
+        wire = protocol.ChainManifest(id=uuid4().hex)
+        wire.vars.add(
+            namespace=var.namespace,
+            name=var.name,
+            value=b"not-pickle",
+            spent_tokens=["aa"],
+            unspent_tokens=["ff"],
+        )
+
+        # Act & assert
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=wool.SerializationWarning)
+            with pytest.raises(wool.ChainSerializationError):
+                _decode_manifest(wire)
+
+    @given(
+        value_entries=st.lists(
+            st.tuples(
+                st.integers() | st.text(),
+                st.frozensets(token_ids, max_size=3),
+                st.frozensets(token_ids, max_size=3),
+            ),
+            max_size=3,
+        ),
+        reset_ledgers=st.lists(st.frozensets(token_ids, max_size=3), max_size=2),
+    )
+    @settings(max_examples=50, deadline=None)
+    def test_from_protobuf_should_round_trip_token_bookkeeping(
+        self, value_entries, reset_ledgers
+    ):
+        """Test the codec round-trips per-var spent and unspent token ids.
+
+        Given:
+            A manifest mixing value-bearing and reset-only keys, a
+            per-var spent-token ledger over both populations with
+            possibly-empty entry sets, and per-var unspent token ids on
+            the value-bearing keys.
+        When:
+            The manifest is encoded with to_protobuf and decoded back
+            with from_protobuf.
+        Then:
+            The decoded manifest should recover exactly the non-empty
+            spent_tokens and unspent_tokens entries as frozensets — an
+            unspent id rides only its value-bearing var's entry.
+        """
+        # Arrange
+        bound = [ContextVar(_unique("rt_ledger_val")) for _ in value_entries]
+        reset_vars = [ContextVar(_unique("rt_ledger_reset")) for _ in reset_ledgers]
+        spent_tokens = {}
+        unspent_tokens = {}
+        for var, (_, spent, unspent) in zip(bound, value_entries):
+            spent_tokens[(var.namespace, var.name)] = spent
+            unspent_tokens[(var.namespace, var.name)] = unspent
+        for var, spent in zip(reset_vars, reset_ledgers):
+            spent_tokens[(var.namespace, var.name)] = spent
+        manifest = ChainManifest(
+            id=uuid4(),
+            vars={var: value for var, (value, _, _) in zip(bound, value_entries)},
+            resets=frozenset((v.namespace, v.name) for v in reset_vars),
+            stubs=frozenset(),
+            spent_tokens=spent_tokens,
+            unspent_tokens=unspent_tokens,
+        )
+
+        # Act
+        decoded = _decode_manifest(manifest.to_protobuf())
+
+        # Assert
+        assert decoded.spent_tokens == {
+            key: ids for key, ids in spent_tokens.items() if ids
+        }
+        assert decoded.unspent_tokens == {
+            key: ids for key, ids in unspent_tokens.items() if ids
+        }
+        assert all(isinstance(ids, frozenset) for ids in decoded.spent_tokens.values())
+        assert all(isinstance(ids, frozenset) for ids in decoded.unspent_tokens.values())
+
 
 class TestChainManifestToProtobuf:
     def test_to_protobuf_should_return_empty_manifest_when_none(self):
@@ -645,6 +848,276 @@ class TestChainManifestToProtobuf:
         # Assert
         keys = {(entry.namespace, entry.name) for entry in wire.vars}
         assert (var.namespace, var.name) not in keys
+
+    def test_to_protobuf_should_ride_spent_tokens_on_value_entry(self):
+        """Test spent ids ride sorted on the key's value entry.
+
+        Given:
+            A manifest binding one variable to a value, with spent
+            token ids recorded for that variable's key.
+        When:
+            to_protobuf is called.
+        Then:
+            The single wire entry should carry the value and the
+            spent ids sorted within the entry — no standalone entry
+            is emitted for the ledger.
+        """
+        # Arrange
+        var = ContextVar(_unique("piggyback_value"))
+        manifest = ChainManifest(
+            id=uuid4(),
+            vars={var: "v"},
+            resets=frozenset(),
+            stubs=frozenset(),
+            spent_tokens={(var.namespace, var.name): frozenset({"bb", "aa"})},
+        )
+
+        # Act
+        wire = manifest.to_protobuf()
+
+        # Assert
+        assert len(wire.vars) == 1
+        entry = wire.vars[0]
+        assert entry.HasField("value")
+        assert list(entry.spent_tokens) == ["aa", "bb"]
+
+    def test_to_protobuf_should_ride_unspent_tokens_on_value_entry(self):
+        """Test unspent ids ride sorted on the key's value entry.
+
+        Given:
+            A manifest binding one variable to a value, with unspent
+            (live) token ids recorded for that variable's key.
+        When:
+            to_protobuf is called.
+        Then:
+            The single wire entry should carry the value and the
+            unspent ids sorted within the entry — an unspent id always
+            rides its value-bearing var's entry.
+        """
+        # Arrange
+        var = ContextVar(_unique("piggyback_unspent"))
+        manifest = ChainManifest(
+            id=uuid4(),
+            vars={var: "v"},
+            resets=frozenset(),
+            stubs=frozenset(),
+            unspent_tokens={(var.namespace, var.name): frozenset({"bb", "aa"})},
+        )
+
+        # Act
+        wire = manifest.to_protobuf()
+
+        # Assert
+        assert len(wire.vars) == 1
+        entry = wire.vars[0]
+        assert entry.HasField("value")
+        assert list(entry.unspent_tokens) == ["aa", "bb"]
+
+    def test_to_protobuf_should_ride_spent_tokens_on_reset_entry(self):
+        """Test spent ids ride on a value-less reset entry.
+
+        Given:
+            A manifest whose only key is reset-pending, with spent
+            token ids recorded for that key.
+        When:
+            to_protobuf is called.
+        Then:
+            Exactly one value-less wire entry should be emitted,
+            carrying the spent ids sorted within it.
+        """
+        # Arrange
+        key = ("reset_ns", _unique("piggyback_reset"))
+        manifest = ChainManifest(
+            id=uuid4(),
+            vars={},
+            resets=frozenset({key}),
+            stubs=frozenset(),
+            spent_tokens={key: frozenset({"cc", "aa"})},
+        )
+
+        # Act
+        wire = manifest.to_protobuf()
+
+        # Assert
+        assert len(wire.vars) == 1
+        entry = wire.vars[0]
+        assert not entry.HasField("value")
+        assert list(entry.spent_tokens) == ["aa", "cc"]
+
+    def test_to_protobuf_should_omit_token_ids_when_key_not_bound_or_reset(self):
+        """Test spent/unspent ids under a key outside vars and resets emit nothing.
+
+        Given:
+            A manifest with no bindings or resets whose spent_tokens
+            and unspent_tokens carry ids under keys absent from both.
+        When:
+            to_protobuf is called.
+        Then:
+            The wire manifest should carry no entries at all — token
+            ids only piggyback on an entry that exists for a bound or
+            reset key, never a standalone entry.
+        """
+        # Arrange
+        manifest = ChainManifest(
+            id=uuid4(),
+            vars={},
+            resets=frozenset(),
+            stubs=frozenset(),
+            spent_tokens={("ghost_ns", _unique("ghost_spent")): frozenset({"zz"})},
+            unspent_tokens={("ghost_ns", _unique("ghost_unspent")): frozenset({"yy"})},
+        )
+
+        # Act
+        wire = manifest.to_protobuf()
+
+        # Assert
+        assert len(wire.vars) == 0
+
+    def test_to_protobuf_should_omit_empty_token_bookkeeping(self):
+        """Test empty ledger and live-id sets leave no wire footprint.
+
+        Given:
+            Two manifests identical except one carries an empty
+            spent-id set and an empty unspent-id set for its key.
+        When:
+            Both manifests are encoded with to_protobuf.
+        Then:
+            The serialised wire bytes should be identical — empty
+            token bookkeeping is omitted from the wire entirely.
+        """
+        # Arrange
+        var = ContextVar(_unique("empty_ledger"))
+        chain_id = uuid4()
+        with_empty = ChainManifest(
+            id=chain_id,
+            vars={var: "v"},
+            resets=frozenset(),
+            stubs=frozenset(),
+            spent_tokens={(var.namespace, var.name): frozenset()},
+            unspent_tokens={(var.namespace, var.name): frozenset()},
+        )
+        without = ChainManifest(
+            id=chain_id,
+            vars={var: "v"},
+            resets=frozenset(),
+            stubs=frozenset(),
+        )
+
+        # Act
+        first = with_empty.to_protobuf().SerializeToString()
+        second = without.to_protobuf().SerializeToString()
+
+        # Assert
+        assert first == second
+
+    def test_to_protobuf_should_suppress_token_ids_when_value_encode_fails(self):
+        """Test an encode failure suppresses the failed key's spent and unspent ids.
+
+        Given:
+            A manifest binding one unpicklable value whose key carries
+            both spent and unspent token ids, alongside one
+            serializable binding, under non-strict warning filtering.
+        When:
+            to_protobuf is called.
+        Then:
+            It should warn, emit only the good entry, and ship the
+            failed key's spent and unspent ids nowhere on the wire —
+            the whole entry is suppressed, token bookkeeping included.
+        """
+        # Arrange
+        good = ContextVar(_unique("ledger_good"))
+        bad = ContextVar(_unique("ledger_bad"))
+        manifest = ChainManifest(
+            id=uuid4(),
+            vars={good: "ok", bad: threading.Lock()},
+            resets=frozenset(),
+            stubs=frozenset(),
+            spent_tokens={(bad.namespace, bad.name): frozenset({"deadbeef"})},
+            unspent_tokens={(bad.namespace, bad.name): frozenset({"cafef00d"})},
+        )
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            wire = manifest.to_protobuf()
+
+        # Assert
+        emitted = [
+            w for w in caught if issubclass(w.category, wool.SerializationWarning)
+        ]
+        assert emitted
+        keys = {(entry.namespace, entry.name) for entry in wire.vars}
+        assert keys == {(good.namespace, good.name)}
+        assert all("deadbeef" not in entry.spent_tokens for entry in wire.vars)
+        assert all("cafef00d" not in entry.unspent_tokens for entry in wire.vars)
+
+    @given(
+        entries=st.lists(
+            st.tuples(
+                st.integers() | st.text(),
+                st.frozensets(token_ids, max_size=3),
+                st.frozensets(token_ids, max_size=3),
+            ),
+            max_size=4,
+        ),
+    )
+    @settings(max_examples=50, deadline=None)
+    def test_to_protobuf_should_encode_identically_when_insertion_order_differs(
+        self, entries
+    ):
+        """Test byte-determinism of the encode across insertion orders.
+
+        Given:
+            Two manifests carrying the same chain id, variable
+            bindings, per-var spent-token ids, and per-var
+            unspent-token ids, with their vars, spent_tokens, and
+            unspent_tokens mappings built in opposite insertion orders.
+        When:
+            Both manifests are encoded with to_protobuf.
+        Then:
+            The serialised wire bytes should be identical — sorted
+            emission of the entries and of each entry's spent and
+            unspent id lists makes identical logical state encode to
+            byte-identical frames.
+        """
+        # Arrange
+        chain_id = uuid4()
+        bound = [ContextVar(_unique("det_order")) for _ in entries]
+        pairs = [(var, value) for var, (value, _, _) in zip(bound, entries)]
+        spent = [
+            ((var.namespace, var.name), ids)
+            for var, (_, ids, _) in zip(bound, entries)
+            if ids
+        ]
+        unspent = [
+            ((var.namespace, var.name), ids)
+            for var, (_, _, ids) in zip(bound, entries)
+            if ids
+        ]
+
+        def _build(vars_pairs, spent_pairs, unspent_pairs):
+            return ChainManifest(
+                id=chain_id,
+                vars=dict(vars_pairs),
+                resets=frozenset(),
+                stubs=frozenset(),
+                spent_tokens=dict(spent_pairs),
+                unspent_tokens=dict(unspent_pairs),
+            )
+
+        forward = _build(pairs, spent, unspent)
+        backward = _build(
+            list(reversed(pairs)),
+            list(reversed(spent)),
+            list(reversed(unspent)),
+        )
+
+        # Act
+        first = forward.to_protobuf().SerializeToString()
+        second = backward.to_protobuf().SerializeToString()
+
+        # Assert
+        assert first == second
 
 
 class TestChainMount:

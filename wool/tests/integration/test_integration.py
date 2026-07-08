@@ -2,6 +2,7 @@
 
 import asyncio
 import contextvars
+import os
 
 import pytest
 from hypothesis import HealthCheck
@@ -9,6 +10,7 @@ from hypothesis import example
 from hypothesis import given
 from hypothesis import settings
 
+from . import routines
 from .conftest import PAIRWISE_SCENARIOS
 from .conftest import BackpressureMode
 from .conftest import ContextVarPattern
@@ -24,6 +26,7 @@ from .conftest import Scenario
 from .conftest import TimeoutKind
 from .conftest import WorkerOptionsKind
 from .conftest import build_pool_from_scenario
+from .conftest import default_scenario
 from .conftest import invoke_routine
 from .conftest import scenarios_strategy
 
@@ -172,3 +175,41 @@ async def test_dispatch_hypothesis(scenario, credentials_map, retry_grpc_interna
                 await asyncio.create_task(invoke_routine(scenario), context=isolated)
 
     await retry_grpc_internal(body)
+
+
+@pytest.mark.integration
+class TestNestedDispatch:
+    @pytest.mark.asyncio
+    async def test_nested_pid_fanout_should_dispatch_to_the_pool(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test nested dispatches fan out to pool workers, not the outer process.
+
+        Given:
+            An EPHEMERAL pool with two eagerly started workers
+            (quorum 2) and a routine that reports its own pid plus the
+            pids of four nested `get_pid` dispatches.
+        When:
+            The caller dispatches the fan-out routine.
+        Then:
+            The outer pid should differ from the caller's pid, every
+            inner pid should differ from the caller's pid, and the four
+            inner pids should span both pool workers — nested dispatches
+            go through the round-robin pool rather than self-executing.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(
+                pool_mode=PoolMode.EPHEMERAL,
+                lazy=LazyMode.EAGER,
+                quorum=QuorumMode.ABOVE_DEFAULT,
+            )
+            async with build_pool_from_scenario(scenario, credentials_map):
+                outer_pid, inner_pids = await routines.nested_pid_fanout(4)
+            caller_pid = os.getpid()
+            assert outer_pid != caller_pid
+            assert all(pid != caller_pid for pid in inner_pids)
+            assert len(set(inner_pids)) == 2
+
+        await retry_grpc_internal(body)

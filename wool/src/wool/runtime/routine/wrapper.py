@@ -238,7 +238,7 @@ def routine(fn: C) -> C:
                     async_generator_wrapper.__module__,
                     async_generator_wrapper.__qualname__,
                     lineno,
-                    fn,
+                    async_generator_wrapper,
                     *args,
                     **kwargs,
                 )
@@ -281,7 +281,7 @@ def routine(fn: C) -> C:
                     coroutine_wrapper.__module__,
                     coroutine_wrapper.__qualname__,
                     lineno,
-                    fn,
+                    coroutine_wrapper,
                     *args,
                     **kwargs,
                 )

@@ -64,6 +64,142 @@ class TestContextVarPropagation:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
+    async def test_token_reset_on_worker_should_consume_it_for_the_caller(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a token reset on a worker is consumed for the caller too.
+
+        Given:
+            A caller-minted TENANT_ID token dispatched to a worker as an
+            argument, where the worker resets it.
+        When:
+            The caller resets the same token after the dispatch returns.
+        Then:
+            It should raise RuntimeError — the worker's reset propagated
+            the consumed state back on the response frame, enforcing
+            single-use across processes.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("acme-corp")
+                observed = await routines.reset_tenant_id_token(token)
+                assert observed == "unknown"
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(token)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_orphan_token_should_transport_losslessly_without_raising(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test an orphaned token crosses the wire and back without raising.
+
+        Given:
+            A TENANT_ID token minted inside a sibling stdlib context (via
+            copy_context().run) that the dispatching context does not
+            continue, passed to a routine that inspects but does not reset
+            it.
+        When:
+            The routine is dispatched and the token travels to the worker
+            and back in the return value.
+        Then:
+            No error should surface anywhere in transport, and the returned
+            token should be a usable object naming the original variable —
+            failure is deferred exclusively to a reset attempt, which
+            raises stdlib's different-Context ValueError.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                ambient = routines.TENANT_ID.set("ambient")
+                try:
+                    sibling = contextvars.copy_context()
+                    orphan = sibling.run(routines.TENANT_ID.set, "sibling")
+                    returned, var_name = await routines.describe_tenant_id_token(orphan)
+                    assert var_name == routines.TENANT_ID.name
+                    assert returned.var.name == routines.TENANT_ID.name
+                    with pytest.raises(
+                        ValueError, match="was created in a different Context"
+                    ):
+                        routines.TENANT_ID.reset(returned)
+                finally:
+                    routines.TENANT_ID.reset(ambient)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_orphan_token_reset_on_worker_should_raise_different_context(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a worker cannot reset a token minted in a sibling context.
+
+        Given:
+            A TENANT_ID token minted inside a sibling stdlib context sharing
+            the dispatching context's chain — so the chain id matches but
+            the minting context is not the one the worker continues.
+        When:
+            A routine dispatched from the ambient context resets the token
+            on the worker.
+        Then:
+            The reset should raise stdlib's "was created in a different
+            Context" ValueError — token ownership follows the exact minting
+            context, not the chain.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                ambient = routines.TENANT_ID.set("ambient")
+                try:
+                    sibling = contextvars.copy_context()
+                    orphan = sibling.run(routines.TENANT_ID.set, "sibling")
+                    _, kind, message = await routines.reset_tenant_id_token_report(
+                        orphan
+                    )
+                    assert kind == "ValueError"
+                    assert "was created in a different Context" in message
+                finally:
+                    routines.TENANT_ID.reset(ambient)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_worker_minted_token_should_be_resettable_by_the_caller(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a token minted on a worker resets in the awaiting caller.
+
+        Given:
+            A routine that sets TENANT_ID on the worker and returns the
+            minted token to the awaiting caller.
+        When:
+            The caller resets the returned token.
+        Then:
+            The set should have propagated back to the caller (awaited
+            dispatch continues the caller's context), and the reset should
+            succeed there, restoring the pre-call default — stdlib parity
+            with an awaited local coroutine performing the same set.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = await routines.set_tenant_id_and_return_token("worker-set")
+                assert routines.TENANT_ID.get() == "worker-set"
+                routines.TENANT_ID.reset(token)
+                assert routines.TENANT_ID.get() == "unknown"
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
     async def test_async_generator_dispatch_should_propagate_wool_context_var(
         self, credentials_map, retry_grpc_internal
     ):
@@ -2353,5 +2489,801 @@ class TestProxyCollisionAcrossDispatch:
                 gen = routines.stream_proxy_collision_in_shared_context()
                 collected = [value async for value in gen]
             assert collected == ["ready", "task"]
+
+        await retry_grpc_internal(body)
+
+
+@pytest.mark.integration
+class TestTokenSingleUseAcrossProcesses:
+    @pytest.mark.asyncio
+    async def test_second_reset_on_worker_should_report_used_token(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a token consumed on a worker refuses a second worker reset.
+
+        Given:
+            A caller-minted TENANT_ID token already consumed by a
+            dispatched reset on a DEFAULT pool.
+        When:
+            The caller dispatches a second reset attempt of the same
+            token via the catch-and-report routine.
+        Then:
+            It should report RuntimeError with the single-use message,
+            and the caller's own local reset should raise the same
+            RuntimeError — the consumed state is authoritative on both
+            sides of the wire.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("acme-corp")
+                observed = await routines.reset_tenant_id_token(token)
+                assert observed == "unknown"
+                _, kind, message = await routines.reset_tenant_id_token_report(token)
+                assert kind == "RuntimeError"
+                assert "has already been used once" in message
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(token)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_caller_consumed_token_dispatched_should_report_used_gate_first(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a locally consumed token fails the used gate on the worker.
+
+        Given:
+            A caller that mints a TENANT_ID token and consumes it with a
+            successful LOCAL reset before any dispatch.
+        When:
+            The caller dispatches the catch-and-report reset routine
+            with the consumed token.
+        Then:
+            It should report RuntimeError — not ValueError — proving the
+            used gate fires before the context gate on the receiving
+            side of the wire.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("acme-corp")
+                routines.TENANT_ID.reset(token)
+                assert routines.TENANT_ID.get() == "unknown"
+                _, kind, message = await routines.reset_tenant_id_token_report(token)
+                assert kind == "RuntimeError"
+                assert kind != "ValueError"
+                assert "has already been used once" in message
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_consumed_token_relayed_between_workers_should_report_used(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test the consumption ledger reaches a worker that never saw the reset.
+
+        Given:
+            An EPHEMERAL pool with two workers and a TENANT_ID token
+            consumed by a dispatched reset that reported one worker pid.
+        When:
+            The caller dispatches the report routine repeatedly (up to
+            eight times) so at least one dispatch is likely to land on
+            the other worker process.
+        Then:
+            Every post-consumption dispatch should report RuntimeError
+            with the single-use message — the ledger rides every frame in
+            both directions, so a worker that never performed the reset
+            still refuses the token.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("acme-corp")
+                first_pid, first_kind, _ = await routines.reset_tenant_id_token_report(
+                    token
+                )
+                assert first_kind == "ok"
+                # Round-robin over the two-worker pool reaches the other
+                # worker within a few dispatches; keep dispatching until a
+                # different pid confirms the cross-worker relay was exercised.
+                observed_other_pid = False
+                for _ in range(8):
+                    pid, kind, message = await routines.reset_tenant_id_token_report(
+                        token
+                    )
+                    assert kind == "RuntimeError"
+                    assert "has already been used once" in message
+                    if pid != first_pid:
+                        observed_other_pid = True
+                        break
+                assert observed_other_pid, (
+                    "the report never landed on a second worker, so the "
+                    "cross-worker ledger relay was not exercised"
+                )
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_returned_used_token_should_carry_used_state_to_caller(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a token reset on the worker returns visibly used.
+
+        Given:
+            A caller-minted TENANT_ID token dispatched to a routine that
+            resets it and returns the token itself.
+        When:
+            The caller inspects the returned token and attempts to reset
+            both the returned copy and the original.
+        Then:
+            The returned token's repr should carry the ``used`` marker,
+            and both reset attempts should raise the single-use
+            RuntimeError — every copy anywhere reads as consumed.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("acme-corp")
+                returned = await routines.reset_and_return_tenant_id_token(token)
+                assert "used " in repr(returned)
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(returned)
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(token)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_re_set_after_remote_consumption_should_mint_fresh_token(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test the var stays fully usable after a token is consumed remotely.
+
+        Given:
+            A TENANT_ID token consumed by a dispatched reset, then a
+            fresh caller-side set minting a second token.
+        When:
+            The caller dispatches a reset of the second token and then
+            retries it locally.
+        Then:
+            The remote reset should succeed (restoring the default), the
+            local retry should raise the single-use RuntimeError —
+            consumption is per-token, not per-var — and the first token
+            should stay consumed: its remote use survives the fresh set,
+            so a local reset of it must also raise the single-use
+            RuntimeError.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token1 = routines.TENANT_ID.set("first")
+                await routines.reset_tenant_id_token(token1)
+                token2 = routines.TENANT_ID.set("fresh")
+                observed = await routines.reset_tenant_id_token(token2)
+                assert observed == "unknown"
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(token2)
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(token1)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_used_token_transport_should_be_lossless(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a consumed token still crosses the wire without raising.
+
+        Given:
+            A TENANT_ID token consumed by a dispatched reset on a
+            DEFAULT pool.
+        When:
+            The caller passes the used token to a routine that inspects
+            it without resetting and returns it.
+        Then:
+            No error should surface in transport, the returned token
+            should be a usable object naming the original variable, and
+            a caller reset of the returned copy should raise the
+            single-use RuntimeError.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("acme-corp")
+                await routines.reset_tenant_id_token(token)
+                returned, var_name = await routines.describe_tenant_id_token(token)
+                assert var_name == routines.TENANT_ID.name
+                assert returned.var.name == routines.TENANT_ID.name
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(returned)
+
+        await retry_grpc_internal(body)
+
+
+@pytest.mark.integration
+class TestTokenOwnershipTopologies:
+    @pytest.mark.asyncio
+    async def test_create_task_child_dispatch_should_report_different_context(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a token dispatched from a child task arrives orphaned.
+
+        Given:
+            A parent-minted TENANT_ID token and an asyncio child task
+            created via ``create_task`` that dispatches the
+            catch-and-report reset routine with it — the fork drops the
+            chain's live token ids.
+        When:
+            The child's dispatch reports and the parent then resets the
+            token locally.
+        Then:
+            The worker should report stdlib's different-Context
+            ValueError, and the parent's local reset should still
+            succeed afterward — the failed remote attempt did not
+            consume the token.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("parent-mint")
+
+                async def _child():
+                    return await routines.reset_tenant_id_token_report(token)
+
+                _, kind, message = await asyncio.create_task(_child())
+                assert kind == "ValueError"
+                assert "was created in a different Context" in message
+                routines.TENANT_ID.reset(token)
+                assert routines.TENANT_ID.get() == "unknown"
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_unarmed_dispatcher_sibling_token_should_report_different_context(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test an orphan token from a never-armed dispatcher stays an orphan.
+
+        Given:
+            A dispatching task that never sets any wool var and a
+            TENANT_ID token minted inside a stdlib ``copy_context``
+            sibling.
+        When:
+            The caller dispatches the describe routine and then the
+            catch-and-report reset routine with the orphan.
+        Then:
+            Transport should succeed, the reset should report stdlib's
+            different-Context ValueError, and a subsequent dispatch of
+            ``get_tenant_id`` should still observe the default — the
+            sibling's set never leaked into the dispatching context.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                sibling = contextvars.copy_context()
+                orphan = sibling.run(routines.TENANT_ID.set, "sibling-mint")
+                returned, var_name = await routines.describe_tenant_id_token(orphan)
+                assert var_name == routines.TENANT_ID.name
+                assert returned.var.name == routines.TENANT_ID.name
+                _, kind, message = await routines.reset_tenant_id_token_report(orphan)
+                assert kind == "ValueError"
+                assert "was created in a different Context" in message
+                assert await routines.get_tenant_id() == "unknown"
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_twice_travelled_orphan_should_stay_usable(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test an orphan token survives two round trips unchanged.
+
+        Given:
+            A TENANT_ID token minted in a stdlib ``copy_context``
+            sibling and already round-tripped once through the describe
+            routine.
+        When:
+            The returned token is dispatched through the describe
+            routine a second time and the caller finally resets the
+            twice-travelled copy.
+        Then:
+            Both trips should transport losslessly, and the final reset
+            should raise stdlib's different-Context ValueError — orphan
+            state is preserved, never corrupted or upgraded, across
+            repeated travel.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                ambient = routines.TENANT_ID.set("ambient")
+                try:
+                    sibling = contextvars.copy_context()
+                    orphan = sibling.run(routines.TENANT_ID.set, "sibling")
+                    first, _ = await routines.describe_tenant_id_token(orphan)
+                    second, var_name = await routines.describe_tenant_id_token(first)
+                    assert var_name == routines.TENANT_ID.name
+                    assert second.var.name == routines.TENANT_ID.name
+                    with pytest.raises(
+                        ValueError, match="was created in a different Context"
+                    ):
+                        routines.TENANT_ID.reset(second)
+                finally:
+                    routines.TENANT_ID.reset(ambient)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_worker_minted_orphan_should_refuse_caller_reset(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a worker-minted sibling token cannot be reset by the caller.
+
+        Given:
+            A routine that mints a TENANT_ID token inside a stdlib
+            ``copy_context`` sibling on the worker and returns it.
+        When:
+            The caller attempts to reset the returned token.
+        Then:
+            It should raise stdlib's different-Context ValueError, and
+            the caller's own TENANT_ID should be unchanged — the
+            sibling-scoped set never back-propagated.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                before = routines.TENANT_ID.get()
+                orphan = await routines.mint_orphan_tenant_id_token()
+                with pytest.raises(
+                    ValueError, match="was created in a different Context"
+                ):
+                    routines.TENANT_ID.reset(orphan)
+                assert routines.TENANT_ID.get() == before
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_gather_sibling_dispatches_should_orphan_token_for_both(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test gathered sibling dispatches both see the token as orphaned.
+
+        Given:
+            An EPHEMERAL pool, a caller-minted TENANT_ID token, and two
+            reset-report dispatches gathered concurrently — each gather
+            member runs in a forked child task whose chain drops live
+            token ids.
+        When:
+            Both siblings report, then the minting task itself awaits a
+            direct reset dispatch and finally retries locally.
+        Then:
+            Both siblings should report the different-Context
+            ValueError without consuming the token, the direct awaited
+            dispatch should succeed (continuation of the minting
+            context), and the final local reset should raise the
+            single-use RuntimeError.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("gather-mint")
+                reports = await asyncio.gather(
+                    routines.reset_tenant_id_token_report(token),
+                    routines.reset_tenant_id_token_report(token),
+                )
+                for _, kind, message in reports:
+                    assert kind == "ValueError"
+                    assert "was created in a different Context" in message
+                observed = await routines.reset_tenant_id_token(token)
+                assert observed == "unknown"
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(token)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_worker_mint_with_armed_caller_should_restore_pre_call_value(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test resetting a worker-minted token restores the caller's own value.
+
+        Given:
+            A caller that armed TENANT_ID with its own value before
+            dispatching a routine that sets the var on the worker and
+            returns the minted token.
+        When:
+            The caller resets the returned token.
+        Then:
+            The var should restore to the caller's pre-call value — not
+            the constructor default — because the worker's token
+            captured the propagated caller binding as its old value.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                pre_token = routines.TENANT_ID.set("caller-pre")
+                try:
+                    returned = await routines.set_tenant_id_and_return_token(
+                        "worker-set"
+                    )
+                    assert routines.TENANT_ID.get() == "worker-set"
+                    routines.TENANT_ID.reset(returned)
+                    assert routines.TENANT_ID.get() == "caller-pre"
+                finally:
+                    routines.TENANT_ID.reset(pre_token)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_worker_minted_token_reset_from_child_task_should_raise(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a child task cannot reset a token owned by the parent's context.
+
+        Given:
+            A token minted on the worker and returned to the awaiting
+            caller (whose context continues the minting context), and an
+            asyncio child task created via ``create_task``.
+        When:
+            The child performs a LOCAL reset of the token, then the
+            parent resets it after the child completes.
+        Then:
+            The child's reset should raise stdlib's different-Context
+            ValueError (the fork drops live ids), and the parent's reset
+            should succeed, restoring the default.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                returned = await routines.set_tenant_id_and_return_token("worker-set")
+                assert routines.TENANT_ID.get() == "worker-set"
+
+                async def _child():
+                    with pytest.raises(
+                        ValueError, match="was created in a different Context"
+                    ):
+                        routines.TENANT_ID.reset(returned)
+                    return True
+
+                assert await asyncio.create_task(_child())
+                routines.TENANT_ID.reset(returned)
+                assert routines.TENANT_ID.get() == "unknown"
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_sequential_worker_mints_should_reset_independent_old_values(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test two worker-minted tokens restore their own captured old values.
+
+        Given:
+            Two sequential dispatches that each set TENANT_ID on the
+            worker ("first" then "second") and return their minted
+            tokens, plus an inline stdlib contextvars baseline computing
+            the same set/set/reset/reset sequence.
+        When:
+            The caller resets the first token, reads the var, resets the
+            second token, and reads again.
+        Then:
+            Each token should restore its own captured old value —
+            resetting token1 restores the pre-call state, resetting
+            token2 restores "first" — matching the stdlib baseline
+            exactly, with the final read equal to "first".
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            # Inline stdlib baseline for the same FIFO reset order.
+            baseline_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+                "fifo_baseline", default="unknown"
+            )
+            baseline_token1 = baseline_var.set("first")
+            baseline_token2 = baseline_var.set("second")
+            baseline_var.reset(baseline_token1)
+            baseline_after_first = baseline_var.get()
+            baseline_var.reset(baseline_token2)
+            baseline_final = baseline_var.get()
+
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token1 = await routines.set_tenant_id_and_return_token("first")
+                token2 = await routines.set_tenant_id_and_return_token("second")
+                assert routines.TENANT_ID.get() == "second"
+                routines.TENANT_ID.reset(token1)
+                after_first = routines.TENANT_ID.get()
+                routines.TENANT_ID.reset(token2)
+                final = routines.TENANT_ID.get()
+
+            assert after_first == baseline_after_first == "unknown"
+            assert final == baseline_final == "first"
+
+        await retry_grpc_internal(body)
+
+
+@pytest.mark.integration
+class TestTokenNestedDispatch:
+    @pytest.mark.asyncio
+    async def test_relay_reset_should_restore_and_consume_for_caller(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a token consumed two hops away restores and consumes for the caller.
+
+        Given:
+            An EPHEMERAL pool with two workers and a caller-minted
+            TENANT_ID token dispatched through a relay routine that
+            nested-dispatches the actual reset.
+        When:
+            The relay returns and the caller reads its own var and then
+            retries the reset locally.
+        Then:
+            The relay should return the restored default, the caller
+            should observe the restored value, and the local retry
+            should raise the single-use RuntimeError — the consumed
+            state crossed both hops back.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(pool_mode=PoolMode.EPHEMERAL)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("relay-mint")
+                observed = await routines.relay_reset_tenant_id_token(token)
+                assert observed == "unknown"
+                assert routines.TENANT_ID.get() == "unknown"
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(token)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_nested_reset_then_outer_retry_should_report_used_token(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test the ledger rides the inner response frame back to the outer worker.
+
+        Given:
+            A caller-minted TENANT_ID token dispatched to a routine that
+            consumes it via a nested dispatch and then retries the reset
+            locally on the outer worker.
+        When:
+            The routine returns its report and the caller retries the
+            reset locally.
+        Then:
+            The inner reset should have restored the default, the outer
+            retry should report the single-use RuntimeError (the ledger
+            rode the inner response frame back one hop), and the
+            caller's own retry should raise the same RuntimeError.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("nested-mint")
+                inner, kind, message = await routines.nested_reset_then_report(token)
+                assert inner == "unknown"
+                assert kind == "RuntimeError"
+                assert "already been used once" in message
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(token)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_outer_mint_inner_reset_should_consume_for_the_outer_worker(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a worker-minted token consumed downstream reads used upstream.
+
+        Given:
+            A routine that mints a TENANT_ID token on the outer worker,
+            has an awaited nested dispatch consume it, and then retries
+            the reset locally.
+        When:
+            The caller dispatches the routine and reads its own var
+            afterward.
+        Then:
+            The inner dispatch should observe the restored default, the
+            outer retry should report the single-use RuntimeError, and
+            the caller's TENANT_ID should be unchanged — the mint and
+            reset cancelled out before back-propagation.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario()
+            async with build_pool_from_scenario(scenario, credentials_map):
+                before = routines.TENANT_ID.get()
+                inner, kind, message = await routines.outer_mint_inner_reset()
+                assert inner == "unknown"
+                assert kind == "RuntimeError"
+                assert "already been used once" in message
+                assert routines.TENANT_ID.get() == before
+
+        await retry_grpc_internal(body)
+
+
+@pytest.mark.integration
+class TestTokenStreaming:
+    @pytest.mark.asyncio
+    async def test_stream_reset_should_consume_the_token_mid_stream(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a mid-stream reset consumes the caller's token before exhaustion.
+
+        Given:
+            A caller-minted TENANT_ID token passed to an async-generator
+            routine that yields the current value, resets the token, and
+            yields the restored value.
+        When:
+            The caller drives the first two yields and attempts a local
+            reset before exhausting the generator.
+        Then:
+            The first yield should observe the caller's value, the
+            second the restored default, and the local reset should
+            already raise the single-use RuntimeError — the ledger rode
+            the step frame back mid-stream.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ANEXT)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("caller-set")
+                gen = routines.stream_reset_tenant_id_token(token)
+                try:
+                    first = await gen.__anext__()
+                    assert first == "caller-set"
+                    second = await gen.__anext__()
+                    assert second == "unknown"
+                    with pytest.raises(RuntimeError, match="already been used once"):
+                        routines.TENANT_ID.reset(token)
+                    with pytest.raises(StopAsyncIteration):
+                        await gen.__anext__()
+                finally:
+                    await gen.aclose()
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_token_yielded_mid_stream_should_survive_remounts_once(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a worker-minted token yielded early stays resettable exactly once.
+
+        Given:
+            An async-generator routine that sets TENANT_ID, yields the
+            minted token on its first yield, and yields the current
+            value three more times across suspensions.
+        When:
+            The caller collects the token, exhausts the stream, resets
+            the token, and retries the reset.
+        Then:
+            After exhaustion the caller should observe the worker-set
+            value, the first reset should succeed restoring the default,
+            and the retry should raise the single-use RuntimeError — the
+            token's anchor survived every per-yield re-mount exactly
+            once.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ANEXT)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                gen = routines.set_tenant_id_and_yield_token("stream-set", 3)
+                try:
+                    token = await gen.__anext__()
+                    async for _ in gen:
+                        pass
+                finally:
+                    await gen.aclose()
+                assert routines.TENANT_ID.get() == "stream-set"
+                routines.TENANT_ID.reset(token)
+                assert routines.TENANT_ID.get() == "unknown"
+                with pytest.raises(RuntimeError, match="already been used once"):
+                    routines.TENANT_ID.reset(token)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_stream_double_reset_should_raise_on_the_second_step(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a second reset of the same token inside a stream raises mid-stream.
+
+        Given:
+            A caller-minted TENANT_ID token passed to an async-generator
+            routine that resets it before each of two yields.
+        When:
+            The caller drives the first yield and then requests the
+            second.
+        Then:
+            The first yield should arrive with the caller observing the
+            restored default, and the second ``__anext__`` should raise
+            the single-use RuntimeError surfaced from the worker's
+            in-stream violation.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ANEXT)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                token = routines.TENANT_ID.set("twice-mint")
+                gen = routines.stream_reset_token_twice(token)
+                try:
+                    first = await gen.__anext__()
+                    assert first == "first"
+                    assert routines.TENANT_ID.get() == "unknown"
+                    with pytest.raises(RuntimeError, match="already been used once"):
+                        await gen.__anext__()
+                finally:
+                    await gen.aclose()
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_token_sent_via_asend_should_reset_on_the_worker(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a token shipped on an asend frame resets and consumes correctly.
+
+        Given:
+            An async-generator routine that yields ``"ready"``, receives
+            a token via ``asend``, resets it, and yields the restored
+            value — with the caller minting the token only after the
+            stream is already open.
+        When:
+            The caller sends the token mid-stream and reads its own var
+            after the echo.
+        Then:
+            The echoed value should be the restored default, the caller
+            should observe the restored value, and a local reset should
+            raise the single-use RuntimeError — the asend frame carried
+            the live token out and the ledger rode the step frame back.
+        """
+
+        # Arrange, act, & assert
+        async def body():
+            scenario = default_scenario(shape=RoutineShape.ASYNC_GEN_ASEND)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                gen = routines.stream_recv_and_reset()
+                try:
+                    ready = await gen.__anext__()
+                    assert ready == "ready"
+                    token = routines.TENANT_ID.set("mid")
+                    echoed = await gen.asend(token)
+                    assert echoed == "unknown"
+                    assert routines.TENANT_ID.get() == "unknown"
+                    with pytest.raises(RuntimeError, match="already been used once"):
+                        routines.TENANT_ID.reset(token)
+                finally:
+                    await gen.aclose()
 
         await retry_grpc_internal(body)
