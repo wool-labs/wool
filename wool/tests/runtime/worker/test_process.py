@@ -1746,7 +1746,8 @@ class TestWorkerProcess:
             ("grpc.keepalive_timeout_ms", 30000),
             ("grpc.keepalive_permit_without_calls", 1),
             ("grpc.http2.max_pings_without_data", 2),
-            ("grpc.max_concurrent_streams", 100),
+            # Server ceiling is 2x the client gate (100) — see issue #290.
+            ("grpc.max_concurrent_streams", 200),
             ("grpc.default_compression_algorithm", 0),
             ("grpc.http2.min_recv_ping_interval_without_data_ms", 30000),
             ("grpc.http2.max_ping_strikes", 2),
@@ -1806,12 +1807,63 @@ class TestWorkerProcess:
             ("grpc.keepalive_timeout_ms", 30000),
             ("grpc.keepalive_permit_without_calls", 1),
             ("grpc.http2.max_pings_without_data", 2),
-            ("grpc.max_concurrent_streams", 100),
+            # Server ceiling is 2x the client gate (100) — see issue #290.
+            ("grpc.max_concurrent_streams", 200),
             ("grpc.default_compression_algorithm", 0),
             ("grpc.http2.min_recv_ping_interval_without_data_ms", 30000),
             ("grpc.http2.max_ping_strikes", 2),
         ]
         assert call_kwargs["options"] == expected
+
+    def test_run_should_advertise_gate_while_doubling_server_ceiling(self, mocker):
+        """Test the advertised gate stays 1x while the server ceiling doubles.
+
+        Given:
+            A WorkerProcess whose channel options set a custom
+            max_concurrent_streams gate of 40
+        When:
+            run() builds the gRPC server and sends its metadata
+        Then:
+            The server should receive grpc.max_concurrent_streams of 80 (2x the
+            gate) while the advertised metadata still carries the gate of 40
+            (1x), pinning the gate/ceiling decoupling (issue #290)
+        """
+        # Arrange
+        opts = WorkerOptions(channel=ChannelOptions(max_concurrent_streams=40))
+        process = WorkerProcess(options=opts)
+
+        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
+        mocker.patch("wool.runtime.worker.process.ResourcePool")
+
+        mock_server = mocker.MagicMock()
+        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
+        mock_server.start = mocker.AsyncMock()
+        mock_server.stop = mocker.AsyncMock()
+        mock_grpc_server = mocker.patch.object(
+            grpc.aio, "server", return_value=mock_server
+        )
+
+        mock_service = mocker.MagicMock()
+        mock_service.stopped.wait = mocker.AsyncMock()
+        mocker.patch(
+            "wool.runtime.worker.process.WorkerService",
+            return_value=mock_service,
+        )
+        mocker.patch("wool.runtime.worker.process._signal_handlers")
+        mock_send = mocker.patch.object(process._set_metadata, "send")
+        mocker.patch.object(process._set_metadata, "close")
+
+        # Act
+        process.run()
+
+        # Assert
+        server_options = dict(mock_grpc_server.call_args.kwargs["options"])
+        assert server_options["grpc.max_concurrent_streams"] == 80
+        sent = mock_send.call_args[0][0]
+        advertised = WorkerMetadata.from_protobuf(
+            protocol.WorkerMetadata.FromString(sent)
+        )
+        assert advertised.options.max_concurrent_streams == 40
 
     def test_run_with_all_keepalive_options(self, mocker):
         """Test run passes all keepalive options to gRPC server.

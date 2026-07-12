@@ -46,9 +46,13 @@ logger = logging.getLogger(__name__)
 
 _HAS_UDS: Final[bool] = hasattr(socket, "AF_UNIX")
 
+#: Seconds to wait for a terminated worker process to exit
+#: before escalating to SIGKILL in `WorkerProcess.reap`.
 _REAP_GRACE: Final[float] = 5.0
-"""Seconds to wait for a terminated worker process to exit before
-escalating to SIGKILL in `WorkerProcess.reap`."""
+
+# Factor by which the server's HTTP/2 ``MAX_CONCURRENT_STREAMS``
+# ceiling exceeds the advertised client concurrency gate.
+_SERVER_STREAM_CEILING_MULTIPLIER: Final[int] = 2
 
 
 class WorkerProcess(Process):
@@ -304,7 +308,10 @@ class WorkerProcess(Process):
                     int(channel.keepalive_permit_without_calls),
                 ),
                 ("grpc.http2.max_pings_without_data", channel.max_pings_without_data),
-                ("grpc.max_concurrent_streams", channel.max_concurrent_streams),
+                (
+                    "grpc.max_concurrent_streams",
+                    channel.max_concurrent_streams * _SERVER_STREAM_CEILING_MULTIPLIER,
+                ),
                 (
                     "grpc.default_compression_algorithm",
                     channel.compression.value,

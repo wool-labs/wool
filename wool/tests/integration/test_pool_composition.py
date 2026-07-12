@@ -1,5 +1,6 @@
 """Tests for pool composition via build_pool_from_scenario."""
 
+import asyncio
 import uuid
 from functools import partial
 
@@ -9,6 +10,8 @@ import wool
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
 
@@ -711,3 +714,55 @@ class TestBackpressureRejection:
                 await rejecting_worker.stop()
 
         await retry_grpc_internal(body)
+
+
+# Saturating fan-out regression parameters (issue #290). The client gate is
+# small so the test is fast; each burst dispatches well over the gate to force
+# the semaphore permit-turnover overshoot that, before the fix, drove the
+# server's stream ceiling past its limit and faulted the connection with
+# INTERNAL / ExecuteBatchError. Empirically the fault fired within a couple of
+# bursts when the ceiling equalled the gate; these values reproduce it while
+# keeping the run well under a second on the fixed build.
+_FANOUT_GATE = 32
+_FANOUT_SIZE = 128
+_FANOUT_BURSTS = 10
+
+
+@pytest.mark.integration
+class TestSaturatingFanout:
+    @pytest.mark.asyncio
+    async def test_dispatch_should_complete_saturating_fanout_without_spurious_eviction(
+        self,
+    ):
+        """Test sustained saturating fan-out to a one-worker pool.
+
+        Given:
+            A one-worker pool whose worker advertises a small
+            max_concurrent_streams gate, driven by repeated bursts of
+            concurrent dispatches that far exceed the gate.
+        When:
+            Every burst is awaited to completion in turn.
+        Then:
+            It should complete every dispatch without raising
+            NoWorkersAvailable, leaving the healthy worker in the pool —
+            the transient stream-starvation fault neither surfaces nor
+            evicts the live worker.
+        """
+        # Arrange
+        worker = partial(
+            LocalWorker,
+            options=WorkerOptions(
+                channel=ChannelOptions(max_concurrent_streams=_FANOUT_GATE)
+            ),
+        )
+
+        # Act & assert
+        async with WorkerPool(spawn=1, worker=worker):
+            for _ in range(_FANOUT_BURSTS):
+                results = await asyncio.gather(
+                    *(routines.add(1, 2) for _ in range(_FANOUT_SIZE))
+                )
+                assert results == [3] * _FANOUT_SIZE
+            # The worker must still serve after the sustained fan-out —
+            # a spurious eviction would raise NoWorkersAvailable here.
+            assert await routines.add(1, 2) == 3
