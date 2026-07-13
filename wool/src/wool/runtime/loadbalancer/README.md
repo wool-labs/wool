@@ -60,7 +60,7 @@ class StickyTagBalancer:
         *,
         context: wool.LoadBalancerContextView,
     ):
-        workers = list(context.workers.items())
+        workers = list(context.workers.values())
         if not workers:
             return
 
@@ -108,7 +108,7 @@ class LeastLoadedBalancer:
     ):
         # Rank workers by current in-flight count (ascending).
         ranked = sorted(
-            context.workers.items(),
+            context.workers.values(),
             key=lambda item: self._in_flight.get(item[0].uid, 0),
         )
 

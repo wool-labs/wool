@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import Final
@@ -28,15 +29,19 @@ class RoundRobinLoadBalancer:
 
     .. rubric:: Implementation notes
 
-    The cycle boundary is identified by the UID of the first yielded
-    candidate. If that first candidate is evicted mid-cycle its UID can
-    never recur, so the boundary is reseeded from the next surviving
-    candidate.
+    The rotation snapshots the pool's uids once per wrap and indexes
+    them in O(1); each candidate's record and connection are read from
+    the live pool at yield time, so a worker refreshed mid-cycle is
+    offered under its current entry rather than a stale one. The cycle
+    boundary is the uid of the first yielded candidate and survives
+    such refreshes — the cycle terminates when that uid recurs. Only
+    when the boundary uid leaves the pool is the boundary reseeded from
+    the next surviving candidate, since a uid that has left can never
+    recur and would otherwise never close the cycle.
 
     Per-context rotation state lives in a `WeakKeyDictionary` keyed on
-    the context, so a retired pool's cursor — and the connections it
-    references — are reclaimed with the context instead of pinned for
-    the balancer's lifetime.
+    the context, so a retired pool's cursor is reclaimed with the
+    context instead of pinned for the balancer's lifetime.
     """
 
     _index: Final[WeakKeyDictionary[LoadBalancerContextView, int]]
@@ -71,11 +76,14 @@ class RoundRobinLoadBalancer:
             ``(metadata, connection)`` pairs. The generator is driven
             by the proxy via ``anext``/``athrow``/``asend``.
         """
-        checkpoint: WorkerMetadata | None = None
-        snapshot: list[tuple[WorkerMetadata, WorkerConnection]] = []
+        checkpoint: uuid.UUID | None = None
+        snapshot: list[uuid.UUID] = []
         cursor = 0
+        # Hoisted: ``workers`` is a live view (see
+        # LoadBalancerContextView), so re-reading it per candidate would
+        # buy nothing.
+        workers = context.workers
         while True:
-            workers = context.workers
             if not workers:
                 return
             # Select the candidate and advance the shared per-context index
@@ -89,22 +97,24 @@ class RoundRobinLoadBalancer:
                 # Re-observe membership once per wrap and index the ordered
                 # workers in O(1). Rebuilding the snapshot is the only O(n)
                 # step and amortizes to O(1) per candidate over a cycle.
-                snapshot = list(workers.items())
+                snapshot = list(workers)
                 cursor = index % len(snapshot)
-            metadata, connection = snapshot[cursor]
+            uid = snapshot[cursor]
             cursor += 1
             self._index[context] = index + 1
 
             if checkpoint is not None and checkpoint not in workers:
-                # The cycle boundary was evicted; its UID can never recur,
-                # so drop it and let the next survivor reseed the boundary.
+                # See the rubric: a boundary uid that has left the pool
+                # can never recur, so reseed from the next survivor.
                 checkpoint = None
-            if metadata not in workers:
+            current = workers.get(uid)
+            if current is None:
                 # Evicted since the snapshot was taken — skip it.
                 continue
+            metadata, connection = current
             if checkpoint is None:
-                checkpoint = metadata
-            elif metadata.uid == checkpoint.uid:
+                checkpoint = uid
+            elif uid == checkpoint:
                 # One full cycle completed without a successful
                 # dispatch — signal exhaustion.
                 return

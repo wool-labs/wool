@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import uuid
 import warnings
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -40,6 +41,14 @@ class LoadBalancerContextView(Protocol):
     mutation are the `WorkerProxy`'s responsibility; load balancers
     observe the pool but cannot mutate it.
 
+    A worker is identified by its `WorkerMetadata.uid`, which is
+    stable for the life of the worker process while the rest of its
+    record (e.g., address, tags, transport options) is not: discovery
+    republishes a changed record under the same uid, and the pool
+    refreshes the entry in place. A uid observed at any time therefore
+    still names the same worker, and always resolves to that worker's
+    latest record.
+
     By convention across this package, a ``*View`` suffix marks a
     read-only protocol view of an otherwise mutable object.
     """
@@ -47,11 +56,13 @@ class LoadBalancerContextView(Protocol):
     @property
     def workers(
         self,
-    ) -> MappingProxyType[WorkerMetadata, WorkerConnection]:
+    ) -> MappingProxyType[uuid.UUID, tuple[WorkerMetadata, WorkerConnection]]:
         """Read-only view of workers in this context.
 
         :returns:
-            Immutable mapping of worker metadata to connections.
+            A live view of pool membership. The proxy's mutations are
+            visible through it without re-reading the property, and the
+            entry under a uid is always that worker's latest record.
         """
         ...
 
@@ -70,7 +81,19 @@ class LoadBalancerContextLike(LoadBalancerContextView, Protocol):
 
     This is the mutable superset of `LoadBalancerContextView` used by
     the legacy `DispatchingLoadBalancerLike` protocol and by the
-    `WorkerProxy` itself for its internal pool bookkeeping.
+    `WorkerProxy` itself for its internal pool bookkeeping. Worker
+    identity — and with it the semantics every mutator below follows —
+    is defined on `LoadBalancerContextView`.
+
+    Every mutator addresses a worker by ``metadata.uid``, so a record
+    whose other fields have changed still names the worker it was read
+    from. Writes are last-writer-wins: the stored entry is replaced
+    with the given record wholesale, so a caller writing a record it
+    captured earlier regresses a fresher one for the same uid.
+    A displaced `WorkerConnection` is *not* closed — see
+    `wool.runtime.worker.connection.WorkerConnection` for why channel
+    lifetime belongs to the pooling layer rather than to the holder of
+    a connection handle.
     """
 
     def add_worker(
@@ -78,12 +101,12 @@ class LoadBalancerContextLike(LoadBalancerContextView, Protocol):
         metadata: WorkerMetadata,
         connection: WorkerConnection,
     ) -> None:
-        """Add a worker to this context.
+        """Admit a worker to this context, replacing any entry it has.
 
         :param metadata:
-            Information about the worker to add.
+            Information about the worker to admit.
         :param connection:
-            The :py:class:`WorkerConnection` for this worker.
+            The `WorkerConnection` for this worker.
         """
         ...
 
@@ -91,26 +114,26 @@ class LoadBalancerContextLike(LoadBalancerContextView, Protocol):
         self,
         metadata: WorkerMetadata,
         connection: WorkerConnection,
-        *,
-        upsert: bool = False,
     ) -> None:
-        """Update an existing worker's connection.
+        """Refresh an admitted worker's metadata record and connection.
+
+        Does nothing when the worker is not in the context; use
+        `add_worker` to admit one.
 
         :param metadata:
-            Information about the worker to update.
+            Information about the worker to refresh.
         :param connection:
-            New :py:class:`WorkerConnection` for this worker.
-        :param upsert:
-            Flag indicating whether or not to add the worker if
-            it's not already in the context.
+            New `WorkerConnection` for this worker.
         """
         ...
 
     def remove_worker(self, metadata: WorkerMetadata) -> None:
-        """Remove a worker from this context.
+        """Evict a worker from this context.
+
+        Does nothing when the worker is not in the context.
 
         :param metadata:
-            Information about the worker to remove.
+            Information about the worker to evict.
         """
         ...
 
@@ -251,6 +274,13 @@ class LoadBalancerLike(Protocol):
     When the generator ends (via ``return`` or `StopAsyncIteration`
     in response to an ``athrow`` or the initial ``anext``), the proxy
     raises `NoWorkersAvailable`.
+
+    .. rubric:: Implementation notes
+
+    The staleness guarantee is structural rather than enforced: a
+    candidate names a worker, and the proxy resolves that name against
+    the pool it owns at the moment it dispatches, so the record a
+    balancer read is never the record dispatched through.
     """
 
     def delegate(
@@ -274,14 +304,15 @@ class LoadBalancerLike(Protocol):
             its routing decisions on it (for example, hashing
             ``task.tag`` to a worker) or ignore it entirely.
         :param context:
-            Read-only view of the worker pool. Only its ``workers``
-            mapping is exposed; eviction and pool mutation are the
-            proxy's responsibility.
+            Read-only view of the worker pool; see
+            `LoadBalancerContextView` for the surface it exposes.
+            Eviction and pool mutation are the proxy's responsibility.
         :yields:
             ``(metadata, connection)`` candidates in the balancer's
             preferred order. See the class docstring for the
             ``anext``/``athrow``/``asend`` protocol that drives this
             generator.
+
         """
         ...
 
@@ -291,23 +322,21 @@ class LoadBalancerContext:
 
     Manages workers and their connections for a specific worker pool,
     enabling load balancer instances to service multiple pools with
-    independent state and worker lists.
+    independent state and worker lists. The pool's identity model and
+    mutation semantics are the ones `LoadBalancerContextView` and
+    `LoadBalancerContextLike` define.
     """
 
-    _workers: Final[dict[WorkerMetadata, WorkerConnection]]
+    _workers: Final[dict[uuid.UUID, tuple[WorkerMetadata, WorkerConnection]]]
 
     def __init__(self):
         self._workers = {}
 
     @property
-    def workers(self) -> MappingProxyType[WorkerMetadata, WorkerConnection]:
-        """Read-only view of workers in this context.
-
-        :returns:
-            Immutable mapping of worker metadata to connections.
-            Changes to the underlying context are reflected in
-            the returned proxy.
-        """
+    def workers(
+        self,
+    ) -> MappingProxyType[uuid.UUID, tuple[WorkerMetadata, WorkerConnection]]:
+        """Read-only view of workers in this context."""
         return MappingProxyType(self._workers)
 
     def add_worker(
@@ -315,42 +344,18 @@ class LoadBalancerContext:
         metadata: WorkerMetadata,
         connection: WorkerConnection,
     ):
-        """Add a worker to this context.
-
-        :param metadata:
-            Information about the worker to add.
-        :param connection:
-            The :py:class:`WorkerConnection` for this worker.
-        """
-        self._workers[metadata] = connection
+        """Admit a worker to this context, replacing any entry it has."""
+        self._workers[metadata.uid] = (metadata, connection)
 
     def update_worker(
         self,
         metadata: WorkerMetadata,
         connection: WorkerConnection,
-        *,
-        upsert: bool = False,
     ):
-        """Update an existing worker's connection.
-
-        :param metadata:
-            Information about the worker to update. If the worker is not
-            present in the context, this method does nothing.
-        :param connection:
-            New :py:class:`WorkerConnection` for this worker.
-        :param upsert:
-            Flag indicating whether or not to add the worker if it's not
-            already in the context.
-        """
-        if upsert or metadata in self._workers:
-            self._workers[metadata] = connection
+        """Refresh an admitted worker's metadata record and connection."""
+        if metadata.uid in self._workers:
+            self._workers[metadata.uid] = (metadata, connection)
 
     def remove_worker(self, metadata: WorkerMetadata):
-        """Remove a worker from this context.
-
-        :param metadata:
-            Information about the worker to remove. If the worker is not
-            present in the context, this method does nothing.
-        """
-        if metadata in self._workers:
-            del self._workers[metadata]
+        """Evict a worker from this context."""
+        self._workers.pop(metadata.uid, None)

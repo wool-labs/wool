@@ -210,8 +210,8 @@ class WorkerProxy:
     """Client-side proxy for dispatching tasks to distributed workers.
 
     Manages worker discovery, connection pooling, and load-balanced task
-    routing. The bridge between :func:`@wool.routine <wool.routine>` decorated
-    functions and the worker pool.
+    routing. The bridge between `wool.routine`-decorated functions and
+    the worker pool.
 
     Connects to workers through discovery services, pool URIs, or static
     worker lists. Handles connection lifecycle and fault tolerance
@@ -252,7 +252,7 @@ class WorkerProxy:
         class StickyBalancer:
             async def delegate(self, task, *, context):
                 # Yield a preferred worker first, then fall back.
-                for metadata, connection in context.workers.items():
+                for metadata, connection in context.workers.values():
                     try:
                         sent = yield metadata, connection
                     except Exception:
@@ -294,7 +294,10 @@ class WorkerProxy:
         Optional channel credentials for TLS/mTLS connections to workers.
     :param lease:
         Maximum number of workers this proxy will admit from discovery.
-        Defaults to ``None`` (unbounded).
+        Defaults to ``None`` (unbounded).  The cap counts distinct
+        worker uids, so a worker re-announcing itself refreshes its
+        entry without consuming a slot; only a worker the proxy has
+        not admitted can be turned away.
     :param quorum:
         Minimum number of workers that must be discovered before the proxy
         considers itself ready. Defaults to ``1`` — block until at least
@@ -306,11 +309,11 @@ class WorkerProxy:
         first dispatch; with ``lazy=False`` it blocks at context entry.
     :param quorum_timeout:
         Seconds to wait for ``quorum`` workers to be discovered before
-        raising :class:`asyncio.TimeoutError`. Only meaningful when
+        raising `asyncio.TimeoutError`. Only meaningful when
         ``quorum`` is a positive integer; supplying it with
         ``quorum=None`` or ``quorum=0`` records the value but never
         consults it, accompanied by an
-        :class:`IneffectiveQuorumTimeoutWarning`. Defaults to ``60``;
+        `IneffectiveQuorumTimeoutWarning`. Defaults to ``60``;
         pass ``None`` to wait indefinitely.
 
     :raises ValueError:
@@ -321,7 +324,7 @@ class WorkerProxy:
         positive ``quorum``.
     :raises asyncio.TimeoutError:
         Raised at context entry (``lazy=False``) or first
-        :meth:`dispatch` (``lazy=True``) if ``quorum`` workers are not
+        `dispatch` (``lazy=True``) if ``quorum`` workers are not
         admitted within ``quorum_timeout`` seconds.
 
     .. caution::
@@ -329,7 +332,7 @@ class WorkerProxy:
        Pre-called context manager instances passed as ``loadbalancer``
        or ``discovery`` are not picklable and will cause nested routine
        dispatch to fail.  Pass a callable returning the context manager
-       instead.  See :data:`Factory`.
+       instead.  See `Factory`.
     """
 
     _discovery: DiscoverySubscriberLike | Factory[DiscoverySubscriberLike]
@@ -668,9 +671,16 @@ class WorkerProxy:
 
     @property
     def workers(self) -> list[WorkerMetadata]:
-        """A list of the currently discovered worker gRPC stubs."""
+        """Return the current metadata record of every discovered worker.
+
+        A worker's record is replaced in place when discovery
+        republishes it, so correlate entries across calls by
+        `WorkerMetadata.uid` rather than by holding a record.
+        """
         if self._loadbalancer_context:
-            return list(self._loadbalancer_context.workers.keys())
+            return [
+                metadata for metadata, _ in self._loadbalancer_context.workers.values()
+            ]
         else:
             return []
 
@@ -1103,27 +1113,41 @@ class WorkerProxy:
             if self._credentials is not None
             else None
         )
+
+        def connect(metadata: WorkerMetadata) -> WorkerConnection:
+            return WorkerConnection(
+                metadata.address,
+                credentials=client_credentials,
+                options=metadata.options,
+            )
+
         async for event in self._discovery_stream:
             match event.type:
-                case "worker-added" | "worker-updated":
+                case "worker-added":
                     if (
-                        event.type == "worker-added"
-                        and self._lease is not None
+                        self._lease is not None
+                        and event.metadata.uid not in self._loadbalancer_context.workers
                         and len(self._loadbalancer_context.workers) >= self._lease
                     ):
+                        # Admission is per uid — see the ``lease``
+                        # parameter on this class.
                         continue
-                    connection = WorkerConnection(
-                        event.metadata.address,
-                        credentials=client_credentials,
-                        options=event.metadata.options,
+                    # Displaced connections are not closed — see
+                    # LoadBalancerContextLike.
+                    self._loadbalancer_context.add_worker(
+                        event.metadata, connect(event.metadata)
                     )
-                    if event.type == "worker-added":
-                        self._loadbalancer_context.add_worker(event.metadata, connection)
-                        self._workers_changed.set()
-                    elif event.metadata in self._loadbalancer_context.workers:
-                        self._loadbalancer_context.update_worker(
-                            event.metadata, connection
-                        )
+                    self._workers_changed.set()
+                case "worker-updated":
+                    if event.metadata.uid not in self._loadbalancer_context.workers:
+                        # A refresh never admits a worker; skip before
+                        # minting a connection this event cannot use.
+                        continue
+                    # Displaced connections are not closed — see
+                    # LoadBalancerContextLike.
+                    self._loadbalancer_context.update_worker(
+                        event.metadata, connect(event.metadata)
+                    )
                 case "worker-dropped":
                     self._loadbalancer_context.remove_worker(event.metadata)
                     self._workers_changed.set()

@@ -5,6 +5,7 @@ import weakref
 from uuid import uuid4
 
 import pytest
+from hypothesis import HealthCheck
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
@@ -44,18 +45,18 @@ def _make_context(worker_count: int) -> tuple[LoadBalancerContext, list[WorkerMe
     return ctx, ordered
 
 
-class _ItemsCountingContext:
-    """LoadBalancerContextView that counts workers.items() materializations.
+class _SnapshotCountingContext:
+    """LoadBalancerContextView that counts snapshot materializations.
 
-    Wraps a real `LoadBalancerContext` and records how many times
-    the ordered worker mapping is materialized via ``items()``, so a test
-    can prove the balancer snapshots once per wrap rather than rescanning
-    the mapping per candidate.
+    Wraps a real `LoadBalancerContext` and records how many times the
+    worker mapping is materialized by iteration, so a test can prove
+    the balancer snapshots once per wrap rather than rescanning the
+    mapping per candidate.
     """
 
     def __init__(self, context: LoadBalancerContext):
         self._context = context
-        self.items_calls = 0
+        self.snapshot_calls = 0
 
     @property
     def workers(self):
@@ -69,9 +70,12 @@ class _ItemsCountingContext:
             def __contains__(self, key):
                 return key in real
 
-            def items(self):
-                outer.items_calls += 1
-                return real.items()
+            def __iter__(self):
+                outer.snapshot_calls += 1
+                return iter(real)
+
+            def get(self, key):
+                return real.get(key)
 
         return _CountingMapping()
 
@@ -167,7 +171,7 @@ class TestRoundRobinLoadBalancer:
 
         # Assert
         assert metadata == worker
-        assert connection is ctx.workers[worker]
+        assert connection is ctx.workers[worker.uid][1]
         await generator.aclose()
 
     @pytest.mark.asyncio
@@ -287,7 +291,7 @@ class TestRoundRobinLoadBalancer:
         assert first_metadata == workers[0]
         assert second_metadata != first_metadata
         assert second_metadata in workers
-        assert first_metadata not in ctx.workers
+        assert first_metadata.uid not in ctx.workers
         await generator.aclose()
 
     @pytest.mark.asyncio
@@ -459,7 +463,7 @@ class TestRoundRobinLoadBalancer:
 
         # Assert
         assert terminated, "delegate did not terminate after checkpoint eviction"
-        assert first not in ctx.workers
+        assert first.uid not in ctx.workers
         assert first not in yielded[1:]
 
     @pytest.mark.asyncio
@@ -495,8 +499,226 @@ class TestRoundRobinLoadBalancer:
 
         # Assert
         assert terminated, "delegate did not terminate after mid-cycle eviction"
-        assert workers[2] not in ctx.workers
+        assert workers[2].uid not in ctx.workers
         assert workers[2] not in yielded
+
+    @pytest.mark.asyncio
+    async def test_delegate_should_yield_fresh_record_when_sole_worker_updated(self):
+        """Test a refreshed sole worker is served fresh on the next call.
+
+        Given:
+            A single-worker context whose worker is refreshed with a
+            same-uid changed record and a new connection after its
+            first yield
+        When:
+            The proxy reports the failure via athrow and then starts a
+            new delegate call
+        Then:
+            It should exhaust the current cycle — the worker's one
+            attempt was already consumed — and yield the fresh record
+            paired with the new connection on the next call
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(1)
+        stale = workers[0]
+        fresh = WorkerMetadata(
+            uid=stale.uid,
+            address="localhost:60000",
+            pid=9999,
+            version="1.0.0",
+        )
+        fresh_connection = WorkerConnection(fresh.address)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first, _ = await anext(generator)
+        ctx.update_worker(fresh, fresh_connection)
+
+        # Act
+        with pytest.raises(StopAsyncIteration):
+            await generator.athrow(TransientRpcError())
+        retry = loadbalancer.delegate(_TASK, context=ctx)
+        metadata, connection = await anext(retry)
+        await retry.aclose()
+
+        # Assert
+        assert first == stale
+        assert metadata == fresh
+        assert connection is fresh_connection
+
+    @pytest.mark.asyncio
+    async def test_delegate_should_resolve_candidate_when_worker_updated_mid_cycle(
+        self,
+    ):
+        """Test a mid-cycle refresh is offered under its current entry.
+
+        Given:
+            A three-worker context in which a not-yet-reached worker is
+            refreshed with a same-uid changed record and a new
+            connection after the first yield, leaving a same-hash
+            unequal fresh key in the pool
+        When:
+            The proxy drives the generator to exhaustion via athrow
+        Then:
+            It should never yield the stale snapshot pair — the
+            refreshed worker is offered under its fresh record and new
+            connection within the same cycle — and should terminate
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
+        stale = workers[2]
+        fresh = WorkerMetadata(
+            uid=stale.uid,
+            address="localhost:60000",
+            pid=9999,
+            version="1.0.0",
+        )
+        fresh_connection = WorkerConnection(fresh.address)
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first, first_connection = await anext(generator)
+        ctx.update_worker(fresh, fresh_connection)
+
+        # Act
+        yielded: list[tuple[WorkerMetadata, WorkerConnection]] = [
+            (first, first_connection)
+        ]
+        terminated = False
+        for _ in range(100):
+            try:
+                metadata, connection = await generator.athrow(TransientRpcError())
+            except StopAsyncIteration:
+                terminated = True
+                break
+            yielded.append((metadata, connection))
+
+        # Assert
+        assert terminated, "delegate did not terminate after mid-cycle update"
+        candidates = [metadata for metadata, _ in yielded]
+        assert stale not in candidates
+        assert candidates == [workers[0], workers[1], fresh]
+        assert yielded[2][1] is fresh_connection
+
+    @pytest.mark.asyncio
+    async def test_delegate_should_keep_boundary_when_checkpoint_updated(self):
+        """Test the cycle boundary survives a checkpoint refresh.
+
+        Given:
+            A three-worker context whose first-yielded (checkpoint)
+            worker is refreshed with a same-uid changed record
+            immediately after its yield, so its uid remains in the pool
+            under the fresh record
+        When:
+            The proxy drives the generator to termination via athrow
+        Then:
+            It should terminate without livelock when the boundary uid
+            recurs, never re-yielding the stale checkpoint record or
+            offering the fresh record, and yielding each candidate at
+            most twice
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(3)
+        checkpoint = workers[0]
+        fresh = WorkerMetadata(
+            uid=checkpoint.uid,
+            address="localhost:60000",
+            pid=9999,
+            version="1.0.0",
+        )
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+        first, _ = await anext(generator)
+        ctx.update_worker(fresh, WorkerConnection(fresh.address))
+
+        # Act
+        yielded: list[WorkerMetadata] = [first]
+        terminated = False
+        for _ in range(100):
+            try:
+                metadata, _ = await generator.athrow(TransientRpcError())
+            except StopAsyncIteration:
+                terminated = True
+                break
+            yielded.append(metadata)
+
+        # Assert
+        assert terminated, "delegate did not terminate after checkpoint update"
+        assert yielded.count(workers[0]) == 1
+        assert fresh not in yielded
+        assert len(yielded) <= 2 * len(workers)
+        uid_counts: dict = {}
+        for metadata in yielded:
+            uid_counts[metadata.uid] = uid_counts.get(metadata.uid, 0) + 1
+        assert all(count <= 2 for count in uid_counts.values())
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        worker_count=st.integers(min_value=2, max_value=6),
+        position=st.integers(min_value=0, max_value=5),
+        step=st.integers(min_value=0, max_value=5),
+    )
+    async def test_delegate_should_terminate_when_update_lands_at_any_step(
+        self, worker_count: int, position: int, step: int
+    ):
+        """Test refresh timing and position never break cycle termination.
+
+        Given:
+            A context of 2-6 workers, a drawn worker position to
+            refresh, and a drawn injection step, with every dispatch
+            failing transiently
+        When:
+            The refresh is injected after the drawn yield while athrow
+            drives the generator to termination
+        Then:
+            It should always terminate, yield at most two candidates
+            per uid and at most two full cycles in total, and never
+            yield the stale record after the injection
+        """
+        # Arrange
+        loadbalancer = RoundRobinLoadBalancer()
+        ctx, workers = _make_context(worker_count)
+        target = workers[position % worker_count]
+        fresh = WorkerMetadata(
+            uid=target.uid,
+            address="localhost:60000",
+            pid=9999,
+            version="1.0.0",
+        )
+        injection_step = step % worker_count
+        generator = loadbalancer.delegate(_TASK, context=ctx)
+
+        # Act & assert
+        yielded: list[WorkerMetadata] = []
+        terminated = False
+        injected = False
+        metadata, _ = await anext(generator)
+        yielded.append(metadata)
+        if injection_step == 0:
+            ctx.update_worker(fresh, WorkerConnection(fresh.address))
+            injected = True
+        for current in range(1, 3 * worker_count + 4):
+            try:
+                metadata, _ = await generator.athrow(TransientRpcError())
+            except StopAsyncIteration:
+                terminated = True
+                break
+            yielded.append(metadata)
+            if injected:
+                assert metadata != target
+            if current == injection_step:
+                ctx.update_worker(fresh, WorkerConnection(fresh.address))
+                injected = True
+
+        assert terminated, "delegate did not terminate within the bound"
+        assert len(yielded) <= 2 * worker_count
+        uid_counts: dict = {}
+        for metadata in yielded:
+            uid_counts[metadata.uid] = uid_counts.get(metadata.uid, 0) + 1
+        assert all(count <= 2 for count in uid_counts.values())
 
     @pytest.mark.asyncio
     async def test_delegate_snapshots_once_per_wrap(self):
@@ -505,7 +727,7 @@ class TestRoundRobinLoadBalancer:
         Given:
             A balancer cycling a 16-worker pool through one full cycle of
             transient failures, observed through a context view that
-            counts ``workers.items()`` materializations
+            counts snapshot materializations
         When:
             The generator is driven to exhaustion via athrow
         Then:
@@ -515,7 +737,7 @@ class TestRoundRobinLoadBalancer:
         """
         # Arrange
         ctx, workers = _make_context(16)
-        counting = _ItemsCountingContext(ctx)
+        counting = _SnapshotCountingContext(ctx)
         loadbalancer = RoundRobinLoadBalancer()
 
         # Act
@@ -532,7 +754,7 @@ class TestRoundRobinLoadBalancer:
 
         # Assert
         assert len(yielded) == len(workers)
-        assert counting.items_calls <= 2
+        assert counting.snapshot_calls <= 2
 
     @pytest.mark.asyncio
     async def test_delegate_does_not_pin_retired_contexts(self):

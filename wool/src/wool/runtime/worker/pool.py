@@ -141,7 +141,7 @@ class WorkerPool:
         class PriorityBalancer:
             async def delegate(self, task, *, context):
                 # Yield workers in priority order.
-                for metadata, connection in context.workers.items():
+                for metadata, connection in context.workers.values():
                     try:
                         sent = yield metadata, connection
                     except Exception:
@@ -195,7 +195,8 @@ class WorkerPool:
         (unbounded). Only meaningful when a ``discovery`` service is
         configured; supplying ``lease`` without ``discovery`` records
         the value but never consults it, accompanied by an
-        `IneffectiveLeaseWarning`.
+        `IneffectiveLeaseWarning`. Admission semantics are
+        `WorkerProxy`'s — see its ``lease`` parameter.
     :param worker:
         Worker factory callable. A `WorkerFactory` declares a ``host``
         keyword and receives the discovery publisher's prescribed bind
