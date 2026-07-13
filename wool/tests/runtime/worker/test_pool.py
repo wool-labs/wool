@@ -10,6 +10,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import AsyncExitStack
 from contextlib import contextmanager
 from functools import partial
 from types import MappingProxyType
@@ -1189,6 +1190,58 @@ class TestWorkerPool:
 
         # Assert: Context manager returned pool and lifecycle completed
         assert pool_instance is not None
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_return_pool_when_pushed_onto_async_exit_stack(
+        self,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test entering a pool through an AsyncExitStack.
+
+        Given:
+            A WorkerPool
+        When:
+            The pool is pushed onto a contextlib.AsyncExitStack
+        Then:
+            It should return the pool itself.
+        """
+        # Arrange
+        pool = WorkerPool(spawn=1)
+
+        # Act
+        async with AsyncExitStack() as stack:
+            entered = await stack.enter_async_context(pool)
+
+        # Assert
+        assert entered is pool
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_tear_down_pool_when_async_exit_stack_unwinds(
+        self,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_local_worker,
+    ):
+        """Test tearing a pool down through an AsyncExitStack.
+
+        Given:
+            A WorkerPool pushed onto a contextlib.AsyncExitStack
+        When:
+            The stack unwinds
+        Then:
+            It should exit the pool's worker proxy context.
+        """
+        # Arrange
+        pool = WorkerPool(spawn=1)
+
+        # Act
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(pool)
+
+        # Assert
+        mock_worker_proxy.__aexit__.assert_awaited()
 
     @pytest.mark.asyncio
     async def test___aexit___cleanup_on_error(self, mock_worker_factory):
