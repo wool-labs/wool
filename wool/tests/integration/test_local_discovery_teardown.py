@@ -48,6 +48,19 @@ with LocalDiscovery(sys.argv[1]):
     pass
 """
 
+_LEAKED_OWNER_SCRIPT = """
+import sys
+from contextlib import ExitStack
+
+from wool.runtime.discovery.local import LocalDiscovery
+
+stack = ExitStack()
+stack.enter_context(LocalDiscovery(sys.argv[1]))
+print("ready", flush=True)
+sys.stdin.readline()
+print("leaking-context", flush=True)
+"""
+
 
 @pytest.mark.integration
 class TestSameNamespaceRespawn:
@@ -347,6 +360,65 @@ class TestCrossProcessTeardown:
             # Assert
             assert owner.returncode == 0
             assert "clean-exit" in stdout
+            assert "Traceback" not in stderr
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+                owner.wait(timeout=10)
+
+    def test___enter___should_arm_fallback_that_survives_shutdown_when_leaked(self):
+        """Test the shutdown fallback tolerates a vanished segment.
+
+        Given:
+            An owner LocalDiscovery entered in its own interpreter
+            and never exited, and an independent attacher interpreter
+            whose resource tracker unlinked the shared segment at
+            exit
+        When:
+            The owner interpreter shuts down with the fallback still
+            armed
+        Then:
+            It should exit with status 0 and no traceback — the armed
+            fallback suppresses the missing segment instead of
+            crashing interpreter shutdown.
+        """
+        # Arrange
+        namespace = f"leaked-{uuid.uuid4().hex[:12]}"
+        owner = subprocess.Popen(
+            [sys.executable, "-c", _LEAKED_OWNER_SCRIPT, namespace],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert owner.stdin is not None and owner.stdout is not None
+            assert owner.stdout.readline().strip() == "ready"
+
+            attacher = subprocess.run(
+                [sys.executable, "-c", _ATTACHER_SCRIPT, namespace],
+                capture_output=True,
+                text=True,
+                timeout=_TIMEOUT,
+            )
+            assert attacher.returncode == 0
+            # Vacuity guard — the attacher's tracker really unlinked
+            # the segment before the owner shuts down.
+            assert "leaked shared_memory" in attacher.stderr
+
+            # Act — the owner returns from its script with the
+            # context still open, so atexit fires the armed fallback
+            # against the vanished segment
+            owner.stdin.write("\n")
+            owner.stdin.flush()
+            stdout, stderr = owner.communicate(timeout=_TIMEOUT)
+
+            # Assert — the owner's own tracker warns about its stale
+            # registration on stderr (its unlink raised before the
+            # tracker unregistration), so assert traceback absence
+            # rather than a clean stderr
+            assert owner.returncode == 0
+            assert "leaking-context" in stdout
             assert "Traceback" not in stderr
         finally:
             if owner.poll() is None:
