@@ -12,6 +12,7 @@ import ipaddress
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import fields
 from enum import Enum
@@ -1510,6 +1511,57 @@ async def _clear_channel_pool():
 # autouse cleanup. (The previous sync ``_clear_proxy_context``
 # autouse fixture mutated the pytest main Chain, which async test
 # tasks never observe; it was load-bearing in appearance only.)
+
+
+@pytest_asyncio.fixture
+async def worker_update_pool(request) -> AsyncIterator[tuple]:
+    """Yield a live pool over one announced worker plus a live spare.
+
+    Starts two ``LocalWorker`` processes against a per-test
+    ``LocalDiscovery`` namespace, announces only the first, and enters a
+    ``WorkerPool`` bound to that discovery through the ``_DIRECT``
+    factory form. Yields ``(pool, publisher, worker_a, worker_b)``: the
+    publisher so a test can drive worker-added/updated/dropped events,
+    and both workers so a test can name their uids, addresses, and pids.
+
+    The pool's ``lease`` is taken from an indirect parameter and
+    defaults to ``None`` (uncapped); parametrize the fixture indirectly
+    to cap admission.
+
+    The pool is entered inside the caller's task so the ambient proxy
+    ``ContextVar`` is visible to the dispatches the test makes. On exit
+    the announced uid is dropped and both worker processes are stopped,
+    whether or not the test already stopped one of them.
+    """
+    lease = getattr(request, "param", None)
+    namespace = f"worker-update-{uuid.uuid4().hex[:12]}"
+    worker_a = LocalWorker()
+    worker_b = LocalWorker()
+    await worker_a.start()
+    await worker_b.start()
+    try:
+        with LocalDiscovery(namespace) as discovery:
+            publisher = discovery.publisher
+            async with publisher:
+                await publisher.publish("worker-added", worker_a.metadata)
+                pool = WorkerPool(
+                    discovery=_DirectDiscovery(discovery),
+                    loadbalancer=RoundRobinLoadBalancer,
+                    lease=lease,
+                )
+                try:
+                    async with pool:
+                        yield pool, publisher, worker_a, worker_b
+                finally:
+                    with suppress(KeyError):
+                        await publisher.publish("worker-dropped", worker_a.metadata)
+    finally:
+        # ``LocalWorker.stop`` raises on an already-stopped worker, so
+        # the teardown absorbs that here rather than making every test
+        # carry a "did I stop it?" flag.
+        for worker in (worker_b, worker_a):
+            with suppress(RuntimeError):
+                await worker.stop()
 
 
 @pytest.fixture

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import Final
 from weakref import WeakKeyDictionary
-
-from wool.runtime.worker.connection import WorkerConnection
-from wool.runtime.worker.metadata import WorkerMetadata
 
 from .base import LoadBalancerContextView
 
@@ -28,15 +26,18 @@ class RoundRobinLoadBalancer:
 
     .. rubric:: Implementation notes
 
-    The cycle boundary is identified by the UID of the first yielded
-    candidate. If that first candidate is evicted mid-cycle its UID can
-    never recur, so the boundary is reseeded from the next surviving
-    candidate.
+    The rotation snapshots the pool's uids once per wrap and indexes
+    them in O(1). A refresh mid-cycle needs no handling here —
+    candidates are uids (see `LoadBalancerLike`). The cycle boundary is
+    the uid of the first yielded candidate and survives such refreshes:
+    the cycle terminates when that uid recurs. Only when the boundary
+    uid leaves the pool is the boundary reseeded from the next
+    surviving candidate, since a uid that has left can never recur and
+    would otherwise never close the cycle.
 
     Per-context rotation state lives in a `WeakKeyDictionary` keyed on
-    the context, so a retired pool's cursor — and the connections it
-    references — are reclaimed with the context instead of pinned for
-    the balancer's lifetime.
+    the context, so a retired pool's cursor is reclaimed with the
+    context instead of pinned for the balancer's lifetime.
     """
 
     _index: Final[WeakKeyDictionary[LoadBalancerContextView, int]]
@@ -52,10 +53,7 @@ class RoundRobinLoadBalancer:
         task: Task,
         *,
         context: LoadBalancerContextView,
-    ) -> AsyncGenerator[
-        tuple[WorkerMetadata, WorkerConnection],
-        WorkerMetadata | None,
-    ]:
+    ) -> AsyncGenerator[uuid.UUID, uuid.UUID | None]:
         """Yield worker candidates in round-robin order.
 
         :param task:
@@ -68,14 +66,17 @@ class RoundRobinLoadBalancer:
             proxy's responsibility; the balancer only reads
             ``context.workers`` to pick the next candidate.
         :yields:
-            ``(metadata, connection)`` pairs. The generator is driven
-            by the proxy via ``anext``/``athrow``/``asend``.
+            Worker uids. The generator is driven by the proxy via
+            ``anext``/``athrow``/``asend``.
         """
-        checkpoint: WorkerMetadata | None = None
-        snapshot: list[tuple[WorkerMetadata, WorkerConnection]] = []
+        checkpoint: uuid.UUID | None = None
+        snapshot: list[uuid.UUID] = []
         cursor = 0
+        # Hoisted: ``workers`` is a live view (see
+        # LoadBalancerContextView), so re-reading it per candidate would
+        # buy nothing.
+        workers = context.workers
         while True:
-            workers = context.workers
             if not workers:
                 return
             # Select the candidate and advance the shared per-context index
@@ -89,28 +90,30 @@ class RoundRobinLoadBalancer:
                 # Re-observe membership once per wrap and index the ordered
                 # workers in O(1). Rebuilding the snapshot is the only O(n)
                 # step and amortizes to O(1) per candidate over a cycle.
-                snapshot = list(workers.items())
+                snapshot = list(workers)
                 cursor = index % len(snapshot)
-            metadata, connection = snapshot[cursor]
+            uid = snapshot[cursor]
             cursor += 1
             self._index[context] = index + 1
 
             if checkpoint is not None and checkpoint not in workers:
-                # The cycle boundary was evicted; its UID can never recur,
-                # so drop it and let the next survivor reseed the boundary.
+                # See the rubric: a boundary uid that has left the pool
+                # can never recur, so reseed from the next survivor.
                 checkpoint = None
-            if metadata not in workers:
-                # Evicted since the snapshot was taken — skip it.
+            if uid not in workers:
+                # Evicted since the snapshot was taken. The proxy would
+                # skip it anyway; not yielding it keeps the cycle
+                # boundary anchored to a worker that still exists.
                 continue
             if checkpoint is None:
-                checkpoint = metadata
-            elif metadata.uid == checkpoint.uid:
+                checkpoint = uid
+            elif uid == checkpoint:
                 # One full cycle completed without a successful
                 # dispatch — signal exhaustion.
                 return
 
             try:
-                yield (metadata, connection)
+                yield uid
             except Exception:
                 # Proxy reports failure (transient or non-transient).
                 # Advance to the next worker; eviction, if any, has
@@ -119,8 +122,11 @@ class RoundRobinLoadBalancer:
                 # aclose() and task cancellation work correctly.
                 continue
             else:
-                # Resumed without an exception: the proxy signaled
-                # success. Round-robin has no per-dispatch state to
-                # record, so terminate. See LoadBalancerLike for the
-                # driver contract.
+                # A non-exception resume means success *here* only
+                # because the ``uid not in workers`` guard above never
+                # offers a candidate the proxy would skip, so the
+                # ``None`` resume `LoadBalancerLike` documents cannot
+                # reach this branch. A balancer without that guard must
+                # test the value the yield returns instead. Round-robin
+                # has no per-dispatch state to record, so terminate.
                 return
