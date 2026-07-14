@@ -132,6 +132,12 @@ class WorkerConnection:
     The channel stays alive until the caller finishes consuming the
     result stream.
 
+    A connection is a lazy handle, not a channel owner: channel lifetime
+    belongs to the pool, which reaps a channel by refcount and TTL once
+    no handle is using it. Discarding a connection therefore does not
+    close its channel, and closing a connection whose channel another
+    handle still shares would evict that channel out from under it.
+
     **Cleanup semantics on cancellation.** Every code path that owns
     an in-flight gRPC call wraps its body in
     ``try / except BaseException`` so that ``asyncio.CancelledError``
