@@ -5,6 +5,7 @@ import atexit
 import hashlib
 import struct
 import tempfile
+import warnings
 from contextlib import asynccontextmanager
 from contextlib import contextmanager
 from multiprocessing.shared_memory import SharedMemory
@@ -33,6 +34,7 @@ from wool.runtime.discovery.pool import SubscriberMeta
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
+from wool.utilities.noreentry import noreentry
 
 REF_WIDTH: Final = 16
 NULL_REF: Final = b"\x00" * REF_WIDTH
@@ -161,25 +163,45 @@ class _WorkerReference:
 class LocalDiscovery(Discovery):
     """Shared-memory discovery for single-machine worker pools.
 
-    The default when a
-    :py:class:`~wool.runtime.worker.pool.WorkerPool` is created
+    The default when a `~wool.runtime.worker.pool.WorkerPool` is created
     without an explicit discovery protocol. Workers and subscribers
-    communicate through a shared memory region identified by a
-    namespace string. File-based locking ensures consistency across
-    processes.
+    communicate through a shared-memory segment identified by a namespace
+    string, so unrelated processes on the same host discover each other by
+    agreeing on a namespace alone. File-based locking keeps the segment
+    consistent across those processes.
 
-    .. note::
-        Multiple unrelated processes can share the same namespace,
-        enabling automatic worker discovery across process boundaries.
+    **Ownership.** Entering a context creates the namespace's segment, or
+    attaches to it when it already exists. The first entrant across all
+    processes wins the create race and *owns* the segment; every later
+    entrant on that namespace merely attaches. Ownership falls out of that
+    race — it is not something the caller selects.
+
+    **Lifecycle.** An instance is single-use: it may be entered once, and a
+    second entry raises `RuntimeError` whether or not the first has exited.
+    Use a fresh instance per ``with`` block. The guard binds to the instance,
+    so distinct instances sharing a namespace — which compare equal — are
+    unaffected by each other.
+
+    The owner's exit unlinks the segment out from under every still-attached
+    peer, while a non-owner's exit only closes its own mapping; a non-owner
+    can therefore outlive the segment it is mapped to. An owner that never
+    exits at all — an abandoned context, an interpreter killed mid-block —
+    still reclaims the segment at interpreter shutdown rather than leaking
+    the namespace, via a fallback armed on owner entry and disarmed on owner
+    exit.
+
+    Teardown never raises: unlinking goes through `_unlink_quietly`, which
+    owns the failure semantics. So `__exit__` cannot replace an exception a
+    caller is already unwinding, and a genuine leak stays observable.
 
     :param namespace:
-        Unique identifier for the shared memory region. Publishers
+        Unique identifier for the shared-memory segment. Publishers
         and subscribers using the same namespace will see each
         other's workers.
     :param filter:
         Optional default predicate function to filter workers.
-        Used by :py:attr:`subscriber` and as the default for
-        :py:meth:`subscribe` when no explicit filter is provided.
+        Used by `subscriber` and as the default for `subscribe` when no
+        explicit filter is provided.
     :param capacity:
         Maximum number of workers that can be registered
         simultaneously. Defaults to 128.
@@ -191,17 +213,24 @@ class LocalDiscovery(Discovery):
 
     .. code-block:: python
 
-        publisher = LocalDiscovery.Publisher("my-worker-pool")
-        async with publisher:
-            await publisher.publish("worker-added", metadata)
+        with LocalDiscovery("my-worker-pool") as discovery:
+            async with discovery.publisher as publisher:
+                await publisher.publish("worker-added", metadata)
 
     Example — subscribe to workers:
 
     .. code-block:: python
 
-        subscriber = LocalDiscovery.Subscriber("my-worker-pool")
-        async for event in subscriber:
-            print(f"Discovered worker: {event.metadata}")
+        with LocalDiscovery("my-worker-pool") as discovery:
+            async for event in discovery.subscriber:
+                print(f"Discovered worker: {event.metadata}")
+
+    .. rubric:: Implementation notes
+
+    The shutdown fallback is an `atexit` handler registered on owner entry
+    and unregistered on owner exit, before the unlink runs — a failed unlink
+    must not leave the handler armed to fire a second time at interpreter
+    shutdown.
     """
 
     _filter: Final[PredicateFunction | None]
@@ -220,7 +249,17 @@ class LocalDiscovery(Discovery):
         self._capacity = capacity
         self._block_size = block_size
 
+    @noreentry
     def __enter__(self) -> Self:
+        """Create or attach to the namespace's shared-memory segment.
+
+        See `LocalDiscovery` for the ownership and teardown contract.
+
+        :returns:
+            This instance.
+        :raises RuntimeError:
+            If this instance has already been entered.
+        """
         size = self._capacity * 4
         try:
             self._address_space = SharedMemory(
@@ -238,16 +277,24 @@ class LocalDiscovery(Discovery):
 
         assert self._address_space.buf
         if self._owner:
-            self._cleanup = atexit.register(lambda: self._address_space.unlink())
+
+            def cleanup():  # pragma: no cover
+                _unlink_quietly(self._address_space)
+
+            self._cleanup = atexit.register(cleanup)
             for i in range(size):
                 self._address_space.buf[i] = 0
         return self
 
     def __exit__(self, *_):
+        """Release this instance's hold on the namespace's segment.
+
+        See `LocalDiscovery` for the ownership and teardown contract.
+        """
         if self._owner:
-            self._address_space.close()
-            self._address_space.unlink()
             atexit.unregister(self._cleanup)
+            self._address_space.close()
+            _unlink_quietly(self._address_space)
         else:
             self._address_space.close()
 
@@ -439,7 +486,10 @@ class LocalDiscovery(Discovery):
                         )
                         struct.pack_into("16s", address_space.buf, i, ref.bytes)
                     except Exception:
-                        await self._drop(metadata, address_space)
+                        # Release what this method acquired rather than
+                        # delegating to `_drop`, whose slot scan cannot find a
+                        # ref that only lands on the last line of this block.
+                        await self._shared_memory_pool.release(str(ref))
                         raise
                     break
             else:
@@ -540,10 +590,7 @@ class LocalDiscovery(Discovery):
             )
 
             def cleanup():  # pragma: no cover
-                try:
-                    shared_memory.unlink()
-                except OSError:
-                    pass
+                _unlink_quietly(shared_memory)
 
             self._cleanups[name] = atexit.register(cleanup)
             return shared_memory
@@ -551,19 +598,16 @@ class LocalDiscovery(Discovery):
         def _shared_memory_finalizer(self, shared_memory: SharedMemory):
             """Clean up a shared memory block when released from the pool.
 
-            Unlinks the shared memory region and unregisters the atexit
-            handler. Errors during unlink are silently ignored to handle
-            Windows platforms where unlink may fail if other processes still
-            have the memory file open.
+            Unregisters the atexit handler before unlinking the block, so a
+            failed unlink cannot leave the handler armed to fire again at
+            interpreter shutdown. The unlink goes through `_unlink_quietly`;
+            see it for the failure semantics.
 
             :param shared_memory:
                 The SharedMemory instance to finalize.
             """
-            try:
-                shared_memory.unlink()
-            except OSError:
-                pass  # pragma: no cover
             atexit.unregister(self._cleanups.pop(shared_memory.name))
+            _unlink_quietly(shared_memory)
 
     class Subscriber(
         metaclass=SubscriberMeta,
@@ -746,6 +790,35 @@ class LocalDiscovery(Discovery):
                     "worker-updated", metadata=discovered_workers[uid]
                 )
                 yield event
+
+
+def _unlink_quietly(shared_memory: SharedMemory) -> None:
+    """Unlink a segment without raising, warning if it fails unexpectedly.
+
+    Every teardown path in this module unlinks through here, so no teardown
+    can raise: an exception escaping a ``__exit__`` or an `atexit` handler
+    would replace the exception the caller was already unwinding, or crash
+    the interpreter at shutdown.
+
+    A segment that is already gone is the expected case and passes silently —
+    any process that attached to it may have unlinked it first (bpo-38119).
+    Any other failure leaves the segment allocated, which is a leak the caller
+    cannot act on but an operator can, so it surfaces as a `ResourceWarning`
+    rather than being swallowed.
+
+    :param shared_memory:
+        The segment to unlink.
+    """
+    try:
+        shared_memory.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        warnings.warn(
+            f"failed to unlink shared memory {shared_memory.name!r}: {error}",
+            ResourceWarning,
+            stacklevel=2,
+        )
 
 
 def _short_hash(s: str, n: int = 30) -> str:
