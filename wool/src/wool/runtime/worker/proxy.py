@@ -252,9 +252,9 @@ class WorkerProxy:
         class StickyBalancer:
             async def delegate(self, task, *, context):
                 # Yield a preferred worker first, then fall back.
-                for metadata, connection in context.workers.values():
+                for uid in context.workers:
                     try:
-                        sent = yield metadata, connection
+                        sent = yield uid
                     except Exception:
                         continue
                     if sent is not None:
@@ -926,9 +926,8 @@ class WorkerProxy:
     ) -> AsyncGenerator:
         """Drive a delegating load balancer through one dispatch.
 
-        Pulls candidates from ``loadbalancer.delegate(task, context=...)``,
-        calls `WorkerConnection.dispatch` on each, and reports the
-        outcome back via ``asend`` on success or ``athrow`` on failure.
+        Implements the driver side of the `LoadBalancerLike` handshake.
+
         Only `RpcError` is treated as a worker-health signal:
         a non-transient `RpcError` triggers eviction from the
         context before the balancer is notified, so it observes the
@@ -962,11 +961,22 @@ class WorkerProxy:
         generator = loadbalancer.delegate(task, context=ctx)
         try:
             try:
-                metadata, connection = await generator.__anext__()
+                uid = await anext(generator)
             except StopAsyncIteration:
                 raise NoWorkersAvailable()
 
             while True:
+                current = ctx.workers.get(uid)
+                if current is None:
+                    # Departed worker: not a dispatch failure — see
+                    # LoadBalancerLike.
+                    try:
+                        uid = await anext(generator)
+                    except StopAsyncIteration:
+                        raise NoWorkersAvailable()
+                    continue
+
+                metadata, connection = current
                 try:
                     stream = await connection.dispatch(task, timeout=timeout)
                 except RpcError as exc:
@@ -976,7 +986,7 @@ class WorkerProxy:
                     if not isinstance(exc, TransientRpcError):
                         ctx.remove_worker(metadata)
                     try:
-                        metadata, connection = await generator.athrow(exc)
+                        uid = await generator.athrow(exc)
                     except StopAsyncIteration:
                         raise NoWorkersAvailable() from exc
                     continue
@@ -990,7 +1000,7 @@ class WorkerProxy:
                 # handoff.
                 try:
                     try:
-                        trailing = await generator.asend(metadata)
+                        trailing = await generator.asend(uid)
                     except StopAsyncIteration:
                         result, stream = stream, None
                         return result

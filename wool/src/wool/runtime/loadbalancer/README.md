@@ -22,26 +22,15 @@ Wool supports custom load balancers via structural subtyping.
 
 ### `LoadBalancerLike` protocol
 
-Custom load balancers implement a single method:
-
-```python
-class LoadBalancerLike(Protocol):
-    def delegate(
-        self,
-        task: Task,
-        *,
-        context: LoadBalancerContextView,
-    ) -> AsyncGenerator[
-        tuple[WorkerMetadata, WorkerConnection],
-        WorkerMetadata | None,
-    ]: ...
-```
+Custom load balancers implement a single method, `delegate` — an async generator that yields the uid of each worker it wants tried, in preference order. See the `LoadBalancerLike` docstring for the signature and the driver contract.
 
 `task` is the `Task` being routed, passed read-only as the first positional argument. A balancer MAY key its routing on it — hashing `task.tag` for sticky routing, or dispatching by `task.callable` for task-type specialization — or ignore it entirely, as `RoundRobinLoadBalancer` does.
 
 ### Contract
 
 The proxy drives the `delegate` generator: the balancer selects and orders worker candidates, and the proxy dispatches to each, retries on failure, and evicts unhealthy workers. Selection lives in the balancer; dispatch, retry, and eviction live in the proxy. The proxy reports each candidate's outcome back through the generator's `anext`, `athrow`, and `asend` signals — the `LoadBalancerLike` docstring documents them signal by signal and is the single source of truth for the handshake.
+
+A balancer yields worker **uids**, not connections: it names a worker, and the proxy resolves that name against the live pool when it dispatches, so a selection can never carry a stale address. Yielding a uid that has since left the pool is not an error — the proxy skips it and asks for the next candidate, resuming the generator with `None` instead of a success echo. Only a non-`None` resume means the task was dispatched, so a balancer must capture the value the `yield` returns and terminate only on a non-`None` one. See the `LoadBalancerLike` docstring for the full handshake.
 
 ### Implementing a custom load balancer
 
@@ -60,7 +49,7 @@ class StickyTagBalancer:
         *,
         context: wool.LoadBalancerContextView,
     ):
-        workers = list(context.workers.values())
+        workers = list(context.workers)
         if not workers:
             return
 
@@ -73,24 +62,29 @@ class StickyTagBalancer:
         # Probe the hashed worker first, then walk the ring so a single
         # unhealthy worker does not strand the task.
         for offset in range(len(workers)):
-            metadata, connection = workers[(start + offset) % len(workers)]
+            uid = workers[(start + offset) % len(workers)]
             try:
-                yield metadata, connection
+                sent = yield uid
             except Exception:
                 # Dispatch failed (reported via athrow). Advance to the
                 # next worker on the ring. Catch Exception (not
                 # BaseException) so GeneratorExit and CancelledError
                 # propagate correctly.
                 continue
-            # Control returns here only when the proxy signals success
-            # via asend; the contract requires the generator to
-            # terminate after a success.
-            return
+            if sent is not None:
+                # Success echo (asend). The contract requires the
+                # generator to terminate after a success.
+                return
+            # The proxy resumed us with None (anext): the worker left
+            # the pool before dispatch, so nothing was tried. Walk on to
+            # the next worker on the ring.
 ```
 
 A worker-keyed balancer ignores `task` and ranks by worker state instead — here, by in-flight task count, yielding the least-loaded worker first:
 
 ```python
+import uuid
+
 import wool
 
 
@@ -98,7 +92,7 @@ class LeastLoadedBalancer:
     """Yield workers in ascending order of in-flight task count."""
 
     def __init__(self):
-        self._in_flight: dict[str, int] = {}
+        self._in_flight: dict[uuid.UUID, int] = {}
 
     async def delegate(
         self,
@@ -108,28 +102,31 @@ class LeastLoadedBalancer:
     ):
         # Rank workers by current in-flight count (ascending).
         ranked = sorted(
-            context.workers.values(),
-            key=lambda item: self._in_flight.get(item[0].uid, 0),
+            context.workers,
+            key=lambda uid: self._in_flight.get(uid, 0),
         )
 
-        for metadata, connection in ranked:
-            self._in_flight[metadata.uid] = (
-                self._in_flight.get(metadata.uid, 0) + 1
-            )
+        for uid in ranked:
+            self._in_flight[uid] = self._in_flight.get(uid, 0) + 1
             try:
-                yield metadata, connection
+                sent = yield uid
             except Exception:
                 # Dispatch failed. Decrement and try the next candidate.
                 # Catch Exception (not BaseException) so GeneratorExit
                 # and CancelledError propagate correctly.
-                self._in_flight[metadata.uid] -= 1
+                self._in_flight[uid] -= 1
                 continue
-            # Success signaled via asend; the contract requires the
-            # generator to terminate here. The in-flight count stays
-            # incremented for the life of this dispatch; the matching
-            # decrement happens out-of-band when the stream drains (not
-            # shown — requires a lifecycle hook beyond this protocol).
-            return
+            if sent is not None:
+                # Success echo (asend); the contract requires the
+                # generator to terminate here. The in-flight count stays
+                # incremented for the life of this dispatch; the matching
+                # decrement happens out-of-band when the stream drains (not
+                # shown — requires a lifecycle hook beyond this protocol).
+                return
+            # The proxy resumed us with None (anext): the worker left the
+            # pool before dispatch. Nothing was tried, so release the
+            # reservation and rank on.
+            self._in_flight[uid] -= 1
 ```
 
 ## Usage examples

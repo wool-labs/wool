@@ -253,6 +253,17 @@ class LoadBalancerLike(Protocol):
     non-transient errors, and reports each outcome back to the
     balancer's generator.
 
+    A balancer cannot route a task to a superseded address, however
+    long it holds a candidate or however stale the view it chose from.
+    Balancers that need a worker's record or connection to decide
+    (e.g., to match tags, pin a version, or weigh a connection) read
+    them from ``context.workers``, but do not carry what they read back
+    across this boundary.
+
+    Selecting a worker that has left the pool is not an error. The
+    proxy finds no entry for the uid, asks for the next candidate, and
+    reports nothing back — a departed worker has not failed a dispatch.
+
     The generator supports three signals:
 
     - ``anext()`` — request the next worker candidate.
@@ -262,14 +273,14 @@ class LoadBalancerLike(Protocol):
       the context *before* throwing into the generator, so the
       balancer observes the capacity change before choosing the next
       candidate.
-    - ``asend(metadata)`` — report that the previous candidate's
-      dispatch succeeded. The value sent back is an opaque success
-      echo — the proxy sends back the metadata it just yielded, and
-      only its not-None-ness is meaningful. **The generator MUST
-      terminate after receiving a success signal** — either by
-      ``return`` or by letting control fall off the end. Yielding
-      another candidate after ``asend`` is a protocol violation; the
-      proxy raises `RuntimeError` at the call site.
+    - ``asend(uid)`` — report that the previous candidate's dispatch
+      succeeded. The value sent back is an opaque success echo — the
+      proxy sends back the uid it just yielded, and only its
+      not-None-ness is meaningful. **The generator MUST terminate
+      after receiving a success signal** — either by ``return`` or by
+      letting control fall off the end. Yielding another candidate
+      after ``asend`` is a protocol violation; the proxy raises
+      `RuntimeError` at the call site.
 
     When the generator ends (via ``return`` or `StopAsyncIteration`
     in response to an ``athrow`` or the initial ``anext``), the proxy
@@ -288,16 +299,8 @@ class LoadBalancerLike(Protocol):
         task: Task,
         *,
         context: LoadBalancerContextView,
-    ) -> AsyncGenerator[
-        tuple[WorkerMetadata, WorkerConnection],
-        WorkerMetadata | None,
-    ]:
+    ) -> AsyncGenerator[uuid.UUID, uuid.UUID | None]:
         """Yield worker candidates for the proxy to dispatch to.
-
-        The `WorkerProxy` delegates candidate selection to this
-        generator: the balancer selects and orders candidates, and the
-        proxy drives the generator and dispatches to each yielded
-        worker.
 
         :param task:
             The `Task` being routed. Read-only — the balancer MAY key
@@ -308,11 +311,9 @@ class LoadBalancerLike(Protocol):
             `LoadBalancerContextView` for the surface it exposes.
             Eviction and pool mutation are the proxy's responsibility.
         :yields:
-            ``(metadata, connection)`` candidates in the balancer's
-            preferred order. See the class docstring for the
-            ``anext``/``athrow``/``asend`` protocol that drives this
-            generator.
-
+            Worker uids in the balancer's preferred order. See the
+            class docstring for the ``anext``/``athrow``/``asend``
+            protocol that drives this generator.
         """
         ...
 

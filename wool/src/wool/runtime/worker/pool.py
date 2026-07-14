@@ -140,10 +140,10 @@ class WorkerPool:
 
         class PriorityBalancer:
             async def delegate(self, task, *, context):
-                # Yield workers in priority order.
-                for metadata, connection in context.workers.values():
+                # Yield worker uids in priority order.
+                for uid in context.workers:
                     try:
-                        sent = yield metadata, connection
+                        sent = yield uid
                     except Exception:
                         continue
                     if sent is not None:
