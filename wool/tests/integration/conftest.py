@@ -33,6 +33,7 @@ from hypothesis import strategies as st
 
 from wool.runtime.context.runtime import dispatch_timeout
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
@@ -42,6 +43,63 @@ from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
 from .routines import ContextVarPattern
+
+
+async def poll_until_count(get_uids, expected_count, *, timeout=5.0, interval=0.02):
+    """Poll get_uids() until it reports expected_count uids, or fail.
+
+    Returns the uid set once its size equals expected_count. Replaces a
+    fixed settle sleep: it waits no longer than necessary and fails
+    loudly — rather than silently passing on a change that arrived late
+    — if the count never reaches the expected value within the deadline.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        uids = get_uids()
+        if len(uids) == expected_count:
+            return uids
+        assert loop.time() < deadline, (
+            f"admitted count never reached {expected_count}; last saw {len(uids)}"
+        )
+        await asyncio.sleep(interval)
+
+
+async def poll_dispatch_until_pid(target_pid, message, *, timeout=15.0, interval=0.1):
+    """Dispatch get_pid until it reaches target_pid, or fail.
+
+    Tolerates NoWorkersAvailable during the window between an admitting
+    event being published and the sentinel admitting the worker, so an
+    empty pool mid-propagation is retried rather than raised.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            if await routines.get_pid() == target_pid:
+                return
+        except NoWorkersAvailable:
+            pass
+        assert loop.time() < deadline, message
+        await asyncio.sleep(interval)
+
+
+async def poll_dispatch_until_unavailable(message, *, timeout=15.0, interval=0.1):
+    """Dispatch get_pid until the pool has no admitted workers, or fail.
+
+    The eviction counterpart of `poll_dispatch_until_pid`: an
+    evicted worker is observable only as a dispatch that can no longer
+    be routed.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            await routines.get_pid()
+        except NoWorkersAvailable:
+            return
+        assert loop.time() < deadline, message
+        await asyncio.sleep(interval)
 
 
 class RoutineShape(Enum):

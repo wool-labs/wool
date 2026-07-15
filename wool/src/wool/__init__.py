@@ -56,6 +56,7 @@ from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import IneffectiveLeaseWarning
@@ -140,6 +141,7 @@ __all__ = [
     "TransientRpcError",
     "UndefinedType",
     "UnexpectedResponse",
+    "UnparsableVersionWarning",
     "WoolError",
     "WoolWarning",
     "Worker",

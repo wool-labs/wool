@@ -17,16 +17,12 @@ from dataclasses import replace
 
 import pytest
 
-from wool.runtime.loadbalancer.base import NoWorkersAvailable
-
 from . import routines
+from .conftest import poll_dispatch_until_pid
+from .conftest import poll_dispatch_until_unavailable
 
 _TIMEOUT = 30
 _PROPAGATION_TIMEOUT = 15.0
-# Long enough for the publish to traverse the rescan and the subscriber
-# diff, so a sentinel that wrongly admitted the worker would have done
-# so before the assertion reads the pool.
-_SETTLE = 2.0
 
 
 async def _poll_until(predicate, message):
@@ -40,23 +36,6 @@ async def _poll_until(predicate, message):
     deadline = loop.time() + _PROPAGATION_TIMEOUT
     while not predicate(pid := await routines.get_pid()):
         assert loop.time() < deadline, f"dispatch still reaches pid {pid}; {message}"
-        await asyncio.sleep(0.1)
-
-
-async def _poll_until_unavailable(message):
-    """Dispatch get_pid until the pool has no workers left, or fail.
-
-    The eviction counterpart of :func:`_poll_until`: an evicted worker
-    is observable only as a dispatch that can no longer be routed.
-    """
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + _PROPAGATION_TIMEOUT
-    while True:
-        try:
-            await routines.get_pid()
-        except NoWorkersAvailable:
-            return
-        assert loop.time() < deadline, message
         await asyncio.sleep(0.1)
 
 
@@ -168,7 +147,7 @@ class TestWorkerUpdatePropagation:
                 await publisher.publish("worker-dropped", updated)
 
                 # Assert
-                await _poll_until_unavailable(
+                await poll_dispatch_until_unavailable(
                     "worker-dropped never evicted the refreshed entry"
                 )
 
@@ -176,48 +155,43 @@ class TestWorkerUpdatePropagation:
 
     @pytest.mark.parametrize("worker_update_pool", [1], indirect=True)
     @pytest.mark.asyncio
-    async def test_dispatch_should_raise_when_update_precedes_add(
+    async def test_dispatch_should_admit_capacity_freed_worker_on_refresh(
         self, worker_update_pool, retry_grpc_internal
     ):
-        """Test a worker-updated event never admits an unadmitted worker.
+        """Test a worker refused for capacity is admitted once a slot frees.
 
         Given:
             A pool over a real LocalDiscovery with lease=1, holding its
             one announced worker, and a second announced worker the cap
-            rejected, after which the admitted worker is dropped and the
-            pool is empty
+            rejected
         When:
-            The publisher publishes worker-updated for the rejected
-            worker's uid
+            The admitted worker is dropped, freeing the lease slot, so
+            discovery's next scan re-publishes the rejected worker as a
+            worker-updated event
         Then:
-            It should leave the pool empty — dispatch keeps raising
-            NoWorkersAvailable, because a refresh never admits a worker
+            It should admit that worker into the freed slot — dispatch
+            reaches it within a bounded deadline, because the sentinel
+            reconciles membership on every event rather than admitting
+            only on worker-added
         """
         _, publisher, worker_a, worker_b = worker_update_pool
 
         async def body():
             async with asyncio.timeout(_TIMEOUT):
-                # Arrange — discovery's registrar refuses to publish
-                # worker-updated for a uid it has never registered, so
-                # the only worker a refresh can name that the pool does
-                # not hold is one the pool never admitted: one the lease
-                # cap rejected. Dispatch once so the lazy pool starts and
-                # admits worker_a against the cap, announce worker_b so
-                # the cap rejects it, then retire worker_a so only an
-                # admission could repopulate the pool.
+                # Arrange — dispatch once so the lazy pool starts and
+                # admits worker_a against the cap, then announce worker_b
+                # so the cap rejects it.
                 assert await routines.get_pid() == worker_a.metadata.pid
                 await publisher.publish("worker-added", worker_b.metadata)
-                await publisher.publish("worker-dropped", worker_a.metadata)
-                await _poll_until_unavailable(
-                    "the cap-rejected worker was admitted, or worker_a was never evicted"
-                )
 
-                # Act
-                await publisher.publish("worker-updated", worker_b.metadata)
-                await asyncio.sleep(_SETTLE)
+                # Act — retire worker_a, freeing its lease slot; the same
+                # scan that drops it re-publishes worker_b as an update.
+                await publisher.publish("worker-dropped", worker_a.metadata)
 
                 # Assert
-                with pytest.raises(NoWorkersAvailable):
-                    await routines.get_pid()
+                await poll_dispatch_until_pid(
+                    worker_b.metadata.pid,
+                    "the capacity-freed worker was never admitted on refresh",
+                )
 
         await retry_grpc_internal(body)
