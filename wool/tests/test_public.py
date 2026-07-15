@@ -36,6 +36,7 @@ def test_public_api_completeness_should_match_expected_surface():
         "RpcError",
         "TransientRpcError",
         "UnexpectedResponse",
+        "UnparsableVersionWarning",
         "WorkerConnection",
         "ChainContention",
         "ChainSerializationError",

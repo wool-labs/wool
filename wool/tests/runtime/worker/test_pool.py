@@ -23,6 +23,10 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
+import wool
+import wool.runtime.worker.pool as wp
+from wool import protocol
+from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
@@ -31,6 +35,7 @@ from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import IneffectiveLeaseWarning
 from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.proxy import IneffectiveQuorumTimeoutWarning
+from wool.runtime.worker.proxy import ReducibleAsyncIterator
 
 
 def _make_worker_metadata(*tags: str) -> WorkerMetadata:
@@ -43,6 +48,54 @@ def _make_worker_metadata(*tags: str) -> WorkerMetadata:
         tags=frozenset(tags),
         extra=MappingProxyType({}),
     )
+
+
+class _FakePublisher:
+    """Minimal ``DiscoveryPublisherLike`` double for ``_FakeDiscovery``.
+
+    A concrete class rather than a mock: the pool validates the
+    publisher with a runtime ``isinstance`` against the protocol, which
+    a spec'd mock fails and a specless one sends into recursion.
+    """
+
+    bind_host = "127.0.0.1"
+
+    def __init__(self, mocker):
+        self.publish = mocker.AsyncMock()
+
+
+class _FakeDiscovery(DiscoveryLike):
+    """Custom ``DiscoveryLike`` double for admission-gate pool tests.
+
+    Serves both shapes the sentinel tests need through one surface:
+    when ``events`` is supplied, ``subscriber`` and ``subscribe`` yield
+    a ``ReducibleAsyncIterator`` over them (durable admission tests);
+    otherwise they return a plain mock subscriber. ``subscribe`` always
+    records the predicate it was handed on ``captured_filter`` so
+    filter-composition tests can evaluate it.
+    """
+
+    def __init__(self, mocker, events=None):
+        self._events = events
+        self._publisher = _FakePublisher(mocker)
+        self._subscriber = mocker.MagicMock(spec=DiscoverySubscriberLike)
+        self.captured_filter = None
+
+    @property
+    def publisher(self):
+        return self._publisher
+
+    @property
+    def subscriber(self):
+        if self._events is not None:
+            return ReducibleAsyncIterator(self._events)
+        return self._subscriber
+
+    def subscribe(self, filter=None):
+        self.captured_filter = filter
+        if self._events is not None:
+            return ReducibleAsyncIterator(self._events)
+        return self._subscriber
 
 
 class TestWorkerPool:
@@ -564,7 +617,6 @@ class TestWorkerPool:
             pass
 
         # Assert
-        import wool.runtime.worker.pool as wp
 
         wp.LocalWorker.assert_called()
         _, kwargs = wp.LocalWorker.call_args
@@ -592,7 +644,6 @@ class TestWorkerPool:
             pass
 
         # Assert
-        import wool.runtime.worker.pool as wp
 
         wp.LocalWorker.assert_called()
         _, kwargs = wp.LocalWorker.call_args
@@ -625,7 +676,6 @@ class TestWorkerPool:
             pass
 
         # Assert
-        import wool.runtime.worker.pool as wp
 
         wp.LocalWorker.assert_called()
         _, kwargs = wp.LocalWorker.call_args
@@ -1058,7 +1108,6 @@ class TestWorkerPool:
             pass
 
         # Assert
-        import wool.runtime.worker.pool as wp
 
         wp.LocalWorker.assert_called()
         args, kwargs = wp.LocalWorker.call_args
@@ -1097,7 +1146,6 @@ class TestWorkerPool:
             pass
 
         # Assert
-        import wool.runtime.worker.pool as wp
 
         wp.LocalWorker.assert_called()
         _, kwargs = wp.LocalWorker.call_args
@@ -1128,7 +1176,6 @@ class TestWorkerPool:
             pass
 
         # Assert
-        import wool.runtime.worker.pool as wp
 
         wp.LocalWorker.assert_not_called()
 
@@ -1157,7 +1204,6 @@ class TestWorkerPool:
             pass
 
         # Assert
-        import wool.runtime.worker.pool as wp
 
         assert wp.LocalWorker.call_count == 2
         for _, kwargs in wp.LocalWorker.call_args_list:
@@ -2855,7 +2901,6 @@ class TestWorkerPool:
             It should not pass an options parameter to WorkerProxy
         """
         # Arrange
-        import wool.runtime.worker.pool as wp
 
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
@@ -3030,7 +3075,6 @@ class TestWorkerPool:
             It should pass lease=6 (spawn + lease) to WorkerProxy
         """
         # Arrange
-        import wool.runtime.worker.pool as wp
 
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
@@ -3063,7 +3107,6 @@ class TestWorkerPool:
             It should pass lease=6 to WorkerProxy
         """
         # Arrange
-        import wool.runtime.worker.pool as wp
 
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
@@ -3078,6 +3121,238 @@ class TestWorkerPool:
         mock_proxy_cls.assert_called_once()
         _, proxy_kwargs = mock_proxy_cls.call_args
         assert proxy_kwargs["lease"] == 6
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_timeout_when_only_incompatible_discovered(
+        self, mocker: MockerFixture
+    ):
+        """Test custom-source incompatible workers never satisfy quorum.
+
+        Given:
+            A durable WorkerPool over a custom DiscoveryLike source
+            whose unfiltered subscriber yields only a next-major-version
+            worker, with quorum=1 and a short quorum timeout
+        When:
+            The pool context is entered eagerly
+        Then:
+            It should raise asyncio.TimeoutError at entry — the
+            proxy's admission gate rejects the worker, so the quorum
+            is never met
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        incompatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="2.0.0",
+        )
+        events = [DiscoveryEvent("worker-added", metadata=incompatible_worker)]
+        pool = WorkerPool(
+            discovery=_FakeDiscovery(mocker, events=events),
+            quorum=1,
+            quorum_timeout=0.05,
+            lazy=False,
+        )
+
+        # Act & assert
+        with pytest.raises(asyncio.TimeoutError):
+            async with pool:
+                pass
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_admit_only_compatible_workers_within_lease(
+        self, mocker: MockerFixture
+    ):
+        """Test the gate composes with pool lease and quorum wiring.
+
+        Given:
+            A durable WorkerPool with lease=1 and quorum=1 over a
+            custom DiscoveryLike source yielding an incompatible worker
+            followed by a compatible one
+        When:
+            The pool context is entered eagerly and the admitted set is
+            read from the active proxy
+        Then:
+            It should enter successfully with exactly the compatible
+            worker admitted — the rejected worker did not occupy the
+            single lease slot
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        incompatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="2.0.0",
+        )
+        compatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=incompatible_worker),
+            DiscoveryEvent("worker-added", metadata=compatible_worker),
+        ]
+        pool = WorkerPool(
+            discovery=_FakeDiscovery(mocker, events=events),
+            lease=1,
+            quorum=1,
+            lazy=False,
+        )
+
+        # Act & assert
+        async with pool:
+            proxy = wool.__proxy__.get()
+            assert proxy is not None
+            assert len(proxy.workers) == 1
+            assert compatible_worker in proxy.workers
+            assert incompatible_worker not in proxy.workers
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_subscribe_with_tag_only_filter_when_tags_given(
+        self,
+        mocker: MockerFixture,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_shared_memory,
+    ):
+        """Test hybrid subscriptions carry tag semantics only.
+
+        Given:
+            A hybrid WorkerPool with a tag and a filter-capturing
+            DiscoveryLike source
+        When:
+            The pool context is entered and the captured subscription
+            predicate is evaluated
+        Then:
+            It should admit workers by tag intersection alone —
+            version and security mismatches pass through to the
+            proxy's admission gate, and non-matching tags are rejected
+        """
+        # Arrange
+        discovery = _FakeDiscovery(mocker)
+
+        # Act
+        async with WorkerPool("gpu", spawn=1, discovery=discovery):
+            pass
+
+        filter_fn = discovery.captured_filter
+
+        # Assert — tag match passes despite a version mismatch
+        version_mismatched = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="2.0.0",
+            tags=frozenset(["gpu"]),
+        )
+        assert filter_fn(version_mismatched) is True
+
+        # Assert — tag match passes despite a security mismatch
+        secure_mismatched = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+            tags=frozenset(["gpu"]),
+            secure=True,
+        )
+        assert filter_fn(secure_mismatched) is True
+
+        # Assert — non-matching tags are rejected
+        non_matching = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.3:50051",
+            pid=1003,
+            version="1.0.0",
+            tags=frozenset(["other"]),
+        )
+        assert filter_fn(non_matching) is False
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_subscribe_with_match_all_filter_when_no_tags(
+        self,
+        mocker: MockerFixture,
+        mock_worker_proxy,
+        mock_local_worker,
+        mock_shared_memory,
+    ):
+        """Test untagged hybrid subscriptions match every worker.
+
+        Given:
+            A hybrid WorkerPool with no tags and a filter-capturing
+            DiscoveryLike source
+        When:
+            The pool context is entered and the captured subscription
+            predicate is evaluated
+        Then:
+            It should match tagged and untagged workers alike
+        """
+        # Arrange
+        discovery = _FakeDiscovery(mocker)
+
+        # Act
+        async with WorkerPool(spawn=1, discovery=discovery):
+            pass
+
+        filter_fn = discovery.captured_filter
+
+        # Assert
+        tagged = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            tags=frozenset(["anything"]),
+        )
+        untagged = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+        assert filter_fn(tagged) is True
+        assert filter_fn(untagged) is True
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_forward_credentials_to_proxy(
+        self,
+        mocker: MockerFixture,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+        worker_credentials,
+    ):
+        """Test durable mode forwards credentials to WorkerProxy.
+
+        Given:
+            A WorkerPool with discovery only and WorkerCredentials
+        When:
+            The pool context is entered
+        Then:
+            It should pass the exact credentials instance to
+            WorkerProxy — the wiring that aims the security half of
+            the proxy's admission gate
+        """
+        # Arrange
+
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(
+            discovery=mock_discovery_service_for_pool,
+            credentials=worker_credentials,
+        ):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["credentials"] is worker_credentials
 
     @pytest.mark.asyncio
     async def test___aenter___no_lease_forwards_none(
@@ -3097,7 +3372,6 @@ class TestWorkerPool:
             It should pass lease=None to WorkerProxy
         """
         # Arrange
-        import wool.runtime.worker.pool as wp
 
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
@@ -3377,7 +3651,6 @@ class TestWorkerPool:
             It should pass quorum=2 to WorkerProxy
         """
         # Arrange
-        import wool.runtime.worker.pool as wp
 
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
@@ -3411,7 +3684,6 @@ class TestWorkerPool:
             pre-quorum implicit-wait semantics)
         """
         # Arrange
-        import wool.runtime.worker.pool as wp
 
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
@@ -3445,7 +3717,6 @@ class TestWorkerPool:
             forwarding quorum_timeout
         """
         # Arrange
-        import wool.runtime.worker.pool as wp
 
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
@@ -3482,7 +3753,6 @@ class TestWorkerPool:
             typed overload contract
         """
         # Arrange
-        import wool.runtime.worker.pool as wp
 
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
@@ -3515,7 +3785,6 @@ class TestWorkerPool:
             It should pass quorum=3 to WorkerProxy
         """
         # Arrange
-        import wool.runtime.worker.pool as wp
 
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy
@@ -3550,7 +3819,6 @@ class TestWorkerPool:
             It should pass quorum=3 to WorkerProxy
         """
         # Arrange
-        import wool.runtime.worker.pool as wp
 
         mock_proxy_cls = mocker.patch.object(
             wp, "WorkerProxy", return_value=mock_worker_proxy

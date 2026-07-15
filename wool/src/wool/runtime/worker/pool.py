@@ -211,7 +211,9 @@ class WorkerPool:
     :param discovery:
         Discovery service to attach — a `~wool.DiscoveryLike` instance
         or any `Factory` form resolving to one. The resolved object is
-        validated against the protocol at context entry.
+        validated against the protocol at context entry. Workers it
+        surfaces are additionally subject to the underlying
+        `WorkerProxy`'s admission gate.
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
     :param credentials:

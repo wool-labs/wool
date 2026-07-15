@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 import warnings
 from contextlib import AsyncExitStack
@@ -46,6 +47,7 @@ from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.noreentry import noreentry
 
@@ -53,6 +55,8 @@ if TYPE_CHECKING:
     from contextvars import Token
 
     from wool.runtime.routine.task import Task
+
+_logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -64,7 +68,7 @@ def parse_version(version: str) -> Version | None:
         A version string (e.g. ``"1.2.3"``).
     :returns:
         A :class:`~packaging.version.Version` instance, or
-        ``None`` if unparseable.
+        ``None`` if unparsable.
     """
     try:
         return Version(version)
@@ -217,6 +221,36 @@ class WorkerProxy:
     worker lists. Handles connection lifecycle and fault tolerance
     automatically.
 
+    Every worker on every construction path — discovery stream, pool
+    URI, or static list — passes a security/version admission gate
+    before joining the pool: the worker's ``secure`` flag must match
+    the proxy's credentials, and its version must share the local
+    protocol version's major and be at least the local version.
+    Workers surfaced by a user-supplied ``discovery`` subscriber are
+    subject to the same gate — they are not trusted verbatim. The gate
+    is a non-overridable invariant rather than tunable policy. It fails
+    closed — a worker whose advertised version does not parse is
+    rejected, and if the local protocol version is unresolvable no
+    worker is admitted at all (observable as the quorum
+    `asyncio.TimeoutError`). The gate is re-derived from the credential
+    context and protocol version of whichever process holds the proxy,
+    so a static-worker proxy re-gated after serialization may admit
+    fewer workers than at construction, and its construction-time
+    quorum check (see ``:raises ValueError:``) does not carry across a
+    pickle.
+
+    .. rubric:: Implementation notes
+
+    The gate is non-overridable because the version floor is a
+    wire-protocol guarantee the worker interceptor also enforces
+    server-side, and an uncredentialed proxy cannot complete a TLS
+    handshake with a ``secure`` worker.
+
+    .. versionchanged:: 0.12.0
+       Workers from every discovery path, including a user-supplied
+       ``discovery`` subscriber, are now screened by the admission gate;
+       previously such workers were admitted unconditionally.
+
     **Connect via pool URI:**
 
     .. code-block:: python
@@ -285,7 +319,8 @@ class WorkerProxy:
     :param tags:
         Additional tags for filtering discovered workers.
     :param discovery:
-        Discovery service or event stream.
+        Discovery service or event stream. Workers it surfaces are
+        admitted only after passing the admission gate described above.
     :param workers:
         Static worker list for direct connection.
     :param loadbalancer:
@@ -346,6 +381,8 @@ class WorkerProxy:
         AsyncContextManager[LoadBalancerLike] | ContextManager[LoadBalancerLike]
     )
     _credentials: WorkerCredentials | None
+    _security_filter: Callable[[WorkerMetadata], bool]
+    _version_filter: Callable[[WorkerMetadata], bool]
 
     # ``wool.__proxy__`` is a plain ``contextvars.ContextVar``, invisible to
     # the chain-contention guard; this ``wool.ContextVar`` is the guarded
@@ -503,26 +540,30 @@ class WorkerProxy:
         else:
             self._credentials = credentials
 
-        # Create security filter based on resolved credentials
-        security_filter = self._create_security_filter(self._credentials)
-        version_filter = self._create_version_filter()
-
-        def compatible(w):
-            return security_filter(w) and version_filter(w)
+        # Build both halves of the admission gate from the resolved
+        # credentials and the local protocol version. Deliberately not
+        # serialized: __wool_reduce__ restores the proxy through __init__,
+        # so a restored proxy rebuilds the gate from its own credential
+        # context and protocol version.
+        self._security_filter = self._create_security_filter(self._credentials)
+        self._version_filter = self._create_version_filter()
 
         match (pool_uri, discovery, workers):
             case (pool_uri, None, None) if pool_uri is not None:
-                # Combine tag and compatibility filters
-                def combined_filter(w):
-                    return bool({pool_uri, *tags} & w.tags) and compatible(w)
+                # Tag semantics only — compatibility is enforced at
+                # sentinel admission.
+                match_tags = frozenset({pool_uri, *tags})
 
-                self._discovery = LocalDiscovery(pool_uri).subscribe(
-                    filter=combined_filter
-                )
+                def tag_filter(w):
+                    return bool(match_tags & w.tags)
+
+                self._discovery = LocalDiscovery(pool_uri).subscribe(filter=tag_filter)
             case (None, discovery, None) if discovery is not None:
                 self._discovery = discovery
             case (None, None, workers) if workers is not None:
-                compatible_workers = [w for w in workers if compatible(w)]
+                compatible_workers = [
+                    w for w in workers if self._incompatibility_reason(w) is None
+                ]
                 if quorum is not None and quorum > len(compatible_workers):
                     raise ValueError(
                         f"Quorum ({quorum}) cannot exceed compatible worker "
@@ -1051,16 +1092,18 @@ class WorkerProxy:
     def _create_security_filter(
         self, credentials: WorkerCredentials | None
     ) -> Callable[[WorkerMetadata], bool]:
-        """Create discovery filter based on proxy credentials.
+        """Create the security half of the sentinel admission gate.
 
         Workers and proxies must have compatible security settings:
-        - Proxy with credentials only discovers workers with secure=True
-        - Proxy without credentials only discovers workers with secure=False
+        - Proxy with credentials only admits workers with secure=True
+        - Proxy without credentials only admits workers with secure=False
 
         :param credentials:
             Channel credentials for this proxy.
         :returns:
-            Predicate function for filtering workers by security compatibility.
+            Predicate function for filtering workers by security
+            compatibility, enforced at `_worker_sentinel`
+            admission.
         """
         if credentials is not None:
             # Proxy has credentials: only accept secure workers
@@ -1071,19 +1114,28 @@ class WorkerProxy:
 
     @staticmethod
     def _create_version_filter() -> Callable[[WorkerMetadata], bool]:
-        """Create discovery filter based on major version compatibility.
+        """Create the version half of the sentinel admission gate.
 
         A worker is accepted when its version is greater than or
         equal to the local proxy version within the same major
-        version.  Workers with unparseable versions are rejected.
+        version.  Workers with unparsable versions are rejected.
 
         :returns:
             Predicate function for filtering workers by version
-            compatibility.
+            compatibility, enforced at `_worker_sentinel`
+            admission.
         """
         from wool import protocol
 
         local_version = parse_version(protocol.__version__)
+        if local_version is None:
+            warnings.warn(
+                f"Local protocol version {protocol.__version__!r} is not "
+                "a parsable version; the admission gate rejects every "
+                "worker until the proxy's own version metadata is available.",
+                UnparsableVersionWarning,
+                stacklevel=3,
+            )
 
         def version_filter(metadata: WorkerMetadata) -> bool:
             worker_version = parse_version(metadata.version)
@@ -1092,6 +1144,18 @@ class WorkerProxy:
             return is_version_compatible(local_version, worker_version)
 
         return version_filter
+
+    def _incompatibility_reason(self, metadata: WorkerMetadata) -> str | None:
+        """Return which gate half rejects ``metadata``, or None if it passes.
+
+        Security is reported first when both halves fail. Enforced by
+        `_worker_sentinel` on every discovery path.
+        """
+        if not self._security_filter(metadata):
+            return "security"
+        if not self._version_filter(metadata):
+            return "version"
+        return None
 
     async def _await_workers(self):
         """Block until at least ``quorum`` workers are admitted.
@@ -1115,6 +1179,24 @@ class WorkerProxy:
             self._workers_changed.clear()
 
     async def _worker_sentinel(self):
+        """Reconcile discovery events against the load-balancer context.
+
+        The single admission gate for every discovery source.
+        ``worker-added`` and ``worker-updated`` are handled
+        identically — each reconciles the worker's membership to its
+        current eligibility, regardless of how the proxy was
+        constructed (a subscription filter screens on tags or any
+        user-chosen metadata field, never on security/version
+        compatibility). An event whose metadata fails the combined
+        security/version predicate evicts the worker if it was admitted
+        and is otherwise ignored; an eligible worker not yet held is
+        admitted subject to the lease; an eligible worker already held
+        is refreshed in place. Because either event type can admit or
+        evict, a worker that crosses the compatibility boundary in
+        either direction is tracked correctly on every path.
+        ``worker-dropped`` events remove unconditionally: removing an
+        unknown worker is a no-op.
+        """
         assert self._loadbalancer_context is not None
         assert self._discovery_stream is not None
         assert self._workers_changed is not None
@@ -1133,31 +1215,56 @@ class WorkerProxy:
 
         async for event in self._discovery_stream:
             match event.type:
-                case "worker-added":
-                    if (
-                        self._lease is not None
-                        and event.metadata.uid not in self._loadbalancer_context.workers
-                        and len(self._loadbalancer_context.workers) >= self._lease
-                    ):
+                case "worker-added" | "worker-updated":
+                    uid = event.metadata.uid
+                    # Bind once: the ``workers`` property builds a fresh
+                    # MappingProxyType per access, and this branch runs per
+                    # still-registered worker every rescan.
+                    workers = self._loadbalancer_context.workers
+                    present = uid in workers
+                    reason = self._incompatibility_reason(event.metadata)
+                    if reason is not None:
+                        # Incompatible now — evict an admitted worker
+                        # whose posture flipped; ignore one never held.
+                        # Admission and eviction are one authority here,
+                        # independent of the event type.
+                        if present:
+                            _logger.debug(
+                                "Admission gate evicted worker %s: %s incompatible",
+                                uid,
+                                reason,
+                            )
+                            self._loadbalancer_context.remove_worker(event.metadata)
+                            self._workers_changed.set()
+                        else:
+                            # Fires per rescan for standing chaff, so
+                            # debug keeps it out of the default log.
+                            _logger.debug(
+                                "Admission gate rejected worker %s: %s incompatible",
+                                uid,
+                                reason,
+                            )
+                        continue
+                    if present:
+                        # Refresh in place; membership is unchanged, so
+                        # the quorum wait need not re-evaluate. Displaced
+                        # connections are not closed — see
+                        # LoadBalancerContextLike.
+                        self._loadbalancer_context.update_worker(
+                            event.metadata, connect(event.metadata)
+                        )
+                    elif self._lease is not None and len(workers) >= self._lease:
                         # Admission is per uid — see the ``lease``
                         # parameter on this class.
                         continue
-                    # Displaced connections are not closed — see
-                    # LoadBalancerContextLike.
-                    self._loadbalancer_context.add_worker(
-                        event.metadata, connect(event.metadata)
-                    )
-                    self._workers_changed.set()
-                case "worker-updated":
-                    if event.metadata.uid not in self._loadbalancer_context.workers:
-                        # A refresh never admits a worker; skip before
-                        # minting a connection this event cannot use.
-                        continue
-                    # Displaced connections are not closed — see
-                    # LoadBalancerContextLike.
-                    self._loadbalancer_context.update_worker(
-                        event.metadata, connect(event.metadata)
-                    )
+                    else:
+                        _logger.debug("Admission gate admitted worker %s", uid)
+                        # Displaced connections are not closed — see
+                        # LoadBalancerContextLike.
+                        self._loadbalancer_context.add_worker(
+                            event.metadata, connect(event.metadata)
+                        )
+                        self._workers_changed.set()
                 case "worker-dropped":
                     self._loadbalancer_context.remove_worker(event.metadata)
                     self._workers_changed.set()
