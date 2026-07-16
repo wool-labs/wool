@@ -1815,6 +1815,80 @@ class TestWorkerPool:
         stop.assert_awaited_once_with(timeout=5.0)
 
     @pytest.mark.asyncio
+    async def test___aexit___should_log_error_when_stop_fails_unexpectedly(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test an unexpected stop failure is reported rather than swallowed.
+
+        Given:
+            A WorkerPool whose worker's stop() raises an error that is
+            neither a timeout nor a cancellation
+        When:
+            The async-with block exits
+        Then:
+            It should log the failure against the worker's uid with the
+            traceback attached, rather than discarding it into the
+            teardown gather
+        """
+        # Arrange
+        uid = uuid.uuid4()
+
+        def broken_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uid
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock(side_effect=ValueError("stop is broken"))
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+            async with WorkerPool(worker=broken_factory, spawn=1, shutdown_timeout=5.0):
+                pass
+
+        # Assert
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(str(uid) in r.getMessage() and r.exc_info is not None for r in errors)
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_skip_stopping_workers_that_never_started(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test teardown leaves a never-started worker alone.
+
+        Given:
+            A WorkerPool whose worker fails to start, so it is never
+            announced and holds no metadata
+        When:
+            The async-with block exits after the spawn failure
+        Then:
+            It should neither stop nor announce that worker, and should
+            log no error for it — there is nothing to undo
+        """
+        # Arrange
+        stop = mocker.AsyncMock()
+
+        def failing_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uuid.uuid4()
+            worker.start = mocker.AsyncMock(side_effect=RuntimeError("spawn boom"))
+            worker.stop = stop
+            worker.metadata = None
+            return worker
+
+        # Act
+        with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+            with pytest.raises(ExceptionGroup):
+                async with WorkerPool(
+                    worker=failing_factory, spawn=2, shutdown_timeout=5.0
+                ):
+                    pass
+
+        # Assert
+        stop.assert_not_awaited()
+        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
+    @pytest.mark.asyncio
     async def test___aexit___should_wait_unbounded_when_shutdown_timeout_none(
         self, mocker: MockerFixture, caplog
     ):
