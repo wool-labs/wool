@@ -247,12 +247,16 @@ class WorkerPool:
         the full teardown sequence: each worker's ``stop()`` receives
         ``shutdown_timeout`` as its per-worker bound, the gather waits
         for whatever time remains, and publisher cleanup gets whatever
-        is left. When the deadline elapses, abandoned worker UIDs are
-        logged via ``logging.warning`` and teardown proceeds — an
-        abandoned `LocalWorker` is still reaped off-loop (see
-        `LocalWorker._stop`), which can hold ``__aexit__`` past the
-        deadline by up to the reap escalation. ``None`` disables the
-        bound. Must be positive when provided. Defaults to ``60.0``.
+        is left. When the deadline elapses, the pool stops waiting and
+        logs the UIDs it stopped waiting on via ``logging.warning``.
+        Those workers are not leaked: a `LocalWorker` is still reaped
+        off-loop (see `LocalWorker._stop`), which can hold ``__aexit__``
+        past the deadline by up to the reap escalation — what is lost is
+        the graceful drain, not the process. A stop that fails for any
+        other reason is logged via ``logging.error`` and teardown
+        continues, so one worker's failure never strands another's
+        cleanup. ``None`` disables the bound. Must be positive when
+        provided. Defaults to ``60.0``.
     :param lazy:
         When ``True`` (default), defer discovery setup and the quorum
         wait to the first `WorkerProxy.dispatch`.  When ``False``,
@@ -617,8 +621,8 @@ class WorkerPool:
         bind host (see `~wool.DiscoveryPublisherLike.bind_host`);
         bound factories own their binding. Teardown applies the
         pool's ``shutdown_timeout`` as a single deadline across worker
-        stops and publisher cleanup, logging any workers it abandons
-        (see ``shutdown_timeout``), and runs even when publisher
+        stops and publisher cleanup, logging any workers it stops
+        waiting on (see ``shutdown_timeout``), and runs even when publisher
         validation or worker construction fails, so an entered
         publisher context is never leaked.
 
@@ -656,7 +660,14 @@ class WorkerPool:
                     await publisher_svc.publish("worker-added", worker.metadata)
 
                 async def stop(worker):
-                    await publisher_svc.publish("worker-dropped", worker.metadata)
+                    if (metadata := worker.metadata) is None:
+                        # A worker whose start failed was never announced
+                        # and cannot be stopped (`Worker.stop` rejects it),
+                        # so teardown has nothing to undo.
+                        return
+                    # Announce the drop before stopping so subscribers
+                    # stop routing to a worker that is about to go away.
+                    await publisher_svc.publish("worker-dropped", metadata)
                     await worker.stop(timeout=self._shutdown_timeout)
 
                 task = asyncio.create_task(start(worker))
@@ -689,23 +700,32 @@ class WorkerPool:
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*done, *pending, return_exceptions=True)
-                abandoned_tasks = set(pending)
-                for task in done:
-                    if not task.cancelled() and isinstance(
-                        task.exception(), TimeoutError
-                    ):
-                        abandoned_tasks.add(task)
-                if abandoned_tasks:
-                    abandoned_uids = sorted(
-                        str(worker_by_task[task].uid) for task in abandoned_tasks
+                reaped_tasks = set(pending)
+                for task in worker_by_task:
+                    if task.cancelled():
+                        continue
+                    if (error := task.exception()) is None:
+                        continue
+                    if isinstance(error, TimeoutError):
+                        reaped_tasks.add(task)
+                    else:
+                        logger.error(
+                            "WorkerPool shutdown could not stop worker %s cleanly",
+                            worker_by_task[task].uid,
+                            exc_info=error,
+                        )
+                if reaped_tasks:
+                    reaped_uids = sorted(
+                        str(worker_by_task[task].uid) for task in reaped_tasks
                     )
                     logger.warning(
-                        "WorkerPool shutdown abandoned %d worker(s) "
-                        "that did not stop within %ss: %s",
-                        len(abandoned_uids),
+                        "WorkerPool shutdown stopped waiting for %d worker(s) "
+                        "that did not stop gracefully within %ss and reaped "
+                        "them; in-flight work may have been lost: %s",
+                        len(reaped_uids),
                         self._shutdown_timeout,
-                        abandoned_uids,
-                        extra={"abandoned_worker_uids": abandoned_uids},
+                        reaped_uids,
+                        extra={"reaped_worker_uids": reaped_uids},
                     )
 
             try:

@@ -21,6 +21,9 @@ from . import routines
 from .conftest import build_pool_from_scenario
 from .conftest import default_scenario
 
+# This helper script must stay a `python -c` string: it has no
+# `__main__` guard, so as a script file the spawn bootstrap's re-import
+# of `__main__` would re-run it in every worker child.
 _PARENT_SCRIPT = """
 import asyncio
 
@@ -33,6 +36,27 @@ async def main():
     assert worker.metadata is not None
     print(worker.metadata.pid, flush=True)
     await asyncio.sleep(300)
+
+
+asyncio.run(main())
+"""
+
+# `python -c` string for the same reason as `_PARENT_SCRIPT` above.
+_ABANDON_SCRIPT = """
+import asyncio
+import sys
+
+from wool.runtime.worker.local import LocalWorker
+
+
+async def main():
+    worker = LocalWorker(shutdown_grace_period=5.0)
+    await worker.start(timeout=30)
+    assert worker.metadata is not None
+    print(worker.metadata.pid, flush=True)
+    # Hold here so the test owns the moment abandonment begins.
+    sys.stdin.readline()
+    # Return without stopping the worker — abandonment distilled.
 
 
 asyncio.run(main())
@@ -145,6 +169,53 @@ class TestWorkerOrphanPrevention:
                 helper.wait(timeout=10)
             _ensure_killed(worker_pid)
 
+    def test_interpreter_exit_should_not_block_when_worker_abandoned(self):
+        """Test an abandoned worker cannot wedge parent interpreter exit.
+
+        Given:
+            A parent process that started a LocalWorker and reaches
+            interpreter exit without ever stopping it, leaving
+            multiprocessing's atexit handler to deal with the live
+            child.
+        When:
+            The parent interpreter exits.
+        Then:
+            The parent should exit cleanly within a bound instead of
+            blocking in the atexit join, and the abandoned worker
+            subprocess should be terminated rather than orphaned.
+        """
+        # Arrange
+        helper = subprocess.Popen(
+            [sys.executable, "-c", _ABANDON_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        worker_pid = None
+        try:
+            assert helper.stdout is not None
+            assert helper.stdin is not None
+            worker_pid = int(helper.stdout.readline().strip())
+            assert _pid_alive(worker_pid)
+
+            # Act
+            helper.stdin.write("go\n")
+            helper.stdin.flush()
+            returncode = helper.wait(timeout=30)
+
+            # Assert
+            assert returncode == 0
+            deadline = time.monotonic() + 15.0
+            while _pid_alive(worker_pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert not _pid_alive(worker_pid)
+        finally:
+            if helper.poll() is None:
+                helper.kill()
+                helper.wait(timeout=10)
+            _ensure_killed(worker_pid)
+
     @pytest.mark.asyncio
     async def test_pool_exit_should_leave_no_live_worker_processes(self):
         """Test pool teardown reaps every spawned worker process.
@@ -211,6 +282,87 @@ class TestWorkerOrphanPrevention:
         finally:
             for pid in spawned:
                 _ensure_killed(pid)
+
+    @pytest.mark.asyncio
+    async def test_pool_exit_should_reap_workers_when_teardown_cancelled(self):
+        """Test a cancelled teardown still reaps every spawned worker.
+
+        Given:
+            An entered WorkerPool with two spawned local workers, under
+            an asyncio.timeout armed only once the workers are up, so
+            the cancellation lands in teardown rather than startup.
+        When:
+            The timeout cancels the pool's teardown at its first await.
+        Then:
+            It should still leave no worker subprocess alive, since each
+            worker's reap runs in an executor thread that a cancelled
+            stop cannot call off.
+        """
+        # Arrange
+        before = {child.pid for child in multiprocessing.active_children()}
+        spawned = []
+        cancelled = False
+
+        try:
+            # Act
+            try:
+                async with asyncio.timeout(None) as cancellation:
+                    async with WorkerPool("cancelled-teardown-test", spawn=2):
+                        spawned = [
+                            child.pid
+                            for child in multiprocessing.active_children()
+                            if child.pid not in before
+                        ]
+                        assert len(spawned) == 2
+                        # Arm only now, with a deadline already behind
+                        # us: the cancellation then lands at teardown's
+                        # first await, whatever teardown costs.
+                        loop = asyncio.get_running_loop()
+                        cancellation.reschedule(loop.time())
+            except TimeoutError:
+                cancelled = True
+
+            # Assert
+            assert cancelled
+            deadline = time.monotonic() + 30.0
+            while (
+                any(_pid_alive(pid) for pid in spawned) and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.1)
+            for pid in spawned:
+                assert not _pid_alive(pid)
+        finally:
+            for pid in spawned:
+                _ensure_killed(pid)
+
+    def test_worker_should_exit_gracefully_when_sigtermed(self):
+        """Test a worker turns SIGTERM into a graceful stop.
+
+        Given:
+            A started real WorkerProcess.
+        When:
+            SIGTERM is sent to the worker process.
+        Then:
+            It should exit with exit code 0 within a bounded join, i.e.,
+            the installed handler's graceful stop rather than the
+            signal's default disposition.
+        """
+        # Arrange
+        process = WorkerProcess(shutdown_grace_period=5.0)
+        process.start(timeout=30)
+        pid = process.pid
+        assert pid is not None
+        assert _pid_alive(pid)
+
+        try:
+            # Act
+            os.kill(pid, signal.SIGTERM)
+            process.join(timeout=15)
+
+            # Assert
+            assert process.exitcode == 0
+        finally:
+            _ensure_killed(pid)
 
     def test_reap_should_terminate_worker_without_stop_rpc(self):
         """Test reap force-terminates a worker that was never stopped.

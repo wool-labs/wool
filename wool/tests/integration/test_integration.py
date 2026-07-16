@@ -32,6 +32,13 @@ from .conftest import scenarios_strategy
 
 _INTEGRATION_TIMEOUT = 30
 
+# The Hypothesis exploration is load-sensitive: a heavy example on a
+# busy machine can overrun the 30s bound the pairwise cases run under,
+# and the resulting asyncio.timeout cancellation strands live workers in
+# pool teardown (#294). It gets its own, looser bound rather than
+# sharing one.
+_HYPOTHESIS_TIMEOUT = 90
+
 
 @pytest.mark.integration
 def test_pairwise_scenarios_cover_all_discovery_members():
@@ -166,7 +173,7 @@ async def test_dispatch_hypothesis(scenario, credentials_map, retry_grpc_interna
 
     # Arrange, act, & assert
     async def body():
-        async with asyncio.timeout(_INTEGRATION_TIMEOUT):
+        async with asyncio.timeout(_HYPOTHESIS_TIMEOUT):
             async with build_pool_from_scenario(scenario, credentials_map):
                 # See ``test_dispatch_pairwise`` above for the
                 # rationale behind isolating each Hypothesis example

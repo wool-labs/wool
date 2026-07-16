@@ -495,6 +495,60 @@ class TestWorkerProcess:
         # Assert
         assert isinstance(process, multiprocessing.context.SpawnProcess)
 
+    def test___init___should_default_to_daemonic(self):
+        """Test WorkerProcess is daemonic by default.
+
+        Given:
+            Default parameters
+        When:
+            WorkerProcess is instantiated
+        Then:
+            It should be daemonic (see WorkerProcess for the rationale)
+        """
+        # Act
+        process = WorkerProcess()
+
+        # Assert
+        assert process.daemon is True
+
+    def test___init___should_honor_daemon_override_when_explicitly_false(self):
+        """Test WorkerProcess honors an explicit non-daemonic override.
+
+        Given:
+            An explicit daemon=False keyword argument
+        When:
+            WorkerProcess is instantiated
+        Then:
+            It should remain non-daemonic rather than clobbering the
+            caller's choice with the daemonic default
+        """
+        # Act
+        process = WorkerProcess(daemon=False)
+
+        # Assert
+        assert process.daemon is False
+
+    def test___init___should_inherit_daemon_when_none(self):
+        """Test WorkerProcess forwards an explicit daemon=None.
+
+        Given:
+            An explicit daemon=None keyword argument
+        When:
+            WorkerProcess is instantiated from the non-daemonic main
+            process
+        Then:
+            It should inherit that process's non-daemonic disposition
+            rather than being coerced to the daemonic default —
+            ``None`` is multiprocessing's own inherit-from-parent
+            request, and forwarding it is what keeps inheritance
+            requestable
+        """
+        # Act
+        process = WorkerProcess(daemon=None)
+
+        # Assert
+        assert process.daemon is False
+
     def test___init___raises_error_for_blank_host(self):
         """Test WorkerProcess initialization raises error for blank host.
 
