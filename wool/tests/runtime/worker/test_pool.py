@@ -1290,6 +1290,32 @@ class TestWorkerPool:
         mock_worker_proxy.__aexit__.assert_awaited()
 
     @pytest.mark.asyncio
+    async def test___aexit___should_stop_spawned_workers(self, mock_worker_factory):
+        """Test pool teardown stops every spawned worker.
+
+        Given:
+            A WorkerPool with two spawned mock workers
+        When:
+            The async-with block exits
+        Then:
+            It should stop each worker, leaving its metadata cleared
+        """
+        # Arrange
+        spawned = []
+
+        def capturing_factory(*tags, credentials=None):
+            worker = mock_worker_factory(*tags, credentials=credentials)
+            spawned.append(worker)
+            return worker
+
+        # Act & assert
+        async with WorkerPool(worker=capturing_factory, spawn=2):
+            assert len(spawned) == 2
+            assert all(worker.metadata is not None for worker in spawned)
+
+        assert all(worker.metadata is None for worker in spawned)
+
+    @pytest.mark.asyncio
     async def test___aexit___cleanup_on_error(self, mock_worker_factory):
         """Test cleanup still occurs and exception propagates correctly.
 
@@ -1537,22 +1563,25 @@ class TestWorkerPool:
         assert elapsed < shutdown_timeout * 5
 
     @pytest.mark.asyncio
-    async def test___aexit___logs_warning_when_workers_abandoned(
+    async def test___aexit___should_log_warning_when_workers_reaped(
         self, mocker: MockerFixture, caplog
     ):
-        """Test pool logs a warning naming the abandoned worker count.
+        """Test pool logs a warning naming the reaped worker count and uid.
 
         Given:
             A WorkerPool whose worker has a stop() that never returns
         When:
             The async-with block exits and the shutdown bound elapses
         Then:
-            It should emit a logger.warning identifying the abandoned count
+            It should emit a logger.warning identifying the count of
+            workers it stopped waiting on and the reaped worker's uid
         """
-
         # Arrange
+        uid = uuid.uuid4()
+
         def hanging_factory(*tags, credentials=None):
             worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uid
             worker.start = mocker.AsyncMock()
 
             async def hang(*, timeout=None):
@@ -1572,10 +1601,12 @@ class TestWorkerPool:
                 pass
 
         # Assert
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
         assert any(
-            "abandoned 1 worker" in r.getMessage()
-            for r in caplog.records
-            if r.levelno == logging.WARNING
+            "stopped waiting for 1 worker" in message and str(uid) in message
+            for message in warnings
         )
 
     @pytest.mark.asyncio
@@ -1632,7 +1663,7 @@ class TestWorkerPool:
         When:
             The async-with block exits with shutdown_timeout configured
         Then:
-            It should complete without an abandonment warning
+            It should complete without a stopped-waiting warning
         """
 
         # Arrange
@@ -1654,7 +1685,7 @@ class TestWorkerPool:
 
         # Assert
         assert not any(
-            "abandoned" in r.getMessage()
+            "stopped waiting" in r.getMessage()
             for r in caplog.records
             if r.levelno == logging.WARNING
         )
@@ -1706,6 +1737,193 @@ class TestWorkerPool:
         # Assert
         fast_stop.assert_awaited_once()
         assert elapsed < shutdown_timeout * 5
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_log_reap_promptly_when_stop_times_out(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test a stop that raises TimeoutError counts as reaped.
+
+        Given:
+            A WorkerPool with a generous shutdown bound whose worker's
+            stop() raises TimeoutError immediately
+        When:
+            The async-with block exits
+        Then:
+            It should emit the warning promptly even though the pool's
+            own deadline never elapses
+        """
+        # Arrange
+        shutdown_timeout = 30.0
+
+        def timing_out_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uuid.uuid4()
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock(side_effect=TimeoutError)
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        start = time.monotonic()
+        with caplog.at_level(logging.WARNING, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=timing_out_factory,
+                spawn=1,
+                shutdown_timeout=shutdown_timeout,
+            ):
+                pass
+        elapsed = time.monotonic() - start
+
+        # Assert
+        assert any(
+            "stopped waiting for 1 worker" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+        assert elapsed < shutdown_timeout / 2
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_forward_shutdown_timeout_to_worker_stop(
+        self, mocker: MockerFixture
+    ):
+        """Test each worker's stop receives the pool's shutdown timeout.
+
+        Given:
+            A WorkerPool with shutdown_timeout configured
+        When:
+            The async-with block exits
+        Then:
+            It should await the worker's stop exactly once with the
+            configured timeout as its per-worker bound
+        """
+        # Arrange
+        stop = mocker.AsyncMock()
+
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = stop
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(worker=factory, spawn=1, shutdown_timeout=5.0):
+            pass
+
+        # Assert
+        stop.assert_awaited_once_with(timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_log_error_when_stop_fails_unexpectedly(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test an unexpected stop failure is reported rather than swallowed.
+
+        Given:
+            A WorkerPool whose worker's stop() raises an error that is
+            neither a timeout nor a cancellation
+        When:
+            The async-with block exits
+        Then:
+            It should log the failure against the worker's uid with the
+            traceback attached, rather than discarding it into the
+            teardown gather
+        """
+        # Arrange
+        uid = uuid.uuid4()
+
+        def broken_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uid
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock(side_effect=ValueError("stop is broken"))
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+            async with WorkerPool(worker=broken_factory, spawn=1, shutdown_timeout=5.0):
+                pass
+
+        # Assert
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(str(uid) in r.getMessage() and r.exc_info is not None for r in errors)
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_skip_stopping_workers_that_never_started(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test teardown leaves a never-started worker alone.
+
+        Given:
+            A WorkerPool whose worker fails to start, so it is never
+            announced and holds no metadata
+        When:
+            The async-with block exits after the spawn failure
+        Then:
+            It should neither stop nor announce that worker, and should
+            log no error for it — there is nothing to undo
+        """
+        # Arrange
+        stop = mocker.AsyncMock()
+
+        def failing_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uuid.uuid4()
+            worker.start = mocker.AsyncMock(side_effect=RuntimeError("spawn boom"))
+            worker.stop = stop
+            worker.metadata = None
+            return worker
+
+        # Act
+        with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+            with pytest.raises(ExceptionGroup):
+                async with WorkerPool(
+                    worker=failing_factory, spawn=2, shutdown_timeout=5.0
+                ):
+                    pass
+
+        # Assert
+        stop.assert_not_awaited()
+        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_wait_unbounded_when_shutdown_timeout_none(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test teardown waits for a slow worker when the timeout is None.
+
+        Given:
+            A WorkerPool with shutdown_timeout=None whose worker's stop()
+            takes appreciably longer than an instant to return
+        When:
+            The async-with block exits
+        Then:
+            It should let that stop run to completion rather than
+            cancelling it at a bound of the pool's own
+        """
+        # Arrange
+        stopped = asyncio.Event()
+
+        async def slow_stop(*, timeout=None):
+            await asyncio.sleep(0.5)
+            stopped.set()
+
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = slow_stop
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        with caplog.at_level(logging.WARNING, "wool.runtime.worker.pool"):
+            async with WorkerPool(worker=factory, spawn=1, shutdown_timeout=None):
+                pass
+
+        # Assert
+        assert stopped.is_set()
 
     @pytest.mark.asyncio
     async def test___aenter___default_case_covers_shared_memory_creation(
@@ -1880,24 +2098,6 @@ class TestWorkerPool:
 
         assert len(exc_info.value.exceptions) == 1
         assert "Worker 2 failed" in str(exc_info.value.exceptions[0])
-
-    @pytest.mark.asyncio
-    async def test_stop_terminates_workers(self, mock_worker_factory):
-        """Test all workers are terminated.
-
-        Given:
-            A WorkerPool with running workers
-        When:
-            The pool is stopped
-        Then:
-            All workers are terminated
-        """
-        # Arrange & Act
-        async with WorkerPool(worker=mock_worker_factory, spawn=2) as pool:
-            # Pool is running
-            assert pool is not None
-
-        # Assert - context exit completes without error (cleanup successful)
 
     @pytest.mark.asyncio
     async def test_multiple_workers_startup_and_cleanup(

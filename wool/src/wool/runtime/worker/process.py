@@ -64,6 +64,14 @@ class WorkerProcess(Process):
     Communicates the bound port back to the parent process via pipe after
     startup. Handles SIGTERM and SIGINT for graceful shutdown.
 
+    Spawned daemonic by default, so a worker still alive at interpreter
+    exit never blocks it and never outlives its parent. One
+    consequence: daemonic processes cannot spawn
+    `multiprocessing` children (including
+    `concurrent.futures.ProcessPoolExecutor`), so a routine that must
+    create them requires a non-daemonic worker; `subprocess` and
+    `asyncio` subprocesses are unaffected.
+
     :param host:
         Host address to bind.
     :param port:
@@ -76,7 +84,7 @@ class WorkerProcess(Process):
         Optional worker credentials for TLS/mTLS.
     :param options:
         gRPC message size options. Defaults to
-        :class:`WorkerOptions` with 100 MB limits.
+        `WorkerOptions` with 100 MB limits.
     :param uid:
         Unique identifier for this worker. Auto-generated if not
         provided.
@@ -86,13 +94,30 @@ class WorkerProcess(Process):
         Additional metadata as key-value pairs.
     :param backpressure:
         Optional admission control hook. See
-        :class:`~wool.runtime.worker.service.BackpressureLike`.
-        Serialized via :data:`wool.__serializer__` for transfer to
+        `~wool.runtime.worker.service.BackpressureLike`.
+        Serialized via `wool.__serializer__` for transfer to
         the subprocess.
+    :param daemon:
+        Whether the worker process is daemonic. Defaults to ``True``.
+        ``False`` opts out, which a routine that must create
+        `multiprocessing` children requires. ``None`` inherits from the
+        creating process, per `multiprocessing.Process`.
     :param args:
-        Additional args for :class:`multiprocessing.Process`.
+        Additional args for `multiprocessing.Process`.
     :param kwargs:
-        Additional kwargs for :class:`multiprocessing.Process`.
+        Additional kwargs for `multiprocessing.Process`.
+
+    .. rubric:: Implementation notes
+
+    The daemonic default and the parent-death watchdog cover opposite
+    directions of one invariant: neither process outlives the other.
+    `multiprocessing`'s atexit handler terminates daemonic children
+    before joining them, and the SIGTERM handler turns that termination
+    into a graceful stop. Were the child non-daemonic, the same handler
+    would join it while still live — and the child's watchdog cannot
+    fire until the parent is already gone, so the join wedges
+    interpreter exit. The watchdog covers the reverse case, where the
+    parent dies first.
     """
 
     _port: int | None
@@ -117,9 +142,10 @@ class WorkerProcess(Process):
         tags: frozenset[str] = frozenset(),
         extra: dict[str, Any] | None = None,
         backpressure: BackpressureLike | None = None,
+        daemon: bool | None = True,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, daemon=daemon, **kwargs)
         if not host:
             raise ValueError("Host must be a non-blank string")
         self._host = host

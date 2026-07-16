@@ -313,7 +313,7 @@ class MockWorker:
         )
         self._started = True
 
-    async def stop(self) -> None:
+    async def stop(self, *, timeout: float | None = None) -> None:
         """Stop the mock worker (always succeeds)."""
         self._started = False
         self._info = None
