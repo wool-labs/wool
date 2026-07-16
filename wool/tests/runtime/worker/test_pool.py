@@ -1563,18 +1563,18 @@ class TestWorkerPool:
         assert elapsed < shutdown_timeout * 5
 
     @pytest.mark.asyncio
-    async def test___aexit___should_log_warning_when_workers_abandoned(
+    async def test___aexit___should_log_warning_when_workers_reaped(
         self, mocker: MockerFixture, caplog
     ):
-        """Test pool logs a warning naming the abandoned worker count and uid.
+        """Test pool logs a warning naming the reaped worker count and uid.
 
         Given:
             A WorkerPool whose worker has a stop() that never returns
         When:
             The async-with block exits and the shutdown bound elapses
         Then:
-            It should emit a logger.warning identifying the abandoned
-            count and the abandoned worker's uid
+            It should emit a logger.warning identifying the count of
+            workers it stopped waiting on and the reaped worker's uid
         """
         # Arrange
         uid = uuid.uuid4()
@@ -1605,7 +1605,7 @@ class TestWorkerPool:
             r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
         ]
         assert any(
-            "abandoned 1 worker" in message and str(uid) in message
+            "stopped waiting for 1 worker" in message and str(uid) in message
             for message in warnings
         )
 
@@ -1663,7 +1663,7 @@ class TestWorkerPool:
         When:
             The async-with block exits with shutdown_timeout configured
         Then:
-            It should complete without an abandonment warning
+            It should complete without a stopped-waiting warning
         """
 
         # Arrange
@@ -1685,7 +1685,7 @@ class TestWorkerPool:
 
         # Assert
         assert not any(
-            "abandoned" in r.getMessage()
+            "stopped waiting" in r.getMessage()
             for r in caplog.records
             if r.levelno == logging.WARNING
         )
@@ -1739,10 +1739,10 @@ class TestWorkerPool:
         assert elapsed < shutdown_timeout * 5
 
     @pytest.mark.asyncio
-    async def test___aexit___should_log_abandonment_promptly_when_stop_times_out(
+    async def test___aexit___should_log_reap_promptly_when_stop_times_out(
         self, mocker: MockerFixture, caplog
     ):
-        """Test a stop that raises TimeoutError counts as abandoned.
+        """Test a stop that raises TimeoutError counts as reaped.
 
         Given:
             A WorkerPool with a generous shutdown bound whose worker's
@@ -1750,8 +1750,8 @@ class TestWorkerPool:
         When:
             The async-with block exits
         Then:
-            It should emit the abandonment warning promptly even though
-            the pool's own deadline never elapses
+            It should emit the warning promptly even though the pool's
+            own deadline never elapses
         """
         # Arrange
         shutdown_timeout = 30.0
@@ -1777,7 +1777,7 @@ class TestWorkerPool:
 
         # Assert
         assert any(
-            "abandoned 1 worker" in r.getMessage()
+            "stopped waiting for 1 worker" in r.getMessage()
             for r in caplog.records
             if r.levelno == logging.WARNING
         )
