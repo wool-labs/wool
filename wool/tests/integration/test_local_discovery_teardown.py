@@ -12,6 +12,7 @@ in ``tests/runtime/discovery/test_local.py``.
 
 import asyncio
 import contextlib
+import logging
 import multiprocessing
 import os
 import signal
@@ -216,21 +217,15 @@ class TestOverlappingNamespaceLifecycles:
         try:
             await retry_grpc_internal(body)
         finally:
-            # Hygiene, not assertion: pool b's worker currently leaks
-            # after an owner-first exit (#298); kill any stragglers so
-            # they cannot pollute the session.
+            # Hygiene, not assertion: kill any stragglers so a worker
+            # this test failed to reap cannot pollute the session.
             for child in multiprocessing.active_children():
                 if child.pid not in before:
                     _ensure_killed(child.pid)
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="surviving pool's worker leaks after owner-first exit (#298)",
-    )
     async def test___aexit___should_reap_worker_when_owner_pool_exited_first(
-        self, retry_grpc_internal
+        self, retry_grpc_internal, caplog
     ):
         """Test a surviving pool reaps its worker despite owner exit.
 
@@ -251,10 +246,9 @@ class TestOverlappingNamespaceLifecycles:
         release_owner = asyncio.Event()
         b_pids: list[int] = []
 
-        # The strict xfail below pins #298 via ``raises=AssertionError``, so
-        # the reap check must be the only ``assert`` in this test: arrange
-        # and act failures use ``pytest.fail``, which raises ``Failed`` and
-        # therefore cannot satisfy the xfail.
+        # Arrange and act failures use ``pytest.fail`` rather than
+        # ``assert`` so a broken setup stays distinguishable from a
+        # genuine leak.
         async def owner():
             async with WorkerPool("a", spawn=1, discovery=LocalDiscovery(namespace)):
                 if await routines.add(1, 2) != 3:
@@ -289,14 +283,30 @@ class TestOverlappingNamespaceLifecycles:
                         await owner_task
 
         try:
-            await retry_grpc_internal(body)
+            with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+                await retry_grpc_internal(body)
 
             # Assert — join any finished children first so an
             # exited-but-unreaped worker cannot masquerade as alive
             # under os.kill(pid, 0)
             multiprocessing.active_children()
+            # Cardinality first: an empty ``b_pids`` would satisfy the
+            # loop below vacuously.
+            assert len(b_pids) == 1
             for pid in b_pids:
                 assert not _pid_alive(pid)
+
+            # Vacuity guard: the reap above proves nothing unless b's
+            # drop announcement actually failed. #300 would let that
+            # publish succeed, reaping b's worker without exercising
+            # #298's fix at all — so pin that the announcement really
+            # did fail here. If #300 lands, this fails loudly rather
+            # than rotting into a green test that guards nothing.
+            assert any(
+                "could not announce" in record.getMessage()
+                for record in caplog.records
+                if record.levelno == logging.ERROR
+            )
         finally:
             for child in multiprocessing.active_children():
                 if child.pid not in before:

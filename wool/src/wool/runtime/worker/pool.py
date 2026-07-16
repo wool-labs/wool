@@ -244,10 +244,10 @@ class WorkerPool:
     :param shutdown_timeout:
         Maximum number of seconds to wait for spawned workers to stop
         during pool teardown. The bound applies as a single deadline to
-        the full teardown sequence: each worker's ``stop()`` receives
-        ``shutdown_timeout`` as its per-worker bound, the gather waits
-        for whatever time remains, and publisher cleanup gets whatever
-        is left. When the deadline elapses, the pool stops waiting and
+        the full teardown sequence: each worker's drop announcement and
+        ``stop()`` share whatever remains of it, the gather waits for
+        whatever time remains, and publisher cleanup gets whatever is
+        left. When the deadline elapses, the pool stops waiting and
         logs the UIDs it stopped waiting on via ``logging.warning``.
         Those workers are not leaked: a `LocalWorker` is still reaped
         off-loop (see `LocalWorker._stop`), which can hold ``__aexit__``
@@ -255,7 +255,15 @@ class WorkerPool:
         the graceful drain, not the process. A stop that fails for any
         other reason is logged via ``logging.error`` and teardown
         continues, so one worker's failure never strands another's
-        cleanup. ``None`` disables the bound. Must be positive when
+        cleanup. Reaping does not depend on discovery health: a
+        ``worker-dropped`` announcement that raises *or* hangs is logged
+        via ``logging.error`` and the worker is stopped regardless. A
+        hanging announcement consumes the deadline it shares with the
+        stop, so the worker it precedes is reaped rather than drained —
+        discovery cannot strand a worker, but it can cost that worker
+        its graceful drain. ``None`` disables the bound, in which case a
+        hanging announcement blocks teardown indefinitely, in keeping
+        with that value's unbounded-wait contract. Must be positive when
         provided. Defaults to ``60.0``.
     :param lazy:
         When ``True`` (default), defer discovery setup and the quorum
@@ -619,15 +627,37 @@ class WorkerPool:
         `ExceptionGroup`. Factories that declare ``host``, including
         the default `LocalWorker`, receive the publisher's prescribed
         bind host (see `~wool.DiscoveryPublisherLike.bind_host`);
-        bound factories own their binding. Teardown applies the
-        pool's ``shutdown_timeout`` as a single deadline across worker
-        stops and publisher cleanup, logging any workers it stops
-        waiting on (see ``shutdown_timeout``), and runs even when publisher
-        validation or worker construction fails, so an entered
-        publisher context is never leaked.
+        bound factories own their binding. Teardown applies the pool's
+        ``shutdown_timeout`` as a single deadline across worker stops
+        and publisher cleanup — see that parameter for the contract
+        this implements — and runs even when publisher validation or
+        worker construction fails, so an entered publisher context is
+        always exited rather than dropped on the floor. Cleanup is
+        itself bounded by what remains of the deadline, so a teardown
+        that exhausts the deadline can time cleanup out before the
+        publisher's ``__aexit__`` runs.
 
         :yields:
             Metadata for the spawned workers.
+
+        .. rubric:: Implementation notes
+
+        The drop announcement gets its own cancellation arm because
+        `asyncio.CancelledError` is a `BaseException`: an ``except
+        Exception`` guard cannot see the cancellation the shutdown
+        deadline delivers to an announcement that hangs rather than
+        raises, so without that arm the discovery failure driving the
+        teardown goes unreported and the reap warning is left blaming
+        the worker for a fault that was discovery's.
+
+        The stop sits in that ``try``'s ``finally`` rather than after
+        it, so it outlives the same cancellation, and it takes
+        ``remaining()`` rather than the full ``shutdown_timeout``. The
+        deadline has already elapsed by the time a hanging announcement
+        reaches the stop, and handing it a fresh budget there would let
+        an already-cancelled task outlive the deadline that the gather
+        below exists to enforce — trading a leaked worker for an
+        unbounded teardown.
         """
         publisher_svc, publisher_ctx = await self._enter_context(publisher)
         try:
@@ -665,10 +695,42 @@ class WorkerPool:
                         # and cannot be stopped (`Worker.stop` rejects it),
                         # so teardown has nothing to undo.
                         return
-                    # Announce the drop before stopping so subscribers
-                    # stop routing to a worker that is about to go away.
-                    await publisher_svc.publish("worker-dropped", metadata)
-                    await worker.stop(timeout=self._shutdown_timeout)
+                    try:
+                        # Announce the drop before stopping so subscribers
+                        # stop routing to a worker that is about to go away.
+                        await publisher_svc.publish("worker-dropped", metadata)
+                    except Exception:
+                        # An announcement failure never abandons the stop —
+                        # see the docstring's implementation notes.
+                        logger.error(
+                            "WorkerPool shutdown could not announce worker %s as "
+                            "dropped; the stop is attempted regardless and "
+                            "reported separately if it fails, but subscribers "
+                            "may keep routing to it until they observe the drop "
+                            "by other means",
+                            worker.uid,
+                            exc_info=True,
+                            extra={"undropped_worker_uid": str(worker.uid)},
+                        )
+                    except asyncio.CancelledError:
+                        # `except Exception` cannot see a cancelled
+                        # announcement — see the docstring's implementation
+                        # notes.
+                        logger.error(
+                            "WorkerPool shutdown could not announce worker %s as "
+                            "dropped within the shutdown deadline; the stop is "
+                            "attempted regardless, but subscribers may keep "
+                            "routing to it until they observe the drop by other "
+                            "means",
+                            worker.uid,
+                            extra={"undropped_worker_uid": str(worker.uid)},
+                        )
+                        raise
+                    finally:
+                        # The stop outlives the cancellation above, bounded by
+                        # what remains of the deadline — see the docstring's
+                        # implementation notes.
+                        await worker.stop(timeout=remaining())
 
                 task = asyncio.create_task(start(worker))
                 tasks.append(task)
