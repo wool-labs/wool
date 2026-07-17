@@ -339,13 +339,20 @@ class _DirectDiscovery:
     Does NOT implement ``__enter__``/``__exit__``/``__aenter__``/
     ``__aexit__``, forcing ``WorkerPool._enter_context`` to take the
     passthrough path. Used for the ``*_DIRECT`` factory form arrangements.
+
+    ``publisher`` overrides the wrapped service's publisher, for tests
+    that need the real subscribe path but a publisher that misbehaves
+    on demand.
     """
 
-    def __init__(self, discovery):
+    def __init__(self, discovery, publisher=None):
         self._discovery = discovery
+        self._publisher = publisher
 
     @property
     def publisher(self):
+        if self._publisher is not None:
+            return self._publisher
         return self._discovery.publisher
 
     @property

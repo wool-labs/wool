@@ -2,24 +2,34 @@
 
 import asyncio
 import contextlib
+import logging
 import multiprocessing
 import os
 import signal
 import subprocess
 import sys
 import time
+import uuid
 
 import grpc
 import grpc.aio
 import pytest
 
+from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.process import WorkerProcess
 
 from . import routines
+from .conftest import _DirectDiscovery
 from .conftest import build_pool_from_scenario
 from .conftest import default_scenario
+
+#: Hang the ``worker-dropped`` announcement rather than failing it,
+#: modelling a discovery service that has stopped responding rather
+#: than one that errors outright. Mirrors the unit suite's sentinel of
+#: the same name, so one convention governs both.
+_HANG = object()
 
 # This helper script must stay a `python -c` string: it has no
 # `__main__` guard, so as a script file the spawn bootstrap's re-import
@@ -425,6 +435,159 @@ class TestWorkerOrphanPrevention:
             assert not _pid_alive(pid)
         finally:
             _ensure_killed(pid)
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_reap_workers_when_drop_announcement_fails(
+        self, caplog
+    ):
+        """Test a pool reaps its workers despite a broken publisher.
+
+        Given:
+            A pool of two workers on a real LocalDiscovery whose
+            worker-dropped announcement raises PermissionError, a
+            discovery failure unrelated to segment ownership
+        When:
+            The async-with block exits
+        Then:
+            It should leave no worker subprocess alive and report one
+            announcement failure per worker, rather than abandoning the
+            stops behind the failed announcements
+        """
+        # Arrange
+        namespace = f"drop-fails-{uuid.uuid4().hex[:12]}"
+        before = {child.pid for child in multiprocessing.active_children()}
+        pids: list[int] = []
+
+        try:
+            # Act
+            with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+                with LocalDiscovery(namespace) as discovery:
+                    async with asyncio.timeout(30):
+                        async with WorkerPool(
+                            spawn=2,
+                            shutdown_timeout=10.0,
+                            discovery=_DirectDiscovery(
+                                discovery,
+                                _BrokenDropPublisher(
+                                    discovery.publisher,
+                                    PermissionError("discovery is not writable"),
+                                ),
+                            ),
+                        ):
+                            pids.extend(
+                                child.pid
+                                for child in multiprocessing.active_children()
+                                if child.pid not in before
+                            )
+
+            # Assert — join any finished children first so an
+            # exited-but-unreaped worker cannot masquerade as alive
+            # under os.kill(pid, 0)
+            multiprocessing.active_children()
+            assert len(pids) == 2
+            for pid in pids:
+                assert not _pid_alive(pid)
+            errors = [
+                r.getMessage() for r in caplog.records if r.levelno == logging.ERROR
+            ]
+            assert sum("announce" in message for message in errors) == 2
+        finally:
+            # The Act belongs inside this `try`: this test constructs the
+            # scenario where stragglers exist, so an Act that raises is
+            # exactly when cleanup matters most.
+            for child in multiprocessing.active_children():
+                if child.pid not in before:
+                    _ensure_killed(child.pid)
+            for pid in pids:
+                _ensure_killed(pid)
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_reap_worker_when_drop_announcement_hangs(self):
+        """Test a pool reaps its worker despite a wedged publisher.
+
+        Given:
+            A pool on a real LocalDiscovery whose worker-dropped
+            announcement never returns, as an unresponsive discovery
+            service leaves it
+        When:
+            The async-with block exits and the shutdown deadline
+            cancels the pending announcement
+        Then:
+            It should leave no worker subprocess alive, rather than
+            abandoning the stop inside the cancelled announcement
+        """
+        # Arrange
+        namespace = f"drop-hangs-{uuid.uuid4().hex[:12]}"
+        before = {child.pid for child in multiprocessing.active_children()}
+        pids: list[int] = []
+
+        try:
+            # Act
+            with LocalDiscovery(namespace) as discovery:
+                async with asyncio.timeout(30):
+                    async with WorkerPool(
+                        spawn=1,
+                        shutdown_timeout=5.0,
+                        discovery=_DirectDiscovery(
+                            discovery,
+                            _BrokenDropPublisher(discovery.publisher, _HANG),
+                        ),
+                    ):
+                        pids.extend(
+                            child.pid
+                            for child in multiprocessing.active_children()
+                            if child.pid not in before
+                        )
+
+            # Assert — join any finished children first so an
+            # exited-but-unreaped worker cannot masquerade as alive
+            # under os.kill(pid, 0)
+            multiprocessing.active_children()
+            assert len(pids) == 1
+            for pid in pids:
+                assert not _pid_alive(pid)
+        finally:
+            # The Act belongs inside this `try`: if the fix regresses and
+            # the hang wedges teardown until `asyncio.timeout(30)` fires,
+            # the Act raises and live workers would otherwise escape.
+            for child in multiprocessing.active_children():
+                if child.pid not in before:
+                    _ensure_killed(child.pid)
+            for pid in pids:
+                _ensure_killed(pid)
+
+
+class _BrokenDropPublisher:
+    """Wraps a real publisher, breaking only ``worker-dropped``.
+
+    Every other event, and the publisher's context-manager protocol,
+    delegate to the wrapped publisher: `LocalDiscovery.Publisher` is an
+    async context manager, and hiding that would send
+    ``WorkerPool._enter_context`` down the passthrough path, leaving the
+    real publisher neither entered nor exited and teardown's publisher
+    cleanup a no-op. Passing `_HANG` hangs the announcement instead of
+    raising it, modelling an unresponsive discovery service.
+    """
+
+    def __init__(self, publisher, error):
+        self._publisher = publisher
+        self._error = error
+        self.bind_host = publisher.bind_host
+
+    async def __aenter__(self):
+        await self._publisher.__aenter__()
+        return self
+
+    async def __aexit__(self, *args):
+        return await self._publisher.__aexit__(*args)
+
+    async def publish(self, type, metadata):
+        if type == "worker-dropped":
+            # `_HANG` never returns; the shutdown deadline ends the wait.
+            if self._error is _HANG:
+                await asyncio.Event().wait()
+            raise self._error
+        return await self._publisher.publish(type, metadata)
 
 
 def _pid_alive(pid: int) -> bool:

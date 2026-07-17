@@ -37,6 +37,16 @@ from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.proxy import IneffectiveQuorumTimeoutWarning
 from wool.runtime.worker.proxy import ReducibleAsyncIterator
 
+#: Hang the ``worker-dropped`` announcement rather than failing it,
+#: modelling a discovery service that has stopped responding rather
+#: than one that errors outright. A named sentinel rather than
+#: ``None``, which already means "raise the default error".
+_HANG = object()
+
+
+class _BrokenPublisherError(Exception):
+    """A publisher failure of a type the pool has never heard of."""
+
 
 def _make_worker_metadata(*tags: str) -> WorkerMetadata:
     """Build a valid WorkerMetadata with a fresh UUID."""
@@ -48,6 +58,36 @@ def _make_worker_metadata(*tags: str) -> WorkerMetadata:
         tags=frozenset(tags),
         extra=MappingProxyType({}),
     )
+
+
+def _dropped_publish(error=None, *, only=None):
+    """Build a ``publish`` side effect that breaks the drop announcement.
+
+    Lets a worker start and register normally, then breaks teardown's
+    ``worker-dropped`` announcement with ``error`` — by default the
+    ``FileNotFoundError`` an unlinked discovery segment raises, or
+    `_HANG` to hang the announcement forever instead, in which case
+    the shutdown deadline is what ends the wait. ``only`` narrows the
+    breakage to the workers whose metadata it accepts, leaving their
+    siblings' announcements intact. The inner parameter is named
+    ``type`` to match `DiscoveryPublisherLike.publish`.
+    """
+    error = (
+        error
+        if error is not None
+        else FileNotFoundError("discovery segment unlinked by a peer")
+    )
+
+    async def publish(type, metadata):
+        if type != "worker-dropped":
+            return
+        if only is not None and not only(metadata):
+            return
+        if error is _HANG:
+            await asyncio.Event().wait()
+        raise error
+
+    return publish
 
 
 class _FakePublisher:
@@ -1787,15 +1827,17 @@ class TestWorkerPool:
     async def test___aexit___should_forward_shutdown_timeout_to_worker_stop(
         self, mocker: MockerFixture
     ):
-        """Test each worker's stop receives the pool's shutdown timeout.
+        """Test each worker's stop receives what remains of the deadline.
 
         Given:
             A WorkerPool with shutdown_timeout configured
         When:
-            The async-with block exits
+            The async-with block exits with nothing having consumed the
+            deadline
         Then:
-            It should await the worker's stop exactly once with the
-            configured timeout as its per-worker bound
+            It should await the worker's stop exactly once, bounded by
+            what remains of the deadline -- all but a scheduling hair of
+            the configured timeout
         """
         # Arrange
         stop = mocker.AsyncMock()
@@ -1812,7 +1854,12 @@ class TestWorkerPool:
             pass
 
         # Assert
-        stop.assert_awaited_once_with(timeout=5.0)
+        # Approximate by necessity, not by convenience: the bound is the
+        # deadline's *remainder*, so it is a hair under the configured
+        # value and an equality assertion would pin a float identity the
+        # contract does not promise. The tolerance is still tight enough
+        # to catch a dropped kwarg, a None, or a zero.
+        stop.assert_awaited_once_with(timeout=pytest.approx(5.0, abs=0.1))
 
     @pytest.mark.asyncio
     async def test___aexit___should_log_error_when_stop_fails_unexpectedly(
@@ -1849,6 +1896,423 @@ class TestWorkerPool:
         # Assert
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert any(str(uid) in r.getMessage() and r.exc_info is not None for r in errors)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            FileNotFoundError("discovery segment unlinked by a peer"),
+            PermissionError("discovery segment not writable"),
+            OSError("discovery buffer corrupt"),
+            ConnectionError("discovery service unreachable"),
+            TimeoutError("discovery publish timed out"),
+            RuntimeError("publisher is broken"),
+            ValueError("malformed metadata"),
+            _BrokenPublisherError("something the pool has never seen"),
+        ],
+        ids=lambda error: type(error).__name__,
+    )
+    async def test___aexit___should_stop_worker_when_drop_announcement_fails(
+        self, mocker: MockerFixture, error
+    ):
+        """Test a worker is reaped despite an unhealthy publisher.
+
+        Given:
+            A WorkerPool whose publisher raises when announcing
+            worker-dropped, as it does when a peer has unlinked the
+            discovery segment out from under it
+        When:
+            The async-with block exits
+        Then:
+            It should still await the worker's stop with the configured
+            timeout, whatever the announcement raised, rather than
+            abandoning it behind the failed announcement
+        """
+        # Arrange
+        stop = mocker.AsyncMock()
+
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = stop
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        discovery = _FakeDiscovery(mocker)
+        discovery.publisher.publish.side_effect = _dropped_publish(error)
+
+        # Act
+        async with WorkerPool(
+            worker=factory, spawn=1, shutdown_timeout=5.0, discovery=discovery
+        ):
+            pass
+
+        # Assert
+        stop.assert_awaited_once_with(timeout=pytest.approx(5.0, abs=0.1))
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_stop_worker_when_drop_announcement_hangs(
+        self, mocker: MockerFixture
+    ):
+        """Test a worker is reaped when the announcement never returns.
+
+        Given:
+            A WorkerPool whose publisher hangs forever when announcing
+            worker-dropped, as a discovery service that has stopped
+            responding does
+        When:
+            The async-with block exits and the shutdown deadline
+            cancels the pending announcement
+        Then:
+            It should still await the worker's stop rather than
+            abandoning it inside the cancelled announcement, and bound
+            that stop by what remains of the deadline -- nothing, since
+            the announcement consumed it -- reaping the worker instead
+            of granting it a fresh budget to drain in
+        """
+        # Arrange
+        stop = mocker.AsyncMock()
+
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = stop
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        discovery = _FakeDiscovery(mocker)
+        discovery.publisher.publish.side_effect = _dropped_publish(_HANG)
+
+        # Act
+        async with WorkerPool(
+            worker=factory, spawn=1, shutdown_timeout=0.1, discovery=discovery
+        ):
+            pass
+
+        # Assert
+        stop.assert_awaited_once_with(timeout=0.0)
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_log_error_when_drop_announcement_fails(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test a failed drop announcement is reported on its own path.
+
+        Given:
+            A WorkerPool whose publisher raises when announcing
+            worker-dropped
+        When:
+            The async-with block exits
+        Then:
+            It should log the announcement failure against the worker's
+            uid with the traceback attached, rather than discarding it
+            or reporting it as a stop failure
+        """
+        # Arrange
+        uid = uuid.uuid4()
+
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uid
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        discovery = _FakeDiscovery(mocker)
+        discovery.publisher.publish.side_effect = _dropped_publish()
+
+        # Act
+        with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=factory, spawn=1, shutdown_timeout=5.0, discovery=discovery
+            ):
+                pass
+
+        # Assert — the "announce" clause is load-bearing, not decoration:
+        # teardown's stop-failure handler also logs the uid with exc_info,
+        # so without it this assertion passes even when the announcement
+        # failure is misreported as a stop failure.
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            str(uid) in r.getMessage()
+            and "announce" in r.getMessage()
+            and r.exc_info is not None
+            for r in errors
+        )
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_not_bound_worker_stop_when_timeout_is_none(
+        self, mocker: MockerFixture
+    ):
+        """Test an unbounded pool leaves the stop unbounded despite a failure.
+
+        Given:
+            A WorkerPool with shutdown_timeout=None whose publisher
+            raises when announcing worker-dropped
+        When:
+            The async-with block exits
+        Then:
+            It should await the worker's stop with no bound of its own,
+            since there is no deadline for the announcement to consume
+        """
+        # Arrange
+        stop = mocker.AsyncMock()
+
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = stop
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        discovery = _FakeDiscovery(mocker)
+        discovery.publisher.publish.side_effect = _dropped_publish()
+
+        # Act
+        async with WorkerPool(
+            worker=factory, spawn=1, shutdown_timeout=None, discovery=discovery
+        ):
+            pass
+
+        # Assert
+        stop.assert_awaited_once_with(timeout=None)
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_log_error_when_drop_announcement_hangs(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test a hanging drop announcement is reported, not swallowed.
+
+        Given:
+            A WorkerPool whose publisher hangs forever when announcing
+            worker-dropped
+        When:
+            The async-with block exits and the shutdown deadline cancels
+            the pending announcement
+        Then:
+            It should log the announcement failure against the worker's
+            uid, rather than leaving the reap warning as the operator's
+            only signal -- which blames the worker for a fault that was
+            discovery's
+        """
+        # Arrange
+        uid = uuid.uuid4()
+
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uid
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        discovery = _FakeDiscovery(mocker)
+        discovery.publisher.publish.side_effect = _dropped_publish(_HANG)
+
+        # Act
+        with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=factory, spawn=1, shutdown_timeout=0.1, discovery=discovery
+            ):
+                pass
+
+        # Assert — the deadline cancels the announcement rather than
+        # failing it, and `CancelledError` is a `BaseException`: an
+        # `except Exception` guard cannot see this, so the report has to
+        # come from a handler that catches cancellation on purpose.
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            str(uid) in r.getMessage() and "announce" in r.getMessage() for r in errors
+        )
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_stop_every_worker_when_some_announcements_fail(
+        self, mocker: MockerFixture
+    ):
+        """Test one bad announcement cannot strand sibling workers.
+
+        Given:
+            A WorkerPool of three workers whose publisher raises when
+            announcing only the second worker as dropped
+        When:
+            The async-with block exits
+        Then:
+            It should await every worker's stop exactly once, leaving
+            no sibling behind the one failed announcement
+        """
+        # Arrange
+        workers = []
+
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uuid.uuid4()
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            workers.append(worker)
+            return worker
+
+        discovery = _FakeDiscovery(mocker)
+        discovery.publisher.publish.side_effect = _dropped_publish(
+            PermissionError("discovery segment not writable"),
+            only=lambda metadata: metadata is workers[1].metadata,
+        )
+
+        # Act
+        async with WorkerPool(
+            worker=factory, spawn=3, shutdown_timeout=5.0, discovery=discovery
+        ):
+            pass
+
+        # Assert
+        assert len(workers) == 3
+        for worker in workers:
+            worker.stop.assert_awaited_once_with(timeout=pytest.approx(5.0, abs=0.1))
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_report_both_when_announcement_and_stop_fail(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test the announcement and stop failures are reported apart.
+
+        Given:
+            A WorkerPool whose publisher raises when announcing
+            worker-dropped and whose worker's stop also raises
+        When:
+            The async-with block exits
+        Then:
+            It should log both failures against the worker's uid as
+            separate records, collapsing neither into the other
+        """
+        # Arrange
+        uid = uuid.uuid4()
+
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uid
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock(side_effect=ValueError("stop is broken"))
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        discovery = _FakeDiscovery(mocker)
+        discovery.publisher.publish.side_effect = _dropped_publish()
+
+        # Act
+        with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=factory, spawn=1, shutdown_timeout=5.0, discovery=discovery
+            ):
+                pass
+
+        # Assert
+        messages = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.ERROR and str(uid) in r.getMessage()
+        ]
+        assert any("announce" in message for message in messages)
+        assert any("could not stop worker" in message for message in messages)
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_warn_of_abandonment_when_stop_times_out(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test a stop timeout still reaps despite a failed announcement.
+
+        Given:
+            A WorkerPool whose publisher raises when announcing
+            worker-dropped and whose worker's stop then raises
+            TimeoutError
+        When:
+            The async-with block exits
+        Then:
+            It should report the announcement failure and still warn
+            that it stopped waiting on the worker, since the two
+            failures travel independent paths and the announcement's
+            must not divert the stop's out of the reap bucket
+        """
+        # Arrange
+        uid = uuid.uuid4()
+
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uid
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock(
+                side_effect=TimeoutError("worker did not drain in time")
+            )
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        discovery = _FakeDiscovery(mocker)
+        discovery.publisher.publish.side_effect = _dropped_publish()
+
+        # Act
+        with caplog.at_level(logging.DEBUG, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=factory, spawn=1, shutdown_timeout=5.0, discovery=discovery
+            ):
+                pass
+
+        # Assert
+        assert any(
+            "announce" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.ERROR
+        )
+        assert any(
+            "stopped waiting" in r.getMessage() and str(uid) in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_not_warn_of_abandonment_when_announcement_times_out(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test a publish TimeoutError is not laundered into a reap warning.
+
+        Given:
+            A WorkerPool whose publisher raises TimeoutError when
+            announcing worker-dropped but whose worker stops cleanly
+        When:
+            The async-with block exits
+        Then:
+            It should not warn that it stopped waiting on a worker it
+            never abandoned, since teardown's reap bucket keys on
+            TimeoutError and a publish timeout must not land in it
+        """
+
+        # Arrange
+        def factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.uid = uuid.uuid4()
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        discovery = _FakeDiscovery(mocker)
+        discovery.publisher.publish.side_effect = _dropped_publish(
+            TimeoutError("discovery publish timed out")
+        )
+
+        # Act
+        with caplog.at_level(logging.DEBUG, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=factory, spawn=1, shutdown_timeout=5.0, discovery=discovery
+            ):
+                pass
+
+        # Assert — the stop and the announcement report are the sibling
+        # tests' behaviors; this one owns only the absent warning.
+        assert not any(
+            "stopped waiting" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
 
     @pytest.mark.asyncio
     async def test___aexit___should_skip_stopping_workers_that_never_started(
