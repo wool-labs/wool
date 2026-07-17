@@ -75,6 +75,117 @@ class WorkerPool:
     - **Hybrid pools** spawn local workers and additionally admit
       remote workers found through discovery.
 
+    :param tags:
+        Capability tags for spawned workers.
+    :param spawn:
+        Number of workers to spawn (0 = CPU count).
+    :param size:
+        .. deprecated::
+            Use ``spawn`` instead. Will be removed in the next major release.
+    :param lease:
+        Maximum number of additionally discovered workers to admit to the
+        pool. The total pool capacity is ``spawn + lease`` when both are
+        set, or just ``lease`` for a durable pool with no spawned
+        workers. Defaults to ``None`` (unbounded). Only meaningful when
+        a ``discovery`` service is configured; supplying ``lease``
+        without ``discovery`` records the value but never consults it,
+        accompanied by an `IneffectiveLeaseWarning`. Admission semantics
+        are `WorkerProxy`'s — see its ``lease`` parameter.
+    :param worker:
+        Worker factory callable. A `WorkerFactory` declares a ``host``
+        keyword and receives the discovery publisher's prescribed bind
+        host. A `BoundWorkerFactory` declares no ``host`` and owns its
+        binding. Classification is by explicit signature declaration;
+        see `WorkerFactory` for the rules. Defaults to `LocalWorker`,
+        which declares ``host`` and therefore binds the publisher's
+        prescribed host.
+    :param discovery:
+        Discovery service to attach — a `~wool.DiscoveryLike` instance
+        or any `Factory` form resolving to one. The resolved object is
+        validated against the protocol at context entry. Workers it
+        surfaces are additionally subject to the underlying
+        `WorkerProxy`'s admission gate.
+
+        .. caution::
+
+           A pre-called context-manager instance passed as
+           ``discovery`` is not picklable and breaks nested routine
+           dispatch. Pass a callable returning it instead (see
+           `Factory`).
+    :param loadbalancer:
+        Load balancer instance, factory, or context manager.
+
+        .. caution::
+
+           A pre-called context-manager instance passed as
+           ``loadbalancer`` is not picklable and breaks nested routine
+           dispatch. Pass a callable returning it instead (see
+           `Factory`).
+    :param credentials:
+        Optional channel credentials for TLS/mTLS connections to workers.
+    :param quorum:
+        Minimum number of workers that must be discovered before the proxy
+        considers itself ready. Defaults to ``1`` — block until at least
+        one worker is admitted. Pass a larger integer to require more
+        workers, or ``None``/``0`` to disable the gate entirely
+        (``dispatch`` may then raise immediately if no workers have been
+        discovered yet). When ``lazy=True`` (default), the quorum wait is
+        deferred to the first dispatch; with ``lazy=False`` it blocks at
+        context entry.
+    :param quorum_timeout:
+        Seconds to wait for ``quorum`` workers to be discovered before
+        raising `asyncio.TimeoutError`. Only meaningful when
+        ``quorum`` is a positive integer; supplying it with
+        ``quorum=None`` or ``quorum=0`` records the value but never
+        consults it, accompanied by an `IneffectiveQuorumTimeoutWarning`.
+        Defaults to ``60``; pass ``None`` to wait indefinitely.  With
+        ``lazy=False`` the timeout fires at ``__aenter__``; the pool,
+        never having entered, is unusable per its single-use
+        semantics, so construct a new pool to retry.  With
+        ``lazy=True`` (default) the timeout fires on the first
+        `WorkerProxy.dispatch`; a later dispatch retries and recovers
+        once a worker is admitted.
+    :param shutdown_timeout:
+        Maximum number of seconds to wait for spawned workers to stop
+        during pool teardown, applied as a single deadline to the full
+        teardown sequence. When it elapses the pool stops waiting and
+        logs the workers it gave up on; those workers are reaped
+        regardless, so what is lost is the graceful drain, not the
+        process. A stop that fails for any other reason is logged and
+        teardown continues, so one worker's failure never strands
+        another's cleanup. Reaping does not depend on discovery health:
+        a ``worker-dropped`` announcement that fails or hangs is logged
+        and the worker stopped regardless — discovery cannot strand a
+        worker, but a hanging announcement can consume the deadline and
+        cost that worker its graceful drain. A finite value overrides a
+        worker's own shutdown grace period; ``None`` disables the bound,
+        in which case a hanging announcement blocks teardown
+        indefinitely, in keeping with that value's unbounded-wait
+        contract. Must be positive when provided. Defaults to ``60.0``.
+
+        .. caution::
+
+           Size ``shutdown_timeout`` for the slowest worker the pool
+           spawns. Because a finite value overrides the worker's own
+           grace period, a worker configured to shut down more slowly
+           than the pool waits — e.g., ``partial(LocalWorker,
+           shutdown_grace_period=120)`` under the default
+           ``shutdown_timeout=60.0`` — never receives that grace; it is
+           silently ignored unless the pool waits unbounded
+           (``shutdown_timeout=None``).
+    :param lazy:
+        When ``True`` (default), defer discovery setup and the quorum
+        wait to the first `WorkerProxy.dispatch`.  When ``False``,
+        eagerly enter the underlying proxy at ``__aenter__`` time and
+        run the quorum wait there.
+    :raises ValueError:
+        If configuration is invalid, CPU count unavailable, or
+        ``shutdown_timeout`` is not positive.
+    :raises asyncio.TimeoutError:
+        If the quorum wait does not complete within ``quorum_timeout``
+        — raised by the underlying `WorkerProxy` at context entry
+        (``lazy=False``) or first dispatch (``lazy=True``).
+
     **Basic ephemeral pool:**
 
     .. code-block:: python
@@ -181,101 +292,20 @@ class WorkerPool:
         async with WorkerPool(spawn=4, quorum=4, quorum_timeout=30, lazy=False):
             result = await task()
 
-    :param tags:
-        Capability tags for spawned workers.
-    :param spawn:
-        Number of workers to spawn (0 = CPU count).
-    :param size:
-        .. deprecated::
-            Use ``spawn`` instead. Will be removed in the next major release.
-    :param lease:
-        Maximum number of additionally discovered workers to admit to the
-        pool. The total pool capacity is ``spawn + lease`` when both are
-        set, or just ``lease`` for external pools. Defaults to ``None``
-        (unbounded). Only meaningful when a ``discovery`` service is
-        configured; supplying ``lease`` without ``discovery`` records
-        the value but never consults it, accompanied by an
-        `IneffectiveLeaseWarning`. Admission semantics are
-        `WorkerProxy`'s — see its ``lease`` parameter.
-    :param worker:
-        Worker factory callable. A `WorkerFactory` declares a ``host``
-        keyword and receives the discovery publisher's prescribed bind
-        host. A `BoundWorkerFactory` declares no ``host`` and owns its
-        binding. Classification is by explicit signature declaration;
-        see `WorkerFactory` for the rules. Defaults to `LocalWorker`,
-        which declares ``host`` and therefore binds the publisher's
-        prescribed host; a partial of it that leaves ``host`` unset
-        (e.g. ``partial(LocalWorker, ...)``) stays bind-host-aware,
-        while ``partial(LocalWorker, host="...")`` pins the bind and
-        classifies bound.
-    :param discovery:
-        Discovery service to attach — a `~wool.DiscoveryLike` instance
-        or any `Factory` form resolving to one. The resolved object is
-        validated against the protocol at context entry. Workers it
-        surfaces are additionally subject to the underlying
-        `WorkerProxy`'s admission gate.
-    :param loadbalancer:
-        Load balancer instance, factory, or context manager.
-    :param credentials:
-        Optional channel credentials for TLS/mTLS connections to workers.
-    :param quorum:
-        Minimum number of workers that must be discovered before the proxy
-        considers itself ready. Defaults to ``1`` — block until at least
-        one worker is admitted, preserving the pre-quorum implicit-wait
-        behaviour. Pass a larger integer to require more workers, or
-        ``None``/``0`` to disable the gate entirely (``dispatch`` may
-        then raise immediately if no workers have been discovered yet).
-        When ``lazy=True`` (default), the quorum wait is deferred to the
-        first dispatch; with ``lazy=False`` it blocks at context entry.
-    :param quorum_timeout:
-        Seconds to wait for ``quorum`` workers to be discovered before
-        raising `asyncio.TimeoutError`. Only meaningful when
-        ``quorum`` is a positive integer; supplying it with
-        ``quorum=None`` or ``quorum=0`` records the value but never
-        consults it, accompanied by an
-        `~wool.runtime.worker.proxy.IneffectiveQuorumTimeoutWarning`.
-        Defaults to ``60``; pass ``None`` to wait indefinitely.  With
-        ``lazy=False`` the timeout fires at ``__aenter__``; the pool,
-        never having entered, is unusable per its single-use
-        semantics, so construct a new pool to retry.  With
-        ``lazy=True`` (default) the timeout fires on the first
-        `WorkerProxy.dispatch`, which leaves the proxy un-started so a
-        later dispatch retries and recovers once a worker is admitted.
-    :param shutdown_timeout:
-        Maximum number of seconds to wait for spawned workers to stop
-        during pool teardown. The bound applies as a single deadline to
-        the full teardown sequence: each worker's ``stop()`` receives
-        ``shutdown_timeout`` as its per-worker bound, the gather waits
-        for whatever time remains, and publisher cleanup gets whatever
-        is left. When the deadline elapses, the pool stops waiting and
-        logs the UIDs it stopped waiting on via ``logging.warning``.
-        Those workers are not leaked: a `LocalWorker` is still reaped
-        off-loop (see `LocalWorker._stop`), which can hold ``__aexit__``
-        past the deadline by up to the reap escalation — what is lost is
-        the graceful drain, not the process. A stop that fails for any
-        other reason is logged via ``logging.error`` and teardown
-        continues, so one worker's failure never strands another's
-        cleanup. ``None`` disables the bound. Must be positive when
-        provided. Defaults to ``60.0``.
-    :param lazy:
-        When ``True`` (default), defer discovery setup and the quorum
-        wait to the first `WorkerProxy.dispatch`.  When ``False``,
-        eagerly enter the underlying proxy at ``__aenter__`` time and
-        run the quorum wait there.
-    :raises ValueError:
-        If configuration is invalid, CPU count unavailable, or
-        ``shutdown_timeout`` is not positive.
-    :raises asyncio.TimeoutError:
-        If the quorum wait does not complete within ``quorum_timeout``
-        — raised by the underlying `WorkerProxy` at context entry
-        (``lazy=False``) or first dispatch (``lazy=True``).
+    .. rubric:: Implementation notes
 
-    .. caution::
-
-       Pre-called context manager instances passed as ``loadbalancer``
-       or ``discovery`` are not picklable and will cause nested routine
-       dispatch to fail.  Pass a callable returning the context manager
-       instead.  See `Factory`.
+    ``shutdown_timeout`` is apportioned across teardown in order:
+    each worker's drop announcement and ``stop()`` share whatever
+    remains of the deadline, the gather waits for whatever is left,
+    and publisher cleanup gets the remainder. Workers the pool stops
+    waiting on are logged via ``logging.warning``; a `LocalWorker`
+    is still reaped off-loop (see `LocalWorker._stop`), which can
+    hold ``__aexit__`` past the deadline by up to the reap
+    escalation. A ``worker-dropped`` announcement that raises is
+    logged via ``logging.error``, and one that hangs is cancelled at
+    the deadline and logged there; either way the stop runs on the
+    deadline's remainder. `_worker_context` owns the rationale for
+    that cancellation handling.
     """
 
     _workers: Final[dict[WorkerLike, Coroutine]]
@@ -619,15 +649,37 @@ class WorkerPool:
         `ExceptionGroup`. Factories that declare ``host``, including
         the default `LocalWorker`, receive the publisher's prescribed
         bind host (see `~wool.DiscoveryPublisherLike.bind_host`);
-        bound factories own their binding. Teardown applies the
-        pool's ``shutdown_timeout`` as a single deadline across worker
-        stops and publisher cleanup, logging any workers it stops
-        waiting on (see ``shutdown_timeout``), and runs even when publisher
-        validation or worker construction fails, so an entered
-        publisher context is never leaked.
+        bound factories own their binding. Teardown applies the pool's
+        ``shutdown_timeout`` as a single deadline across worker stops
+        and publisher cleanup — see that parameter for the contract
+        this implements — and runs even when publisher validation or
+        worker construction fails, so an entered publisher context is
+        always exited rather than dropped on the floor. Cleanup is
+        itself bounded by what remains of the deadline, so a teardown
+        that exhausts the deadline can time cleanup out before the
+        publisher's ``__aexit__`` runs.
 
         :yields:
             Metadata for the spawned workers.
+
+        .. rubric:: Implementation notes
+
+        The drop announcement gets its own cancellation arm because
+        `asyncio.CancelledError` is a `BaseException`: an ``except
+        Exception`` guard cannot see the cancellation the shutdown
+        deadline delivers to an announcement that hangs rather than
+        raises, so without that arm the discovery failure driving the
+        teardown goes unreported and the reap warning is left blaming
+        the worker for a fault that was discovery's.
+
+        The stop sits in that ``try``'s ``finally`` rather than after
+        it, so it outlives the same cancellation, and it takes
+        ``remaining()`` rather than the full ``shutdown_timeout``. The
+        deadline has already elapsed by the time a hanging announcement
+        reaches the stop, and handing it a fresh budget there would let
+        an already-cancelled task outlive the deadline that the gather
+        below exists to enforce — trading a leaked worker for an
+        unbounded teardown.
         """
         publisher_svc, publisher_ctx = await self._enter_context(publisher)
         try:
@@ -665,10 +717,42 @@ class WorkerPool:
                         # and cannot be stopped (`Worker.stop` rejects it),
                         # so teardown has nothing to undo.
                         return
-                    # Announce the drop before stopping so subscribers
-                    # stop routing to a worker that is about to go away.
-                    await publisher_svc.publish("worker-dropped", metadata)
-                    await worker.stop(timeout=self._shutdown_timeout)
+                    try:
+                        # Announce the drop before stopping so subscribers
+                        # stop routing to a worker that is about to go away.
+                        await publisher_svc.publish("worker-dropped", metadata)
+                    except Exception:
+                        # An announcement failure never abandons the stop —
+                        # see the docstring's implementation notes.
+                        logger.error(
+                            "WorkerPool shutdown could not announce worker %s as "
+                            "dropped; the stop is attempted regardless and "
+                            "reported separately if it fails, but subscribers "
+                            "may keep routing to it until they observe the drop "
+                            "by other means",
+                            worker.uid,
+                            exc_info=True,
+                            extra={"undropped_worker_uid": str(worker.uid)},
+                        )
+                    except asyncio.CancelledError:
+                        # `except Exception` cannot see a cancelled
+                        # announcement — see the docstring's implementation
+                        # notes.
+                        logger.error(
+                            "WorkerPool shutdown could not announce worker %s as "
+                            "dropped within the shutdown deadline; the stop is "
+                            "attempted regardless, but subscribers may keep "
+                            "routing to it until they observe the drop by other "
+                            "means",
+                            worker.uid,
+                            extra={"undropped_worker_uid": str(worker.uid)},
+                        )
+                        raise
+                    finally:
+                        # The stop outlives the cancellation above, bounded by
+                        # what remains of the deadline — see the docstring's
+                        # implementation notes.
+                        await worker.stop(timeout=remaining())
 
                 task = asyncio.create_task(start(worker))
                 tasks.append(task)
