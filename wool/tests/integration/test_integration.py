@@ -212,8 +212,12 @@ class TestNestedDispatch:
                 lazy=LazyMode.EAGER,
                 quorum=QuorumMode.ABOVE_DEFAULT,
             )
-            async with build_pool_from_scenario(scenario, credentials_map):
-                outer_pid, inner_pids = await routines.nested_pid_fanout(4)
+            # The same bound every sibling in this module runs under.
+            # Without it, a worker child that wedges before reporting
+            # its metadata hangs pool entry — and this test — forever.
+            async with asyncio.timeout(_INTEGRATION_TIMEOUT):
+                async with build_pool_from_scenario(scenario, credentials_map):
+                    outer_pid, inner_pids = await routines.nested_pid_fanout(4)
             caller_pid = os.getpid()
             assert outer_pid != caller_pid
             assert all(pid != caller_pid for pid in inner_pids)
