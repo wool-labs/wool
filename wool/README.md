@@ -527,7 +527,7 @@ sequenceDiagram
     participant Worker
 
     %% -- 1. Pool startup --
-    rect rgb(0, 0, 0, 0)
+    rect rgba(0, 0, 0, 0)
         Note over Client, Worker: Worker pool startup
 
         Client ->> Pool: create pool (spawn, discovery, loadbalancer)
@@ -549,7 +549,7 @@ sequenceDiagram
     end
 
     %% -- 2. Discovery --
-    rect rgb(0, 0, 0, 0)
+    rect rgba(0, 0, 0, 0)
         Note over Discovery, Loadbalancer: Worker discovery
 
         par Worker discovery
@@ -569,7 +569,7 @@ sequenceDiagram
     end
 
     %% -- 3. Task dispatch --
-    rect rgb(0, 0, 0, 0)
+    rect rgba(0, 0, 0, 0)
         Note over Client, Worker: Task dispatch
 
         Client ->> Routine: invoke wool routine
@@ -580,7 +580,7 @@ sequenceDiagram
         loop Until handshake resolves or all workers exhausted
             Loadbalancer ->> Loadbalancer: select next worker
             Loadbalancer ->> Worker: open stream, write task frame
-            Worker ->> Worker: VersionInterceptor; DispatchSession.__aenter__ (parse)
+            Worker ->> Worker: VersionInterceptor, then DispatchSession.__aenter__ (parse)
             alt Ack
                 Worker -->> Loadbalancer: Ack
                 Loadbalancer ->> Loadbalancer: break
@@ -600,7 +600,7 @@ sequenceDiagram
         end
 
         Worker ->> Worker: DispatchSession.__aiter__ schedules worker driver lazily
-        Worker ->> Worker: routine_scope enters; routine runs under the work context
+        Worker ->> Worker: routine_scope enters, routine runs under the work context
 
         alt Coroutine (single synthesized "next" request)
             Worker ->> Worker: _drive_step advances coroutine, serializes result + context
@@ -618,7 +618,7 @@ sequenceDiagram
             end
         else Routine or encoding exception
             Worker ->> Worker: drain worker, read final wire context published by worker task
-            Worker -->> Routine: terminal Response.exception (cloudpickled; decode/encode failures ride on __context__/__cause__)
+            Worker -->> Routine: terminal Response.exception (cloudpickled, decode/encode failures ride on __context__/__cause__)
             Routine ->> Routine: deserialize exception (preserves type and traceback)
             Routine -->> Client: re-raise
         end
@@ -626,7 +626,7 @@ sequenceDiagram
     end
 
     %% -- 4. Teardown --
-    rect rgb(0, 0, 0, 0)
+    rect rgba(0, 0, 0, 0)
         Note over Client, Worker: Worker pool teardown
 
         Client ->> Pool: exit pool
