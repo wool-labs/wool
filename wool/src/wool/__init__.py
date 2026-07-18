@@ -28,6 +28,7 @@ from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
+from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
 from wool.runtime.discovery.lan import AdvertiseHostError
 from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.lan import LoopbackAdvertisementWarning
@@ -110,6 +111,7 @@ __all__ = [
     "ContextVar",
     "ContextVarCollision",
     "Discovery",
+    "DiscoveryCapacityExhausted",
     "DiscoveryEvent",
     "DiscoveryEventType",
     "DiscoveryLike",

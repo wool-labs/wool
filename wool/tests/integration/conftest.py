@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import datetime
 import ipaddress
+import os
+import signal
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -134,6 +136,8 @@ class DiscoveryFactory(Enum):
     LAN_DIRECT = auto()
     LAN_CALLABLE = auto()
     LAN_ASYNC_CM = auto()
+    LOCAL_CAPACITY_BOUNDED = auto()
+    LOCAL_CAPACITY_EXACT = auto()
 
 
 class LbFactory(Enum):
@@ -438,6 +442,18 @@ async def build_pool_from_scenario(
         match scenario.discovery:
             case DiscoveryFactory.LOCAL_SYNC_CM:
                 discovery_obj = LocalDiscovery(namespace)
+            case DiscoveryFactory.LOCAL_CAPACITY_BOUNDED:
+                # A sub-page capacity (4 slots) that still admits the
+                # single HYBRID worker — exercises the sized segment and
+                # capacity-bounded publish/subscribe scans end-to-end.
+                discovery_obj = LocalDiscovery(namespace, capacity=4)
+            case DiscoveryFactory.LOCAL_CAPACITY_EXACT:
+                # Capacity exactly equal to the single HYBRID-spawned
+                # worker: the segment is completely full the moment that
+                # worker announces, yet still admits it and dispatches —
+                # the tightest end-to-end bound satisfying the
+                # dispatch-success oracle.
+                discovery_obj = LocalDiscovery(namespace, capacity=1)
             case DiscoveryFactory.LOCAL_CALLABLE:
                 discovery_obj = lambda: LocalDiscovery(namespace)  # noqa: E731
             case DiscoveryFactory.LOCAL_DIRECT:
@@ -1362,6 +1378,53 @@ PAIRWISE_SCENARIOS.append(
     )
 )
 
+# LOCAL_CAPACITY_BOUNDED pairs only with HYBRID (like the LAN factories),
+# so allpairspy's greedy placement can drop it from the generated array.
+# Pin one canonical scenario to guarantee the cover-all guard stays green
+# and the capacity-bounded LocalDiscovery gets a deterministic
+# dispatch-success case.
+PAIRWISE_SCENARIOS.append(
+    Scenario(
+        shape=RoutineShape.COROUTINE,
+        pool_mode=PoolMode.HYBRID,
+        discovery=DiscoveryFactory.LOCAL_CAPACITY_BOUNDED,
+        lb=LbFactory.CLASS_REF,
+        credential=CredentialType.INSECURE,
+        options=WorkerOptionsKind.DEFAULT,
+        timeout=TimeoutKind.NONE,
+        binding=RoutineBinding.MODULE_FUNCTION,
+        lazy=LazyMode.LAZY,
+        backpressure=BackpressureMode.NONE,
+        ctx_var_1=ContextVarPattern.NONE,
+        ctx_var_2=ContextVarPattern.NONE,
+        ctx_var_3=ContextVarPattern.NONE,
+        quorum=QuorumMode.DEFAULT,
+    )
+)
+
+
+# LOCAL_CAPACITY_EXACT is likewise HYBRID-only, so pin one canonical
+# scenario: capacity == the single spawned worker exercises a completely
+# full self-describing segment end-to-end while still dispatching.
+PAIRWISE_SCENARIOS.append(
+    Scenario(
+        shape=RoutineShape.COROUTINE,
+        pool_mode=PoolMode.HYBRID,
+        discovery=DiscoveryFactory.LOCAL_CAPACITY_EXACT,
+        lb=LbFactory.CLASS_REF,
+        credential=CredentialType.INSECURE,
+        options=WorkerOptionsKind.DEFAULT,
+        timeout=TimeoutKind.NONE,
+        binding=RoutineBinding.MODULE_FUNCTION,
+        lazy=LazyMode.LAZY,
+        backpressure=BackpressureMode.NONE,
+        ctx_var_1=ContextVarPattern.NONE,
+        ctx_var_2=ContextVarPattern.NONE,
+        ctx_var_3=ContextVarPattern.NONE,
+        quorum=QuorumMode.DEFAULT,
+    )
+)
+
 
 @st.composite
 def scenarios_strategy(draw):
@@ -1665,3 +1728,21 @@ def retry_grpc_internal():
                 raise
 
     return run
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return whether a process with the given pid currently exists."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _ensure_killed(pid: int | None) -> None:
+    """Send a best-effort SIGKILL so a failing run cannot leak a worker."""
+    if pid is not None and _pid_alive(pid):
+        with suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
