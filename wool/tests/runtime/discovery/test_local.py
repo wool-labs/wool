@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import pickle
 import struct
 import uuid
 from collections import Counter
@@ -15,6 +16,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool.runtime.discovery.base import DiscoverySubscriberLike
+from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
@@ -155,6 +157,22 @@ class TestLocalDiscovery:
 
         # Assert
         assert discovery.namespace == "my-namespace"
+
+    @pytest.mark.parametrize("capacity", [0, -1])
+    def test___init___should_raise_when_capacity_below_one(self, capacity):
+        """Test LocalDiscovery rejects a capacity below one.
+
+        Given:
+            A capacity of zero or a negative capacity
+        When:
+            LocalDiscovery is instantiated
+        Then:
+            It should raise ValueError, since a segment with fewer than one
+            slot can never admit a worker.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Expected capacity of at least 1"):
+            LocalDiscovery("ns", capacity=capacity)
 
     def test___hash___with_same_namespace(self):
         """Test hash equality for same namespace.
@@ -1143,6 +1161,63 @@ class TestLocalDiscovery:
         assert events[0].type == "worker-added"
         assert events[0].metadata.uid == worker.uid
 
+    @pytest.mark.asyncio
+    async def test___enter___should_restamp_capacity_when_recreated_by_new_owner(
+        self, namespace
+    ):
+        """Test a new owner generation re-stamps the segment's capacity.
+
+        Given:
+            A namespace previously owned at capacity 1 whose owner has
+            entered and exited, unlinking the segment
+        When:
+            A new owner enters the same namespace at capacity 3 and its
+            publisher registers three workers, then a fourth
+        Then:
+            It should admit all three and reject the fourth — the fresh
+            owner re-stamps capacity 3, so the prior generation's cap of 1
+            does not persist.
+        """
+        # Arrange — a prior owner generation stamps capacity 1, then exits.
+        with LocalDiscovery(namespace, capacity=1) as first:
+            async with first.publisher as publisher:
+                await publisher.publish(
+                    "worker-added",
+                    WorkerMetadata(
+                        uid=uuid.uuid4(),
+                        address="localhost:50051",
+                        pid=1,
+                        version="1.0",
+                    ),
+                )
+
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:{50051 + i}",
+                pid=100 + i,
+                version="1.0",
+            )
+            for i in range(3)
+        ]
+
+        # Act & assert — a new owner generation stamps capacity 3.
+        with LocalDiscovery(namespace, capacity=3) as second:
+            async with second.publisher as publisher:
+                for worker in workers:
+                    await publisher.publish("worker-added", worker)
+
+                with pytest.raises(DiscoveryCapacityExhausted):
+                    await publisher.publish(
+                        "worker-added",
+                        WorkerMetadata(
+                            uid=uuid.uuid4(),
+                            address="localhost:60000",
+                            pid=999,
+                            version="1.0",
+                        ),
+                    )
+
 
 class TestLocalDiscoveryPublisher:
     """Tests for LocalDiscovery.Publisher class.
@@ -1690,16 +1765,9 @@ class TestLocalDiscoveryPublisher:
                 with pytest.raises(KeyError, match=str(metadata.uid)):
                     await publisher.publish("worker-updated", metadata)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "capacity is not enforced until #299 — page rounding inflates "
-            "the segment to a full page"
-        ),
-    )
     @pytest.mark.asyncio
-    async def test_publish_to_full_address_space_raises_runtime_error(self, namespace):
-        """Test publish to full address space raises RuntimeError.
+    async def test_publish_should_raise_when_address_space_full(self, namespace):
+        """Test publish to full address space raises DiscoveryCapacityExhausted.
 
         Given:
             A LocalDiscovery whose declared capacity has been filled
@@ -1707,7 +1775,7 @@ class TestLocalDiscoveryPublisher:
         When:
             One worker beyond capacity is published
         Then:
-            It should raise RuntimeError with "No available slots".
+            It should raise DiscoveryCapacityExhausted.
         """
         # Arrange
         capacity = 8
@@ -1721,15 +1789,15 @@ class TestLocalDiscoveryPublisher:
             for i in range(capacity + 1)
         ]
 
-        with LocalDiscovery(namespace, capacity=capacity):
-            publisher = LocalDiscovery.Publisher(namespace)
+        with LocalDiscovery(namespace, capacity=capacity) as discovery:
+            publisher = discovery.publisher
 
             async with publisher:
                 for worker in workers[:capacity]:
                     await publisher.publish("worker-added", worker)
 
                 # Act & assert
-                with pytest.raises(RuntimeError, match="No available slots"):
+                with pytest.raises(DiscoveryCapacityExhausted):
                     await publisher.publish("worker-added", workers[capacity])
 
     @pytest.mark.asyncio
@@ -2087,6 +2155,378 @@ class TestLocalDiscoveryPublisher:
             # Assert
             block_registered = registered[baseline:]
             assert Counter(block_registered) == Counter(unregistered)
+
+    @given(capacity=st.integers(min_value=1, max_value=8))
+    @settings(
+        max_examples=10,
+        deadline=5000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @pytest.mark.asyncio
+    async def test_publish_should_bound_registrations_by_capacity(
+        self, namespace, capacity
+    ):
+        """Test capacity caps the number of registerable workers.
+
+        Given:
+            A LocalDiscovery declaring an arbitrary small capacity C
+            and its publisher
+        When:
+            C distinct workers are published, then one more
+        Then:
+            It should accept all C and raise DiscoveryCapacityExhausted on the
+            (C+1)th.
+        """
+        # Arrange — a per-example namespace so shared-memory state does
+        # not carry across Hypothesis examples.
+        example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:{50051 + i}",
+                pid=123 + i,
+                version="1.0",
+            )
+            for i in range(capacity + 1)
+        ]
+
+        # Act & assert
+        with LocalDiscovery(example_ns, capacity=capacity) as discovery:
+            async with discovery.publisher as publisher:
+                for worker in workers[:capacity]:
+                    await publisher.publish("worker-added", worker)
+
+                with pytest.raises(DiscoveryCapacityExhausted):
+                    await publisher.publish("worker-added", workers[capacity])
+
+    @pytest.mark.asyncio
+    async def test_publish_should_reject_second_worker_when_capacity_is_one(
+        self, namespace
+    ):
+        """Test a capacity-one segment admits exactly one worker.
+
+        Given:
+            A LocalDiscovery(capacity=1) — a single 16-byte slot in a
+            page-rounded mapping — and its publisher
+        When:
+            A first worker is published, then a second
+        Then:
+            It should register the first and raise DiscoveryCapacityExhausted
+            on the second; page rounding grants no extra slot.
+        """
+        # Arrange
+        first = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        second = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=124, version="1.0"
+        )
+
+        # Act & assert
+        with LocalDiscovery(namespace, capacity=1) as discovery:
+            async with discovery.publisher as publisher:
+                await publisher.publish("worker-added", first)
+
+                with pytest.raises(DiscoveryCapacityExhausted):
+                    await publisher.publish("worker-added", second)
+
+    @pytest.mark.asyncio
+    async def test_publish_should_reject_worker_beyond_default_capacity(self, namespace):
+        """Test the default capacity admits exactly 128 workers.
+
+        Given:
+            A LocalDiscovery constructed with no capacity argument and
+            its default publisher
+        When:
+            128 distinct workers are published, then a 129th
+        Then:
+            It should accept all 128 and raise DiscoveryCapacityExhausted on
+            the 129th, pinning the documented default of 128.
+        """
+        # Arrange
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:{50051 + i}",
+                pid=123 + i,
+                version="1.0",
+            )
+            for i in range(129)
+        ]
+
+        # Act & assert
+        with LocalDiscovery(namespace) as discovery:
+            async with discovery.publisher as publisher:
+                for worker in workers[:128]:
+                    await publisher.publish("worker-added", worker)
+
+                with pytest.raises(DiscoveryCapacityExhausted):
+                    await publisher.publish("worker-added", workers[128])
+
+    @pytest.mark.asyncio
+    async def test_publish_should_free_slot_within_capacity_when_worker_dropped(
+        self, namespace
+    ):
+        """Test dropping a worker frees its capped slot for reuse.
+
+        Given:
+            A LocalDiscovery(capacity=1) whose only slot is filled and a
+            second add already rejected
+        When:
+            The first worker is dropped and a second worker is published
+        Then:
+            It should admit the second worker and make it discoverable —
+            the bounded drop freed the single in-cap slot.
+        """
+        # Arrange
+        first = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        second = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=124, version="1.0"
+        )
+
+        events = []
+        discovered = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                if event.type == "worker-added" and event.metadata.uid == second.uid:
+                    events.append(event)
+                    discovered.set()
+                    break
+
+        with LocalDiscovery(namespace, capacity=1) as discovery:
+            async with discovery.publisher as publisher:
+                await publisher.publish("worker-added", first)
+                with pytest.raises(DiscoveryCapacityExhausted):
+                    await publisher.publish("worker-added", second)
+
+                # Act
+                await publisher.publish("worker-dropped", first)
+                await publisher.publish("worker-added", second)
+
+                # Assert
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                task = asyncio.create_task(collect(subscriber))
+                try:
+                    await asyncio.wait_for(discovered.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("Second worker not discoverable after freed slot reuse")
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        assert len(events) == 1
+        assert events[0].metadata.uid == second.uid
+
+    @pytest.mark.asyncio
+    async def test_publish_should_update_worker_within_capacity(self, namespace):
+        """Test updating a worker in the last in-cap slot succeeds.
+
+        Given:
+            A LocalDiscovery(capacity=2) holding a filler in slot 0 and
+            the target worker in the last in-cap slot
+        When:
+            The target is republished as "worker-updated" with a bumped
+            version
+        Then:
+            It should locate the target within the bounded scan (no
+            KeyError) and make the new version discoverable.
+        """
+        # Arrange
+        filler = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        target = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=124, version="1.0"
+        )
+        updated = WorkerMetadata(
+            uid=target.uid, address="localhost:50052", pid=124, version="2.0"
+        )
+
+        discovered = {}
+        target_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                discovered[event.metadata.uid] = event.metadata
+                if event.metadata.uid == target.uid:
+                    target_seen.set()
+                    break
+
+        with LocalDiscovery(namespace, capacity=2) as discovery:
+            async with discovery.publisher as publisher:
+                await publisher.publish("worker-added", filler)
+                await publisher.publish("worker-added", target)
+
+                # Act
+                await publisher.publish("worker-updated", updated)
+
+                # Assert
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                task = asyncio.create_task(collect(subscriber))
+                try:
+                    await asyncio.wait_for(target_seen.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("Updated worker not discoverable")
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        assert discovered[target.uid].version == "2.0"
+
+    @pytest.mark.asyncio
+    async def test_publish_should_enforce_owner_capacity_when_non_owner_declares_larger(
+        self, namespace
+    ):
+        """Test a non-owner's publisher enforces the owner's stamped capacity.
+
+        Given:
+            An owner LocalDiscovery holding the segment at capacity 1 and a
+            non-owner attached to the same namespace declaring capacity 100
+        When:
+            The non-owner's publisher publishes a first worker, then a
+            second
+        Then:
+            It should admit the first and raise DiscoveryCapacityExhausted on
+            the second — the owner's stamped cap of 1 governs, and the
+            non-owner's declared 100 is ignored.
+        """
+        # Arrange
+        worker_a = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=1, version="1.0"
+        )
+        worker_b = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=2, version="1.0"
+        )
+
+        # Act & assert
+        with LocalDiscovery(namespace, capacity=1):
+            with LocalDiscovery(namespace, capacity=100) as non_owner:
+                async with non_owner.publisher as publisher:
+                    await publisher.publish("worker-added", worker_a)
+
+                    with pytest.raises(DiscoveryCapacityExhausted):
+                        await publisher.publish("worker-added", worker_b)
+
+    @given(
+        owner_cap=st.integers(min_value=1, max_value=8),
+        peer_cap=st.integers(min_value=1, max_value=8),
+    )
+    @settings(
+        max_examples=15,
+        deadline=5000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @pytest.mark.asyncio
+    async def test_publish_should_bound_non_owner_registrations_by_owner_capacity(
+        self, namespace, owner_cap, peer_cap
+    ):
+        """Test the owner's stamped capacity bounds a non-owner's publisher.
+
+        Given:
+            An owner declaring an arbitrary capacity and a non-owner
+            attached to the same namespace declaring an unrelated capacity
+        When:
+            The non-owner's publisher publishes owner-capacity workers,
+            then one more
+        Then:
+            It should admit exactly the owner's capacity and raise "No
+            available slots" on the next — the segment header is the single
+            source of truth regardless of the non-owner's declared value.
+        """
+        # Arrange — a per-example namespace so shared-memory state does not
+        # carry across Hypothesis examples.
+        example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:{50051 + i}",
+                pid=100 + i,
+                version="1.0",
+            )
+            for i in range(owner_cap + 1)
+        ]
+
+        # Act & assert
+        with LocalDiscovery(example_ns, capacity=owner_cap):
+            with LocalDiscovery(example_ns, capacity=peer_cap) as non_owner:
+                async with non_owner.publisher as publisher:
+                    for worker in workers[:owner_cap]:
+                        await publisher.publish("worker-added", worker)
+
+                    with pytest.raises(DiscoveryCapacityExhausted):
+                        await publisher.publish("worker-added", workers[owner_cap])
+
+    @given(
+        ops=st.lists(
+            st.tuples(
+                st.sampled_from(["add", "drop"]),
+                st.integers(min_value=0, max_value=4),
+            ),
+            min_size=1,
+            max_size=20,
+        )
+    )
+    @settings(
+        max_examples=15,
+        deadline=5000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @pytest.mark.asyncio
+    async def test_publish_should_bound_registrations_when_workers_cycle_at_capacity(
+        self, namespace, ops
+    ):
+        """Test a capacity-3 segment reuses freed slots under add/drop churn.
+
+        Given:
+            A capacity-3 discovery, a five-worker roster, and an arbitrary
+            sequence of add/drop operations modelled so a currently-live
+            worker is never re-added (the separate #321 defect)
+        When:
+            The operations are published serially through one publisher
+        Then:
+            It should accept an add exactly when fewer than three workers
+            are live and raise DiscoveryCapacityExhausted when three are live —
+            proving a dropped slot is freed and reused within the cap.
+        """
+        # Arrange
+        capacity = 3
+        example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
+        roster = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:{50051 + i}",
+                pid=100 + i,
+                version="1.0",
+            )
+            for i in range(5)
+        ]
+        live: set[int] = set()
+
+        # Act & assert
+        with LocalDiscovery(example_ns, capacity=capacity) as discovery:
+            async with discovery.publisher as publisher:
+                for action, index in ops:
+                    if action == "add":
+                        if index in live:
+                            continue
+                        if len(live) < capacity:
+                            await publisher.publish("worker-added", roster[index])
+                            live.add(index)
+                        else:
+                            with pytest.raises(DiscoveryCapacityExhausted):
+                                await publisher.publish("worker-added", roster[index])
+                    elif index in live:
+                        await publisher.publish("worker-dropped", roster[index])
+                        live.discard(index)
 
 
 class TestWorkerReference:
@@ -2579,6 +3019,265 @@ class TestLocalDiscoverySubscriber:
         assert len(events_2) == 1
         assert events_2[0].type == "worker-added"
         assert events_2[0].metadata.uid == metadata.uid
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_discover_all_workers_up_to_capacity(self, namespace):
+        """Test a subscriber discovers every worker up to capacity.
+
+        Given:
+            A LocalDiscovery(capacity=4) with four distinct workers
+            published through its publisher
+        When:
+            The discovery's subscriber iterates
+        Then:
+            It should discover exactly the four published worker uids.
+        """
+        # Arrange
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:{50051 + i}",
+                pid=123 + i,
+                version="1.0",
+            )
+            for i in range(4)
+        ]
+        expected = {worker.uid for worker in workers}
+        seen = set()
+        all_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                if event.type == "worker-added":
+                    seen.add(event.metadata.uid)
+                    if expected <= seen:
+                        all_seen.set()
+                        break
+
+        with LocalDiscovery(namespace, capacity=4) as discovery:
+            async with discovery.publisher as publisher:
+                for worker in workers:
+                    await publisher.publish("worker-added", worker)
+
+                # Act
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                task = asyncio.create_task(collect(subscriber))
+                try:
+                    await asyncio.wait_for(all_seen.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("Not all workers discovered within timeout")
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        # Assert
+        assert seen == expected
+
+    @given(capacity=st.integers(min_value=1, max_value=8))
+    @settings(
+        max_examples=10,
+        deadline=5000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @pytest.mark.asyncio
+    async def test___aiter___should_discover_workers_up_to_capacity(
+        self, namespace, capacity
+    ):
+        """Test a subscriber discovers every worker the segment admits.
+
+        Given:
+            A LocalDiscovery declaring an arbitrary small capacity C with
+            C workers published through its publisher
+        When:
+            The discovery's subscriber — told no capacity of its own —
+            iterates
+        Then:
+            It should discover exactly the C published worker uids, its
+            scan bounded by the capacity the owner stamped into the
+            segment.
+        """
+        # Arrange — a per-example namespace so shared-memory state does
+        # not carry across Hypothesis examples.
+        example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:{50051 + i}",
+                pid=123 + i,
+                version="1.0",
+            )
+            for i in range(capacity)
+        ]
+        expected = {worker.uid for worker in workers}
+        seen = set()
+        all_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                if event.type == "worker-added":
+                    seen.add(event.metadata.uid)
+                    if expected <= seen:
+                        all_seen.set()
+                        break
+
+        # Act
+        with LocalDiscovery(example_ns, capacity=capacity) as discovery:
+            async with discovery.publisher as publisher:
+                for worker in workers:
+                    await publisher.publish("worker-added", worker)
+
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                task = asyncio.create_task(collect(subscriber))
+                try:
+                    await asyncio.wait_for(all_seen.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("Not all workers discovered within timeout")
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        # Assert
+        assert seen == expected
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_bound_non_owner_subscriber_by_owner_capacity(
+        self, namespace
+    ):
+        """Test a non-owner's subscriber reads the owner's stamped capacity.
+
+        Given:
+            An owner LocalDiscovery at capacity 4 with four workers
+            published, and a non-owner attached to the same namespace
+            declaring capacity 1
+        When:
+            A subscriber obtained from the non-owner iterates
+        Then:
+            It should discover all four workers — the scan is bounded by
+            the owner's stamped capacity, and the non-owner's declared 1 is
+            ignored.
+        """
+        # Arrange
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:{50051 + i}",
+                pid=100 + i,
+                version="1.0",
+            )
+            for i in range(4)
+        ]
+        expected = {worker.uid for worker in workers}
+        seen = set()
+        all_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                if event.type == "worker-added":
+                    seen.add(event.metadata.uid)
+                    if expected <= seen:
+                        all_seen.set()
+                        break
+
+        # Act
+        with LocalDiscovery(namespace, capacity=4) as owner:
+            async with owner.publisher as publisher:
+                for worker in workers:
+                    await publisher.publish("worker-added", worker)
+
+                with LocalDiscovery(namespace, capacity=1) as non_owner:
+                    subscriber = non_owner.subscribe(poll_interval=0.05)
+                    task = asyncio.create_task(collect(subscriber))
+                    try:
+                        await asyncio.wait_for(all_seen.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Non-owner subscriber did not discover all workers")
+                    finally:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+
+        # Assert
+        assert seen == expected
+
+    def test___new___should_return_distinct_object_when_key_matches(self, namespace):
+        """Test constructing a Subscriber returns a fresh object each call.
+
+        Given:
+            A namespace and a fixed poll interval
+        When:
+            `LocalDiscovery.Subscriber` is constructed twice with the same
+            namespace and poll interval
+        Then:
+            It should return two distinct objects of the same type.
+
+        Note:
+            The metaclass returns a fresh wrapper over a shared source per
+            call; that sharing is not observable through object identity, so
+            this test pins only the per-call distinctness.
+        """
+        # Act
+        first = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+        second = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+
+        # Assert
+        assert first is not second
+        assert type(first) is type(second)
+
+    @pytest.mark.asyncio
+    async def test___reduce___should_rebind_subscriber_to_its_namespace(
+        self, namespace, metadata
+    ):
+        """Test a pickled subscriber reconstructs bound to its namespace.
+
+        Given:
+            A subscriber for a namespace, pickled before any iteration
+        When:
+            It is unpickled and the reconstructed subscriber iterates while
+            a worker is published to that namespace
+        Then:
+            It should discover the worker — the pickle round-trip rebinds
+            the subscriber to the same namespace.
+        """
+        # Arrange
+        subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+        restored = pickle.loads(pickle.dumps(subscriber))
+
+        events = []
+        received = asyncio.Event()
+
+        async def collect(sub):
+            async for event in sub:
+                events.append(event)
+                received.set()
+                break
+
+        # Act
+        with LocalDiscovery(namespace) as discovery:
+            async with discovery.publisher as publisher:
+                task = asyncio.create_task(collect(restored))
+                await publisher.publish("worker-added", metadata)
+                try:
+                    await asyncio.wait_for(received.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("Reconstructed subscriber did not discover the worker")
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        # Assert
+        assert len(events) == 1
+        assert events[0].metadata.uid == metadata.uid
 
 
 def _enter_lifecycle_forest(namespace, forest):

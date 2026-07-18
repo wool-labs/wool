@@ -80,6 +80,7 @@ def test_public_api_completeness_should_match_expected_surface():
         "WorkerProxy",
         "WorkerService",
         "Discovery",
+        "DiscoveryCapacityExhausted",
         "DiscoveryEvent",
         "DiscoveryEventType",
         "DiscoveryLike",
