@@ -14,6 +14,7 @@ from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Callable
 from typing import Final
+from typing import Iterator
 from typing import Self
 from uuid import UUID
 from uuid import uuid4
@@ -30,6 +31,7 @@ from wool.runtime.discovery.base import DiscoveryEventType
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
+from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
 from wool.runtime.discovery.pool import SubscriberMeta
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -38,6 +40,8 @@ from wool.utilities.noreentry import noreentry
 
 REF_WIDTH: Final = 16
 NULL_REF: Final = b"\x00" * REF_WIDTH
+_HEADER_MAGIC: Final = b"WLD1"
+_HEADER_SIZE: Final = REF_WIDTH
 
 
 class _Watchdog(FileSystemEventHandler):
@@ -203,8 +207,11 @@ class LocalDiscovery(Discovery):
         Used by `subscriber` and as the default for `subscribe` when no
         explicit filter is provided.
     :param capacity:
-        Maximum number of workers that can be registered
-        simultaneously. Defaults to 128.
+        Maximum number of workers registrable — and discoverable —
+        simultaneously. The owner stamps it into the segment on entry, so
+        every publisher and subscriber enforces the same bound without
+        re-declaring it. Publishing a worker once ``capacity`` are
+        registered raises `RuntimeError`. Defaults to 128.
     :param block_size:
         Size in bytes for each worker's serialized data block.
         Defaults to 1024.
@@ -244,6 +251,8 @@ class LocalDiscovery(Discovery):
         capacity: int = 128,
         block_size: int = 1024,
     ):
+        if capacity < 1:
+            raise ValueError(f"Expected capacity of at least 1, got {capacity}")
         self._namespace = namespace or f"workerpool-{uuid4()}"
         self._filter = filter
         self._capacity = capacity
@@ -260,7 +269,7 @@ class LocalDiscovery(Discovery):
         :raises RuntimeError:
             If this instance has already been entered.
         """
-        size = self._capacity * 4
+        size = _HEADER_SIZE + self._capacity * REF_WIDTH
         try:
             self._address_space = SharedMemory(
                 name=_short_hash(self._namespace),
@@ -284,6 +293,9 @@ class LocalDiscovery(Discovery):
             self._cleanup = atexit.register(cleanup)
             for i in range(size):
                 self._address_space.buf[i] = 0
+            struct.pack_into(
+                "<4sI", self._address_space.buf, 0, _HEADER_MAGIC, self._capacity
+            )
         return self
 
     def __exit__(self, *_):
@@ -367,11 +379,13 @@ class LocalDiscovery(Discovery):
     class Publisher:
         """Publisher for broadcasting worker discovery events.
 
-        Publishes worker :class:`discovery events
-        <~wool.DiscoveryEvent>` to a shared memory region where
-        subscribers can discover them. Multiple publishers in different
-        processes can safely write to the same namespace using
-        cross-platform file locking for synchronization.
+        Publishes worker discovery events (see `~wool.DiscoveryEvent`) to
+        a shared memory region where subscribers can discover them.
+        Multiple publishers in different processes can safely write to the
+        same namespace using cross-platform file locking for
+        synchronization. The capacity bound is read from the segment the
+        owning `LocalDiscovery` stamped, so a publisher never re-declares
+        it.
 
         :param namespace:
             The namespace identifier for the shared memory region.
@@ -393,7 +407,7 @@ class LocalDiscovery(Discovery):
         #: See `~wool.DiscoveryPublisherLike.bind_host` for the contract.
         bind_host: str = "127.0.0.1"
 
-        def __init__(self, namespace: str, *, block_size: int = 512):
+        def __init__(self, namespace: str, *, block_size: int = 1024):
             if block_size < 0:
                 raise ValueError("Block size must be positive")
             self._namespace = namespace
@@ -435,11 +449,20 @@ class LocalDiscovery(Discovery):
             :param metadata:
                 Worker metadata to publish.
             :raises RuntimeError:
-                If an unexpected event type is provided or if the
-                shared memory is not properly initialized.
+                If an unexpected event type is provided, or the segment is
+                not yet initialized (a peer attached before the owner
+                stamped the header); the pool's startup aborts and retries
+                in that case.
+            :raises DiscoveryCapacityExhausted:
+                For ``worker-added``, if the segment is already at capacity.
             """
             async with _lock(self._namespace):
                 with _shared_memory(_short_hash(self._namespace)) as address_space:
+                    if (
+                        address_space.buf is None
+                        or _read_capacity(address_space.buf) is None
+                    ):  # pragma: no cover
+                        raise RuntimeError("Registrar service not properly initialized")
                     match type:
                         case "worker-added":
                             await self._add(metadata, address_space)
@@ -460,23 +483,18 @@ class LocalDiscovery(Discovery):
 
             :param metadata:
                 The worker to publish to the namespace's shared memory.
-            :raises RuntimeError:
-                If the shared memory region is not properly initialized or no
-                slots are available.
+            :raises DiscoveryCapacityExhausted:
+                If no slots are available.
             :raises ValueError:
                 If the worker UID is not specified.
             """
-            if address_space.buf is None:
-                raise RuntimeError(
-                    "Registrar service not properly initialized"
-                )  # pragma: no cover
+            assert address_space.buf is not None
 
             ref = _WorkerReference(metadata.uid)
             serialized = metadata.to_protobuf().SerializeToString()
             size = len(serialized)
 
-            for i in range(0, len(address_space.buf), REF_WIDTH):
-                slot = struct.unpack_from("16s", address_space.buf, i)[0]
+            for i, slot in _iter_slots(address_space.buf):
                 if slot == NULL_REF:
                     try:
                         memory_block = await self._shared_memory_pool.acquire(str(ref))
@@ -493,25 +511,19 @@ class LocalDiscovery(Discovery):
                         raise
                     break
             else:
-                raise RuntimeError("No available slots in shared memory registrar")
+                raise DiscoveryCapacityExhausted(_read_capacity(address_space.buf))
 
         async def _drop(self, metadata: WorkerMetadata, address_space: SharedMemory):
             """Unregister a worker by removing it from shared memory.
 
             :param metadata:
                 The worker to unpublish from the namespace's shared memory.
-            :raises RuntimeError:
-                If the registrar service is not properly initialized.
             """
-            if address_space.buf is None:
-                raise RuntimeError(
-                    "Registrar service not properly initialized"
-                )  # pragma: no cover
+            assert address_space.buf is not None
 
             target_ref = _WorkerReference(metadata.uid)
 
-            for i in range(0, len(address_space.buf), REF_WIDTH):
-                slot = struct.unpack_from("16s", address_space.buf, i)[0]
+            for i, slot in _iter_slots(address_space.buf):
                 if slot != NULL_REF:
                     ref = _WorkerReference.from_bytes(slot)
                     if ref == target_ref:
@@ -524,22 +536,16 @@ class LocalDiscovery(Discovery):
 
             :param metadata:
                 The updated worker to publish to the namespace's shared memory.
-            :raises RuntimeError:
-                If the registrar service is not properly initialized.
             :raises KeyError:
                 If the worker is not found in the address space.
             """
-            if address_space.buf is None:
-                raise RuntimeError(
-                    "Registrar service not properly initialized"
-                )  # pragma: no cover
+            assert address_space.buf is not None
 
             target_ref = _WorkerReference(metadata.uid)
             serialized = metadata.to_protobuf().SerializeToString()
             size = len(serialized)
 
-            for i in range(0, len(address_space.buf), REF_WIDTH):
-                slot = struct.unpack_from("16s", address_space.buf, i)[0]
+            for _, slot in _iter_slots(address_space.buf):
                 if slot != NULL_REF:
                     ref = _WorkerReference.from_bytes(slot)
                     if ref == target_ref:
@@ -708,8 +714,7 @@ class LocalDiscovery(Discovery):
                         async with lock:
                             notification.clear()
                             discovered_workers: dict[str, WorkerMetadata] = {}
-                            for i in range(0, len(address_space.buf), REF_WIDTH):
-                                slot = struct.unpack_from("16s", address_space.buf, i)[0]
+                            for _, slot in _iter_slots(address_space.buf):
                                 if slot != NULL_REF:
                                     ref = _WorkerReference.from_bytes(slot)
                                     metadata = self._deserialize_metadata(str(ref))
@@ -790,6 +795,50 @@ class LocalDiscovery(Discovery):
                     "worker-updated", metadata=discovered_workers[uid]
                 )
                 yield event
+
+
+def _read_capacity(buf: memoryview) -> int | None:
+    """Return the owner-stamped capacity, or ``None`` when unstamped.
+
+    The owner writes `_HEADER_MAGIC` and the capacity into the segment
+    header on entry. An attacher that raced that write — or any segment
+    not created by this module — reads a mismatched magic and is reported
+    as not-yet-ready (`None`) rather than trusting a zero-filled header. A
+    subscriber re-reads on its next scan; a publisher instead raises, and
+    the pool's startup aborts and retries.
+
+    :param buf:
+        The mapped address-space buffer.
+    :returns:
+        The stamped capacity, or ``None`` when the header magic is absent.
+    """
+    magic, capacity = struct.unpack_from("<4sI", buf, 0)
+    if magic != _HEADER_MAGIC:  # pragma: no cover
+        return None
+    return capacity
+
+
+def _iter_slots(buf: memoryview) -> Iterator[tuple[int, bytes]]:
+    """Yield each ``(offset, ref_bytes)`` slot bounded by the stamped capacity.
+
+    Reads the owner-stamped capacity from the header and walks exactly
+    that many slots, so ``capacity`` — not the page-rounded mapping — is
+    the enforced ceiling. Yields nothing for a segment whose header is not
+    yet stamped, so a subscriber simply re-reads on its next scan. The
+    capacity is re-read on every call, so a scan always reflects the
+    current header.
+
+    :param buf:
+        The mapped address-space buffer to scan.
+    :yields:
+        ``(offset, ref_bytes)`` for each 16-byte slot, in order.
+    """
+    capacity = _read_capacity(buf)
+    if capacity is None:  # pragma: no cover
+        return
+    limit = _HEADER_SIZE + capacity * REF_WIDTH
+    for offset in range(_HEADER_SIZE, limit, REF_WIDTH):
+        yield offset, struct.unpack_from("16s", buf, offset)[0]
 
 
 def _unlink_quietly(shared_memory: SharedMemory) -> None:

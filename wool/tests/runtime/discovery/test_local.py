@@ -1690,13 +1690,6 @@ class TestLocalDiscoveryPublisher:
                 with pytest.raises(KeyError, match=str(metadata.uid)):
                     await publisher.publish("worker-updated", metadata)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "capacity is not enforced until #299 — page rounding inflates "
-            "the segment to a full page"
-        ),
-    )
     @pytest.mark.asyncio
     async def test_publish_to_full_address_space_raises_runtime_error(self, namespace):
         """Test publish to full address space raises RuntimeError.
@@ -1721,8 +1714,8 @@ class TestLocalDiscoveryPublisher:
             for i in range(capacity + 1)
         ]
 
-        with LocalDiscovery(namespace, capacity=capacity):
-            publisher = LocalDiscovery.Publisher(namespace)
+        with LocalDiscovery(namespace, capacity=capacity) as discovery:
+            publisher = discovery.publisher
 
             async with publisher:
                 for worker in workers[:capacity]:
