@@ -40,6 +40,7 @@ from wool.utilities.noreentry import noreentry
 
 REF_WIDTH: Final = 16
 NULL_REF: Final = b"\x00" * REF_WIDTH
+DEFAULT_LOCK_TIMEOUT: Final[float] = 30.0
 _HEADER_MAGIC: Final = b"WLD1"
 _HEADER_SIZE: Final = REF_WIDTH
 
@@ -215,6 +216,11 @@ class LocalDiscovery(Discovery):
     :param block_size:
         Size in bytes for each worker's serialized data block.
         Defaults to 1024.
+    :param lock_timeout:
+        Maximum seconds a publisher waits to acquire the cross-process
+        file lock; see `LocalDiscovery.Publisher` for the acquisition
+        contract. Plumbed through to each `Publisher`. Defaults to
+        `DEFAULT_LOCK_TIMEOUT`.
 
     Example — publish workers:
 
@@ -250,6 +256,7 @@ class LocalDiscovery(Discovery):
         filter: PredicateFunction | None = None,
         capacity: int = 128,
         block_size: int = 1024,
+        lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
     ):
         if capacity < 1:
             raise ValueError(f"Expected capacity of at least 1, got {capacity}")
@@ -257,6 +264,7 @@ class LocalDiscovery(Discovery):
         self._filter = filter
         self._capacity = capacity
         self._block_size = block_size
+        self._lock_timeout = lock_timeout
 
     @noreentry
     def __enter__(self) -> Self:
@@ -334,7 +342,11 @@ class LocalDiscovery(Discovery):
         :returns:
             A publisher instance for broadcasting worker events.
         """
-        return self.Publisher(self._namespace, block_size=self._block_size)
+        return self.Publisher(
+            self._namespace,
+            block_size=self._block_size,
+            lock_timeout=self._lock_timeout,
+        )
 
     @property
     def subscriber(self) -> DiscoverySubscriberLike:
@@ -393,12 +405,17 @@ class LocalDiscovery(Discovery):
             Size in bytes for worker metadata storage blocks. Defaults
             to 512 bytes, which accommodates typical worker
             metadata including tags and extra metadata.
+        :param lock_timeout:
+            Maximum seconds to wait for the cross-process file lock before
+            raising `TimeoutError`. ``None`` waits forever. Defaults to
+            `DEFAULT_LOCK_TIMEOUT`.
         :raises ValueError:
-            If block_size is negative.
+            If ``block_size`` is negative, or ``lock_timeout`` is negative.
         """
 
         _block_size: int
         _cleanups: dict[str, Callable]
+        _lock_timeout: float | None
         _namespace: Final[str]
         _shared_memory_pool: ResourcePool[SharedMemory]
 
@@ -407,11 +424,20 @@ class LocalDiscovery(Discovery):
         #: See `~wool.DiscoveryPublisherLike.bind_host` for the contract.
         bind_host: str = "127.0.0.1"
 
-        def __init__(self, namespace: str, *, block_size: int = 1024):
+        def __init__(
+            self,
+            namespace: str,
+            *,
+            block_size: int = 1024,
+            lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
+        ):
             if block_size < 0:
                 raise ValueError("Block size must be positive")
+            if lock_timeout is not None and lock_timeout < 0:
+                raise ValueError("Lock timeout must be non-negative")
             self._namespace = namespace
             self._block_size = block_size
+            self._lock_timeout = lock_timeout
             self._cleanups = {}
             self._shared_memory_pool = ResourcePool(
                 factory=self._shared_memory_factory,
@@ -455,8 +481,11 @@ class LocalDiscovery(Discovery):
                 in that case.
             :raises DiscoveryCapacityExhausted:
                 For ``worker-added``, if the segment is already at capacity.
+            :raises TimeoutError:
+                If the cross-process file lock is not acquired within this
+                publisher's ``lock_timeout``.
             """
-            async with _lock(self._namespace):
+            async with _lock(self._namespace, timeout=self._lock_timeout):
                 with _shared_memory(_short_hash(self._namespace)) as address_space:
                     if (
                         address_space.buf is None
@@ -925,30 +954,55 @@ def _shared_memory(name):
 
 
 @asynccontextmanager
-async def _lock(namespace: str):
+async def _lock(namespace: str, *, timeout: float | None = DEFAULT_LOCK_TIMEOUT):
     """Acquire an exclusive lock for the address space identified by namespace.
 
     Uses cross-platform file locking (via portalocker) to synchronize access
     across unrelated processes that may be publishing to the same shared
-    memory region. Works on Windows, Linux, and macOS.
+    memory region. Works on Windows, Linux, and macOS, and does not block the
+    event loop while waiting for acquisition.
 
-    Uses non-blocking lock attempts with async sleep to avoid blocking the
-    event loop while waiting for lock acquisition. Retries every 1ms until
-    the lock is acquired.
+    ``timeout`` bounds **acquisition only, never the held section**. Once the
+    lock is held the ``with`` body runs to completion regardless of how long
+    it takes.
 
     :param namespace:
         The namespace identifying the shared memory region to lock.
+    :param timeout:
+        Maximum seconds to wait for acquisition. ``None`` waits forever.
+        Defaults to `DEFAULT_LOCK_TIMEOUT`.
+    :raises TimeoutError:
+        If the lock is not acquired within ``timeout`` seconds.
+
+    .. rubric:: Implementation notes
+
+    Acquisition uses non-blocking ``portalocker`` attempts, retrying every
+    1ms (``await asyncio.sleep(0.001)``) until the lock is acquired or
+    ``timeout`` elapses. The lock holder is by definition another process, so
+    a hot spin here cannot make it release sooner — it would only burn CPU
+    competing with the process being waited on — hence the 1ms poll rather
+    than a zero-second yield.
+
+    The held section runs to completion because interrupting a holder
+    mid-write would corrupt the shared segment for every attached process.
     """
     lock_name = _short_hash(namespace)
     lock_path = Path(tempfile.gettempdir()).resolve() / f"wool-lock-{lock_name}"
 
     with open(lock_path, "w") as lock_file:
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
         while True:
             try:
                 portalocker.lock(lock_file, portalocker.LOCK_EX | portalocker.LOCK_NB)
                 break
             except portalocker.LockException:
-                await asyncio.sleep(0)
+                if deadline is not None and loop.time() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out after {timeout}s waiting to acquire the "
+                        f"discovery lock for namespace {namespace!r}"
+                    )
+                await asyncio.sleep(0.001)
 
         try:
             yield

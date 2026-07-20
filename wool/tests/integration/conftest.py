@@ -11,6 +11,9 @@ import datetime
 import ipaddress
 import os
 import signal
+import subprocess
+import sys
+import threading
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -1746,3 +1749,68 @@ def _ensure_killed(pid: int | None) -> None:
     if pid is not None and _pid_alive(pid):
         with suppress(OSError):
             os.kill(pid, signal.SIGKILL)
+
+
+def _iter_leaf_exceptions(exc: BaseException):
+    """Yield the non-group leaf exceptions of a (possibly nested) group."""
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            yield from _iter_leaf_exceptions(sub)
+    else:
+        yield exc
+
+
+def spawn_script_subprocess(script, *args, ready_line, timeout=10):
+    """Run script in a fresh interpreter and wait for its readiness line.
+
+    Spawns ``[sys.executable, "-c", script, *args]`` with an open stdin pipe
+    (so the child can block awaiting release), a captured stdout pipe for the
+    handshake, and a discarded stderr. Returns the process once it prints
+    ``ready_line`` to stdout. If the child does not report readiness within
+    ``timeout`` seconds it is killed before the failure propagates, so a stuck
+    or crashing child never leaks. The caller must release the returned
+    process with `release_subprocess`.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, *args],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        line_holder: list[str] = []
+
+        def _await_ready():
+            try:
+                line_holder.append(proc.stdout.readline().strip())
+            except (ValueError, OSError):
+                pass  # stdout closed during teardown
+
+        reader = threading.Thread(target=_await_ready, daemon=True)
+        reader.start()
+        reader.join(timeout)
+        if reader.is_alive():
+            raise TimeoutError(
+                f"subprocess did not report {ready_line!r} within {timeout}s"
+            )
+        line = line_holder[0] if line_holder else ""
+        assert line == ready_line, f"subprocess failed to become ready: {line!r}"
+    except BaseException:
+        release_subprocess(proc)
+        raise
+    return proc
+
+
+def release_subprocess(proc: subprocess.Popen | None) -> None:
+    """Best-effort kill and pipe-close so a failing run cannot leak a subprocess."""
+    if proc is None:
+        return
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=10)
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            with suppress(Exception):
+                stream.close()

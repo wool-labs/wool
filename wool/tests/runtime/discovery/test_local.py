@@ -107,6 +107,44 @@ def unlink_schedule(mocker):
     return schedule
 
 
+@pytest.fixture
+def held_lock(mocker):
+    """Patch portalocker.lock to report the lock is permanently held.
+
+    Every acquisition attempt raises LockException, so a publish resolves
+    only through its lock_timeout deadline, never by acquiring.
+    """
+
+    def _held(fh, flags):
+        raise portalocker.LockException("Lock held")
+
+    mocker.patch.object(portalocker, "lock", side_effect=_held)
+
+
+@pytest.fixture
+def contending_lock(mocker):
+    """Return a factory patching portalocker.lock to fail its first n calls.
+
+    The returned callable installs a side effect that raises LockException
+    on the first n acquisition attempts and then delegates to the real
+    lock, returning the mock so a test can assert on its call count.
+    """
+    real_lock = portalocker.lock
+
+    def _make(n):
+        calls = {"count": 0}
+
+        def _contend(fh, flags):
+            calls["count"] += 1
+            if calls["count"] <= n:
+                raise portalocker.LockException("Lock held")
+            real_lock(fh, flags)
+
+        return mocker.patch.object(portalocker, "lock", side_effect=_contend)
+
+    return _make
+
+
 #: Same-namespace lifecycle forests: each node is one LocalDiscovery
 #: context; nesting models concurrently overlapping instances and
 #: siblings model teardown+respawn generations reusing the namespace.
@@ -274,6 +312,46 @@ class TestLocalDiscovery:
         # Assert
         assert isinstance(publisher, LocalDiscovery.Publisher)
         assert publisher.namespace == namespace
+
+    @pytest.mark.asyncio
+    async def test_publisher_should_propagate_lock_timeout(
+        self, namespace, metadata, held_lock
+    ):
+        """Test the publisher property plumbs lock_timeout to publish.
+
+        Given:
+            A LocalDiscovery constructed with a zero-second lock_timeout
+            and a file lock permanently held by another process
+        When:
+            A publisher obtained from the publisher property publishes
+        Then:
+            It should raise TimeoutError, proving lock_timeout reaches the
+            nested Publisher's lock acquisition.
+        """
+        # Act & assert
+        with LocalDiscovery(namespace, lock_timeout=0) as discovery:
+            async with discovery.publisher as publisher:
+                with pytest.raises(TimeoutError):
+                    await publisher.publish("worker-added", metadata)
+
+    def test_publisher_should_raise_when_lock_timeout_negative(self, namespace):
+        """Test the publisher property rejects a negative lock timeout lazily.
+
+        Given:
+            A LocalDiscovery constructed with a negative lock_timeout,
+            which does not validate at construction
+        When:
+            Its publisher property is accessed
+        Then:
+            It should raise ValueError, deferring lock_timeout validation
+            to the Publisher the property builds, mirroring block_size.
+        """
+        # Arrange
+        discovery = LocalDiscovery(namespace, lock_timeout=-1)
+
+        # Act & assert
+        with pytest.raises(ValueError, match="Lock timeout must be non-negative"):
+            discovery.publisher
 
     def test_subscriber_with_default_instance(self, namespace):
         """Test subscriber property returns Subscriber instance.
@@ -1273,6 +1351,58 @@ class TestLocalDiscoveryPublisher:
         with pytest.raises(ValueError, match="Block size must be positive"):
             LocalDiscovery.Publisher(namespace, block_size=-1)
 
+    def test___init___should_raise_when_lock_timeout_negative(self, namespace):
+        """Test Publisher rejects a negative lock timeout.
+
+        Given:
+            A negative lock_timeout
+        When:
+            Publisher is instantiated
+        Then:
+            It should raise ValueError.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Lock timeout must be non-negative"):
+            LocalDiscovery.Publisher(namespace, lock_timeout=-1)
+
+    @given(
+        lock_timeout=st.one_of(
+            st.none(),
+            st.floats(min_value=0, allow_nan=False, allow_infinity=False),
+            st.floats(
+                max_value=0,
+                exclude_max=True,
+                allow_nan=False,
+                allow_infinity=False,
+            ),
+        )
+    )
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test___init___should_validate_lock_timeout_across_domain(
+        self, namespace, lock_timeout
+    ):
+        """Test Publisher validates lock_timeout across the float domain.
+
+        Given:
+            Any None or finite float lock_timeout.
+        When:
+            A Publisher is instantiated with it.
+        Then:
+            It should raise ValueError exactly when the value is a negative
+            float, and construct successfully for None and every
+            non-negative float.
+        """
+        # Act & assert
+        if lock_timeout is not None and lock_timeout < 0:
+            with pytest.raises(ValueError, match="Lock timeout must be non-negative"):
+                LocalDiscovery.Publisher(namespace, lock_timeout=lock_timeout)
+        else:
+            publisher = LocalDiscovery.Publisher(namespace, lock_timeout=lock_timeout)
+            assert publisher.namespace == namespace
+
     @pytest.mark.asyncio
     async def test___aenter___and___aexit___lifecycle(self, namespace):
         """Test Publisher async context manager lifecycle.
@@ -1974,7 +2104,7 @@ class TestLocalDiscoveryPublisher:
 
     @pytest.mark.asyncio
     async def test_publish_with_concurrent_lock_contention(
-        self, namespace, metadata, mocker
+        self, namespace, metadata, contending_lock
     ):
         """Test publish retries on concurrent lock contention.
 
@@ -1988,20 +2118,7 @@ class TestLocalDiscoveryPublisher:
             the lock is released.
         """
         # Arrange
-        original_lock = portalocker.lock
-        attempt = 0
-
-        def contending_lock(fh, flags):
-            nonlocal attempt
-            attempt += 1
-            if attempt == 1:
-                raise portalocker.LockException("Lock held")
-            original_lock(fh, flags)
-
-        mocker.patch(
-            "wool.runtime.discovery.local.portalocker.lock",
-            side_effect=contending_lock,
-        )
+        lock = contending_lock(1)
 
         with LocalDiscovery(namespace):
             publisher = LocalDiscovery.Publisher(namespace)
@@ -2011,7 +2128,234 @@ class TestLocalDiscoveryPublisher:
                 await publisher.publish("worker-added", metadata)
 
         # Assert
-        assert attempt == 2
+        assert lock.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_publish_should_poll_at_one_millisecond_when_lock_contended(
+        self, namespace, metadata, mocker, contending_lock
+    ):
+        """Test publish polls the file lock at the 1ms interval.
+
+        Given:
+            A file lock temporarily held by another process, with
+            asyncio.sleep wrapped in a recording pass-through
+        When:
+            publish("worker-added") retries lock acquisition
+        Then:
+            It should sleep 1ms between attempts rather than busy-spinning
+            on a zero-second yield.
+        """
+        # Arrange
+        contending_lock(1)
+
+        recorded: list[float | None] = []
+        real_sleep = asyncio.sleep
+
+        async def recording_sleep(delay, *args, **kwargs):
+            recorded.append(delay)
+            return await real_sleep(delay, *args, **kwargs)
+
+        mocker.patch.object(asyncio, "sleep", recording_sleep)
+
+        with LocalDiscovery(namespace):
+            publisher = LocalDiscovery.Publisher(namespace)
+
+            # Act
+            async with publisher:
+                await publisher.publish("worker-added", metadata)
+
+        # Assert — the retry polls at exactly 1ms and never busy-spins on a
+        # zero-second yield. Pinning the poll interval (an otherwise
+        # unobservable implementation constant) mirrors atexit_recorder's
+        # deliberate mechanism-pinning; a refactor of the retry is expected
+        # to rewrite this assertion.
+        assert 0.001 in recorded
+        assert 0 not in recorded
+
+    @pytest.mark.asyncio
+    async def test_publish_should_raise_timeout_error_when_lock_acquisition_times_out(
+        self, namespace, metadata, held_lock
+    ):
+        """Test publish surfaces a held lock as a bounded TimeoutError.
+
+        Given:
+            A file lock permanently held by another process and a
+            publisher with a zero-second lock timeout
+        When:
+            publish("worker-added") attempts lock acquisition
+        Then:
+            It should raise TimeoutError rather than waiting forever.
+        """
+        # Act & assert
+        with LocalDiscovery(namespace):
+            publisher = LocalDiscovery.Publisher(namespace, lock_timeout=0)
+
+            async with publisher:
+                with pytest.raises(TimeoutError):
+                    await publisher.publish("worker-added", metadata)
+
+    @pytest.mark.asyncio
+    async def test_publish_should_bound_a_held_lock_with_the_default_timeout(
+        self, namespace, metadata, mocker, held_lock
+    ):
+        """Test the default lock timeout bounds a permanently held lock.
+
+        Given:
+            A permanently held lock, a publisher constructed with the
+            default lock_timeout, and a clock advanced far past that
+            default on the first poll
+        When:
+            publish("worker-added", metadata) attempts lock acquisition
+        Then:
+            It should raise TimeoutError, proving the default timeout is
+            finite rather than an unbounded wait.
+        """
+        # Arrange
+        loop = asyncio.get_running_loop()
+        fake_now = loop.time()
+
+        async def jumping_sleep(delay, *args, **kwargs):
+            nonlocal fake_now
+            # Jump far past any finite timeout on the first poll so the
+            # default deadline expires without a real 30s wait.
+            fake_now += 1_000_000.0
+
+        mocker.patch.object(loop, "time", side_effect=lambda: fake_now)
+        mocker.patch.object(asyncio, "sleep", jumping_sleep)
+
+        with LocalDiscovery(namespace):
+            publisher = LocalDiscovery.Publisher(namespace)
+
+            # Act & assert
+            async with publisher:
+                with pytest.raises(TimeoutError, match="discovery lock"):
+                    await publisher.publish("worker-added", metadata)
+
+    @pytest.mark.asyncio
+    async def test_publish_should_retry_without_bound_when_lock_timeout_none(
+        self, namespace, metadata, mocker, contending_lock
+    ):
+        """Test a None lock timeout imposes no deadline as the clock advances.
+
+        Given:
+            A lock held across several attempts before release, a publisher
+            whose lock_timeout is None, and a clock that jumps far past any
+            finite timeout on every poll
+        When:
+            publish("worker-added") retries lock acquisition
+        Then:
+            It should keep polling until acquisition succeeds without ever
+            raising, where any finite timeout would already have expired.
+        """
+        # Arrange
+        lock = contending_lock(5)
+
+        loop = asyncio.get_running_loop()
+        fake_now = loop.time()
+
+        async def jumping_sleep(delay, *args, **kwargs):
+            nonlocal fake_now
+            # Each poll jumps far past any finite timeout; a None deadline
+            # never consults the clock, so acquisition still succeeds.
+            fake_now += 1_000_000.0
+
+        mocker.patch.object(loop, "time", side_effect=lambda: fake_now)
+        mocker.patch.object(asyncio, "sleep", jumping_sleep)
+
+        with LocalDiscovery(namespace):
+            publisher = LocalDiscovery.Publisher(namespace, lock_timeout=None)
+
+            # Act
+            async with publisher:
+                await publisher.publish("worker-added", metadata)
+
+        # Assert — reaching the sixth attempt proves no deadline fired
+        # despite the clock advancing past any finite timeout; a finite
+        # lock_timeout would have raised on the second poll.
+        assert lock.call_count == 6
+
+    @pytest.mark.asyncio
+    async def test_publish_should_acquire_when_lock_timeout_zero_and_uncontended(
+        self, namespace, metadata
+    ):
+        """Test a zero lock timeout still acquires an uncontended lock.
+
+        Given:
+            An owner LocalDiscovery and a Publisher with lock_timeout=0 on
+            an uncontended lock
+        When:
+            publish("worker-added", metadata) is called
+        Then:
+            It should acquire on the first attempt and publish the worker
+            so a subscriber discovers it, proving the timeout gates
+            contended acquisition only and never an uncontended acquire or
+            the held section.
+        """
+        # Arrange
+        events = []
+        event_received = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                events.append(event)
+                event_received.set()
+                break
+
+        with LocalDiscovery(namespace):
+            publisher = LocalDiscovery.Publisher(namespace, lock_timeout=0)
+            subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+
+            # Act
+            async with publisher:
+                await publisher.publish("worker-added", metadata)
+
+                task = asyncio.create_task(collect(subscriber))
+                try:
+                    await asyncio.wait_for(event_received.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("Worker not discovered within timeout")
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        # Assert
+        assert len(events) == 1
+        assert events[0].type == "worker-added"
+        assert events[0].metadata.uid == metadata.uid
+
+    @pytest.mark.asyncio
+    async def test_publish_should_name_timeout_and_namespace_in_timeout_error(
+        self, namespace, metadata, held_lock
+    ):
+        """Test an elapsed finite timeout raises a message naming the timeout.
+
+        Given:
+            A permanently held lock and a Publisher with a small finite
+            lock_timeout
+        When:
+            publish("worker-added", metadata) exhausts the timeout
+        Then:
+            It should raise TimeoutError whose message names both the
+            configured timeout and the namespace.
+        """
+
+        # Arrange
+        with LocalDiscovery(namespace):
+            publisher = LocalDiscovery.Publisher(namespace, lock_timeout=0.02)
+
+            # Act
+            async with publisher:
+                with pytest.raises(TimeoutError) as excinfo:
+                    await publisher.publish("worker-added", metadata)
+
+        # Assert
+        message = str(excinfo.value)
+        assert "0.02" in message
+        assert namespace in message
+        assert "discovery lock" in message
 
     @pytest.mark.asyncio
     async def test___aexit___should_disarm_atexit_fallbacks_when_workers_still_published(
