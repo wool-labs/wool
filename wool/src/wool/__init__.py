@@ -28,11 +28,14 @@ from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
+from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
 from wool.runtime.discovery.lan import AdvertiseHostError
 from wool.runtime.discovery.lan import LanDiscovery
 from wool.runtime.discovery.lan import LoopbackAdvertisementWarning
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.loadbalancer.base import DispatchingLoadBalancerLike
 from wool.runtime.loadbalancer.base import LoadBalancerContextLike
+from wool.runtime.loadbalancer.base import LoadBalancerContextView
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
@@ -54,6 +57,7 @@ from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import IneffectiveLeaseWarning
@@ -107,16 +111,19 @@ __all__ = [
     "ContextVar",
     "ContextVarCollision",
     "Discovery",
+    "DiscoveryCapacityExhausted",
     "DiscoveryEvent",
     "DiscoveryEventType",
     "DiscoveryLike",
     "DiscoveryPublisherLike",
     "DiscoverySubscriberLike",
+    "DispatchingLoadBalancerLike",
     "Factory",
     "IneffectiveLeaseWarning",
     "IneffectiveQuorumTimeoutWarning",
     "LanDiscovery",
     "LoadBalancerContextLike",
+    "LoadBalancerContextView",
     "LoadBalancerLike",
     "LocalDiscovery",
     "LocalWorker",
@@ -136,6 +143,7 @@ __all__ = [
     "TransientRpcError",
     "UndefinedType",
     "UnexpectedResponse",
+    "UnparsableVersionWarning",
     "WoolError",
     "WoolWarning",
     "Worker",

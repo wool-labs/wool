@@ -9,9 +9,15 @@ from __future__ import annotations
 import asyncio
 import datetime
 import ipaddress
+import os
+import signal
+import subprocess
+import sys
+import threading
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import fields
 from enum import Enum
@@ -32,6 +38,7 @@ from hypothesis import strategies as st
 
 from wool.runtime.context.runtime import dispatch_timeout
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
@@ -41,6 +48,63 @@ from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
 from .routines import ContextVarPattern
+
+
+async def poll_until_count(get_uids, expected_count, *, timeout=5.0, interval=0.02):
+    """Poll get_uids() until it reports expected_count uids, or fail.
+
+    Returns the uid set once its size equals expected_count. Replaces a
+    fixed settle sleep: it waits no longer than necessary and fails
+    loudly — rather than silently passing on a change that arrived late
+    — if the count never reaches the expected value within the deadline.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        uids = get_uids()
+        if len(uids) == expected_count:
+            return uids
+        assert loop.time() < deadline, (
+            f"admitted count never reached {expected_count}; last saw {len(uids)}"
+        )
+        await asyncio.sleep(interval)
+
+
+async def poll_dispatch_until_pid(target_pid, message, *, timeout=15.0, interval=0.1):
+    """Dispatch get_pid until it reaches target_pid, or fail.
+
+    Tolerates NoWorkersAvailable during the window between an admitting
+    event being published and the sentinel admitting the worker, so an
+    empty pool mid-propagation is retried rather than raised.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            if await routines.get_pid() == target_pid:
+                return
+        except NoWorkersAvailable:
+            pass
+        assert loop.time() < deadline, message
+        await asyncio.sleep(interval)
+
+
+async def poll_dispatch_until_unavailable(message, *, timeout=15.0, interval=0.1):
+    """Dispatch get_pid until the pool has no admitted workers, or fail.
+
+    The eviction counterpart of `poll_dispatch_until_pid`: an
+    evicted worker is observable only as a dispatch that can no longer
+    be routed.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            await routines.get_pid()
+        except NoWorkersAvailable:
+            return
+        assert loop.time() < deadline, message
+        await asyncio.sleep(interval)
 
 
 class RoutineShape(Enum):
@@ -75,6 +139,8 @@ class DiscoveryFactory(Enum):
     LAN_DIRECT = auto()
     LAN_CALLABLE = auto()
     LAN_ASYNC_CM = auto()
+    LOCAL_CAPACITY_BOUNDED = auto()
+    LOCAL_CAPACITY_EXACT = auto()
 
 
 class LbFactory(Enum):
@@ -280,13 +346,20 @@ class _DirectDiscovery:
     Does NOT implement ``__enter__``/``__exit__``/``__aenter__``/
     ``__aexit__``, forcing ``WorkerPool._enter_context`` to take the
     passthrough path. Used for the ``*_DIRECT`` factory form arrangements.
+
+    ``publisher`` overrides the wrapped service's publisher, for tests
+    that need the real subscribe path but a publisher that misbehaves
+    on demand.
     """
 
-    def __init__(self, discovery):
+    def __init__(self, discovery, publisher=None):
         self._discovery = discovery
+        self._publisher = publisher
 
     @property
     def publisher(self):
+        if self._publisher is not None:
+            return self._publisher
         return self._discovery.publisher
 
     @property
@@ -372,6 +445,18 @@ async def build_pool_from_scenario(
         match scenario.discovery:
             case DiscoveryFactory.LOCAL_SYNC_CM:
                 discovery_obj = LocalDiscovery(namespace)
+            case DiscoveryFactory.LOCAL_CAPACITY_BOUNDED:
+                # A sub-page capacity (4 slots) that still admits the
+                # single HYBRID worker — exercises the sized segment and
+                # capacity-bounded publish/subscribe scans end-to-end.
+                discovery_obj = LocalDiscovery(namespace, capacity=4)
+            case DiscoveryFactory.LOCAL_CAPACITY_EXACT:
+                # Capacity exactly equal to the single HYBRID-spawned
+                # worker: the segment is completely full the moment that
+                # worker announces, yet still admits it and dispatches —
+                # the tightest end-to-end bound satisfying the
+                # dispatch-success oracle.
+                discovery_obj = LocalDiscovery(namespace, capacity=1)
             case DiscoveryFactory.LOCAL_CALLABLE:
                 discovery_obj = lambda: LocalDiscovery(namespace)  # noqa: E731
             case DiscoveryFactory.LOCAL_DIRECT:
@@ -1296,6 +1381,53 @@ PAIRWISE_SCENARIOS.append(
     )
 )
 
+# LOCAL_CAPACITY_BOUNDED pairs only with HYBRID (like the LAN factories),
+# so allpairspy's greedy placement can drop it from the generated array.
+# Pin one canonical scenario to guarantee the cover-all guard stays green
+# and the capacity-bounded LocalDiscovery gets a deterministic
+# dispatch-success case.
+PAIRWISE_SCENARIOS.append(
+    Scenario(
+        shape=RoutineShape.COROUTINE,
+        pool_mode=PoolMode.HYBRID,
+        discovery=DiscoveryFactory.LOCAL_CAPACITY_BOUNDED,
+        lb=LbFactory.CLASS_REF,
+        credential=CredentialType.INSECURE,
+        options=WorkerOptionsKind.DEFAULT,
+        timeout=TimeoutKind.NONE,
+        binding=RoutineBinding.MODULE_FUNCTION,
+        lazy=LazyMode.LAZY,
+        backpressure=BackpressureMode.NONE,
+        ctx_var_1=ContextVarPattern.NONE,
+        ctx_var_2=ContextVarPattern.NONE,
+        ctx_var_3=ContextVarPattern.NONE,
+        quorum=QuorumMode.DEFAULT,
+    )
+)
+
+
+# LOCAL_CAPACITY_EXACT is likewise HYBRID-only, so pin one canonical
+# scenario: capacity == the single spawned worker exercises a completely
+# full self-describing segment end-to-end while still dispatching.
+PAIRWISE_SCENARIOS.append(
+    Scenario(
+        shape=RoutineShape.COROUTINE,
+        pool_mode=PoolMode.HYBRID,
+        discovery=DiscoveryFactory.LOCAL_CAPACITY_EXACT,
+        lb=LbFactory.CLASS_REF,
+        credential=CredentialType.INSECURE,
+        options=WorkerOptionsKind.DEFAULT,
+        timeout=TimeoutKind.NONE,
+        binding=RoutineBinding.MODULE_FUNCTION,
+        lazy=LazyMode.LAZY,
+        backpressure=BackpressureMode.NONE,
+        ctx_var_1=ContextVarPattern.NONE,
+        ctx_var_2=ContextVarPattern.NONE,
+        ctx_var_3=ContextVarPattern.NONE,
+        quorum=QuorumMode.DEFAULT,
+    )
+)
+
 
 @st.composite
 def scenarios_strategy(draw):
@@ -1512,6 +1644,57 @@ async def _clear_channel_pool():
 # tasks never observe; it was load-bearing in appearance only.)
 
 
+@pytest_asyncio.fixture
+async def worker_update_pool(request) -> AsyncIterator[tuple]:
+    """Yield a live pool over one announced worker plus a live spare.
+
+    Starts two ``LocalWorker`` processes against a per-test
+    ``LocalDiscovery`` namespace, announces only the first, and enters a
+    ``WorkerPool`` bound to that discovery through the ``_DIRECT``
+    factory form. Yields ``(pool, publisher, worker_a, worker_b)``: the
+    publisher so a test can drive worker-added/updated/dropped events,
+    and both workers so a test can name their uids, addresses, and pids.
+
+    The pool's ``lease`` is taken from an indirect parameter and
+    defaults to ``None`` (uncapped); parametrize the fixture indirectly
+    to cap admission.
+
+    The pool is entered inside the caller's task so the ambient proxy
+    ``ContextVar`` is visible to the dispatches the test makes. On exit
+    the announced uid is dropped and both worker processes are stopped,
+    whether or not the test already stopped one of them.
+    """
+    lease = getattr(request, "param", None)
+    namespace = f"worker-update-{uuid.uuid4().hex[:12]}"
+    worker_a = LocalWorker()
+    worker_b = LocalWorker()
+    await worker_a.start()
+    await worker_b.start()
+    try:
+        with LocalDiscovery(namespace) as discovery:
+            publisher = discovery.publisher
+            async with publisher:
+                await publisher.publish("worker-added", worker_a.metadata)
+                pool = WorkerPool(
+                    discovery=_DirectDiscovery(discovery),
+                    loadbalancer=RoundRobinLoadBalancer,
+                    lease=lease,
+                )
+                try:
+                    async with pool:
+                        yield pool, publisher, worker_a, worker_b
+                finally:
+                    with suppress(KeyError):
+                        await publisher.publish("worker-dropped", worker_a.metadata)
+    finally:
+        # ``LocalWorker.stop`` raises on an already-stopped worker, so
+        # the teardown absorbs that here rather than making every test
+        # carry a "did I stop it?" flag.
+        for worker in (worker_b, worker_a):
+            with suppress(RuntimeError):
+                await worker.stop()
+
+
 @pytest.fixture
 def retry_grpc_internal():
     """Retry a test body on transient internal gRPC errors.
@@ -1548,3 +1731,86 @@ def retry_grpc_internal():
                 raise
 
     return run
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return whether a process with the given pid currently exists."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _ensure_killed(pid: int | None) -> None:
+    """Send a best-effort SIGKILL so a failing run cannot leak a worker."""
+    if pid is not None and _pid_alive(pid):
+        with suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def _iter_leaf_exceptions(exc: BaseException):
+    """Yield the non-group leaf exceptions of a (possibly nested) group."""
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            yield from _iter_leaf_exceptions(sub)
+    else:
+        yield exc
+
+
+def spawn_script_subprocess(script, *args, ready_line, timeout=10):
+    """Run script in a fresh interpreter and wait for its readiness line.
+
+    Spawns ``[sys.executable, "-c", script, *args]`` with an open stdin pipe
+    (so the child can block awaiting release), a captured stdout pipe for the
+    handshake, and a discarded stderr. Returns the process once it prints
+    ``ready_line`` to stdout. If the child does not report readiness within
+    ``timeout`` seconds it is killed before the failure propagates, so a stuck
+    or crashing child never leaks. The caller must release the returned
+    process with `release_subprocess`.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, *args],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        line_holder: list[str] = []
+
+        def _await_ready():
+            try:
+                line_holder.append(proc.stdout.readline().strip())
+            except (ValueError, OSError):
+                pass  # stdout closed during teardown
+
+        reader = threading.Thread(target=_await_ready, daemon=True)
+        reader.start()
+        reader.join(timeout)
+        if reader.is_alive():
+            raise TimeoutError(
+                f"subprocess did not report {ready_line!r} within {timeout}s"
+            )
+        line = line_holder[0] if line_holder else ""
+        assert line == ready_line, f"subprocess failed to become ready: {line!r}"
+    except BaseException:
+        release_subprocess(proc)
+        raise
+    return proc
+
+
+def release_subprocess(proc: subprocess.Popen | None) -> None:
+    """Best-effort kill and pipe-close so a failing run cannot leak a subprocess."""
+    if proc is None:
+        return
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=10)
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            with suppress(Exception):
+                stream.close()

@@ -15,6 +15,7 @@ jobs:
   detect-changes:
     name: Detect code changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       has_code_changes: ${{ steps.get-touched-files.outputs.touched && 'true' || 'false' }}
     steps:
@@ -32,6 +33,7 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.has_code_changes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -56,6 +58,7 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.has_code_changes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         namespace: ['wool']
@@ -74,6 +77,7 @@ jobs:
     needs: [detect-changes, unit-tests]
     if: needs.detect-changes.outputs.has_code_changes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       matrix:
         namespace: ['wool']
@@ -92,6 +96,7 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.has_code_changes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         python-version: ['3.11', '3.12', '3.13']

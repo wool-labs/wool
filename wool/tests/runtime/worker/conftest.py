@@ -20,6 +20,7 @@ from pytest_mock import MockerFixture
 
 import wool.runtime.worker.pool as wp
 from tests.helpers import scoped_context
+from wool import protocol
 from wool.runtime.context.factory import _loops_with_factory
 from wool.runtime.context.factory import install_task_factory
 from wool.runtime.discovery.base import DiscoveryEvent
@@ -222,12 +223,17 @@ def worker_extra():
 
 
 def _make_worker_metadata(*tags: str) -> WorkerMetadata:
-    """Build a valid WorkerMetadata with a fresh UUID."""
+    """Build a valid WorkerMetadata with a fresh UUID.
+
+    Advertises the ambient protocol version — what a real in-process
+    worker would — so the metadata passes the proxy's security/version
+    admission gate.
+    """
     return WorkerMetadata(
         uid=uuid.uuid4(),
         address="localhost:50051",
         pid=12345,
-        version="1.0.0",
+        version=protocol.__version__,
         tags=frozenset(tags),
         extra=MappingProxyType({}),
     )
@@ -294,18 +300,20 @@ class MockWorker:
         if self.start_delay > 0:
             await asyncio.sleep(self.start_delay)
 
-        # Create WorkerMetadata after successful start
+        # Create WorkerMetadata after successful start; advertise the
+        # ambient protocol version so the mock worker passes the
+        # proxy's security/version admission gate.
         self._info = WorkerMetadata(
             uid=self._uid,
             address="localhost:50051",
             pid=12345,
-            version="1.0.0",
+            version=protocol.__version__,
             tags=frozenset(self._tags),
             extra=MappingProxyType({}),
         )
         self._started = True
 
-    async def stop(self) -> None:
+    async def stop(self, *, timeout: float | None = None) -> None:
         """Stop the mock worker (always succeeds)."""
         self._started = False
         self._info = None
