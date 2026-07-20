@@ -23,6 +23,7 @@ from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
 from .conftest import _ensure_killed
+from .conftest import _iter_leaf_exceptions
 
 _TIMEOUT = 30
 
@@ -164,12 +165,3 @@ class TestLocalDiscoveryCapacity:
             for child in multiprocessing.active_children():
                 if child.pid not in before:
                     _ensure_killed(child.pid)
-
-
-def _iter_leaf_exceptions(exc: BaseException):
-    """Yield the non-group leaf exceptions of a (possibly nested) group."""
-    if isinstance(exc, BaseExceptionGroup):
-        for sub in exc.exceptions:
-            yield from _iter_leaf_exceptions(sub)
-    else:
-        yield exc
