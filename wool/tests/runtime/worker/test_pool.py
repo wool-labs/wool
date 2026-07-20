@@ -1580,7 +1580,7 @@ class TestWorkerPool:
             worker = mocker.MagicMock(spec=LocalWorker)
             worker.start = mocker.AsyncMock()
 
-            async def hang(*, timeout=None):
+            async def hang(*, grace=None):
                 await asyncio.sleep(60)
 
             worker.stop = hang
@@ -1624,7 +1624,7 @@ class TestWorkerPool:
             worker.uid = uid
             worker.start = mocker.AsyncMock()
 
-            async def hang(*, timeout=None):
+            async def hang(*, grace=None):
                 await asyncio.sleep(60)
 
             worker.stop = hang
@@ -1669,7 +1669,7 @@ class TestWorkerPool:
             worker = mocker.MagicMock(spec=LocalWorker)
             worker.start = mocker.AsyncMock()
 
-            async def hang(*, timeout=None):
+            async def hang(*, grace=None):
                 try:
                     await asyncio.sleep(60)
                 except asyncio.CancelledError:
@@ -1753,7 +1753,7 @@ class TestWorkerPool:
             worker.metadata = _make_worker_metadata()
             if not workers_built:
 
-                async def hang(*, timeout=None):
+                async def hang(*, grace=None):
                     await asyncio.sleep(60)
 
                 worker.stop = hang
@@ -1859,7 +1859,7 @@ class TestWorkerPool:
         # value and an equality assertion would pin a float identity the
         # contract does not promise. The tolerance is still tight enough
         # to catch a dropped kwarg, a None, or a zero.
-        stop.assert_awaited_once_with(timeout=pytest.approx(5.0, abs=0.1))
+        stop.assert_awaited_once_with(grace=pytest.approx(5.0, abs=0.1))
 
     @pytest.mark.asyncio
     async def test___aexit___should_log_error_when_stop_fails_unexpectedly(
@@ -1948,7 +1948,7 @@ class TestWorkerPool:
             pass
 
         # Assert
-        stop.assert_awaited_once_with(timeout=pytest.approx(5.0, abs=0.1))
+        stop.assert_awaited_once_with(grace=pytest.approx(5.0, abs=0.1))
 
     @pytest.mark.asyncio
     async def test___aexit___should_stop_worker_when_drop_announcement_hangs(
@@ -1990,7 +1990,7 @@ class TestWorkerPool:
             pass
 
         # Assert
-        stop.assert_awaited_once_with(timeout=0.0)
+        stop.assert_awaited_once_with(grace=0.0)
 
     @pytest.mark.asyncio
     async def test___aexit___should_log_error_when_drop_announcement_fails(
@@ -2076,7 +2076,7 @@ class TestWorkerPool:
             pass
 
         # Assert
-        stop.assert_awaited_once_with(timeout=None)
+        stop.assert_awaited_once_with(grace=None)
 
     @pytest.mark.asyncio
     async def test___aexit___should_log_error_when_drop_announcement_hangs(
@@ -2168,7 +2168,7 @@ class TestWorkerPool:
         # Assert
         assert len(workers) == 3
         for worker in workers:
-            worker.stop.assert_awaited_once_with(timeout=pytest.approx(5.0, abs=0.1))
+            worker.stop.assert_awaited_once_with(grace=pytest.approx(5.0, abs=0.1))
 
     @pytest.mark.asyncio
     async def test___aexit___should_report_both_when_announcement_and_stop_fail(
@@ -2370,7 +2370,7 @@ class TestWorkerPool:
         # Arrange
         stopped = asyncio.Event()
 
-        async def slow_stop(*, timeout=None):
+        async def slow_stop(*, grace=None):
             await asyncio.sleep(0.5)
             stopped.set()
 

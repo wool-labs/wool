@@ -21,6 +21,7 @@ from wool.runtime.context.var import ContextVar
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
 from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.connection import IdleUnavailable
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
@@ -28,6 +29,28 @@ from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.connection import clear_channel_pool
 
 from .conftest import PicklableMock
+
+
+class _MockRpcError(grpc.RpcError):
+    """A ``grpc.RpcError`` carrying a controllable ``code``/``details``.
+
+    Defined at module scope so property tests can raise a realistic
+    gRPC error for any status code without redefining the class per
+    example. ``str(self)`` is non-empty so the ``details() or
+    str(error)`` fallback in :class:`WorkerConnection` is observable
+    when ``details`` is empty.
+    """
+
+    def __init__(self, code: grpc.StatusCode, details: str | None):
+        super().__init__(f"<mock {code.name}>")
+        self._code = code
+        self._details = details
+
+    def code(self) -> grpc.StatusCode:
+        return self._code
+
+    def details(self) -> str | None:
+        return self._details
 
 
 class MyAppError(Exception):
@@ -393,6 +416,389 @@ class TestWorkerConnection:
         with pytest.raises(RpcError):
             async for _ in await connection.dispatch(sample_task):
                 pass
+
+    @pytest.mark.asyncio
+    async def test_idle_time_should_return_seconds_when_worker_responds(
+        self, mocker: MockerFixture
+    ):
+        """Test idle returns the worker's reported idle seconds.
+
+        Given:
+            A connection whose worker answers the idle RPC with an
+            IdleTime
+        When:
+            idle is awaited
+        Then:
+            It should return the reported seconds as a float.
+        """
+        # Arrange
+        mock_stub = mocker.MagicMock()
+        mock_stub.idle = mocker.AsyncMock(return_value=protocol.IdleTime(seconds=42.5))
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("localhost:50051")
+
+        # Act
+        result = await connection.idle_time()
+
+        # Assert
+        assert result == 42.5
+        mock_stub.idle.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_idle_time_should_raise_idle_unavailable_when_unimplemented(
+        self, mocker: MockerFixture
+    ):
+        """Test idle surfaces IdleUnavailable for a worker without the RPC.
+
+        Given:
+            A connection whose worker answers the idle RPC with gRPC
+            UNIMPLEMENTED (a worker predating idle reporting)
+        When:
+            idle is awaited
+        Then:
+            It should raise IdleUnavailable so the caller can treat idle
+            reporting as unavailable for this worker.
+        """
+
+        # Arrange
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNIMPLEMENTED
+
+            def details(self):
+                return "method idle not implemented"
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.idle = mocker.AsyncMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("localhost:50051")
+
+        # Act & assert
+        with pytest.raises(IdleUnavailable):
+            await connection.idle_time()
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        code=st.sampled_from(
+            [c for c in grpc.StatusCode if c is not grpc.StatusCode.OK]
+        ),
+        details=st.one_of(st.none(), st.just(""), st.text()),
+    )
+    async def test_idle_time_should_map_status_code_to_typed_exception(
+        self, mocker: MockerFixture, code: grpc.StatusCode, details: str | None
+    ):
+        """Test idle maps every gRPC status code to the right exception.
+
+        Given:
+            A connection whose worker answers the idle RPC with any gRPC
+            error status code and any details
+        When:
+            idle is awaited
+        Then:
+            It should raise IdleUnavailable for UNIMPLEMENTED (chained
+            from the gRPC error and not an RpcError), TransientRpcError
+            for transient codes, and RpcError otherwise — carrying the
+            code and details, falling back to str(error) when details
+            are empty.
+        """
+        # Arrange
+        error = _MockRpcError(code, details)
+        mock_stub = mocker.MagicMock()
+        mock_stub.idle = mocker.AsyncMock(side_effect=error)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("localhost:50051")
+        # Fresh channel per example — the module pool persists across
+        # Hypothesis examples within one test function, so evict any
+        # channel a prior example cached under this key.
+        await clear_channel_pool()
+
+        # Act
+        with pytest.raises(Exception) as exc_info:
+            await connection.idle_time()
+
+        # Assert
+        raised = exc_info.value
+        if code is grpc.StatusCode.UNIMPLEMENTED:
+            assert isinstance(raised, IdleUnavailable)
+            assert not isinstance(raised, RpcError)
+            assert raised.__cause__ is error
+        else:
+            if code in WorkerConnection.TRANSIENT_ERRORS:
+                assert isinstance(raised, TransientRpcError)
+            else:
+                assert isinstance(raised, RpcError)
+                assert not isinstance(raised, TransientRpcError)
+            assert raised.code is code
+            assert raised.details == (details or str(error))
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(timeout=st.floats(max_value=0.0, allow_nan=False, allow_infinity=False))
+    async def test_idle_time_should_reject_non_positive_timeout(
+        self, mocker: MockerFixture, timeout: float
+    ):
+        """Test idle_time rejects a non-positive timeout with ValueError.
+
+        Given:
+            A connection whose worker answers the idle RPC, and any
+            non-positive timeout
+        When:
+            idle_time is awaited with that timeout
+        Then:
+            It should raise ValueError without calling the stub, matching
+            dispatch's timeout validation.
+        """
+        # Arrange
+        mock_stub = mocker.MagicMock()
+        mock_stub.idle = mocker.AsyncMock(return_value=protocol.IdleTime(seconds=1.0))
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("localhost:50051")
+        # Fresh channel per example (see idle-map note above).
+        await clear_channel_pool()
+
+        # Act & assert
+        with pytest.raises(ValueError):
+            await connection.idle_time(timeout=timeout)
+        mock_stub.idle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        timeout=st.one_of(
+            st.none(),
+            st.floats(
+                min_value=0.0,
+                exclude_min=True,
+                allow_nan=False,
+                allow_infinity=False,
+            ),
+        )
+    )
+    async def test_idle_time_should_forward_positive_timeout(
+        self, mocker: MockerFixture, timeout: float | None
+    ):
+        """Test idle_time forwards None or a positive timeout to the stub.
+
+        Given:
+            A connection whose worker answers the idle RPC, and None or
+            any positive timeout
+        When:
+            idle_time is awaited with that timeout
+        Then:
+            It should call the stub with a Void request and that timeout
+            as the gRPC deadline.
+        """
+        # Arrange
+        mock_stub = mocker.MagicMock()
+        mock_stub.idle = mocker.AsyncMock(return_value=protocol.IdleTime(seconds=1.0))
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("localhost:50051")
+        # Fresh channel per example (see idle-map note above).
+        await clear_channel_pool()
+
+        # Act
+        result = await connection.idle_time(timeout=timeout)
+
+        # Assert
+        assert result == 1.0
+        mock_stub.idle.assert_awaited_once()
+        call = mock_stub.idle.await_args
+        assert isinstance(call.args[0], protocol.Void)
+        assert call.kwargs["timeout"] == timeout
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(seconds=st.floats(width=64, allow_nan=False, allow_infinity=False))
+    async def test_idle_time_should_return_reported_seconds_verbatim(
+        self, mocker: MockerFixture, seconds: float
+    ):
+        """Test idle returns the worker's reported seconds losslessly.
+
+        Given:
+            A worker answering the idle RPC with any double value
+        When:
+            idle is awaited
+        Then:
+            It should return exactly that value (including 0.0) — the
+            double survives the round-trip through the connection.
+        """
+        # Arrange
+        mock_stub = mocker.MagicMock()
+        mock_stub.idle = mocker.AsyncMock(
+            return_value=protocol.IdleTime(seconds=seconds)
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("localhost:50051")
+        # Fresh channel per example (see idle-map note above).
+        await clear_channel_pool()
+
+        # Act
+        result = await connection.idle_time()
+
+        # Assert
+        assert result == seconds
+
+    @pytest.mark.asyncio
+    async def test_stop_should_send_stop_request_with_timeout(
+        self, mocker: MockerFixture
+    ):
+        """Test stop sends a StopRequest carrying the grace timeout.
+
+        Given:
+            A connection to a worker that acknowledges the stop RPC
+        When:
+            stop is awaited with a timeout
+        Then:
+            It should send a StopRequest with that timeout and return
+            None.
+        """
+        # Arrange
+        mock_stub = mocker.MagicMock()
+        mock_stub.stop = mocker.AsyncMock(return_value=protocol.Void())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("localhost:50051")
+
+        # Act
+        result = await connection.stop(grace=5.0)
+
+        # Assert
+        assert result is None
+        mock_stub.stop.assert_awaited_once()
+        sent = mock_stub.stop.await_args.args[0]
+        assert isinstance(sent, protocol.StopRequest)
+        assert sent.timeout == 5.0
+
+    @pytest.mark.asyncio
+    async def test_stop_should_send_zero_timeout_when_none(self, mocker: MockerFixture):
+        """Test stop sends the wire-default timeout when none is given.
+
+        Given:
+            A connection to a worker that acknowledges the stop RPC
+        When:
+            stop is awaited with no timeout argument
+        Then:
+            It should send a StopRequest whose timeout is 0.0 (the proto
+            default), which the worker reads as cancel-immediately.
+        """
+        # Arrange
+        mock_stub = mocker.MagicMock()
+        mock_stub.stop = mocker.AsyncMock(return_value=protocol.Void())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("localhost:50051")
+
+        # Act
+        await connection.stop()
+
+        # Assert
+        sent = mock_stub.stop.await_args.args[0]
+        assert isinstance(sent, protocol.StopRequest)
+        assert sent.timeout == 0.0
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        code=st.sampled_from(
+            [c for c in grpc.StatusCode if c is not grpc.StatusCode.OK]
+        ),
+        details=st.one_of(st.none(), st.just(""), st.text()),
+    )
+    async def test_stop_should_map_status_code_to_typed_exception(
+        self, mocker: MockerFixture, code: grpc.StatusCode, details: str | None
+    ):
+        """Test stop maps every gRPC status code to the right exception.
+
+        Given:
+            A connection whose worker answers the stop RPC with any gRPC
+            error status code and any details
+        When:
+            stop is awaited
+        Then:
+            It should raise TransientRpcError for transient codes and
+            RpcError otherwise (including UNIMPLEMENTED, which stop does
+            not special-case), carrying the code and details, falling
+            back to str(error) when details are empty.
+        """
+        # Arrange
+        error = _MockRpcError(code, details)
+        mock_stub = mocker.MagicMock()
+        mock_stub.stop = mocker.AsyncMock(side_effect=error)
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("localhost:50051")
+        # Fresh channel per example (see idle-map note above).
+        await clear_channel_pool()
+
+        # Act
+        with pytest.raises(RpcError) as exc_info:
+            await connection.stop()
+
+        # Assert
+        raised = exc_info.value
+        if code in WorkerConnection.TRANSIENT_ERRORS:
+            assert isinstance(raised, TransientRpcError)
+        else:
+            assert not isinstance(raised, TransientRpcError)
+        assert raised.code is code
+        assert raised.details == (details or str(error))
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(timeout=st.floats(width=32, allow_nan=False, allow_infinity=False))
+    async def test_stop_should_forward_timeout_without_validation(
+        self, mocker: MockerFixture, timeout: float
+    ):
+        """Test stop forwards any timeout onto the StopRequest verbatim.
+
+        Given:
+            A connection whose worker acknowledges the stop RPC, and any
+            float32 timeout including non-positive values
+        When:
+            stop is awaited with that timeout
+        Then:
+            It should send a StopRequest carrying that timeout (a
+            negative value rides the wire unchanged) without raising
+            ValueError — stop does not validate its timeout.
+        """
+        # Arrange
+        mock_stub = mocker.MagicMock()
+        mock_stub.stop = mocker.AsyncMock(return_value=protocol.Void())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("localhost:50051")
+        # Fresh channel per example (see idle-map note above).
+        await clear_channel_pool()
+
+        # Act
+        result = await connection.stop(grace=timeout)
+
+        # Assert
+        assert result is None
+        sent = mock_stub.stop.await_args.args[0]
+        assert isinstance(sent, protocol.StopRequest)
+        assert sent.timeout == pytest.approx(timeout)
 
     @pytest.mark.asyncio
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])

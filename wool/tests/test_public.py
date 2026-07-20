@@ -33,6 +33,7 @@ def test_public_api_completeness_should_match_expected_surface():
     """
     # Arrange
     expected_public_api = {
+        "IdleUnavailable",
         "RpcError",
         "TransientRpcError",
         "UnexpectedResponse",

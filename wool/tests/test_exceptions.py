@@ -1,6 +1,7 @@
 import pytest
 
 from wool import AdvertiseHostError
+from wool import IdleUnavailable
 from wool import IneffectiveLeaseWarning
 from wool import IneffectiveQuorumTimeoutWarning
 from wool import LoopbackAdvertisementWarning
@@ -15,7 +16,14 @@ class TestWoolError:
     Fully qualified name: wool.exceptions.WoolError
     """
 
-    def test___init___should_subclass_wool_error(self):
+    @pytest.mark.parametrize(
+        "exception",
+        [
+            AdvertiseHostError,
+            IdleUnavailable,
+        ],
+    )
+    def test___init___should_subclass_wool_error(self, exception):
         """Test wool's typed exceptions descend from WoolError.
 
         Given:
@@ -27,7 +35,7 @@ class TestWoolError:
             catches all wool-raised errors.
         """
         # Act & assert
-        assert issubclass(AdvertiseHostError, WoolError)
+        assert issubclass(exception, WoolError)
 
 
 class TestWoolWarning:
