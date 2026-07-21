@@ -33,7 +33,9 @@ from wool.runtime.discovery.base import DiscoveryEventType
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
+from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
+from wool.runtime.discovery.exceptions import DiscoveryWorkerNotFound
 from wool.runtime.discovery.pool import SubscriberMeta
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -498,9 +500,9 @@ class LocalDiscovery(Discovery):
             :raises DiscoveryCapacityExhausted:
                 For ``worker-added``, if the segment is already at capacity
                 and the worker is not already registered.
-            :raises KeyError:
+            :raises DiscoveryWorkerNotFound:
                 For ``worker-updated``, if the worker is not registered.
-            :raises struct.error:
+            :raises DiscoveryBlockExhausted:
                 For ``worker-added`` and ``worker-updated``, if the
                 serialized metadata exceeds the worker's block; the prior
                 registration is restored before the error propagates.
@@ -579,7 +581,10 @@ class LocalDiscovery(Discovery):
                 memory_block = await self._shared_memory_pool.acquire(str(ref))
                 assert memory_block.buf is not None
                 size = len(serialized)
-                struct.pack_into(f"I{size}s", memory_block.buf, 0, size, serialized)
+                try:
+                    struct.pack_into(f"I{size}s", memory_block.buf, 0, size, serialized)
+                except struct.error as error:
+                    raise DiscoveryBlockExhausted(size) from error
                 struct.pack_into("16s", address_space.buf, free_offset, ref.bytes)
             except Exception:
                 # Release what this method acquired rather than delegating
@@ -613,7 +618,7 @@ class LocalDiscovery(Discovery):
 
             :param metadata:
                 The updated worker to publish to the namespace's shared memory.
-            :raises KeyError:
+            :raises DiscoveryWorkerNotFound:
                 If the worker is not found in the address space.
             """
             assert address_space.buf is not None
@@ -628,7 +633,7 @@ class LocalDiscovery(Discovery):
                         _rewrite_block(memory_block.buf, serialized)
                     return
 
-            raise KeyError(f"Worker {metadata.uid} not found in address space")
+            raise DiscoveryWorkerNotFound(metadata.uid)
 
         def _shared_memory_factory(self, name: str):
             """Create a new shared memory block for worker metadata storage.
@@ -908,7 +913,7 @@ def _rewrite_block(buf: memoryview, serialized: bytes) -> None:
         The mapped buffer of the block to rewrite.
     :param serialized:
         The serialized metadata to write.
-    :raises struct.error:
+    :raises DiscoveryBlockExhausted:
         If the payload does not fit the block.
     """
     size = len(serialized)
@@ -916,8 +921,10 @@ def _rewrite_block(buf: memoryview, serialized: bytes) -> None:
     prior_serialized = struct.unpack_from(f"{prior_size}s", buf, 4)[0]
     try:
         struct.pack_into(f"I{size}s", buf, 0, size, serialized)
-    except Exception:
+    except Exception as error:
         struct.pack_into(f"I{prior_size}s", buf, 0, prior_size, prior_serialized)
+        if isinstance(error, struct.error):
+            raise DiscoveryBlockExhausted(size) from error
         raise
 
 
