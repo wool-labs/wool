@@ -4,10 +4,12 @@ import asyncio
 import atexit
 import hashlib
 import struct
+import sys
 import tempfile
 import warnings
 from contextlib import asynccontextmanager
 from contextlib import contextmanager
+from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from typing import AsyncGenerator
@@ -211,8 +213,10 @@ class LocalDiscovery(Discovery):
         Maximum number of workers registrable — and discoverable —
         simultaneously. The owner stamps it into the segment on entry, so
         every publisher and subscriber enforces the same bound without
-        re-declaring it. Publishing a worker once ``capacity`` are
-        registered raises `RuntimeError`. Defaults to 128.
+        re-declaring it. Publishing a new worker once ``capacity`` are
+        registered raises `DiscoveryCapacityExhausted`; see
+        `LocalDiscovery.Publisher.publish` for the full contract.
+        Defaults to 128.
     :param block_size:
         Size in bytes for each worker's serialized data block.
         Defaults to 1024.
@@ -470,6 +474,18 @@ class LocalDiscovery(Discovery):
             touches a notification file to wake subscribers via
             filesystem events.
 
+            Publishing ``worker-added`` for a worker that is already
+            registered refreshes the registration in place — last write
+            wins — consuming no additional slot, so a single
+            ``worker-dropped`` always fully unregisters the worker. Live
+            subscribers observe a refresh as a ``worker-updated`` event.
+            A refresh writes into the block created at the worker's first
+            registration, so ``block_size`` governs only blocks this
+            publisher creates. If that block has vanished — e.g., its
+            publisher exited without dropping the worker — the re-add
+            reclaims the stale registration and registers the worker
+            fresh.
+
             :param type:
                 The type of discovery event.
             :param metadata:
@@ -480,7 +496,14 @@ class LocalDiscovery(Discovery):
                 stamped the header); the pool's startup aborts and retries
                 in that case.
             :raises DiscoveryCapacityExhausted:
-                For ``worker-added``, if the segment is already at capacity.
+                For ``worker-added``, if the segment is already at capacity
+                and the worker is not already registered.
+            :raises KeyError:
+                For ``worker-updated``, if the worker is not registered.
+            :raises struct.error:
+                For ``worker-added`` and ``worker-updated``, if the
+                serialized metadata exceeds the worker's block; the prior
+                registration is restored before the error propagates.
             :raises TimeoutError:
                 If the cross-process file lock is not acquired within this
                 publisher's ``lock_timeout``.
@@ -508,39 +531,62 @@ class LocalDiscovery(Discovery):
                 _watchdog_path(self._namespace).touch()
 
         async def _add(self, metadata: WorkerMetadata, address_space: SharedMemory):
-            """Register a worker by adding it to shared memory.
+            """Register a worker, or refresh one already registered.
+
+            See `publish` for the re-add contract. The refresh attaches to
+            the existing block by name rather than acquiring it from the
+            pool, so it holds no pool reference and reaches blocks created
+            by another publisher's pool.
 
             :param metadata:
                 The worker to publish to the namespace's shared memory.
             :raises DiscoveryCapacityExhausted:
-                If no slots are available.
-            :raises ValueError:
-                If the worker UID is not specified.
+                If no slots are available and the worker is not already
+                registered.
             """
             assert address_space.buf is not None
 
             ref = _WorkerReference(metadata.uid)
             serialized = metadata.to_protobuf().SerializeToString()
-            size = len(serialized)
 
-            for i, slot in _iter_slots(address_space.buf):
-                if slot == NULL_REF:
-                    try:
-                        memory_block = await self._shared_memory_pool.acquire(str(ref))
-                        assert memory_block.buf is not None
-                        struct.pack_into(
-                            f"I{size}s", memory_block.buf, 0, size, serialized
-                        )
-                        struct.pack_into("16s", address_space.buf, i, ref.bytes)
-                    except Exception:
-                        # Release what this method acquired rather than
-                        # delegating to `_drop`, whose slot scan cannot find a
-                        # ref that only lands on the last line of this block.
-                        await self._shared_memory_pool.release(str(ref))
-                        raise
+            free_offset = None
+            match_offset = None
+            for offset, slot in _iter_slots(address_space.buf):
+                if slot == ref.bytes:
+                    match_offset = offset
                     break
-            else:
+                if free_offset is None and slot == NULL_REF:
+                    free_offset = offset
+
+            if match_offset is not None:
+                try:
+                    with _shared_memory(str(ref)) as memory_block:
+                        assert memory_block.buf is not None
+                        _rewrite_block(memory_block.buf, serialized)
+                    return
+                except FileNotFoundError:
+                    # The block vanished out from under its slot — a dead
+                    # publisher's teardown unlinks blocks without nulling
+                    # slots — so reclaim the stale slot and register fresh.
+                    struct.pack_into("16s", address_space.buf, match_offset, NULL_REF)
+                    if free_offset is None:
+                        free_offset = match_offset
+
+            if free_offset is None:
                 raise DiscoveryCapacityExhausted(_read_capacity(address_space.buf))
+
+            try:
+                memory_block = await self._shared_memory_pool.acquire(str(ref))
+                assert memory_block.buf is not None
+                size = len(serialized)
+                struct.pack_into(f"I{size}s", memory_block.buf, 0, size, serialized)
+                struct.pack_into("16s", address_space.buf, free_offset, ref.bytes)
+            except Exception:
+                # Release what this method acquired rather than delegating
+                # to `_drop`, whose slot scan cannot find a ref that only
+                # lands on the last line of this block.
+                await self._shared_memory_pool.release(str(ref))
+                raise
 
         async def _drop(self, metadata: WorkerMetadata, address_space: SharedMemory):
             """Unregister a worker by removing it from shared memory.
@@ -552,16 +598,18 @@ class LocalDiscovery(Discovery):
 
             target_ref = _WorkerReference(metadata.uid)
 
-            for i, slot in _iter_slots(address_space.buf):
-                if slot != NULL_REF:
-                    ref = _WorkerReference.from_bytes(slot)
-                    if ref == target_ref:
-                        struct.pack_into("16s", address_space.buf, i, NULL_REF)
-                        await self._shared_memory_pool.release(str(ref))
-                        break
+            for offset, slot in _iter_slots(address_space.buf):
+                if slot == target_ref.bytes:
+                    struct.pack_into("16s", address_space.buf, offset, NULL_REF)
+                    await self._shared_memory_pool.release(str(target_ref))
+                    break
 
         async def _update(self, metadata: WorkerMetadata, address_space: SharedMemory):
-            """Update a worker's properties in shared memory.
+            """Update a registered worker's metadata in shared memory.
+
+            Attaches to the worker's block by name — holding no pool
+            reference, and reaching blocks created by another publisher's
+            pool — and rewrites it via `_rewrite_block`.
 
             :param metadata:
                 The updated worker to publish to the namespace's shared memory.
@@ -572,36 +620,14 @@ class LocalDiscovery(Discovery):
 
             target_ref = _WorkerReference(metadata.uid)
             serialized = metadata.to_protobuf().SerializeToString()
-            size = len(serialized)
 
             for _, slot in _iter_slots(address_space.buf):
-                if slot != NULL_REF:
-                    ref = _WorkerReference.from_bytes(slot)
-                    if ref == target_ref:
-                        memory_block = await self._shared_memory_pool.acquire(str(ref))
+                if slot == target_ref.bytes:
+                    with _shared_memory(str(target_ref)) as memory_block:
                         assert memory_block.buf is not None
-                        # Save prior state before updating
-                        prior_size = struct.unpack_from("I", memory_block.buf, 0)[0]
-                        prior_serialized = struct.unpack_from(
-                            f"{prior_size}s", memory_block.buf, 4
-                        )[0]
-                        try:
-                            struct.pack_into(
-                                f"I{size}s", memory_block.buf, 0, size, serialized
-                            )
-                        except Exception:
-                            # Restore prior state on failure
-                            struct.pack_into(
-                                f"I{prior_size}s",
-                                memory_block.buf,
-                                0,
-                                prior_size,
-                                prior_serialized,
-                            )
-                            raise
-                        return
+                        _rewrite_block(memory_block.buf, serialized)
+                    return
 
-            # Worker not found in address space
             raise KeyError(f"Worker {metadata.uid} not found in address space")
 
         def _shared_memory_factory(self, name: str):
@@ -870,6 +896,31 @@ def _iter_slots(buf: memoryview) -> Iterator[tuple[int, bytes]]:
         yield offset, struct.unpack_from("16s", buf, offset)[0]
 
 
+def _rewrite_block(buf: memoryview, serialized: bytes) -> None:
+    """Rewrite a metadata block in place, restoring it on failure.
+
+    Writes the size-prefixed payload over the block's current contents.
+    If the write fails — e.g., the payload exceeds the block — the prior
+    contents are restored before the error propagates, so a failed
+    rewrite never corrupts or regresses the block's registration.
+
+    :param buf:
+        The mapped buffer of the block to rewrite.
+    :param serialized:
+        The serialized metadata to write.
+    :raises struct.error:
+        If the payload does not fit the block.
+    """
+    size = len(serialized)
+    prior_size = struct.unpack_from("I", buf, 0)[0]
+    prior_serialized = struct.unpack_from(f"{prior_size}s", buf, 4)[0]
+    try:
+        struct.pack_into(f"I{size}s", buf, 0, size, serialized)
+    except Exception:
+        struct.pack_into(f"I{prior_size}s", buf, 0, prior_size, prior_serialized)
+        raise
+
+
 def _unlink_quietly(shared_memory: SharedMemory) -> None:
     """Unlink a segment without raising, warning if it fails unexpectedly.
 
@@ -934,6 +985,11 @@ def _shared_memory(name):
     and ensures it is properly closed on exit. Does not create new memory
     regions (use SharedMemory with create=True for that).
 
+    The attachment is deliberately untracked: registering an attach-only
+    mapping with this process's resource tracker would unlink the segment
+    at this process's exit out from under its owner (bpo-38119). Only the
+    process that created a segment may own its lifetime.
+
     :param name:
         The name of the shared memory region to open.
     :yields:
@@ -943,7 +999,14 @@ def _shared_memory(name):
         Close errors are silently ignored to handle cases where the memory
         region has been unlinked by another process.
     """
-    shared_memory = SharedMemory(name=name)
+    if sys.version_info >= (3, 13):
+        shared_memory = SharedMemory(name=name, track=False)
+    else:  # pragma: no cover — bpo-38119 workaround predating track=False
+        shared_memory = SharedMemory(name=name)
+        resource_tracker.unregister(
+            shared_memory._name,  # type: ignore[attr-defined]
+            "shared_memory",
+        )
     try:
         yield shared_memory
     finally:
