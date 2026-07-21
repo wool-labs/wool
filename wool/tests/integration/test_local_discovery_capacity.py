@@ -22,10 +22,9 @@ from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
+from .conftest import _TIMEOUT
 from .conftest import _ensure_killed
 from .conftest import _iter_leaf_exceptions
-
-_TIMEOUT = 30
 
 
 @pytest.mark.integration

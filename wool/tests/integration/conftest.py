@@ -49,6 +49,9 @@ from wool.runtime.worker.pool import WorkerPool
 from . import routines
 from .routines import ContextVarPattern
 
+#: Wall-clock budget for a single integration scenario.
+_TIMEOUT = 30
+
 
 async def poll_until_count(get_uids, expected_count, *, timeout=5.0, interval=0.02):
     """Poll get_uids() until it reports expected_count uids, or fail.
