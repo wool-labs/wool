@@ -1,7 +1,6 @@
 import asyncio
 import atexit
 import pickle
-import struct
 import uuid
 from collections import Counter
 from contextlib import ExitStack
@@ -17,7 +16,9 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool.runtime.discovery.base import DiscoverySubscriberLike
+from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
+from wool.runtime.discovery.exceptions import DiscoveryWorkerNotFound
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
@@ -1893,10 +1894,8 @@ class TestLocalDiscoveryPublisher:
         assert events[0].metadata.extra == worker.extra
 
     @pytest.mark.asyncio
-    async def test_publish_worker_updated_non_existent_raises_key_error(
-        self, namespace, metadata
-    ):
-        """Test update non-existent worker raises KeyError.
+    async def test_publish_worker_updated_non_existent_worker(self, namespace, metadata):
+        """Test update non-existent worker raises a typed error.
 
         Given:
             An initialized Publisher with no published workers
@@ -1904,14 +1903,14 @@ class TestLocalDiscoveryPublisher:
             publish("worker-updated", metadata) is called for a
             worker that was never added
         Then:
-            It should raise KeyError.
+            It should raise DiscoveryWorkerNotFound.
         """
         with LocalDiscovery(namespace):
             publisher = LocalDiscovery.Publisher(namespace)
 
             # Act & assert
             async with publisher:
-                with pytest.raises(KeyError, match=str(metadata.uid)):
+                with pytest.raises(DiscoveryWorkerNotFound, match=str(metadata.uid)):
                     await publisher.publish("worker-updated", metadata)
 
     @pytest.mark.asyncio
@@ -1960,7 +1959,7 @@ class TestLocalDiscoveryPublisher:
             The worker is updated with metadata too large for the
             block
         Then:
-            It should raise struct.error and preserve the original
+            It should raise DiscoveryBlockExhausted and preserve the original
             metadata.
         """
         # Arrange
@@ -1994,7 +1993,7 @@ class TestLocalDiscoveryPublisher:
                 await publisher.publish("worker-added", worker)
 
                 # Act
-                with pytest.raises(struct.error):
+                with pytest.raises(DiscoveryBlockExhausted):
                     await publisher.publish("worker-updated", oversized_worker)
 
                 # Assert — original metadata preserved via subscriber
@@ -2046,7 +2045,7 @@ class TestLocalDiscoveryPublisher:
             publisher = LocalDiscovery.Publisher(namespace, block_size=100)
             async with publisher:
                 # Act
-                with pytest.raises(struct.error):
+                with pytest.raises(DiscoveryBlockExhausted):
                     await publisher.publish("worker-added", oversized)
 
                 # Assert
@@ -2067,7 +2066,7 @@ class TestLocalDiscoveryPublisher:
             The oversized worker is published and then the fitting
             worker is published
         Then:
-            It should raise struct.error for the oversized worker,
+            It should raise DiscoveryBlockExhausted for the oversized worker,
             discover only the fitting worker, and tear both contexts
             down cleanly.
         """
@@ -2098,7 +2097,7 @@ class TestLocalDiscoveryPublisher:
             publisher = LocalDiscovery.Publisher(namespace, block_size=100)
             async with publisher:
                 # Act
-                with pytest.raises(struct.error):
+                with pytest.raises(DiscoveryBlockExhausted):
                     await publisher.publish("worker-added", oversized)
                 await publisher.publish("worker-added", fitting)
 
@@ -3184,7 +3183,7 @@ class TestLocalDiscoveryPublisher:
         When:
             The oversized re-announcement is published "worker-added"
         Then:
-            It should raise struct.error and leave the worker
+            It should raise DiscoveryBlockExhausted and leave the worker
             discoverable with its original metadata intact — the
             rollback holds whichever publisher issues the refresh.
         """
@@ -3217,7 +3216,7 @@ class TestLocalDiscoveryPublisher:
                 await publisher_a.publish("worker-added", worker)
 
                 # Act
-                with pytest.raises(struct.error):
+                with pytest.raises(DiscoveryBlockExhausted):
                     await readding.publish("worker-added", oversized)
 
                 # Assert — original metadata preserved via subscriber
@@ -3240,7 +3239,7 @@ class TestLocalDiscoveryPublisher:
 
         Given:
             A LocalDiscovery(capacity=1) whose worker's oversized
-            re-announcement has failed with struct.error
+            re-announcement has failed with DiscoveryBlockExhausted
         When:
             A single "worker-dropped" is published and a distinct
             fitting worker is then published
@@ -3269,7 +3268,7 @@ class TestLocalDiscoveryPublisher:
             publisher = LocalDiscovery.Publisher(namespace, block_size=100)
             async with publisher:
                 await publisher.publish("worker-added", worker)
-                with pytest.raises(struct.error):
+                with pytest.raises(DiscoveryBlockExhausted):
                     await publisher.publish("worker-added", oversized)
 
                 await publisher.publish("worker-dropped", worker)
@@ -3283,7 +3282,7 @@ class TestLocalDiscoveryPublisher:
 
         Given:
             A registered worker whose oversized re-announcement has
-            failed with struct.error, with atexit registration wrapped
+            failed with DiscoveryBlockExhausted, with atexit registration wrapped
             in recording pass-throughs
         When:
             A single "worker-dropped" is published
@@ -3310,7 +3309,7 @@ class TestLocalDiscoveryPublisher:
             publisher = LocalDiscovery.Publisher(namespace, block_size=100)
             async with publisher:
                 await publisher.publish("worker-added", worker)
-                with pytest.raises(struct.error):
+                with pytest.raises(DiscoveryBlockExhausted):
                     await publisher.publish("worker-added", oversized)
 
                 # Act
@@ -3333,7 +3332,7 @@ class TestLocalDiscoveryPublisher:
             version
         Then:
             It should locate the target within the bounded scan (no
-            KeyError) and make the new version discoverable.
+            DiscoveryWorkerNotFound) and make the new version discoverable.
         """
         # Arrange
         filler = WorkerMetadata(
@@ -3571,7 +3570,7 @@ class TestLocalDiscoveryPublisher:
             fitting the block or exceeding it
         When:
             Each re-announcement is published as "worker-added" in
-            order, the oversized ones raising struct.error
+            order, the oversized ones raising DiscoveryBlockExhausted
         Then:
             It should leave the worker discoverable exactly once with
             the metadata of the last fitting write — failed refreshes
@@ -3619,7 +3618,7 @@ class TestLocalDiscoveryPublisher:
                             version=f"2.{n}",
                             extra=MappingProxyType({"data": "x" * 20000}),
                         )
-                        with pytest.raises(struct.error):
+                        with pytest.raises(DiscoveryBlockExhausted):
                             await publisher.publish("worker-added", variant)
 
                 # Assert
