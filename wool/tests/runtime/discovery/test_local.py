@@ -5,6 +5,7 @@ import struct
 import uuid
 from collections import Counter
 from contextlib import ExitStack
+from contextlib import asynccontextmanager
 from multiprocessing.shared_memory import SharedMemory
 from types import MappingProxyType
 
@@ -143,6 +144,24 @@ def contending_lock(mocker):
         return mocker.patch.object(portalocker, "lock", side_effect=_contend)
 
     return _make
+
+
+@asynccontextmanager
+async def _collecting(subscriber, collector):
+    """Run collector over subscriber as a task, cancelling it on exit.
+
+    Yields the collect task so a test can await its side effects; the
+    task is cancelled and awaited on exit regardless of outcome.
+    """
+    task = asyncio.create_task(collector(subscriber))
+    try:
+        yield task
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 #: Same-namespace lifecycle forests: each node is one LocalDiscovery
@@ -2454,15 +2473,17 @@ class TestLocalDiscoveryPublisher:
 
         Given:
             An arbitrary sequence of add and drop operations over a
-            small worker roster, where drops may target workers that
-            were never added, with atexit registration wrapped in
-            recording pass-throughs
+            small worker roster, where adds may re-add currently-live
+            workers and drops may target workers that were never
+            added, with atexit registration wrapped in recording
+            pass-throughs
         When:
             The sequence is published and the publisher then exits
             with any residual workers still registered
         Then:
             It should unwind cleanly and pair every per-block
-            fallback registration with exactly one unregistration.
+            fallback registration with exactly one unregistration —
+            a re-add registers no second fallback.
         """
         # Arrange — per-example namespace and recorder state so
         # Hypothesis examples stay independent
@@ -2488,8 +2509,8 @@ class TestLocalDiscoveryPublisher:
             async with publisher:
                 for op, index in ops:
                     if op == "add":
-                        if index in added:
-                            continue
+                        # A re-add of a live worker is legal (#321) and
+                        # must register no second fallback.
                         await publisher.publish("worker-added", roster[index])
                         added.add(index)
                     else:
@@ -2668,6 +2689,639 @@ class TestLocalDiscoveryPublisher:
         assert events[0].metadata.uid == second.uid
 
     @pytest.mark.asyncio
+    async def test_publish_should_leave_worker_undiscoverable_when_readded_then_dropped(
+        self, namespace, metadata
+    ):
+        """Test one drop fully unregisters a worker added twice.
+
+        Given:
+            A worker published "worker-added" twice through one publisher
+        When:
+            A single "worker-dropped" is published, followed by a
+            distinct sentinel worker, and a subscriber observes the
+            namespace
+        Then:
+            It should discover only the sentinel — its arrival proves a
+            full scan completed with the re-added worker absent.
+        """
+        # Arrange
+        sentinel = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=124, version="1.0"
+        )
+
+        events = []
+        sentinel_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                events.append(event)
+                if event.metadata.uid == sentinel.uid:
+                    sentinel_seen.set()
+                    break
+
+        with LocalDiscovery(namespace):
+            publisher = LocalDiscovery.Publisher(namespace)
+            async with publisher:
+                await publisher.publish("worker-added", metadata)
+                await publisher.publish("worker-added", metadata)
+
+                # Act
+                await publisher.publish("worker-dropped", metadata)
+                await publisher.publish("worker-added", sentinel)
+
+                # Assert — the sentinel's arrival proves a completed scan
+                subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+                async with _collecting(subscriber, collect):
+                    try:
+                        await asyncio.wait_for(sentinel_seen.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Sentinel worker not discovered")
+
+        assert {event.metadata.uid for event in events} == {sentinel.uid}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("readd_via_second_publisher", [False, True])
+    async def test_publish_should_not_consume_slot_when_worker_readded_at_capacity(
+        self, namespace, readd_via_second_publisher
+    ):
+        """Test re-adding the sole registered worker is not exhaustion.
+
+        Given:
+            A LocalDiscovery(capacity=1) whose only slot holds a worker,
+            and a re-announcement issued through the registering
+            publisher or a second publisher on the same namespace
+            (parameterized)
+        When:
+            The same worker is published "worker-added" again, then a
+            distinct worker is published
+        Then:
+            It should accept the re-add without raising and raise
+            DiscoveryCapacityExhausted only for the distinct worker — the
+            re-add consumed no slot through either publisher.
+        """
+        # Arrange
+        first = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        second = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=124, version="1.0"
+        )
+
+        # Act & assert
+        with LocalDiscovery(namespace, capacity=1):
+            publisher_a = LocalDiscovery.Publisher(namespace)
+            publisher_b = LocalDiscovery.Publisher(namespace)
+            async with publisher_a, publisher_b:
+                readding = publisher_b if readd_via_second_publisher else publisher_a
+                await publisher_a.publish("worker-added", first)
+                await readding.publish("worker-added", first)
+
+                with pytest.raises(DiscoveryCapacityExhausted):
+                    await readding.publish("worker-added", second)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("readd_via_second_publisher", [False, True])
+    async def test_publish_should_refresh_metadata_when_worker_readded(
+        self, namespace, readd_via_second_publisher
+    ):
+        """Test a re-add carries its newer metadata to subscribers.
+
+        Given:
+            A registered worker and a re-announcement of the same UID
+            with a bumped version, issued through the registering
+            publisher or a second publisher on the same namespace
+            (parameterized)
+        When:
+            The re-announcement is published as "worker-added"
+        Then:
+            It should leave the worker discoverable at the bumped
+            version.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        readded = WorkerMetadata(
+            uid=worker.uid, address="localhost:50051", pid=123, version="2.0"
+        )
+
+        discovered = {}
+        target_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                discovered[event.metadata.uid] = event.metadata
+                if event.metadata.version == "2.0":
+                    target_seen.set()
+                    break
+
+        with LocalDiscovery(namespace) as discovery:
+            publisher_a = LocalDiscovery.Publisher(namespace)
+            publisher_b = LocalDiscovery.Publisher(namespace)
+            async with publisher_a, publisher_b:
+                readding = publisher_b if readd_via_second_publisher else publisher_a
+                await publisher_a.publish("worker-added", worker)
+
+                # Act
+                await readding.publish("worker-added", readded)
+
+                # Assert
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                async with _collecting(subscriber, collect):
+                    try:
+                        await asyncio.wait_for(target_seen.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Re-added worker's metadata not discovered")
+
+        assert discovered[worker.uid].version == "2.0"
+
+    @pytest.mark.asyncio
+    async def test_publish_should_disarm_atexit_fallback_when_readded_worker_dropped(
+        self, namespace, metadata, atexit_recorder
+    ):
+        """Test one drop finalizes the block of a worker added twice.
+
+        Given:
+            A worker published "worker-added" twice through one
+            publisher, with atexit registration wrapped in recording
+            pass-throughs
+        When:
+            A single "worker-dropped" is published
+        Then:
+            It should register exactly one per-block fallback and
+            unregister that same callable — the re-add held no extra
+            pool reference to keep the block alive past the drop.
+        """
+        # Arrange
+        registered, unregistered = atexit_recorder
+
+        with LocalDiscovery(namespace):
+            baseline = len(registered)
+            publisher = LocalDiscovery.Publisher(namespace)
+            async with publisher:
+                await publisher.publish("worker-added", metadata)
+                await publisher.publish("worker-added", metadata)
+
+                # Act
+                await publisher.publish("worker-dropped", metadata)
+
+                # Assert
+                block_registered = registered[baseline:]
+                assert block_registered == unregistered
+                assert len(block_registered) == 1
+
+    @pytest.mark.asyncio
+    async def test_publish_should_update_worker_when_previously_readded(self, namespace):
+        """Test a refreshed registration still applies updates.
+
+        Given:
+            A worker registered once and re-announced via "worker-added"
+            with a bumped version
+        When:
+            A "worker-updated" with a further-bumped version is published
+        Then:
+            It should apply the update to the single registration — a
+            subscriber discovers the final version.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        readded = WorkerMetadata(
+            uid=worker.uid, address="localhost:50051", pid=123, version="2.0"
+        )
+        updated = WorkerMetadata(
+            uid=worker.uid, address="localhost:50051", pid=123, version="3.0"
+        )
+
+        discovered = {}
+        final_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                if event.metadata.uid != worker.uid:
+                    continue
+                discovered[event.metadata.uid] = event.metadata
+                if event.metadata.version == "3.0":
+                    final_seen.set()
+                    break
+
+        with LocalDiscovery(namespace) as discovery:
+            async with discovery.publisher as publisher:
+                await publisher.publish("worker-added", worker)
+                await publisher.publish("worker-added", readded)
+
+                # Act
+                await publisher.publish("worker-updated", updated)
+
+                # Assert
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                async with _collecting(subscriber, collect):
+                    try:
+                        await asyncio.wait_for(final_seen.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Updated metadata not discovered after re-add")
+
+        assert discovered[worker.uid].version == "3.0"
+
+    @pytest.mark.asyncio
+    async def test_publish_should_register_worker_fresh_when_readded_after_drop(
+        self, namespace
+    ):
+        """Test add-after-drop is a fresh registration, not a refresh.
+
+        Given:
+            A LocalDiscovery(capacity=1) whose worker was added then
+            dropped
+        When:
+            The same worker is published "worker-added" again, then a
+            distinct worker, then the first is dropped and the
+            distinct worker is published once more
+        Then:
+            It should re-register the first worker in the freed slot —
+            the distinct worker raises DiscoveryCapacityExhausted while
+            the first is live and is admitted after the final drop.
+        """
+        # Arrange
+        first = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        second = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=124, version="1.0"
+        )
+
+        # Act & assert
+        with LocalDiscovery(namespace, capacity=1) as discovery:
+            async with discovery.publisher as publisher:
+                await publisher.publish("worker-added", first)
+                await publisher.publish("worker-dropped", first)
+
+                await publisher.publish("worker-added", first)
+                with pytest.raises(DiscoveryCapacityExhausted):
+                    await publisher.publish("worker-added", second)
+
+                await publisher.publish("worker-dropped", first)
+                await publisher.publish("worker-added", second)
+
+    @pytest.mark.asyncio
+    async def test_publish_should_register_worker_fresh_when_block_vanished(
+        self, namespace
+    ):
+        """Test a re-add reclaims a slot whose block has vanished.
+
+        Given:
+            A worker registered through a publisher that exited its
+            context without dropping the worker, leaving its slot
+            populated but its metadata block unlinked
+        When:
+            A second publisher publishes "worker-added" for the same UID
+            with a bumped version
+        Then:
+            It should reclaim the stale registration and register the
+            worker fresh, leaving it discoverable at the bumped version.
+        """
+        # Arrange — the exiting publisher unlinks its blocks but leaves
+        # the address-space slot populated.
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        readded = WorkerMetadata(
+            uid=worker.uid, address="localhost:50051", pid=123, version="2.0"
+        )
+
+        discovered = {}
+        target_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                discovered[event.metadata.uid] = event.metadata
+                if event.metadata.version == "2.0":
+                    target_seen.set()
+                    break
+
+        with LocalDiscovery(namespace) as discovery:
+            publisher_a = LocalDiscovery.Publisher(namespace)
+            async with publisher_a:
+                await publisher_a.publish("worker-added", worker)
+
+            publisher_b = LocalDiscovery.Publisher(namespace)
+            async with publisher_b:
+                # Act
+                await publisher_b.publish("worker-added", readded)
+
+                # Assert
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                async with _collecting(subscriber, collect):
+                    try:
+                        await asyncio.wait_for(target_seen.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Worker not re-registered over vanished block")
+
+        assert discovered[worker.uid].version == "2.0"
+
+    @pytest.mark.asyncio
+    async def test_publish_should_unregister_worker_when_dropped_by_second_publisher(
+        self, namespace
+    ):
+        """Test the refreshing publisher's drop unregisters the worker.
+
+        Given:
+            A worker registered through publisher A and refreshed with
+            a bumped version by publisher B on the same namespace
+        When:
+            B publishes a single "worker-dropped" for that worker
+        Then:
+            It should emit worker-dropped to a subscriber and leave the
+            worker unregistered, with both publishers exiting cleanly.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        readded = WorkerMetadata(
+            uid=worker.uid, address="localhost:50051", pid=123, version="2.0"
+        )
+
+        refreshed = asyncio.Event()
+        dropped = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                if event.metadata.uid != worker.uid:
+                    continue
+                if event.type == "worker-dropped":
+                    dropped.set()
+                    break
+                if event.metadata.version == "2.0":
+                    refreshed.set()
+
+        with LocalDiscovery(namespace) as discovery:
+            publisher_a = LocalDiscovery.Publisher(namespace)
+            publisher_b = LocalDiscovery.Publisher(namespace)
+            async with publisher_a, publisher_b:
+                await publisher_a.publish("worker-added", worker)
+                await publisher_b.publish("worker-added", readded)
+
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                async with _collecting(subscriber, collect):
+                    try:
+                        await asyncio.wait_for(refreshed.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Refreshed worker not discoverable")
+
+                    # Act
+                    await publisher_b.publish("worker-dropped", worker)
+
+                    # Assert
+                    try:
+                        await asyncio.wait_for(dropped.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Drop by refreshing publisher not observed")
+
+    @pytest.mark.asyncio
+    async def test_publish_should_update_worker_when_registered_by_second_publisher(
+        self, namespace
+    ):
+        """Test an update reaches a worker another publisher registered.
+
+        Given:
+            A worker registered through publisher A and a second
+            publisher B on the same namespace
+        When:
+            B publishes "worker-updated" for that UID with a bumped
+            version
+        Then:
+            It should apply the update — a subscriber discovers the
+            bumped version.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        updated = WorkerMetadata(
+            uid=worker.uid, address="localhost:50051", pid=123, version="2.0"
+        )
+
+        discovered = {}
+        target_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                discovered[event.metadata.uid] = event.metadata
+                if event.metadata.version == "2.0":
+                    target_seen.set()
+                    break
+
+        with LocalDiscovery(namespace) as discovery:
+            publisher_a = LocalDiscovery.Publisher(namespace)
+            publisher_b = LocalDiscovery.Publisher(namespace)
+            async with publisher_a, publisher_b:
+                await publisher_a.publish("worker-added", worker)
+
+                # Act
+                await publisher_b.publish("worker-updated", updated)
+
+                # Assert
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                async with _collecting(subscriber, collect):
+                    try:
+                        await asyncio.wait_for(target_seen.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Second publisher's update not discovered")
+
+        assert discovered[worker.uid].version == "2.0"
+
+    @pytest.mark.asyncio
+    async def test_publish_should_disarm_atexit_fallback_when_updated_worker_dropped(
+        self, namespace, metadata, atexit_recorder
+    ):
+        """Test an update leaves the drop able to finalize the block.
+
+        Given:
+            A registered worker whose metadata has since been published
+            as "worker-updated", with atexit registration wrapped in
+            recording pass-throughs
+        When:
+            A single "worker-dropped" is published
+        Then:
+            It should register exactly one per-block fallback and
+            unregister that same callable — the update held no extra
+            pool reference to keep the block alive past the drop.
+        """
+        # Arrange
+        registered, unregistered = atexit_recorder
+        updated = WorkerMetadata(
+            uid=metadata.uid, address="localhost:50051", pid=12345, version="2.0"
+        )
+
+        with LocalDiscovery(namespace):
+            baseline = len(registered)
+            publisher = LocalDiscovery.Publisher(namespace)
+            async with publisher:
+                await publisher.publish("worker-added", metadata)
+                await publisher.publish("worker-updated", updated)
+
+                # Act
+                await publisher.publish("worker-dropped", metadata)
+
+                # Assert
+                block_registered = registered[baseline:]
+                assert block_registered == unregistered
+                assert len(block_registered) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("readd_via_second_publisher", [False, True])
+    async def test_publish_should_preserve_prior_state_when_readd_overflows(
+        self, namespace, readd_via_second_publisher
+    ):
+        """Test an oversized re-add preserves the prior registration.
+
+        Given:
+            A worker registered through a small-block publisher and an
+            oversized re-announcement of the same UID, issued through the
+            registering publisher or a second publisher with the default
+            block size (parameterized)
+        When:
+            The oversized re-announcement is published "worker-added"
+        Then:
+            It should raise struct.error and leave the worker
+            discoverable with its original metadata intact — the
+            rollback holds whichever publisher issues the refresh.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        oversized = WorkerMetadata(
+            uid=worker.uid,
+            address="localhost:50051",
+            pid=123,
+            version="2.0",
+            extra=MappingProxyType({"data": "x" * 20000}),
+        )
+
+        events = []
+        event_received = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                events.append(event)
+                event_received.set()
+                break
+
+        with LocalDiscovery(namespace):
+            publisher_a = LocalDiscovery.Publisher(namespace, block_size=100)
+            publisher_b = LocalDiscovery.Publisher(namespace)
+            async with publisher_a, publisher_b:
+                readding = publisher_b if readd_via_second_publisher else publisher_a
+                await publisher_a.publish("worker-added", worker)
+
+                # Act
+                with pytest.raises(struct.error):
+                    await readding.publish("worker-added", oversized)
+
+                # Assert — original metadata preserved via subscriber
+                subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+                async with _collecting(subscriber, collect):
+                    try:
+                        await asyncio.wait_for(event_received.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Worker not discoverable after failed re-add")
+
+        assert len(events) == 1
+        assert events[0].metadata.uid == worker.uid
+        assert events[0].metadata.version == "1.0"
+
+    @pytest.mark.asyncio
+    async def test_publish_should_free_slot_when_worker_dropped_after_failed_readd(
+        self, namespace
+    ):
+        """Test a failed re-add leaves one drop able to free the slot.
+
+        Given:
+            A LocalDiscovery(capacity=1) whose worker's oversized
+            re-announcement has failed with struct.error
+        When:
+            A single "worker-dropped" is published and a distinct
+            fitting worker is then published
+        Then:
+            It should admit the distinct worker — the failed refresh
+            consumed no extra slot or reference, so one drop fully
+            unregisters.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        oversized = WorkerMetadata(
+            uid=worker.uid,
+            address="localhost:50051",
+            pid=123,
+            version="2.0",
+            extra=MappingProxyType({"data": "x" * 20000}),
+        )
+        distinct = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=124, version="1.0"
+        )
+
+        # Act & assert
+        with LocalDiscovery(namespace, capacity=1):
+            publisher = LocalDiscovery.Publisher(namespace, block_size=100)
+            async with publisher:
+                await publisher.publish("worker-added", worker)
+                with pytest.raises(struct.error):
+                    await publisher.publish("worker-added", oversized)
+
+                await publisher.publish("worker-dropped", worker)
+                await publisher.publish("worker-added", distinct)
+
+    @pytest.mark.asyncio
+    async def test_publish_should_disarm_atexit_fallback_when_readd_overflows(
+        self, namespace, atexit_recorder
+    ):
+        """Test a failed refresh leaves the atexit lifecycle paired.
+
+        Given:
+            A registered worker whose oversized re-announcement has
+            failed with struct.error, with atexit registration wrapped
+            in recording pass-throughs
+        When:
+            A single "worker-dropped" is published
+        Then:
+            It should have registered exactly one per-block fallback —
+            from the original add, none from the failed refresh — and
+            unregistered that same callable at the drop.
+        """
+        # Arrange
+        registered, unregistered = atexit_recorder
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        oversized = WorkerMetadata(
+            uid=worker.uid,
+            address="localhost:50051",
+            pid=123,
+            version="2.0",
+            extra=MappingProxyType({"data": "x" * 20000}),
+        )
+
+        with LocalDiscovery(namespace):
+            baseline = len(registered)
+            publisher = LocalDiscovery.Publisher(namespace, block_size=100)
+            async with publisher:
+                await publisher.publish("worker-added", worker)
+                with pytest.raises(struct.error):
+                    await publisher.publish("worker-added", oversized)
+
+                # Act
+                await publisher.publish("worker-dropped", worker)
+
+                # Assert
+                block_registered = registered[baseline:]
+                assert block_registered == unregistered
+                assert len(block_registered) == 1
+
+    @pytest.mark.asyncio
     async def test_publish_should_update_worker_within_capacity(self, namespace):
         """Test updating a worker in the last in-cap slot succeeds.
 
@@ -2810,10 +3464,188 @@ class TestLocalDiscoveryPublisher:
                         await publisher.publish("worker-added", workers[owner_cap])
 
     @given(
+        capacity=st.integers(min_value=1, max_value=4),
+        ops=st.lists(
+            st.tuples(
+                st.sampled_from(["add", "drop"]),
+                st.integers(min_value=0, max_value=5),
+            ),
+            max_size=12,
+        ),
+    )
+    @settings(
+        max_examples=15,
+        deadline=5000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @pytest.mark.asyncio
+    async def test_publish_should_conserve_slots_when_workers_readded_across_capacities(
+        self, namespace, capacity, ops
+    ):
+        """Test re-adds conserve slots for any capacity and op sequence.
+
+        Given:
+            A LocalDiscovery declaring an arbitrary small capacity C, a
+            six-worker roster, and an arbitrary sequence of add and
+            drop operations in which adds may re-add currently-live
+            workers
+        When:
+            The sequence is published and fresh distinct workers are
+            then published until the segment is exhausted
+        Then:
+            It should admit exactly C minus the live count of fresh
+            workers before raising DiscoveryCapacityExhausted — re-adds
+            consumed no slots and every drop reclaimed exactly one.
+        """
+        # Arrange — a per-example namespace so shared-memory state does
+        # not carry across Hypothesis examples.
+        example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
+        roster = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:{50051 + i}",
+                pid=100 + i,
+                version="1.0",
+            )
+            for i in range(6)
+        ]
+        live: set[int] = set()
+
+        # Act & assert
+        with LocalDiscovery(example_ns, capacity=capacity) as discovery:
+            async with discovery.publisher as publisher:
+                for action, index in ops:
+                    if action == "add":
+                        if index in live or len(live) < capacity:
+                            await publisher.publish("worker-added", roster[index])
+                            live.add(index)
+                        else:
+                            with pytest.raises(DiscoveryCapacityExhausted):
+                                await publisher.publish("worker-added", roster[index])
+                    elif index in live:
+                        await publisher.publish("worker-dropped", roster[index])
+                        live.discard(index)
+
+                # Act & assert — flush the remaining capacity with fresh workers
+                for i in range(capacity - len(live)):
+                    await publisher.publish(
+                        "worker-added",
+                        WorkerMetadata(
+                            uid=uuid.uuid4(),
+                            address=f"localhost:{60000 + i}",
+                            pid=900 + i,
+                            version="1.0",
+                        ),
+                    )
+                with pytest.raises(DiscoveryCapacityExhausted):
+                    await publisher.publish(
+                        "worker-added",
+                        WorkerMetadata(
+                            uid=uuid.uuid4(),
+                            address="localhost:60099",
+                            pid=999,
+                            version="1.0",
+                        ),
+                    )
+
+    @given(
+        variants=st.lists(
+            st.tuples(st.booleans(), st.integers(min_value=0, max_value=999)),
+            max_size=6,
+        )
+    )
+    @settings(
+        max_examples=10,
+        deadline=5000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @pytest.mark.asyncio
+    async def test_publish_should_converge_on_last_fitting_metadata_when_readded(
+        self, namespace, variants
+    ):
+        """Test arbitrary refresh chains converge on the last fitting write.
+
+        Given:
+            A registered worker in a small-block publisher and an
+            arbitrary chain of re-announcements of its UID, each either
+            fitting the block or exceeding it
+        When:
+            Each re-announcement is published as "worker-added" in
+            order, the oversized ones raising struct.error
+        Then:
+            It should leave the worker discoverable exactly once with
+            the metadata of the last fitting write — failed refreshes
+            never corrupt or regress the registration.
+        """
+        # Arrange — a per-example namespace so shared-memory state does
+        # not carry across Hypothesis examples.
+        example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
+        uid = uuid.uuid4()
+        worker = WorkerMetadata(
+            uid=uid, address="localhost:50051", pid=123, version="1.0"
+        )
+        expected_version = "1.0"
+
+        events = []
+        event_received = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                events.append(event)
+                event_received.set()
+                break
+
+        with LocalDiscovery(example_ns):
+            publisher = LocalDiscovery.Publisher(example_ns, block_size=100)
+            async with publisher:
+                await publisher.publish("worker-added", worker)
+
+                # Act
+                for fits, n in variants:
+                    if fits:
+                        variant = WorkerMetadata(
+                            uid=uid,
+                            address="localhost:50051",
+                            pid=123,
+                            version=f"2.{n}",
+                        )
+                        await publisher.publish("worker-added", variant)
+                        expected_version = f"2.{n}"
+                    else:
+                        variant = WorkerMetadata(
+                            uid=uid,
+                            address="localhost:50051",
+                            pid=123,
+                            version=f"2.{n}",
+                            extra=MappingProxyType({"data": "x" * 20000}),
+                        )
+                        with pytest.raises(struct.error):
+                            await publisher.publish("worker-added", variant)
+
+                # Assert
+                subscriber = LocalDiscovery.Subscriber(example_ns, poll_interval=0.05)
+                task = asyncio.create_task(collect(subscriber))
+                try:
+                    await asyncio.wait_for(event_received.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("Worker not discoverable after refresh chain")
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        assert len(events) == 1
+        assert events[0].metadata.uid == uid
+        assert events[0].metadata.version == expected_version
+
+    @given(
         ops=st.lists(
             st.tuples(
                 st.sampled_from(["add", "drop"]),
                 st.integers(min_value=0, max_value=4),
+                st.booleans(),
             ),
             min_size=1,
             max_size=20,
@@ -2825,23 +3657,28 @@ class TestLocalDiscoveryPublisher:
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
-    async def test_publish_should_bound_registrations_when_workers_cycle_at_capacity(
+    async def test_publish_should_bound_registrations_when_two_publishers_interleave(
         self, namespace, ops
     ):
-        """Test a capacity-3 segment reuses freed slots under add/drop churn.
+        """Test two publishers share one re-add contract on a namespace.
 
         Given:
-            A capacity-3 discovery, a five-worker roster, and an arbitrary
-            sequence of add/drop operations modelled so a currently-live
-            worker is never re-added (the separate #321 defect)
+            A capacity-3 discovery, a five-worker roster, and an
+            arbitrary add/drop sequence in which each add draws which
+            of two publishers issues it, re-adds of live workers going
+            through either publisher and drops through the worker's
+            registering publisher
         When:
-            The operations are published serially through one publisher
+            The operations are published serially
         Then:
-            It should accept an add exactly when fewer than three workers
-            are live and raise DiscoveryCapacityExhausted when three are live —
-            proving a dropped slot is freed and reused within the cap.
+            It should accept an add exactly when the worker is live or
+            fewer than three are live and raise
+            DiscoveryCapacityExhausted when three others are live —
+            publisher identity never affects whether an add refreshes
+            or registers.
         """
-        # Arrange
+        # Arrange — a per-example namespace so shared-memory state does
+        # not carry across Hypothesis examples.
         capacity = 3
         example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
         roster = [
@@ -2853,24 +3690,31 @@ class TestLocalDiscoveryPublisher:
             )
             for i in range(5)
         ]
-        live: set[int] = set()
+        # Drops route through each worker's registering publisher: a
+        # foreign drop leaves the registrar's pool entry live — a
+        # pre-existing reclamation gap tracked as a follow-up to #321 —
+        # which would skew the model's slot accounting.
+        registrar: dict[int, LocalDiscovery.Publisher] = {}
 
         # Act & assert
-        with LocalDiscovery(example_ns, capacity=capacity) as discovery:
-            async with discovery.publisher as publisher:
-                for action, index in ops:
+        with LocalDiscovery(example_ns, capacity=capacity):
+            publisher_a = LocalDiscovery.Publisher(example_ns)
+            publisher_b = LocalDiscovery.Publisher(example_ns)
+            async with publisher_a, publisher_b:
+                for action, index, use_b in ops:
+                    chosen = publisher_b if use_b else publisher_a
                     if action == "add":
-                        if index in live:
-                            continue
-                        if len(live) < capacity:
-                            await publisher.publish("worker-added", roster[index])
-                            live.add(index)
+                        if index in registrar:
+                            await chosen.publish("worker-added", roster[index])
+                        elif len(registrar) < capacity:
+                            await chosen.publish("worker-added", roster[index])
+                            registrar[index] = chosen
                         else:
                             with pytest.raises(DiscoveryCapacityExhausted):
-                                await publisher.publish("worker-added", roster[index])
-                    elif index in live:
+                                await chosen.publish("worker-added", roster[index])
+                    elif index in registrar:
+                        publisher = registrar.pop(index)
                         await publisher.publish("worker-dropped", roster[index])
-                        live.discard(index)
 
 
 class TestWorkerReference:
@@ -3550,6 +4394,132 @@ class TestLocalDiscoverySubscriber:
 
         # Assert
         assert seen == expected
+
+    @pytest.mark.asyncio
+    async def test___aiter___when_live_worker_readded_with_changed_metadata(
+        self, namespace
+    ):
+        """Test a live subscriber observes a re-add as an update.
+
+        Given:
+            A subscriber already iterating that has observed
+            "worker-added" for a worker at version 1.0
+        When:
+            The same UID is published "worker-added" again with
+            version 2.0
+        Then:
+            It should yield a worker-updated event carrying version 2.0,
+            with no worker-dropped and no second worker-added observed
+            before it.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        readded = WorkerMetadata(
+            uid=worker.uid, address="localhost:50051", pid=123, version="2.0"
+        )
+
+        events = []
+        added_seen = asyncio.Event()
+        refreshed_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                if event.metadata.uid != worker.uid:
+                    continue
+                events.append(event)
+                if event.type == "worker-added":
+                    added_seen.set()
+                if event.metadata.version == "2.0":
+                    refreshed_seen.set()
+                    break
+
+        with LocalDiscovery(namespace) as discovery:
+            async with discovery.publisher as publisher:
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                async with _collecting(subscriber, collect):
+                    await publisher.publish("worker-added", worker)
+                    await asyncio.wait_for(added_seen.wait(), timeout=2.0)
+
+                    # Act
+                    await publisher.publish("worker-added", readded)
+
+                    # Assert
+                    try:
+                        await asyncio.wait_for(refreshed_seen.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Refresh not observed by live subscriber")
+
+        assert events[-1].type == "worker-updated"
+        assert events[-1].metadata.version == "2.0"
+        added = [e for e in events if e.type == "worker-added"]
+        assert len(added) == 1
+        assert not any(e.type == "worker-dropped" for e in events)
+
+    @pytest.mark.asyncio
+    async def test___aiter___when_readded_worker_dropped_once_while_iterating(
+        self, namespace
+    ):
+        """Test a live subscriber sees one drop fully retire a re-add.
+
+        Given:
+            A subscriber live from before a worker's first add that has
+            observed the worker's add and its re-add at a bumped
+            version
+        When:
+            A single "worker-dropped" is published
+        Then:
+            It should yield a worker-dropped event for that UID — the
+            re-add left no residual registration keeping the worker
+            discoverable past the drop.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        readded = WorkerMetadata(
+            uid=worker.uid, address="localhost:50051", pid=123, version="2.0"
+        )
+
+        events = []
+        added_seen = asyncio.Event()
+        refreshed_seen = asyncio.Event()
+        dropped_seen = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                if event.metadata.uid != worker.uid:
+                    continue
+                events.append(event)
+                if event.type == "worker-added":
+                    added_seen.set()
+                if event.metadata.version == "2.0":
+                    refreshed_seen.set()
+                if event.type == "worker-dropped":
+                    dropped_seen.set()
+                    break
+
+        with LocalDiscovery(namespace) as discovery:
+            async with discovery.publisher as publisher:
+                subscriber = discovery.subscribe(poll_interval=0.05)
+                async with _collecting(subscriber, collect):
+                    await publisher.publish("worker-added", worker)
+                    await asyncio.wait_for(added_seen.wait(), timeout=2.0)
+                    await publisher.publish("worker-added", readded)
+                    await asyncio.wait_for(refreshed_seen.wait(), timeout=2.0)
+
+                    # Act
+                    await publisher.publish("worker-dropped", worker)
+
+                    # Assert
+                    try:
+                        await asyncio.wait_for(dropped_seen.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pytest.fail("Single drop not observed by live subscriber")
+
+        assert events[0].type == "worker-added"
+        assert events[-1].type == "worker-dropped"
 
     def test___new___should_return_distinct_object_when_key_matches(self, namespace):
         """Test constructing a Subscriber returns a fresh object each call.

@@ -39,13 +39,12 @@ from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
+from .conftest import _TIMEOUT
 from .conftest import _ensure_killed
 from .conftest import _iter_leaf_exceptions
 from .conftest import _pid_alive
 from .conftest import release_subprocess
 from .conftest import spawn_script_subprocess
-
-_TIMEOUT = 30
 
 # Acquire the namespace's discovery lock in a separate interpreter and hold
 # it until released via stdin. Uses the production `_lock` so the held lock
