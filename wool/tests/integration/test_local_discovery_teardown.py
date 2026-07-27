@@ -26,8 +26,7 @@ from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
-
-_TIMEOUT = 30
+from .conftest import _TIMEOUT
 
 _OWNER_SCRIPT = """
 import sys
