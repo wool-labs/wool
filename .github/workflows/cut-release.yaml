@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: main
       - name: Get touched files
@@ -47,7 +47,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - uses: ./.github/actions/get-wool-labs-app-token
@@ -78,7 +78,7 @@ jobs:
           echo "Release candidate: $version"
           echo "version=$version" >> $GITHUB_OUTPUT
       - name: Checkout release
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: release
           token: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
@@ -114,7 +114,7 @@ jobs:
       matrix:
         source: [wool]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/build-release
         with:
           source: ${{ matrix.source }}
@@ -156,7 +156,7 @@ jobs:
       matrix:
         source: [wool]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/publish-github-release
         with:
           source: ${{ matrix.source }}
@@ -174,7 +174,7 @@ jobs:
       matrix:
         source: [wool]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/publish-pypi-release
         with:
           source: ${{ matrix.source }}
