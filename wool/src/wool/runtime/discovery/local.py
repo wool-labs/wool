@@ -54,17 +54,28 @@ _HEADER_SIZE: Final = REF_WIDTH
 # which would deadlock the nested attach `_add` performs.
 _attach_lock: threading.Lock = threading.Lock()
 
+# The tracker's own hooks, captured before anything can rebind them, so a
+# forked child can be put back to a known state.
+_tracker_register: Final = resource_tracker.register
+_tracker_unregister: Final = resource_tracker.unregister
+
 
 def _reinit_attach_lock() -> None:  # pragma: no cover — fork-only path
-    """Replace the attach lock in a forked child.
+    """Reset the attach state a forked child inherited mid-window.
 
-    A `fork` inside the rebind window copies the lock held, wedging every
+    A ``fork`` inside the rebind window copies the lock held, wedging every
     later attach in the child. Wool starts its own workers with ``spawn``,
     but `LocalDiscovery` is public and runs inside host processes that may
     fork — the default start method on Linux below 3.14.
+
+    The hooks are restored too: a fork inside the window leaves the child
+    holding this module's shims, since the frame that would have put them
+    back died with the parent's thread.
     """
     global _attach_lock
     _attach_lock = threading.Lock()
+    resource_tracker.register = _tracker_register
+    resource_tracker.unregister = _tracker_unregister
 
 
 if hasattr(os, "register_at_fork"):  # pragma: no branch — POSIX-only guard
@@ -1061,7 +1072,9 @@ def _attach(name: str) -> SharedMemory:
     the window would otherwise copy it held and wedge every later attach.
     """
     if sys.version_info >= (3, 13):
-        return SharedMemory(name=name, track=False)
+        # Unreachable below 3.13, where the parameter does not exist, so
+        # the 3.11 and 3.12 legs would otherwise report it missing.
+        return SharedMemory(name=name, track=False)  # pragma: no cover
 
     with _attach_lock:
         register = resource_tracker.register
