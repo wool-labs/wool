@@ -92,10 +92,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # No `ref:` here. Under `pull_request_target` on a fork PR,
+      # actions/checkout refuses any PR-associated ref (see
+      # allow-unsafe-pr-checkout). The base branch is trusted and is all
+      # this job needs: the composite action below runs from the checked
+      # out tree, and the tag is created through the API at TARGET_SHA.
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
       - uses: ./.github/actions/get-wool-labs-app-token
         id: get-wool-labs-app-token
         with:
@@ -108,11 +111,12 @@ jobs:
           GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
           REPO: ${{ github.repository }}
           NEW_VERSION: ${{ needs.bump-version.outputs.version }}
+          TARGET_SHA: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
         run: |
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
-          echo "Tagging $NEW_VERSION"
-          git tag "$NEW_VERSION"
-          git push origin "$NEW_VERSION"
+          echo "Tagging $NEW_VERSION at $TARGET_SHA"
+          gh api "repos/$REPO/git/refs" \
+            -f ref="refs/tags/$NEW_VERSION" \
+            -f sha="$TARGET_SHA"
           echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
   build-release:
