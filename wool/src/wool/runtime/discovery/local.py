@@ -6,6 +6,7 @@ import hashlib
 import struct
 import sys
 import tempfile
+import threading
 import warnings
 from contextlib import asynccontextmanager
 from contextlib import contextmanager
@@ -47,6 +48,12 @@ NULL_REF: Final = b"\x00" * REF_WIDTH
 DEFAULT_LOCK_TIMEOUT: Final[float] = 30.0
 _HEADER_MAGIC: Final = b"WLD1"
 _HEADER_SIZE: Final = REF_WIDTH
+# Serialises the resource-tracker rebind window in `_attach` below 3.13. Held
+# only across one `SharedMemory` constructor, never across a `_shared_memory`
+# body -- the module attaches a worker's block while an address-space attach is
+# already open, which a lock held that wide would deadlock on. Not reinitialised
+# after `fork`; wool starts workers with `spawn`, which inherits no lock state.
+_ATTACH_LOCK: Final = threading.Lock()
 
 
 class _Watchdog(FileSystemEventHandler):
@@ -984,18 +991,78 @@ def _short_hash(s: str, n: int = 30) -> str:
     return b64_str.rstrip("=")[:n]
 
 
+def _attach(name: str) -> SharedMemory:
+    """Map an existing shared memory segment without tracking it.
+
+    Only the process that created a segment may own its lifetime. Were an
+    attach-only mapping registered with this process's resource tracker, the
+    tracker would unlink the segment when this process exits, out from under
+    its owner (bpo-38119).
+
+    Python 3.13 says exactly that with ``track=False``. Below 3.13 there is
+    no such parameter, so the registration is instead suppressed at its
+    source for as long as the constructor runs. Undoing it afterwards --
+    registering, then unregistering -- is *not* equivalent: the tracker's
+    cache is a set shared by every process in the tree, so the first attach's
+    unregister discards the entry the creator made, and the creator's own
+    ``unlink`` later finds nothing to remove. That raises `KeyError` inside
+    the tracker process, which prints a traceback to stderr nothing in the
+    attaching process can intercept.
+
+    The suppression is as narrow as the failure allows. It matches on all
+    three of the calling thread, the resource type, and this segment's name,
+    and it lasts only as long as one constructor call -- so the sole call it
+    can ever swallow is the one made on our behalf from inside that
+    constructor. A ``create=True`` running concurrently on another thread is
+    still tracked, even for this same name. The lock serialises the rebind
+    itself, without which two overlapping attaches would restore each other's
+    shim and leave one installed for good.
+
+    `SharedMemory` compares names with a leading ``/`` on POSIX and without
+    it here, so both sides are stripped before matching.
+
+    A segment mapped through here MUST NOT be unlinked -- below 3.13
+    `SharedMemory.unlink` unregisters unconditionally, which would discard
+    the creator's entry after all. Teardown in this module unlinks only
+    segments it created; see `_unlink_quietly`.
+
+    :param name:
+        The name of the shared memory segment to map.
+    :returns:
+        An untracked SharedMemory instance mapped to the named segment.
+    """
+    if sys.version_info >= (3, 13):
+        return SharedMemory(name=name, track=False)
+
+    with _ATTACH_LOCK:
+        register = resource_tracker.register
+        attaching = threading.get_ident()
+        target = name.lstrip("/")
+
+        def _register(registered_name: str, rtype: str) -> None:
+            if (
+                threading.get_ident() == attaching
+                and rtype == "shared_memory"
+                and registered_name.lstrip("/") == target
+            ):
+                return
+            register(registered_name, rtype)
+
+        resource_tracker.register = _register
+        try:
+            return SharedMemory(name=name)
+        finally:
+            resource_tracker.register = register
+
+
 @contextmanager
 def _shared_memory(name):
     """Open an existing shared memory region by name.
 
     Context manager that opens a shared memory region for reading or writing
     and ensures it is properly closed on exit. Does not create new memory
-    regions (use SharedMemory with create=True for that).
-
-    The attachment is deliberately untracked: registering an attach-only
-    mapping with this process's resource tracker would unlink the segment
-    at this process's exit out from under its owner (bpo-38119). Only the
-    process that created a segment may own its lifetime.
+    regions (use SharedMemory with create=True for that). The mapping is
+    untracked -- see `_attach` for why, and for what that forbids.
 
     :param name:
         The name of the shared memory region to open.
@@ -1006,14 +1073,7 @@ def _shared_memory(name):
         Close errors are silently ignored to handle cases where the memory
         region has been unlinked by another process.
     """
-    if sys.version_info >= (3, 13):
-        shared_memory = SharedMemory(name=name, track=False)
-    else:  # pragma: no cover — bpo-38119 workaround predating track=False
-        shared_memory = SharedMemory(name=name)
-        resource_tracker.unregister(
-            shared_memory._name,  # type: ignore[attr-defined]
-            "shared_memory",
-        )
+    shared_memory = _attach(name)
     try:
         yield shared_memory
     finally:
