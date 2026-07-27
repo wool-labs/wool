@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import atexit
 import hashlib
+import os
 import struct
 import sys
 import tempfile
+import threading
 import warnings
 from contextlib import asynccontextmanager
 from contextlib import contextmanager
@@ -47,6 +49,37 @@ NULL_REF: Final = b"\x00" * REF_WIDTH
 DEFAULT_LOCK_TIMEOUT: Final[float] = 30.0
 _HEADER_MAGIC: Final = b"WLD1"
 _HEADER_SIZE: Final = REF_WIDTH
+# Serialises the resource-tracker rebind window; see `_attach`. Held only
+# across one `SharedMemory` constructor, never across a `_shared_memory` body,
+# which would deadlock the nested attach `_add` performs.
+_attach_lock: threading.Lock = threading.Lock()
+
+# The tracker's own hooks, captured before anything can rebind them, so a
+# forked child can be put back to a known state.
+_tracker_register: Final = resource_tracker.register
+_tracker_unregister: Final = resource_tracker.unregister
+
+
+def _reinit_attach_lock() -> None:  # pragma: no cover — fork-only path
+    """Reset the attach state a forked child inherited mid-window.
+
+    A ``fork`` inside the rebind window copies the lock held, wedging every
+    later attach in the child. Wool starts its own workers with ``spawn``,
+    but `LocalDiscovery` is public and runs inside host processes that may
+    fork — the default start method on Linux below 3.14.
+
+    The hooks are restored too: a fork inside the window leaves the child
+    holding this module's shims, since the frame that would have put them
+    back died with the parent's thread.
+    """
+    global _attach_lock
+    _attach_lock = threading.Lock()
+    resource_tracker.register = _tracker_register
+    resource_tracker.unregister = _tracker_unregister
+
+
+if hasattr(os, "register_at_fork"):  # pragma: no branch — POSIX-only guard
+    os.register_at_fork(after_in_child=_reinit_attach_lock)
 
 
 class _Watchdog(FileSystemEventHandler):
@@ -125,10 +158,11 @@ class _WorkerReference:
         self._uuid = uid
 
     def __str__(self) -> str:
-        """String representation (32-char hex) for :class:`SharedMemory` names.
+        """Return the `SharedMemory` name identifying this worker's block.
 
         :returns:
-            The UUID as a hex string without dashes.
+            The UUID abbreviated by `_short_hash` — 30 characters of
+            URL-safe base64, short enough for the platform name limit.
         """
         return _short_hash(self._uuid.hex)
 
@@ -292,10 +326,7 @@ class LocalDiscovery(Discovery):
             )
             self._owner = True
         except FileExistsError:
-            self._address_space = SharedMemory(
-                name=_short_hash(self._namespace),
-                create=False,
-            )
+            self._address_space = _attach(_short_hash(self._namespace))
             self._owner = False
 
         assert self._address_space.buf
@@ -984,18 +1015,109 @@ def _short_hash(s: str, n: int = 30) -> str:
     return b64_str.rstrip("=")[:n]
 
 
+def _attach(name: str) -> SharedMemory:
+    """Map an existing shared memory segment without tracking it.
+
+    Only the process that created a segment may own its lifetime. An
+    attach-only mapping registered with this process's resource tracker
+    would be unlinked when this process exits, out from under its owner
+    (bpo-38119), so this maps the segment without registering it.
+
+    A segment mapped through here MUST NOT be unlinked. Where `track` is
+    unavailable `SharedMemory.unlink` unregisters unconditionally, which
+    would discard the creator's entry after all; teardown in this module
+    unlinks only segments it created, through `_unlink_quietly`.
+
+    :param name:
+        The name of the shared memory segment to map.
+    :returns:
+        An untracked `SharedMemory` mapped to the named segment.
+    :raises FileNotFoundError:
+        If no segment of that name exists. The tracker hooks are restored
+        whether the mapping succeeds or raises.
+
+    .. rubric:: Implementation notes
+
+    Python 3.13 says this directly with ``track=False``. Below it there is
+    no such parameter, so the registration is suppressed at its source for
+    as long as the constructor runs. Undoing it afterwards, i.e. registering
+    and then unregistering, is *not* equivalent: the tracker's cache is a
+    set shared by every process in the tree, so the first attach's
+    unregister discards the entry the creator made, and the creator's own
+    unlink later finds nothing to remove — which raises `KeyError` inside
+    the tracker process and prints a traceback to stderr that nothing in the
+    attaching process can intercept.
+
+    Both hooks are rebound, not just `resource_tracker.register`: the
+    constructor wraps its own ``mmap`` in ``except OSError: self.unlink()``,
+    and that unlink issues the very unregister this function exists to
+    avoid. It also calls ``shm_unlink``, which is CPython's to own and
+    cannot be intercepted from here — a mid-construction `OSError` therefore
+    still destroys the segment.
+
+    The suppression matches on the calling thread, the resource type, and
+    this segment's name, and lasts only one constructor call, so the sole
+    call it can swallow is the one made on this function's behalf. A
+    ``create=True`` running concurrently on another thread stays tracked
+    even for the same name. `SharedMemory` registers names slash-prefixed
+    on POSIX while callers pass them bare, so both sides are stripped
+    before matching.
+
+    The lock serialises the rebind. Without it two overlapping attaches
+    would each capture the other's shim: the second attach's registration
+    would reach a shim whose thread does not match, be forwarded to the
+    real tracker, and be tracked after all — reinstating bpo-38119. That a
+    shim would also be left permanently installed is the lesser effect.
+    `os.register_at_fork` replaces the lock in a child, since a fork inside
+    the window would otherwise copy it held and wedge every later attach.
+    """
+    if sys.version_info >= (3, 13):
+        # Unreachable below 3.13, where the parameter does not exist, so
+        # the 3.11 and 3.12 legs would otherwise report it missing.
+        return SharedMemory(name=name, track=False)  # pragma: no cover
+
+    with _attach_lock:
+        register = resource_tracker.register
+        unregister = resource_tracker.unregister
+        attaching = threading.get_ident()
+        target = name.lstrip("/")
+
+        def _suppressed(name: str, rtype: str) -> bool:
+            return (
+                threading.get_ident() == attaching
+                and rtype == "shared_memory"
+                and name.lstrip("/") == target
+            )
+
+        def _register(name: str, rtype: str) -> None:
+            if not _suppressed(name, rtype):
+                register(name, rtype)
+
+        def _unregister(name: str, rtype: str) -> None:
+            if not _suppressed(name, rtype):
+                unregister(name, rtype)
+
+        try:
+            resource_tracker.register = _register
+            resource_tracker.unregister = _unregister
+            return SharedMemory(name=name)
+        finally:
+            # Only restore what is still ours: a third party that rebound
+            # either hook inside the window keeps its wrapper.
+            if resource_tracker.register is _register:
+                resource_tracker.register = register
+            if resource_tracker.unregister is _unregister:
+                resource_tracker.unregister = unregister
+
+
 @contextmanager
 def _shared_memory(name):
     """Open an existing shared memory region by name.
 
     Context manager that opens a shared memory region for reading or writing
     and ensures it is properly closed on exit. Does not create new memory
-    regions (use SharedMemory with create=True for that).
-
-    The attachment is deliberately untracked: registering an attach-only
-    mapping with this process's resource tracker would unlink the segment
-    at this process's exit out from under its owner (bpo-38119). Only the
-    process that created a segment may own its lifetime.
+    regions (use `SharedMemory` with ``create=True`` for that). The mapping
+    is untracked — see `_attach` for why, and for what that forbids.
 
     :param name:
         The name of the shared memory region to open.
@@ -1006,14 +1128,7 @@ def _shared_memory(name):
         Close errors are silently ignored to handle cases where the memory
         region has been unlinked by another process.
     """
-    if sys.version_info >= (3, 13):
-        shared_memory = SharedMemory(name=name, track=False)
-    else:  # pragma: no cover — bpo-38119 workaround predating track=False
-        shared_memory = SharedMemory(name=name)
-        resource_tracker.unregister(
-            shared_memory._name,  # type: ignore[attr-defined]
-            "shared_memory",
-        )
+    shared_memory = _attach(name)
     try:
         yield shared_memory
     finally:

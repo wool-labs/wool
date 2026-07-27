@@ -1,20 +1,30 @@
 import asyncio
 import atexit
+import contextlib
+import errno
+import mmap
 import pickle
+import sys
+import threading
 import uuid
 from collections import Counter
 from contextlib import ExitStack
 from contextlib import asynccontextmanager
+from contextlib import contextmanager
+from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
 from types import MappingProxyType
+from types import SimpleNamespace
 
 import portalocker
 import pytest
 from hypothesis import HealthCheck
+from hypothesis import assume
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
+from wool.runtime.discovery import local
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
@@ -110,6 +120,110 @@ def unlink_schedule(mocker):
 
 
 @pytest.fixture
+def tracker_ledger(mocker):
+    """Mirror the resource tracker's cache in-process, recording violations.
+
+    Wraps `resource_tracker.register` and `resource_tracker.unregister`,
+    replaying the tracker's own bookkeeping locally: a per-type **set**,
+    added to on register and removed from on unregister.
+
+    The set is the whole point. Registrations of one name collapse to a
+    single entry while every unregister attempts its own removal, so
+    counting calls does not detect the fault `_attach` documents — the
+    counts stay perfectly balanced while the tracker raises. What raises is
+    a removal of a name the cache no longer holds; here it lands in
+    ``violations`` instead of a traceback no test can observe.
+
+    A violating unregister is recorded and *not* forwarded. Forwarding it
+    would corrupt the real tracker's session-global cache and reproduce
+    that traceback inside this suite, misattributed to whichever test ran
+    last. Every other call passes through, so real segments stay tracked.
+
+    Only names first registered inside this fixture's window can be
+    recorded as violations, so a segment that outlived an earlier test
+    cannot produce a false one.
+    """
+    ledger = SimpleNamespace(registered=[], violations=[])
+    cache: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str]] = set()
+    real_register = resource_tracker.register
+    real_unregister = resource_tracker.unregister
+
+    def register(name, rtype):
+        key = (rtype, name.lstrip("/"))
+        ledger.registered.append(key)
+        cache.add(key)
+        seen.add(key)
+        return real_register(name, rtype)
+
+    def unregister(name, rtype):
+        key = (rtype, name.lstrip("/"))
+        if key in cache:
+            cache.discard(key)
+        elif key in seen:
+            ledger.violations.append(key)
+            return None
+        return real_unregister(name, rtype)
+
+    def reset():
+        ledger.registered.clear()
+        ledger.violations.clear()
+        cache.clear()
+        seen.clear()
+
+    mocker.patch.object(resource_tracker, "register", register)
+    mocker.patch.object(resource_tracker, "unregister", unregister)
+    ledger.residual = cache
+    ledger.reset = reset
+    return ledger
+
+
+@pytest.fixture
+def attach_fallback(mocker):
+    """Force the attach path taken where `SharedMemory` has no ``track``.
+
+    The package supports 3.11 and up, so most supported interpreters take
+    that path — but the development interpreter is 3.13, where it is
+    unreachable. The branch is measured rather than pragma-excluded, so
+    forcing it is what covers it there; where the interpreter is already
+    below 3.13 the override is a no-op against the natural branch.
+
+    The module reads `sys` at exactly one place, so replacing its own
+    reference is narrower than patching the real `sys.version_info`, which
+    every module in the interpreter would see. Should another `sys`
+    attribute ever be used there, this raises `AttributeError` rather than
+    silently steering nothing.
+
+    Forcing *down* is always safe. Forcing up is not: ``track=False`` does
+    not exist below 3.13, so a test wanting the modern path must skip
+    rather than override.
+    """
+    mocker.patch.object(
+        local, "sys", SimpleNamespace(version_info=(3, 12, 0, "final", 0))
+    )
+
+
+@pytest.fixture
+def attach_calls(mocker):
+    """Record the keyword arguments of every `SharedMemory` construction.
+
+    Observes which attach path ran, rather than trusting the version the
+    `attach_fallback` fixture reports: only the modern path passes
+    ``track``. Without this, inverting the version predicate leaves the
+    suite green while every test silently exercises the other branch.
+    """
+    calls = []
+    mapping = local.SharedMemory
+
+    def constructing(*args, **kwargs):
+        calls.append(kwargs)
+        return mapping(*args, **kwargs)
+
+    mocker.patch.object(local, "SharedMemory", constructing)
+    return calls
+
+
+@pytest.fixture
 def held_lock(mocker):
     """Patch portalocker.lock to report the lock is permanently held.
 
@@ -175,6 +289,263 @@ _LIFECYCLE_FORESTS = st.recursive(
     lambda children: st.lists(children, max_size=3),
     max_leaves=6,
 )
+
+
+@contextmanager
+def _segment(name):
+    """Create a shared memory segment by name, unlinking it on exit."""
+    created = SharedMemory(name=name, create=True, size=64)
+    try:
+        yield created
+    finally:
+        created.close()
+        created.unlink()
+
+
+def _segment_name():
+    """Return a fresh segment name short enough for macOS's 31-char limit."""
+    return f"wool-336-{uuid.uuid4().hex[:16]}"
+
+
+@pytest.fixture(params=["fallback", "native"])
+def attach_path(request, mocker):
+    """Select an attach path, skipping the modern one where it cannot run.
+
+    Forcing the fallback is safe on every interpreter. Forcing the modern
+    path is not — ``track=False`` does not exist below 3.13 — so that case
+    skips rather than overrides.
+    """
+    if request.param == "fallback":
+        mocker.patch.object(
+            local, "sys", SimpleNamespace(version_info=(3, 12, 0, "final", 0))
+        )
+    elif sys.version_info < (3, 13):
+        pytest.skip("track=False requires Python 3.13")
+    return request.param
+
+
+def test__attach_should_not_register_the_segment(
+    attach_path, attach_calls, tracker_ledger
+):
+    """Test attaching to a segment leaves the resource tracker untouched.
+
+    Given:
+        An existing shared memory segment, on either attach path.
+    When:
+        The segment is attached by name.
+    Then:
+        It should register nothing further for that segment, leaving the
+        creator's registration to answer the creator's own unlink — the
+        same observable on both paths.
+    """
+    # Arrange
+    name = _segment_name()
+
+    # Act
+    with _segment(name):
+        before = tracker_ledger.registered.count(("shared_memory", name))
+        attached = local._attach(name)
+        attached.close()
+
+    # Assert
+    assert tracker_ledger.registered.count(("shared_memory", name)) == before
+    assert tracker_ledger.violations == []
+    # Pin which path ran: only the modern one passes track.
+    assert ("track" in attach_calls[-1]) == (attach_path == "native")
+
+
+def test__attach_should_register_other_resources_when_track_unsupported(
+    mocker, attach_fallback, tracker_ledger
+):
+    """Test the fallback suppresses only this segment and this resource type.
+
+    Given:
+        An interpreter reporting a version below 3.13, and a mapping that
+        registers an unrelated segment and a semaphore of the very name
+        being attached while the constructor runs.
+    When:
+        The segment is attached by name.
+    Then:
+        It should pass both registrations through — narrowing the
+        suppression to one segment and one resource type, not to the name
+        alone.
+    """
+    # Arrange
+    name = _segment_name()
+    other = _segment_name()
+    mapping = local.SharedMemory
+
+    def constructing(*args, **kwargs):
+        resource_tracker.register(f"/{other}", "shared_memory")
+        resource_tracker.register(f"/{name}", "semaphore")
+        return mapping(*args, **kwargs)
+
+    mocker.patch.object(local, "SharedMemory", constructing)
+
+    # Act
+    with _segment(name):
+        before = tracker_ledger.registered.count(("shared_memory", name))
+        try:
+            attached = local._attach(name)
+            attached.close()
+        finally:
+            resource_tracker.unregister(f"/{other}", "shared_memory")
+            resource_tracker.unregister(f"/{name}", "semaphore")
+
+    # Assert
+    assert ("shared_memory", other) in tracker_ledger.registered
+    assert ("semaphore", name) in tracker_ledger.registered
+    assert tracker_ledger.registered.count(("shared_memory", name)) == before
+
+
+def test__attach_should_register_the_segment_when_another_thread_registers_it(
+    mocker, attach_fallback, tracker_ledger
+):
+    """Test the fallback suppresses only its own thread's registration.
+
+    Given:
+        An interpreter reporting a version below 3.13, and a second thread
+        registering the very segment being attached from inside the window
+        in which the attach has the tracker's hooks rebound.
+    When:
+        The segment is attached by name.
+    Then:
+        It should let that thread's registration reach the tracker.
+    """
+    # Arrange
+    name = _segment_name()
+    mapping = local.SharedMemory
+
+    def constructing(*args, **kwargs):
+        registrar = threading.Thread(
+            target=resource_tracker.register, args=(f"/{name}", "shared_memory")
+        )
+        registrar.start()
+        registrar.join(timeout=5)
+        assert not registrar.is_alive()
+        return mapping(*args, **kwargs)
+
+    mocker.patch.object(local, "SharedMemory", constructing)
+
+    # Act
+    with _segment(name):
+        before = tracker_ledger.registered.count(("shared_memory", name))
+        attached = local._attach(name)
+        attached.close()
+
+    # Assert
+    assert tracker_ledger.registered.count(("shared_memory", name)) == before + 1
+
+
+def test__attach_should_serialise_overlapping_attaches(
+    mocker, attach_fallback, tracker_ledger
+):
+    """Test one attach's rebind window excludes another thread's.
+
+    Given:
+        An interpreter reporting a version below 3.13, and a second thread
+        attaching a different segment while the first attach holds the
+        window open.
+    When:
+        The first attach is in its constructor.
+    Then:
+        It should keep the second thread waiting until the window closes —
+        two overlapping rebinds would capture each other's shim, letting an
+        attach's own registration escape suppression.
+    """
+    # Arrange
+    first = _segment_name()
+    second = _segment_name()
+    mapping = local.SharedMemory
+    contender_ran = threading.Event()
+
+    def constructing(*args, **kwargs):
+        if kwargs.get("name") == first:
+
+            def contend():
+                local._attach(second).close()
+                contender_ran.set()
+
+            contender = threading.Thread(target=contend, daemon=True)
+            contender.start()
+            # The contender cannot enter its own window while this one is
+            # open, so it is still blocked here.
+            assert not contender_ran.wait(timeout=0.5)
+        return mapping(*args, **kwargs)
+
+    mocker.patch.object(local, "SharedMemory", constructing)
+
+    # Act
+    with _segment(first), _segment(second):
+        local._attach(first).close()
+
+        # Assert
+        assert contender_ran.wait(timeout=5)
+        assert tracker_ledger.violations == []
+
+
+def test__attach_should_suppress_the_unregister_when_the_mapping_fails(
+    mocker, attach_fallback, tracker_ledger
+):
+    """Test a mapping that fails mid-construction issues no unregister.
+
+    Given:
+        An interpreter reporting a version below 3.13, where the memory
+        mapping raises after the segment is opened — the path on which
+        `SharedMemory` unlinks what it opened before returning.
+    When:
+        The segment is attached by name.
+    Then:
+        It should propagate the error without unregistering a name it
+        never registered, which would discard the creator's entry exactly
+        as the superseded pattern did.
+    """
+    # Arrange — create first, then break the mapping, so only the attach
+    # takes the constructor's failure path.
+    name = _segment_name()
+    created = SharedMemory(name=name, create=True, size=64)
+    mocker.patch.object(mmap, "mmap", side_effect=OSError(errno.ENOMEM, "no memory"))
+
+    # Act & assert
+    try:
+        with pytest.raises(OSError):
+            local._attach(name)
+
+        assert tracker_ledger.violations == []
+    finally:
+        created.close()
+        # The failed attach unlinks what it opened, so the segment may
+        # already be gone; that part is CPython's and not ours to prevent.
+        with contextlib.suppress(FileNotFoundError):
+            created.unlink()
+
+
+def test__attach_should_restore_the_tracker_hooks_when_the_segment_is_gone(
+    attach_fallback, tracker_ledger
+):
+    """Test a failed attach still unwinds the tracker suppression.
+
+    Given:
+        An interpreter reporting a version below 3.13 and a segment name
+        that does not exist.
+    When:
+        The segment is attached by name and the mapping fails.
+    Then:
+        It should propagate FileNotFoundError and leave a later, unrelated
+        segment tracked normally — suppression left installed would
+        silently stop tracking that name for the rest of the process.
+    """
+    # Arrange
+    missing = _segment_name()
+    later = _segment_name()
+
+    # Act
+    with pytest.raises(FileNotFoundError):
+        local._attach(missing)
+
+    # Assert — the observable consequence, not the hook's identity.
+    with _segment(later):
+        assert ("shared_memory", later) in tracker_ledger.registered
 
 
 class TestLocalDiscovery:
@@ -3715,6 +4086,108 @@ class TestLocalDiscoveryPublisher:
                         publisher = registrar.pop(index)
                         await publisher.publish("worker-dropped", roster[index])
 
+    @pytest.mark.asyncio
+    async def test_publish_should_leave_the_tracker_balanced_when_worker_readded(
+        self, namespace, attach_fallback, tracker_ledger
+    ):
+        """Test a re-announced worker never unregisters an untracked name.
+
+        Given:
+            An owned namespace on an interpreter reporting a version
+            below 3.13, and a worker announced more than once, which
+            attaches a live block on every announcement.
+        When:
+            The worker is added, re-added, updated, and dropped, and the
+            namespace's owner exits.
+        Then:
+            It should never unregister a name the tracker is not holding,
+            and should leave nothing registered — every attach preserved
+            the registration its creator's unlink depends on.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+
+        # Act
+        with LocalDiscovery(namespace):
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", worker)
+                await publisher.publish("worker-added", worker)
+                await publisher.publish("worker-updated", worker)
+                await publisher.publish("worker-dropped", worker)
+
+        # Assert
+        assert tracker_ledger.violations == []
+        assert tracker_ledger.residual == set()
+
+    @given(
+        ops=st.lists(
+            st.tuples(
+                st.sampled_from(["add", "update", "drop"]),
+                st.integers(min_value=0, max_value=2),
+            ),
+            min_size=1,
+            max_size=12,
+        )
+    )
+    @settings(
+        max_examples=15,
+        deadline=5000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @pytest.mark.asyncio
+    async def test_publish_should_leave_the_tracker_balanced_across_event_sequences(
+        self, namespace, attach_fallback, tracker_ledger, ops
+    ):
+        """Test the tracker stays consistent however segments are reattached.
+
+        Given:
+            An owned namespace on an interpreter reporting a version
+            below 3.13, a three-worker roster, and an arbitrary sequence
+            of add, update, and drop events over it.
+        When:
+            The sequence is published serially and the owner exits.
+        Then:
+            It should never unregister a name the tracker is not holding,
+            whatever the order and however many times one segment is
+            attached.
+        """
+        # Arrange — a per-example namespace and ledger, so neither
+        # shared-memory state nor one example's imbalance carries into the
+        # next; the fixture itself is function-scoped, not example-scoped.
+        example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
+        tracker_ledger.reset()
+        assume(any(action == "add" for action, _ in ops))
+        roster = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:{50051 + i}",
+                pid=100 + i,
+                version="1.0",
+            )
+            for i in range(3)
+        ]
+        live: set[int] = set()
+
+        # Act
+        with LocalDiscovery(example_ns):
+            async with LocalDiscovery.Publisher(example_ns) as publisher:
+                for action, index in ops:
+                    if action == "add":
+                        await publisher.publish("worker-added", roster[index])
+                        live.add(index)
+                    elif index in live:
+                        if action == "update":
+                            await publisher.publish("worker-updated", roster[index])
+                        else:
+                            await publisher.publish("worker-dropped", roster[index])
+                            live.discard(index)
+
+        # Assert
+        assert tracker_ledger.violations == []
+        assert tracker_ledger.residual == set()
+
 
 class TestWorkerReference:
     """Tests for the internal _WorkerReference value object."""
@@ -4591,6 +5064,59 @@ class TestLocalDiscoverySubscriber:
         # Assert
         assert len(events) == 1
         assert events[0].metadata.uid == metadata.uid
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_leave_the_tracker_balanced_when_polling(
+        self, namespace, attach_fallback, attach_calls, tracker_ledger
+    ):
+        """Test repeated read-side attaches leave the tracker consistent.
+
+        Given:
+            An owned namespace holding one worker, on an interpreter
+            reporting a version below 3.13, and a subscriber polling it —
+            the most frequent attach in the system, since every poll
+            reattaches the address space and each worker's block.
+        When:
+            The subscriber discovers the worker, the poll loop reattaches
+            those segments several times, and the worker is dropped.
+        Then:
+            It should never unregister a name the tracker is not holding
+            and should leave nothing registered — a reader must not consume
+            the registration the writer's unlink depends on.
+        """
+        # Arrange — a unique uid, so a segment left by a concurrent run of
+        # this test cannot collide on the name derived from it.
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        received = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                if event.metadata.uid == worker.uid:
+                    received.set()
+
+        # Act
+        with LocalDiscovery(namespace) as discovery:
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", worker)
+                subscriber = discovery.subscribe(poll_interval=0.02)
+                async with _collecting(subscriber, collect):
+                    await asyncio.wait_for(received.wait(), timeout=5.0)
+                    attaches = len(attach_calls)
+                    # Count reattachments rather than trusting elapsed time:
+                    # the poll loop remaps the same segments every cycle.
+                    deadline = asyncio.get_running_loop().time() + 5.0
+                    while len(attach_calls) < attaches + 4:
+                        assert asyncio.get_running_loop().time() < deadline, (
+                            "poll loop stopped reattaching"
+                        )
+                        await asyncio.sleep(0.02)
+                await publisher.publish("worker-dropped", worker)
+
+        # Assert
+        assert tracker_ledger.violations == []
+        assert tracker_ledger.residual == set()
 
 
 def _enter_lifecycle_forest(namespace, forest):
