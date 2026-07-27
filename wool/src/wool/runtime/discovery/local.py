@@ -315,9 +315,7 @@ class LocalDiscovery(Discovery):
             )
             self._owner = True
         except FileExistsError:
-            self._address_space = SharedMemory(
-                name=_short_hash(self._namespace), create=False
-            )
+            self._address_space = _attach(_short_hash(self._namespace))
             self._owner = False
 
         assert self._address_space.buf
