@@ -20,7 +20,7 @@ jobs:
       has_code_changes: ${{ steps.get-touched-files.outputs.touched && 'true' || 'false' }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Get touched files
         id: get-touched-files
@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install uv and prepare python
         uses: astral-sh/setup-uv@v5
@@ -64,7 +64,7 @@ jobs:
         namespace: ['wool']
         python-version: ['3.11', '3.12', '3.13']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/run-tests
         with:
           python-version: ${{ matrix.python-version }}
@@ -83,7 +83,7 @@ jobs:
         namespace: ['wool']
         python-version: ['3.11', '3.12', '3.13']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/run-tests
         with:
           python-version: ${{ matrix.python-version }}
@@ -102,7 +102,7 @@ jobs:
         python-version: ['3.11', '3.12', '3.13']
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install uv and prepare python
         uses: astral-sh/setup-uv@v5

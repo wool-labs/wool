@@ -60,7 +60,7 @@ jobs:
       version: ${{ steps.bump-version.outputs.version }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.commit }}
           fetch-depth: 0
@@ -92,7 +92,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.commit }}
       - uses: ./.github/actions/get-wool-labs-app-token
@@ -123,7 +123,7 @@ jobs:
       matrix:
         source: [wool]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.commit }}
       - uses: ./.github/actions/build-release
@@ -164,7 +164,7 @@ jobs:
       matrix:
         source: [wool]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.commit }}
       - uses: ./.github/actions/publish-github-release
@@ -185,7 +185,7 @@ jobs:
       matrix:
         source: [wool]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.commit }}
       - uses: ./.github/actions/publish-pypi-release
