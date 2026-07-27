@@ -4,10 +4,9 @@ These are targeted standalone tests rather than pairwise scenarios:
 issue #291's reproduction shape — rapid same-namespace teardown and
 respawn with overlapping pool lifecycles — cannot be expressed through
 ``build_pool_from_scenario``'s single-yield nested-context contract,
-and the cross-process case needs independent interpreters whose
-multiprocessing resource trackers genuinely unlink the shared segment
-(CPython bpo-38119). Unit-level simulations of the same contracts live
-in ``tests/runtime/discovery/test_local.py``.
+and the cross-process case needs an independent interpreter to remove
+the shared segment out from under a live owner. Unit-level simulations
+of the same contracts live in ``tests/runtime/discovery/test_local.py``.
 """
 
 import asyncio
@@ -42,10 +41,19 @@ print("clean-exit", flush=True)
 _ATTACHER_SCRIPT = """
 import sys
 
-from wool.runtime.discovery.local import LocalDiscovery
+from multiprocessing.shared_memory import SharedMemory
 
-with LocalDiscovery(sys.argv[1]):
-    pass
+from wool.runtime.discovery.local import _short_hash
+
+# Remove the owner's segment out from under it. This used to be a side
+# effect of entering LocalDiscovery as a non-owner, whose tracked attach
+# had this interpreter's resource tracker reclaim the segment at exit;
+# that attach is untracked as of #336, so the removal is explicit here.
+# What these tests need is only that the segment vanishes externally.
+segment = SharedMemory(name=_short_hash(sys.argv[1]), create=False)
+segment.close()
+segment.unlink()
+print("unlinked", flush=True)
 """
 
 _LEAKED_OWNER_SCRIPT = """
@@ -353,12 +361,10 @@ class TestCrossProcessTeardown:
                 timeout=_TIMEOUT,
             )
             assert attacher.returncode == 0
-            # Vacuity guard — the attacher's tracker really unlinked
-            # the segment (warning about the leak) before the owner
-            # exits; if CPython ever stops tracking attaches this
-            # fails loudly instead of passing without exercising the
-            # fix.
-            assert "leaked shared_memory" in attacher.stderr
+            # Vacuity guard — the segment really did vanish before the
+            # owner exits, so the owner's teardown is exercised against a
+            # missing segment rather than passing on a live one.
+            assert "unlinked" in attacher.stdout
 
             # Act — release the owner to exit its context and shut
             # down its interpreter
@@ -411,9 +417,9 @@ class TestCrossProcessTeardown:
                 timeout=_TIMEOUT,
             )
             assert attacher.returncode == 0
-            # Vacuity guard — the attacher's tracker really unlinked
-            # the segment before the owner shuts down.
-            assert "leaked shared_memory" in attacher.stderr
+            # Vacuity guard — the segment really did vanish before the
+            # owner shuts down.
+            assert "unlinked" in attacher.stdout
 
             # Act — the owner returns from its script with the
             # context still open, so atexit fires the armed fallback
