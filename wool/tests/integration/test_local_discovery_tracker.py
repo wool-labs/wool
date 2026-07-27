@@ -49,7 +49,7 @@ if mode == "legacy":
     local.sys = SimpleNamespace(version_info=(3, 12, 0, "final", 0))
 
 # Report the path that actually ran, observed from the constructor's
-# arguments rather than by re-reading the version the override set --
+# arguments rather than by re-reading the version the override set:
 # only the modern path passes ``track``.
 _mapping = local.SharedMemory
 _paths = set()
@@ -113,7 +113,7 @@ print("done", flush=True)
 #: The superseded pattern, in pure standard library: attach to a segment
 #: this interpreter created, undo the attach's registration, then unlink.
 #: Deliberately independent of `wool`, so it keeps reproducing the fault
-#: however `local.py` is later refactored.
+#: however ``local.py`` is later refactored.
 _SUPERSEDED_SCRIPT = """
 import sys
 from multiprocessing import resource_tracker
@@ -153,50 +153,30 @@ def _run(script, *args):
 class TestCrossProcessTracker:
     """Pin tracker silence and segment ownership across a real process."""
 
-    def test_publish_should_emit_no_tracker_output_when_track_unsupported(self):
-        """Test a worker lifecycle below 3.13 leaves the tracker silent.
+    @pytest.mark.parametrize("mode", ["legacy", "native"])
+    def test_publish_should_emit_no_tracker_output_when_workers_cycle(self, mode):
+        """Test a worker lifecycle leaves the resource tracker silent.
 
         Given:
-            An independent interpreter forced onto the attach path taken
-            below 3.13, owning a namespace of its own.
+            An independent interpreter owning a namespace of its own, on
+            the attach path taken where ``track`` is unavailable or on
+            whichever path its own version selects.
         When:
             It announces, re-announces, updates, and drops three workers,
             then exits so its resource tracker drains.
         Then:
-            It should exit 0 having taken that path, with no tracker
-            traceback on stderr — the failure no exit code reflects.
+            It should exit 0 with no tracker traceback on stderr — the
+            failure no exit code reflects. Below 3.13 the unforced case
+            exercises the reported conditions with nothing simulated.
         """
         # Act
-        result = _run(_PUBLISH_SCRIPT, "legacy", f"tracker-{uuid.uuid4().hex[:12]}")
-
-        # Assert
-        assert result.returncode == 0, result.stderr
-        assert "path=legacy" in result.stdout, result.stdout
-        assert "done" in result.stdout, result.stdout
-        assert "KeyError" not in result.stderr, result.stderr
-        assert "Traceback" not in result.stderr, result.stderr
-        assert "resource_tracker" not in result.stderr, result.stderr
-
-    def test_publish_should_emit_no_tracker_output_on_the_running_interpreter(self):
-        """Test a worker lifecycle leaves the tracker silent as shipped.
-
-        Given:
-            An independent interpreter taking whichever attach path its
-            own version selects, owning a namespace of its own.
-        When:
-            It announces, re-announces, updates, and drops three workers,
-            then exits so its resource tracker drains.
-        Then:
-            It should exit 0 with no tracker traceback on stderr — on an
-            interpreter below 3.13 this exercises the reported failure's
-            conditions with nothing forced.
-        """
-        # Act
-        result = _run(_PUBLISH_SCRIPT, "native", f"tracker-{uuid.uuid4().hex[:12]}")
+        result = _run(_PUBLISH_SCRIPT, mode, f"tracker-{uuid.uuid4().hex[:12]}")
 
         # Assert
         assert result.returncode == 0, result.stderr
         assert "done" in result.stdout, result.stdout
+        if mode == "legacy":
+            assert "path=legacy" in result.stdout, result.stdout
         assert "KeyError" not in result.stderr, result.stderr
         assert "Traceback" not in result.stderr, result.stderr
         assert "resource_tracker" not in result.stderr, result.stderr

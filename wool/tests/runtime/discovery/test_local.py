@@ -410,8 +410,7 @@ def test__attach_should_register_the_segment_when_another_thread_registers_it(
     When:
         The segment is attached by name.
     Then:
-        It should let that thread's registration reach the tracker — a
-        concurrent creator keeps ownership of what it created.
+        It should let that thread's registration reach the tracker.
     """
     # Arrange
     name = _segment_name()
