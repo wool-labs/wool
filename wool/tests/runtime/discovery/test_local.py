@@ -511,6 +511,12 @@ def test__attach_should_suppress_the_unregister_when_the_mapping_fails(
         with pytest.raises(OSError):
             local._attach(name)
 
+        # `violations` alone does not discriminate here: the creator's
+        # entry is live, so an unsuppressed unregister is absorbed as an
+        # ordinary discard and records nothing. Surviving in `residual`
+        # is what says the entry the creator's unlink needs is still
+        # there.
+        assert tracker_ledger.residual == {("shared_memory", name)}
         assert tracker_ledger.violations == []
     finally:
         created.close()
