@@ -84,10 +84,17 @@ class DiscoveryPublisherLike(Protocol):
         the application requires strict lifecycle ordering; wool is
         unopinionated about which.
 
-        Exceptions raised here propagate to the publishing pool: a
-        failure while announcing a spawned worker aborts the pool's
-        startup, so transient transport errors worth surviving must
-        be retried or suppressed inside the implementation.
+        What an exception raised here costs depends on the event. A
+        failure announcing ``worker-added`` propagates and aborts the
+        pool's startup, so transient transport errors worth surviving
+        must be retried or suppressed inside the implementation. A
+        failure announcing ``worker-dropped`` is best-effort: the
+        publishing pool logs it and stops the worker regardless, since
+        a pool must be able to reap its own workers when the discovery
+        service is exactly what has failed. A publisher that rejects
+        out-of-order drops to enforce strict lifecycle ordering should
+        therefore expect that rejection to be recorded rather than to
+        reach the caller.
 
         :param type:
             The type of discovery event.

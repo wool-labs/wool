@@ -8,14 +8,17 @@ to avoid network overhead and ensure deterministic behavior.
 import asyncio
 import contextvars
 import copy
+import inspect
 import pickle
 import uuid
 import warnings
+from dataclasses import replace
 from types import MappingProxyType
 
 import cloudpickle
 import pytest
 from hypothesis import HealthCheck
+from hypothesis import assume
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
@@ -28,28 +31,220 @@ from tests.helpers import _unique
 from wool import protocol
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.routine.task import Task
 from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.connection import RpcError
+from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.proxy import WorkerProxy
 from wool.runtime.worker.proxy import is_version_compatible
 from wool.runtime.worker.proxy import parse_version
+from wool.utilities.afilter import afilter
 
 
-async def _drain_discovery(proxy, *, expect, timeout=2.0):
-    """Wait until proxy.workers reaches the expected count or times out.
+async def _drain_until(predicate, *, timeout=2.0):
+    """Yield the event loop until predicate() holds, or fail.
 
-    Yields the event loop in a tight loop so the sentinel can process
-    events from a finite ReducibleAsyncIterator without a hard sleep.
+    The sentinel consumes discovery events strictly in order, so waiting
+    for the last event's observable effect implies all earlier events
+    were processed.
+
+    Raises `AssertionError` when the predicate does not hold within
+    ``timeout``: a caller that drains to establish a precondition would
+    otherwise proceed on an unmet one, and pass for the wrong reason.
     """
     deadline = asyncio.get_event_loop().time() + timeout
-    while len(proxy.workers) != expect:
+    while not predicate():
         if asyncio.get_event_loop().time() > deadline:
-            break
+            raise AssertionError(
+                f"drain timed out after {timeout}s: the awaited condition "
+                f"never held, so the state it was establishing is absent"
+            )
         await asyncio.sleep(0)
+
+
+async def _run_hook(hook, *arguments):
+    """Invoke an optional balancer hook, awaiting an awaitable result.
+
+    A hook may be ``None`` (a no-op), a plain callable, or a callable
+    returning an awaitable — the awaitable form lets a hook suspend the
+    generator (e.g. to simulate slow success bookkeeping under
+    cancellation).
+    """
+    if hook is None:
+        return
+    result = hook(*arguments)
+    if inspect.isawaitable(result):
+        await result
+
+
+def make_delegating_balancer(
+    *, on_task=None, on_yield=None, on_throw=None, on_success=None
+):
+    """Build a delegating balancer that yields workers in context order.
+
+    The returned balancer's ``delegate`` walks ``context.workers`` in
+    insertion order, yielding each worker's uid for the proxy to
+    resolve and dispatch to. Four optional hooks observe the handshake
+    without altering control flow: ``on_task(task)`` fires once with the
+    routed task before any candidate is offered, ``on_yield(metadata)``
+    fires before each candidate is offered — with the record the
+    balancer read, so tests can assert on the candidate it chose —
+    ``on_throw(exception, context)`` fires when the proxy reports a
+    dispatch failure via ``athrow``, and ``on_success(sent)`` fires when
+    the proxy acknowledges a successful dispatch via ``asend``, carrying
+    the proxy's echo verbatim (a uid). Any hook may return an awaitable,
+    which is awaited before the generator continues.
+    """
+
+    class DelegatingBalancer:
+        async def delegate(self, task, *, context):
+            await _run_hook(on_task, task)
+            for uid, (metadata, _) in list(context.workers.items()):
+                await _run_hook(on_yield, metadata)
+                try:
+                    sent = yield uid
+                except Exception as exception:
+                    await _run_hook(on_throw, exception, context)
+                    continue
+                if sent is not None:
+                    await _run_hook(on_success, sent)
+                    return
+
+    return DelegatingBalancer()
+
+
+def make_dispatching_balancer(*, marker="ok", on_dispatch=None):
+    """Build a legacy dispatching balancer that yields a single marker.
+
+    The returned balancer implements only the deprecated ``dispatch``
+    method — the `DispatchingLoadBalancerLike` protocol — yielding
+    ``marker`` once as its streamed result. The optional
+    ``on_dispatch(task)`` hook fires before the result stream is produced
+    so a test can record the dispatched task; it may return an awaitable,
+    which is awaited before the stream is returned.
+    """
+
+    class DispatchingBalancer:
+        async def dispatch(self, task, *, context, timeout=None):
+            await _run_hook(on_dispatch, task)
+
+            async def _stream():
+                yield marker
+
+            return _stream()
+
+    return DispatchingBalancer()
+
+
+def _dispatch_deprecations(caught):
+    """Return the recorded `DispatchingLoadBalancerLike` deprecation warnings.
+
+    Filters a ``warnings.catch_warnings(record=True)`` list down to the
+    proxy's dispatch-protocol ``DeprecationWarning``, so an assertion on the
+    fire-once guarantee is not perturbed by unrelated deprecation warnings.
+    """
+    return [
+        warning
+        for warning in caught
+        if issubclass(warning.category, DeprecationWarning)
+        and "DispatchingLoadBalancerLike" in str(warning.message)
+    ]
+
+
+class SpyStream:
+    """Async result-stream double that records ``aclose`` invocations.
+
+    Yields the supplied items, then reports each ``aclose`` call to the
+    ``on_close`` callback so a test can assert the proxy released an
+    orphaned stream.
+    """
+
+    def __init__(self, items=(), *, on_close):
+        self._items = iter(items)
+        self._on_close = on_close
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._items)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    async def aclose(self):
+        self._on_close()
+
+
+class _SteppedDiscovery:
+    """Discovery stream that hands the sentinel one event at a time.
+
+    ``apply`` publishes a single event and returns only once the
+    sentinel has finished applying it. The sentinel consumes the stream
+    strictly in order and asks for the next event only after applying
+    the current one, so its next ``__anext__`` call is the
+    acknowledgement. This lets a test observe the pool after every
+    single event rather than only after the stream drains.
+    """
+
+    def __init__(self):
+        self._pending: asyncio.Queue = asyncio.Queue()
+        self._requested = asyncio.Event()
+        self._requests = 0
+        self._published = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self._requests += 1
+        self._requested.set()
+        return await self._pending.get()
+
+    async def apply(self, event, *, timeout=5.0):
+        """Publish one event and return once the sentinel has applied it."""
+        self._published += 1
+        await self._pending.put(event)
+        async with asyncio.timeout(timeout):
+            while self._requests <= self._published:
+                self._requested.clear()
+                await self._requested.wait()
+
+
+@st.composite
+def _worker_event_sequence(draw):
+    """Generate a lease cap and a sequence of worker lifecycle events.
+
+    Draws an optional lease alongside up to twelve
+    ``(event_type, uid_slot, mutate)`` tuples over a pool of three uid
+    slots. ``mutate`` selects between a changed record and an equal copy
+    of that uid's last record, so a refresh that changes nothing is
+    drawn as readily as one that does.
+
+    :param draw:
+        Hypothesis draw function
+
+    :returns:
+        Tuple of ``(lease, events)``
+    """
+    lease = draw(st.one_of(st.none(), st.integers(min_value=1, max_value=3)))
+    events = draw(
+        st.lists(
+            st.tuples(
+                st.sampled_from(("worker-added", "worker-updated", "worker-dropped")),
+                st.integers(min_value=0, max_value=2),
+                st.booleans(),
+            ),
+            max_size=12,
+        )
+    )
+    return lease, events
 
 
 # ============================================================================
@@ -59,18 +254,20 @@ async def _drain_discovery(proxy, *, expect, timeout=2.0):
 
 @pytest.fixture
 def mock_load_balancer_factory(mocker: MockerFixture):
-    """Create a mock load balancer factory for testing.
+    """Create a mock delegating load balancer factory for testing.
 
-    Returns a tuple of (factory, load_balancer) where the factory creates
-    the load balancer instance. Used for testing factory-based load balancer
-    creation patterns.
+    Returns a tuple of (factory, load_balancer). The mock load balancer
+    has an empty ``delegate`` async generator that terminates immediately
+    — tests that actually exercise dispatch should override it.
     """
     mock_load_balancer_factory = mocker.MagicMock()
-    mock_load_balancer = mocker.MagicMock(spec=wp.LoadBalancerLike)
-    mock_load_balancer.dispatch = mocker.AsyncMock()
-    mock_load_balancer.worker_added_callback = mocker.MagicMock()
-    mock_load_balancer.worker_updated_callback = mocker.MagicMock()
-    mock_load_balancer.worker_removed_callback = mocker.MagicMock()
+    mock_load_balancer = mocker.MagicMock(spec=LoadBalancerLike)
+
+    async def _empty_delegate(task, *, context):
+        if False:
+            yield  # pragma: no cover
+
+    mock_load_balancer.delegate = mocker.MagicMock(side_effect=_empty_delegate)
     mock_load_balancer_factory.return_value = mock_load_balancer
     return mock_load_balancer_factory, mock_load_balancer
 
@@ -101,60 +298,14 @@ def mock_wool_task(mocker: MockerFixture):
 
 @pytest.fixture
 def spy_loadbalancer_with_workers(mocker: MockerFixture):
-    """Create a spy-wrapped LoadBalancer with realistic behavior.
+    """Create a spy-wrapped delegating load balancer.
 
-    Provides a LoadBalancer that implements the LoadBalancerLike protocol
-    with real functionality for storing workers and dispatching tasks,
-    while being wrapped with spies to verify method calls.
+    Provides a `LoadBalancerLike` implementation that yields workers
+    straight from the context in iteration order, wrapped with a spy so
+    tests can assert that ``delegate`` was called.
     """
-
-    class SpyableLoadBalancer:
-        """LoadBalancer with real functionality that can be spied upon."""
-
-        def __init__(self):
-            self._workers = {}
-            self._current_index = 0
-
-        def worker_added_callback(
-            self, connection: WorkerConnection, info: WorkerMetadata
-        ):
-            """Add worker to internal storage."""
-            self._workers[info] = connection
-
-        def worker_updated_callback(
-            self, connection: WorkerConnection, info: WorkerMetadata
-        ):
-            """Update worker in internal storage."""
-            self._workers[info] = connection
-
-        def worker_removed_callback(self, info: WorkerMetadata):
-            """Remove worker from internal storage."""
-            if info in self._workers:
-                del self._workers[info]
-
-        async def dispatch(self, task, *, context, timeout=None):
-            """Dispatch task to available workers."""
-            if not self._workers:
-                raise NoWorkersAvailable("No workers available for dispatch")
-
-            # Simple dispatch to first available worker
-            metadata, connection = next(iter(self._workers.items()))
-            return await connection.dispatch(task)
-
-    loadbalancer = SpyableLoadBalancer()
-
-    # Wrap methods with spies
-    loadbalancer.worker_added_callback = mocker.spy(
-        loadbalancer, "worker_added_callback"
-    )
-    loadbalancer.worker_updated_callback = mocker.spy(
-        loadbalancer, "worker_updated_callback"
-    )
-    loadbalancer.worker_removed_callback = mocker.spy(
-        loadbalancer, "worker_removed_callback"
-    )
-    loadbalancer.dispatch = mocker.spy(loadbalancer, "dispatch")
-
+    loadbalancer = make_delegating_balancer()
+    loadbalancer.delegate = mocker.spy(loadbalancer, "delegate")
     return loadbalancer
 
 
@@ -187,9 +338,13 @@ def spy_discovery_with_events(mocker: MockerFixture):
             """Add event to be yielded by the discovery service."""
             self._events.append(event)
 
-    # Create default worker info for testing
+    # Create default worker info for testing; advertise the ambient
+    # protocol version so the worker passes the sentinel admission gate.
     metadata = WorkerMetadata(
-        uid=uuid.uuid4(), address="127.0.0.1:50051", pid=1234, version="1.0.0"
+        uid=uuid.uuid4(),
+        address="127.0.0.1:50051",
+        pid=1234,
+        version=protocol.__version__,
     )
 
     # Create discovery with default worker-added event
@@ -212,7 +367,7 @@ def mock_worker_connection(mocker: MockerFixture):
     """
     mock_connection = mocker.MagicMock(spec=WorkerConnection)
 
-    async def mock_dispatch_success(task):
+    async def mock_dispatch_success(task, *, timeout=None):
         async def _result_generator():
             yield "test_result"
 
@@ -353,6 +508,211 @@ def test_is_version_compatible_different_major():
 
     # Assert
     assert result is False
+
+
+_version_suffixes = st.sampled_from(["", "a1", "b2", "rc3", ".post1", ".dev2"])
+
+_versions = st.builds(
+    lambda release, suffix: Version(".".join(map(str, release)) + suffix),
+    st.tuples(
+        st.integers(min_value=0, max_value=99),
+        st.integers(min_value=0, max_value=99),
+        st.integers(min_value=0, max_value=99),
+    ),
+    _version_suffixes,
+)
+
+_same_major_version_pairs = st.builds(
+    lambda major, tail_a, tail_b: (
+        Version(f"{major}.{tail_a[0]}.{tail_a[1]}{tail_a[2]}"),
+        Version(f"{major}.{tail_b[0]}.{tail_b[1]}{tail_b[2]}"),
+    ),
+    st.integers(min_value=0, max_value=99),
+    st.tuples(
+        st.integers(min_value=0, max_value=99),
+        st.integers(min_value=0, max_value=99),
+        _version_suffixes,
+    ),
+    st.tuples(
+        st.integers(min_value=0, max_value=99),
+        st.integers(min_value=0, max_value=99),
+        _version_suffixes,
+    ),
+)
+
+
+@given(text=st.one_of(st.text(max_size=30), _versions.map(str)))
+@settings(max_examples=200)
+def test_parse_version_should_return_version_or_none_when_text_arbitrary(text):
+    """Test parse_version tolerates arbitrary input without raising.
+
+    Given:
+        Arbitrary text, biased to include stringified valid versions.
+    When:
+        parse_version is called.
+    Then:
+        It should return None or a Version whose string form re-parses
+        to an equal Version, never raising.
+    """
+    # Act
+    result = parse_version(text)
+
+    # Assert
+    assert result is None or parse_version(str(result)) == result
+
+
+@given(version=_versions)
+@settings(max_examples=100)
+def test_is_version_compatible_should_accept_equal_versions(version):
+    """Test equal versions are always mutually compatible.
+
+    Given:
+        Any generated PEP 440 version.
+    When:
+        is_version_compatible is called with it as both client and
+        server.
+    Then:
+        It should return True.
+    """
+    # Act & assert
+    assert is_version_compatible(version, version) is True
+
+
+@given(pair=_same_major_version_pairs)
+@settings(max_examples=100)
+def test_is_version_compatible_should_accept_only_lower_client_when_same_major(pair):
+    """Test same-major compatibility holds in exactly one direction.
+
+    Given:
+        Two distinct generated versions sharing a major version.
+    When:
+        is_version_compatible is evaluated in both directions.
+    Then:
+        It should return True only when the client is the lower
+        version — there is no forward-compatibility guarantee.
+    """
+    # Arrange
+    version_a, version_b = pair
+    assume(version_a != version_b)
+    lower, higher = sorted((version_a, version_b))
+
+    # Act & assert
+    assert is_version_compatible(lower, higher) is True
+    assert is_version_compatible(higher, lower) is False
+
+
+@given(client=_versions, server=_versions)
+@settings(max_examples=200)
+def test_is_version_compatible_should_reject_differing_majors(client, server):
+    """Test major-version fencing regardless of ordering.
+
+    Given:
+        Two generated versions with differing major versions.
+    When:
+        is_version_compatible is evaluated in both directions.
+    Then:
+        It should return False both ways.
+    """
+    # Arrange
+    assume(client.major != server.major)
+
+    # Act & assert
+    assert is_version_compatible(client, server) is False
+    assert is_version_compatible(server, client) is False
+
+
+_gate_worker_versions = st.one_of(
+    st.builds(
+        lambda release: ".".join(map(str, release)),
+        st.tuples(
+            st.integers(min_value=0, max_value=3),
+            st.integers(min_value=0, max_value=3),
+            st.integers(min_value=0, max_value=3),
+        ),
+    ),
+    st.sampled_from(["1.0.0a1", "not-a-version", ""]),
+)
+
+
+@st.composite
+def _gate_worker_lists(draw, min_size=1, max_size=6):
+    """Build static worker lists with mixed versions and secure flags."""
+    specs = draw(
+        st.lists(
+            st.tuples(_gate_worker_versions, st.booleans()),
+            min_size=min_size,
+            max_size=max_size,
+        )
+    )
+    return [
+        WorkerMetadata(
+            uid=uuid.uuid4(),
+            address=f"127.0.0.1:{51000 + index}",
+            pid=8000 + index,
+            version=version,
+            secure=secure,
+        )
+        for index, (version, secure) in enumerate(specs)
+    ]
+
+
+@st.composite
+def _gate_event_scenarios(draw):
+    """Draw a local version, lease, uid pool, and an event stream.
+
+    Each add/update event carries an independently drawn version and
+    secure flag, so the same uid can cross the compatibility boundary in
+    either direction across successive events — the transitions a
+    universe of fixed-metadata records could never express.
+    """
+    local_version = draw(st.sampled_from(["1.0.0", "1.2.0"]))
+    lease = draw(st.one_of(st.none(), st.integers(min_value=1, max_value=3)))
+    size = draw(st.integers(min_value=1, max_value=4))
+    slots = [
+        (uuid.uuid4(), f"127.0.0.1:{52000 + index}", 8100 + index)
+        for index in range(size)
+    ]
+    specs = draw(
+        st.lists(
+            st.tuples(
+                st.sampled_from(("worker-added", "worker-updated", "worker-dropped")),
+                st.integers(min_value=0, max_value=size - 1),
+                _gate_worker_versions,
+                st.booleans(),
+            ),
+            max_size=12,
+        )
+    )
+    events = [
+        DiscoveryEvent(
+            kind,
+            metadata=WorkerMetadata(
+                uid=slots[index][0],
+                address=slots[index][1],
+                pid=slots[index][2],
+                version=version,
+                secure=secure,
+            ),
+        )
+        for kind, index, version, secure in specs
+    ]
+    return local_version, lease, events
+
+
+def _gate_predicate(local_version):
+    """Build the public security/version predicate for an insecure proxy."""
+    local = parse_version(local_version)
+    assert local is not None
+
+    def compatible(metadata):
+        version = parse_version(metadata.version)
+        return (
+            not metadata.secure
+            and version is not None
+            and is_version_compatible(local, version)
+        )
+
+    return compatible
 
 
 # ============================================================================
@@ -1235,7 +1595,7 @@ class TestWorkerProxy:
             uid=uuid.uuid4(),
             address="192.168.1.100:50051",
             pid=1001,
-            version="1.0.0",
+            version=protocol.__version__,
         )
 
         events = [
@@ -1362,7 +1722,8 @@ class TestWorkerProxy:
         Then:
             It should create WorkerConnection with
             options=ChannelOptions(keepalive_time_ms=90000) for the
-            updated event
+            updated event and refresh the pool entry with the updated
+            record
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
@@ -1395,12 +1756,14 @@ class TestWorkerProxy:
 
         # Act
         await proxy.start()
-        await asyncio.sleep(0.1)
+        await _drain_until(lambda: updated_metadata in proxy.workers)
 
         # Assert
         assert mock_conn_cls.call_count == 2
         _, updated_kwargs = mock_conn_cls.call_args_list[1]
         assert updated_kwargs["options"] == updated_opts
+        assert updated_metadata in proxy.workers
+        assert initial_metadata not in proxy.workers
 
         # Cleanup
         await proxy.stop()
@@ -1486,7 +1849,7 @@ class TestWorkerProxy:
 
         # Act
         await proxy.start()
-        await _drain_discovery(proxy, expect=2)
+        await _drain_until(lambda: len(proxy.workers) == 2)
 
         # Assert
         assert len(proxy.workers) == 2
@@ -1525,57 +1888,10 @@ class TestWorkerProxy:
 
         # Act
         await proxy.start()
-        await _drain_discovery(proxy, expect=3)
+        await _drain_until(lambda: len(proxy.workers) == 3)
 
         # Assert
         assert len(proxy.workers) == 3
-
-        # Cleanup
-        await proxy.stop()
-
-    @pytest.mark.asyncio
-    async def test_start_allows_worker_updated_at_capacity(
-        self, mock_proxy_session, mocker: MockerFixture
-    ):
-        """Test sentinel processes worker-updated events even at capacity.
-
-        Given:
-            A non-lazy WorkerProxy with lease=2, already at capacity,
-            receiving a worker-updated event
-        When:
-            The sentinel processes the update event
-        Then:
-            It should process the update without being blocked by the cap
-        """
-        # Arrange
-        mocker.patch.object(protocol, "__version__", "1.0.0")
-        worker1 = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="192.168.1.1:50051",
-            pid=1001,
-            version="1.0.0",
-        )
-        worker2 = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="192.168.1.2:50051",
-            pid=1002,
-            version="1.0.0",
-        )
-        events = [
-            DiscoveryEvent("worker-added", metadata=worker1),
-            DiscoveryEvent("worker-added", metadata=worker2),
-            DiscoveryEvent("worker-updated", metadata=worker1),
-        ]
-        discovery = wp.ReducibleAsyncIterator(events)
-        proxy = WorkerProxy(discovery=discovery, lease=2, lazy=False)
-
-        # Act
-        await proxy.start()
-        await _drain_discovery(proxy, expect=2)
-
-        # Assert
-        assert len(proxy.workers) == 2
-        assert worker1 in proxy.workers
 
         # Cleanup
         await proxy.stop()
@@ -1626,7 +1942,7 @@ class TestWorkerProxy:
 
         # Act
         await proxy.start()
-        await _drain_discovery(proxy, expect=2)
+        await _drain_until(lambda: len(proxy.workers) == 2)
 
         # Assert — worker3 was accepted after worker1 was dropped
         assert len(proxy.workers) == 2
@@ -1675,7 +1991,7 @@ class TestWorkerProxy:
 
         # Act
         await proxy.start()
-        await _drain_discovery(proxy, expect=1)
+        await _drain_until(lambda: len(proxy.workers) == 1)
 
         # Assert — only worker1 is present; worker2 was never admitted
         assert len(proxy.workers) == 1
@@ -1684,6 +2000,2050 @@ class TestWorkerProxy:
 
         # Cleanup
         await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_refresh_worker_when_updated_metadata_changes(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test worker-updated with changed metadata refreshes the pool entry.
+
+        Given:
+            A non-lazy WorkerProxy with a discovered worker and a
+            worker-updated event carrying the same uid with a changed
+            address, pid, and tags
+        When:
+            The sentinel processes the update event
+        Then:
+            It should replace the worker's stale metadata with the
+            updated record without changing the pool size
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        worker_uid = uuid.uuid4()
+        initial_metadata = WorkerMetadata(
+            uid=worker_uid,
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            tags=frozenset(["cpu"]),
+        )
+        updated_metadata = WorkerMetadata(
+            uid=worker_uid,
+            address="192.168.1.2:50052",
+            pid=1002,
+            version="1.0.0",
+            tags=frozenset(["gpu"]),
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=initial_metadata),
+            DiscoveryEvent("worker-updated", metadata=updated_metadata),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lazy=False)
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: updated_metadata in proxy.workers)
+
+        # Assert
+        assert updated_metadata in proxy.workers
+        assert initial_metadata not in proxy.workers
+        assert len(proxy.workers) == 1
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_refresh_worker_when_updated_at_capacity(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test sentinel refreshes changed metadata even at capacity.
+
+        Given:
+            A non-lazy WorkerProxy with lease=2, already at capacity,
+            receiving a worker-updated event whose same-uid metadata
+            changed
+        When:
+            The sentinel processes the update event
+        Then:
+            It should refresh the worker's entry with the updated
+            record without being blocked by the cap
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        worker1 = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+        )
+        worker2 = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+        updated1 = WorkerMetadata(
+            uid=worker1.uid,
+            address="192.168.1.9:50059",
+            pid=1009,
+            version="1.0.0",
+            tags=frozenset(["updated"]),
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=worker1),
+            DiscoveryEvent("worker-added", metadata=worker2),
+            DiscoveryEvent("worker-updated", metadata=updated1),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lease=2, lazy=False)
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: updated1 in proxy.workers)
+
+        # Assert
+        assert len(proxy.workers) == 2
+        assert updated1 in proxy.workers
+        assert worker1 not in proxy.workers
+        assert worker2 in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_readmit_worker_when_updated_after_drop(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test a post-drop update re-admits the worker it names.
+
+        Given:
+            A non-lazy WorkerProxy whose discovered worker is dropped
+            and then updated with a same-uid changed record, followed
+            by an unrelated worker-added event
+        When:
+            The sentinel processes all events
+        Then:
+            It should re-admit the worker from the post-drop update —
+            the sentinel reconciles an update like an add — so both the
+            re-admitted worker (carrying the updated record) and the
+            unrelated worker are pooled
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        worker_uid = uuid.uuid4()
+        initial_metadata = WorkerMetadata(
+            uid=worker_uid,
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+        )
+        updated_metadata = WorkerMetadata(
+            uid=worker_uid,
+            address="192.168.1.2:50052",
+            pid=1002,
+            version="1.0.0",
+        )
+        beacon = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.3:50053",
+            pid=1003,
+            version="1.0.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=initial_metadata),
+            DiscoveryEvent("worker-dropped", metadata=initial_metadata),
+            DiscoveryEvent("worker-updated", metadata=updated_metadata),
+            DiscoveryEvent("worker-added", metadata=beacon),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lazy=False)
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: beacon in proxy.workers)
+
+        # Assert — the post-drop update re-admits the worker under its
+        # updated record; the original record is gone, replaced by it.
+        assert len(proxy.workers) == 2
+        assert beacon in proxy.workers
+        assert updated_metadata in proxy.workers
+        assert initial_metadata not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_refresh_readded_worker_when_pool_at_capacity(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test a same-uid re-announcement bypasses the lease cap.
+
+        Given:
+            A non-lazy WorkerProxy with lease=2 at capacity, receiving
+            a worker-added event re-announcing an admitted uid with
+            changed fields, then a drop freeing capacity and an
+            unrelated worker-added event
+        When:
+            The sentinel processes all events
+        Then:
+            It should replace the re-announced worker's entry with the
+            new record while the pool stays within the lease
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        worker_a = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+        )
+        worker_b = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50052",
+            pid=1002,
+            version="1.0.0",
+        )
+        readded_a = WorkerMetadata(
+            uid=worker_a.uid,
+            address="192.168.1.9:50059",
+            pid=1009,
+            version="1.0.0",
+        )
+        beacon = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.3:50053",
+            pid=1003,
+            version="1.0.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=worker_a),
+            DiscoveryEvent("worker-added", metadata=worker_b),
+            DiscoveryEvent("worker-added", metadata=readded_a),  # at capacity
+            DiscoveryEvent("worker-dropped", metadata=worker_b),
+            DiscoveryEvent("worker-added", metadata=beacon),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lease=2, lazy=False)
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: beacon in proxy.workers)
+
+        # Assert — the admission gate applies only to pool-growing
+        # adds: re-announcing an already-admitted uid replaces that
+        # worker's entry in place without consuming a lease slot.
+        assert len(proxy.workers) == 2
+        assert readded_a in proxy.workers
+        assert worker_a not in proxy.workers
+        assert beacon in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @given(_worker_event_sequence())
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @pytest.mark.asyncio
+    async def test_workers_should_mirror_uid_keyed_model_when_events_interleave(
+        self, mock_proxy_session, mocker: MockerFixture, scenario
+    ):
+        """Test the workers list against a uid-keyed reference model.
+
+        Given:
+            A non-lazy WorkerProxy under a drawn lease cap and a drawn
+            sequence of worker-added, worker-updated, and worker-dropped
+            events over a pool of three uids — two of which share an
+            address, so uid-keyed matching is exercised against a
+            colliding address — each event carrying either a mutated
+            record or an equal copy of that uid's last record
+        When:
+            The sentinel consumes the events in order alongside a plain
+            uid-keyed dict model implementing the documented semantics:
+            an add and an update reconcile membership identically —
+            admitting or replacing subject to the lease — a drop evicts
+            by uid regardless of the record it carries, and the lease
+            gates only pool-growing admissions
+        Then:
+            After every event the workers list should equal the model
+            exactly — one entry per live uid, carrying that uid's
+            last-written record
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        lease, events = scenario
+        bases = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                # Slots 0 and 1 deliberately share an address so a drop
+                # or refresh that matched on address rather than uid
+                # would corrupt the model.
+                address=f"192.168.1.{min(slot, 1)}:50051",
+                pid=1000 + slot,
+                version="1.0.0",
+            )
+            for slot in range(3)
+        ]
+        stream = _SteppedDiscovery()
+        proxy = WorkerProxy(discovery=stream, lease=lease, lazy=False, quorum=0)
+        await proxy.start()
+        model: dict[uuid.UUID, WorkerMetadata] = {}
+
+        # Act & assert
+        try:
+            for event_type, slot, mutate in events:
+                last = model.get(bases[slot].uid)
+                base = bases[slot] if last is None else last
+                record = replace(base, pid=base.pid + 1) if mutate else replace(base)
+                admitted = record.uid in model
+
+                await stream.apply(DiscoveryEvent(event_type, metadata=record))
+
+                if event_type in ("worker-added", "worker-updated"):
+                    if lease is None or admitted or len(model) < lease:
+                        model[record.uid] = record
+                else:
+                    model.pop(record.uid, None)
+
+                assert proxy.workers == list(model.values())
+        finally:
+            # Cleanup
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_use_refreshed_connection_when_metadata_updates(
+        self, mock_proxy_session, mock_wool_task, mocker: MockerFixture
+    ):
+        """Test dispatch routes through the connection built from an update.
+
+        Given:
+            A non-lazy WorkerProxy with a delegating balancer whose
+            discovered worker is refreshed by a worker-updated event
+            carrying a changed address
+        When:
+            A task is dispatched after the refresh is visible
+        Then:
+            It should dispatch through the connection built from the
+            updated metadata and never touch the stale connection
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        worker_uid = uuid.uuid4()
+        initial_metadata = WorkerMetadata(
+            uid=worker_uid,
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+        )
+        updated_metadata = WorkerMetadata(
+            uid=worker_uid,
+            address="192.168.1.2:50052",
+            pid=1002,
+            version="1.0.0",
+        )
+        stale_connection = mocker.MagicMock(spec=WorkerConnection)
+        stale_connection.dispatch = mocker.AsyncMock()
+        success_streams: list = []
+        fresh_connection = _make_success_connection(mocker, success_streams)
+        mocker.patch.object(
+            wp, "WorkerConnection", side_effect=[stale_connection, fresh_connection]
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=initial_metadata),
+            DiscoveryEvent("worker-updated", metadata=updated_metadata),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(
+            discovery=discovery,
+            loadbalancer=make_delegating_balancer(),
+            lazy=False,
+        )
+        await proxy.start()
+        await _drain_until(lambda: updated_metadata in proxy.workers)
+
+        # Act
+        stream = await proxy.dispatch(mock_wool_task)
+        results = [result async for result in stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert stale_connection.dispatch.await_count == 0
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_evict_worker_by_uid_when_refreshed_mid_dispatch(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test non-transient eviction removes a concurrently refreshed worker.
+
+        Given:
+            Two workers behind a delegating balancer, a gated discovery
+            stream holding a same-uid changed-record update for the
+            first worker, and a first-worker connection that releases
+            the gate, awaits the refresh, and then raises a
+            non-transient RpcError
+        When:
+            dispatch() is called and fails over
+        Then:
+            It should evict the first worker by uid — neither the stale
+            nor the refreshed record remains — while the balancer
+            observes only the surviving worker and dispatch succeeds on
+            it
+        """
+        # Arrange
+        gate = asyncio.Event()
+        worker_a = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50100",
+            pid=9000,
+            version=protocol.__version__,
+        )
+        worker_b = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50101",
+            pid=9001,
+            version=protocol.__version__,
+        )
+        refreshed_a = WorkerMetadata(
+            uid=worker_a.uid,
+            address="127.0.0.1:50109",
+            pid=9009,
+            version=protocol.__version__,
+        )
+        proxy = None
+        stale_connection = mocker.MagicMock(spec=WorkerConnection)
+
+        async def _stale_dispatch(task, *, timeout=None):
+            gate.set()
+            await _drain_until(lambda: refreshed_a in proxy.workers)
+            raise RpcError()
+
+        stale_connection.dispatch = _stale_dispatch
+        success_streams: list = []
+        survivor_connection = _make_success_connection(mocker, success_streams)
+        fresh_connection = mocker.MagicMock(spec=WorkerConnection)
+        fresh_connection.dispatch = mocker.AsyncMock()
+        observed_pools: list = []
+        discovery = _GatedDiscovery(
+            initial=[
+                DiscoveryEvent("worker-added", metadata=worker_a),
+                DiscoveryEvent("worker-added", metadata=worker_b),
+            ],
+            deferred=[DiscoveryEvent("worker-updated", metadata=refreshed_a)],
+            gate=gate,
+        )
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[stale_connection, survivor_connection, fresh_connection],
+            loadbalancer=make_delegating_balancer(
+                on_throw=lambda _, context: observed_pools.append(
+                    [m for m, _ in context.workers.values()]
+                )
+            ),
+            mocker=mocker,
+            discovery=discovery,
+            metadata_list=[worker_a, worker_b],
+        )
+
+        # Act
+        stream = await proxy.dispatch(mock_wool_task)
+        results = [result async for result in stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert len(proxy.workers) == 1
+        assert worker_b in proxy.workers
+        assert refreshed_a not in proxy.workers
+        assert worker_a not in proxy.workers
+        assert observed_pools == [[worker_b]]
+        assert fresh_connection.dispatch.await_count == 0
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_keep_refreshed_worker_when_failure_transient(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test a transient failure neither evicts nor clobbers a refresh.
+
+        Given:
+            Two workers behind a delegating balancer, a gated discovery
+            stream holding a same-uid changed-record update for the
+            first worker, and a first-worker connection that releases
+            the gate, awaits the refresh, and then raises a
+            TransientRpcError
+        When:
+            dispatch() is called
+        Then:
+            It should leave the refreshed entry in the pool keyed by
+            the updated record and succeed on the second worker
+        """
+        # Arrange
+        gate = asyncio.Event()
+        worker_a = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50100",
+            pid=9000,
+            version=protocol.__version__,
+        )
+        worker_b = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50101",
+            pid=9001,
+            version=protocol.__version__,
+        )
+        refreshed_a = WorkerMetadata(
+            uid=worker_a.uid,
+            address="127.0.0.1:50109",
+            pid=9009,
+            version=protocol.__version__,
+        )
+        proxy = None
+        stale_connection = mocker.MagicMock(spec=WorkerConnection)
+
+        async def _stale_dispatch(task, *, timeout=None):
+            gate.set()
+            await _drain_until(lambda: refreshed_a in proxy.workers)
+            raise TransientRpcError()
+
+        stale_connection.dispatch = _stale_dispatch
+        success_streams: list = []
+        survivor_connection = _make_success_connection(mocker, success_streams)
+        fresh_connection = mocker.MagicMock(spec=WorkerConnection)
+        fresh_connection.dispatch = mocker.AsyncMock()
+        discovery = _GatedDiscovery(
+            initial=[
+                DiscoveryEvent("worker-added", metadata=worker_a),
+                DiscoveryEvent("worker-added", metadata=worker_b),
+            ],
+            deferred=[DiscoveryEvent("worker-updated", metadata=refreshed_a)],
+            gate=gate,
+        )
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[stale_connection, survivor_connection, fresh_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+            discovery=discovery,
+            metadata_list=[worker_a, worker_b],
+        )
+
+        # Act
+        stream = await proxy.dispatch(mock_wool_task)
+        results = [result async for result in stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert len(proxy.workers) == 2
+        assert refreshed_a in proxy.workers
+        assert worker_a not in proxy.workers
+        assert worker_b in proxy.workers
+        assert fresh_connection.dispatch.await_count == 0
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_use_fresh_connection_when_selection_precedes_refresh(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test a uid selected before a refresh dispatches to the fresh entry.
+
+        Given:
+            A balancer that selects a worker's uid and only then lets a
+            same-uid changed-record update land, so its selection was
+            made against a pool state that no longer exists
+        When:
+            dispatch() is called
+        Then:
+            It should dispatch through the refreshed worker's
+            connection and never touch the superseded one — the proxy
+            resolves the uid against the live pool at dispatch time, so
+            a selection cannot carry a stale address
+        """
+        # Arrange
+        gate = asyncio.Event()
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50100",
+            pid=9000,
+            version=protocol.__version__,
+        )
+        refreshed = WorkerMetadata(
+            uid=worker.uid,
+            address="127.0.0.1:50109",
+            pid=9009,
+            version=protocol.__version__,
+        )
+        proxy = None
+        stale_connection = mocker.MagicMock(spec=WorkerConnection)
+        stale_connection.dispatch = mocker.AsyncMock()
+        success_streams: list = []
+        fresh_connection = _make_success_connection(mocker, success_streams)
+
+        async def _land_refresh(_):
+            # Fires after the balancer has read the pool and chosen a
+            # candidate, but before the proxy resolves it.
+            gate.set()
+            await _drain_until(lambda: refreshed in proxy.workers)
+
+        discovery = _GatedDiscovery(
+            initial=[DiscoveryEvent("worker-added", metadata=worker)],
+            deferred=[DiscoveryEvent("worker-updated", metadata=refreshed)],
+            gate=gate,
+        )
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[stale_connection, fresh_connection],
+            loadbalancer=make_delegating_balancer(on_yield=_land_refresh),
+            mocker=mocker,
+            discovery=discovery,
+            metadata_list=[worker],
+        )
+
+        # Act
+        stream = await proxy.dispatch(mock_wool_task)
+        results = [result async for result in stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert len(success_streams) == 1
+        assert stale_connection.dispatch.await_count == 0
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_skip_candidate_when_uid_no_longer_pooled(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test a departed candidate is skipped rather than dispatched to.
+
+        Given:
+            Two pooled workers and a balancer that selects both, with
+            the first dropped from the pool after selection but before
+            the proxy resolves it
+        When:
+            dispatch() is called
+        Then:
+            It should skip the departed worker without dispatching to
+            it and without reporting a failure against it — a worker
+            that has left the pool has not failed anything — and
+            dispatch should succeed on the survivor
+        """
+        # Arrange
+        gate = asyncio.Event()
+        departed = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50100",
+            pid=9000,
+            version=protocol.__version__,
+        )
+        survivor = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50101",
+            pid=9001,
+            version=protocol.__version__,
+        )
+        proxy = None
+        departed_connection = mocker.MagicMock(spec=WorkerConnection)
+        departed_connection.dispatch = mocker.AsyncMock()
+        success_streams: list = []
+        survivor_connection = _make_success_connection(mocker, success_streams)
+        throws: list = []
+
+        async def _drop_first(metadata):
+            if metadata != departed:
+                return
+            gate.set()
+            await _drain_until(lambda: departed not in proxy.workers)
+
+        discovery = _GatedDiscovery(
+            initial=[
+                DiscoveryEvent("worker-added", metadata=departed),
+                DiscoveryEvent("worker-added", metadata=survivor),
+            ],
+            deferred=[DiscoveryEvent("worker-dropped", metadata=departed)],
+            gate=gate,
+        )
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[departed_connection, survivor_connection],
+            loadbalancer=make_delegating_balancer(
+                on_yield=_drop_first,
+                on_throw=lambda exception, _: throws.append(exception),
+            ),
+            mocker=mocker,
+            discovery=discovery,
+            metadata_list=[departed, survivor],
+        )
+
+        # Act
+        stream = await proxy.dispatch(mock_wool_task)
+        results = [result async for result in stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert departed_connection.dispatch.await_count == 0
+        assert len(success_streams) == 1
+        assert throws == []
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_when_every_candidate_departed(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test exhausting the balancer on departed uids raises.
+
+        Given:
+            A single pooled worker and a balancer that selects it, with
+            the worker dropped from the pool after selection but before
+            the proxy resolves it
+        When:
+            dispatch() is called
+        Then:
+            It should raise NoWorkersAvailable once the balancer is
+            exhausted, having dispatched to nothing — skipping a
+            departed candidate must not loop forever
+        """
+        # Arrange
+        gate = asyncio.Event()
+        departed = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50100",
+            pid=9000,
+            version=protocol.__version__,
+        )
+        proxy = None
+        departed_connection = mocker.MagicMock(spec=WorkerConnection)
+        departed_connection.dispatch = mocker.AsyncMock()
+        throws: list = []
+
+        async def _drop_it(_):
+            gate.set()
+            await _drain_until(lambda: departed not in proxy.workers)
+
+        discovery = _GatedDiscovery(
+            initial=[DiscoveryEvent("worker-added", metadata=departed)],
+            deferred=[DiscoveryEvent("worker-dropped", metadata=departed)],
+            gate=gate,
+        )
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[departed_connection],
+            loadbalancer=make_delegating_balancer(
+                on_yield=_drop_it,
+                on_throw=lambda exception, _: throws.append(exception),
+            ),
+            mocker=mocker,
+            discovery=discovery,
+            metadata_list=[departed],
+        )
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable):
+            await proxy.dispatch(mock_wool_task)
+        assert departed_connection.dispatch.await_count == 0
+        assert throws == []
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_evict_worker_when_legacy_record_stale(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test a legacy balancer's stale-record eviction takes effect.
+
+        Given:
+            A started proxy with one worker and a legacy
+            DispatchingLoadBalancerLike whose dispatch removes the
+            worker using a same-uid record with changed fields and then
+            raises NoWorkersAvailable
+        When:
+            dispatch() is called
+        Then:
+            It should propagate NoWorkersAvailable and leave the pool
+            empty — the stale-record eviction matches by uid
+        """
+
+        # Arrange
+        class EvictingBalancer:
+            async def dispatch(self, task, *, context, timeout=None):
+                [(current, _)] = list(context.workers.values())
+                stale = WorkerMetadata(
+                    uid=current.uid,
+                    address="127.0.0.1:50109",
+                    pid=9099,
+                    version=current.version,
+                )
+                context.remove_worker(stale)
+                raise NoWorkersAvailable()
+
+        dummy_connection = mocker.MagicMock(spec=WorkerConnection)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            proxy, _ = await _make_proxy_with_workers(
+                connections=[dummy_connection],
+                loadbalancer=EvictingBalancer(),
+                mocker=mocker,
+            )
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable):
+            await proxy.dispatch(mock_wool_task)
+        assert len(proxy.workers) == 0
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_admit_worker_when_only_update_arrives(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test a lone worker-updated event admits its worker.
+
+        Given:
+            A non-lazy WorkerProxy with quorum=1 whose discovery stream
+            yields only a worker-updated event for a compatible,
+            not-yet-admitted worker
+        When:
+            start() is awaited
+        Then:
+            It should admit the worker and satisfy the quorum — the
+            sentinel reconciles an update like an add, so start()
+            returns instead of timing out
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        metadata = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+        )
+        events = [DiscoveryEvent("worker-updated", metadata=metadata)]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(
+            discovery=discovery,
+            lazy=False,
+            quorum=1,
+            quorum_timeout=5,
+        )
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: metadata in proxy.workers)
+
+        # Assert
+        assert proxy.workers == [metadata]
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_reject_version_incompatible_workers_from_discovery(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test sentinel admission rejects version-incompatible workers.
+
+        Given:
+            A non-lazy WorkerProxy with a user-supplied discovery stream
+            yielding a version-compatible worker, a same-major-but-older
+            worker, and different-major workers above and below the
+            local major
+        When:
+            The sentinel processes all events
+        Then:
+            It should admit only the version-compatible worker
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.1.0")
+        compatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.2.0",
+        )
+        older_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+        next_major_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.3:50051",
+            pid=1003,
+            version="2.0.0",
+        )
+        prior_major_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.4:50051",
+            pid=1004,
+            version="0.9.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=compatible_worker),
+            DiscoveryEvent("worker-added", metadata=older_worker),
+            DiscoveryEvent("worker-added", metadata=next_major_worker),
+            DiscoveryEvent("worker-added", metadata=prior_major_worker),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lazy=False)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert len(proxy.workers) == 1
+        assert compatible_worker in proxy.workers
+        assert older_worker not in proxy.workers
+        assert next_major_worker not in proxy.workers
+        assert prior_major_worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_reject_secure_workers_when_credentials_absent(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test sentinel admission rejects secure workers on an insecure proxy.
+
+        Given:
+            A non-lazy WorkerProxy with explicit credentials=None and a
+            user-supplied discovery stream yielding a secure and an
+            insecure worker
+        When:
+            The sentinel processes all events
+        Then:
+            It should admit only the insecure worker
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        secure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=True,
+        )
+        insecure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+            secure=False,
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=secure_worker),
+            DiscoveryEvent("worker-added", metadata=insecure_worker),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, credentials=None, lazy=False)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert insecure_worker in proxy.workers
+        assert secure_worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_admit_only_secure_workers_when_credentials_present(
+        self, mock_proxy_session, worker_credentials, mocker: MockerFixture
+    ):
+        """Test sentinel admission rejects insecure workers on a secure proxy.
+
+        Given:
+            A non-lazy WorkerProxy with credentials and a user-supplied
+            discovery stream yielding a secure and an insecure worker
+        When:
+            The sentinel processes all events
+        Then:
+            It should admit only the secure worker
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        secure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=True,
+        )
+        insecure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+            secure=False,
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=secure_worker),
+            DiscoveryEvent("worker-added", metadata=insecure_worker),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(
+            discovery=discovery, credentials=worker_credentials, lazy=False
+        )
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert secure_worker in proxy.workers
+        assert insecure_worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_reject_workers_when_version_unparsable(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test sentinel admission rejects workers with unparsable versions.
+
+        Given:
+            A non-lazy WorkerProxy with a user-supplied discovery stream
+            yielding a worker with an unparsable version alongside a
+            compatible worker
+        When:
+            The sentinel processes all events
+        Then:
+            It should admit only the worker with a parsable,
+            compatible version
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        unparsable_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="not-a-semver",
+        )
+        compatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=unparsable_worker),
+            DiscoveryEvent("worker-added", metadata=compatible_worker),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lazy=False)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert compatible_worker in proxy.workers
+        assert unparsable_worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_not_count_incompatible_workers_against_lease(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test rejected workers do not consume lease capacity.
+
+        Given:
+            A non-lazy WorkerProxy with lease=1 and a discovery stream
+            yielding an incompatible worker followed by a compatible one
+        When:
+            The sentinel processes all events
+        Then:
+            It should admit the compatible worker — the incompatible
+            worker must not occupy the single lease slot
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        incompatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="2.0.0",
+        )
+        compatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=incompatible_worker),
+            DiscoveryEvent("worker-added", metadata=compatible_worker),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, lease=1, lazy=False)
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: len(proxy.workers) == 1)
+
+        # Assert
+        assert len(proxy.workers) == 1
+        assert compatible_worker in proxy.workers
+        assert incompatible_worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_evict_worker_when_updated_metadata_incompatible(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test an incompatible update evicts an admitted worker.
+
+        Given:
+            A non-lazy WorkerProxy with explicit credentials=None and a
+            discovery stream yielding a compatible worker-added event
+            followed by a worker-updated event whose metadata flips the
+            same worker to secure=True
+        When:
+            The sentinel processes both events
+        Then:
+            It should evict the worker whose posture flipped — the pool
+            is left empty and no connection is created for the update
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        worker_uid = uuid.uuid4()
+        initial_metadata = WorkerMetadata(
+            uid=worker_uid,
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=False,
+        )
+        updated_metadata = WorkerMetadata(
+            uid=worker_uid,
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=True,
+        )
+        mock_conn_cls = mocker.patch.object(
+            wp, "WorkerConnection", return_value=mocker.MagicMock()
+        )
+        stream = _SteppedDiscovery()
+        proxy = WorkerProxy(discovery=stream, credentials=None, lazy=False, quorum=0)
+        await proxy.start()
+
+        try:
+            # Act & assert — the compatible add admits the worker...
+            await stream.apply(DiscoveryEvent("worker-added", metadata=initial_metadata))
+            assert proxy.workers == [initial_metadata]
+
+            # ...and the incompatible update evicts it, minting no
+            # connection of its own — the add produced the only one.
+            await stream.apply(
+                DiscoveryEvent("worker-updated", metadata=updated_metadata)
+            )
+            assert proxy.workers == []
+            assert mock_conn_cls.call_count == 1
+        finally:
+            # Cleanup
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_tolerate_worker_dropped_when_worker_never_admitted(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test a drop for a worker rejected at admission is a safe no-op.
+
+        Given:
+            A non-lazy WorkerProxy with quorum=None and a discovery
+            stream yielding an incompatible worker-added event followed
+            by a worker-dropped event for the same worker
+        When:
+            The sentinel processes both events
+        Then:
+            It should process the drop without error and admit no
+            workers
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        incompatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="2.0.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=incompatible_worker),
+            DiscoveryEvent("worker-dropped", metadata=incompatible_worker),
+        ]
+        discovery = wp.ReducibleAsyncIterator(events)
+        proxy = WorkerProxy(discovery=discovery, quorum=None, lazy=False)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert proxy.workers == []
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_reject_incompatible_workers_when_pool_uri_supplied(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test the admission gate covers the pool-URI construction path.
+
+        Given:
+            A non-lazy WorkerProxy constructed with a pool URI whose
+            (mocked) local discovery surfaces a tag-matching but
+            version-incompatible worker alongside a tag-matching
+            compatible worker
+        When:
+            The sentinel processes both events
+        Then:
+            It should admit only the compatible worker — compatibility
+            is enforced at admission even though the subscription
+            filter passed both workers through
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        incompatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="2.0.0",
+            tags=frozenset(["pool-1"]),
+        )
+        compatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+            tags=frozenset(["pool-1"]),
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=incompatible_worker),
+            DiscoveryEvent("worker-added", metadata=compatible_worker),
+        ]
+        mock_local_discovery = mocker.MagicMock()
+        mock_local_discovery.subscribe.return_value = wp.ReducibleAsyncIterator(events)
+        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local_discovery)
+        proxy = WorkerProxy("pool-1", quorum=None, lazy=False)
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: len(proxy.workers) == 1)
+
+        # Assert — the compatible worker proves the event path was live
+        assert len(proxy.workers) == 1
+        assert compatible_worker in proxy.workers
+        assert incompatible_worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.parametrize(
+        "flipped",
+        [
+            {"secure": True, "version": "1.0.0"},
+            {"secure": False, "version": "2.0.0"},
+        ],
+        ids=["security", "version"],
+    )
+    @pytest.mark.asyncio
+    async def test_start_should_evict_via_afilter_when_pool_uri_flips_incompatible(
+        self, mock_proxy_session, mocker: MockerFixture, flipped
+    ):
+        """Test the pool-URI path evicts a worker that flips incompatible.
+
+        Given:
+            A pool-URI proxy whose real afilter-wrapped subscription
+            first surfaces a tag-matching compatible worker, then a
+            worker-updated for the same uid flipped incompatible on one
+            gate half
+        When:
+            The sentinel admits the worker and then processes the flip
+        Then:
+            It should evict the worker — the afilter path tracks the
+            posture flip end to end, unlike the bypassed-afilter tests
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        uid = uuid.uuid4()
+        compatible = WorkerMetadata(
+            uid=uid,
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=False,
+            tags=frozenset(["pool-1"]),
+        )
+        incompatible = WorkerMetadata(
+            uid=uid,
+            address="192.168.1.1:50051",
+            pid=1001,
+            tags=frozenset(["pool-1"]),
+            **flipped,
+        )
+        release = asyncio.Event()
+
+        class _Inner:
+            def __aiter__(self):
+                async def gen():
+                    yield DiscoveryEvent("worker-added", metadata=compatible)
+                    await release.wait()
+                    yield DiscoveryEvent("worker-updated", metadata=incompatible)
+                    await asyncio.Event().wait()
+
+                return gen()
+
+        mock_local = mocker.MagicMock()
+        mock_local.subscribe.side_effect = lambda filter=None, **_: afilter(
+            filter, _Inner()
+        )
+        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local)
+        proxy = WorkerProxy("pool-1", credentials=None, quorum=None, lazy=False)
+
+        try:
+            # Act — admit the compatible worker, then release the flip
+            await proxy.start()
+            await _drain_until(lambda: [w.uid for w in proxy.workers] == [uid])
+            release.set()
+
+            # Assert
+            await _drain_until(lambda: proxy.workers == [])
+        finally:
+            # Cleanup
+            await proxy.stop()
+
+    @pytest.mark.parametrize(
+        "initial",
+        [
+            {"secure": True, "version": "1.0.0"},
+            {"secure": False, "version": "2.0.0"},
+        ],
+        ids=["security", "version"],
+    )
+    @pytest.mark.asyncio
+    async def test_start_should_admit_via_afilter_when_pool_uri_flips_compatible(
+        self, mock_proxy_session, mocker: MockerFixture, initial
+    ):
+        """Test the pool-URI path admits a worker that becomes compatible.
+
+        Given:
+            A pool-URI proxy whose real afilter-wrapped subscription
+            first surfaces a tag-matching but incompatible worker
+            (rejected), then a worker-updated for the same uid carrying
+            compatible metadata
+        When:
+            The sentinel rejects the first event and processes the update
+        Then:
+            It should admit the now-compatible worker on the update —
+            the afilter path delivers the transition as worker-updated,
+            which reconciliation admits
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        uid = uuid.uuid4()
+        incompatible = WorkerMetadata(
+            uid=uid,
+            address="192.168.1.1:50051",
+            pid=1001,
+            tags=frozenset(["pool-1"]),
+            **initial,
+        )
+        compatible = WorkerMetadata(
+            uid=uid,
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=False,
+            tags=frozenset(["pool-1"]),
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=incompatible),
+            DiscoveryEvent("worker-updated", metadata=compatible),
+        ]
+
+        class _Inner:
+            def __aiter__(self):
+                async def gen():
+                    for event in events:
+                        yield event
+                    await asyncio.Event().wait()
+
+                return gen()
+
+        mock_local = mocker.MagicMock()
+        mock_local.subscribe.side_effect = lambda filter=None, **_: afilter(
+            filter, _Inner()
+        )
+        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local)
+        proxy = WorkerProxy("pool-1", credentials=None, quorum=None, lazy=False)
+
+        try:
+            # Act
+            await proxy.start()
+            await _drain_until(lambda: [w.uid for w in proxy.workers] == [uid])
+
+            # Assert — admitted under the compatible record
+            assert proxy.workers == [compatible]
+        finally:
+            # Cleanup
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_raise_timeout_when_all_workers_incompatible(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test gate-rejected workers never satisfy the quorum wait.
+
+        Given:
+            A non-lazy WorkerProxy with quorum=1, a short quorum
+            timeout, and a discovery stream yielding only incompatible
+            workers — one next-major version and one secure-mismatched
+        When:
+            The proxy is entered as an async context manager
+        Then:
+            It should raise asyncio.TimeoutError out of __aenter__,
+            leaving the proxy un-started with no admitted workers
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        next_major_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="2.0.0",
+        )
+        secure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+            secure=True,
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=next_major_worker),
+            DiscoveryEvent("worker-added", metadata=secure_worker),
+        ]
+        proxy = WorkerProxy(
+            discovery=wp.ReducibleAsyncIterator(events),
+            credentials=None,
+            quorum=1,
+            quorum_timeout=0.1,
+            lazy=False,
+        )
+
+        # Act & assert
+        with pytest.raises(asyncio.TimeoutError):
+            async with proxy:
+                pass
+        assert not proxy.started
+        assert proxy.workers == []
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_retry_start_when_incompatible_caused_timeout(
+        self, mocker: MockerFixture
+    ):
+        """Test a gate-caused quorum failure leaves the proxy retryable.
+
+        Given:
+            A lazy WorkerProxy with quorum=1 and a short quorum timeout
+            whose discovery yields an incompatible worker immediately
+            and a compatible worker behind an event gate
+        When:
+            A first dispatch is awaited, then the gate is released and
+            the dispatch retried
+        Then:
+            The first dispatch should raise asyncio.TimeoutError
+            leaving the proxy un-started without invoking the
+            balancer, and the retried dispatch should start the proxy
+            and dispatch successfully
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        gate = asyncio.Event()
+        incompatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="2.0.0",
+        )
+        compatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+        )
+
+        class RecoveringDiscovery:
+            def __init__(self):
+                self._index = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._index == 0:
+                    self._index += 1
+                    return DiscoveryEvent("worker-added", metadata=incompatible_worker)
+                await gate.wait()
+                if self._index == 1:
+                    self._index += 1
+                    return DiscoveryEvent("worker-added", metadata=compatible_worker)
+                await asyncio.Event().wait()
+                raise StopAsyncIteration
+
+        class StubLoadBalancer:
+            def __init__(self):
+                self.dispatched = False
+
+            async def dispatch(self, task, *, context, timeout=None):
+                self.dispatched = True
+
+        stub_lb = StubLoadBalancer()
+        proxy = WorkerProxy(
+            discovery=RecoveringDiscovery(),
+            loadbalancer=stub_lb,
+            credentials=None,
+            quorum=1,
+            quorum_timeout=0.1,
+        )
+        mock_task = mocker.MagicMock(spec=Task)
+
+        # Act & assert — the rejected worker never satisfies quorum
+        with pytest.raises(asyncio.TimeoutError):
+            await proxy.dispatch(mock_task)
+        assert not proxy.started
+        assert not stub_lb.dispatched
+
+        # Act — the compatible worker appears and a retry recovers
+        gate.set()
+        await asyncio.wait_for(proxy.dispatch(mock_task), timeout=2.0)
+
+        # Assert
+        assert proxy.started
+        assert stub_lb.dispatched
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_gate_with_credentials_resolved_at_construction(
+        self, mock_proxy_session, worker_credentials, mocker: MockerFixture
+    ):
+        """Test implicit credential resolution feeds the admission gate.
+
+        Given:
+            A WorkerProxy constructed inside a CredentialContext with
+            credentials left to default resolution, the context exited
+            before start, and a discovery stream yielding one secure
+            and one insecure worker
+        When:
+            The proxy is started outside the credential context
+        Then:
+            It should admit only the secure worker — the gate binds
+            the credentials resolved at construction time
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        secure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=True,
+        )
+        insecure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+            secure=False,
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=secure_worker),
+            DiscoveryEvent("worker-added", metadata=insecure_worker),
+        ]
+        with CredentialContext(worker_credentials):
+            proxy = WorkerProxy(discovery=wp.ReducibleAsyncIterator(events), lazy=False)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert secure_worker in proxy.workers
+        assert insecure_worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_reject_all_workers_when_local_version_unparsable(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test the version gate fails closed on an unparsable local version.
+
+        Given:
+            The local protocol version patched to "unknown" — the real
+            missing-distribution fallback — and a discovery stream
+            yielding a valid-version worker and an "unknown"-version
+            worker
+        When:
+            The proxy is started and the sentinel processes both events
+        Then:
+            It should warn that the local version is unresolvable and
+            admit no workers — identical unparsable strings do not match
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "unknown")
+        valid_version_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+        )
+        unknown_version_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="unknown",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=valid_version_worker),
+            DiscoveryEvent("worker-added", metadata=unknown_version_worker),
+        ]
+        with pytest.warns(UnparsableVersionWarning):
+            proxy = WorkerProxy(
+                discovery=wp.ReducibleAsyncIterator(events),
+                credentials=None,
+                quorum=None,
+                lazy=False,
+            )
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert proxy.workers == []
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_await_live_worker_count_when_drop_races_quorum(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test the quorum wait tracks the live count across drops.
+
+        Given:
+            A non-lazy WorkerProxy with quorum=2 and a step-gated
+            discovery stream releasing add A, drop A, add B, then add C
+            one event at a time
+        When:
+            The proxy is entered while the events are released stepwise
+        Then:
+            It should remain blocked after add/drop/add — only one
+            live worker — and complete only after the fourth event,
+            with exactly B and C admitted
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        gate = asyncio.Event()
+        worker_a, worker_b, worker_c = (
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+            )
+            for i in range(3)
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=worker_a),
+            DiscoveryEvent("worker-dropped", metadata=worker_a),
+            DiscoveryEvent("worker-added", metadata=worker_b),
+            DiscoveryEvent("worker-added", metadata=worker_c),
+        ]
+        call_count = 0
+
+        class GatedDiscovery:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                nonlocal call_count
+                await gate.wait()
+                gate.clear()
+                if call_count < len(events):
+                    event = events[call_count]
+                    call_count += 1
+                    return event
+                await asyncio.Event().wait()
+                raise StopAsyncIteration
+
+        proxy = WorkerProxy(discovery=GatedDiscovery(), quorum=2, lazy=False)
+        entered = asyncio.Event()
+        hold = asyncio.Event()
+
+        async def enter():
+            async with proxy:
+                entered.set()
+                await hold.wait()
+
+        # Act — release add A, drop A, add B; quorum must stay unmet
+        enter_task = asyncio.create_task(enter())
+        await asyncio.sleep(0)
+        try:
+            for _ in range(3):
+                gate.set()
+                await asyncio.sleep(0.05)
+                assert not entered.is_set()
+
+            # Release add C — the live count reaches the quorum
+            gate.set()
+            await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+            # Assert
+            assert len(proxy.workers) == 2
+            assert worker_b in proxy.workers
+            assert worker_c in proxy.workers
+            assert worker_a not in proxy.workers
+        finally:
+            # Cleanup — release the held context and cancel the entry
+            # task so it unwinds inside the context that entered it,
+            # running ``__aexit__`` on the started proxy.
+            hold.set()
+            enter_task.cancel()
+            try:
+                await enter_task
+            except asyncio.CancelledError:
+                pass
+
+    def test_workers_should_return_empty_list_when_proxy_unstarted(
+        self, mock_discovery_service
+    ):
+        """Test the workers property is safe on an un-started proxy.
+
+        Given:
+            A lazy WorkerProxy that has never been entered or started
+        When:
+            The workers property is accessed
+        Then:
+            It should return an empty list without raising
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service)
+
+        # Act & assert
+        assert proxy.workers == []
+
+    def test___init___should_succeed_when_quorum_matches_compatible_worker_count(
+        self, mocker: MockerFixture
+    ):
+        """Test construction succeeds when quorum equals the compatible count.
+
+        Given:
+            A static list of three workers of which exactly two are
+            version-compatible, and quorum=2
+        When:
+            The proxy is constructed
+        Then:
+            It should return a WorkerProxy instance rather than raising
+            ValueError — the just-satisfiable quorum is accepted
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        compatible_workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+            )
+            for i in range(2)
+        ]
+        incompatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.9:50051",
+            pid=1009,
+            version="2.0.0",
+        )
+
+        # Act
+        proxy = WorkerProxy(
+            workers=[*compatible_workers, incompatible_worker],
+            quorum=2,
+            lazy=False,
+        )
+
+        # Assert
+        assert isinstance(proxy, WorkerProxy)
+
+    @pytest.mark.asyncio
+    async def test_start_should_admit_only_compatible_workers_when_static_list_mixed(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test start admits exactly the compatible workers from a mixed list.
+
+        Given:
+            A non-lazy proxy over a static list of two version-compatible
+            workers and one incompatible worker, with quorum=2
+        When:
+            The proxy is started
+        Then:
+            It should admit exactly the two compatible workers and never
+            the incompatible one
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        compatible_workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+            )
+            for i in range(2)
+        ]
+        incompatible_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.9:50051",
+            pid=1009,
+            version="2.0.0",
+        )
+        proxy = WorkerProxy(
+            workers=[*compatible_workers, incompatible_worker],
+            quorum=2,
+            lazy=False,
+        )
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: len(proxy.workers) == 2)
+
+        # Assert
+        assert len(proxy.workers) == 2
+        assert compatible_workers[0] in proxy.workers
+        assert compatible_workers[1] in proxy.workers
+        assert incompatible_worker not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    def test___init___should_raise_when_quorum_exceeds_insecure_worker_count(
+        self, mocker: MockerFixture
+    ):
+        """Test the security half reduces the construction-time count.
+
+        Given:
+            An explicit credentials=None proxy over a static list of
+            one insecure and one secure version-compatible worker, and
+            quorum=2
+        When:
+            The proxy is constructed
+        Then:
+            It should raise ValueError reporting "1 of 2" — the secure
+            worker fails the security half of the compatibility count
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        insecure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=False,
+        )
+        secure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+            secure=True,
+        )
+
+        # Act & assert
+        with pytest.raises(ValueError, match=r"compatible worker count \(1 of 2"):
+            WorkerProxy(
+                workers=[insecure_worker, secure_worker],
+                credentials=None,
+                quorum=2,
+            )
+
+    @pytest.mark.asyncio
+    async def test_start_should_admit_no_workers_when_static_list_incompatible(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test an all-incompatible static list is legal without a quorum.
+
+        Given:
+            A static list whose workers are all version-incompatible
+            and quorum=None
+        When:
+            The proxy is constructed and started
+        Then:
+            It should construct without error and start with an empty
+            worker set — the fail-fast is quorum-gated
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="2.0.0",
+            )
+            for i in range(2)
+        ]
+        proxy = WorkerProxy(workers=workers, credentials=None, quorum=None, lazy=False)
+
+        # Act
+        await proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert proxy.workers == []
+
+        # Cleanup
+        await proxy.stop()
+
+    @given(
+        workers=_gate_worker_lists(),
+        quorum=st.one_of(st.none(), st.integers(min_value=0, max_value=8)),
+    )
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test___init___should_validate_quorum_against_compatible_static_workers(
+        self, mocker: MockerFixture, workers, quorum
+    ):
+        """Test constructor-gate consistency over generated static lists.
+
+        Given:
+            A generated non-empty static worker list with mixed secure
+            flags and compatible, older, other-major, and unparsable
+            versions, and a generated quorum.
+        When:
+            WorkerProxy is instantiated with the workers and quorum.
+        Then:
+            It should raise ValueError naming the compatible worker
+            count exactly when the quorum exceeds the number of
+            workers passing the public security/version predicate, and
+            construct successfully otherwise.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.2.0")
+        compatible = _gate_predicate("1.2.0")
+        compatible_count = sum(1 for worker in workers if compatible(worker))
+
+        # Act & assert
+        if quorum is not None and quorum > compatible_count:
+            with pytest.raises(ValueError, match="compatible worker count"):
+                WorkerProxy(workers=workers, credentials=None, quorum=quorum)
+        else:
+            proxy = WorkerProxy(workers=workers, credentials=None, quorum=quorum)
+            assert isinstance(proxy, WorkerProxy)
+
+    @given(scenario=_gate_event_scenarios())
+    @settings(
+        max_examples=75,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_start_should_admit_exactly_compatible_workers_when_stream_arbitrary(
+        self, mocker: MockerFixture, scenario
+    ):
+        """Test the sentinel admits exactly the model-predicted set.
+
+        Given:
+            A generated stream of add, update, and drop events over a
+            small worker universe with mixed versions and secure
+            flags, a drawn local protocol version, and a drawn lease.
+        When:
+            A non-lazy insecure proxy consumes the full stream.
+        Then:
+            It should admit exactly the workers a reconcile model
+            predicts — adds and updates alike admit a compatible worker
+            under the lease, evict one that becomes incompatible, and
+            refresh one already held; drops always remove.
+        """
+        # Arrange
+        local_version, lease, events = scenario
+        mocker.patch.object(protocol, "__version__", local_version)
+        mocker.patch.object(wp, "WorkerConnection", return_value=mocker.MagicMock())
+        compatible = _gate_predicate(local_version)
+        model: dict[uuid.UUID, WorkerMetadata] = {}
+        for event in events:
+            metadata = event.metadata
+            uid = metadata.uid
+            if event.type == "worker-dropped":
+                model.pop(uid, None)
+            elif not compatible(metadata):
+                model.pop(uid, None)
+            elif uid in model or lease is None or len(model) < lease:
+                model[uid] = metadata
+        expected = set(model.values())
+
+        async def _scenario():
+            proxy = WorkerProxy(
+                discovery=wp.ReducibleAsyncIterator(events),
+                credentials=None,
+                lease=lease,
+                quorum=None,
+                lazy=False,
+            )
+            await proxy.start()
+            await _drain_until(lambda: len(proxy.workers) == len(model), timeout=1.0)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            admitted = set(proxy.workers)
+            await proxy.stop()
+            return admitted
+
+        # Act
+        admitted = asyncio.run(_scenario())
+
+        # Assert
+        assert admitted == expected
+        assert not any(worker.secure for worker in admitted)
+        assert all(compatible(worker) for worker in admitted)
+        assert lease is None or len(admitted) <= lease
 
     @pytest.mark.asyncio
     async def test_cloudpickle_serialization_preserves_lease(
@@ -1725,7 +4085,7 @@ class TestWorkerProxy:
         pickled_data = wool.__serializer__.dumps(proxy)
         restored = cloudpickle.loads(pickled_data)
         await restored.start()
-        await _drain_discovery(restored, expect=2)
+        await _drain_until(lambda: len(restored.workers) == 2)
 
         # Assert — restored proxy enforces the cap
         assert len(restored.workers) == 2
@@ -1917,17 +4277,17 @@ class TestWorkerProxy:
         ):
             WorkerProxy(workers=workers, quorum=5)
 
-    def test___init___with_static_workers_unparseable_version_filtered(self):
-        """Test workers with unparseable versions are filtered out of quorum count.
+    def test___init___with_static_workers_unparsable_version_filtered(self):
+        """Test workers with unparsable versions are filtered out of quorum count.
 
         Given:
             A static workers list of length 2 where one worker has an
-            unparseable version, and quorum=2
+            unparsable version, and quorum=2
         When:
             WorkerProxy is instantiated
         Then:
             It should raise ValueError reporting "1 of 2" — the
-            unparseable-version worker is rejected by the version filter
+            unparsable-version worker is rejected by the version filter
         """
         # Arrange
         workers = [
@@ -2055,7 +4415,7 @@ class TestWorkerProxy:
                 uid=uuid.uuid4(),
                 address=f"192.168.1.{i}:50051",
                 pid=1000 + i,
-                version="1.0.0",
+                version=protocol.__version__,
             )
             for i in range(2)
         ]
@@ -2133,7 +4493,7 @@ class TestWorkerProxy:
                 uid=uuid.uuid4(),
                 address=f"192.168.1.{i}:50051",
                 pid=1000 + i,
-                version="1.0.0",
+                version=protocol.__version__,
             )
             for i in range(2)
         ]
@@ -2465,7 +4825,7 @@ class TestWorkerProxy:
         # Act — pickle round-trip, then start the restored proxy
         restored = cloudpickle.loads(wool.__serializer__.dumps(proxy))
         await restored.start()
-        await _drain_discovery(restored, expect=3)
+        await _drain_until(lambda: len(restored.workers) == 3)
 
         # Assert — quorum survived the round-trip
         assert len(restored.workers) >= 2
@@ -2587,7 +4947,8 @@ class TestWorkerProxy:
             It should delegate the task to the load balancer and yield results
         """
         # Arrange
-        discovery, metadata = spy_discovery_with_events
+        discovery, _ = spy_discovery_with_events
+        mocker.patch.object(wp, "WorkerConnection", return_value=mock_worker_connection)
 
         proxy = WorkerProxy(
             discovery=discovery,
@@ -2595,11 +4956,7 @@ class TestWorkerProxy:
         )
 
         await proxy.start()
-
-        # Add worker through proper loadbalancer callback (simulating discovery)
-        spy_loadbalancer_with_workers.worker_added_callback(
-            mock_worker_connection, metadata
-        )
+        await _drain_until(lambda: len(proxy.workers) == 1)
 
         # Act
         result_iterator = await proxy.dispatch(mock_wool_task)
@@ -2607,9 +4964,7 @@ class TestWorkerProxy:
 
         # Assert
         assert results == ["test_result"]
-        spy_loadbalancer_with_workers.dispatch.assert_called_once()
-        # worker_added_callback gets called twice: once by test, once by _worker_sentinel
-        assert spy_loadbalancer_with_workers.worker_added_callback.call_count >= 1
+        spy_loadbalancer_with_workers.delegate.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_dispatch_not_started_raises_error(
@@ -2704,7 +5059,7 @@ class TestWorkerProxy:
             uid=uuid.uuid4(),
             address="192.168.1.100:50051",
             pid=1001,
-            version="1.0.0",
+            version=protocol.__version__,
         )
 
         class RecoverableDiscovery:
@@ -2781,7 +5136,7 @@ class TestWorkerProxy:
             uid=uuid.uuid4(),
             address="192.168.1.101:50051",
             pid=1002,
-            version="1.0.0",
+            version=protocol.__version__,
         )
 
         class RecoverableDiscovery:
@@ -2909,15 +5264,12 @@ class TestWorkerProxy:
             It should auto-start the proxy and dispatch the task.
         """
         # Arrange
-        discovery, metadata = spy_discovery_with_events
+        discovery, _ = spy_discovery_with_events
+        mocker.patch.object(wp, "WorkerConnection", return_value=mock_worker_connection)
 
         proxy = WorkerProxy(
             discovery=discovery,
             loadbalancer=spy_loadbalancer_with_workers,
-        )
-
-        spy_loadbalancer_with_workers.worker_added_callback(
-            mock_worker_connection, metadata
         )
 
         assert not proxy.started
@@ -2937,6 +5289,7 @@ class TestWorkerProxy:
         spy_loadbalancer_with_workers,
         spy_discovery_with_events,
         mock_worker_connection,
+        mock_wool_task,
         mock_proxy_session,
         mocker,
     ):
@@ -2950,34 +5303,23 @@ class TestWorkerProxy:
             It should start the proxy and both dispatches should succeed.
         """
         # Arrange
-        discovery, metadata = spy_discovery_with_events
+        discovery, _ = spy_discovery_with_events
+        mocker.patch.object(wp, "WorkerConnection", return_value=mock_worker_connection)
 
         proxy = WorkerProxy(
             discovery=discovery,
             loadbalancer=spy_loadbalancer_with_workers,
         )
 
-        spy_loadbalancer_with_workers.worker_added_callback(
-            mock_worker_connection, metadata
-        )
-
-        task = mocker.MagicMock(spec=Task)
-        spy_loadbalancer_with_workers.dispatch = mocker.AsyncMock(
-            return_value=mocker.AsyncMock(
-                __aiter__=mocker.Mock(return_value=mocker.AsyncMock()),
-                __anext__=mocker.AsyncMock(side_effect=StopAsyncIteration),
-            )
-        )
-
         # Act
         await asyncio.gather(
-            proxy.dispatch(task),
-            proxy.dispatch(task),
+            proxy.dispatch(mock_wool_task),
+            proxy.dispatch(mock_wool_task),
         )
 
         # Assert
         assert proxy.started
-        assert spy_loadbalancer_with_workers.dispatch.call_count == 2
+        assert spy_loadbalancer_with_workers.delegate.call_count == 2
         await proxy.stop()
 
     @pytest.mark.asyncio
@@ -2992,41 +5334,29 @@ class TestWorkerProxy:
         """Test propagate the error from the load balancer.
 
         Given:
-            A WorkerProxy where load balancer dispatch fails
+            A WorkerProxy where the delegate generator raises
         When:
             Dispatch is called
         Then:
             It should propagate the error from the load balancer
         """
         # Arrange
-        discovery, metadata = spy_discovery_with_events
+        discovery, _ = spy_discovery_with_events
+        mocker.patch.object(wp, "WorkerConnection", return_value=mock_worker_connection)
 
-        # Create loadbalancer that raises errors during dispatch
+        # Create a delegating loadbalancer whose generator raises immediately
         class FailingLoadBalancer:
-            def __init__(self):
-                self._workers = {}
-
-            def worker_added_callback(self, connection, info):
-                self._workers[info] = connection
-
-            def worker_updated_callback(self, connection, info):
-                self._workers[info] = connection
-
-            def worker_removed_callback(self, info):
-                if info in self._workers:
-                    del self._workers[info]
-
-            async def dispatch(self, task, *, context, timeout=None):
+            async def delegate(self, task, *, context):
                 raise Exception("Load balancer error")
+                if False:
+                    yield  # pragma: no cover
 
         failing_loadbalancer = FailingLoadBalancer()
 
         proxy = WorkerProxy(discovery=discovery, loadbalancer=failing_loadbalancer)
 
         await proxy.start()
-
-        # Add worker through proper callback
-        failing_loadbalancer.worker_added_callback(mock_worker_connection, metadata)
+        await _drain_until(lambda: len(proxy.workers) == 1)
 
         # Act & assert
         with pytest.raises(Exception, match="Load balancer error"):
@@ -3037,13 +5367,14 @@ class TestWorkerProxy:
     async def test_dispatch_waits_for_workers_then_dispatches(
         self,
         mocker: MockerFixture,
+        mock_worker_connection,
         mock_wool_task,
         mock_proxy_session,
     ):
         """Test wait via _await_workers, then dispatch when workers appear.
 
         Given:
-            A started WorkerProxy with no initial workers in loadbalancer
+            A started WorkerProxy with no initial workers
         When:
             Dispatch is called and workers become available during wait
         Then:
@@ -3051,38 +5382,19 @@ class TestWorkerProxy:
         """
         # Arrange
         metadata = WorkerMetadata(
-            uid=uuid.uuid4(), address="127.0.0.1:50051", pid=1234, version="1.0.0"
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50051",
+            pid=1234,
+            version=protocol.__version__,
         )
 
         # Create discovery service that will emit worker event
         events = [DiscoveryEvent("worker-added", metadata=metadata)]
         discovery = wp.ReducibleAsyncIterator(events)
+        mocker.patch.object(wp, "WorkerConnection", return_value=mock_worker_connection)
 
-        # Create loadbalancer that tracks workers through callbacks
-        class WaitingLoadBalancer:
-            def __init__(self):
-                self._workers = {}  # Start empty
-
-            def worker_added_callback(self, connection, info):
-                self._workers[info] = connection
-
-            def worker_updated_callback(self, connection, info):
-                self._workers[info] = connection
-
-            def worker_removed_callback(self, info):
-                if info in self._workers:
-                    del self._workers[info]
-
-            async def dispatch(self, task, *, context, timeout=None):
-                if not context.workers:
-                    raise NoWorkersAvailable("No workers available")
-
-                async def _result_generator():
-                    yield "test_result"
-
-                return _result_generator()
-
-        waiting_loadbalancer = WaitingLoadBalancer()
+        # Delegating loadbalancer that yields straight from the context
+        waiting_loadbalancer = make_delegating_balancer()
 
         proxy = WorkerProxy(
             discovery=discovery,
@@ -3127,7 +5439,7 @@ class TestWorkerProxy:
             uid=uuid.uuid4(),
             address="192.168.1.100:50051",
             pid=1001,
-            version="1.0.0",
+            version=protocol.__version__,
         )
 
         class GatedDiscovery:
@@ -3139,14 +5451,21 @@ class TestWorkerProxy:
                 gate.clear()
                 return DiscoveryEvent("worker-added", metadata=metadata)
 
-        class StubLoadBalancer:
-            def __init__(self):
-                self.dispatched = False
+        delegated: list[bool] = []
+        stub_lb = make_delegating_balancer(
+            on_yield=lambda metadata: delegated.append(True)
+        )
+        mock_connection = mocker.MagicMock(spec=WorkerConnection)
 
-            async def dispatch(self, task, *, context, timeout=None):
-                self.dispatched = True
+        async def fake_dispatch(task, *, timeout=None):
+            async def _gen():
+                yield "result"
 
-        stub_lb = StubLoadBalancer()
+            return _gen()
+
+        mock_connection.dispatch = fake_dispatch
+        mocker.patch.object(wp, "WorkerConnection", return_value=mock_connection)
+
         proxy = WorkerProxy(discovery=GatedDiscovery(), loadbalancer=stub_lb, quorum=1)
         mock_task = mocker.MagicMock(spec=Task)
 
@@ -3161,7 +5480,7 @@ class TestWorkerProxy:
 
         # Assert
         assert metadata in proxy.workers
-        assert stub_lb.dispatched
+        assert delegated
 
         # Cleanup
         await proxy.stop()
@@ -3281,7 +5600,7 @@ class TestWorkerProxy:
             uid=uuid.uuid4(),
             address="127.0.0.1:50051",
             pid=1234,
-            version="1.0.0",
+            version=protocol.__version__,
         )
 
         # Inject worker into discovery service before starting proxy
@@ -3504,31 +5823,57 @@ class TestWorkerProxy:
         """Test pickle roundtrip does not include credentials.
 
         Given:
-            A started WorkerProxy with WorkerCredentials.
+            A WorkerProxy with WorkerCredentials and a discovery stream
+            carrying one secure and one insecure worker.
         When:
-            Cloudpickle serialization and deserialization are performed
-            outside a WorkerCredentials context.
+            The proxy is serialized, deserialized outside any
+            WorkerCredentials context, and the restored proxy is
+            started.
         Then:
-            The unpickled proxy should resolve to None credentials
-            (insecure) and only discover insecure workers.
+            It should admit only the insecure worker — the restored
+            admission gate is rebuilt from the restoring context's
+            absent credentials, not carried in the pickle.
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
-        discovery_service = LocalDiscovery("test-pool").subscriber
+        secure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+            secure=True,
+        )
+        insecure_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="1.0.0",
+            secure=False,
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=secure_worker),
+            DiscoveryEvent("worker-added", metadata=insecure_worker),
+        ]
         proxy = WorkerProxy(
-            discovery=discovery_service,
+            discovery=wp.ReducibleAsyncIterator(events),
             credentials=worker_credentials,
         )
+        pickled_data = wool.__serializer__.dumps(proxy)
 
-        async with proxy:
-            pickled_data = wool.__serializer__.dumps(proxy)
-
-        # Act — unpickle outside any WorkerCredentials context
+        # Act — unpickle outside any WorkerCredentials context and start
         unpickled_proxy = cloudpickle.loads(pickled_data)
+        await unpickled_proxy.start()
+        await asyncio.sleep(0.1)
 
-        # Assert — credentials not carried; proxy acts insecure
+        # Assert — credentials not carried; the restored gate admits
+        # only insecure workers
         assert isinstance(unpickled_proxy, WorkerProxy)
         assert unpickled_proxy.id == proxy.id
+        assert insecure_worker in unpickled_proxy.workers
+        assert secure_worker not in unpickled_proxy.workers
+
+        # Cleanup
+        await unpickled_proxy.stop()
 
     @pytest.mark.asyncio
     async def test_cloudpickle_serialization_resolves_credentials_from_context(
@@ -3537,27 +5882,19 @@ class TestWorkerProxy:
         """Test unpickled proxy resolves credentials from ContextVar.
 
         Given:
-            A WorkerProxy serialized with credentials.
+            An insecure WorkerProxy serialized with a discovery stream
+            carrying one secure and one insecure worker.
         When:
-            Deserialized inside a WorkerCredentials context with
-            secure and insecure static workers.
+            The payload is deserialized inside a WorkerCredentials
+            context and the restored proxy is started after the
+            context exits.
         Then:
-            The restored proxy should discover only secure workers,
-            confirming credentials resolved from the ContextVar.
+            It should admit only the secure worker — the restored gate
+            resolves credentials from the ContextVar at load time, not
+            at start time.
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
-        discovery_service = LocalDiscovery("test-pool").subscriber
-        proxy = WorkerProxy(
-            discovery=discovery_service,
-            credentials=worker_credentials,
-        )
-
-        async with proxy:
-            wool.__serializer__.dumps(proxy)
-
-        # Act — unpickle inside a WorkerCredentials context with
-        # static workers so we can observe the security filter
         secure_worker = WorkerMetadata(
             uid=uuid.uuid4(),
             address="192.168.1.100:50051",
@@ -3572,20 +5909,178 @@ class TestWorkerProxy:
             version="1.0.0",
             secure=False,
         )
+        events = [
+            DiscoveryEvent("worker-added", metadata=secure_worker),
+            DiscoveryEvent("worker-added", metadata=insecure_worker),
+        ]
+        proxy = WorkerProxy(
+            discovery=wp.ReducibleAsyncIterator(events),
+            credentials=None,
+        )
+        pickled_data = wool.__serializer__.dumps(proxy)
+
+        # Act — unpickle inside a WorkerCredentials context, then start
+        # after the context has exited
         with CredentialContext(worker_credentials):
-            # Unpickle restores proxy with credentials from ContextVar.
-            # Verify by constructing a new proxy (same mechanism) with
-            # static workers — default credentials resolve from ContextVar.
-            restored_proxy = WorkerProxy(
-                workers=[secure_worker, insecure_worker],
-                lazy=False,
-            )
+            restored_proxy = cloudpickle.loads(pickled_data)
+        await restored_proxy.start()
+        await asyncio.sleep(0.1)
 
         # Assert — resolved credentials from ContextVar: only secure workers
-        await restored_proxy.start()
-        await asyncio.sleep(0.05)
         assert secure_worker in restored_proxy.workers
         assert insecure_worker not in restored_proxy.workers
+
+        # Cleanup
+        await restored_proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_cloudpickle_serialization_should_rebuild_version_gate_on_restore(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test the restored gate uses the restoring process's version.
+
+        Given:
+            An insecure WorkerProxy serialized under local protocol
+            version 1.0.0 with a discovery stream carrying a 1.0.0
+            worker and a 2.5.0 worker.
+        When:
+            The local protocol version is re-patched to 2.0.0 before
+            deserialization and the restored proxy is started.
+        Then:
+            It should admit only the 2.5.0 worker — the origin-side
+            admissible 1.0.0 worker is rejected under the restoring
+            side's major version.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        origin_major_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.1:50051",
+            pid=1001,
+            version="1.0.0",
+        )
+        next_major_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="192.168.1.2:50051",
+            pid=1002,
+            version="2.5.0",
+        )
+        events = [
+            DiscoveryEvent("worker-added", metadata=origin_major_worker),
+            DiscoveryEvent("worker-added", metadata=next_major_worker),
+        ]
+        proxy = WorkerProxy(
+            discovery=wp.ReducibleAsyncIterator(events),
+            credentials=None,
+        )
+        pickled_data = wool.__serializer__.dumps(proxy)
+
+        # Act — restore under a different local protocol version
+        mocker.patch.object(protocol, "__version__", "2.0.0")
+        restored_proxy = cloudpickle.loads(pickled_data)
+        await restored_proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert next_major_worker in restored_proxy.workers
+        assert origin_major_worker not in restored_proxy.workers
+
+        # Cleanup
+        await restored_proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_cloudpickle_serialization_should_regate_static_workers_on_restore(
+        self, mock_proxy_session, worker_credentials, mocker: MockerFixture
+    ):
+        """Test origin-filtered static workers are re-gated on restore.
+
+        Given:
+            An insecure WorkerProxy built with two compatible insecure
+            static workers and quorum=None, serialized after the
+            construction-time filter passed both into the reduce
+            payload.
+        When:
+            The payload is deserialized inside a WorkerCredentials
+            context and the restored proxy is started.
+        Then:
+            It should admit no workers — the carried events travel the
+            discovery restore path and every one is re-checked by the
+            restored sentinel's credentialed gate.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+                secure=False,
+            )
+            for i in range(2)
+        ]
+        proxy = WorkerProxy(workers=workers, credentials=None, quorum=None)
+        pickled_data = wool.__serializer__.dumps(proxy)
+
+        # Act — restore inside a credentialed context
+        with CredentialContext(worker_credentials):
+            restored_proxy = cloudpickle.loads(pickled_data)
+        await restored_proxy.start()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert restored_proxy.workers == []
+
+        # Cleanup
+        await restored_proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_cloudpickle_serialization_should_replay_static_stream_on_restore(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test a consumed static event stream replays after restore.
+
+        Given:
+            A started insecure WorkerProxy built from two compatible
+            static workers whose carried event stream has been fully
+            consumed, serialized while started.
+        When:
+            The payload is deserialized in the same insecure context
+            and the restored proxy is started.
+        Then:
+            It should admit both workers again — the carried iterator
+            resets on reduction, so the restored sentinel replays the
+            full static event list.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"192.168.1.{i}:50051",
+                pid=1000 + i,
+                version="1.0.0",
+                secure=False,
+            )
+            for i in range(2)
+        ]
+        proxy = WorkerProxy(workers=workers, credentials=None, quorum=None, lazy=False)
+        await proxy.start()
+        await _drain_until(lambda: len(proxy.workers) == 2)
+        pickled_data = wool.__serializer__.dumps(proxy)
+        await proxy.stop()
+
+        # Act
+        restored_proxy = cloudpickle.loads(pickled_data)
+        await restored_proxy.start()
+        await _drain_until(lambda: len(restored_proxy.workers) == 2)
+
+        # Assert — the positive control for restore-side re-gating:
+        # the carried stream was non-empty and replayed in full
+        assert workers[0] in restored_proxy.workers
+        assert workers[1] in restored_proxy.workers
+
+        # Cleanup
         await restored_proxy.stop()
 
     def test_cloudpickle_serialization_with_sync_cm_loadbalancer_raises(
@@ -3981,18 +6476,20 @@ class TestWorkerProxy:
         # Cleanup
         await proxy.stop()
 
-    @pytest.mark.asyncio
-    async def test_pool_uri_combined_filter(self, mocker: MockerFixture):
-        """Test pool URI filter combines tag matching, security, and version
-        filtering.
+    def test___init___should_build_tag_only_filter_when_pool_uri_supplied(
+        self, mocker: MockerFixture
+    ):
+        """Test pool URI subscription filter applies tag semantics only.
 
         Given:
             A WorkerProxy instantiated with a pool URI and extra tags.
         When:
-            The discovery filter is evaluated against workers.
+            The discovery subscription filter is evaluated against
+            workers.
         Then:
-            Only workers matching the tags, security, and version
-            requirements pass the filter.
+            It should admit workers by tag intersection alone —
+            security and version compatibility are enforced at sentinel
+            admission, not in the subscription filter.
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
@@ -4006,7 +6503,7 @@ class TestWorkerProxy:
         # Capture the filter passed to subscribe()
         filter_fn = mock_local_discovery.subscribe.call_args.kwargs["filter"]
 
-        # Act & assert — matching tags, insecure (no credentials)
+        # Act & assert — matching tags pass
         matching = WorkerMetadata(
             uid=uuid.uuid4(),
             address="127.0.0.1:50051",
@@ -4017,7 +6514,7 @@ class TestWorkerProxy:
         )
         assert filter_fn(matching) is True
 
-        # Act & assert — no matching tags
+        # Act & assert — no matching tags fail
         non_matching = WorkerMetadata(
             uid=uuid.uuid4(),
             address="127.0.0.1:50052",
@@ -4028,8 +6525,8 @@ class TestWorkerProxy:
         )
         assert filter_fn(non_matching) is False
 
-        # Act & assert — matching tags but secure (no credentials means
-        # security filter rejects secure workers)
+        # Act & assert — matching tags pass despite a security mismatch;
+        # the sentinel admission gate owns compatibility rejection
         secure_matching = WorkerMetadata(
             uid=uuid.uuid4(),
             address="127.0.0.1:50053",
@@ -4038,48 +6535,29 @@ class TestWorkerProxy:
             tags=frozenset(["pool-1"]),
             secure=True,
         )
-        assert filter_fn(secure_matching) is False
+        assert filter_fn(secure_matching) is True
 
-    @given(worker_count=st.integers(min_value=0, max_value=10))
-    @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
-    )
-    @pytest.mark.asyncio
-    async def test_property_workers_list_accurate(
-        self, mock_discovery_service, worker_count
-    ):
-        """Test the workers list remains consistent.
+        # Act & assert — matching tags pass despite a version mismatch
+        version_mismatched = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50054",
+            pid=4,
+            version="2.0.0",
+            tags=frozenset(["pool-1"]),
+            secure=False,
+        )
+        assert filter_fn(version_mismatched) is True
 
-        Given:
-            A WorkerProxy with varying numbers of discovered workers
-        When:
-            Workers are added via discovery
-        Then:
-            The workers list remains consistent
-        """
-        # Arrange
-        await mock_discovery_service.start()
-        workers = []
-        for i in range(worker_count):
-            worker = WorkerMetadata(
-                uid=uuid.uuid4(),
-                address=f"192.168.1.{100 + i}:50051",
-                pid=1000 + i,
-                version="1.0.0",
-                tags=frozenset(["test"]),
-                extra=MappingProxyType({}),
-            )
-            workers.append(worker)
-            mock_discovery_service.inject_worker_added(worker)
-
-        proxy = WorkerProxy(discovery=mock_discovery_service)
-
-        # Act
-        async with proxy:
-            await asyncio.sleep(0.1)
-            # Workers list should be consistent
-
-        await mock_discovery_service.stop()
+        # Act & assert — the extra-tag member of the union matches alone
+        extra_tag_only = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50055",
+            pid=5,
+            version="1.0.0",
+            tags=frozenset(["extra-tag"]),
+            secure=False,
+        )
+        assert filter_fn(extra_tag_only) is True
 
     @given(num_proxies=st.integers(min_value=2, max_value=20))
     @settings(
@@ -4230,3 +6708,934 @@ class TestReducibleAsyncIterator:
 
         # Assert
         assert results == items
+
+
+_DISPATCH_OUTCOMES = ("success", "transient", "non_transient")
+
+
+async def _make_proxy_with_workers(
+    *,
+    connections: list,
+    loadbalancer,
+    mocker: MockerFixture,
+    discovery=None,
+    metadata_list=None,
+) -> tuple[WorkerProxy, list[WorkerMetadata]]:
+    """Build and start a WorkerProxy seeded via the public discovery flow.
+
+    Patches `WorkerConnection` so the sentinel creates the given mock
+    connections, constructs a proxy with a `ReducibleAsyncIterator`
+    discovery stream, starts it, and waits until all workers are visible
+    on ``proxy.workers``.
+
+    A custom ``discovery`` stream (e.g. `_GatedDiscovery`) and matching
+    ``metadata_list`` may be supplied; the drain then waits only for the
+    ``metadata_list`` workers, and ``connections`` must cover every
+    event the stream will ever emit.
+
+    :returns:
+        ``(proxy, metadata_list)`` where the metadata matches the
+        connections in order.
+    """
+    if metadata_list is None:
+        metadata_list = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"127.0.0.1:{50100 + i}",
+                pid=9000 + i,
+                version=protocol.__version__,
+            )
+            for i in range(len(connections))
+        ]
+    mocker.patch.object(wp, "WorkerConnection", side_effect=connections)
+    if discovery is None:
+        discovery = wp.ReducibleAsyncIterator(
+            [DiscoveryEvent("worker-added", metadata=m) for m in metadata_list]
+        )
+    proxy = WorkerProxy(
+        discovery=discovery,
+        loadbalancer=loadbalancer,
+        lazy=False,
+    )
+    await proxy.start()
+    await _drain_until(lambda: len(proxy.workers) == len(metadata_list))
+    return proxy, metadata_list
+
+
+def _make_success_connection(mocker: MockerFixture, spy_stream: list):
+    """Build a mock connection whose dispatch yields a tracked stream."""
+    connection = mocker.MagicMock(spec=WorkerConnection)
+
+    async def _fake_dispatch(task, *, timeout=None):
+        async def _gen():
+            yield "ok"
+
+        gen = _gen()
+        spy_stream.append(gen)
+        return gen
+
+    connection.dispatch = _fake_dispatch
+    return connection
+
+
+def _make_outcome_connection(outcome, marker, mocker: MockerFixture):
+    """Build a mock connection whose dispatch resolves to a drawn outcome.
+
+    A ``"success"`` connection returns a stream yielding ``marker``; a
+    ``"transient"`` connection raises `TransientRpcError`; any other
+    outcome raises a non-transient `RpcError`.
+    """
+    connection = mocker.MagicMock(spec=WorkerConnection)
+    if outcome == "success":
+
+        async def _dispatch(task, *, timeout=None, _marker=marker):
+            async def _stream():
+                yield _marker
+
+            return _stream()
+
+        connection.dispatch = _dispatch
+    elif outcome == "transient":
+        connection.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
+    else:
+        connection.dispatch = mocker.AsyncMock(side_effect=RpcError())
+    return connection
+
+
+class _GatedDiscovery:
+    """Discovery stream yielding initial events, then gated deferred events.
+
+    Yields ``initial`` immediately, waits for ``gate`` to be set, then
+    yields ``deferred`` — landing a discovery event deterministically in
+    the middle of an in-flight dispatch.
+    """
+
+    def __init__(self, initial, deferred, gate):
+        self._initial = list(initial)
+        self._deferred = list(deferred)
+        self._gate = gate
+
+    def __aiter__(self):
+        return self._events()
+
+    async def _events(self):
+        for event in self._initial:
+            yield event
+        await self._gate.wait()
+        for event in self._deferred:
+            yield event
+
+
+class TestWorkerProxyDispatchRetryEviction:
+    """Tests for the proxy-owned dispatch-retry-evict loop.
+
+    Each test drives the public `dispatch()` API against a delegating
+    balancer, seeding the worker pool through the public discovery flow.
+    The proxy owns the dispatch loop — it calls `WorkerConnection.dispatch`
+    on each candidate, evicts workers on non-transient errors, reports
+    outcomes back to the balancer, and surfaces `NoWorkersAvailable` when
+    candidates are exhausted. The tests verify each branch of that loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_forwards_task_to_delegate(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test the proxy forwards the routed task to the balancer.
+
+        Given:
+            A delegating balancer with one worker that records the task
+            its ``delegate`` receives
+        When:
+            dispatch() is called with a task
+        Then:
+            The balancer's ``delegate`` should receive the same task
+            object the caller passed to dispatch()
+        """
+        # Arrange
+        routed_tasks: list = []
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
+
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[success_connection],
+            loadbalancer=make_delegating_balancer(
+                on_task=lambda task: routed_tasks.append(task)
+            ),
+            mocker=mocker,
+        )
+
+        # Act
+        result_stream = await proxy.dispatch(mock_wool_task)
+        results = [r async for r in result_stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert routed_tasks == [mock_wool_task]
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_transient_error(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test transient errors skip to the next candidate without eviction.
+
+        Given:
+            A delegating balancer with two workers; the first worker's
+            connection raises ``TransientRpcError``, the second succeeds
+        When:
+            dispatch() is called
+        Then:
+            The proxy yields the first candidate, observes the transient
+            error, calls athrow to get the next candidate, dispatches
+            successfully, and the first worker is NOT evicted from the
+            context.
+        """
+        # Arrange
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
+
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=[failing_connection, success_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act
+        result_stream = await proxy.dispatch(mock_wool_task)
+        results = [r async for r in result_stream]
+
+        # Assert
+        assert results == ["ok"]
+        # Transient errors do NOT evict workers.
+        assert metadata_list[0] in proxy.workers
+        assert metadata_list[1] in proxy.workers
+        # The success stream was handed off (exactly one created).
+        assert len(success_streams) == 1
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_non_transient_error(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test non-transient errors evict the worker before retry.
+
+        Given:
+            A delegating balancer with two workers; the first worker's
+            connection raises a non-transient ``RpcError``, the second
+            succeeds
+        When:
+            dispatch() is called
+        Then:
+            The first worker is removed from ``proxy.workers`` before
+            the balancer is notified via athrow, and the proxy
+            eventually dispatches to the second worker.
+        """
+        # Arrange
+        observed_workers_during_athrow: list[list[WorkerMetadata]] = []
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(side_effect=RpcError())
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
+
+        proxy, metadata_list = await _make_proxy_with_workers(
+            connections=[failing_connection, success_connection],
+            loadbalancer=make_delegating_balancer(
+                on_throw=lambda exception, context: (
+                    observed_workers_during_athrow.append(
+                        [m for m, _ in context.workers.values()]
+                    )
+                )
+            ),
+            mocker=mocker,
+        )
+
+        # Act
+        result_stream = await proxy.dispatch(mock_wool_task)
+        results = [r async for r in result_stream]
+
+        # Assert
+        assert results == ["ok"]
+        # Non-transient error evicted the failing worker.
+        assert metadata_list[0] not in proxy.workers
+        assert metadata_list[1] in proxy.workers
+        # The balancer observed the post-eviction context when reacting
+        # to athrow — only the healthy worker remained visible.
+        assert len(observed_workers_during_athrow) == 1
+        assert observed_workers_during_athrow[0] == [metadata_list[1]]
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_non_rpc_error(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test non-RpcError faults propagate without evicting the worker.
+
+        Given:
+            A delegating balancer with one worker whose connection
+            raises a non-``RpcError`` exception — a fault unrelated to
+            worker health, such as a caller-side ``ValueError``
+        When:
+            dispatch() is called
+        Then:
+            The exception propagates to the caller unwrapped and the
+            worker is left in ``proxy.workers``; only ``RpcError`` is
+            treated as a worker-health signal warranting eviction.
+        """
+        # Arrange
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(side_effect=ValueError("boom"))
+
+        proxy, [metadata] = await _make_proxy_with_workers(
+            connections=[failing_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act & assert
+        with pytest.raises(ValueError, match="boom"):
+            await proxy.dispatch(mock_wool_task)
+        # Not a worker-health signal: the worker was NOT evicted.
+        assert metadata in proxy.workers
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_empty_delegate(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test the initial anext exhaustion path.
+
+        Given:
+            A delegating balancer whose generator produces zero
+            candidates (empty ``delegate``)
+        When:
+            dispatch() is called with a seeded context
+        Then:
+            NoWorkersAvailable is raised via the initial-anext path.
+        """
+
+        # Arrange
+        class EmptyBalancer:
+            async def delegate(self, task, *, context):
+                if False:
+                    yield  # pragma: no cover
+
+        dummy_connection = mocker.MagicMock(spec=WorkerConnection)
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[dummy_connection],
+            loadbalancer=EmptyBalancer(),
+            mocker=mocker,
+        )
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable):
+            await proxy.dispatch(mock_wool_task)
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_non_transient_exhaustion(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test the non-transient exhaustion path.
+
+        Given:
+            A delegating balancer with one worker whose connection
+            raises a non-transient error; after athrow the generator
+            has no further candidates
+        When:
+            dispatch() is called
+        Then:
+            NoWorkersAvailable is raised from the non-transient
+            branch, and the failing worker was evicted before the
+            athrow (covering the eviction-then-exhaustion path).
+        """
+        # Arrange
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(side_effect=RpcError())
+
+        proxy, [metadata] = await _make_proxy_with_workers(
+            connections=[failing_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable):
+            await proxy.dispatch(mock_wool_task)
+        # Non-transient error: worker was evicted from the context.
+        assert metadata not in proxy.workers
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_exhausted_candidates(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test exhaustion maps to NoWorkersAvailable.
+
+        Given:
+            A delegating balancer whose generator ends immediately
+            after all candidates fail
+        When:
+            dispatch() is called
+        Then:
+            NoWorkersAvailable is raised.
+        """
+        # Arrange
+        failing_connection = mocker.MagicMock(spec=WorkerConnection)
+        failing_connection.dispatch = mocker.AsyncMock(side_effect=TransientRpcError())
+
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[failing_connection],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+        )
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable):
+            await proxy.dispatch(mock_wool_task)
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_evicted_checkpoint_and_transient_survivors(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test dispatch ends when the checkpoint worker is evicted.
+
+        Given:
+            A real RoundRobinLoadBalancer over three workers where the
+            first-tried (checkpoint) worker fails non-transiently and is
+            evicted, while both survivors fail transiently on every
+            attempt
+        When:
+            dispatch() is awaited under a short timeout
+        Then:
+            It should raise NoWorkersAvailable rather than spin forever,
+            because the balancer reseeds its cycle boundary when the
+            checkpoint worker leaves the pool.
+        """
+
+        # Arrange
+        def _slow_transient_connection():
+            connection = mocker.MagicMock(spec=WorkerConnection)
+
+            async def _dispatch(task, *, timeout=None):
+                # Yield to the loop so wait_for can fire — a regression
+                # surfaces as TimeoutError, never a suite hang.
+                await asyncio.sleep(0)
+                raise TransientRpcError()
+
+            connection.dispatch = _dispatch
+            return connection
+
+        checkpoint_connection = mocker.MagicMock(spec=WorkerConnection)
+        checkpoint_connection.dispatch = mocker.AsyncMock(side_effect=RpcError())
+        proxy, [checkpoint, _, _] = await _make_proxy_with_workers(
+            connections=[
+                checkpoint_connection,
+                _slow_transient_connection(),
+                _slow_transient_connection(),
+            ],
+            loadbalancer=wp.RoundRobinLoadBalancer,
+            mocker=mocker,
+        )
+
+        # Act & assert
+        with pytest.raises(NoWorkersAvailable):
+            await asyncio.wait_for(proxy.dispatch(mock_wool_task), timeout=2)
+        assert checkpoint not in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_success(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test the proxy reports success to the balancer via asend.
+
+        Given:
+            A delegating balancer that records sent values
+        When:
+            dispatch() succeeds
+        Then:
+            The balancer observed a sent value equal to the uid of the
+            successful worker — the candidate it yielded, echoed back —
+            and the generator terminated.
+        """
+        # Arrange
+        sent_values: list = []
+        success_streams: list = []
+        conn = _make_success_connection(mocker, success_streams)
+
+        proxy, [metadata] = await _make_proxy_with_workers(
+            connections=[conn],
+            loadbalancer=make_delegating_balancer(
+                on_success=lambda sent: sent_values.append(sent)
+            ),
+            mocker=mocker,
+        )
+
+        # Act
+        stream = await proxy.dispatch(mock_wool_task)
+        await stream.aclose()
+
+        # Assert
+        assert sent_values == [metadata.uid]
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_post_success_yield(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test post-asend yield is a loud protocol violation.
+
+        Given:
+            A malformed delegating balancer whose generator yields
+            another candidate after receiving a success signal via
+            asend
+        When:
+            dispatch() is called
+        Then:
+            RuntimeError is raised naming the trailing value, and the
+            orphaned gRPC stream is closed (its aclose was called).
+        """
+        # Arrange
+        sentinel_uid = uuid.uuid4()
+
+        class MalformedBalancer:
+            async def delegate(self, task, *, context):
+                uids = list(context.workers)
+                if not uids:
+                    return
+                _ = yield uids[0]
+                # Contract violation: yield again after asend.
+                yield sentinel_uid
+
+        stream_close_calls: list[bool] = []
+        spy_stream = SpyStream(["ok"], on_close=lambda: stream_close_calls.append(True))
+        conn = mocker.MagicMock(spec=WorkerConnection)
+
+        async def _dispatch(task, *, timeout=None):
+            return spy_stream
+
+        conn.dispatch = _dispatch
+
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[conn],
+            loadbalancer=MalformedBalancer(),
+            mocker=mocker,
+        )
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="after receiving a success signal"):
+            await proxy.dispatch(mock_wool_task)
+        assert stream_close_calls == [True]
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_cancellation_during_connection_dispatch(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test cancellation during connection.dispatch propagates cleanly.
+
+        Given:
+            A delegating balancer with one worker whose
+            ``connection.dispatch`` awaits indefinitely
+        When:
+            The outer dispatch task is cancelled mid-dispatch
+        Then:
+            CancelledError propagates to the caller, the worker is
+            NOT evicted, and the balancer yielded only one candidate
+            (no retry against another candidate).
+        """
+        # Arrange
+        yielded_candidates: list = []
+        conn = mocker.MagicMock(spec=WorkerConnection)
+
+        async def _hang(task, *, timeout=None):
+            await asyncio.sleep(10)
+
+        conn.dispatch = _hang
+
+        proxy, [metadata] = await _make_proxy_with_workers(
+            connections=[conn],
+            loadbalancer=make_delegating_balancer(
+                on_yield=lambda metadata: yielded_candidates.append(metadata)
+            ),
+            mocker=mocker,
+        )
+
+        # Act
+        dispatch_task = asyncio.create_task(proxy.dispatch(mock_wool_task))
+        await asyncio.sleep(0.01)  # let the dispatch enter connection.dispatch
+        dispatch_task.cancel()
+
+        # Assert
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch_task
+        # Worker was not evicted.
+        assert metadata in proxy.workers
+        # Exactly one candidate was yielded — no retry on cancellation.
+        assert len(yielded_candidates) == 1
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_cancellation_during_asend(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test cancellation mid-asend closes the orphaned stream.
+
+        Given:
+            A delegating balancer whose ``asend`` branch hangs (via an
+            awaitable inside the generator body) and one worker whose
+            connection returns a spy stream
+        When:
+            The outer dispatch is cancelled while the balancer is
+            processing the success signal
+        Then:
+            The spy stream's aclose was invoked so the underlying gRPC
+            call is released, and CancelledError propagates.
+        """
+        # Arrange — the success hook blocks, simulating slow bookkeeping.
+        hang = asyncio.Event()
+        stream_close_calls: list[bool] = []
+        spy_stream = SpyStream(on_close=lambda: stream_close_calls.append(True))
+        conn = mocker.MagicMock(spec=WorkerConnection)
+
+        async def _dispatch(task, *, timeout=None):
+            return spy_stream
+
+        conn.dispatch = _dispatch
+
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[conn],
+            loadbalancer=make_delegating_balancer(on_success=lambda sent: hang.wait()),
+            mocker=mocker,
+        )
+
+        # Act
+        dispatch_task = asyncio.create_task(proxy.dispatch(mock_wool_task))
+        await asyncio.sleep(0.01)  # let dispatch reach the asend hang
+        dispatch_task.cancel()
+
+        # Assert
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch_task
+        assert stream_close_calls == [True]
+        await proxy.stop()
+
+    @settings(
+        max_examples=30,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        outcomes=st.lists(st.sampled_from(_DISPATCH_OUTCOMES), min_size=1, max_size=5)
+    )
+    def test_dispatch_with_arbitrary_outcome_sequence(
+        self, outcomes, mock_proxy_session, mock_wool_task, mocker: MockerFixture
+    ):
+        """Test the retry/evict loop over an arbitrary per-worker outcome run.
+
+        Given:
+            A delegating balancer over N workers whose connections each
+            resolve to a drawn outcome — a success, a transient
+            ``TransientRpcError``, or a non-transient ``RpcError``.
+        When:
+            dispatch() drives the candidates in order.
+        Then:
+            It should return the first success (else raise
+            NoWorkersAvailable), evict exactly the non-transient failures
+            it attempted, and leave every transient-failing worker in
+            place.
+        """
+
+        async def _scenario() -> None:
+            # Arrange
+            connections = [
+                _make_outcome_connection(outcome, index, mocker)
+                for index, outcome in enumerate(outcomes)
+            ]
+            proxy, metadata_list = await _make_proxy_with_workers(
+                connections=connections,
+                loadbalancer=make_delegating_balancer(),
+                mocker=mocker,
+            )
+            first_success = next(
+                (i for i, o in enumerate(outcomes) if o == "success"), None
+            )
+            attempted = (
+                range(len(outcomes))
+                if first_success is None
+                else range(first_success + 1)
+            )
+            evicted = {
+                metadata_list[i] for i in attempted if outcomes[i] == "non_transient"
+            }
+            surviving = set(metadata_list) - evicted
+
+            # Act & assert
+            try:
+                if first_success is None:
+                    with pytest.raises(NoWorkersAvailable):
+                        await proxy.dispatch(mock_wool_task)
+                else:
+                    stream = await proxy.dispatch(mock_wool_task)
+                    results = [item async for item in stream]
+                    assert results == [first_success]
+                assert set(proxy.workers) == surviving
+                for index, outcome in enumerate(outcomes):
+                    if outcome == "transient":
+                        assert metadata_list[index] in proxy.workers
+            finally:
+                await proxy.stop()
+
+        asyncio.run(_scenario())
+
+    @pytest.mark.asyncio
+    async def test_start_with_delegating_balancer(
+        self, mock_discovery_service, mock_proxy_session
+    ):
+        """Test starting a delegating balancer emits no deprecation warning.
+
+        Given:
+            A proxy configured with a delegating balancer that implements
+            the ``delegate`` protocol.
+        When:
+            The proxy is started.
+        Then:
+            It should emit no DeprecationWarning — the delegating protocol
+            is the supported, non-deprecated path.
+        """
+        # Arrange
+        proxy = WorkerProxy(
+            discovery=mock_discovery_service,
+            loadbalancer=make_delegating_balancer(),
+            lazy=False,
+            quorum=0,
+        )
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await proxy.start()
+
+        # Assert
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert deprecations == []
+        await proxy.stop()
+
+
+class TestWorkerProxyDispatchingBalancerBackcompat:
+    """Tests for the deprecated `DispatchingLoadBalancerLike` dispatch path.
+
+    A balancer that implements only the legacy ``dispatch`` method keeps
+    working: the proxy delegates dispatch to it and warns once that the
+    protocol is deprecated.
+    """
+
+    @pytest.mark.asyncio
+    async def test_init_with_dispatching_balancer_instance(
+        self, mock_discovery_service, mock_proxy_session
+    ):
+        """Test constructing with a legacy balancer instance warns once.
+
+        Given:
+            A load balancer instance implementing only the legacy
+            ``dispatch`` method (a `DispatchingLoadBalancerLike`)
+        When:
+            The proxy is constructed and then started
+        Then:
+            It should emit exactly one deprecation warning, at
+            construction, and starting should not warn a second time
+        """
+        # Arrange
+        loadbalancer = make_dispatching_balancer()
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            proxy = WorkerProxy(
+                discovery=mock_discovery_service,
+                loadbalancer=loadbalancer,
+                lazy=False,
+                quorum=0,
+            )
+            warned_at_construction = _dispatch_deprecations(caught)
+            await proxy.start()
+
+        # Assert
+        assert len(warned_at_construction) == 1
+        assert len(_dispatch_deprecations(caught)) == 1
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_with_dispatching_balancer_factory(
+        self, mock_discovery_service, mock_proxy_session
+    ):
+        """Test a legacy balancer factory warns at start().
+
+        Given:
+            A factory returning a load balancer that implements only the
+            legacy ``dispatch`` method (a `DispatchingLoadBalancerLike`)
+        When:
+            The proxy is constructed and then started
+        Then:
+            It should not warn at construction — the factory is opaque —
+            and emit exactly one deprecation warning when start() resolves
+            it to the legacy instance
+        """
+
+        # Arrange
+        def factory():
+            return make_dispatching_balancer()
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            proxy = WorkerProxy(
+                discovery=mock_discovery_service,
+                loadbalancer=factory,
+                lazy=False,
+                quorum=0,
+            )
+            warned_at_construction = _dispatch_deprecations(caught)
+            await proxy.start()
+
+        # Assert
+        assert warned_at_construction == []
+        assert len(_dispatch_deprecations(caught)) == 1
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_dispatching_balancer(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test the legacy dispatch path is still functional.
+
+        Given:
+            A started proxy with a legacy `DispatchingLoadBalancerLike`
+        When:
+            dispatch() is called
+        Then:
+            The legacy ``dispatch`` method is invoked and its stream
+            is returned to the caller.
+        """
+        # Arrange
+        dispatched_tasks: list = []
+        loadbalancer = make_dispatching_balancer(
+            marker="legacy-ok",
+            on_dispatch=lambda task: dispatched_tasks.append(task),
+        )
+
+        dummy_connection = mocker.MagicMock(spec=WorkerConnection)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            proxy, _ = await _make_proxy_with_workers(
+                connections=[dummy_connection],
+                loadbalancer=loadbalancer,
+                mocker=mocker,
+            )
+
+        # Act
+        stream = await proxy.dispatch(mock_wool_task)
+        results = [r async for r in stream]
+
+        # Assert
+        assert results == ["legacy-ok"]
+        assert len(dispatched_tasks) == 1
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_dual_protocol_balancer(
+        self,
+        mock_proxy_session,
+        mock_wool_task,
+        mocker: MockerFixture,
+    ):
+        """Test a balancer implementing both protocols uses delegate.
+
+        Given:
+            A balancer implementing both the ``delegate`` and the legacy
+            ``dispatch`` methods, seeded with one worker
+        When:
+            The proxy is constructed, started, and dispatch() is called
+        Then:
+            It should route through ``delegate`` — surfacing the delegate
+            path's result, not the ``dispatch`` result — and emit no
+            deprecation warning, because the non-deprecated path is used
+        """
+
+        # Arrange
+        class DualBalancer:
+            async def delegate(self, task, *, context):
+                for uid in list(context.workers):
+                    sent = yield uid
+                    if sent is not None:
+                        return
+
+            async def dispatch(self, task, *, context, timeout=None):
+                async def _stream():
+                    yield "legacy-ok"
+
+                return _stream()
+
+        success_streams: list = []
+        success_connection = _make_success_connection(mocker, success_streams)
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            proxy, _ = await _make_proxy_with_workers(
+                connections=[success_connection],
+                loadbalancer=DualBalancer(),
+                mocker=mocker,
+            )
+            result_stream = await proxy.dispatch(mock_wool_task)
+            results = [r async for r in result_stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert _dispatch_deprecations(caught) == []
+        await proxy.stop()

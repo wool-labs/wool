@@ -8,6 +8,8 @@ from typing import Final
 import grpc.aio
 
 from wool import protocol
+from wool.runtime.typing import Undefined
+from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
@@ -82,6 +84,10 @@ class LocalWorker(Worker):
         gRPC ``RESOURCE_EXHAUSTED``, causing the load balancer to
         skip to the next worker. ``None`` (default) accepts all
         tasks unconditionally.
+    :param daemon:
+        Whether the worker subprocess is daemonic. Forwarded to
+        `WorkerProcess`, which owns the default and the per-value
+        semantics; omit to accept that default.
     :param extra:
         Additional metadata as key-value pairs.
     """
@@ -99,6 +105,7 @@ class LocalWorker(Worker):
         credentials: WorkerCredentials | None = None,
         options: WorkerOptions | None = None,
         backpressure: BackpressureLike | None = None,
+        daemon: bool | None | UndefinedType = Undefined,
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
@@ -114,6 +121,7 @@ class LocalWorker(Worker):
             tags=frozenset(self._tags),
             extra=self._extra,
             backpressure=backpressure,
+            **({} if daemon is Undefined else {"daemon": daemon}),
         )
 
     @property

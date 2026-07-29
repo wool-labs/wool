@@ -93,6 +93,11 @@ asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--cov --cov-config=.coveragerc"
 pythonpath = ["."]
+# Dump every thread's stack (non-fatally) when a single test exceeds
+# this bound, so a hang self-diagnoses in the log instead of stalling
+# CI silently until the job is killed. Set well above the slowest
+# legitimate test (the Hypothesis dispatch exploration, ~2-3 minutes).
+faulthandler_timeout = 300
 markers = [
     "integration: end-to-end integration tests against real WorkerPool",
     "stdlib_parity: stdlib contextvars propagation parity pins",
