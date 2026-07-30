@@ -256,6 +256,7 @@ class _HandshakeWarningThrottle:
         self._throttle.discard(uid)
 
 
+# public
 class WorkerProxy:
     """Client-side proxy for dispatching tasks to distributed workers.
 

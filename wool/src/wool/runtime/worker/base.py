@@ -307,6 +307,7 @@ class WorkerLike(Protocol):
         ...
 
 
+# public
 class Worker(ABC):
     """Abstract base class for worker implementations.
 

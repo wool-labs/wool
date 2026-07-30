@@ -53,9 +53,11 @@ from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import BoundWorkerFactory
+from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
+from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
@@ -113,6 +115,7 @@ __all__ = [
     "BoundWorkerFactory",
     "ChainContention",
     "ChainSerializationError",
+    "ChannelOptions",
     "Context",
     "ContextVar",
     "ContextVarCollision",
@@ -139,13 +142,14 @@ __all__ = [
     "LoopbackAdvertisementWarning",
     "NoWorkersAvailable",
     "PredicateFunction",
+    "Refreshing",
     "RoundRobinLoadBalancer",
     "RpcError",
     "RuntimeContext",
     "SerializationError",
     "SerializationWarning",
-    "SlowCredentialResolutionWarning",
     "Serializer",
+    "SlowCredentialResolutionWarning",
     "Task",
     "TaskException",
     "TaskFactoryDisplaced",
@@ -160,10 +164,10 @@ __all__ = [
     "WorkerConnection",
     "WorkerCredentials",
     "WorkerCredentialsProvider",
-    "Refreshing",
     "WorkerFactory",
     "WorkerLike",
     "WorkerMetadata",
+    "WorkerOptions",
     "WorkerPool",
     "WorkerProxy",
     "WorkerService",
