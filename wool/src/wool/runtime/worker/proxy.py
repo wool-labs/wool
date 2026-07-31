@@ -70,7 +70,7 @@ def parse_version(version: str) -> Version | None:
     :param version:
         A version string (e.g. ``"1.2.3"``).
     :returns:
-        A :class:`~packaging.version.Version` instance, or
+        A `~packaging.version.Version` instance, or
         ``None`` if unparsable.
     """
     try:
@@ -133,7 +133,7 @@ DEFAULT_QUORUM: Final[int] = 1
 
 DEFAULT_QUORUM_TIMEOUT: Final[float] = 60.0
 """Default seconds to wait for ``quorum`` workers before raising
-:class:`asyncio.TimeoutError`."""
+`asyncio.TimeoutError`."""
 
 DEFAULT_LAZY: Final[bool] = True
 """Default lazy-start behavior: defer discovery setup and the quorum wait to
@@ -151,9 +151,9 @@ class IneffectiveQuorumTimeoutWarning(WoolWarning):
 
     The timeout value is recorded on the proxy but never consulted —
     no quorum wait runs when the gate is disabled.  Filter this category
-    to ``"error"`` (via :func:`warnings.filterwarnings`) to enforce the
+    to ``"error"`` (via `warnings.filterwarnings`) to enforce the
     previous strict behaviour and turn the warning back into a
-    :class:`ValueError`.
+    `ValueError`.
     """
 
 
@@ -166,7 +166,7 @@ def _restore_proxy(
     quorum: int | None = DEFAULT_QUORUM,
     quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
 ) -> WorkerProxy:
-    """Reconstruct a :class:`WorkerProxy` from its reduce tuple.
+    """Reconstruct a `WorkerProxy` from its reduce tuple.
 
     Module-level so the reduce tuple references a stable callable rather
     than a freshly created closure on every reduction.  New parameters
@@ -192,12 +192,12 @@ def _restore_proxy(
         preserve their pre-quorum "wait for any worker" semantics.
     :param quorum_timeout:
         Seconds to wait for ``quorum`` workers before raising
-        :class:`asyncio.TimeoutError`.  Recorded but never consulted
+        `asyncio.TimeoutError`.  Recorded but never consulted
         when ``quorum`` is ``None`` or ``0``.  Defaults to ``60`` for
         back-compat with reduce tuples emitted by clients that
         predate this parameter.
     :returns:
-        A reconstructed :class:`WorkerProxy` with the original id.
+        A reconstructed `WorkerProxy` with the original id.
     """
     if quorum:
         proxy = WorkerProxy(
@@ -694,7 +694,7 @@ class WorkerProxy:
         context.
 
         WorkerProxy is guarded against vanilla pickling (see
-        :meth:`__reduce_ex__`); this method is invoked only by Wool's own
+        `__reduce_ex__`); this method is invoked only by Wool's own
         pickler.
 
         :returns:
@@ -735,13 +735,13 @@ class WorkerProxy:
         WorkerProxy carries credentials that are resolved from the active
         credential context at construction and intentionally not
         transported across process boundaries.  Allowing vanilla
-        :func:`pickle.dumps` or :func:`cloudpickle.dumps` would silently
+        `pickle.dumps` or `cloudpickle.dumps` would silently
         produce payloads that deserialize into nonsense outside the
         dispatch path.  Wool's own pickler consults ``reducer_override``
         (and therefore ``__wool_reduce__``) before ``__reduce_ex__``, so
         this guard is invisible to Wool's own serialization.
 
-        :func:`copy.copy` and :func:`copy.deepcopy` also route through
+        `copy.copy` and `copy.deepcopy` also route through
         ``__reduce_ex__`` and are rejected for the same reason — a
         runtime-bound proxy has no meaningful copy semantics.
 
@@ -797,8 +797,8 @@ class WorkerProxy:
 
         Sets this proxy as the active context variable.  When
         ``lazy=True``, defers resource acquisition until
-        :meth:`dispatch` is first called.  When ``lazy=False``,
-        calls :meth:`start` eagerly.
+        `dispatch` is first called.  When ``lazy=False``,
+        calls `start` eagerly.
 
         :raises RuntimeError:
             If the proxy has already been entered.  ``WorkerProxy``
@@ -901,11 +901,11 @@ class WorkerProxy:
     async def _teardown_sentinel(self) -> None:
         """Cancel the sentinel task and null all partial-init attributes.
 
-        Idempotent rollback callback used by :meth:`start`'s
-        :class:`AsyncExitStack` and reused by :meth:`stop`.  Cancels
+        Idempotent rollback callback used by `start`'s
+        `~contextlib.AsyncExitStack` and reused by `stop`.  Cancels
         ``_sentinel_task`` (if any), awaits its termination swallowing
         ``CancelledError``, and resets every attribute populated by
-        :meth:`start` to ``None`` so a failed start leaves no stale
+        `start` to ``None`` so a failed start leaves no stale
         references.
         """
         if self._sentinel_task:
@@ -927,7 +927,7 @@ class WorkerProxy:
         """Exit the proxy context.
 
         Resets the context variable.  If the proxy was started,
-        delegates to :meth:`stop` to release resources.  Calling
+        delegates to `stop` to release resources.  Calling
         ``exit()`` on an un-started lazy proxy is a safe no-op.
 
         :raises RuntimeError:
@@ -949,7 +949,7 @@ class WorkerProxy:
         Teardown runs in reverse-acquisition order: sentinel first
         (so it stops reading from the discovery stream), then
         discovery, then load balancer.  All three are guaranteed to
-        run via :class:`AsyncExitStack` even if an earlier teardown
+        run via `~contextlib.AsyncExitStack` even if an earlier teardown
         raises.
 
         :raises RuntimeError:
@@ -1250,7 +1250,7 @@ class WorkerProxy:
         """Block until at least ``quorum`` workers are admitted.
 
         Waits on the workers-changed event set by
-        :meth:`_worker_sentinel` after each add or drop, re-checking
+        `_worker_sentinel` after each add or drop, re-checking
         the worker count after each wakeup.  The caller is expected
         to gate this call on ``self._quorum`` being a positive
         integer; calling with ``quorum`` of ``None`` or ``0`` will

@@ -21,7 +21,7 @@ class Resource(Generic[T]):
     released again.
 
     :param pool:
-        The :class:`ResourcePool` this resource belongs to.
+        The `ResourcePool` this resource belongs to.
     :param key:
         The cache key for this resource.
     """
@@ -198,7 +198,7 @@ class ResourcePool(Generic[T]):
             when not concurrently modifying the cache.
 
         :returns:
-            :class:`ResourcePool.Stats` containing current statistics.
+            `ResourcePool.Stats` containing current statistics.
         """
         return self.Stats(
             total_entries=len(self._cache),
@@ -234,7 +234,7 @@ class ResourcePool(Generic[T]):
         :param key:
             The cache key.
         :returns:
-            :class:`Resource` that can be awaited or used with 'async with'.
+            `Resource` that can be awaited or used with 'async with'.
         """
         return Resource(self, key)
 
