@@ -327,6 +327,10 @@ Wool ships with two discovery protocols:
 
 Custom discovery protocols are supported via structural subtyping — implement the `DiscoveryLike` protocol and pass it to `WorkerPool`.
 
+### Discovery is an untrusted hint
+
+Discovery is **not** an authenticated channel: a worker self-advertises its `WorkerMetadata` (including the `secure` flag) over the discovery plane, and no built-in protocol authenticates those advertisements. The advertised `secure` flag gates transport *compatibility*, not trust — trust is established solely by the mTLS handshake performed when a connection is made. See the worker package's [_Security → Discovery-plane trust_](src/wool/runtime/worker/README.md#discovery-plane-trust) note for the full narrative.
+
 ## Load balancing
 
 The load balancer decides which worker handles each dispatched task. The `WorkerProxy` maintains a load balancer and a context of discovered workers with gRPC connections. It waits for at least one worker to become available, then the load balancer selects one.
@@ -343,6 +347,8 @@ async with wool.WorkerPool(spawn=4, loadbalancer=my_balancer):
 ### Transient vs. non-transient errors
 
 Transient errors are the gRPC status codes `UNAVAILABLE`, `DEADLINE_EXCEEDED`, and `RESOURCE_EXHAUSTED` — temporary conditions that may resolve on retry to the same or another worker. Non-transient errors are all other gRPC failures (e.g., `INVALID_ARGUMENT`, `PERMISSION_DENIED`) indicating persistent problems. The load balancer skips transient-error workers but evicts non-transient-error workers from the pool.
+
+A failure carrying TLS/mTLS or peer-authentication evidence — `UNAUTHENTICATED`, or `UNAVAILABLE` whose error text names TLS — is carved out of that split: it surfaces as `HandshakeError`, a `TransientRpcError`, and is skipped without eviction so the worker can recover when credentials rotate out of band. See [Error handling → gRPC handshake](#grpc-handshake).
 
 ### Self-describing worker connections
 
@@ -412,11 +418,15 @@ async with wool.WorkerPool(spawn=4, credentials=creds):
 
 With mutual TLS (`mutual=True`), the server requires client authentication — both sides present and verify certificates signed by the same CA. With one-way TLS (`mutual=False`), the server presents its certificate for the client to verify, but the client remains anonymous at the transport layer. The `mutual` flag controls `require_client_auth` on the server and whether the client includes its key and cert when opening the channel.
 
+### Identity-based verification and rotation
+
+Platforms that assign a worker's address at startup and rotate credentials out of band (Kubernetes, ECS/Fargate) defeat a fixed credential snapshot, which can only be verified against the address it was dialed at. For those, supply a **credential provider** anywhere `credentials=` is accepted: `WorkerCredentials.from_files(...).as_provider(identity=...)` adapts fixed material, while `WorkerCredentialsProvider(factory, identity=..., reloadable=True)` wraps any callable returning the current `WorkerCredentials`, so long-running workers and pools adopt rotated material without a restart. See [`src/wool/runtime/worker/README.md`](src/wool/runtime/worker/README.md#credential-providers-identity-and-rotation) for the identity-verification and rotation mechanics.
+
 ### Discovery security filtering
 
-Each `WorkerMetadata` carries a `secure` boolean flag set at startup based on whether the worker was given credentials. The `WorkerProxy` applies a security filter to discovery events: a proxy with credentials only accepts workers with `secure=True`, and a proxy without credentials only accepts workers with `secure=False`. This prevents secure proxies from connecting to insecure workers and vice versa, but does not guard against incompatible credentials between two secure peers (e.g., certificates signed by different CAs).
+Each `WorkerMetadata` carries a `secure` boolean flag set at startup based on whether the worker was given credentials. The `WorkerProxy` applies a security filter to discovery events: a proxy with credentials only accepts workers with `secure=True`, and a proxy without credentials only accepts workers with `secure=False`. This prevents secure proxies from connecting to insecure workers and vice versa, but does not by itself guard against incompatible credentials between two secure peers (e.g., certificates signed by different CAs) — that case is caught at the handshake.
 
-If a TLS handshake fails (e.g., incompatible, invalid, or expired certificates), gRPC surfaces it as an `RpcError`. The `WorkerConnection` classifies the error by status code using the same transient/non-transient logic as any other gRPC failure — there is no TLS-specific error handling path.
+Credentials that this client's own verification rejects — a worker signed by an untrusted authority, presenting an unexpected identity, or expired — surface as a `HandshakeError`; see [Error handling → gRPC handshake](#grpc-handshake) for how that classifies and what the load balancer does with it. The opposite direction, a worker rejecting this client's certificate, is not observable client-side and surfaces as an ordinary transport failure — see `HandshakeError` for why.
 
 ## Error handling
 
@@ -425,10 +435,10 @@ A dispatch crosses two processes and several stages on each side; failures can o
 | Phase | Wool-internal failure → caller sees | User-code failure → caller sees | Load balancer action |
 | ----- | ----------------------------------- | ------------------------------- | -------------------- |
 | Caller-side request encoding | n/a (no transport involved yet) | Original `Exception` (unwrapped) | None — no worker contacted |
-| gRPC handshake | `TransientRpcError` (transient codes) or `RpcError` (non-transient, incl. `FAILED_PRECONDITION` for version mismatch) | n/a | Skip on transient; evict on non-transient |
-| Worker-side request decoding | `Rejected.original` re-raised on the caller (typed) | Strict-mode `wool.ContextSerializationError` re-raised on the caller | None — typed re-raise |
-| Routine execution | n/a | Original routine exception (type and traceback preserved); ancillary `wool.ContextSerializationError` chained on `__cause__` | None |
-| Worker-side response encoding | Routine exception chained from strict-mode `wool.ContextSerializationError` via `__cause__` | n/a | None |
+| gRPC handshake | `TransientRpcError` (transient codes), `HandshakeError` (a `TransientRpcError`, on handshake evidence), or `RpcError` (non-transient, incl. `FAILED_PRECONDITION` for version mismatch) | n/a | Skip on transient; skip without eviction and log a rate-limited warning on `HandshakeError`; evict on non-transient |
+| Worker-side request decoding | `Rejected.original` re-raised on the caller (typed) | Strict-mode `wool.ChainSerializationError` re-raised on the caller | None — typed re-raise |
+| Routine execution | n/a | Original routine exception (type and traceback preserved); ancillary `wool.ChainSerializationError` chained on `__cause__` | None |
+| Worker-side response encoding | Routine exception chained from strict-mode `wool.ChainSerializationError` via `__cause__` | n/a | None |
 | Caller-side response decoding | `UnexpectedResponse` (malformed payload, missing class, version skew) | n/a | None — caller-fault, worker is healthy |
 | Post-execution teardown | Swallowed (the wire is already closed) | n/a | n/a |
 
@@ -450,6 +460,7 @@ Before dispatch, the caller's `WorkerConnection` serializes the routine callable
 The handshake opens the bidirectional stream, writes the task frame, and reads the first response. Failures classify by gRPC status code:
 
 - **Transient** (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`) — surfaces as `TransientRpcError`. The load balancer skips to the next worker. `NoWorkersAvailable` is raised if a full cycle of all workers is exhausted without success.
+- **Handshake/authentication** (`UNAUTHENTICATED`, or `UNAVAILABLE` carrying TLS evidence) — surfaces as `HandshakeError` (a `TransientRpcError`). The proxy skips the worker without eviction and logs a rate-limited warning; a pool that drains entirely on handshake failures raises the plain `NoWorkersAvailable`, so a fleet-wide credential misconfiguration is diagnosed from the warnings rather than from the raised exception. See `HandshakeError` for the classification, recoverability, and logging contract.
 - **Non-transient** (everything else, including `FAILED_PRECONDITION` for protocol-version mismatch and `INTERNAL` for handler-side bugs) — surfaces as `RpcError`. The load balancer evicts the worker from its context.
 
 Version compatibility is checked by `VersionInterceptor` **before** the dispatch handler runs. A mismatch aborts the RPC with `FAILED_PRECONDITION`; the caller observes `RpcError(FAILED_PRECONDITION)` like any other handshake rejection. (The `Nack` frame retains its in-stream role only for parse-phase rejections — see the next section.)
@@ -461,7 +472,7 @@ Version compatibility is checked by `VersionInterceptor` **before** the dispatch
 Failures here wrap in `Rejected` and surface via a `Nack` frame whose `exception` payload carries the original failure (cloudpickle-dumped). The caller deserializes and re-raises, so the user observes the **actual failure class**, not an opaque RPC error:
 
 - Malformed task id, cloudpickle errors on the routine callable, ImportError on a missing module, non-async callable → original `Exception` re-raised on the caller.
-- Strict-mode promoted `wool.SerializationWarning` (operator set `warnings.filterwarnings("error", category=wool.SerializationWarning)` in the worker subprocess) → the promoted warnings aggregate into a `wool.ContextSerializationError` that ships through the same Nack-with-exception path and re-raises on the caller as `wool.ContextSerializationError`. The default lenient mode emits the warning and runs the routine against a fresh empty context (see Context propagation > Decode failure semantics).
+- Strict-mode promoted `wool.SerializationWarning` (operator set `warnings.filterwarnings("error", category=wool.SerializationWarning)` in the worker subprocess) → the promoted warnings aggregate into a `wool.ChainSerializationError` that ships through the same Nack-with-exception path and re-raises on the caller as `wool.ChainSerializationError`. The default lenient mode emits the warning and runs the routine against a fresh empty context (see Context propagation > Decode failure semantics).
 
 Parse-phase rejections reflect a user-code or version-skew issue, not a worker-health issue. The load balancer does not evict the worker.
 
@@ -480,13 +491,13 @@ If the routine raises an exception that drags an unpicklable object into its gra
 After each successful step, the dispatch handler builds a `protocol.Response`: it dumps the result via `cloudpickle` and attaches the post-step context.
 
 - **Result dump fails** (un-picklable yielded value) — the failure surfaces as a handler-side exception during response encoding. The dispatch handler drains the worker, reads the final wire context published by the worker task via `session._final_wire_context`, and ships a terminal `Response.exception` carrying the encode failure. Caller observes the dump exception; no worker eviction.
-- **Strict-mode context encode failure during a routine exception** — the worker task's final-encode step raised a `wool.ContextSerializationError` aggregating per-var warnings during the terminal-exception path. The handler reads the encode failure from the worker (alongside `session._final_wire_context`) and chains it onto the routine's exception as `__cause__` via `raise routine_exc from encode_err`, so the **routine exception's type is preserved**. The terminal response drops the `context` field. The caller's `except RoutineError:` clause still matches; the encode error remains visible in the traceback through cause chaining.
+- **Strict-mode context encode failure during a routine exception** — the worker task's final-encode step raised a `wool.ChainSerializationError` aggregating per-var warnings during the terminal-exception path. The handler reads the encode failure from the worker (alongside `session._final_wire_context`) and chains it onto the routine's exception as `__cause__` via `raise routine_exc from encode_err`, so the **routine exception's type is preserved**. The terminal response drops the `context` field. The caller's `except RoutineError:` clause still matches; the encode error remains visible in the traceback through cause chaining.
 
 `DispatchSession.__aexit__` registers `drain` on its exit stack precisely because of this path: a result-dump failure mid-stream leaves the worker still running, and drain must complete before the handler reads `session._final_wire_context` for the terminal frame — otherwise the read races the worker task still publishing the final wire context.
 
 ### Caller-side response decoding
 
-The caller's `DispatchStream` parses each response frame in turn. Malformed payloads — typically caused by version skew on a shared result class, a missing class on the caller's `sys.path`, or truncated bytes — degrade to `UnexpectedResponse` with the original pickle/import failure on `__cause__`. The load balancer treats this as caller-fault: the worker is healthy, the wire frame is valid, only the caller cannot reconstruct the payload. No eviction.
+The async iterator `WorkerConnection.dispatch` returns parses each response frame in turn. Malformed payloads — typically caused by version skew on a shared result class, a missing class on the caller's `sys.path`, or truncated bytes — degrade to `UnexpectedResponse` with the original pickle/import failure on `__cause__`. The load balancer treats this as caller-fault: the worker is healthy, the wire frame is valid, only the caller cannot reconstruct the payload. No eviction.
 
 A worker that ships a non-`Exception` `BaseException` payload (other than `CancelledError`, which propagates raw to honor stdlib `await task` semantics) is degraded to `UnexpectedResponse`. This is a worker-bug guard: process-level signals like `KeyboardInterrupt` and `SystemExit` cannot be smuggled across the wire.
 

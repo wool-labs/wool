@@ -1,5 +1,9 @@
 import asyncio
 import logging
+import pickle
+import threading
+from datetime import timedelta
+from pathlib import Path
 from typing import Callable
 from typing import Coroutine
 from uuid import uuid4
@@ -15,12 +19,16 @@ from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 import wool
+from tests.helpers import write_certificate_files
 from wool import protocol
 from wool.runtime.context.exceptions import SerializationWarning
 from wool.runtime.context.var import ContextVar
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
@@ -28,6 +36,39 @@ from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.connection import clear_channel_pool
 
 from .conftest import PicklableMock
+
+
+def _rotating_provider(factory) -> WorkerCredentialsProvider:
+    """Build a reloadable provider that re-consults its factory every resolve.
+
+    A zero freshness interval means no resolve is served from cache, so a
+    test drives adoption by resolving rather than by tampering with the
+    provider's timing state.
+    """
+    return WorkerCredentialsProvider(factory, reloadable=True, fresh_for=timedelta(0))
+
+
+def _await_rotation_adopted(
+    provider: WorkerCredentialsProvider, previous: WorkerCredentials
+) -> None:
+    """Drive the provider until it adopts material newer than *previous*.
+
+    `WorkerCredentialsProvider.refresh` consults the factory regardless of
+    age, so one call is enough for a factory whose output has changed.
+    """
+    assert provider.credentials.refresh() != previous, "rotation was not adopted"
+
+
+def _secure_provider(identity: str | None = None) -> WorkerCredentialsProvider:
+    """Build a static provider over dummy credential bytes.
+
+    For tests that only need a secure (non-None) provider; gRPC defers PEM
+    validation to the handshake, which these tests never reach.
+    """
+    credentials = WorkerCredentials(
+        ca_cert=b"ca", worker_key=b"key", worker_cert=b"cert"
+    )
+    return WorkerCredentialsProvider(lambda: credentials, identity=identity)
 
 
 class MyAppError(Exception):
@@ -116,6 +157,114 @@ def mock_grpc_call(mocker: MockerFixture):
         return mock_call
 
     return create_call
+
+
+@pytest.fixture
+def dispatching_stub(mocker: MockerFixture, async_stream, mock_grpc_call):
+    """Patch `protocol.WorkerStub` with a stub whose dispatch always succeeds.
+
+    Every call builds a fresh ack-then-result stream, so a test may
+    dispatch any number of times without exhausting a shared generator.
+    Returns the stub, for tests that assert on the dispatch calls.
+    """
+
+    def fresh_call(*args, **kwargs):
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        return mock_grpc_call(async_stream(responses))
+
+    stub = mocker.MagicMock()
+    stub.dispatch = mocker.MagicMock(side_effect=fresh_call)
+    mocker.patch.object(protocol, "WorkerStub", return_value=stub)
+    return stub
+
+
+@pytest.fixture
+def reloading_provider(tmp_path, test_certificates):
+    """Build a file-backed provider over freshly written PEM material.
+
+    Returns a `(provider, files)` pair. The provider re-reads the files on
+    every resolve, so a test drives adoption by rewriting them — see
+    `_await_rotation_adopted` — rather than by tampering with timing state.
+    """
+    key_pem, cert_pem, ca_pem = test_certificates
+    files = write_certificate_files(tmp_path, ca_pem, key_pem, cert_pem)
+    provider = _rotating_provider(
+        lambda: WorkerCredentials.from_files(
+            files.ca_path, files.key_path, files.cert_path
+        )
+    )
+    return provider, files
+
+
+class TestHandshakeError:
+    """Test suite for the HandshakeError exception type."""
+
+    def test___init___should_set_code_and_details(self):
+        """Test HandshakeError records its gRPC fields.
+
+        Given:
+            A status code and details.
+        When:
+            HandshakeError is constructed.
+        Then:
+            It should expose the code and details.
+        """
+        # Act
+        error = HandshakeError(grpc.StatusCode.UNAVAILABLE, "boom")
+
+        # Assert
+        assert error.code is grpc.StatusCode.UNAVAILABLE
+        assert error.details == "boom"
+
+    def test___init___should_be_transient_rpc_error(self):
+        """Test HandshakeError sits in the worker-health hierarchy.
+
+        Given:
+            A HandshakeError instance.
+        When:
+            Its type relationships are inspected.
+        Then:
+            It should be a TransientRpcError (and hence an RpcError), so
+            every consumer honoring the worker-health contract skips the
+            worker without eviction — see HandshakeError for the
+            recoverability rationale.
+        """
+        # Arrange
+        error = HandshakeError()
+
+        # Act & assert
+        assert isinstance(error, TransientRpcError)
+        assert isinstance(error, RpcError)
+
+    @given(
+        code=st.sampled_from(list(grpc.StatusCode)) | st.none(),
+        details=st.text() | st.none(),
+    )
+    def test_pickle_roundtrip_should_preserve_code_and_details(self, code, details):
+        """Test HandshakeError survives a serialization roundtrip.
+
+        Given:
+            A HandshakeError carrying any status code or None and any
+            details text or None.
+        When:
+            It is pickled and cloudpickled and restored.
+        Then:
+            The code and details should survive — it is a wire-crossing type
+            raised back to a calling process.
+        """
+        # Arrange
+        error = HandshakeError(code, details)
+
+        # Act & assert
+        for restored in (
+            pickle.loads(pickle.dumps(error)),
+            cloudpickle.loads(cloudpickle.dumps(error)),
+        ):
+            assert restored.code is code
+            assert restored.details == details
 
 
 class TestWorkerConnection:
@@ -393,6 +542,912 @@ class TestWorkerConnection:
         with pytest.raises(RpcError):
             async for _ in await connection.dispatch(sample_task):
                 pass
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_handshake_error_when_peer_unauthenticated(
+        self, mocker: MockerFixture, sample_task
+    ):
+        """Test dispatch surfaces a rejected client certificate distinctly.
+
+        Given:
+            A secure connection whose stub raises UNAUTHENTICATED.
+        When:
+            A task is dispatched.
+        Then:
+            It should raise HandshakeError (the peer rejected the client's
+            certificate).
+        """
+
+        # Arrange
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNAUTHENTICATED
+
+            def details(self):
+                return "peer certificate rejected"
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051",
+            credentials=_secure_provider(),
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act & assert
+        with pytest.raises(HandshakeError) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        assert exc_info.value.code is grpc.StatusCode.UNAUTHENTICATED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "secure, details",
+        [
+            # Distinct secure-handshake flavors (CA rejection, expired cert,
+            # generic TLS failure) all surface as the same HandshakeError.
+            (True, "Ssl handshake: certificate verify failed"),
+            (True, "certificate has expired"),
+            (True, "tls handshake eof"),
+            # An insecure client that reached a TLS-only worker.
+            (False, "Ssl handshake failed"),
+            # Chain-validation and protocol-negotiation flavors. Unlike the
+            # hostname-verification test below, these two are synthesized
+            # rather than captured: each carries its own token and none of
+            # the others, so the row fails if and only if that token is
+            # dropped from the gate.
+            (True, "X509_verify_cert failed"),
+            (True, "ALPN protocol mismatch"),
+        ],
+    )
+    async def test_dispatch_should_raise_handshake_error_when_tls_handshake_fails(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        secure: bool,
+        details: str,
+    ):
+        """Test dispatch classifies a failed TLS handshake structurally.
+
+        Given:
+            A connection whose stub raises UNAVAILABLE carrying TLS evidence
+            in its error text.
+        When:
+            A task is dispatched.
+        Then:
+            It should raise HandshakeError, whatever the TLS failure flavor —
+            the failure is not sub-classified.
+        """
+
+        # Arrange
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNAVAILABLE
+
+            def details(self):
+                return details
+
+            def debug_error_string(self):
+                return f"UNAVAILABLE:{details}"
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051",
+            credentials=_secure_provider() if secure else None,
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act & assert
+        with pytest.raises(HandshakeError):
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+    @pytest.mark.parametrize(
+        "error_details",
+        [
+            "failed to connect to all addresses",
+            # The two below were captured from a live worker rejecting the
+            # client's certificate (signed by an authority the worker does
+            # not trust). Under TLS 1.3 that rejection lands after the
+            # client's handshake completes, so gRPC reports it as a plain
+            # transport failure carrying no TLS evidence — see
+            # HandshakeError. They are here so a future gRPC or TLS change
+            # that starts surfacing the alert is noticed.
+            (
+                "failed to connect to all addresses; last error: "
+                "UNAVAILABLE: ipv4:127.0.0.1:56936: Socket closed"
+            ),
+            (
+                "failed to connect to all addresses; last error: "
+                "UNAVAILABLE: ipv4:127.0.0.1:56936: recvmsg:Connection reset by peer"
+            ),
+        ],
+        ids=["unreachable", "worker_rejected_client_cert", "worker_reset_connection"],
+    )
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_transient_error_when_unavailable_not_tls(
+        self, mocker: MockerFixture, sample_task, error_details: str
+    ):
+        """Test dispatch keeps a plain unreachable worker transient.
+
+        Given:
+            A connection whose stub raises UNAVAILABLE with no TLS evidence
+            in its error text.
+        When:
+            A task is dispatched.
+        Then:
+            It should raise TransientRpcError and not HandshakeError, so a
+            genuinely unreachable worker is not mistaken for a handshake
+            failure.
+        """
+
+        # Arrange
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNAVAILABLE
+
+            def details(self):
+                return error_details
+
+            def debug_error_string(self):
+                return error_details
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051",
+            credentials=_secure_provider(),
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act & assert
+        with pytest.raises(TransientRpcError) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        assert not isinstance(exc_info.value, HandshakeError)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_redact_debug_string_from_handshake_details(
+        self, mocker: MockerFixture, sample_task
+    ):
+        """Test the handshake error does not leak gRPC's debug string.
+
+        Given:
+            A handshake failure whose ``details()`` is empty and whose debug
+            string carries an internal peer address and source paths.
+        When:
+            A task is dispatched.
+        Then:
+            The raised HandshakeError's details should be a fixed message,
+            not the verbose gRPC debug blob, so internal topology does not
+            ride into logs or across the wire.
+        """
+
+        # Arrange — UNAUTHENTICATED classifies without needing evidence in
+        # the text, so the empty ``details()`` reaches the fixed-message
+        # fallback with a verbose debug string available to leak.
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNAUTHENTICATED
+
+            def details(self):
+                return ""
+
+            def debug_error_string(self):
+                return "Ssl handshake failed; peer 10.1.2.3:8443; src/core/tsi/ssl.cc"
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051",
+            credentials=_secure_provider(),
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act & assert
+        with pytest.raises(HandshakeError) as exc_info:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+        assert "10.1.2.3" not in exc_info.value.details
+        assert "src/core" not in exc_info.value.details
+        assert "secure handshake failed" in exc_info.value.details
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_classify_hostname_verification_as_handshake_failure(
+        self, mocker: MockerFixture, sample_task
+    ):
+        """Test a real gRPC hostname-verification failure is gated as a handshake.
+
+        Given:
+            A handshake failure whose text is gRPC's verbatim
+            ``ssl_target_name_override`` mismatch ("Hostname Verification
+            Check failed") — a drift canary for the broad handshake gate.
+        When:
+            A task is dispatched.
+        Then:
+            It should raise HandshakeError, so an identity mismatch stays
+            diagnosable as a handshake failure and is not mistaken for plain
+            unreachability.
+        """
+
+        # Arrange — verbatim text from a gRPC ssl_target_name_override
+        # mismatch (captured from grpc.aio against a real worker).
+        class MockRpcError(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.UNAVAILABLE
+
+            def details(self):
+                return (
+                    "failed to connect to all addresses; last error: UNKNOWN: "
+                    "ipv4:127.0.0.1:51127: Custom verification check failed with "
+                    "error: UNAUTHENTICATED: Hostname Verification Check failed."
+                )
+
+            def debug_error_string(self):
+                return self.details()
+
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(side_effect=MockRpcError())
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "localhost:50051",
+            credentials=_secure_provider(),
+            options=ChannelOptions(max_concurrent_streams=10),
+        )
+
+        # Act & assert
+        with pytest.raises(HandshakeError):
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_override_target_name_when_identity_configured(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch verifies the worker against a configured identity.
+
+        Given:
+            A connection whose provider carries an expected identity and a
+            target that is a bare network address.
+        When:
+            A task is dispatched.
+        Then:
+            The secure channel should be built with a
+            grpc.ssl_target_name_override option for the identity, so the
+            certificate is verified against the identity rather than the
+            dialed address.
+        """
+        # Arrange
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "10.0.0.7:50051", credentials=_secure_provider(identity="wool-worker")
+        )
+
+        # Act
+        results = [result async for result in await connection.dispatch(sample_task)]
+
+        # Assert
+        assert results == ["ok"]
+        options = secure_spy.call_args.kwargs["options"]
+        assert ("grpc.ssl_target_name_override", "wool-worker") in options
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_not_override_target_name_when_identity_none(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test dispatch leaves address verification intact without identity.
+
+        Given:
+            A connection whose provider carries no identity.
+        When:
+            A task is dispatched.
+        Then:
+            The secure channel should be built without a
+            grpc.ssl_target_name_override option, preserving address-based
+            verification.
+        """
+        # Arrange
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("10.0.0.7:50051", credentials=_secure_provider())
+
+        # Act
+        results = [result async for result in await connection.dispatch(sample_task)]
+
+        # Assert
+        assert results == ["ok"]
+        option_keys = [key for key, _ in secure_spy.call_args.kwargs["options"]]
+        assert "grpc.ssl_target_name_override" not in option_keys
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_override_target_name_from_bare_credentials_identity(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test a bare WorkerCredentials identity overrides the SAN target.
+
+        Given:
+            A connection built from a bare `WorkerCredentials` (not a provider)
+            that carries an identity.
+        When:
+            A task is dispatched.
+        Then:
+            The secure channel should carry the grpc.ssl_target_name_override
+            option for that identity — the ``credentials`` union coerces the
+            bare value and its identity flows through.
+        """
+        # Arrange
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "10.0.0.7:50051",
+            credentials=WorkerCredentials(
+                ca_cert=b"ca",
+                worker_key=b"key",
+                worker_cert=b"cert",
+                identity="wool-worker",
+            ),
+        )
+
+        # Act
+        results = [result async for result in await connection.dispatch(sample_task)]
+
+        # Assert
+        assert results == ["ok"]
+        options = secure_spy.call_args.kwargs["options"]
+        assert ("grpc.ssl_target_name_override", "wool-worker") in options
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_reuse_channel_when_credentials_unchanged(
+        self, mocker: MockerFixture, sample_task, dispatching_stub
+    ):
+        """Test unchanged credential material reuses one pooled channel.
+
+        Given:
+            A connection over a static provider, dispatched twice.
+        When:
+            The second dispatch runs with the credential material
+            unchanged.
+        Then:
+            The secure channel should be built only once — the pooled
+            channel is reused because the credentials value is
+            unchanged.
+        """
+        # Arrange
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+
+        connection = WorkerConnection("10.0.0.7:50051", credentials=_secure_provider())
+
+        # Act
+        async for _ in await connection.dispatch(sample_task):
+            pass
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        # Assert
+        assert secure_spy.call_count == 1
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_create_new_channel_when_credentials_rotated(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        dispatching_stub,
+        reloading_provider,
+    ):
+        """Test rotated credential material yields a fresh channel.
+
+        Given:
+            A connection over a reloading file provider, dispatched once,
+            after which the CA file is rotated on disk and the provider's
+            debounce window elapses so the rotation is adopted.
+        When:
+            Another task is dispatched.
+        Then:
+            A second secure channel should be built — the rotated material
+            resolves to a different credentials value and a new pooled
+            channel.
+        """
+        # Arrange
+        provider, files = reloading_provider
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        connection = WorkerConnection("10.0.0.7:50051", credentials=provider)
+
+        # Act
+        original = provider.credentials.get()
+        async for _ in await connection.dispatch(sample_task):
+            pass
+        # Rotation appends trailing bytes so the re-read material compares
+        # unequal and yields a new pool key.
+        Path(files.ca_path).write_bytes(files.ca_pem + b"\n# rotated\n")
+        _await_rotation_adopted(provider, original)
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        # Assert
+        assert secure_spy.call_count == 2
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_finish_inflight_stream_after_rotation(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        async_stream,
+        mock_grpc_call,
+        reloading_provider,
+    ):
+        """Test an in-flight dispatch is not torn down by a rotation.
+
+        Given:
+            A connection over a reloading file provider, with a dispatch
+            primed and its stream still open.
+        When:
+            The credential material is rotated and the open stream is then
+            consumed to completion.
+        Then:
+            The stream should finish on its original channel — rotation is
+            adopted at the next connection, never by interrupting work in
+            flight — so no replacement channel is built for it.
+        """
+        # Arrange — a single-shot stub, not `dispatching_stub`: this test
+        # primes one stream and holds it open across the rotation.
+        provider, files = reloading_provider
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection("10.0.0.7:50051", credentials=provider)
+
+        # Act — prime the dispatch (builds the original channel), then rotate
+        # the material before consuming the still-open stream. Rotation
+        # appends trailing bytes so the re-read material compares unequal.
+        stream = await connection.dispatch(sample_task)
+        Path(files.ca_path).write_bytes(files.ca_pem + b"\n# rotated\n")
+        results = [result async for result in stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert secure_spy.call_count == 1
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_use_insecure_uds_when_self_dispatch_secure(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test a secure worker self-dispatches over the insecure loopback.
+
+        Given:
+            A connection with a secure provider whose target matches the
+            current worker's own address and a UDS address is available.
+        When:
+            A task is dispatched.
+        Then:
+            It should route over the insecure UDS channel and never build a
+            secure channel — the worker does not do TLS against itself.
+        """
+        # Arrange
+        target = "localhost:50051"
+        uds_target = "unix:/tmp/wool-test-secure-self.sock"
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address=target,
+            pid=1,
+            version="1.0.0",
+        )
+        wool.__worker_uds_address__ = uds_target
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        mock_channel = mocker.AsyncMock()
+        insecure_spy = mocker.patch.object(
+            grpc.aio, "insecure_channel", return_value=mock_channel
+        )
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        connection = WorkerConnection(
+            target, credentials=_secure_provider(identity="wool-worker")
+        )
+
+        # Act
+        results = [result async for result in await connection.dispatch(sample_task)]
+
+        # Assert
+        assert results == ["ok"]
+        uds_calls = [c for c in insecure_spy.call_args_list if c.args[0] == uds_target]
+        assert len(uds_calls) >= 1
+        secure_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_not_invoke_factory_when_self_dispatch_uds(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test the self-dispatch route skips credential resolution entirely.
+
+        Given:
+            A connection over a reloadable counting factory whose target
+            matches the current worker's own address, with a UDS address
+            available.
+        When:
+            A task is dispatched.
+        Then:
+            It should never invoke the factory — the UDS route is decided
+            before resolving, so no credential material is computed only to
+            be discarded.
+        """
+        # Arrange
+        target = "localhost:50051"
+        uds_target = "unix:/tmp/wool-test-uds-no-resolve.sock"
+        wool.__worker_metadata__ = wool.WorkerMetadata(
+            uid=uuid4(),
+            address=target,
+            pid=1,
+            version="1.0.0",
+        )
+        wool.__worker_uds_address__ = uds_target
+        calls = []
+        credentials = WorkerCredentials(
+            ca_cert=b"ca", worker_key=b"key", worker_cert=b"cert"
+        )
+
+        def factory():
+            calls.append(1)
+            return credentials
+
+        provider = _rotating_provider(factory)
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        mock_channel = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "insecure_channel", return_value=mock_channel)
+        connection = WorkerConnection(target, credentials=provider)
+
+        # Act
+        results = [result async for result in await connection.dispatch(sample_task)]
+
+        # Assert
+        assert results == ["ok"]
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_keep_loop_responsive_when_factory_blocks(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test a blocking reloadable factory does not stall the event loop.
+
+        Given:
+            A connection over a reloadable provider whose factory blocks on a
+            gate until released.
+        When:
+            A dispatch resolves that factory while an unrelated coroutine
+            keeps running on the same loop.
+        Then:
+            It should let the unrelated coroutine make progress while the
+            factory is blocked — the reloadable resolve runs off-thread, so
+            a slow factory delays only its own dispatch.
+        """
+        # Arrange
+        credentials = WorkerCredentials(
+            ca_cert=b"ca", worker_key=b"key", worker_cert=b"cert"
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        progress = [0]
+        progress_at_release = []
+
+        def factory():
+            entered.set()
+            assert release.wait(timeout=5.0)
+            progress_at_release.append(progress[0])
+            return credentials
+
+        provider = _rotating_provider(factory)
+
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        mock_channel = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "secure_channel", return_value=mock_channel)
+        connection = WorkerConnection("10.0.0.7:50051", credentials=provider)
+
+        async def consume():
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        # Act
+        dispatch = asyncio.create_task(consume())
+        while not entered.is_set():
+            await asyncio.sleep(0.001)
+        # The factory is blocked; a responsive loop still runs this coroutine.
+        for _ in range(3):
+            await asyncio.sleep(0.001)
+            progress[0] += 1
+        release.set()
+        await dispatch
+
+        # Assert — the factory observed the loop's progress before release:
+        # had the resolve run on the loop, the loop could not have advanced
+        # while the factory was blocked.
+        assert progress_at_release == [3]
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_resolve_inline_when_provider_not_reloadable(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test a non-reloadable provider is not routed through a thread hop.
+
+        Given:
+            A connection over a static (non-reloadable) provider.
+        When:
+            A task is dispatched.
+        Then:
+            It should resolve the provider directly on the loop — the
+            constant-snapshot common case never pays asyncio.to_thread.
+        """
+        # Arrange
+        to_thread_spy = mocker.patch.object(
+            asyncio, "to_thread", wraps=asyncio.to_thread
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        mock_channel = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "secure_channel", return_value=mock_channel)
+        connection = WorkerConnection("10.0.0.7:50051", credentials=_secure_provider())
+
+        # Act
+        results = [result async for result in await connection.dispatch(sample_task)]
+
+        # Assert
+        assert results == ["ok"]
+        to_thread_spy.assert_not_called()
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_share_provider_guard_when_connections_share_provider(
+        self, mocker: MockerFixture, sample_task, dispatching_stub
+    ):
+        """Test the resolve guard is per provider, not per connection.
+
+        Given:
+            Two connections over the same reloadable provider, with a
+            freshness interval wide enough to span both dispatches.
+        When:
+            Each connection dispatches a task.
+        Then:
+            It should invoke the factory exactly once in total — the cache
+            lives on the shared provider, so N connections do not run N
+            resolves.
+        """
+        # Arrange
+        credentials = WorkerCredentials(
+            ca_cert=b"ca", worker_key=b"key", worker_cert=b"cert"
+        )
+        calls = []
+
+        def factory():
+            calls.append(1)
+            return credentials
+
+        provider = WorkerCredentialsProvider(
+            factory, reloadable=True, fresh_for=timedelta(seconds=60)
+        )
+        mock_channel = mocker.AsyncMock()
+        mocker.patch.object(grpc.aio, "secure_channel", return_value=mock_channel)
+        first = WorkerConnection("10.0.0.7:50051", credentials=provider)
+        second = WorkerConnection("10.0.0.8:50051", credentials=provider)
+
+        # Act
+        async for _ in await first.dispatch(sample_task):
+            pass
+        async for _ in await second.dispatch(sample_task):
+            pass
+
+        # Assert
+        assert len(calls) == 1
+
+        # Cleanup
+        await first.close()
+        await second.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_discard_superseded_channel_when_key_changes(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        dispatching_stub,
+        reloading_provider,
+    ):
+        """Test a superseded credential key's channel closes without a TTL wait.
+
+        Given:
+            A connection over a reloading file provider with one drained
+            dispatch, after which the material is rotated and adopted.
+        When:
+            The next dispatch completes on the rotated material.
+        Then:
+            It should close the superseded key's pooled channel promptly —
+            the dispatch that observed the new key discards the old one —
+            while the new channel stays open.
+        """
+        # Arrange
+        provider, files = reloading_provider
+        channel_a = mocker.AsyncMock()
+        channel_b = mocker.AsyncMock()
+        mocker.patch.object(
+            grpc.aio, "secure_channel", side_effect=[channel_a, channel_b]
+        )
+        connection = WorkerConnection("10.0.0.7:50051", credentials=provider)
+
+        # Act
+        original = provider.credentials.get()
+        async for _ in await connection.dispatch(sample_task):
+            pass
+        # Rotation appends trailing bytes so the re-read material compares
+        # unequal and yields a new pool key.
+        Path(files.ca_path).write_bytes(files.ca_pem + b"\n# rotated\n")
+        _await_rotation_adopted(provider, original)
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        # Assert
+        channel_a.close.assert_awaited_once()
+        channel_b.close.assert_not_awaited()
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_drain_inflight_stream_when_superseded(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        dispatching_stub,
+        reloading_provider,
+    ):
+        """Test discarding a superseded key never tears down in-flight work.
+
+        Given:
+            A connection with a primed, still-open stream on the original
+            credential key, after which the material is rotated, adopted, and
+            a second dispatch completes on the new key.
+        When:
+            The original stream is consumed to completion.
+        Then:
+            It should finish successfully on its original channel, which
+            stays open until that stream drains and closes only after.
+        """
+        # Arrange
+        provider, files = reloading_provider
+        channel_a = mocker.AsyncMock()
+        channel_b = mocker.AsyncMock()
+        mocker.patch.object(
+            grpc.aio, "secure_channel", side_effect=[channel_a, channel_b]
+        )
+        connection = WorkerConnection("10.0.0.7:50051", credentials=provider)
+
+        # Act — prime a stream on the original key, rotate and adopt, then
+        # complete a second dispatch on the new key before draining the first.
+        original = provider.credentials.get()
+        inflight = await connection.dispatch(sample_task)
+        # Rotation appends trailing bytes so the re-read material compares
+        # unequal and yields a new pool key.
+        Path(files.ca_path).write_bytes(files.ca_pem + b"\n# rotated\n")
+        _await_rotation_adopted(provider, original)
+        async for _ in await connection.dispatch(sample_task):
+            pass
+        closed_before_drain = channel_a.close.await_count
+        results = [result async for result in inflight]
+
+        # Assert
+        assert not closed_before_drain  # In-flight stream held it open.
+        assert results == ["ok"]
+        channel_a.close.assert_awaited_once()
+        channel_b.close.assert_not_awaited()
+
+        # Cleanup
+        await connection.close()
 
     @pytest.mark.asyncio
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
@@ -1670,8 +2725,7 @@ class TestWorkerConnection:
         mock_stub.dispatch = mocker.MagicMock(return_value=mock_call)
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
 
-        credentials = grpc.ssl_channel_credentials()
-        connection = WorkerConnection("localhost:50051", credentials=credentials)
+        connection = WorkerConnection("localhost:50051", credentials=_secure_provider())
 
         # Act
         results = []

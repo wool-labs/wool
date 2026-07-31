@@ -100,18 +100,7 @@ The wildcard bind makes the publisher auto-resolve a routable advertised address
 
 `WorkerPool` accepts either factory protocol for its `worker` parameter. A `WorkerFactory` declares a keyword-passable `host` and receives the bind host prescribed by the pool's discovery publisher, so factory-customized workers stay reachable wherever the publisher advertises them. `LocalWorker` itself qualifies, as does a partial of it that leaves `host` unset. A `BoundWorkerFactory` declares no `host` and owns its own binding. A bound factory always wins (a partial that pre-supplies `host` is treated as bound). The pool classifies a factory by inspecting its signature for an explicitly declared `host` (see the `WorkerFactory` docstring for details):
 
-```python
-class WorkerFactory(Protocol):
-    def __call__(
-        self, *tags: str, credentials: WorkerCredentials | None = None,
-        host: str,
-    ) -> WorkerLike: ...
-
-class BoundWorkerFactory(Protocol):
-    def __call__(
-        self, *tags: str, credentials: WorkerCredentials | None = None,
-    ) -> WorkerLike: ...
-```
+Both protocols take capability tags and a `credentials` keyword accepting a `WorkerCredentials`, a `WorkerCredentialsProvider`, or `None`; see the `WorkerFactory` and `BoundWorkerFactory` docstrings for the authoritative signatures.
 
 Custom workers need only satisfy the `WorkerLike` protocol and host a gRPC server implementing the worker service protocol at its reported `address`.
 
@@ -153,7 +142,7 @@ class ResilientWorker(LocalWorker):
         self._worker_process = WorkerProcess(
             host=self._worker_process.host,
             port=self._worker_process.port,
-            server_credentials=self._server_credentials,
+            credentials=self._provider,
         )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
@@ -197,7 +186,7 @@ Per-dispatch, the gRPC handler instantiates a `DispatchSession` — an async con
 3. **Teardown** (`__aexit__`) — drains the worker driver and unwinds the exit stack. Drain is registered as an exit-stack callback so resource release runs even if drain itself raises.
 4. **Cancellation** (`cancel`) — sets a flag observed by both the iteration loop and the deferred scheduler, cancels the worker driver task on the worker loop so a routine suspended inside an `await` receives `CancelledError`, and pushes an end-of-stream frame onto the response queue. Cancellation is idempotent and cross-task safe (no `aclose` of the iterator, so a `cancel` call from any task — including the service's preemption path during graceful shutdown — does not race the driving task).
 
-The dispatch handler decodes the chain manifest into a `ChainManifest` inside the session's parse phase. The worker driver task's first action is to install that chain manifest — re-stamped so the worker-loop thread owns the chain — and the routine then runs under it. When the decoded caller frame carries no state, the mount is skipped — the worker task runs unarmed, matching the armed-gating contract documented in `context/README.md`. A later mid-stream frame with state arms lazily through the `ChainManifest.mount` pipeline inside `_drive_step`. After each step the worker publishes the post-step chain manifest onto the session so the handler can encode it for back-propagation; the handler reads it only after draining the worker, so the cross-thread read is race-free.
+The dispatch handler decodes the chain manifest into a `ChainManifest` inside the session's parse phase. The worker driver task's first action is to install that chain manifest — re-stamped so the worker-loop thread owns the chain — and the routine then runs under it. When the decoded caller frame carries no state, the mount is skipped — the worker task runs unarmed, matching the armed-gating contract documented in `context/README.md`. A later mid-stream frame with state arms lazily through the `Frame.mount` pipeline inside `_drive_step`. After each step the worker publishes the post-step chain manifest onto the session so the handler can encode it for back-propagation; the handler reads it only after draining the worker, so the cross-thread read is race-free.
 
 ### Chain-manifest decode failures
 
@@ -299,7 +288,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 ### Connection pooling
 
-`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams` — the client-side dispatch gate. The worker's own HTTP/2 `MAX_CONCURRENT_STREAMS` ceiling is set to twice that value to absorb transient permit-turnover overshoot without faulting the connection. See issue #290.
+`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Keying on the `WorkerCredentials` value (a frozen dataclass, so hashable and value-equal) is what makes rotation observable at the channel layer — see [Credential providers: identity and rotation](#credential-providers-identity-and-rotation). Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams` — the client-side dispatch gate. The worker's own HTTP/2 `MAX_CONCURRENT_STREAMS` ceiling is set to twice that value to absorb transient permit-turnover overshoot without faulting the connection. See issue #290.
 
 ### Transport configuration
 
@@ -338,7 +327,10 @@ async with wool.WorkerPool(
 | Error | gRPC codes | Dispatch behavior |
 | ----- | ---------- | ----------------- |
 | `TransientRpcError` | `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED` | Skip worker, retry next candidate. |
+| `HandshakeError` | `UNAUTHENTICATED`, or `UNAVAILABLE` with TLS evidence | Skip worker without eviction; warn, rate-limited per worker. |
 | `RpcError` | All others | Evict worker from context, retry next candidate. |
+
+`HandshakeError` (a `TransientRpcError`) signals that a worker is reachable but the failure carried TLS/mTLS handshake or peer-authentication evidence; the proxy's dispatch loop skips the worker without eviction and logs a per-worker rate-limited warning — see `HandshakeError` for the classification and recoverability contract. A dispatch that drains entirely on handshake failures raises the plain `NoWorkersAvailable`.
 
 ### Security filter
 
@@ -367,4 +359,56 @@ async with wool.WorkerPool(spawn=4, credentials=creds):
     result = await my_routine()
 ```
 
-Credential flow: `server_credentials` are passed to spawned workers for their gRPC servers; `client_credentials` are passed to the proxy for outgoing connections and to workers for the stop RPC.
+### Credential providers: identity and rotation
+
+`WorkerCredentials` describes a fixed snapshot of material verified against the dialed address. For dynamic-address platforms (Kubernetes, ECS/Fargate) where a worker's address is assigned at startup and credentials are rotated out of band, supply a **credential provider** instead — anywhere `credentials=` is accepted (`WorkerPool`, `LocalWorker`, `WorkerProxy`). A bare `WorkerCredentials` is wrapped in a non-reloadable provider automatically, so existing deployments are unaffected.
+
+A `WorkerCredentialsProvider` is a thin adapter over a `factory` callable returning the current `WorkerCredentials`; it stamps an optional `identity` onto the credentials the channel pool keys on. It comes in two shapes.
+
+**Fixed material — `WorkerCredentials.as_provider`.** Read or build credentials once, then adapt them, optionally pinning the identity to verify discovered workers against:
+
+```python
+import wool
+
+credentials = wool.WorkerCredentials.from_files(
+    ca_path="certs/ca-cert.pem",
+    key_path="certs/worker-key.pem",
+    cert_path="certs/worker-cert.pem",
+)
+provider = credentials.as_provider(identity="wool-worker.svc")
+
+async with wool.WorkerPool(spawn=4, credentials=provider):
+    result = await my_routine()
+```
+
+**Rotating material — `reloadable=True`.** Supply a `factory` the runtime calls to obtain current material, so a long-running fleet adopts rotated certificates without a restart. Wool is unopinionated about *how* you reload — `factory` owns the strategy (re-read a file, poll a secrets manager, cache with a TTL, keep a last-good fallback):
+
+```python
+import functools
+
+# Re-read the PEM files each time the factory runs. For an expensive source,
+# or to survive a torn read mid-rotation, add caching / last-good fallback here.
+factory = functools.partial(
+    wool.WorkerCredentials.from_files,
+    "certs/ca-cert.pem",
+    "certs/worker-key.pem",
+    "certs/worker-cert.pem",
+)
+provider = wool.WorkerCredentialsProvider(
+    factory, identity="wool-worker.svc", reloadable=True
+)
+```
+
+A configured `identity` verifies a worker's certificate against a stable logical identity (its SAN, via gRPC's `ssl_target_name_override`) rather than the dialed address, and applies to every worker reached through the provider. Rotation spans both planes: the client channel pool is keyed by the `WorkerCredentials` value — rotated material is a different key and yields fresh channels, unchanged material reuses pooled ones, and a superseded pooled channel is discarded once its in-flight dispatches drain — and the worker server adopts new material per connection via `grpc.dynamic_ssl_server_credentials`.
+
+A `reloadable=True` `factory` must be **safe to call concurrently** — both the client dispatch path and the worker's per-handshake server fetcher read through it. Reads are cached, so neither path rides on `factory` being cheap and rotation adoption is bounded by the freshness interval plus one factory call; see `WorkerCredentialsProvider.credentials` for what a read costs on each path. An expensive `factory` is still encouraged to return cached material when nothing has changed, since unchanged material reuses pooled channels. A `reloadable=False` provider resolves once at construction and serves that fixed snapshot, so a broken `factory` fails there rather than at the first handshake.
+
+A provider supplied to a worker crosses into the worker subprocess, so its `factory` must survive that trip — see `WorkerCredentialsProvider` for the serialization requirement, which a lambda or closure satisfies. The proxy instead re-resolves its provider from the ambient credential context, so it is never serialized across the dispatch boundary.
+
+### Local self-dispatch socket
+
+For nested routines that dispatch back to the worker's own address, the worker exposes an additional **insecure** Unix-domain-socket port and routes self-dispatch over it (a worker never does TLS against itself). That socket serves the full dispatch service with no transport authentication, so its reachability is confined to the worker's own user by binding it in a uid-confined directory that a respawned worker reclaims — see `WorkerProcess._serve` for the placement and reclaim mechanics. The local host is therefore a trust boundary: any process running as the same uid can dispatch to the worker over the socket. On a shared or multi-tenant host, isolate workers by uid (or container/network namespace) accordingly.
+
+### Discovery-plane trust
+
+Identity-based mTLS secures the **dispatch** plane; it does not authenticate the **discovery** plane. A worker self-advertises its `WorkerMetadata` — address, `secure` flag, tags, and channel options — over whatever discovery mechanism is in use (LAN multicast, shared-memory, a custom `DiscoveryLike`), none of which is authenticated, so the advertisement is forgeable by anything that can write to that plane. The proxy-side security filter that drops workers whose advertised `secure` flag disagrees with the client's credential posture is therefore a **compatibility gate, not a trust boundary**: it prevents a plaintext/encrypted mismatch, not a malicious advertisement. Actual confidentiality and integrity rest entirely on the mTLS handshake performed when a connection is made — a forged advertisement still cannot complete the handshake without a CA-trusted certificate (and, when an identity is configured, one whose SAN matches). The discovery plane is not authenticated; treat discovery as an untrusted hint and the handshake as the trust boundary.

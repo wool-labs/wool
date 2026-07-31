@@ -11,6 +11,7 @@ from wool import protocol
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.process import WorkerProcess
@@ -68,9 +69,13 @@ class LocalWorker(Worker):
     :param credentials:
         Optional credentials for TLS/mTLS authentication:
 
-        - :class:`WorkerCredentials`: Provides both server and client
+        - `WorkerCredentials`: Provides both server and client
           credentials for mutual TLS. Enables secure worker-to-worker
           communication.
+        - `WorkerCredentialsProvider`: A provider —
+          `WorkerCredentials.as_provider` for fixed material, or one built
+          with a factory callable for identity-based verification or credential
+          rotation without restart.
         - ``None``: Worker uses insecure connections.
     :param options:
         gRPC message size options. Defaults to
@@ -93,7 +98,7 @@ class LocalWorker(Worker):
     """
 
     _worker_process: WorkerProcess
-    _credentials: WorkerCredentials | None
+    _provider: WorkerCredentialsProvider | None
 
     def __init__(
         self,
@@ -102,21 +107,21 @@ class LocalWorker(Worker):
         port: int = 0,
         shutdown_grace_period: float = 60.0,
         proxy_pool_ttl: float = 60.0,
-        credentials: WorkerCredentials | None = None,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         options: WorkerOptions | None = None,
         backpressure: BackpressureLike | None = None,
         daemon: bool | None | UndefinedType = Undefined,
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
-        self._credentials = credentials
+        self._provider = WorkerCredentialsProvider.coerce(credentials)
         self._worker_process = WorkerProcess(
             uid=self._uid,
             host=host,
             port=port,
             shutdown_grace_period=shutdown_grace_period,
             proxy_pool_ttl=proxy_pool_ttl,
-            credentials=credentials,
+            credentials=self._provider,
             options=options,
             tags=frozenset(self._tags),
             extra=self._extra,
@@ -165,10 +170,10 @@ class LocalWorker(Worker):
         can skip it, in which case the worker-side parent watchdog
         remains the backstop against orphans.
 
-        For workers configured with `WorkerCredentials`, uses the
-        client credentials to establish a secure connection for the
-        stop operation. For insecure workers, uses an insecure
-        channel.
+        For secure workers, resolves the current credentials and dials with
+        the identity-derived channel options (see
+        `WorkerCredentials.identity_channel_options`); for insecure
+        workers, uses an insecure channel.
 
         :param timeout:
             Bound on the worker's graceful drain, forwarded in the
@@ -179,9 +184,13 @@ class LocalWorker(Worker):
                 assert self.address
 
                 # Create appropriate channel based on available credentials
-                if self._credentials is not None:
-                    credentials = self._credentials.client_credentials()
-                    channel = grpc.aio.secure_channel(self.address, credentials)
+                if self._provider is not None:
+                    resolved = await self._provider.credentials
+                    channel = grpc.aio.secure_channel(
+                        self.address,
+                        resolved.client_credentials(),
+                        options=resolved.identity_channel_options(),
+                    )
                 else:
                     channel = grpc.aio.insecure_channel(self.address)
 

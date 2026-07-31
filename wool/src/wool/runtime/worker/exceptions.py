@@ -24,3 +24,16 @@ class UnparsableVersionWarning(WoolWarning):
     absent fleet.  Filter this category to ``"error"`` (via
     `warnings.filterwarnings`) to fail loudly instead.
     """
+
+
+# public
+class SlowCredentialResolutionWarning(WoolWarning):
+    """Warn that resolving a worker's own credentials was slow at startup.
+
+    A worker resolves its credentials once before it serves. The
+    resolution is awaited, so it never stalls the worker's event loop,
+    but a factory that takes seconds still delays the worker becoming
+    available and is indistinguishable from a hung start to whoever is
+    waiting for it. Emitted so the cost is attributable to the factory
+    rather than to wool.
+    """
