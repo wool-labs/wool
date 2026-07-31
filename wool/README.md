@@ -436,9 +436,9 @@ A dispatch crosses two processes and several stages on each side; failures can o
 | ----- | ----------------------------------- | ------------------------------- | -------------------- |
 | Caller-side request encoding | n/a (no transport involved yet) | Original `Exception` (unwrapped) | None — no worker contacted |
 | gRPC handshake | `TransientRpcError` (transient codes), `HandshakeError` (a `TransientRpcError`, on handshake evidence), or `RpcError` (non-transient, incl. `FAILED_PRECONDITION` for version mismatch) | n/a | Skip on transient; skip without eviction and log a rate-limited warning on `HandshakeError`; evict on non-transient |
-| Worker-side request decoding | `Rejected.original` re-raised on the caller (typed) | Strict-mode `wool.ContextSerializationError` re-raised on the caller | None — typed re-raise |
-| Routine execution | n/a | Original routine exception (type and traceback preserved); ancillary `wool.ContextSerializationError` chained on `__cause__` | None |
-| Worker-side response encoding | Routine exception chained from strict-mode `wool.ContextSerializationError` via `__cause__` | n/a | None |
+| Worker-side request decoding | `Rejected.original` re-raised on the caller (typed) | Strict-mode `wool.ChainSerializationError` re-raised on the caller | None — typed re-raise |
+| Routine execution | n/a | Original routine exception (type and traceback preserved); ancillary `wool.ChainSerializationError` chained on `__cause__` | None |
+| Worker-side response encoding | Routine exception chained from strict-mode `wool.ChainSerializationError` via `__cause__` | n/a | None |
 | Caller-side response decoding | `UnexpectedResponse` (malformed payload, missing class, version skew) | n/a | None — caller-fault, worker is healthy |
 | Post-execution teardown | Swallowed (the wire is already closed) | n/a | n/a |
 
@@ -472,7 +472,7 @@ Version compatibility is checked by `VersionInterceptor` **before** the dispatch
 Failures here wrap in `Rejected` and surface via a `Nack` frame whose `exception` payload carries the original failure (cloudpickle-dumped). The caller deserializes and re-raises, so the user observes the **actual failure class**, not an opaque RPC error:
 
 - Malformed task id, cloudpickle errors on the routine callable, ImportError on a missing module, non-async callable → original `Exception` re-raised on the caller.
-- Strict-mode promoted `wool.SerializationWarning` (operator set `warnings.filterwarnings("error", category=wool.SerializationWarning)` in the worker subprocess) → the promoted warnings aggregate into a `wool.ContextSerializationError` that ships through the same Nack-with-exception path and re-raises on the caller as `wool.ContextSerializationError`. The default lenient mode emits the warning and runs the routine against a fresh empty context (see Context propagation > Decode failure semantics).
+- Strict-mode promoted `wool.SerializationWarning` (operator set `warnings.filterwarnings("error", category=wool.SerializationWarning)` in the worker subprocess) → the promoted warnings aggregate into a `wool.ChainSerializationError` that ships through the same Nack-with-exception path and re-raises on the caller as `wool.ChainSerializationError`. The default lenient mode emits the warning and runs the routine against a fresh empty context (see Context propagation > Decode failure semantics).
 
 Parse-phase rejections reflect a user-code or version-skew issue, not a worker-health issue. The load balancer does not evict the worker.
 
@@ -491,13 +491,13 @@ If the routine raises an exception that drags an unpicklable object into its gra
 After each successful step, the dispatch handler builds a `protocol.Response`: it dumps the result via `cloudpickle` and attaches the post-step context.
 
 - **Result dump fails** (un-picklable yielded value) — the failure surfaces as a handler-side exception during response encoding. The dispatch handler drains the worker, reads the final wire context published by the worker task via `session._final_wire_context`, and ships a terminal `Response.exception` carrying the encode failure. Caller observes the dump exception; no worker eviction.
-- **Strict-mode context encode failure during a routine exception** — the worker task's final-encode step raised a `wool.ContextSerializationError` aggregating per-var warnings during the terminal-exception path. The handler reads the encode failure from the worker (alongside `session._final_wire_context`) and chains it onto the routine's exception as `__cause__` via `raise routine_exc from encode_err`, so the **routine exception's type is preserved**. The terminal response drops the `context` field. The caller's `except RoutineError:` clause still matches; the encode error remains visible in the traceback through cause chaining.
+- **Strict-mode context encode failure during a routine exception** — the worker task's final-encode step raised a `wool.ChainSerializationError` aggregating per-var warnings during the terminal-exception path. The handler reads the encode failure from the worker (alongside `session._final_wire_context`) and chains it onto the routine's exception as `__cause__` via `raise routine_exc from encode_err`, so the **routine exception's type is preserved**. The terminal response drops the `context` field. The caller's `except RoutineError:` clause still matches; the encode error remains visible in the traceback through cause chaining.
 
 `DispatchSession.__aexit__` registers `drain` on its exit stack precisely because of this path: a result-dump failure mid-stream leaves the worker still running, and drain must complete before the handler reads `session._final_wire_context` for the terminal frame — otherwise the read races the worker task still publishing the final wire context.
 
 ### Caller-side response decoding
 
-The caller's `DispatchStream` parses each response frame in turn. Malformed payloads — typically caused by version skew on a shared result class, a missing class on the caller's `sys.path`, or truncated bytes — degrade to `UnexpectedResponse` with the original pickle/import failure on `__cause__`. The load balancer treats this as caller-fault: the worker is healthy, the wire frame is valid, only the caller cannot reconstruct the payload. No eviction.
+The async iterator `WorkerConnection.dispatch` returns parses each response frame in turn. Malformed payloads — typically caused by version skew on a shared result class, a missing class on the caller's `sys.path`, or truncated bytes — degrade to `UnexpectedResponse` with the original pickle/import failure on `__cause__`. The load balancer treats this as caller-fault: the worker is healthy, the wire frame is valid, only the caller cannot reconstruct the payload. No eviction.
 
 A worker that ships a non-`Exception` `BaseException` payload (other than `CancelledError`, which propagates raw to honor stdlib `await task` semantics) is degraded to `UnexpectedResponse`. This is a worker-bug guard: process-level signals like `KeyboardInterrupt` and `SystemExit` cannot be smuggled across the wire.
 
