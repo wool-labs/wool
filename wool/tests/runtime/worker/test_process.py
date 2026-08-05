@@ -1,9 +1,13 @@
 import asyncio
 import multiprocessing.context
+import os
 import signal
+import socket
+import stat
 import threading
 import uuid
 from types import MappingProxyType
+from types import SimpleNamespace
 
 import grpc
 import grpc.aio
@@ -13,12 +17,15 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
+import wool
 from wool import protocol
 from wool.runtime.worker import process as process_module
-from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import current_credentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.exceptions import SlowCredentialResolutionWarning
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.process import WorkerProcess
 from wool.runtime.worker.process import _parent_watchdog
@@ -58,6 +65,37 @@ def watchdog_env(mocker):
         process_module.os, "_exit", side_effect=lambda code: exited.set()
     )
     return mock_parent, mock_exit, exited
+
+
+@pytest.fixture
+def run_harness(mocker):
+    """Stub the run() lifecycle collaborators behind one seam.
+
+    Concentrates the patching the run() tests share — the proxy pool,
+    the proxy resource pool, the metadata pipe (stubbed at the Pipe
+    seam so constructed processes get mock pipe ends), the signal
+    handlers, the gRPC server, and the worker service — so individual
+    tests do not reach into the process under test. Yields a namespace
+    exposing the server and service mocks (shape their port bindings
+    and stopped.wait per test) and the metadata pipe's send end.
+    """
+    mocker.patch.object(wool, "__proxy_pool__")
+    mocker.patch.object(process_module, "ResourcePool")
+    metadata_send = mocker.MagicMock()
+    mocker.patch.object(
+        process_module, "Pipe", return_value=(mocker.MagicMock(), metadata_send)
+    )
+    server = mocker.MagicMock()
+    server.add_secure_port = mocker.MagicMock(return_value=50051)
+    server.add_insecure_port = mocker.MagicMock(return_value=50051)
+    server.start = mocker.AsyncMock()
+    server.stop = mocker.AsyncMock()
+    mocker.patch.object(grpc.aio, "server", return_value=server)
+    service = mocker.MagicMock()
+    service.stopped.wait = mocker.AsyncMock()
+    mocker.patch.object(process_module, "WorkerService", return_value=service)
+    mocker.patch.object(process_module, "_signal_handlers")
+    return SimpleNamespace(server=server, service=service, metadata_send=metadata_send)
 
 
 def _join_watchdog(thread, exited):
@@ -2178,16 +2216,17 @@ class TestWorkerProcess:
         )
         assert deserialized.options == channel
 
-    def test_run_sets_worker_credentials_contextvar(self, mocker):
-        """Test run sets WorkerCredentials ContextVar when credentials are provided.
+    def test_run_should_bind_credential_provider_in_context(self, run_harness):
+        """Test run binds a credential provider in the context.
 
         Given:
             A WorkerProcess with valid WorkerCredentials.
         When:
             run() is called and the server lifecycle executes.
         Then:
-            WorkerCredentials.current() should return the credentials
-            during the server lifecycle.
+            It should bind the coerced provider in the credential
+            context, so current_credentials() returns a provider
+            resolving to those credentials during the server lifecycle.
         """
         # Arrange
         dummy_key = (
@@ -2200,74 +2239,42 @@ class TestWorkerProcess:
 
         captured_current = []
 
-        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch.object(process_module, "ResourcePool")
-
-        mock_server = mocker.MagicMock()
-        mock_server.add_secure_port = mocker.MagicMock(return_value=50051)
-        mock_server.start = mocker.AsyncMock()
-        mock_server.stop = mocker.AsyncMock()
-        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
-
-        mock_service = mocker.MagicMock()
-
         async def capture_current():
-            captured_current.append(CredentialContext.current())
+            captured_current.append(current_credentials())
 
-        mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
-        mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
-
-        mocker.patch.object(process_module, "_signal_handlers")
+        run_harness.service.stopped.wait.side_effect = capture_current
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
-
-        mocker.patch.object(process._set_metadata, "send")
-        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
 
         # Assert
         assert len(captured_current) == 1
-        assert captured_current[0] is creds
+        resolved = captured_current[0]
+        assert isinstance(resolved, WorkerCredentialsProvider)
+        assert resolved.credentials.get() == creds
 
-    def test_run_does_not_set_contextvar_when_credentials_none(self, mocker):
-        """Test run does not set WorkerCredentials ContextVar without credentials.
+    def test_run_should_not_bind_context_when_credentials_none(self, run_harness):
+        """Test run leaves the credential context unbound without credentials.
 
         Given:
             A WorkerProcess with credentials=None.
         When:
             run() is called and the server lifecycle executes.
         Then:
-            WorkerCredentials.current() should return None during
-            the server lifecycle.
+            It should bind no provider, so current_credentials()
+            returns None during the server lifecycle.
         """
         # Arrange
         captured_current = []
 
-        mocker.patch("wool.runtime.worker.process.wool.__proxy_pool__")
-        mocker.patch.object(process_module, "ResourcePool")
-
-        mock_server = mocker.MagicMock()
-        mock_server.add_insecure_port = mocker.MagicMock(return_value=50051)
-        mock_server.start = mocker.AsyncMock()
-        mock_server.stop = mocker.AsyncMock()
-        mocker.patch.object(grpc.aio, "server", return_value=mock_server)
-
-        mock_service = mocker.MagicMock()
-
         async def capture_current():
-            captured_current.append(CredentialContext.current())
+            captured_current.append(current_credentials())
 
-        mock_service.stopped.wait = mocker.AsyncMock(side_effect=capture_current)
-        mocker.patch.object(process_module, "WorkerService", return_value=mock_service)
-
-        mocker.patch.object(process_module, "_signal_handlers")
+        run_harness.service.stopped.wait.side_effect = capture_current
 
         process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
-
-        mocker.patch.object(process._set_metadata, "send")
-        mocker.patch.object(process._set_metadata, "close")
 
         # Act
         process.run()
@@ -2440,3 +2447,327 @@ class TestWorkerProcess:
         assert mock_join.call_args_list[0] == mocker.call(0.1)
         assert mock_join.call_args_list[1].args[0] is not None
         assert mock_join.call_args_list[2] == mocker.call()
+
+    @pytest.mark.asyncio
+    async def test__resolve_startup_credentials_should_warn_while_still_resolving(
+        self, mocker, test_certificates
+    ):
+        """Test a slow credential resolution warns before it completes.
+
+        Given:
+            A worker whose credential factory blocks for longer than the
+            slow-resolution bound, with that bound shortened.
+        When:
+            The worker resolves its startup credentials.
+        Then:
+            It should raise SlowCredentialResolutionWarning while the
+            factory is still running — a warning deferred until the
+            resolution finished would arrive too late to explain a worker
+            that looks hung.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        mocker.patch.object(process_module, "_SLOW_STARTUP_RESOLVE_S", 0.05)
+        release = threading.Event()
+        warned = threading.Event()
+
+        def factory():
+            # Held until the warning is observed, so the assertion can only
+            # pass if the warning preceded the factory returning.
+            assert warned.wait(timeout=5.0)
+            return creds
+
+        provider = WorkerCredentialsProvider(factory, reloadable=True)
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=provider)
+
+        # Act
+        with pytest.warns(SlowCredentialResolutionWarning):
+            task = asyncio.ensure_future(process._resolve_startup_credentials(provider))
+            await asyncio.sleep(0.2)
+            warned.set()
+            resolved = await task
+        release.set()
+
+        # Assert
+        assert resolved == creds
+
+    def test_run_should_use_dynamic_server_credentials_when_reloadable(
+        self, mocker, tmp_path, test_certificates, run_harness
+    ):
+        """Test a reloading provider serves rotating server credentials.
+
+        Given:
+            A WorkerProcess configured with a reloading file provider.
+        When:
+            run() executes the server lifecycle.
+        Then:
+            It should build dynamic SSL server credentials whose fetcher
+            re-resolves the provider on each invocation, yielding a
+            certificate configuration built from the provider's current
+            material, and bind a secure port.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        ca = tmp_path / "ca.pem"
+        key = tmp_path / "key.pem"
+        cert = tmp_path / "cert.pem"
+        ca.write_bytes(ca_pem)
+        key.write_bytes(key_pem)
+        cert.write_bytes(cert_pem)
+        provider = WorkerCredentialsProvider(
+            lambda: WorkerCredentials.from_files(str(ca), str(key), str(cert)),
+            reloadable=True,
+        )
+        resolve_spy = mocker.spy(provider.credentials, "get")
+
+        dynamic_spy = mocker.patch.object(
+            grpc, "dynamic_ssl_server_credentials", return_value=mocker.MagicMock()
+        )
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=provider)
+
+        # Act — run the lifecycle, then invoke the fetcher gRPC captured, which
+        # is the second half of the behavior under test.
+        process.run()
+        fetcher = dynamic_spy.call_args.args[1]
+        resolves_before_fetch = resolve_spy.call_count
+        configuration = fetcher()
+
+        # Assert
+        dynamic_spy.assert_called_once()
+        run_harness.server.add_secure_port.assert_called_once()
+        assert resolve_spy.call_count == resolves_before_fetch + 1
+        assert isinstance(configuration, grpc.ServerCertificateConfiguration)
+
+    def test_run_should_use_static_server_credentials_when_not_reloadable(
+        self, mocker, run_harness
+    ):
+        """Test a static provider keeps the fixed server-credential path.
+
+        Given:
+            A WorkerProcess configured with a bare WorkerCredentials.
+        When:
+            run() executes the server lifecycle.
+        Then:
+            It should bind a secure port without building dynamic SSL
+            server credentials, preserving the static-mTLS posture.
+        """
+        # Arrange
+        creds = WorkerCredentials(ca_cert=b"ca", worker_key=b"key", worker_cert=b"cert")
+        dynamic_spy = mocker.patch.object(grpc, "dynamic_ssl_server_credentials")
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=creds)
+
+        # Act
+        process.run()
+
+        # Assert
+        dynamic_spy.assert_not_called()
+        run_harness.server.add_secure_port.assert_called_once()
+
+    @pytest.mark.skipif(
+        not hasattr(socket, "AF_UNIX"), reason="UDS self-dispatch requires AF_UNIX"
+    )
+    def test_run_should_bind_uds_socket_in_private_directory(self, run_harness):
+        """Test the self-dispatch UDS socket is not world-reachable.
+
+        Given:
+            A worker process that opens its insecure self-dispatch socket.
+        When:
+            run() executes the server lifecycle.
+        Then:
+            The socket should be bound inside a per-worker 0700 directory,
+            so a co-located process under another uid cannot connect to the
+            unauthenticated dispatch service.
+        """
+        # Arrange
+        captured = {}
+
+        def add_insecure_port(target):
+            if target.startswith("unix:"):
+                sock_dir = os.path.dirname(target.removeprefix("unix:"))
+                captured["mode"] = stat.S_IMODE(os.stat(sock_dir).st_mode)
+            return 50051
+
+        run_harness.server.add_insecure_port.side_effect = add_insecure_port
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
+
+        # Act
+        process.run()
+
+        # Assert
+        assert captured.get("mode") == 0o700
+
+    @pytest.mark.skipif(
+        not hasattr(socket, "AF_UNIX"), reason="UDS self-dispatch requires AF_UNIX"
+    )
+    def test_run_should_bind_uds_under_short_base_directory(self, run_harness):
+        """Test the self-dispatch socket stays within the AF_UNIX path limit.
+
+        Given:
+            A worker that opens its self-dispatch socket.
+        When:
+            run() executes the server lifecycle.
+        Then:
+            The socket path should be bound under a short base directory
+            (not macOS's deep per-user temp dir) and stay within the
+            portable 92-byte AF_UNIX path budget, so binding never wedges
+            startup.
+        """
+        # Arrange
+        captured = {}
+
+        def add_insecure_port(target):
+            if target.startswith("unix:"):
+                captured["path"] = target.removeprefix("unix:")
+            return 50051
+
+        run_harness.server.add_insecure_port.side_effect = add_insecure_port
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
+
+        # Act
+        process.run()
+
+        # Assert
+        assert "path" in captured
+        assert len(captured["path"].encode()) <= 92
+
+    @pytest.mark.skipif(
+        not hasattr(socket, "AF_UNIX"), reason="UDS self-dispatch requires AF_UNIX"
+    )
+    def test_run_should_fall_back_to_tmp_when_runtime_dir_is_not_a_directory(
+        self, mocker, tmp_path, run_harness
+    ):
+        """Test the self-dispatch socket falls back to /tmp for an invalid base.
+
+        Given:
+            A worker whose XDG_RUNTIME_DIR points to a path that is not an
+            existing directory.
+        When:
+            run() executes the server lifecycle and binds the self-dispatch
+            socket.
+        Then:
+            The socket should be bound under /tmp, the fallback base, rather
+            than the unusable XDG_RUNTIME_DIR.
+        """
+        # Arrange
+        captured = {}
+
+        def add_insecure_port(target):
+            if target.startswith("unix:"):
+                captured["path"] = target.removeprefix("unix:")
+            return 50051
+
+        mocker.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(tmp_path / "nonexistent")})
+        run_harness.server.add_insecure_port.side_effect = add_insecure_port
+
+        process = WorkerProcess(host="127.0.0.1", port=0, credentials=None)
+
+        # Act
+        process.run()
+
+        # Assert
+        assert captured["path"].startswith("/tmp/wool-")
+
+    @pytest.mark.skipif(
+        not hasattr(socket, "AF_UNIX"), reason="UDS self-dispatch requires AF_UNIX"
+    )
+    def test_run_should_reclaim_stale_uds_directory_when_predecessor_exited_uncleanly(
+        self, mocker, tmp_path, run_harness
+    ):
+        """Test a dead predecessor's UDS directory is reclaimed on startup.
+
+        Given:
+            A stale per-worker UDS directory with a leftover socket file,
+            left at this worker's deterministic uid-derived path by a
+            predecessor that was killed before its graceful cleanup ran.
+        When:
+            run() executes the server lifecycle and binds the self-dispatch
+            socket.
+        Then:
+            The stale directory should be removed and recreated with mode
+            0700 at the same path, the leftover socket file gone, so the
+            bind succeeds and unclean exits never leak directories.
+        """
+        # Arrange
+        uid = uuid.uuid4()
+        stale_dir = tmp_path / f"wool-{uid}"
+        stale_dir.mkdir(mode=0o700)
+        (stale_dir / "dispatch.sock").touch()
+
+        captured = {}
+
+        def add_insecure_port(target):
+            if target.startswith("unix:"):
+                path = target.removeprefix("unix:")
+                sock_dir = os.path.dirname(path)
+                captured["dir"] = sock_dir
+                captured["mode"] = stat.S_IMODE(os.stat(sock_dir).st_mode)
+                captured["stale_socket_present"] = os.path.exists(path)
+            return 50051
+
+        mocker.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(tmp_path)})
+        run_harness.server.add_insecure_port.side_effect = add_insecure_port
+
+        process = WorkerProcess(uid=uid, host="127.0.0.1", port=0, credentials=None)
+
+        # Act
+        process.run()
+
+        # Assert
+        assert captured["dir"] == str(stale_dir)
+        assert captured["mode"] == 0o700
+        assert captured["stale_socket_present"] is False
+
+    @pytest.mark.skipif(
+        not hasattr(socket, "AF_UNIX"), reason="UDS self-dispatch requires AF_UNIX"
+    )
+    def test_run_should_replace_symlink_with_real_directory_when_planted_at_uds_path(
+        self, mocker, tmp_path, run_harness
+    ):
+        """Test a symlink planted at the UDS directory path is not followed.
+
+        Given:
+            A symlink at this worker's deterministic uid-derived UDS
+            directory path pointing at another directory.
+        When:
+            run() executes the server lifecycle and binds the self-dispatch
+            socket.
+        Then:
+            The symlink should be removed and replaced with a real 0700
+            directory, so the socket is never bound inside the symlink's
+            target.
+        """
+        # Arrange
+        uid = uuid.uuid4()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        link = tmp_path / f"wool-{uid}"
+        link.symlink_to(elsewhere)
+
+        captured = {}
+
+        def add_insecure_port(target):
+            if target.startswith("unix:"):
+                sock_dir = os.path.dirname(target.removeprefix("unix:"))
+                captured["is_symlink"] = os.path.islink(sock_dir)
+                captured["mode"] = stat.S_IMODE(os.stat(sock_dir).st_mode)
+            return 50051
+
+        mocker.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(tmp_path)})
+        run_harness.server.add_insecure_port.side_effect = add_insecure_port
+
+        process = WorkerProcess(uid=uid, host="127.0.0.1", port=0, credentials=None)
+
+        # Act
+        process.run()
+
+        # Assert
+        assert captured["is_symlink"] is False
+        assert captured["mode"] == 0o700
+        assert elsewhere.exists()

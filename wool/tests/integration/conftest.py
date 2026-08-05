@@ -7,8 +7,6 @@ fixtures, and builder functions for composable integration tests.
 from __future__ import annotations
 
 import asyncio
-import datetime
-import ipaddress
 import os
 import signal
 import subprocess
@@ -28,14 +26,10 @@ import grpc
 import pytest
 import pytest_asyncio
 from allpairspy import AllPairs
-from cryptography import x509
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
 from hypothesis import strategies as st
 
+from tests.helpers import LOOPBACK_SANS
+from tests.helpers import generate_ca_and_leaf
 from wool.runtime.context.runtime import dispatch_timeout
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
@@ -1548,55 +1542,12 @@ def scenarios_strategy(draw):
 
 def _generate_test_certificates():
     """Generate self-signed test certificates for SSL/TLS testing."""
-    private_key = rsa.generate_private_key(
-        public_exponent=65537, key_size=2048, backend=default_backend()
+    material = generate_ca_and_leaf(
+        LOOPBACK_SANS, common_name="localhost", self_signed=True
     )
-
-    subject = issuer = x509.Name(
-        [
-            x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
-        ]
-    )
-
-    now = datetime.datetime.now(datetime.UTC)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(private_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now)
-        .not_valid_after(now + datetime.timedelta(days=365))
-        .add_extension(
-            x509.SubjectAlternativeName(
-                [
-                    x509.DNSName("localhost"),
-                    x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
-                ]
-            ),
-            critical=False,
-        )
-        .add_extension(
-            x509.ExtendedKeyUsage(
-                [
-                    x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
-                    x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH,
-                ]
-            ),
-            critical=False,
-        )
-        .sign(private_key, hashes.SHA256(), default_backend())
-    )
-
-    private_key_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-
-    return private_key_pem, cert_pem, cert_pem
+    # The fixture's own order is (key, cert, ca) — the reverse of the
+    # helper's. Bound by name so the permutation is stated, not implied.
+    return material.key_pem, material.cert_pem, material.ca_pem
 
 
 @pytest.fixture(scope="session")

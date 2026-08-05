@@ -19,6 +19,7 @@ from enum import Enum
 from enum import auto
 
 import wool
+from wool.runtime.worker.auth import current_credentials
 
 
 class ContextVarPattern(Enum):
@@ -1637,3 +1638,37 @@ async def set_var_and_raise_with_token(namespace: str, name: str, value) -> None
     """
     token = _resolve_oracle_var(namespace, name).set(value)
     raise TokenCarrier(token)
+
+
+def force_adoption(provider):
+    """Make a reloadable provider serve material read after this call.
+
+    ``Refreshing.refresh`` joins a refresh already in flight rather than
+    duplicating it, so a single call can return material a concurrent
+    refresh read before the rotation landed. The second call cannot: the
+    first has committed by then, so it consults the factory afresh.
+    Returns the adopted credentials.
+
+    Lives here rather than beside its test because the routine below
+    calls it on the worker, where only non-test modules are importable.
+    """
+    provider.credentials.refresh()
+    return provider.credentials.refresh()
+
+
+@wool.routine
+async def read_adopted_worker_ca() -> bytes:
+    """Force the worker-side provider to adopt rotated material.
+
+    Runs inside the worker process: grabs the ambient credential
+    provider — the same instance the server's per-handshake fetcher
+    resolves — forces it to re-read its source, and returns the adopted
+    CA certificate so the caller can assert which authority the worker
+    now presents. The dispatch reply doubles as the happens-before
+    barrier: once it returns, every subsequent handshake serves the
+    rotated material.
+    """
+    provider = current_credentials()
+    assert provider is not None
+    material = await asyncio.to_thread(force_adoption, provider)
+    return material.ca_cert

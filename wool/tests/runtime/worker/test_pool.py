@@ -16,6 +16,7 @@ from functools import partial
 from types import MappingProxyType
 from typing import cast
 
+import grpc
 import pytest
 from hypothesis import HealthCheck
 from hypothesis import given
@@ -30,6 +31,7 @@ from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
+from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import IneffectiveLeaseWarning
@@ -58,6 +60,17 @@ def _make_worker_metadata(*tags: str) -> WorkerMetadata:
         tags=frozenset(tags),
         extra=MappingProxyType({}),
     )
+
+
+def _assert_provider_over(forwarded, expected: WorkerCredentials) -> None:
+    """Assert a forwarded ``credentials`` kwarg is a provider over ``expected``.
+
+    The pool normalizes through ``WorkerCredentialsProvider.coerce`` at
+    construction, so what reaches a worker or the proxy is a provider
+    rather than the bare value the caller passed.
+    """
+    assert isinstance(forwarded, wool.WorkerCredentialsProvider)
+    assert forwarded.credentials.get() == expected
 
 
 def _dropped_publish(error=None, *, only=None):
@@ -495,6 +508,26 @@ class TestWorkerPool:
         # Assert
         assert isinstance(pool, WorkerPool)
 
+    def test___init___rejects_raw_channel_credentials(self):
+        """Test the pool normalizes credentials at construction.
+
+        Given:
+            A grpc.ChannelCredentials, the shape the pool's own README
+            examples once passed and which no longer has a home in the
+            credentials union.
+        When:
+            WorkerPool is initialized with it.
+        Then:
+            It should raise TypeError here, where the caller can see it,
+            rather than deferring the failure to worker spawn.
+        """
+        # Arrange
+        channel_credentials = grpc.ssl_channel_credentials()
+
+        # Act & assert
+        with pytest.raises(TypeError, match="WorkerCredentials"):
+            WorkerPool(spawn=1, credentials=channel_credentials)  # type: ignore[arg-type]
+
     def test___init___with_empty_tags(self):
         """Test create pool successfully.
 
@@ -604,7 +637,7 @@ class TestWorkerPool:
         # Assert
         spy_factory.assert_called_once()
         _, kwargs = spy_factory.call_args
-        assert kwargs["credentials"] is worker_credentials
+        _assert_provider_over(kwargs["credentials"], worker_credentials)
 
     @pytest.mark.asyncio
     async def test_worker_context_with_none_credentials(self, mocker: MockerFixture):
@@ -660,7 +693,7 @@ class TestWorkerPool:
 
         wp.LocalWorker.assert_called()
         _, kwargs = wp.LocalWorker.call_args
-        assert kwargs["credentials"] is worker_credentials
+        _assert_provider_over(kwargs["credentials"], worker_credentials)
 
     @pytest.mark.asyncio
     async def test_worker_context_default_factory_without_discovery(
@@ -1153,7 +1186,7 @@ class TestWorkerPool:
         args, kwargs = wp.LocalWorker.call_args
         assert kwargs["host"] == "10.0.0.9"
         assert "gpu" in args
-        assert kwargs["credentials"] is worker_credentials
+        _assert_provider_over(kwargs["credentials"], worker_credentials)
 
     @pytest.mark.asyncio
     async def test_worker_context_default_factory_with_discovery_factory(
@@ -3996,7 +4029,7 @@ class TestWorkerPool:
         When:
             The pool context is entered
         Then:
-            It should pass the exact credentials instance to
+            It should pass a provider over those credentials to
             WorkerProxy — the wiring that aims the security half of
             the proxy's admission gate
         """
@@ -4016,7 +4049,45 @@ class TestWorkerPool:
         # Assert
         mock_proxy_cls.assert_called_once()
         _, proxy_kwargs = mock_proxy_cls.call_args
-        assert proxy_kwargs["credentials"] is worker_credentials
+        _assert_provider_over(proxy_kwargs["credentials"], worker_credentials)
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_forward_a_provider_unwrapped(
+        self,
+        mocker: MockerFixture,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+        worker_credentials,
+    ):
+        """Test an already-normalized provider is not wrapped a second time.
+
+        Given:
+            A WorkerPool constructed with a WorkerCredentialsProvider
+            rather than bare credentials.
+        When:
+            The pool context is entered.
+        Then:
+            It should forward that same provider instance, so a caller
+            who built one keeps its identity, its rotation state, and
+            its cache rather than dispatching against a fresh copy.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider()
+        mock_proxy_cls = mocker.patch.object(
+            wp, "WorkerProxy", return_value=mock_worker_proxy
+        )
+
+        # Act
+        async with WorkerPool(
+            discovery=mock_discovery_service_for_pool,
+            credentials=provider,
+        ):
+            pass
+
+        # Assert
+        mock_proxy_cls.assert_called_once()
+        _, proxy_kwargs = mock_proxy_cls.call_args
+        assert proxy_kwargs["credentials"] is provider
 
     @pytest.mark.asyncio
     async def test___aenter___no_lease_forwards_none(

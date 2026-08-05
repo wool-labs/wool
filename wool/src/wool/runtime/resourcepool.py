@@ -9,9 +9,6 @@ from typing import Generic
 from typing import TypeVar
 from typing import cast
 
-from wool.runtime.typing import Undefined
-from wool.runtime.typing import UndefinedType
-
 T = TypeVar("T")
 
 
@@ -24,7 +21,7 @@ class Resource(Generic[T]):
     released again.
 
     :param pool:
-        The :class:`ResourcePool` this resource belongs to.
+        The `ResourcePool` this resource belongs to.
     :param key:
         The cache key for this resource.
     """
@@ -126,6 +123,12 @@ class ResourcePool(Generic[T]):
             expose its loop).
         :param cleanup:
             Optional cleanup task created when the TTL timer fires.
+        :param doomed:
+            Whether `ResourcePool.expire` marked this entry for
+            finalization as soon as its reference count reaches zero.
+            Cleared when the entry is re-acquired first — re-access
+            resurrects, matching the pool's timer-cancellation
+            semantics.
         """
 
         obj: Any
@@ -133,6 +136,7 @@ class ResourcePool(Generic[T]):
         timer: asyncio.TimerHandle | None = None
         timer_loop: asyncio.AbstractEventLoop | None = None
         cleanup: asyncio.Task | None = None
+        doomed: bool = False
 
     @dataclass
     class Stats:
@@ -194,7 +198,7 @@ class ResourcePool(Generic[T]):
             when not concurrently modifying the cache.
 
         :returns:
-            :class:`ResourcePool.Stats` containing current statistics.
+            `ResourcePool.Stats` containing current statistics.
         """
         return self.Stats(
             total_entries=len(self._cache),
@@ -230,7 +234,7 @@ class ResourcePool(Generic[T]):
         :param key:
             The cache key.
         :returns:
-            :class:`Resource` that can be awaited or used with 'async with'.
+            `Resource` that can be awaited or used with 'async with'.
         """
         return Resource(self, key)
 
@@ -250,6 +254,7 @@ class ResourcePool(Generic[T]):
             if key in self._cache:
                 entry = self._cache[key]
                 entry.reference_count += 1
+                entry.doomed = False
                 self._cancel_timer(entry)
                 await self._cancel_cleanup(entry)
                 return entry.obj
@@ -283,7 +288,18 @@ class ResourcePool(Generic[T]):
             entry.reference_count -= 1
 
             if entry.reference_count <= 0:
-                if self._ttl > 0:
+                if entry.doomed:
+                    # An entry expired while still referenced, whose last
+                    # reference just drained. Spawn the cleanup rather than
+                    # awaiting it here: the finalizer can be a real teardown
+                    # (closing a gRPC channel) and release sits on the
+                    # caller's unwind path, so it must not run while this
+                    # holds the pool lock. Same path a TTL expiry takes.
+                    self._expire(key)
+                elif self._ttl <= 0:
+                    # No TTL to defer to, so finalize inline.
+                    await self._cleanup(key)
+                else:
                     # Defer cleanup with a plain timer rather than a
                     # task parked on a TTL sleep: an unfired
                     # TimerHandle is discarded silently at loop close,
@@ -293,25 +309,46 @@ class ResourcePool(Generic[T]):
                     loop = asyncio.get_running_loop()
                     entry.timer = loop.call_later(self._ttl, self._expire, key)
                     entry.timer_loop = loop
-                else:
-                    # Immediate cleanup
-                    await self._cleanup(key)
 
-    async def clear(self, key: Any | UndefinedType = Undefined) -> None:
-        """Clear cache entries and cancel pending cleanups.
+    async def expire(self, key: Any) -> None:
+        """Treat *key* as TTL-expired now, finalizing it once unreferenced.
+
+        Drops the pool's own retention of an entry — the retention that
+        keeps it cached for reuse until its TTL fires — without touching
+        the reference count callers hold through `acquire` and `release`.
+        An unreferenced entry, including one already idling out its TTL,
+        is finalized immediately; a referenced entry is marked and
+        finalized when its last reference is released, so in-flight users
+        always drain first. Re-acquiring a marked entry before that
+        release clears the mark — re-access resurrects, matching the
+        pool's timer-cancellation semantics. Unlike `clear`, which tears
+        the whole pool down regardless of reference count, this never
+        finalizes a resource out from under an active reference. Expiring
+        a key that is not cached is a silent no-op.
 
         :param key:
-            Specific key to clear (clears all entries if not specified).
-        :raises KeyError:
-            If the given key is not cached.
+            The cache key to expire.
         """
         async with self._lock:
-            # Clean up all entries
-            if key is Undefined:
-                keys = list(self._cache.keys())
+            entry = self._cache.get(key)
+            if entry is None:
+                return
+            if entry.reference_count <= 0:
+                # Also cancels any pending TTL timer or cleanup task.
+                await self._cleanup(key)
             else:
-                keys = [key]
-            for key in keys:
+                entry.doomed = True
+
+    async def clear(self) -> None:
+        """Finalize every cached entry and cancel pending cleanups.
+
+        The teardown primitive: it force-finalizes regardless of reference
+        count, which is correct when the pool itself is going away and
+        there is nothing left to drain for. To retire a single key while
+        the pool stays in use, use `expire`, which drains first.
+        """
+        async with self._lock:
+            for key in list(self._cache.keys()):
                 await self._cleanup(key)
 
     def _cancel_timer(self, entry: ResourcePool.CacheEntry) -> None:

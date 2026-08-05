@@ -51,14 +51,19 @@ from wool.runtime.serializer import Serializer
 from wool.runtime.typing import Factory
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import BoundWorkerFactory
+from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
 from wool.runtime.worker.base import WorkerLike
+from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.exceptions import SlowCredentialResolutionWarning
 from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -69,6 +74,7 @@ from wool.runtime.worker.proxy import WorkerProxy
 from wool.runtime.worker.service import BackpressureContext
 from wool.runtime.worker.service import BackpressureLike
 from wool.runtime.worker.service import WorkerService
+from wool.utilities.refreshing import Refreshing
 
 if TYPE_CHECKING:
     from wool.runtime.context.chain import Chain
@@ -109,6 +115,7 @@ __all__ = [
     "BoundWorkerFactory",
     "ChainContention",
     "ChainSerializationError",
+    "ChannelOptions",
     "Context",
     "ContextVar",
     "ContextVarCollision",
@@ -123,6 +130,7 @@ __all__ = [
     "DiscoveryWorkerNotFound",
     "DispatchingLoadBalancerLike",
     "Factory",
+    "HandshakeError",
     "IneffectiveLeaseWarning",
     "IneffectiveQuorumTimeoutWarning",
     "LanDiscovery",
@@ -134,12 +142,14 @@ __all__ = [
     "LoopbackAdvertisementWarning",
     "NoWorkersAvailable",
     "PredicateFunction",
+    "Refreshing",
     "RoundRobinLoadBalancer",
     "RpcError",
     "RuntimeContext",
     "SerializationError",
     "SerializationWarning",
     "Serializer",
+    "SlowCredentialResolutionWarning",
     "Task",
     "TaskException",
     "TaskFactoryDisplaced",
@@ -153,9 +163,11 @@ __all__ = [
     "Worker",
     "WorkerConnection",
     "WorkerCredentials",
+    "WorkerCredentialsProvider",
     "WorkerFactory",
     "WorkerLike",
     "WorkerMetadata",
+    "WorkerOptions",
     "WorkerPool",
     "WorkerProxy",
     "WorkerService",

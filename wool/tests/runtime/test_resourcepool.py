@@ -528,7 +528,7 @@ class TestResourcePool:
         clearing_loop = asyncio.new_event_loop()
         try:
             # Act
-            clearing_loop.run_until_complete(pool.clear("key"))
+            clearing_loop.run_until_complete(pool.clear())
 
             # Assert
             finalizer.assert_awaited_once_with("obj")
@@ -614,18 +614,18 @@ class TestResourcePool:
         assert pool.stats.total_entries == 2
 
     @pytest.mark.asyncio
-    async def test_clear_should_cancel_in_flight_cleanup_when_cleared_after_expiry(
+    async def test_expire_should_cancel_in_flight_cleanup_when_expired_after_ttl(
         self, expiry_race_pool
     ):
-        """Test clear cancels a fired cleanup racing on the pool lock.
+        """Test expire cancels a fired cleanup racing on the pool lock.
 
         Given:
             A pool whose expired key's TTL timer has fired while the
             pool lock is held by another key's acquire, so the
-            spawned cleanup task and a queued clear of the expired
-            key both wait on the lock with the clear first
+            spawned cleanup task and a queued expiry of the expired
+            key both wait on the lock with the expiry first
         When:
-            The lock holder completes and the queued clear runs
+            The lock holder completes and the queued expiry runs
         Then:
             It should cancel the in-flight cleanup, still run the
             finalizer exactly once, and evict the entry
@@ -633,7 +633,7 @@ class TestResourcePool:
         # Arrange
         pool, finalizer, factory_calls, release_blocker = expiry_race_pool
         blocker_task, clear_task = await _queue_behind_fired_cleanup(
-            pool, factory_calls, pool.clear("expired")
+            pool, factory_calls, pool.expire("expired")
         )
 
         # Act
@@ -732,87 +732,179 @@ class TestResourcePool:
         assert mock_finalizer.call_count == 3
 
     @pytest.mark.asyncio
-    async def test_clear_should_remove_specific_resource_when_key_given(
-        self, mock_finalizer
-    ):
-        """Test clearing a specific key from the pool.
+    async def test_expire_should_leave_other_entries_when_key_expired(self):
+        """Test expiring one key retires only that key.
 
         Given:
-            A pool with multiple resources
+            A pool holding two unreferenced entries under a long TTL.
         When:
-            Clear is called with a specific key
+            One of them is expired.
         Then:
-            Only that resource should be cleaned up and removed
+            It should finalize that entry alone, leaving the other cached
+            and its resource untouched.
         """
         # Arrange
-        mock_factory = Mock()
+        finalized = []
+
+        async def factory(key):
+            return f"obj-{key}"
+
+        async def finalizer(resource):
+            finalized.append(resource)
+
+        pool = ResourcePool(factory, finalizer=finalizer, ttl=3600)
+        async with pool:
+            await pool.acquire("key1")
+            await pool.acquire("key2")
+            await pool.release("key1")
+            await pool.release("key2")
+            assert pool.stats.total_entries == 2
+
+            # Act
+            await pool.expire("key1")
+
+            # Assert
+            assert finalized == ["obj-key1"]
+            assert pool.stats.total_entries == 1
+            assert "key2" in pool.pending_cleanup
+
+    async def test_expire_should_finalize_immediately_when_unreferenced(self):
+        """Test expiring an unreferenced entry skips its remaining TTL.
+
+        Given:
+            A long-TTL pool holding an unreferenced entry whose TTL timer is
+            pending.
+        When:
+            expire() is called with that entry's key.
+        Then:
+            It should run the finalizer immediately, remove the entry, and
+            leave no pending cleanup — no TTL wait.
+        """
+        # Arrange
+        mock_factory = Mock(return_value="resource")
+        mock_finalizer = AsyncMock()
         pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
-
-        # Create multiple resources
-        mock_resource1 = Mock()
-        mock_resource1.name = "resource1"
-        mock_resource2 = Mock()
-        mock_resource2.name = "resource2"
-
-        mock_factory.side_effect = [mock_resource1, mock_resource2]
-
-        # Acquire two resources using context managers to populate cache
-        async with pool.get("key1"):
-            pass  # Resource created and cached with TTL > 0
-        async with pool.get("key2"):
-            pass  # Resource created and cached with TTL > 0
-
-        # Both resources should be in cache but not referenced (TTL keeps them)
-        assert pool.stats.total_entries == 2
-        assert pool.stats.referenced_entries == 0
+        async with pool.get("key"):
+            pass  # Released: the TTL timer is now armed.
+        assert "key" in pool.pending_cleanup
 
         # Act
-        # Clear only one specific key
-        await pool.clear("key1")
+        await pool.expire("key")
 
         # Assert
-        # Only key1 should be removed, key2 should remain
-        assert pool.stats.total_entries == 1
-        assert pool.stats.referenced_entries == 0
-
-        # Finalizer should have been called only for the cleared resource
-        mock_finalizer.assert_called_once_with(mock_resource1)
+        mock_finalizer.assert_awaited_once_with("resource")
+        assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
 
     @pytest.mark.asyncio
-    async def test_clear_should_raise_key_error_when_key_nonexistent(self):
-        """Test clearing a non-existent key raises KeyError.
+    async def test_expire_should_not_finalize_while_referenced(self):
+        """Test expiring a referenced entry leaves the in-flight user alone.
 
         Given:
-            A pool with some resources
+            A long-TTL pool holding an entry with an active reference.
         When:
-            Clear is called with a non-existent key
+            expire() is called.
         Then:
-            Should raise KeyError and not affect existing resources
+            It should leave the resource unfinalized and the entry cached —
+            an in-flight user is never torn out from under.
         """
         # Arrange
-        mock_factory = Mock()
+        mock_factory = Mock(return_value="resource")
+        mock_finalizer = AsyncMock()
+        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
+        await pool.acquire("key")
+
+        # Act
+        await pool.expire("key")
+
+        # Assert
+        mock_finalizer.assert_not_awaited()
+        assert pool.stats.total_entries == 1
+
+    @pytest.mark.asyncio
+    async def test_expire_should_finalize_at_last_release_when_expired(self):
+        """Test an expired entry is finalized as soon as its users drain.
+
+        Given:
+            A long-TTL pool holding an entry that has been expired while
+            still referenced.
+        When:
+            The last reference is released.
+        Then:
+            It should finalize the resource promptly, without waiting out
+            the TTL. The finalizer is spawned rather than awaited by
+            release, so draining the loop is what settles it.
+        """
+        # Arrange
+        mock_factory = Mock(return_value="resource")
+        mock_finalizer = AsyncMock()
+        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
+        await pool.acquire("key")
+        await pool.expire("key")
+
+        # Act
+        await pool.release("key")
+        await asyncio.sleep(0)
+
+        # Assert
+        mock_finalizer.assert_awaited_once_with("resource")
+        assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
+
+    @pytest.mark.asyncio
+    async def test_expire_should_resurrect_entry_when_reacquired(self):
+        """Test re-acquiring an expired entry cancels its doom.
+
+        Given:
+            A long-TTL pool holding a referenced entry that has been
+            expired.
+        When:
+            The key is acquired again before the references drain and both
+            references are then released.
+        Then:
+            It should keep the entry cached on the normal TTL schedule — the
+            re-acquire resurrects it — with the finalizer never called.
+        """
+        # Arrange
+        mock_factory = Mock(return_value="resource")
+        mock_finalizer = AsyncMock()
+        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
+        async with pool:
+            await pool.acquire("key")
+            await pool.expire("key")
+
+            # Act
+            await pool.acquire("key")  # Resurrection: clears the mark.
+            await pool.release("key")
+            await pool.release("key")
+
+            # Assert
+            mock_finalizer.assert_not_awaited()
+            assert pool.stats.total_entries == 1
+            assert "key" in pool.pending_cleanup  # Normal TTL schedule.
+
+    @pytest.mark.asyncio
+    async def test_expire_should_not_raise_when_key_unknown(self):
+        """Test expiring an uncached key is a silent no-op.
+
+        Given:
+            A pool that has never cached the given key.
+        When:
+            expire() is called with that key.
+        Then:
+            It should neither raise nor invoke the finalizer.
+        """
+        # Arrange
+        mock_factory = Mock(return_value="resource")
         mock_finalizer = AsyncMock()
         pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
 
-        # Create one resource
-        mock_resource = Mock()
-        mock_factory.return_value = mock_resource
+        # Act
+        await pool.expire("missing")
 
-        async with pool.get("existing-key"):
-            pass  # Resource created and cached with TTL > 0
-        assert pool.stats.total_entries == 1
-
-        # Act & assert
-        # Try to clear a non-existent key - should raise KeyError
-        with pytest.raises(KeyError):
-            await pool.clear("nonexistent-key")
-
-        # Should not affect existing resources
-        assert pool.stats.total_entries == 1
-        assert pool.stats.referenced_entries == 0  # Not referenced after context exit
-
-        # Finalizer should not have been called
-        mock_finalizer.assert_not_called()
+        # Assert
+        mock_finalizer.assert_not_awaited()
+        assert pool.stats.total_entries == 0
 
     @pytest.mark.asyncio
     async def test_ttl_cleanup_should_schedule_resource_removal(self):
@@ -1029,30 +1121,6 @@ class TestResourcePool:
 
         # Resource should still be cleaned up
         assert pool.stats.total_entries == 0
-
-    @pytest.mark.asyncio
-    async def test_clear_should_raise_key_error_when_key_absent(self):
-        """Test clear with non-existent key raises appropriate error.
-
-        Given:
-            A pool with a resource
-        When:
-            clear() is called with a non-existent key
-        Then:
-            Should raise KeyError for non-existent key
-        """
-        # Arrange
-        mock_factory = Mock(return_value=Mock())
-        pool = ResourcePool(factory=mock_factory, ttl=0)
-
-        # Create one resource first
-        async with pool.get("valid-key"):
-            pass
-
-        # Act & assert
-        # Non-existent keys should raise KeyError
-        with pytest.raises(KeyError):
-            await pool.clear("nonexistent-key")
 
     @pytest.mark.asyncio
     async def test_concurrent_should_maintain_consistency_when_acquire_release_same_key(

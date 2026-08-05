@@ -42,14 +42,17 @@ from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
-from wool.runtime.worker.auth import CredentialContext
 from wool.runtime.worker.auth import WorkerCredentials
+from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import current_credentials
+from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.noreentry import noreentry
+from wool.utilities.throttle import Throttle
 
 if TYPE_CHECKING:
     from contextvars import Token
@@ -67,7 +70,7 @@ def parse_version(version: str) -> Version | None:
     :param version:
         A version string (e.g. ``"1.2.3"``).
     :returns:
-        A :class:`~packaging.version.Version` instance, or
+        A `~packaging.version.Version` instance, or
         ``None`` if unparsable.
     """
     try:
@@ -129,10 +132,17 @@ DEFAULT_QUORUM: Final[int] = 1
 """Default minimum worker count required before dispatch."""
 
 DEFAULT_QUORUM_TIMEOUT: Final[float] = 60.0
-"""Default seconds to wait for ``quorum`` workers before raising :class:`asyncio.TimeoutError`."""
+"""Default seconds to wait for ``quorum`` workers before raising
+`asyncio.TimeoutError`."""
 
 DEFAULT_LAZY: Final[bool] = True
-"""Default lazy-start behavior: defer discovery setup and the quorum wait to first dispatch."""
+"""Default lazy-start behavior: defer discovery setup and the quorum wait to
+first dispatch."""
+
+# Minimum wall-clock interval between identical handshake-failure warnings
+# for one worker. A rejected worker is retried at dispatch rate, so this is
+# what keeps a persistent rejection from flooding the log.
+_HANDSHAKE_WARNING_INTERVAL_S: Final[float] = 60.0
 
 
 # public
@@ -141,9 +151,9 @@ class IneffectiveQuorumTimeoutWarning(WoolWarning):
 
     The timeout value is recorded on the proxy but never consulted —
     no quorum wait runs when the gate is disabled.  Filter this category
-    to ``"error"`` (via :func:`warnings.filterwarnings`) to enforce the
+    to ``"error"`` (via `warnings.filterwarnings`) to enforce the
     previous strict behaviour and turn the warning back into a
-    :class:`ValueError`.
+    `ValueError`.
     """
 
 
@@ -156,7 +166,7 @@ def _restore_proxy(
     quorum: int | None = DEFAULT_QUORUM,
     quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
 ) -> WorkerProxy:
-    """Reconstruct a :class:`WorkerProxy` from its reduce tuple.
+    """Reconstruct a `WorkerProxy` from its reduce tuple.
 
     Module-level so the reduce tuple references a stable callable rather
     than a freshly created closure on every reduction.  New parameters
@@ -182,12 +192,12 @@ def _restore_proxy(
         preserve their pre-quorum "wait for any worker" semantics.
     :param quorum_timeout:
         Seconds to wait for ``quorum`` workers before raising
-        :class:`asyncio.TimeoutError`.  Recorded but never consulted
+        `asyncio.TimeoutError`.  Recorded but never consulted
         when ``quorum`` is ``None`` or ``0``.  Defaults to ``60`` for
         back-compat with reduce tuples emitted by clients that
         predate this parameter.
     :returns:
-        A reconstructed :class:`WorkerProxy` with the original id.
+        A reconstructed `WorkerProxy` with the original id.
     """
     if quorum:
         proxy = WorkerProxy(
@@ -210,6 +220,43 @@ def _restore_proxy(
     return proxy
 
 
+class _HandshakeWarningThrottle:
+    """Per-worker suppression for repeated handshake-failure warnings.
+
+    Bounds the log volume of a handshake-rejected worker that is retried
+    forever, keying `Throttle` on the worker's uid and comparing on
+    ``str(exc)``: the first rejection per worker logs immediately,
+    identical rejections then log at most once per
+    ``_HANDSHAKE_WARNING_INTERVAL_S`` carrying a count of what they
+    suppressed, and a rejection whose detail differs logs immediately.
+    Callers discard a worker's entry when it leaves the pool or
+    dispatches successfully, so a recovered or re-added worker logs fresh
+    and state stays bounded by pool size. Event-loop-confined, which is
+    what `Throttle` requires.
+    """
+
+    def __init__(self) -> None:
+        self._throttle = Throttle(_HANDSHAKE_WARNING_INTERVAL_S)
+
+    def warn(self, metadata: WorkerMetadata, exc: HandshakeError) -> None:
+        """Log the rejection, unless suppressed by the cadence contract."""
+        emit, suppressed = self._throttle.due(metadata.uid, str(exc))
+        if not emit:
+            return
+        _logger.warning(
+            "Skipping worker %s at %s after handshake failure: %s%s",
+            metadata.uid,
+            metadata.address,
+            exc,
+            f" ({suppressed} similar warnings suppressed)" if suppressed else "",
+        )
+
+    def discard(self, uid: uuid.UUID) -> None:
+        """Forget a worker so its next failure logs fresh."""
+        self._throttle.discard(uid)
+
+
+# public
 class WorkerProxy:
     """Client-side proxy for dispatching tasks to distributed workers.
 
@@ -232,8 +279,8 @@ class WorkerProxy:
     closed — a worker whose advertised version does not parse is
     rejected, and if the local protocol version is unresolvable no
     worker is admitted at all (observable as the quorum
-    `asyncio.TimeoutError`). The gate is re-derived from the credential
-    context and protocol version of whichever process holds the proxy,
+    `asyncio.TimeoutError`). The gate is re-derived from the
+    credentials and protocol version of whichever process holds the proxy,
     so a static-worker proxy re-gated after serialization may admit
     fewer workers than at construction, and its construction-time
     quorum check (see ``:raises ValueError:``) does not carry across a
@@ -326,7 +373,13 @@ class WorkerProxy:
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
     :param credentials:
-        Optional channel credentials for TLS/mTLS connections to workers.
+        Optional credentials for TLS/mTLS connections to workers — either a
+        `WorkerCredentials` or a `WorkerCredentialsProvider` (from
+        `WorkerCredentials.as_provider`, or built with a factory callable for
+        identity-based verification or credential rotation). A bare
+        `WorkerCredentials` is wrapped in a non-reloadable provider. When
+        omitted, a proxy created inside a worker defaults to that worker's
+        own credentials; otherwise connections are insecure.
     :param lease:
         Maximum number of workers this proxy will admit from discovery.
         Defaults to ``None`` (unbounded).  The cap counts distinct
@@ -380,7 +433,7 @@ class WorkerProxy:
     _loadbalancer_manager: (
         AsyncContextManager[LoadBalancerLike] | ContextManager[LoadBalancerLike]
     )
-    _credentials: WorkerCredentials | None
+    _provider: WorkerCredentialsProvider | None
     _security_filter: Callable[[WorkerMetadata], bool]
     _version_filter: Callable[[WorkerMetadata], bool]
 
@@ -402,7 +455,9 @@ class WorkerProxy:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: (
+            WorkerCredentials | WorkerCredentialsProvider | None | UndefinedType
+        ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
@@ -417,7 +472,9 @@ class WorkerProxy:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: (
+            WorkerCredentials | WorkerCredentialsProvider | None | UndefinedType
+        ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
@@ -432,7 +489,9 @@ class WorkerProxy:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: (
+            WorkerCredentials | WorkerCredentialsProvider | None | UndefinedType
+        ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
@@ -450,7 +509,9 @@ class WorkerProxy:
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
-        credentials: WorkerCredentials | None | UndefinedType = Undefined,
+        credentials: (
+            WorkerCredentials | WorkerCredentialsProvider | None | UndefinedType
+        ) = Undefined,
         lease: int | None = None,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None | UndefinedType = Undefined,
@@ -536,16 +597,20 @@ class WorkerProxy:
             self._dispatching_deprecation_warned = True
 
         if credentials is Undefined:
-            self._credentials = CredentialContext.current()
+            resolved = current_credentials()
         else:
-            self._credentials = credentials
+            resolved = credentials
+        # Normalize an explicitly passed value into a provider the sentinel
+        # resolves per connection; an ambient read already yields a coerced
+        # provider (see credentials_scope), for which this is a no-op.
+        self._provider = WorkerCredentialsProvider.coerce(resolved)
 
         # Build both halves of the admission gate from the resolved
         # credentials and the local protocol version. Deliberately not
         # serialized: __wool_reduce__ restores the proxy through __init__,
         # so a restored proxy rebuilds the gate from its own credential
         # context and protocol version.
-        self._security_filter = self._create_security_filter(self._credentials)
+        self._security_filter = self._create_security_filter(self._provider)
         self._version_filter = self._create_version_filter()
 
         match (pool_uri, discovery, workers):
@@ -584,6 +649,7 @@ class WorkerProxy:
                 )
         self._sentinel_task: asyncio.Task[None] | None = None
         self._loadbalancer_context: LoadBalancerContext | None = None
+        self._handshake_throttle: _HandshakeWarningThrottle | None = None
 
     async def __aenter__(self):
         """Enter the proxy context and set it as the active proxy.
@@ -628,7 +694,7 @@ class WorkerProxy:
         context.
 
         WorkerProxy is guarded against vanilla pickling (see
-        :meth:`__reduce_ex__`); this method is invoked only by Wool's own
+        `__reduce_ex__`); this method is invoked only by Wool's own
         pickler.
 
         :returns:
@@ -669,13 +735,13 @@ class WorkerProxy:
         WorkerProxy carries credentials that are resolved from the active
         credential context at construction and intentionally not
         transported across process boundaries.  Allowing vanilla
-        :func:`pickle.dumps` or :func:`cloudpickle.dumps` would silently
+        `pickle.dumps` or `cloudpickle.dumps` would silently
         produce payloads that deserialize into nonsense outside the
         dispatch path.  Wool's own pickler consults ``reducer_override``
         (and therefore ``__wool_reduce__``) before ``__reduce_ex__``, so
         this guard is invisible to Wool's own serialization.
 
-        :func:`copy.copy` and :func:`copy.deepcopy` also route through
+        `copy.copy` and `copy.deepcopy` also route through
         ``__reduce_ex__`` and are rejected for the same reason — a
         runtime-bound proxy has no meaningful copy semantics.
 
@@ -731,8 +797,8 @@ class WorkerProxy:
 
         Sets this proxy as the active context variable.  When
         ``lazy=True``, defers resource acquisition until
-        :meth:`dispatch` is first called.  When ``lazy=False``,
-        calls :meth:`start` eagerly.
+        `dispatch` is first called.  When ``lazy=False``,
+        calls `start` eagerly.
 
         :raises RuntimeError:
             If the proxy has already been entered.  ``WorkerProxy``
@@ -816,6 +882,11 @@ class WorkerProxy:
             )
 
             self._loadbalancer_context = LoadBalancerContext()
+            # Built here, not in __init__, so its keys cannot outlive the
+            # pool membership they mirror: a uid stranded by teardown could
+            # never be discarded again, since a respawned worker gets a
+            # fresh one.
+            self._handshake_throttle = _HandshakeWarningThrottle()
             self._workers_changed = asyncio.Event()
             self._sentinel_task = asyncio.create_task(self._worker_sentinel())
             stack.push_async_callback(self._teardown_sentinel)
@@ -830,11 +901,11 @@ class WorkerProxy:
     async def _teardown_sentinel(self) -> None:
         """Cancel the sentinel task and null all partial-init attributes.
 
-        Idempotent rollback callback used by :meth:`start`'s
-        :class:`AsyncExitStack` and reused by :meth:`stop`.  Cancels
+        Idempotent rollback callback used by `start`'s
+        `~contextlib.AsyncExitStack` and reused by `stop`.  Cancels
         ``_sentinel_task`` (if any), awaits its termination swallowing
         ``CancelledError``, and resets every attribute populated by
-        :meth:`start` to ``None`` so a failed start leaves no stale
+        `start` to ``None`` so a failed start leaves no stale
         references.
         """
         if self._sentinel_task:
@@ -845,6 +916,7 @@ class WorkerProxy:
                 pass
             self._sentinel_task = None
         self._loadbalancer_context = None
+        self._handshake_throttle = None
         self._loadbalancer_service = None
         self._loadbalancer_context_manager = None
         self._discovery_stream = None
@@ -855,7 +927,7 @@ class WorkerProxy:
         """Exit the proxy context.
 
         Resets the context variable.  If the proxy was started,
-        delegates to :meth:`stop` to release resources.  Calling
+        delegates to `stop` to release resources.  Calling
         ``exit()`` on an un-started lazy proxy is a safe no-op.
 
         :raises RuntimeError:
@@ -877,7 +949,7 @@ class WorkerProxy:
         Teardown runs in reverse-acquisition order: sentinel first
         (so it stops reading from the discovery stream), then
         discovery, then load balancer.  All three are guaranteed to
-        run via :class:`AsyncExitStack` even if an earlier teardown
+        run via `~contextlib.AsyncExitStack` even if an earlier teardown
         raises.
 
         :raises RuntimeError:
@@ -972,7 +1044,12 @@ class WorkerProxy:
         Only `RpcError` is treated as a worker-health signal:
         a non-transient `RpcError` triggers eviction from the
         context before the balancer is notified, so it observes the
-        capacity change when choosing the next candidate.
+        capacity change when choosing the next candidate; a
+        `TransientRpcError` skips the worker without eviction. A
+        `HandshakeError` is skipped without eviction by the same rule
+        (see `HandshakeError` for the recoverability and logging
+        contract and `_HandshakeWarningThrottle` for the warning
+        cadence).
 
         Exceptions that are not worker-health signals — e.g., a
         strict-mode `wool.ChainSerializationError` or a
@@ -998,6 +1075,7 @@ class WorkerProxy:
             after receiving a success signal via ``asend``.
         """
         assert self._loadbalancer_context is not None
+        assert self._handshake_throttle is not None
         ctx = self._loadbalancer_context
         generator = loadbalancer.delegate(task, context=ctx)
         try:
@@ -1026,11 +1104,22 @@ class WorkerProxy:
                     # eviction.
                     if not isinstance(exc, TransientRpcError):
                         ctx.remove_worker(metadata)
+                        self._handshake_throttle.discard(metadata.uid)
+                    elif isinstance(exc, HandshakeError):
+                        # Transient by the worker-health contract, so the
+                        # split above already skips without eviction; this
+                        # branch only selects the diagnostic warning — see
+                        # HandshakeError and _HandshakeWarningThrottle.
+                        self._handshake_throttle.warn(metadata, exc)
                     try:
                         uid = await generator.athrow(exc)
                     except StopAsyncIteration:
                         raise NoWorkersAvailable() from exc
                     continue
+
+                # Successful dispatch: a later failure from this worker
+                # is a new incident — see _HandshakeWarningThrottle.
+                self._handshake_throttle.discard(uid)
 
                 # Success path: connection.dispatch() returned a live
                 # stream. The proxy owns it until handed off via
@@ -1090,7 +1179,7 @@ class WorkerProxy:
             ctx.__exit__(*args)
 
     def _create_security_filter(
-        self, credentials: WorkerCredentials | None
+        self, provider: WorkerCredentialsProvider | None
     ) -> Callable[[WorkerMetadata], bool]:
         """Create the security half of the sentinel admission gate.
 
@@ -1098,14 +1187,14 @@ class WorkerProxy:
         - Proxy with credentials only admits workers with secure=True
         - Proxy without credentials only admits workers with secure=False
 
-        :param credentials:
-            Channel credentials for this proxy.
+        :param provider:
+            Credential provider for this proxy, or ``None``.
         :returns:
             Predicate function for filtering workers by security
             compatibility, enforced at `_worker_sentinel`
             admission.
         """
-        if credentials is not None:
+        if provider is not None:
             # Proxy has credentials: only accept secure workers
             return lambda metadata: metadata.secure
         else:
@@ -1161,7 +1250,7 @@ class WorkerProxy:
         """Block until at least ``quorum`` workers are admitted.
 
         Waits on the workers-changed event set by
-        :meth:`_worker_sentinel` after each add or drop, re-checking
+        `_worker_sentinel` after each add or drop, re-checking
         the worker count after each wakeup.  The caller is expected
         to gate this call on ``self._quorum`` being a positive
         integer; calling with ``quorum`` of ``None`` or ``0`` will
@@ -1198,18 +1287,16 @@ class WorkerProxy:
         unknown worker is a no-op.
         """
         assert self._loadbalancer_context is not None
+        assert self._handshake_throttle is not None
         assert self._discovery_stream is not None
         assert self._workers_changed is not None
-        client_credentials = (
-            self._credentials.client_credentials()
-            if self._credentials is not None
-            else None
-        )
 
         def connect(metadata: WorkerMetadata) -> WorkerConnection:
+            # The provider is passed through unresolved so each dispatch
+            # resolves current material — see WorkerConnection.
             return WorkerConnection(
                 metadata.address,
-                credentials=client_credentials,
+                credentials=self._provider,
                 options=metadata.options,
             )
 
@@ -1235,6 +1322,9 @@ class WorkerProxy:
                                 reason,
                             )
                             self._loadbalancer_context.remove_worker(event.metadata)
+                            # Departed the pool — see
+                            # _HandshakeWarningThrottle.
+                            self._handshake_throttle.discard(uid)
                             self._workers_changed.set()
                         else:
                             # Fires per rescan for standing chaff, so
@@ -1267,4 +1357,6 @@ class WorkerProxy:
                         self._workers_changed.set()
                 case "worker-dropped":
                     self._loadbalancer_context.remove_worker(event.metadata)
+                    # Departed the pool — see _HandshakeWarningThrottle.
+                    self._handshake_throttle.discard(event.metadata.uid)
                     self._workers_changed.set()
