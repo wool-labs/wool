@@ -3,6 +3,7 @@ import atexit
 import contextlib
 import errno
 import mmap
+import os
 import pickle
 import sys
 import threading
@@ -20,6 +21,7 @@ import portalocker
 import pytest
 from hypothesis import HealthCheck
 from hypothesis import assume
+from hypothesis import example
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
@@ -179,6 +181,39 @@ def tracker_ledger(mocker):
 
 
 @pytest.fixture
+def broken_ftruncate(mocker):
+    """Return a toggle making `os.ftruncate` raise ENOSPC while it is set.
+
+    A create is the only `SharedMemory` construction that truncates —
+    ``if create and size`` guards the call, so an attach skips it — which
+    makes this the one injection point that breaks a create and leaves
+    every attach in the arrangement working. That matters wherever the
+    arrangement attaches before it creates: `~LocalDiscovery.Publisher`
+    remaps the address space on every publish, and a failure planted in
+    the mapping itself would break that remap instead of the block
+    creation under test.
+
+    The truncation runs inside the constructor's ``try``, so failing it
+    reaches the ``except OSError: self.unlink()`` handler that emits the
+    stray unregister — the fault itself, not an approximation of it.
+
+    A toggle rather than a plain patch, so a test can arrange with the
+    syscall working, fail exactly one construction, and then restore it
+    to observe what the failure left behind.
+    """
+    failing = {"now": False}
+    real_ftruncate = os.ftruncate
+
+    def ftruncate(fd, length):
+        if failing["now"]:
+            raise OSError(errno.ENOSPC, "no space left on device")
+        return real_ftruncate(fd, length)
+
+    mocker.patch.object(os, "ftruncate", ftruncate)
+    return failing
+
+
+@pytest.fixture
 def attach_fallback(mocker):
     """Force the attach path taken where `SharedMemory` has no ``track``.
 
@@ -307,6 +342,15 @@ def _segment_name():
     return f"wool-336-{uuid.uuid4().hex[:16]}"
 
 
+#: The largest capacity whose address space still fits in a single page.
+#: Below it a segment created short still maps a whole page, so every slot
+#: lands anyway and an under-sized request is invisible; above it the
+#: mapping is genuinely too small. Derived rather than hard-coded because
+#: the page size is 4 KiB on Linux x86-64 and 16 KiB on macOS arm64, and a
+#: constant tuned to either is a no-op on the other.
+_PAGE_CAPACITY = (mmap.PAGESIZE - local._HEADER_SIZE) // local.REF_WIDTH
+
+
 @pytest.fixture(params=["fallback", "native"])
 def attach_path(request, mocker):
     """Select an attach path, skipping the modern one where it cannot run.
@@ -322,6 +366,201 @@ def attach_path(request, mocker):
     elif sys.version_info < (3, 13):
         pytest.skip("track=False requires Python 3.13")
     return request.param
+
+
+@pytest.mark.parametrize("suppress_register", [False, True])
+@given(
+    rtype=st.sampled_from(["shared_memory", "semaphore"]),
+    same_name=st.booleans(),
+    other=st.text(
+        alphabet="abcdefghijklmnopqrstuvwxyz0123456789", min_size=1, max_size=12
+    ),
+)
+@settings(
+    max_examples=25,
+    deadline=5000,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+def test__suppressing_should_forward_every_call_but_its_own(
+    tracker_ledger, suppress_register, rtype, same_name, other
+):
+    """Test the window silences one segment's calls and nothing else.
+
+    Given:
+        An open suppression window over one segment name, in either
+        configuration, and any other resource the tracker may be asked
+        about from the same thread — differing in name, in resource type,
+        or in both.
+    When:
+        That resource is registered and unregistered inside the window.
+    Then:
+        It should let both calls through. Only an exact match on name
+        *and* resource type is suppressed, so a construction narrows the
+        tracker rather than silencing it — a window that matched on the
+        name alone would swallow this segment's semaphore traffic too.
+    """
+    # Arrange — register and unregister within the example, so the real
+    # tracker stays balanced however many examples Hypothesis draws. The
+    # exact-match case is excluded here and covered by the tests that
+    # drive a real construction through the window.
+    target = _segment_name()
+    name = target if same_name else other
+    assume(not (same_name and rtype == "shared_memory"))
+    assume(name != target or rtype != "shared_memory")
+    tracker_ledger.reset()
+    key = (rtype, name)
+
+    # Act
+    with local._suppressing(target, register=suppress_register):
+        resource_tracker.register(f"/{name}", rtype)
+        resource_tracker.unregister(f"/{name}", rtype)
+
+    # Assert
+    assert key in tracker_ledger.registered
+    assert tracker_ledger.residual == set()
+    assert tracker_ledger.violations == []
+
+
+def test__suppressing_should_raise_when_the_lock_is_held_too_long(mocker):
+    """Test a wedged holder surfaces as an error, not a stalled process.
+
+    Given:
+        Another thread holding the rebind lock, and a short bound on how
+        long an acquisition waits for it.
+    When:
+        A second window is opened.
+    Then:
+        It should raise TimeoutError naming the wait — an unbounded
+        acquire would block the caller for the life of the holder, and
+        the caller is often an event-loop thread with no way to time out
+        a `threading.Lock` from the outside.
+    """
+    # Arrange
+    mocker.patch.object(local, "DEFAULT_LOCK_TIMEOUT", 0.05)
+    holder_ready = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with local._tracker_lock:
+            holder_ready.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert holder_ready.wait(timeout=10)
+
+    # Act & assert
+    try:
+        with pytest.raises(TimeoutError, match="0.05"):
+            with local._suppressing(_segment_name(), register=False):
+                pass  # pragma: no cover — the acquire never succeeds
+    finally:
+        release.set()
+        holder.join(timeout=10)
+        assert not holder.is_alive()
+
+
+def test__suppressing_should_keep_a_wrapper_a_third_party_installed(
+    tracker_ledger,
+):
+    """Test the window yields the hook to anyone who rebound it.
+
+    Given:
+        An open suppression window whose block rebinds the tracker's
+        unregister hook, as an instrumenting library would.
+    When:
+        The window closes.
+    Then:
+        It should leave that wrapper installed rather than overwrite it
+        with the hook it displaced — restoring unconditionally would
+        silently uninstall another library's instrumentation, and the
+        shim the wrapper now delegates to is inert once the window ends.
+    """
+    # Arrange
+    target = _segment_name()
+    ledger_hook = resource_tracker.unregister
+
+    def third_party(name, rtype):  # pragma: no cover — identity only
+        raise AssertionError("not called")
+
+    # Act
+    with local._suppressing(target, register=False):
+        resource_tracker.unregister = third_party
+
+    # Assert
+    try:
+        assert resource_tracker.unregister is third_party
+    finally:
+        # The ledger's own patch was displaced; put it back so this
+        # test's teardown observes the fixture, not the sentinel.
+        resource_tracker.unregister = ledger_hook
+
+
+def test__create_should_track_the_segment_after_a_failed_attach(
+    attach_fallback, tracker_ledger
+):
+    """Test a create still registers a name a failed attach was scoped to.
+
+    Given:
+        An attach of a name no segment holds, on an interpreter reporting
+        a version below 3.13 so the attach opens a suppression window,
+        and the same name created afterwards on the same thread.
+    When:
+        The attach raises and the create follows.
+    Then:
+        It should track the created segment. The attach suppresses the
+        registration this create then depends on, and both are scoped to
+        one name and one thread — so a window that failed to unwind is
+        invisible to every name except this one.
+    """
+    # Arrange
+    name = _segment_name()
+    with pytest.raises(FileNotFoundError):
+        local._attach(name)
+
+    # Act
+    created = local._create(name, 64)
+
+    # Assert
+    try:
+        assert ("shared_memory", name) in tracker_ledger.registered
+        assert ("shared_memory", name) in tracker_ledger.residual
+    finally:
+        created.close()
+        created.unlink()
+
+
+def test__suppressing_should_restore_the_hooks_when_the_block_raises(
+    tracker_ledger,
+):
+    """Test the window unwinds even when its block does not return.
+
+    Given:
+        An open suppression window whose block raises.
+    When:
+        The exception propagates out of the context manager.
+    Then:
+        It should leave a later, unrelated segment tracked normally —
+        restoration that only ran on the returning path would strand the
+        shim for the rest of the process.
+    """
+    # Arrange
+    target = _segment_name()
+    later = _segment_name()
+
+    # Act
+    with pytest.raises(RuntimeError):
+        with local._suppressing(target, register=True):
+            raise RuntimeError("block failed")
+
+    # Assert — the observable consequence, not the hook's identity.
+    with _segment(later):
+        assert ("shared_memory", later) in tracker_ledger.registered
+
+    # No window is open, so the module must be holding no shim to unwind.
+    # A stale entry here is what a forked child would act on, restoring a
+    # hook that is no longer this module's to restore.
+    assert local._shims == {}
 
 
 def test__attach_should_not_register_the_segment(
@@ -511,6 +750,12 @@ def test__attach_should_suppress_the_unregister_when_the_mapping_fails(
         with pytest.raises(OSError):
             local._attach(name)
 
+        # `violations` alone does not discriminate here: the creator's
+        # entry is live, so an unsuppressed unregister is absorbed as an
+        # ordinary discard and records nothing. Surviving in `residual`
+        # is what says the entry the creator's unlink needs is still
+        # there.
+        assert tracker_ledger.residual == {("shared_memory", name)}
         assert tracker_ledger.violations == []
     finally:
         created.close()
@@ -1159,6 +1404,222 @@ class TestLocalDiscovery:
         # Act & assert
         with second as entered:
             assert entered is second
+
+    def test___enter___should_track_the_segment_when_it_is_created(
+        self, namespace, tracker_ledger
+    ):
+        """Test a created segment is registered with this process's tracker.
+
+        Given:
+            A namespace no process currently owns.
+        When:
+            An owner enters its context and leaves it.
+        Then:
+            It should hold exactly one tracked segment for the life of
+            the context and none after it — a segment this process
+            created is the one its own unlink must find registered, so
+            only the failure path may be silenced.
+        """
+        # Act & assert
+        with LocalDiscovery(namespace):
+            assert len(tracker_ledger.residual) == 1
+
+        assert tracker_ledger.residual == set()
+        assert tracker_ledger.violations == []
+
+    def test___enter___should_not_unregister_when_the_create_fails(
+        self, namespace, tracker_ledger, broken_ftruncate
+    ):
+        """Test a create that fails mid-construction unregisters nothing.
+
+        Given:
+            A namespace an owner has already entered and left, so the
+            tracker has held its segment before, and a filesystem that
+            fails the truncation every create performs.
+        When:
+            A fresh owner enters that namespace.
+        Then:
+            It should propagate the error without unregistering a name
+            the tracker is not holding — the removal that raises
+            KeyError inside the tracker process and prints a traceback
+            nothing here can intercept.
+        """
+        # Arrange — the completed cycle is load-bearing, not incidental.
+        # It puts this segment's name into the ledger's history; without
+        # it a stray unregister names something the ledger never saw,
+        # is forwarded to the real tracker unclassified, and leaves this
+        # test green against the very fault it is named for.
+        with LocalDiscovery(namespace):
+            pass
+        assert len(tracker_ledger.registered) == 1
+        assert tracker_ledger.residual == set()
+        broken_ftruncate["now"] = True
+
+        # Act
+        try:
+            with pytest.raises(OSError) as excinfo:
+                with LocalDiscovery(namespace):
+                    pass
+        finally:
+            broken_ftruncate["now"] = False
+
+        # Assert — ENOSPC, not the FileExistsError that is also an OSError.
+        assert excinfo.value.errno == errno.ENOSPC
+        assert tracker_ledger.violations == []
+
+    def test___enter___should_track_the_segment_when_a_retry_follows_a_failure(
+        self, namespace, tracker_ledger, broken_ftruncate
+    ):
+        """Test retrying the same namespace after a failed create tracks it.
+
+        Given:
+            A namespace whose create already failed mid-construction, and
+            a filesystem that has since recovered.
+        When:
+            That same namespace is entered again and left.
+        Then:
+            It should track the retried segment and release it on exit.
+            The same name is what discriminates: a shim left installed
+            keeps matching only the name and thread it was scoped to, so
+            it is invisible to any later segment except this one — whose
+            registration it would swallow, leaving the exit unlink to
+            remove a name the tracker is not holding.
+        """
+        # Arrange
+        broken_ftruncate["now"] = True
+        try:
+            with pytest.raises(OSError):
+                with LocalDiscovery(namespace):
+                    pass
+        finally:
+            broken_ftruncate["now"] = False
+        tracker_ledger.reset()
+
+        # Act & assert
+        with LocalDiscovery(namespace):
+            assert len(tracker_ledger.residual) == 1
+
+        assert tracker_ledger.residual == set()
+        assert tracker_ledger.violations == []
+
+    def test___enter___should_track_a_later_segment_when_a_create_failed(
+        self, namespace, tracker_ledger, broken_ftruncate
+    ):
+        """Test a failed create leaves the tracker suppression unwound.
+
+        Given:
+            An owner whose create already failed mid-construction, and a
+            filesystem that has since recovered.
+        When:
+            A second, unrelated namespace is entered and left.
+        Then:
+            It should track that segment and release it on exit —
+            suppression left installed for every name, rather than the
+            one it was scoped to, would stop tracking process-wide.
+        """
+        # Arrange
+        broken_ftruncate["now"] = True
+        try:
+            with pytest.raises(OSError):
+                with LocalDiscovery(namespace):
+                    pass
+        finally:
+            broken_ftruncate["now"] = False
+        tracker_ledger.reset()
+
+        # Act & assert — the observable consequence, not the hook's identity.
+        with LocalDiscovery(f"{namespace}-later"):
+            assert len(tracker_ledger.residual) == 1
+
+        assert tracker_ledger.residual == set()
+        assert tracker_ledger.violations == []
+
+    @given(capacity=st.integers(min_value=1, max_value=2 * _PAGE_CAPACITY))
+    @settings(
+        max_examples=20,
+        deadline=5000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    # The page boundary, pinned rather than left to the draw: Hypothesis
+    # biases toward small values, and every capacity below `_PAGE_CAPACITY`
+    # maps a whole page regardless of the size requested, so a run that
+    # never crosses it cannot see an under-sized segment at all.
+    @example(capacity=_PAGE_CAPACITY)
+    @example(capacity=_PAGE_CAPACITY + 1)
+    @example(capacity=2 * _PAGE_CAPACITY)
+    def test___enter___should_map_every_slot_it_declares_capacity_for(
+        self, namespace, capacity
+    ):
+        """Test the created segment spans the capacity it was sized for.
+
+        Given:
+            Any capacity a caller may ask a namespace to hold, spanning
+            the point at which its address space outgrows one page.
+        When:
+            The namespace is entered and every slot it declares is
+            written and read back.
+        Then:
+            It should map the whole address space, whatever the capacity —
+            a size computed short, by a dropped header or a truncating
+            division, maps the same page below that boundary and is only
+            observable above it.
+        """
+        # Arrange — a per-example namespace, so one example's segment
+        # cannot be reused by the next under a different capacity.
+        example_ns = f"{namespace}-{capacity}"
+
+        # Act & assert
+        header, width = local._HEADER_SIZE, local.REF_WIDTH
+        with LocalDiscovery(example_ns, capacity=capacity) as discovery:
+            buffer = discovery._address_space.buf
+            assert buffer is not None
+            assert len(buffer) >= header + capacity * width
+            for slot in range(capacity):
+                offset = header + slot * width
+                buffer[offset : offset + width] = bytes([slot % 256]) * width
+            for slot in range(capacity):
+                offset = header + slot * width
+                assert bytes(buffer[offset : offset + width]) == (
+                    bytes([slot % 256]) * width
+                )
+
+    def test___enter___should_forward_other_unregisters_while_creating(
+        self, namespace, tracker_ledger, mocker
+    ):
+        """Test the create window suppresses one segment, not the tracker.
+
+        Given:
+            A construction that registers and then unregisters an
+            unrelated segment while the create's suppression window is
+            open, from the creating thread.
+        When:
+            An owner enters its context.
+        Then:
+            It should let that unrelated unregister reach the tracker,
+            narrowing the suppression to the one segment being created
+            rather than silencing the hook outright.
+        """
+        # Arrange — act on the unrelated name from inside the window,
+        # which is open for the duration of the create's constructor.
+        other = _segment_name()
+        constructing = local.SharedMemory
+
+        def interposed(*args, **kwargs):
+            if kwargs.get("create"):
+                resource_tracker.register(f"/{other}", "shared_memory")
+                resource_tracker.unregister(f"/{other}", "shared_memory")
+            return constructing(*args, **kwargs)
+
+        mocker.patch.object(local, "SharedMemory", interposed)
+
+        # Act
+        with LocalDiscovery(namespace):
+            pass
+
+        # Assert
+        assert ("shared_memory", other) in tracker_ledger.registered
+        assert ("shared_memory", other) not in tracker_ledger.residual
+        assert tracker_ledger.violations == []
 
     def test___exit___should_disarm_atexit_fallback_when_reentry_is_rejected(
         self, namespace, atexit_recorder
@@ -4087,6 +4548,77 @@ class TestLocalDiscoveryPublisher:
                         await publisher.publish("worker-dropped", roster[index])
 
     @pytest.mark.asyncio
+    async def test_publish_should_track_the_block_when_a_worker_is_added(
+        self, namespace, metadata, tracker_ledger
+    ):
+        """Test a worker's block is registered with this process's tracker.
+
+        Given:
+            An owned namespace and a publisher on it.
+        When:
+            A worker is added and then dropped.
+        Then:
+            It should track the block alongside the address space while
+            the worker is registered and release it on the drop — the
+            publisher creates that block, so its own unlink must find it
+            registered.
+        """
+        # Act & assert
+        with LocalDiscovery(namespace):
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", metadata)
+                assert len(tracker_ledger.residual) == 2
+
+                await publisher.publish("worker-dropped", metadata)
+                assert len(tracker_ledger.residual) == 1
+
+        assert tracker_ledger.residual == set()
+        assert tracker_ledger.violations == []
+
+    @pytest.mark.asyncio
+    async def test_publish_should_not_unregister_when_a_block_create_fails(
+        self, namespace, metadata, tracker_ledger, broken_ftruncate
+    ):
+        """Test a block create that fails mid-construction unregisters nothing.
+
+        Given:
+            An owned namespace, a worker already added and dropped so
+            the tracker has held its block before, and a filesystem that
+            fails the truncation every create performs.
+        When:
+            That worker is added again.
+        Then:
+            It should propagate the error without unregistering a name
+            the tracker is not holding, leaving the tracker exactly as
+            the failed block found it.
+        """
+        # Arrange — the add/drop cycle puts the block's name into the
+        # ledger's history, so a stray unregister is classified rather
+        # than forwarded unseen; without it this test is green whether or
+        # not the suppression is there. Failing the truncation only
+        # afterwards leaves every attach this publish performs, including
+        # the address-space remap, working normally.
+        block = local._short_hash(metadata.uid.hex)
+        with LocalDiscovery(namespace):
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", metadata)
+                await publisher.publish("worker-dropped", metadata)
+                assert ("shared_memory", block) in tracker_ledger.registered
+                broken_ftruncate["now"] = True
+
+                # Act
+                try:
+                    with pytest.raises(OSError) as excinfo:
+                        await publisher.publish("worker-added", metadata)
+                finally:
+                    broken_ftruncate["now"] = False
+
+        # Assert
+        assert excinfo.value.errno == errno.ENOSPC
+        assert tracker_ledger.violations == []
+        assert tracker_ledger.residual == set()
+
+    @pytest.mark.asyncio
     async def test_publish_should_leave_the_tracker_balanced_when_worker_readded(
         self, namespace, attach_fallback, tracker_ledger
     ):
@@ -4129,29 +4661,32 @@ class TestLocalDiscoveryPublisher:
             ),
             min_size=1,
             max_size=12,
-        )
+        ),
+        failures=st.sets(st.integers(min_value=0, max_value=11), max_size=4),
     )
     @settings(
-        max_examples=15,
+        max_examples=20,
         deadline=5000,
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test_publish_should_leave_the_tracker_balanced_across_event_sequences(
-        self, namespace, attach_fallback, tracker_ledger, ops
+        self, namespace, attach_fallback, tracker_ledger, broken_ftruncate, ops, failures
     ):
-        """Test the tracker stays consistent however segments are reattached.
+        """Test the tracker stays consistent however segments fail or reattach.
 
         Given:
             An owned namespace on an interpreter reporting a version
-            below 3.13, a three-worker roster, and an arbitrary sequence
-            of add, update, and drop events over it.
+            below 3.13, a three-worker roster, an arbitrary sequence of
+            add, update, and drop events over it, and an arbitrary subset
+            of those events whose block creation fails mid-construction.
         When:
             The sequence is published serially and the owner exits.
         Then:
             It should never unregister a name the tracker is not holding,
-            whatever the order and however many times one segment is
-            attached.
+            whatever the order, however many times one segment is
+            attached, and whichever creates failed — including a create
+            that fails and is then retried for the same worker.
         """
         # Arrange — a per-example namespace and ledger, so neither
         # shared-memory state nor one example's imbalance carries into the
@@ -4173,16 +4708,32 @@ class TestLocalDiscoveryPublisher:
         # Act
         with LocalDiscovery(example_ns):
             async with LocalDiscovery.Publisher(example_ns) as publisher:
-                for action, index in ops:
-                    if action == "add":
-                        await publisher.publish("worker-added", roster[index])
-                        live.add(index)
-                    elif index in live:
-                        if action == "update":
-                            await publisher.publish("worker-updated", roster[index])
-                        else:
-                            await publisher.publish("worker-dropped", roster[index])
-                            live.discard(index)
+                for step, (action, index) in enumerate(ops):
+                    # Only an add for a worker that is not already live
+                    # reaches a block create: a re-add refreshes the block
+                    # the pool still holds, and update and drop only
+                    # attach. Arming the toggle over any of those would
+                    # break an attach instead of the create under test.
+                    failing = step in failures and action == "add" and index not in live
+                    broken_ftruncate["now"] = failing
+                    try:
+                        if action == "add":
+                            if failing:
+                                with pytest.raises(OSError):
+                                    await publisher.publish(
+                                        "worker-added", roster[index]
+                                    )
+                            else:
+                                await publisher.publish("worker-added", roster[index])
+                                live.add(index)
+                        elif index in live:
+                            if action == "update":
+                                await publisher.publish("worker-updated", roster[index])
+                            else:
+                                await publisher.publish("worker-dropped", roster[index])
+                                live.discard(index)
+                    finally:
+                        broken_ftruncate["now"] = False
 
         # Assert
         assert tracker_ledger.violations == []
