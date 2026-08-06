@@ -254,8 +254,10 @@ class LocalDiscovery(Discovery):
         `LocalDiscovery.Publisher.publish` for the full contract.
         Defaults to 128.
     :param block_size:
-        Size in bytes for each worker's serialized data block.
-        Defaults to 1024.
+        Size in bytes for each worker's serialized data block. Each
+        block spends 4 bytes on a length prefix, leaving
+        ``block_size - 4`` for the serialized metadata. Defaults to
+        1024.
     :param lock_timeout:
         Maximum seconds a publisher waits to acquire the cross-process
         file lock; see `LocalDiscovery.Publisher` for the acquisition
@@ -439,8 +441,10 @@ class LocalDiscovery(Discovery):
         :param namespace:
             The namespace identifier for the shared memory region.
         :param block_size:
-            Size in bytes for worker metadata storage blocks. Defaults
-            to 512 bytes, which accommodates typical worker
+            Size in bytes for worker metadata storage blocks. Each
+            block spends 4 bytes on a length prefix, leaving
+            ``block_size - 4`` for the serialized metadata. Defaults
+            to 1024 bytes, which accommodates typical worker
             metadata including tags and extra metadata.
         :param lock_timeout:
             Maximum seconds to wait for the cross-process file lock before
