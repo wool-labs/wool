@@ -603,6 +603,36 @@ class TestLocalDiscovery:
         with pytest.raises(ValueError, match="Expected capacity of at least 1"):
             LocalDiscovery("ns", capacity=capacity)
 
+    @pytest.mark.parametrize("block_size", [0, -1])
+    def test___init___should_raise_when_block_size_below_one(self, block_size):
+        """Test LocalDiscovery rejects a block size below one.
+
+        Given:
+            A block_size of zero or a negative block_size
+        When:
+            LocalDiscovery is instantiated
+        Then:
+            It should raise ValueError, since a block smaller than one
+            byte can never hold a worker's serialized metadata.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Expected block size of at least 1"):
+            LocalDiscovery("ns", block_size=block_size)
+
+    def test___init___should_raise_when_lock_timeout_negative(self):
+        """Test LocalDiscovery rejects a negative lock timeout.
+
+        Given:
+            A negative lock_timeout
+        When:
+            LocalDiscovery is instantiated
+        Then:
+            It should raise ValueError at construction.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="Lock timeout must be non-negative"):
+            LocalDiscovery("ns", lock_timeout=-1)
+
     def test___hash___with_same_namespace(self):
         """Test hash equality for same namespace.
 
@@ -724,25 +754,6 @@ class TestLocalDiscovery:
             async with discovery.publisher as publisher:
                 with pytest.raises(TimeoutError):
                     await publisher.publish("worker-added", metadata)
-
-    def test_publisher_should_raise_when_lock_timeout_negative(self, namespace):
-        """Test the publisher property rejects a negative lock timeout lazily.
-
-        Given:
-            A LocalDiscovery constructed with a negative lock_timeout,
-            which does not validate at construction
-        When:
-            Its publisher property is accessed
-        Then:
-            It should raise ValueError, deferring lock_timeout validation
-            to the Publisher the property builds, mirroring block_size.
-        """
-        # Arrange
-        discovery = LocalDiscovery(namespace, lock_timeout=-1)
-
-        # Act & assert
-        with pytest.raises(ValueError, match="Lock timeout must be non-negative"):
-            discovery.publisher
 
     def test_subscriber_with_default_instance(self, namespace):
         """Test subscriber property returns Subscriber instance.
@@ -1728,19 +1739,22 @@ class TestLocalDiscoveryPublisher:
         # Assert
         assert publisher.namespace == namespace
 
-    def test___init___with_negative_block_size(self, namespace):
-        """Test Publisher rejects negative block sizes.
+    @pytest.mark.parametrize("block_size", [0, -1])
+    def test___init___should_raise_when_block_size_below_one(
+        self, namespace, block_size
+    ):
+        """Test Publisher rejects a block size below one.
 
         Given:
-            A negative block_size
+            A block_size of zero or a negative block_size
         When:
             Publisher is instantiated
         Then:
-            It should raise ValueError.
+            It should raise ValueError at construction.
         """
         # Act & assert
-        with pytest.raises(ValueError, match="Block size must be positive"):
-            LocalDiscovery.Publisher(namespace, block_size=-1)
+        with pytest.raises(ValueError, match="Expected block size of at least 1"):
+            LocalDiscovery.Publisher(namespace, block_size=block_size)
 
     def test___init___should_raise_when_lock_timeout_negative(self, namespace):
         """Test Publisher rejects a negative lock timeout.

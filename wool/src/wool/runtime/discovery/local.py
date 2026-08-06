@@ -263,6 +263,9 @@ class LocalDiscovery(Discovery):
         file lock; see `LocalDiscovery.Publisher` for the acquisition
         contract. Plumbed through to each `Publisher`. Defaults to
         `DEFAULT_LOCK_TIMEOUT`.
+    :raises ValueError:
+        If ``capacity`` or ``block_size`` is less than 1, or
+        ``lock_timeout`` is negative.
 
     Example — publish workers:
 
@@ -302,6 +305,9 @@ class LocalDiscovery(Discovery):
     ):
         if capacity < 1:
             raise ValueError(f"Expected capacity of at least 1, got {capacity}")
+        _validate_block_size(block_size)
+        if lock_timeout is not None and lock_timeout < 0:
+            raise ValueError("Lock timeout must be non-negative")
         self._namespace = namespace or f"workerpool-{uuid4()}"
         self._filter = filter
         self._capacity = capacity
@@ -451,7 +457,8 @@ class LocalDiscovery(Discovery):
             raising `TimeoutError`. ``None`` waits forever. Defaults to
             `DEFAULT_LOCK_TIMEOUT`.
         :raises ValueError:
-            If ``block_size`` is negative, or ``lock_timeout`` is negative.
+            If ``block_size`` is less than 1, or ``lock_timeout`` is
+            negative.
         """
 
         _block_size: int
@@ -472,8 +479,7 @@ class LocalDiscovery(Discovery):
             block_size: int = 1024,
             lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
         ):
-            if block_size < 0:
-                raise ValueError("Block size must be positive")
+            _validate_block_size(block_size)
             if lock_timeout is not None and lock_timeout < 0:
                 raise ValueError("Lock timeout must be non-negative")
             self._namespace = namespace
@@ -890,6 +896,16 @@ class LocalDiscovery(Discovery):
                     "worker-updated", metadata=discovered_workers[uid]
                 )
                 yield event
+
+
+def _validate_block_size(block_size: int) -> None:
+    """Reject a block size below one.
+
+    :raises ValueError:
+        If ``block_size`` is less than 1.
+    """
+    if block_size < 1:
+        raise ValueError(f"Expected block size of at least 1, got {block_size}")
 
 
 def _read_capacity(buf: memoryview) -> int | None:
