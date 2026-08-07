@@ -17,6 +17,7 @@ import grpc.aio
 
 import wool
 from wool import protocol
+from wool.exceptions import WoolError
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.serializer import Serializer
@@ -201,8 +202,28 @@ class HandshakeError(TransientRpcError):
 
 
 # public
+class IdleUnavailable(WoolError):
+    """Raised when a worker does not implement the idle RPC.
+
+    A worker that predates the idle capability answers the idle RPC
+    with gRPC ``UNIMPLEMENTED``; `WorkerConnection.idle_time`
+    translates that into this typed signal so a polling client can
+    detect an old worker and treat idle reporting as unavailable,
+    distinct from a transient hiccup or an unhealthy peer. It descends
+    from `wool.WoolError` — not `RpcError` — because an absent
+    capability is not an RPC-health fault, so ``except RpcError`` does
+    not catch it.
+    """
+
+
+# public
 class WorkerConnection:
-    """gRPC connection to a worker for task dispatch.
+    """Direct single-worker control surface over a pooled gRPC channel.
+
+    Exposes `dispatch` (task execution), `idle_time` (poll the worker's
+    continuous idle duration), and `stop` (shut the remote worker
+    down). ``close`` is distinct: it releases this connection's local
+    pooled channel, whereas `stop` terminates the remote worker.
 
     Acquires pooled gRPC channels keyed by ``(target, credentials,
     options)``.  Each `dispatch` call obtains a reference-counted
@@ -288,6 +309,41 @@ class WorkerConnection:
         # self-dispatches over the loopback UDS never set it.
         self._key: _PoolKey | None = None
         self._uds_key: _PoolKey | None = None
+
+    async def _resolve_key(self) -> _PoolKey:
+        """Resolve the pool key routing the next RPC.
+
+        Decides the route before touching credentials: a self-directed
+        call rides the loopback UDS, which is always insecure — the
+        worker never does TLS/identity against itself — so those calls
+        never pay a credential resolve whose result would be discarded.
+        Otherwise resolves current credential material per call so
+        rotated material is adopted on the next connection (see class
+        docstring); the resolve is awaited rather than read
+        synchronously because this runs on the loop — see
+        `WorkerCredentialsProvider.credentials` for what the read
+        costs. A previous call's superseded TCP key has its pooled
+        channel doomed so it finalizes as soon as in-flight work
+        drains instead of idling out the pool's TTL.
+        """
+        key: _PoolKey
+        if (
+            (metadata := wool.__worker_metadata__) is not None
+            and metadata.address == self._target
+            and (uds_address := wool.__worker_uds_address__) is not None
+        ):
+            key = (uds_address, None, self._options)
+            self._uds_key = key
+        else:
+            if self._provider is None:
+                credentials = None
+            else:
+                credentials = await self._provider.credentials
+            key = (self._target, credentials, self._options)
+            if self._key is not None and self._key != key:
+                await _channel_pool.expire(self._key)
+            self._key = key
+        return key
 
     async def dispatch(
         self,
@@ -381,36 +437,7 @@ class WorkerConnection:
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
 
-        # Decide the route before touching credentials: self-dispatch rides
-        # the loopback UDS, which is always insecure — the worker never does
-        # TLS/identity against itself — so those dispatches never pay a
-        # credential resolve whose result would be discarded.
-        key: _PoolKey
-        if (
-            (metadata := wool.__worker_metadata__) is not None
-            and metadata.address == self._target
-            and (uds_address := wool.__worker_uds_address__) is not None
-        ):
-            key = (uds_address, None, self._options)
-            self._uds_key = key
-        else:
-            # Resolve current credential material per dispatch so rotated
-            # material is adopted on the next connection (see class
-            # docstring). Awaited rather than read synchronously because
-            # this runs on the loop — see WorkerCredentialsProvider.
-            # credentials for what the read costs.
-            if self._provider is None:
-                credentials = None
-            else:
-                credentials = await self._provider.credentials
-            key = (self._target, credentials, self._options)
-            if self._key is not None and self._key != key:
-                # The previous dispatch's material was superseded (e.g., by
-                # rotation): doom its pooled channel so it finalizes as soon
-                # as in-flight dispatches drain instead of idling out the
-                # pool's TTL.
-                await _channel_pool.expire(self._key)
-            self._key = key
+        key = await self._resolve_key()
 
         stream = self._execute(task, key, timeout)
         try:
@@ -459,6 +486,84 @@ class WorkerConnection:
             await _channel_pool.expire(self._key)
         if self._uds_key is not None:
             await _channel_pool.expire(self._uds_key)
+
+    async def idle_time(self, *, timeout: float | None = None) -> float:
+        """Query how long the remote worker has been continuously idle.
+
+        Returns the worker's reported continuous idle duration; see
+        `WorkerService.idle` for how idle is defined and measured. The
+        call draws a channel from this connection's pool, inheriting
+        its credential and secure-channel handling.
+
+        :param timeout:
+            gRPC call deadline in seconds for the poll. ``None``
+            applies no deadline.
+        :returns:
+            The worker's continuous idle duration in seconds.
+        :raises ValueError:
+            If ``timeout`` is not positive.
+        :raises IdleUnavailable:
+            If the worker predates the idle RPC (gRPC ``UNIMPLEMENTED``).
+        :raises TransientRpcError:
+            If the worker returns a transient RPC error
+            (``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, or
+            ``RESOURCE_EXHAUSTED``).
+        :raises RpcError:
+            If the worker returns any other non-transient RPC error.
+        """
+        if timeout is not None and timeout <= 0:
+            raise ValueError("Idle timeout must be positive")
+        async with _channel_pool.get(await self._resolve_key()) as channel:
+            try:
+                response = await channel.stub.idle(protocol.Void(), timeout=timeout)
+            except grpc.RpcError as error:
+                code = error.code()
+                details = error.details() or str(error)
+                if code == grpc.StatusCode.UNIMPLEMENTED:
+                    raise IdleUnavailable(
+                        "Worker does not implement idle reporting"
+                    ) from error
+                if code in self._TRANSIENT_ERRORS:
+                    raise TransientRpcError(code, details) from error
+                raise RpcError(code, details) from error
+        return response.seconds
+
+    async def stop(
+        self, *, grace: float | None = None, timeout: float | None = None
+    ) -> None:
+        """Stop the remote worker.
+
+        Sends the stop RPC over a channel drawn from this connection's
+        pool, inheriting its credential and secure-channel handling.
+
+        :param grace:
+            The worker's shutdown grace period in seconds, carried in
+            the stop request. ``None`` (the wire default of ``0``)
+            cancels in-flight tasks immediately; a positive value
+            waits that long for a graceful drain; a negative value
+            waits indefinitely.
+        :param timeout:
+            gRPC call deadline in seconds for the stop call. ``None``
+            applies no deadline. The worker drains for up to ``grace``
+            before responding, so a finite deadline must exceed it.
+        :raises TransientRpcError:
+            If the worker returns a transient RPC error
+            (``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, or
+            ``RESOURCE_EXHAUSTED``).
+        :raises RpcError:
+            If the worker returns any other non-transient RPC error.
+        """
+        async with _channel_pool.get(await self._resolve_key()) as channel:
+            try:
+                await channel.stub.stop(
+                    protocol.StopRequest(timeout=grace), timeout=timeout
+                )
+            except grpc.RpcError as error:
+                code = error.code()
+                details = error.details() or str(error)
+                if code in self._TRANSIENT_ERRORS:
+                    raise TransientRpcError(code, details) from error
+                raise RpcError(code, details) from error
 
     async def _handshake(
         self,

@@ -13,6 +13,7 @@ from wool.protocol._wire import (
 from wool.protocol._wire import ChainManifest as ChainManifest
 from wool.protocol._wire import ChannelOptions as ChannelOptions
 from wool.protocol._wire import ContextVar as ContextVar
+from wool.protocol._wire import IdleTime as IdleTime
 from wool.protocol._wire import Message as Message
 from wool.protocol._wire import Nack as Nack
 from wool.protocol._wire import Request as Request
@@ -35,6 +36,7 @@ __all__ = [
     "ChainManifest",
     "ChannelOptions",
     "ContextVar",
+    "IdleTime",
     "Message",
     "Nack",
     "Request",
