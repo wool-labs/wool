@@ -72,6 +72,7 @@ jobs:
           INPUT_VERSION: ${{ github.event.inputs.version }}
           VERSION_SEGMENT: ${{ steps.determine-version-segment.outputs.segment }}
         run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
           if [[ "$INPUT_VERSION" != "" ]]; then
             new_version="$INPUT_VERSION"
@@ -230,7 +231,8 @@ jobs:
           GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
           REPO: ${{ github.repository }}
         run: |
-          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $(echo -n "x-access-token:${GH_TOKEN}" | base64)"
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
           git fetch --unshallow
           if [[ -n $(git ls-remote --heads origin release) ]]; then
             git push origin --delete release
