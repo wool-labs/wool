@@ -69,6 +69,7 @@ jobs:
           APP_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
           REPO: ${{ github.repository }}
         run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${REPO}.git"
       - name: Create release branch
         id: cut-release-branch
