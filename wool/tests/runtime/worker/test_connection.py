@@ -1473,14 +1473,13 @@ class TestWorkerConnection:
         await connection.close()
 
     @pytest.mark.asyncio
-    async def test_idle_time_should_return_seconds_when_worker_responds(
+    async def test_idle_should_return_seconds_when_worker_responds(
         self, mocker: MockerFixture
     ):
         """Test idle returns the worker's reported idle seconds.
 
         Given:
-            A connection whose worker answers the idle RPC with an
-            IdleTime
+            A connection whose worker answers the idle RPC with an Idle
         When:
             idle is awaited
         Then:
@@ -1488,19 +1487,19 @@ class TestWorkerConnection:
         """
         # Arrange
         mock_stub = mocker.MagicMock()
-        mock_stub.idle = mocker.AsyncMock(return_value=protocol.IdleTime(seconds=42.5))
+        mock_stub.idle = mocker.AsyncMock(return_value=protocol.Idle(seconds=42.5))
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection("localhost:50051")
 
         # Act
-        result = await connection.idle_time()
+        result = await connection.idle()
 
         # Assert
         assert result == 42.5
         mock_stub.idle.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_idle_time_should_raise_idle_unavailable_when_unimplemented(
+    async def test_idle_should_raise_idle_unavailable_when_unimplemented(
         self, mocker: MockerFixture
     ):
         """Test idle surfaces IdleUnavailable for a worker without the RPC.
@@ -1530,7 +1529,7 @@ class TestWorkerConnection:
 
         # Act & assert
         with pytest.raises(IdleUnavailable):
-            await connection.idle_time()
+            await connection.idle()
 
     @pytest.mark.asyncio
     @settings(
@@ -1544,7 +1543,7 @@ class TestWorkerConnection:
         ),
         details=st.one_of(st.none(), st.just(""), st.text()),
     )
-    async def test_idle_time_should_map_status_code_to_typed_exception(
+    async def test_idle_should_map_status_code_to_typed_exception(
         self, mocker: MockerFixture, code: grpc.StatusCode, details: str | None
     ):
         """Test idle maps every gRPC status code to the right exception.
@@ -1574,7 +1573,7 @@ class TestWorkerConnection:
 
         # Act
         with pytest.raises(Exception) as exc_info:
-            await connection.idle_time()
+            await connection.idle()
 
         # Assert
         raised = exc_info.value
@@ -1598,23 +1597,23 @@ class TestWorkerConnection:
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @given(timeout=st.floats(max_value=0.0, allow_nan=False, allow_infinity=False))
-    async def test_idle_time_should_reject_non_positive_timeout(
+    async def test_idle_should_reject_non_positive_timeout(
         self, mocker: MockerFixture, timeout: float
     ):
-        """Test idle_time rejects a non-positive timeout with ValueError.
+        """Test idle rejects a non-positive timeout with ValueError.
 
         Given:
             A connection whose worker answers the idle RPC, and any
             non-positive timeout
         When:
-            idle_time is awaited with that timeout
+            idle is awaited with that timeout
         Then:
             It should raise ValueError without calling the stub, matching
             dispatch's timeout validation.
         """
         # Arrange
         mock_stub = mocker.MagicMock()
-        mock_stub.idle = mocker.AsyncMock(return_value=protocol.IdleTime(seconds=1.0))
+        mock_stub.idle = mocker.AsyncMock(return_value=protocol.Idle(seconds=1.0))
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection("localhost:50051")
         # Fresh channel per example (see idle-map note above).
@@ -1622,7 +1621,7 @@ class TestWorkerConnection:
 
         # Act & assert
         with pytest.raises(ValueError):
-            await connection.idle_time(timeout=timeout)
+            await connection.idle(timeout=timeout)
         mock_stub.idle.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1642,30 +1641,30 @@ class TestWorkerConnection:
             ),
         )
     )
-    async def test_idle_time_should_forward_positive_timeout(
+    async def test_idle_should_forward_positive_timeout(
         self, mocker: MockerFixture, timeout: float | None
     ):
-        """Test idle_time forwards None or a positive timeout to the stub.
+        """Test idle forwards None or a positive timeout to the stub.
 
         Given:
             A connection whose worker answers the idle RPC, and None or
             any positive timeout
         When:
-            idle_time is awaited with that timeout
+            idle is awaited with that timeout
         Then:
             It should call the stub with a Void request and that timeout
             as the gRPC deadline.
         """
         # Arrange
         mock_stub = mocker.MagicMock()
-        mock_stub.idle = mocker.AsyncMock(return_value=protocol.IdleTime(seconds=1.0))
+        mock_stub.idle = mocker.AsyncMock(return_value=protocol.Idle(seconds=1.0))
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection("localhost:50051")
         # Fresh channel per example (see idle-map note above).
         await clear_channel_pool()
 
         # Act
-        result = await connection.idle_time(timeout=timeout)
+        result = await connection.idle(timeout=timeout)
 
         # Assert
         assert result == 1.0
@@ -1681,7 +1680,7 @@ class TestWorkerConnection:
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @given(seconds=st.floats(width=64, allow_nan=False, allow_infinity=False))
-    async def test_idle_time_should_return_reported_seconds_verbatim(
+    async def test_idle_should_return_reported_seconds_verbatim(
         self, mocker: MockerFixture, seconds: float
     ):
         """Test idle returns the worker's reported seconds losslessly.
@@ -1696,16 +1695,14 @@ class TestWorkerConnection:
         """
         # Arrange
         mock_stub = mocker.MagicMock()
-        mock_stub.idle = mocker.AsyncMock(
-            return_value=protocol.IdleTime(seconds=seconds)
-        )
+        mock_stub.idle = mocker.AsyncMock(return_value=protocol.Idle(seconds=seconds))
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection("localhost:50051")
         # Fresh channel per example (see idle-map note above).
         await clear_channel_pool()
 
         # Act
-        result = await connection.idle_time()
+        result = await connection.idle()
 
         # Assert
         assert result == seconds
