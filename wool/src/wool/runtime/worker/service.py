@@ -582,7 +582,7 @@ class WorkerService(protocol.WorkerServicer):
         self,
         request: protocol.Void,
         context: ServicerContext | None,
-    ) -> protocol.IdleTime:
+    ) -> protocol.Idle:
         """Report how long the worker has been continuously idle.
 
         Idle is the number of seconds since the in-flight task set
@@ -600,13 +600,13 @@ class WorkerService(protocol.WorkerServicer):
         :param context:
             The `grpc.aio.ServicerContext` for this request.
         :returns:
-            An `IdleTime` carrying the continuous idle duration in
+            An `Idle` carrying the continuous idle duration in
             seconds.
         """
         seconds = (
             0.0 if self._idle_since is None else time.monotonic() - self._idle_since
         )
-        return protocol.IdleTime(seconds=seconds)
+        return protocol.Idle(seconds=seconds)
 
     @staticmethod
     def _create_worker_loop(
