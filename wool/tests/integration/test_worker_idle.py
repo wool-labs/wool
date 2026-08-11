@@ -109,7 +109,7 @@ class TestWorkerIdleReporting:
         "cred",
         [CredentialType.INSECURE, CredentialType.MTLS, CredentialType.ONE_WAY],
     )
-    async def test_idle_time_should_accrue_from_startup_over_the_real_wire(
+    async def test_idle_should_accrue_from_startup_over_the_real_wire(
         self, credentials_map, retry_grpc_internal, cred
     ):
         """Test idle accrues from startup, over each transport.
@@ -133,9 +133,9 @@ class TestWorkerIdleReporting:
                 conn = connect()
 
                 # Act
-                first = await conn.idle_time()
+                first = await conn.idle()
                 await asyncio.sleep(0.1)
-                second = await conn.idle_time()
+                second = await conn.idle()
 
                 # Assert
                 assert first >= 0.0
@@ -145,7 +145,7 @@ class TestWorkerIdleReporting:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_idle_time_should_report_zero_while_a_task_is_in_flight(
+    async def test_idle_should_report_zero_while_a_task_is_in_flight(
         self, credentials_map, retry_grpc_internal, tmp_path
     ):
         """Test idle is zero while a dispatched routine runs on the worker.
@@ -177,7 +177,7 @@ class TestWorkerIdleReporting:
                     )
 
                     # Act & assert
-                    assert await conn.idle_time() == 0.0
+                    assert await conn.idle() == 0.0
                 finally:
                     dispatch.cancel()
                     with contextlib.suppress(BaseException):
@@ -186,7 +186,7 @@ class TestWorkerIdleReporting:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_idle_time_should_reset_after_the_in_flight_set_drains(
+    async def test_idle_should_reset_after_the_in_flight_set_drains(
         self, credentials_map, retry_grpc_internal, tmp_path
     ):
         """Test idle resets once the worker's in-flight set drains.
@@ -210,7 +210,7 @@ class TestWorkerIdleReporting:
             ):
                 conn = connect()
                 await asyncio.sleep(0.2)
-                before = await conn.idle_time()
+                before = await conn.idle()
 
                 # Act
                 sentinel = tmp_path / "drain.txt"
@@ -219,10 +219,10 @@ class TestWorkerIdleReporting:
                 # Wait for the docket-drain to be reflected (idle > 0),
                 # then confirm it counts from the drain, not from startup.
                 async def _reset():
-                    return await conn.idle_time() > 0.0
+                    return await conn.idle() > 0.0
 
                 await _poll_coro(_reset)
-                after = await conn.idle_time()
+                after = await conn.idle()
 
                 # Assert
                 assert before > 0.0
@@ -231,7 +231,7 @@ class TestWorkerIdleReporting:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_idle_time_should_raise_idle_unavailable_for_a_legacy_worker(
+    async def test_idle_should_raise_idle_unavailable_for_a_legacy_worker(
         self, retry_grpc_internal
     ):
         """Test idle surfaces IdleUnavailable against a legacy worker.
@@ -257,7 +257,7 @@ class TestWorkerIdleReporting:
             try:
                 # Act & assert
                 with pytest.raises(IdleUnavailable) as exc_info:
-                    await conn.idle_time()
+                    await conn.idle()
                 assert not isinstance(exc_info.value, RpcError)
             finally:
                 await conn.close()
@@ -287,7 +287,7 @@ class TestWorkerControlSurface:
             # Arrange
             async with _bare_worker(credentials_map[cred]) as (worker, connect):
                 conn = connect()
-                assert await conn.idle_time() >= 0.0
+                assert await conn.idle() >= 0.0
 
                 # Act
                 await conn.stop()
@@ -295,7 +295,7 @@ class TestWorkerControlSurface:
                 # Assert
                 async def _unreachable():
                     try:
-                        await conn.idle_time()
+                        await conn.idle()
                         return False
                     except TransientRpcError:
                         return True

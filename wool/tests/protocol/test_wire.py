@@ -8,7 +8,7 @@ from wool import protocol
 EXPECTED_MESSAGE_EXPORTS = [
     "Ack",
     "ChainManifest",
-    "IdleTime",
+    "Idle",
     "Message",
     "Nack",
     "Request",
@@ -273,38 +273,38 @@ class TestMessageConstruction:
         parsed.ParseFromString(nack.SerializeToString())
         assert parsed.HasField("exception") is False
 
-    def test_idle_time_fields(self):
-        """Test IdleTime carries the idle duration in seconds.
+    def test_idle_fields(self):
+        """Test Idle carries the idle duration in seconds.
 
         Given:
             A seconds value, and the default construction.
         When:
-            An IdleTime message is constructed with and without a value.
+            An Idle message is constructed with and without a value.
         Then:
             The seconds field should hold the value and default to 0.0.
         """
         # Arrange, act, & assert
-        assert protocol.IdleTime(seconds=42.5).seconds == 42.5
-        assert protocol.IdleTime().seconds == 0.0
+        assert protocol.Idle(seconds=42.5).seconds == 42.5
+        assert protocol.Idle().seconds == 0.0
 
     @settings(max_examples=100)
     @given(seconds=st.floats(width=64, allow_nan=False, allow_infinity=False))
-    def test_idle_time_roundtrip(self, seconds):
-        """Test IdleTime.seconds survives the wire-format round-trip.
+    def test_idle_roundtrip(self, seconds):
+        """Test Idle.seconds survives the wire-format round-trip.
 
         Given:
             Any finite double value for the idle duration.
         When:
-            An IdleTime message is serialized and re-parsed.
+            An Idle message is serialized and re-parsed.
         Then:
             The seconds field should equal the original exactly — a
             proto double round-trips losslessly.
         """
         # Arrange
-        message = protocol.IdleTime(seconds=seconds)
+        message = protocol.Idle(seconds=seconds)
 
         # Act
-        parsed = protocol.IdleTime()
+        parsed = protocol.Idle()
         parsed.ParseFromString(message.SerializeToString())
 
         # Assert

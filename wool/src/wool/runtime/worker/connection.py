@@ -206,13 +206,12 @@ class IdleUnavailable(WoolError):
     """Raised when a worker does not implement the idle RPC.
 
     A worker that predates the idle capability answers the idle RPC
-    with gRPC ``UNIMPLEMENTED``; `WorkerConnection.idle_time`
-    translates that into this typed signal so a polling client can
-    detect an old worker and treat idle reporting as unavailable,
-    distinct from a transient hiccup or an unhealthy peer. It descends
-    from `wool.WoolError` — not `RpcError` — because an absent
-    capability is not an RPC-health fault, so ``except RpcError`` does
-    not catch it.
+    with gRPC ``UNIMPLEMENTED``; `WorkerConnection.idle` translates
+    that into this typed signal so a polling client can detect an old
+    worker and treat idle reporting as unavailable, distinct from a
+    transient hiccup or an unhealthy peer. It descends from
+    `wool.WoolError` — not `RpcError` — because an absent capability is
+    not an RPC-health fault, so ``except RpcError`` does not catch it.
     """
 
 
@@ -220,7 +219,7 @@ class IdleUnavailable(WoolError):
 class WorkerConnection:
     """Direct single-worker control surface over a pooled gRPC channel.
 
-    Exposes `dispatch` (task execution), `idle_time` (poll the worker's
+    Exposes `dispatch` (task execution), `idle` (poll the worker's
     continuous idle duration), and `stop` (shut the remote worker
     down). ``close`` is distinct: it releases this connection's local
     pooled channel, whereas `stop` terminates the remote worker.
@@ -487,7 +486,7 @@ class WorkerConnection:
         if self._uds_key is not None:
             await _channel_pool.expire(self._uds_key)
 
-    async def idle_time(self, *, timeout: float | None = None) -> float:
+    async def idle(self, *, timeout: float | None = None) -> float:
         """Query how long the remote worker has been continuously idle.
 
         Returns the worker's reported continuous idle duration; see
