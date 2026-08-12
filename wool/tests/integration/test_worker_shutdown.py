@@ -12,10 +12,10 @@ import time
 import uuid
 
 import grpc
-import grpc.aio
 import pytest
 
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.process import WorkerProcess
@@ -410,11 +410,12 @@ class TestWorkerOrphanPrevention:
             SIGSTOP, so it can neither serve the stop RPC nor honor
             SIGTERM.
         When:
-            stop() is awaited with a short timeout.
+            stop() is awaited with a short grace period.
         Then:
-            It should surface the RPC deadline within a bound and
-            leave the worker subprocess killed, rather than hang on
-            the deadline-less stop RPC.
+            It should surface the RPC deadline within a bound — as the
+            TransientRpcError the stop RPC's WorkerConnection routing
+            wraps it in — and leave the worker subprocess killed,
+            rather than hang on the deadline-less stop RPC.
         """
         # Arrange
         worker = LocalWorker(shutdown_grace_period=5.0)
@@ -427,11 +428,11 @@ class TestWorkerOrphanPrevention:
             os.kill(pid, signal.SIGSTOP)
 
             # Act
-            with pytest.raises(grpc.aio.AioRpcError) as excinfo:
-                await asyncio.wait_for(worker.stop(timeout=0.5), timeout=30)
+            with pytest.raises(TransientRpcError) as excinfo:
+                await asyncio.wait_for(worker.stop(grace=0.5), timeout=30)
 
             # Assert
-            assert excinfo.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+            assert excinfo.value.code is grpc.StatusCode.DEADLINE_EXCEEDED
             assert not _pid_alive(pid)
         finally:
             _ensure_killed(pid)

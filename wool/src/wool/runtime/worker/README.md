@@ -128,14 +128,14 @@ class ResilientWorker(LocalWorker):
         await super()._start(timeout=timeout)
         self._monitor_task = asyncio.create_task(self._monitor())
 
-    async def _stop(self, timeout=None):
+    async def _stop(self, grace=None):
         if self._monitor_task:
             self._monitor_task.cancel()
             try:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
-        await super()._stop(timeout=timeout)
+        await super()._stop(grace=grace)
 
     async def _restart(self):
         """Replace the dead process, reusing the original port."""
@@ -290,6 +290,16 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 `WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options)`, with a 60-second TTL — idle channels are finalized after the TTL expires. Keying on the `WorkerCredentials` value (a frozen dataclass, so hashable and value-equal) is what makes rotation observable at the channel layer — see [Credential providers: identity and rotation](#credential-providers-identity-and-rotation). Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams` — the client-side dispatch gate. The worker's own HTTP/2 `MAX_CONCURRENT_STREAMS` ceiling is set to twice that value to absorb transient permit-turnover overshoot without faulting the connection. See issue #290.
 
+### Idle reporting
+
+`WorkerConnection.idle` polls how long the remote worker has been continuously idle, returning the duration in seconds. It wraps `rpc idle (Void) returns (Idle)` on the worker's gRPC service; the response is a `wool.protocol.Idle` carrying a single `seconds` field. The optional `timeout` is the gRPC deadline for the poll itself and must be positive — `None`, the default, applies no deadline. The call draws a channel from the same pool a dispatch would, inheriting the connection's credential and secure-channel handling.
+
+Idle is measured as the time since the worker's in-flight task set last emptied, with worker startup counting as the initial empty state. It reads `0.0` while any task is in flight and restarts from zero each time the set drains again, so the value answers "how long has this worker had nothing to do", not "how long since it was started". The measurement is taken on a monotonic clock, so a wall-clock adjustment cannot distort it. Polling creates no `DispatchSession` and never enters the in-flight set, so reading the measurement cannot disturb it.
+
+This is worker idleness, not channel idleness: the 60-second `ResourcePool` TTL above and `WorkerOptions.max_connection_idle_ms` govern how long an unused *channel* survives, and neither is affected by whether the worker at the other end is executing tasks.
+
+A worker that predates the idle capability answers the RPC with gRPC `UNIMPLEMENTED`, which surfaces as `IdleUnavailable`. It descends from `WoolError` rather than `RpcError`, so `except RpcError` does not catch it — an absent capability is not an RPC-health fault, and a polling client should treat it as "idle reporting is unavailable on this worker" rather than as a transient hiccup or an unhealthy peer. Every other gRPC failure classifies as it does for dispatch: transient codes raise `TransientRpcError`, everything else raises `RpcError`.
+
 ### Transport configuration
 
 Transport options are split into two tiers:
@@ -331,6 +341,8 @@ async with wool.WorkerPool(
 | `RpcError` | All others | Evict worker from context, retry next candidate. |
 
 `HandshakeError` (a `TransientRpcError`) signals that a worker is reachable but the failure carried TLS/mTLS handshake or peer-authentication evidence; the proxy's dispatch loop skips the worker without eviction and logs a per-worker rate-limited warning — see `HandshakeError` for the classification and recoverability contract. A dispatch that drains entirely on handshake failures raises the plain `NoWorkersAvailable`.
+
+The table classifies dispatch-path failures, where the behavior column is the load balancer's response. The idle poll reaches no load balancer and adds one error of its own, `IdleUnavailable` — see [Idle reporting](#idle-reporting).
 
 ### Security filter
 

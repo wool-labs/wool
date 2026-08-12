@@ -28,15 +28,47 @@ from wool.runtime.worker.session import DispatchSession
 from .conftest import PicklableMock
 
 
-def make_task(callable, *, proxy_id="test-proxy-id"):
+def make_task(callable, *, args=(), kwargs=None, proxy_id="test-proxy-id"):
     """Build a `wool.Task` wrapping *callable* with a throwaway worker proxy."""
     return Task(
         id=uuid4(),
         callable=callable,
-        args=(),
-        kwargs={},
+        args=args,
+        kwargs=kwargs or {},
         proxy=PicklableMock(spec=WorkerProxyLike, id=proxy_id),
     )
+
+
+# Registry of per-task control events for tests that need several
+# independently-releasable in-flight tasks (the single global
+# `_control_event` below only drives one). Keyed by an opaque token
+# carried in the task's args so the worker-side routine can look up its
+# own event. Cross-loop/cross-thread safe (threading.Event); tests
+# populate and clear it around each use.
+_keyed_events: dict[str, threading.Event] = {}
+
+
+class _KeyedTaskError(Exception):
+    """Failure raised by a keyed controllable task drawn to raise.
+
+    Module-level so cloudpickle can resolve it when the routine's
+    exception ships back across the dispatch stream.
+    """
+
+
+async def _keyed_task(key: str, should_raise: bool):
+    """Controllable task keyed by *key*.
+
+    Waits on ``_keyed_events[key]`` (set by the test to release it),
+    then returns *key* or raises `_KeyedTaskError`, per *should_raise*.
+    Module-level so cloudpickle can serialize it for dispatch; runs on
+    the worker loop in the same process, so it shares ``_keyed_events``.
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _keyed_events[key].wait)
+    if should_raise:
+        raise _KeyedTaskError(key)
+    return key
 
 
 @pytest.fixture(scope="function")
@@ -5262,6 +5294,233 @@ class TestWorkerService:
         assert type(shipped) is RuntimeError
         assert "_UnpicklableRejected" in str(shipped)
         assert "unpicklable parse failure" in str(shipped)
+
+    @pytest.mark.asyncio
+    async def test_idle_should_report_elapsed_since_startup_when_no_task_dispatched(
+        self, grpc_aio_stub
+    ):
+        """Test the idle RPC reports time accrued since worker startup.
+
+        Given:
+            A `WorkerService` that has never dispatched a task, so its
+            in-flight set has been empty since construction
+        When:
+            The idle RPC is polled twice with a short wait between
+        Then:
+            It should report a positive, non-decreasing idle duration
+            measured from startup.
+        """
+        # Arrange
+        service = WorkerService()
+
+        # Act
+        async with grpc_aio_stub(servicer=service) as stub:
+            await asyncio.sleep(0.05)
+            first = await stub.idle(protocol.Void())
+            await asyncio.sleep(0.05)
+            second = await stub.idle(protocol.Void())
+
+        # Assert
+        assert first.seconds >= 0.04
+        assert second.seconds >= first.seconds
+
+    @pytest.mark.asyncio
+    async def test_idle_should_report_zero_when_task_in_flight(
+        self, service_fixture, mock_worker_proxy_cache
+    ):
+        """Test the idle RPC reports zero while a task is executing.
+
+        Given:
+            A `WorkerService` with one task dispatched and still in
+            flight
+        When:
+            The idle RPC is polled
+        Then:
+            It should report zero seconds, since the in-flight set is
+            non-empty.
+        """
+        # Arrange, act, & assert
+        async with service_fixture as (service, event, stub):
+            response = await stub.idle(protocol.Void())
+            assert response.seconds == 0.0
+
+    @pytest.mark.asyncio
+    async def test_idle_should_reset_when_task_completes(
+        self, grpc_aio_stub, mock_worker_proxy_cache
+    ):
+        """Test the idle count resets once the in-flight set drains.
+
+        Given:
+            A `WorkerService` that has accrued idle time since startup,
+            then dispatches and completes a task
+        When:
+            The idle RPC is polled before dispatch, during execution,
+            and after the task completes
+        Then:
+            It should report accrued idle before dispatch, zero while
+            in flight, and a smaller value than before after the set
+            drains — proving the count reset when work drained.
+        """
+        # Arrange
+        global _control_event
+        _control_event = threading.Event()
+        wool_task = make_task(_controllable_task)
+        request = protocol.Request(task=wool_task.to_protobuf())
+        service = WorkerService()
+
+        # Act
+        try:
+            async with grpc_aio_stub(servicer=service) as stub:
+                await asyncio.sleep(0.1)
+                before = await stub.idle(protocol.Void())
+
+                stream = stub.dispatch()
+                await stream.write(request)
+                await stream.done_writing()
+                async for response in stream:
+                    assert response.HasField("ack")
+                    break
+                during = await stub.idle(protocol.Void())
+
+                _control_event.set()
+                [r async for r in stream]
+                after = await stub.idle(protocol.Void())
+        finally:
+            if _control_event and not _control_event.is_set():
+                _control_event.set()
+            _control_event = None
+
+        # Assert
+        assert before.seconds >= 0.08
+        assert during.seconds == 0.0
+        assert after.seconds < before.seconds
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=20,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(modes=st.lists(st.booleans(), min_size=1, max_size=4))
+    async def test_idle_should_stay_zero_until_the_last_task_drains(
+        self, grpc_aio_stub, mock_worker_proxy_cache, modes
+    ):
+        """Test idle is zero until the last of N in-flight tasks drains.
+
+        Given:
+            A `WorkerService` with N tasks (1-4) dispatched and in
+            flight, each drawn to return or raise
+        When:
+            The tasks are completed one at a time and idle is polled
+            after each completion
+        Then:
+            It should report zero while any task remains in flight
+            (including after each non-final completion) and reset to a
+            positive value only after the last task drains — regardless
+            of how many tasks there are or how each one finishes.
+        """
+        # Arrange
+        keys = [uuid4().hex for _ in modes]
+        for key in keys:
+            _keyed_events[key] = threading.Event()
+        service = WorkerService()
+
+        # Act & assert
+        try:
+            async with grpc_aio_stub(servicer=service) as stub:
+                streams = []
+                for key, should_raise in zip(keys, modes):
+                    wool_task = make_task(_keyed_task, args=(key, should_raise))
+                    stream = stub.dispatch()
+                    await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+                    await stream.done_writing()
+                    async for response in stream:
+                        assert response.HasField("ack")
+                        break
+                    streams.append(stream)
+
+                # All N in flight -> idle is zero.
+                assert (await stub.idle(protocol.Void())).seconds == 0.0
+
+                # Complete one at a time; idle stays zero until the last.
+                for index, (key, stream) in enumerate(zip(keys, streams)):
+                    _keyed_events[key].set()
+                    [_ async for _ in stream]  # drain this task fully
+                    if index < len(keys) - 1:
+                        assert (await stub.idle(protocol.Void())).seconds == 0.0
+
+                # Last task drained -> idle reset and now accruing.
+                await asyncio.sleep(0.02)
+                assert (await stub.idle(protocol.Void())).seconds > 0
+        finally:
+            for key in keys:
+                _keyed_events[key].set()
+                _keyed_events.pop(key, None)
+            if not service.stopped.is_set():
+                await service.stop(protocol.StopRequest(), None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["backpressure", "malformed_id", "sync_callable"])
+    async def test_idle_should_ignore_dispatches_rejected_before_tracking(
+        self, grpc_aio_stub, mock_worker_proxy_cache, kind
+    ):
+        """Test a dispatch rejected before tracking never resets idle.
+
+        Given:
+            A `WorkerService` that has accrued idle, and a dispatch that
+            is rejected before it enters the in-flight set — backpressure
+            (RESOURCE_EXHAUSTED), a malformed task id, or a sync callable
+        When:
+            The rejected dispatch is attempted and idle is polled before
+            and after
+        Then:
+            It should keep counting from startup — the rejected task
+            never enters the docket, so idle is never reset to zero.
+        """
+        # Arrange
+        if kind == "backpressure":
+            service = WorkerService(backpressure=lambda ctx: True)
+        else:
+            service = WorkerService()
+
+        async def returns():
+            return "unreached"
+
+        def sync_callable():
+            return "unreached"
+
+        if kind == "sync_callable":
+            wool_task = make_task(sync_callable)
+        else:
+            wool_task = make_task(returns)
+        request = protocol.Request(task=wool_task.to_protobuf())
+        if kind == "malformed_id":
+            request.task.id = "not-a-uuid"
+
+        # Act & assert
+        try:
+            async with grpc_aio_stub(servicer=service) as stub:
+                await asyncio.sleep(0.05)
+                before = (await stub.idle(protocol.Void())).seconds
+
+                stream = stub.dispatch()
+                await stream.write(request)
+                await stream.done_writing()
+                if kind == "backpressure":
+                    with pytest.raises(grpc.RpcError) as exc_info:
+                        [_ async for _ in stream]
+                    assert exc_info.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+                else:
+                    responses = [r async for r in stream]
+                    assert responses and responses[0].HasField("nack")
+
+                after = (await stub.idle(protocol.Void())).seconds
+
+                assert before > 0
+                assert after >= before
+        finally:
+            if not service.stopped.is_set():
+                await service.stop(protocol.StopRequest(), None)
 
 
 class TestBackpressureContext:
