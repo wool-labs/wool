@@ -18,6 +18,7 @@ from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Callable
 from typing import Final
+from typing import Generator
 from typing import Iterator
 from typing import Self
 from uuid import UUID
@@ -49,37 +50,44 @@ NULL_REF: Final = b"\x00" * REF_WIDTH
 DEFAULT_LOCK_TIMEOUT: Final[float] = 30.0
 _HEADER_MAGIC: Final = b"WLD1"
 _HEADER_SIZE: Final = REF_WIDTH
-# Serialises the resource-tracker rebind window; see `_attach`. Held only
-# across one `SharedMemory` constructor, never across a `_shared_memory` body,
-# which would deadlock the nested attach `_add` performs.
-_attach_lock: threading.Lock = threading.Lock()
+# Serialises the resource-tracker rebind window; see `_suppressing` for the
+# scoping constraint that makes it safe. Taken by every construction this
+# module performs, create and attach alike, and on every Python version —
+# `_attach` skips it only where `track` makes the window unnecessary.
+_tracker_lock: threading.Lock = threading.Lock()
 
-# The tracker's own hooks, captured before anything can rebind them, so a
-# forked child can be put back to a known state.
-_tracker_register: Final = resource_tracker.register
-_tracker_unregister: Final = resource_tracker.unregister
+# The shims an open window has installed, keyed by hook name, each paired
+# with the hook it displaced. Written only under `_tracker_lock`, so a
+# forked child can restore precisely what this module changed and nothing
+# else.
+_shims: dict[str, tuple[Callable, Callable]] = {}
 
 
-def _reinit_attach_lock() -> None:  # pragma: no cover — fork-only path
-    """Reset the attach state a forked child inherited mid-window.
+def _reinit_tracker_state() -> None:  # pragma: no cover — fork-only path
+    """Reset the suppression state a forked child inherited mid-window.
 
     A ``fork`` inside the rebind window copies the lock held, wedging every
-    later attach in the child. Wool starts its own workers with ``spawn``,
-    but `LocalDiscovery` is public and runs inside host processes that may
-    fork — the default start method on Linux below 3.14.
+    later attach or create in the child. Wool starts its own workers with
+    ``spawn``, but `LocalDiscovery` is public and runs inside host processes
+    that may fork — the default start method on Linux below 3.14.
 
-    The hooks are restored too: a fork inside the window leaves the child
-    holding this module's shims, since the frame that would have put them
-    back died with the parent's thread.
+    The shims are unwound too: a fork inside the window leaves the child
+    holding them, since the frame that would have put them back died with
+    the parent's thread. Each is replaced by the hook it displaced rather
+    than by a snapshot taken at import, so a child forked with no window
+    open changes nothing, and instrumentation another library installed
+    after this module was imported survives.
     """
-    global _attach_lock
-    _attach_lock = threading.Lock()
-    resource_tracker.register = _tracker_register
-    resource_tracker.unregister = _tracker_unregister
+    global _tracker_lock
+    _tracker_lock = threading.Lock()
+    for hook, (shim, forward) in _shims.items():
+        if getattr(resource_tracker, hook) is shim:
+            setattr(resource_tracker, hook, forward)
+    _shims.clear()
 
 
 if hasattr(os, "register_at_fork"):  # pragma: no branch — POSIX-only guard
-    os.register_at_fork(after_in_child=_reinit_attach_lock)
+    os.register_at_fork(after_in_child=_reinit_tracker_state)
 
 
 class _Watchdog(FileSystemEventHandler):
@@ -221,9 +229,12 @@ class LocalDiscovery(Discovery):
 
     **Lifecycle.** An instance is single-use: it may be entered once, and a
     second entry raises `RuntimeError` whether or not the first has exited.
-    Use a fresh instance per ``with`` block. The guard binds to the instance,
-    so distinct instances sharing a namespace — which compare equal — are
-    unaffected by each other.
+    An entry that *failed* also counts — a create that raises `OSError`
+    leaves nothing behind, but the instance is spent, so recovering from a
+    transient failure means retrying with a fresh instance rather than the
+    same one. Use a fresh instance per ``with`` block. The guard binds to
+    the instance, so distinct instances sharing a namespace — which compare
+    equal — are unaffected by each other.
 
     The owner's exit unlinks the segment out from under every still-attached
     peer, while a non-owner's exit only closes its own mapping; a non-owner
@@ -323,15 +334,18 @@ class LocalDiscovery(Discovery):
         :returns:
             This instance.
         :raises RuntimeError:
-            If this instance has already been entered.
+            If this instance has already been entered — including by an
+            entry that raised, which still consumes the instance.
+        :raises OSError:
+            If the namespace's segment can neither be created nor
+            attached. Transient at the OS level, but recovery needs a
+            fresh instance; see `LocalDiscovery` for why.
+        :raises TimeoutError:
+            If the tracker rebind window cannot be entered; see `_create`.
         """
         size = _HEADER_SIZE + self._capacity * REF_WIDTH
         try:
-            self._address_space = SharedMemory(
-                name=_short_hash(self._namespace),
-                create=True,
-                size=size,
-            )
+            self._address_space = _create(_short_hash(self._namespace), size)
             self._owner = True
         except FileExistsError:
             self._address_space = _attach(_short_hash(self._namespace))
@@ -549,7 +563,14 @@ class LocalDiscovery(Discovery):
                 registration is restored before the error propagates.
             :raises TimeoutError:
                 If the cross-process file lock is not acquired within this
-                publisher's ``lock_timeout``.
+                publisher's ``lock_timeout``, or the tracker rebind window
+                within `DEFAULT_LOCK_TIMEOUT`; see `_create` for the
+                distinction.
+            :raises OSError:
+                For ``worker-added``, if the worker's block cannot be
+                created — e.g. an exhausted ``/dev/shm``. Nothing is
+                registered and the publisher stays usable, so a retry may
+                succeed.
             """
             async with _lock(self._namespace, timeout=self._lock_timeout):
                 with _shared_memory(_short_hash(self._namespace)) as address_space:
@@ -688,13 +709,12 @@ class LocalDiscovery(Discovery):
                 The name for the shared memory block (typically a worker UUID
                 hex string).
             :returns:
-                A new SharedMemory instance.
+                A new SharedMemory instance, tracked by this process.
+            :raises OSError:
+                If the segment cannot be created. The creation goes through
+                `_create`; see it for the tracker and failure semantics.
             """
-            shared_memory = SharedMemory(
-                name=name,
-                create=True,
-                size=self._block_size,
-            )
+            shared_memory = _create(name, self._block_size)
 
             def cleanup():  # pragma: no cover
                 _unlink_quietly(shared_memory)
@@ -1035,6 +1055,186 @@ def _short_hash(s: str, n: int = 30) -> str:
     return b64_str.rstrip("=")[:n]
 
 
+@contextmanager
+def _suppressing(
+    name: str, *, register: bool, unregister: bool = True
+) -> Generator[None, None, None]:
+    """Silence the tracker calls one `SharedMemory` constructor would make.
+
+    Rebinds the named `resource_tracker` hooks for the duration of the
+    block, so the calls `SharedMemory.__init__` makes on this module's
+    behalf never reach the tracker process. Suppressing ``unregister`` is
+    always right: the constructor's own failure handler issues one whether
+    or not the name was ever registered. Suppressing ``register`` too is
+    right only where the mapping must not be tracked at all — a
+    construction that creates the segment leaves it set, so the entry its
+    own later `SharedMemory.unlink` needs is made.
+
+    .. important::
+        The block MUST contain exactly one `SharedMemory` construction and
+        nothing that constructs shared memory transitively. `_tracker_lock`
+        is not reentrant, so widening the window — across a
+        ``try``/``except`` that falls back to another construction, or
+        across a `_shared_memory` body whose nested attach `_add`
+        performs — deadlocks the process with nothing to diagnose from.
+
+    :param name:
+        The segment name whose tracker calls are suppressed. Callers pass
+        it bare; `SharedMemory` registers names slash-prefixed on POSIX,
+        so both sides are stripped before matching.
+    :param register:
+        Whether to suppress `resource_tracker.register`.
+    :param unregister:
+        Whether to suppress `resource_tracker.unregister`.
+    :yields:
+        Nothing. The block runs with the hooks installed, and they are
+        restored whether it returns or raises.
+    :raises TimeoutError:
+        If the lock cannot be acquired within `DEFAULT_LOCK_TIMEOUT`.
+
+    .. rubric:: Implementation notes
+
+    Rebinding works because `SharedMemory` resolves ``register`` and
+    ``unregister`` as attributes of the `resource_tracker` *module* at call
+    time, on every supported version. A future CPython that imported them
+    by value instead would leave these shims installed and consulted by
+    nobody — silently, in production. What catches that is
+    ``tests/integration/test_local_discovery_tracker.py``: its controls
+    assert the unguarded fault still reproduces, so a CPython that fixed or
+    restructured this turns that suite red rather than turning the guard
+    into a no-op.
+
+    The tracker keeps a per-resource-type `set`, so removing a name it does
+    not hold raises `KeyError` in its main loop. That traceback is printed
+    by the tracker process to the stderr it inherited, after the
+    interpreter that caused it has already exited 0 — nothing in this
+    process can intercept it, which is why suppression at the source is
+    the only remedy available.
+
+    The suppression matches on the calling thread, the resource type, and
+    this segment's name, so the only calls it can swallow are the ones made
+    on the wrapped construction's behalf. A construction running
+    concurrently on another thread stays tracked even for the same name.
+
+    The lock serialises the rebind. Without it two overlapping windows
+    would each capture the other's shim: the second window's call would
+    reach a shim whose thread does not match, be forwarded to the real
+    tracker, and take effect after all — reinstating for an attach the
+    registration bpo-38119 makes fatal, and for a create the stray
+    unregister. That a shim would also be left permanently installed is the
+    lesser effect. Acquisition is bounded rather than indefinite, so a
+    holder that wedges surfaces as an attributable error instead of a
+    process-wide stall.
+    """
+    lock = _tracker_lock
+    if not lock.acquire(timeout=DEFAULT_LOCK_TIMEOUT):
+        raise TimeoutError(
+            f"Timed out acquiring the resource-tracker suppression lock "
+            f"after {DEFAULT_LOCK_TIMEOUT}s"
+        )
+    constructing = threading.get_ident()
+    target = name.lstrip("/")
+    installed: list[str] = []
+    active = True
+
+    def _matches(name: str, rtype: str) -> bool:
+        return (
+            active
+            and threading.get_ident() == constructing
+            and rtype == "shared_memory"
+            and name.lstrip("/") == target
+        )
+
+    def _install(hook: str) -> None:
+        forward = getattr(resource_tracker, hook)
+
+        def _suppressed(name: str, rtype: str) -> None:
+            if not _matches(name, rtype):
+                forward(name, rtype)
+
+        setattr(resource_tracker, hook, _suppressed)
+        _shims[hook] = (_suppressed, forward)
+        installed.append(hook)
+
+    try:
+        if register:
+            _install("register")
+        if unregister:
+            _install("unregister")
+        yield
+    finally:
+        # Neutralise before unwinding. A shim a third party wrapped stays
+        # in their delegation chain for the life of the process, where it
+        # would otherwise keep matching this segment's name against a
+        # thread ident the interpreter is free to reuse once this thread
+        # dies — swallowing a later, legitimate call for the same name.
+        active = False
+        for hook in installed:
+            shim, forward = _shims.pop(hook)
+            # Only restore what is still ours: a third party that rebound
+            # this hook inside the window keeps its wrapper.
+            if getattr(resource_tracker, hook) is shim:
+                setattr(resource_tracker, hook, forward)
+        lock.release()
+
+
+def _create(name: str, size: int) -> SharedMemory:
+    """Create a shared memory segment, tracked by this process.
+
+    This process owns the segment, and the registration this makes is what
+    its own later `unlink` removes. Only the tracker call a *failed*
+    construction would make is silenced.
+
+    :param name:
+        The name of the shared memory segment to create.
+    :param size:
+        The size of the segment, in bytes.
+    :returns:
+        A tracked `SharedMemory` mapped to a newly created segment.
+    :raises FileExistsError:
+        If a segment of that name already exists. Raised before anything
+        is mapped, so nothing is left behind; `LocalDiscovery.__enter__`
+        routes this case to `_attach`.
+    :raises OSError:
+        If the truncation, stat or mapping fails partway through
+        construction — ``ENOSPC`` on an exhausted ``/dev/shm``, ``ENOMEM``
+        on the mapping. The segment is destroyed by the constructor's own
+        handler before the error escapes, so the caller has nothing to
+        clean up; this is the failure the suppression exists for.
+    :raises TimeoutError:
+        If the rebind window cannot be entered within
+        `DEFAULT_LOCK_TIMEOUT`. This bound is the module's own, not the
+        ``lock_timeout`` a caller configures — the two locks guard
+        different things.
+
+    .. rubric:: Implementation notes
+
+    `SharedMemory.__init__` registers the name *after* the block that
+    truncates, stats and maps it, but unlinks from inside that block's
+    ``except OSError`` handler. Below 3.13 `SharedMemory.unlink`
+    unregisters unconditionally; on 3.13 and up it unregisters whenever
+    ``track`` is set, which it is here. So on every supported version a
+    construction that fails mid-way unregisters a name that was never
+    registered — the tracker fault `_suppressing` describes, reached from
+    the owning side rather than the attaching one.
+
+    Only failures raised *inside* that block reach the handler. A
+    ``shm_open`` failure — ``EEXIST``, ``EMFILE``, ``ENOENT`` — raises
+    ahead of it and needs no suppression, which is what makes
+    `LocalDiscovery.__enter__`'s `FileExistsError` fallback safe.
+
+    Unlike the attach case, the ``shm_unlink`` that same handler performs
+    is correct here — the segment it destroys is the one this call just
+    created — so nothing is left for CPython to fix.
+
+    There is no version fast path. `_attach` can ask for ``track=False``
+    on 3.13 and skip the window entirely; nothing equivalent exists for a
+    create, so this rebinds the tracker hook on every supported version.
+    """
+    with _suppressing(name, register=False):
+        return SharedMemory(name=name, create=True, size=size)
+
+
 def _attach(name: str) -> SharedMemory:
     """Map an existing shared memory segment without tracking it.
 
@@ -1053,81 +1253,37 @@ def _attach(name: str) -> SharedMemory:
     :returns:
         An untracked `SharedMemory` mapped to the named segment.
     :raises FileNotFoundError:
-        If no segment of that name exists. The tracker hooks are restored
-        whether the mapping succeeds or raises.
+        If no segment of that name exists.
 
     .. rubric:: Implementation notes
 
     Python 3.13 says this directly with ``track=False``. Below it there is
     no such parameter, so the registration is suppressed at its source for
     as long as the constructor runs. Undoing it afterwards, i.e. registering
-    and then unregistering, is *not* equivalent: the tracker's cache is a
-    set shared by every process in the tree, so the first attach's
-    unregister discards the entry the creator made, and the creator's own
-    unlink later finds nothing to remove — which raises `KeyError` inside
-    the tracker process and prints a traceback to stderr that nothing in the
-    attaching process can intercept.
+    and then unregistering, is *not* equivalent: the tracker's cache is
+    shared by every process in the tree, so the first attach's unregister
+    discards the entry the creator made and the creator's own unlink later
+    finds nothing to remove.
 
-    Both hooks are rebound, not just `resource_tracker.register`: the
+    Both hooks are suppressed, not just `resource_tracker.register`: the
     constructor wraps its own ``mmap`` in ``except OSError: self.unlink()``,
     and that unlink issues the very unregister this function exists to
     avoid. It also calls ``shm_unlink``, which is CPython's to own and
     cannot be intercepted from here — a mid-construction `OSError` therefore
-    still destroys the segment.
+    still destroys a segment this process does not own. `_create` covers
+    the same handler on the owning side, where only the unregister is
+    wrong.
 
-    The suppression matches on the calling thread, the resource type, and
-    this segment's name, and lasts only one constructor call, so the sole
-    call it can swallow is the one made on this function's behalf. A
-    ``create=True`` running concurrently on another thread stays tracked
-    even for the same name. `SharedMemory` registers names slash-prefixed
-    on POSIX while callers pass them bare, so both sides are stripped
-    before matching.
-
-    The lock serialises the rebind. Without it two overlapping attaches
-    would each capture the other's shim: the second attach's registration
-    would reach a shim whose thread does not match, be forwarded to the
-    real tracker, and be tracked after all — reinstating bpo-38119. That a
-    shim would also be left permanently installed is the lesser effect.
-    `os.register_at_fork` replaces the lock in a child, since a fork inside
-    the window would otherwise copy it held and wedge every later attach.
+    See `_suppressing` for how the window is scoped and serialised, and
+    for the tracker behaviour both callers are working around.
     """
     if sys.version_info >= (3, 13):
         # Unreachable below 3.13, where the parameter does not exist, so
         # the 3.11 and 3.12 legs would otherwise report it missing.
         return SharedMemory(name=name, track=False)  # pragma: no cover
 
-    with _attach_lock:
-        register = resource_tracker.register
-        unregister = resource_tracker.unregister
-        attaching = threading.get_ident()
-        target = name.lstrip("/")
-
-        def _suppressed(name: str, rtype: str) -> bool:
-            return (
-                threading.get_ident() == attaching
-                and rtype == "shared_memory"
-                and name.lstrip("/") == target
-            )
-
-        def _register(name: str, rtype: str) -> None:
-            if not _suppressed(name, rtype):
-                register(name, rtype)
-
-        def _unregister(name: str, rtype: str) -> None:
-            if not _suppressed(name, rtype):
-                unregister(name, rtype)
-
-        try:
-            resource_tracker.register = _register
-            resource_tracker.unregister = _unregister
-            return SharedMemory(name=name)
-        finally:
-            # Only restore what is still ours: a third party that rebound
-            # either hook inside the window keeps its wrapper.
-            if resource_tracker.register is _register:
-                resource_tracker.register = register
-            if resource_tracker.unregister is _unregister:
-                resource_tracker.unregister = unregister
+    with _suppressing(name, register=True):
+        return SharedMemory(name=name)
 
 
 @contextmanager
@@ -1136,8 +1292,9 @@ def _shared_memory(name):
 
     Context manager that opens a shared memory region for reading or writing
     and ensures it is properly closed on exit. Does not create new memory
-    regions (use `SharedMemory` with ``create=True`` for that). The mapping
-    is untracked — see `_attach` for why, and for what that forbids.
+    regions (use `_create` for that, which is the module's only sanctioned
+    creation path). The mapping is untracked — see `_attach` for why, and
+    for what that forbids.
 
     :param name:
         The name of the shared memory region to open.
