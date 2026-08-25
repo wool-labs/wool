@@ -20,10 +20,13 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import uuid
+from pathlib import Path
 
 import pytest
 
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
@@ -31,6 +34,15 @@ from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
 from .conftest import _TIMEOUT
+from .conftest import release_subprocess
+from .conftest import spawn_script_subprocess
+
+#: Passed to owner interpreters so the workers they spawn can import
+#: this suite's routines when unpickling a dispatch. Spawned children
+#: inherit the parent's ``sys.path``, so setting it in the owner is
+#: enough. Passed explicitly rather than relying on an inherited
+#: working directory.
+_TESTS_ROOT = Path(__file__).resolve().parents[1]
 
 _OWNER_SCRIPT = """
 import sys
@@ -60,6 +72,67 @@ segment = SharedMemory(name=_short_hash(sys.argv[1]), create=False)
 segment.close()
 segment.unlink()
 print("unlinked", flush=True)
+"""
+
+_XPROC_OWNER_SCRIPT = """
+import asyncio
+import sys
+
+sys.path.insert(0, sys.argv[2])
+
+from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.worker.local import LocalWorker
+
+
+async def main():
+    namespace = sys.argv[1]
+    with LocalDiscovery(namespace):
+        worker = LocalWorker()
+        await worker.start()
+        publisher = LocalDiscovery.Publisher(namespace)
+        async with publisher:
+            await publisher.publish("worker-added", worker.metadata)
+            print("ready", flush=True)
+            await asyncio.to_thread(sys.stdin.readline)
+            await publisher.publish("worker-dropped", worker.metadata)
+        await worker.stop()
+    print("clean-exit", flush=True)
+
+
+asyncio.run(main())
+"""
+
+_RACING_CLAIMANT_SCRIPT = """
+import sys
+import time
+
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
+from wool.runtime.discovery.local import LocalDiscovery
+
+namespace, deadline = sys.argv[1], float(sys.argv[2])
+# Spin to the shared wall-clock deadline so every claimant attempts the
+# create within the same instant; a sequential probe would pass against a
+# check-then-create implementation, which is the race being removed.
+while time.time() < deadline:
+    pass
+try:
+    with LocalDiscovery(namespace):
+        print("claimed", flush=True)
+except DiscoveryNamespaceInUse as error:
+    print(f"rejected {error.segment}", flush=True)
+"""
+
+_CLAIMANT_SCRIPT = """
+import sys
+
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
+from wool.runtime.discovery.local import LocalDiscovery
+
+try:
+    with LocalDiscovery(sys.argv[1]):
+        print("claimed", flush=True)
+except DiscoveryNamespaceInUse as error:
+    print(f"rejected: {error}", flush=True)
 """
 
 _LEAKED_OWNER_SCRIPT = """
@@ -381,6 +454,325 @@ class TestDiscoveryFailureIsolation:
                     _ensure_killed(child.pid)
             for pid in pids:
                 _ensure_killed(pid)
+
+
+@pytest.mark.integration
+class TestCrossProcessOwnership:
+    def test___enter___should_raise_when_another_process_owns_the_namespace(self):
+        """Test ownership is asserted across process boundaries.
+
+        Given:
+            An owner LocalDiscovery holding a namespace in its own
+            interpreter
+        When:
+            An independent interpreter enters the same namespace
+        Then:
+            It should be rejected with DiscoveryNamespaceInUse rather
+            than attaching to the owner's registry, and leave the owner
+            able to exit cleanly.
+        """
+        # Arrange
+        namespace = f"claim-{uuid.uuid4().hex[:12]}"
+        owner = subprocess.Popen(
+            [sys.executable, "-c", _OWNER_SCRIPT, namespace],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert owner.stdin is not None and owner.stdout is not None
+            assert owner.stdout.readline().strip() == "ready"
+
+            # Act
+            claimant = subprocess.run(
+                [sys.executable, "-c", _CLAIMANT_SCRIPT, namespace],
+                capture_output=True,
+                text=True,
+                timeout=_TIMEOUT,
+            )
+
+            # Assert — the claim was refused, not silently downgraded
+            assert claimant.returncode == 0
+            assert "claimed" not in claimant.stdout
+            assert "rejected" in claimant.stdout
+            assert namespace in claimant.stdout
+
+            # Assert — the refusal left the owner's registry intact
+            owner.stdin.write("\n")
+            owner.stdin.flush()
+            stdout, stderr = owner.communicate(timeout=_TIMEOUT)
+            assert owner.returncode == 0
+            assert "clean-exit" in stdout
+            assert "Traceback" not in stderr
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+                owner.wait(timeout=10)
+
+
+@pytest.mark.integration
+class TestPoolNamespaceOwnership:
+    @pytest.mark.asyncio
+    async def test___aenter___should_raise_when_the_namespace_is_already_owned(
+        self, retry_grpc_internal, caplog
+    ):
+        """Test a second pool cannot claim a live pool's namespace.
+
+        Given:
+            An entered pool owning a namespace and serving one worker
+        When:
+            A second WorkerPool is entered with a fresh LocalDiscovery
+            on that same namespace
+        Then:
+            It should raise DiscoveryNamespaceInUse unwrapped, spawn no
+            worker of its own, and leave the incumbent still dispatching
+            and still able to reap its worker without a failed
+            announcement.
+        """
+        # Arrange
+        before = {child.pid for child in multiprocessing.active_children()}
+
+        async def body():
+            caplog.clear()
+            namespace = f"pool-claim-{uuid.uuid4().hex[:12]}"
+            async with asyncio.timeout(_TIMEOUT):
+                async with WorkerPool(spawn=1, discovery=LocalDiscovery(namespace)):
+                    assert await routines.add(1, 2) == 3
+                    contender = {
+                        child.pid for child in multiprocessing.active_children()
+                    }
+
+                    # Act & assert — unwrapped, not an ExceptionGroup:
+                    # the claim fails before any worker is spawned.
+                    with pytest.raises(DiscoveryNamespaceInUse) as excinfo:
+                        async with WorkerPool(
+                            spawn=1, discovery=LocalDiscovery(namespace)
+                        ):
+                            pass
+
+                    assert excinfo.value.namespace == namespace
+                    assert {
+                        child.pid for child in multiprocessing.active_children()
+                    } == contender
+
+                    # Assert — the incumbent is untouched by the refusal
+                    assert await routines.add(3, 4) == 7
+
+            # Assert — and reaped its own worker cleanly. A future
+            # __enter__ that reclaimed on the FileExistsError path would
+            # break the incumbent's drop announcement here, which #298's
+            # fix would otherwise mask entirely.
+            assert not any(
+                "could not announce" in record.getMessage()
+                for record in caplog.records
+                if record.levelno == logging.ERROR
+            )
+
+        try:
+            with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+                await retry_grpc_internal(body)
+        finally:
+            for child in multiprocessing.active_children():
+                if child.pid not in before:
+                    _ensure_killed(child.pid)
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_raise_when_no_owner_holds_the_namespace(self):
+        """Test a durable pool over an unowned namespace fails visibly.
+
+        Given:
+            A namespace no LocalDiscovery has entered
+        When:
+            A durable WorkerPool borrowing it is entered eagerly with a
+            short quorum timeout
+        Then:
+            It should raise DiscoveryNamespaceNotFound naming the
+            namespace rather than creating a registry of its own, and
+            leave the namespace claimable afterwards.
+        """
+        # Arrange
+        namespace = f"pool-unowned-{uuid.uuid4().hex[:12]}"
+
+        # Act & assert. The failure is currently reported only once the
+        # quorum wait expires — the borrower's bind kills the sentinel
+        # where the wait cannot observe it — so this bounds the wait
+        # rather than inheriting the 60s default. See the follow-up
+        # issue; the outcome pinned here is unaffected by that fix.
+        with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+            async with asyncio.timeout(_TIMEOUT):
+                async with WorkerPool(
+                    discovery=LocalDiscovery.Subscriber(namespace),
+                    lazy=False,
+                    quorum_timeout=2.0,
+                ):
+                    pass
+
+        assert excinfo.value.namespace == namespace
+
+        # Assert — the rejected borrow created nothing
+        with LocalDiscovery(namespace) as claimed:
+            assert claimed.namespace == namespace
+
+
+@pytest.mark.integration
+class TestCrossProcessBorrowing:
+    @pytest.mark.asyncio
+    async def test___aenter___should_dispatch_when_another_process_owns_the_namespace(
+        self, retry_grpc_internal
+    ):
+        """Test a durable pool joins a namespace owned elsewhere.
+
+        Given:
+            An independent interpreter owning a namespace and hosting
+            the only worker in it
+        When:
+            A durable WorkerPool in this interpreter borrows that
+            namespace through a bare subscriber and dispatches
+        Then:
+            It should return the routine's result from a worker
+            belonging to the owner's process tree — the documented
+            durable-pool topology, across a real process boundary.
+        """
+        # Arrange
+        before = {child.pid for child in multiprocessing.active_children()}
+
+        async def body():
+            namespace = f"xproc-{uuid.uuid4().hex[:12]}"
+            owner = spawn_script_subprocess(
+                _XPROC_OWNER_SCRIPT,
+                namespace,
+                str(_TESTS_ROOT),
+                ready_line="ready",
+                timeout=_TIMEOUT,
+            )
+            try:
+                async with asyncio.timeout(_TIMEOUT):
+                    async with WorkerPool(
+                        discovery=LocalDiscovery.Subscriber(namespace)
+                    ):
+                        # Act & assert
+                        assert await routines.add(20, 22) == 42
+                        serving = await routines.get_pid()
+
+                # Assert — the serving worker is the owner's, not one
+                # this interpreter spawned. A pool that quietly spawned
+                # its own worker would satisfy the dispatch alone.
+                assert serving != os.getpid()
+                assert serving not in {
+                    child.pid for child in multiprocessing.active_children()
+                }
+            finally:
+                release_subprocess(owner)
+
+        try:
+            await retry_grpc_internal(body)
+        finally:
+            for child in multiprocessing.active_children():
+                if child.pid not in before:
+                    _ensure_killed(child.pid)
+
+    @pytest.mark.parametrize("death", ["clean-exit", "killed"])
+    def test___enter___should_admit_a_successor_when_the_owner_dies(self, death):
+        """Test a namespace outlives its owner's death, however it dies.
+
+        Given:
+            An owner LocalDiscovery holding a namespace in its own
+            interpreter, released either to exit cleanly or killed
+            outright with SIGKILL so neither its context exit nor its
+            atexit fallback runs
+        When:
+            A fresh interpreter claims the same namespace afterwards
+        Then:
+            It should be admitted in both cases — a crashed owner does
+            not brick its namespace, because the multiprocessing
+            resource tracker reclaims what the owner could not.
+        """
+        # Arrange
+        namespace = f"handoff-{uuid.uuid4().hex[:12]}"
+        owner = spawn_script_subprocess(
+            _OWNER_SCRIPT, namespace, ready_line="ready", timeout=_TIMEOUT
+        )
+
+        # Act — end the owner's life the way this case calls for
+        try:
+            if death == "clean-exit":
+                assert owner.stdin is not None
+                owner.stdin.write("\n")
+                owner.stdin.flush()
+                assert owner.wait(timeout=_TIMEOUT) == 0
+            else:
+                owner.kill()
+                owner.wait(timeout=_TIMEOUT)
+        finally:
+            release_subprocess(owner)
+
+        successor = subprocess.run(
+            [sys.executable, "-c", _CLAIMANT_SCRIPT, namespace],
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT,
+        )
+
+        # Assert
+        assert successor.returncode == 0, successor.stderr
+        assert "claimed" in successor.stdout, (
+            f"a {death} owner left its namespace unclaimable: {successor.stdout!r}"
+        )
+
+    def test___enter___should_admit_exactly_one_of_several_racing_claimants(self):
+        """Test simultaneous claims resolve to a single owner.
+
+        Given:
+            Four independent interpreters spin-waiting on one shared
+            wall-clock deadline, all naming the same fresh namespace
+        When:
+            The deadline passes and all four claim the namespace at once
+        Then:
+            It should admit exactly one and reject the other three with
+            DiscoveryNamespaceInUse naming a segment — ownership is
+            decided atomically, not by a check that another claimant
+            can interleave with.
+        """
+        # Arrange
+        namespace = f"race-{uuid.uuid4().hex[:12]}"
+        deadline = time.time() + 2.0
+        claimants = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    _RACING_CLAIMANT_SCRIPT,
+                    namespace,
+                    str(deadline),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(4)
+        ]
+
+        # Act
+        try:
+            outcomes = [proc.communicate(timeout=_TIMEOUT) for proc in claimants]
+        finally:
+            for proc in claimants:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
+
+        # Assert
+        stdouts = [stdout.strip() for stdout, _ in outcomes]
+        assert all(proc.returncode == 0 for proc in claimants), [
+            stderr for _, stderr in outcomes
+        ]
+        assert sum(line == "claimed" for line in stdouts) == 1
+        rejections = [line for line in stdouts if line.startswith("rejected ")]
+        assert len(rejections) == 3
+        # The segment is the operator's handle on a stranded registry;
+        # a rejection that named none would be unactionable.
+        assert all(line.split(" ", 1)[1] not in ("", "None") for line in rejections)
 
 
 @pytest.mark.integration

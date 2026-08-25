@@ -140,6 +140,13 @@ class TestPoolTeardownLockTimeout:
             It should bound teardown by the lock timeout instead of hanging
             forever, log that it could not announce the worker, and still
             reap the worker process.
+
+        .. note::
+            This is the *raising* arm. With ``shutdown_timeout=None``
+            there is no deadline, so nothing is cancelled: the publish
+            raises ``TimeoutError`` from the lock and travels the
+            ``except Exception`` path. The cancellation arm is covered
+            by ``test_worker_shutdown.py``.
         """
         # Arrange
         namespace = f"lock-teardown-{uuid.uuid4().hex[:12]}"
@@ -183,6 +190,12 @@ class TestPoolTeardownLockTimeout:
             # lock, so the reap is not satisfied by a drop that succeeded.
             assert any(
                 "could not announce" in record.getMessage() for record in caplog.records
+            )
+            # And the failure stayed in the announcement bucket: a
+            # publish TimeoutError must not be laundered into the reap
+            # accounting, which reports workers that would not stop.
+            assert not any(
+                "stopped waiting" in record.getMessage() for record in caplog.records
             )
         finally:
             release_subprocess(holder)
