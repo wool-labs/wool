@@ -51,6 +51,7 @@ from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.metadata import WorkerMetadata
+from wool.utilities.afilter import afilter
 from wool.utilities.noreentry import noreentry
 from wool.utilities.throttle import Throttle
 
@@ -622,7 +623,12 @@ class WorkerProxy:
                 def tag_filter(w):
                     return bool(match_tags & w.tags)
 
-                self._discovery = LocalDiscovery(pool_uri).subscribe(filter=tag_filter)
+                # A borrower: this proxy reads the namespace its pool
+                # owns — from a worker subprocess, more often than not —
+                # and never creates a registry of its own.
+                self._discovery = afilter(
+                    tag_filter, LocalDiscovery.Subscriber(pool_uri)
+                )
             case (None, discovery, None) if discovery is not None:
                 self._discovery = discovery
             case (None, None, workers) if workers is not None:
