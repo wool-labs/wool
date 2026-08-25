@@ -90,11 +90,11 @@ class TestSameNamespaceRespawn:
             process after each exit.
         """
         # Arrange
-        namespace = f"respawn-{uuid.uuid4().hex[:12]}"
         spawned: list[int] = []
 
         # Act & assert
         async def body():
+            namespace = f"respawn-{uuid.uuid4().hex[:12]}"
             for _ in range(3):
                 before = {child.pid for child in multiprocessing.active_children()}
                 async with asyncio.timeout(_TIMEOUT):
@@ -138,11 +138,13 @@ class TestOverlappingNamespaceLifecycles:
             and unwind both teardowns cleanly with no leaked worker.
         """
         # Arrange
-        namespace = f"overlap-lifo-{uuid.uuid4().hex[:12]}"
         before = {child.pid for child in multiprocessing.active_children()}
 
-        # Act & assert
+        # Act & assert — every per-attempt value is minted inside the
+        # body, so a retry claims a fresh namespace rather than one the
+        # previous attempt may have left held.
         async def body():
+            namespace = f"overlap-lifo-{uuid.uuid4().hex[:12]}"
             async with asyncio.timeout(_TIMEOUT):
                 async with WorkerPool("a", spawn=1, discovery=LocalDiscovery(namespace)):
                     assert await routines.add(1, 2) == 3
@@ -186,19 +188,22 @@ class TestOverlappingNamespaceLifecycles:
             respawned pool c.
         """
         # Arrange
-        namespace = f"overlap-owner-first-{uuid.uuid4().hex[:12]}"
         before = {child.pid for child in multiprocessing.active_children()}
-        owner_up = asyncio.Event()
-        release_owner = asyncio.Event()
 
-        async def owner():
-            async with WorkerPool("a", spawn=1, discovery=LocalDiscovery(namespace)):
-                assert await routines.add(1, 2) == 3
-                owner_up.set()
-                await release_owner.wait()
-
-        # Act & assert
+        # Act & assert — namespace, events and the owner closure are all
+        # minted per attempt: a retry that reused an already-set Event
+        # would let the owner exit before pool b ever entered.
         async def body():
+            namespace = f"overlap-owner-first-{uuid.uuid4().hex[:12]}"
+            owner_up = asyncio.Event()
+            release_owner = asyncio.Event()
+
+            async def owner():
+                async with WorkerPool("a", spawn=1, discovery=LocalDiscovery(namespace)):
+                    assert await routines.add(1, 2) == 3
+                    owner_up.set()
+                    await release_owner.wait()
+
             async with asyncio.timeout(_TIMEOUT):
                 owner_task = asyncio.create_task(owner())
                 try:
@@ -247,24 +252,31 @@ class TestOverlappingNamespaceLifecycles:
             exit.
         """
         # Arrange
-        namespace = f"overlap-reap-{uuid.uuid4().hex[:12]}"
         before = {child.pid for child in multiprocessing.active_children()}
-        owner_up = asyncio.Event()
-        release_owner = asyncio.Event()
         b_pids: list[int] = []
 
         # Arrange and act failures use ``pytest.fail`` rather than
         # ``assert`` so a broken setup stays distinguishable from a
         # genuine leak.
-        async def owner():
-            async with WorkerPool("a", spawn=1, discovery=LocalDiscovery(namespace)):
-                if await routines.add(1, 2) != 3:
-                    pytest.fail("pool a failed to dispatch before the owner was pinned")
-                owner_up.set()
-                await release_owner.wait()
-
-        # Act
         async def body():
+            # Reset per attempt: a retry that appended to the previous
+            # attempt's pids would fail the cardinality assertion below
+            # with a fabricated leak instead of the original error.
+            b_pids.clear()
+            caplog.clear()
+            namespace = f"overlap-reap-{uuid.uuid4().hex[:12]}"
+            owner_up = asyncio.Event()
+            release_owner = asyncio.Event()
+
+            async def owner():
+                async with WorkerPool("a", spawn=1, discovery=LocalDiscovery(namespace)):
+                    if await routines.add(1, 2) != 3:
+                        pytest.fail(
+                            "pool a failed to dispatch before the owner was pinned"
+                        )
+                    owner_up.set()
+                    await release_owner.wait()
+
             async with asyncio.timeout(_TIMEOUT):
                 owner_task = asyncio.create_task(owner())
                 try:

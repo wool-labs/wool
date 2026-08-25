@@ -91,10 +91,10 @@ class TestLocalDiscoveryCapacity:
             routine result, and leave no worker process alive after exit.
         """
         # Arrange
-        namespace = f"capacity-ok-{uuid.uuid4().hex[:12]}"
         before = {child.pid for child in multiprocessing.active_children()}
 
         async def body():
+            namespace = f"capacity-ok-{uuid.uuid4().hex[:12]}"
             async with asyncio.timeout(_TIMEOUT):
                 async with WorkerPool(
                     spawn=2, discovery=LocalDiscovery(namespace, capacity=2)
