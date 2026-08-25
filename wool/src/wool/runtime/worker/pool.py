@@ -107,6 +107,13 @@ class WorkerPool:
         surfaces are additionally subject to the underlying
         `WorkerProxy`'s admission gate.
 
+        A pool with no ``spawn`` announces no workers of its own, so
+        there a bare `~wool.DiscoverySubscriberLike` is accepted as
+        well — the form a process uses to join a namespace another
+        process owns (see `~wool.LocalDiscovery`). A pool that does
+        spawn must supply a full `~wool.DiscoveryLike`, having workers
+        of its own to announce.
+
         .. caution::
 
            A pre-called context-manager instance passed as
@@ -344,7 +351,11 @@ class WorkerPool:
         self,
         *,
         lease: int | None = None,
-        discovery: DiscoveryLike | Factory[DiscoveryLike],
+        discovery: (
+            DiscoveryLike
+            | DiscoverySubscriberLike
+            | Factory[DiscoveryLike | DiscoverySubscriberLike]
+        ),
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
@@ -426,7 +437,12 @@ class WorkerPool:
         size: int | None = None,
         lease: int | None = None,
         worker: WorkerFactory | BoundWorkerFactory | None = None,
-        discovery: DiscoveryLike | Factory[DiscoveryLike] | None = None,
+        discovery: (
+            DiscoveryLike
+            | DiscoverySubscriberLike
+            | Factory[DiscoveryLike | DiscoverySubscriberLike]
+            | None
+        ) = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
@@ -488,7 +504,10 @@ class WorkerPool:
                         # entered, and its context is owed an exit.
                         if not isinstance(discovery_svc, DiscoveryLike):
                             raise TypeError(
-                                f"Expected DiscoveryLike, got: {type(discovery_svc)}"
+                                "Expected DiscoveryLike — a pool that spawns "
+                                "workers announces them, so it needs a publisher "
+                                f"as well as a subscriber; got: "
+                                f"{type(discovery_svc)}"
                             )
                         async with self._worker_context(
                             *tags,
@@ -551,12 +570,24 @@ class WorkerPool:
                     try:
                         # Inside the try: a rejected service was still
                         # entered, and its context is owed an exit.
-                        if not isinstance(discovery_svc, DiscoveryLike):
+                        #
+                        # A durable pool spawns nothing and so never
+                        # publishes, for which a subscriber alone suffices.
+                        # DiscoveryLike is tested first:
+                        # DiscoverySubscriberLike is satisfied by `__aiter__`
+                        # alone, which a full service may also expose.
+                        if isinstance(discovery_svc, DiscoveryLike):
+                            subscriber = discovery_svc.subscriber
+                        elif isinstance(discovery_svc, DiscoverySubscriberLike):
+                            subscriber = discovery_svc
+                        else:
                             raise TypeError(
-                                f"Expected DiscoveryLike, got: {type(discovery_svc)}"
+                                "Expected DiscoveryLike or "
+                                "DiscoverySubscriberLike, got: "
+                                f"{type(discovery_svc)}"
                             )
                         async with self._make_proxy(
-                            discovery=discovery_svc.subscriber,
+                            discovery=subscriber,
                             loadbalancer=loadbalancer,
                             lease=lease,
                             quorum=quorum,
