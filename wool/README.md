@@ -321,7 +321,7 @@ A `DiscoveryEvent` pairs a type — one of `worker-added`, `worker-dropped`, or 
 
 Wool ships with two discovery protocols:
 
-- **`LocalDiscovery`** — shared-memory IPC for single-machine pools. Publishers write worker metadata into a named shared memory region (`multiprocessing.SharedMemory`), using cross-process file locking (`portalocker`) for synchronization. Subscribers attach to the same region, diff its contents against a local cache, and emit discovery events for changes. A notification file touched by publishers after each write wakes subscribers via `watchdog` filesystem monitoring, with optional fallback polling. This is the default when no discovery is specified.
+- **`LocalDiscovery`** — shared-memory IPC for single-machine pools. A namespace's registry is a named shared-memory region (`multiprocessing.SharedMemory`) created and reclaimed by exactly one owner: the `LocalDiscovery` whose context entry claimed it. Publishers and subscribers borrow that registry rather than creating one — publishers write worker metadata into it under cross-process file locking (`portalocker`), and subscribers diff its contents against a local cache and emit discovery events for changes. A notification file touched by publishers after each write wakes subscribers via `watchdog` filesystem monitoring, with optional fallback polling. This is the default when no discovery is specified.
 
 - **`LanDiscovery`** — Zeroconf DNS-SD (`_wool._tcp.local.`) for network-wide discovery. Publishers register, update, and unregister `ServiceInfo` records via `AsyncZeroconf`. Subscribers use `AsyncServiceBrowser` to listen for service changes and convert Zeroconf callbacks into Wool `DiscoveryEvent`s. No central coordinator or shared state is required.
 

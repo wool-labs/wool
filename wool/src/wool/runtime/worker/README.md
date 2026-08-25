@@ -253,7 +253,7 @@ Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagat
 
 | Mode | Parameter | Description |
 | ---- | --------- | ----------- |
-| Pool URI | `pool_uri` | Subscribes to `LocalDiscovery` with the URI as namespace and tag filter. |
+| Pool URI | `pool_uri` | Borrows the `LocalDiscovery` registry named by the URI, with a tag filter. |
 | Discovery | `discovery` | Accepts any `DiscoverySubscriberLike` or `Factory` thereof. |
 | Static | `workers` | Takes a sequence of `WorkerMetadata` directly — no discovery needed. |
 
