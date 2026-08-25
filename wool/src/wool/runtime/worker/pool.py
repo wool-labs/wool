@@ -483,12 +483,13 @@ class WorkerPool:
                 @asynccontextmanager
                 async def create_proxy():
                     discovery_svc, discovery_ctx = await self._enter_context(discovery)
-                    if not isinstance(discovery_svc, DiscoveryLike):
-                        raise TypeError(
-                            f"Expected DiscoveryLike, got: {type(discovery_svc)}"
-                        )
-
                     try:
+                        # Inside the try: a rejected service was still
+                        # entered, and its context is owed an exit.
+                        if not isinstance(discovery_svc, DiscoveryLike):
+                            raise TypeError(
+                                f"Expected DiscoveryLike, got: {type(discovery_svc)}"
+                            )
                         async with self._worker_context(
                             *tags,
                             spawn=spawn,
@@ -547,11 +548,13 @@ class WorkerPool:
                 @asynccontextmanager
                 async def create_proxy():
                     discovery_svc, discovery_ctx = await self._enter_context(discovery)
-                    if not isinstance(discovery_svc, DiscoveryLike):
-                        raise TypeError(
-                            f"Expected DiscoveryLike, got: {type(discovery_svc)}"
-                        )
                     try:
+                        # Inside the try: a rejected service was still
+                        # entered, and its context is owed an exit.
+                        if not isinstance(discovery_svc, DiscoveryLike):
+                            raise TypeError(
+                                f"Expected DiscoveryLike, got: {type(discovery_svc)}"
+                            )
                         async with self._make_proxy(
                             discovery=discovery_svc.subscriber,
                             loadbalancer=loadbalancer,
