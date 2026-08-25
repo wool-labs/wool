@@ -37,6 +37,8 @@ from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
 from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.exceptions import DiscoveryWorkerNotFound
 from wool.runtime.discovery.pool import SubscriberMeta
 from wool.runtime.resourcepool import ResourcePool
@@ -208,37 +210,65 @@ class LocalDiscovery(Discovery):
 
     The default when a `~wool.runtime.worker.pool.WorkerPool` is created
     without an explicit discovery protocol. Workers and subscribers
-    communicate through a shared-memory segment identified by a namespace
-    string, so unrelated processes on the same host discover each other by
-    agreeing on a namespace alone. File-based locking keeps the segment
+    communicate through a shared-memory registry identified by a
+    namespace string, so processes on the same host reach each other by
+    agreeing on a namespace alone. File-based locking keeps the registry
     consistent across those processes.
 
-    **Ownership.** Entering a context creates the namespace's segment, or
-    attaches to it when it already exists. The first entrant across all
-    processes wins the create race and *owns* the segment; every later
-    entrant on that namespace merely attaches. Ownership falls out of that
-    race — it is not something the caller selects.
+    **Ownership.** A namespace's registry has exactly one owner: the
+    instance whose entry created it. Entering creates the registry and
+    claims it, and exiting reclaims it. Entering a namespace whose
+    registry already exists raises `DiscoveryNamespaceInUse` rather than
+    attaching to it, so ownership is asserted rather than won by whichever
+    instance entered first.
 
-    **Lifecycle.** An instance is single-use: it may be entered once, and a
-    second entry raises `RuntimeError` whether or not the first has exited.
-    Use a fresh instance per ``with`` block. The guard binds to the instance,
-    so distinct instances sharing a namespace — which compare equal — are
-    unaffected by each other.
+    **Borrowing.** `LocalDiscovery.Publisher` and
+    `LocalDiscovery.Subscriber` — including the ones `publisher`,
+    `subscriber` and `subscribe` hand out — borrow the registry their
+    namespace's owner created. They never create one, and raise
+    `DiscoveryNamespaceNotFound` where no owner holds it. Exactly one
+    process enters a namespace as its owner; every other process reaches
+    it through borrowers.
 
-    The owner's exit unlinks the segment out from under every still-attached
-    peer, while a non-owner's exit only closes its own mapping; a non-owner
-    can therefore outlive the segment it is mapped to. An owner that never
-    exits at all — an abandoned context, an interpreter killed mid-block —
-    still reclaims the segment at interpreter shutdown rather than leaking
-    the namespace, via a fallback armed on owner entry and disarmed on owner
-    exit.
+    **Orphaning.** The owner's lifetime bounds the registry, so a
+    borrower outliving its owner is orphaned: a mapping it already holds
+    stays readable, and its next bind raises
+    `DiscoveryNamespaceNotFound`. That is defined behaviour rather than a
+    fault — a borrower owns nothing and has nothing to reclaim.
+
+    The raise is a property of *binding*, so it does not reach an
+    iteration that never binds. `LocalDiscovery.Subscriber` instances
+    sharing a namespace and a ``poll_interval`` within one context are
+    served from a single subscription, so a second iteration started
+    while the first is live joins that subscription rather than binding
+    for itself — and keeps reading the orphaned mapping instead of
+    raising. `~wool.WorkerProxy` constructs its subscriber without a
+    ``poll_interval``, so proxies naming one pool URI in one context
+    share a subscription on exactly these terms.
+
+    **Lifecycle.** An instance is single-use: it may be entered once, and
+    a second entry raises `RuntimeError` whether or not the first has
+    exited. Use a fresh instance per ``with`` block. The guard binds to
+    the instance, so distinct instances sharing a namespace — which
+    compare equal — are unaffected by each other; what stops the second
+    from entering while the first still holds the namespace is
+    `DiscoveryNamespaceInUse`, and once the first has exited the second
+    enters as a new owner.
+
+    An owner that never exits at all — an abandoned context, an
+    interpreter shut down mid-block — still reclaims the registry at
+    interpreter shutdown rather than leaking the namespace, via a fallback
+    armed on entry and disarmed on exit. An owner killed outright runs
+    neither, and the registry it strands makes every later entry on that
+    namespace raise; the error names the segment to remove, since adopting
+    a stranded registry is the very race this model exists to remove.
 
     Teardown never raises: unlinking goes through `_unlink_quietly`, which
     owns the failure semantics. So `__exit__` cannot replace an exception a
     caller is already unwinding, and a genuine leak stays observable.
 
     :param namespace:
-        Unique identifier for the shared-memory segment. Publishers
+        Unique identifier for the shared-memory registry. Publishers
         and subscribers using the same namespace will see each
         other's workers.
     :param filter:
@@ -247,9 +277,10 @@ class LocalDiscovery(Discovery):
         explicit filter is provided.
     :param capacity:
         Maximum number of workers registrable — and discoverable —
-        simultaneously. The owner stamps it into the segment on entry, so
-        every publisher and subscriber enforces the same bound without
-        re-declaring it. Publishing a new worker once ``capacity`` are
+        simultaneously. Stamped into the registry on entry, so every
+        publisher and subscriber enforces the same bound without
+        re-declaring it. It is the owner's to set and no borrower's to
+        override. Publishing a new worker once ``capacity`` are
         registered raises `DiscoveryCapacityExhausted`; see
         `LocalDiscovery.Publisher.publish` for the full contract.
         Defaults to 128.
@@ -283,11 +314,18 @@ class LocalDiscovery(Discovery):
             async for event in discovery.subscriber:
                 print(f"Discovered worker: {event.metadata}")
 
+    Example — borrow a namespace another process owns:
+
+    .. code-block:: python
+
+        async for event in LocalDiscovery.Subscriber("my-worker-pool"):
+            print(f"Discovered worker: {event.metadata}")
+
     .. rubric:: Implementation notes
 
-    The shutdown fallback is an `atexit` handler registered on owner entry
-    and unregistered on owner exit, before the unlink runs — a failed unlink
-    must not leave the handler armed to fire a second time at interpreter
+    The shutdown fallback is an `atexit` handler registered on entry and
+    unregistered on exit, before the unlink runs — a failed unlink must
+    not leave the handler armed to fire a second time at interpreter
     shutdown.
     """
 
@@ -316,7 +354,7 @@ class LocalDiscovery(Discovery):
 
     @noreentry
     def __enter__(self) -> Self:
-        """Create or attach to the namespace's shared-memory segment.
+        """Create the namespace's registry and claim its ownership.
 
         See `LocalDiscovery` for the ownership and teardown contract.
 
@@ -324,44 +362,42 @@ class LocalDiscovery(Discovery):
             This instance.
         :raises RuntimeError:
             If this instance has already been entered.
+        :raises DiscoveryNamespaceInUse:
+            If the namespace's registry already exists — a live owner
+            holds it, or a dead one left it behind.
         """
         size = _HEADER_SIZE + self._capacity * REF_WIDTH
+        segment = _short_hash(self._namespace)
         try:
             self._address_space = SharedMemory(
-                name=_short_hash(self._namespace),
+                name=segment,
                 create=True,
                 size=size,
             )
-            self._owner = True
-        except FileExistsError:
-            self._address_space = _attach(_short_hash(self._namespace))
-            self._owner = False
+        except FileExistsError as error:
+            raise DiscoveryNamespaceInUse(self._namespace, segment=segment) from error
 
         assert self._address_space.buf
-        if self._owner:
 
-            def cleanup():  # pragma: no cover
-                _unlink_quietly(self._address_space)
+        def cleanup():  # pragma: no cover
+            _unlink_quietly(self._address_space)
 
-            self._cleanup = atexit.register(cleanup)
-            for i in range(size):
-                self._address_space.buf[i] = 0
-            struct.pack_into(
-                "<4sI", self._address_space.buf, 0, _HEADER_MAGIC, self._capacity
-            )
+        self._cleanup = atexit.register(cleanup)
+        for i in range(size):
+            self._address_space.buf[i] = 0
+        struct.pack_into(
+            "<4sI", self._address_space.buf, 0, _HEADER_MAGIC, self._capacity
+        )
         return self
 
     def __exit__(self, *_):
-        """Release this instance's hold on the namespace's segment.
+        """Reclaim the namespace's registry.
 
         See `LocalDiscovery` for the ownership and teardown contract.
         """
-        if self._owner:
-            atexit.unregister(self._cleanup)
-            self._address_space.close()
-            _unlink_quietly(self._address_space)
-        else:
-            self._address_space.close()
+        atexit.unregister(self._cleanup)
+        self._address_space.close()
+        _unlink_quietly(self._address_space)
 
     def __hash__(self) -> int:
         return hash((type(self), self._namespace))
@@ -437,12 +473,18 @@ class LocalDiscovery(Discovery):
         """Publisher for broadcasting worker discovery events.
 
         Publishes worker discovery events (see `~wool.DiscoveryEvent`) to
-        a shared memory region where subscribers can discover them.
-        Multiple publishers in different processes can safely write to the
-        same namespace using cross-platform file locking for
-        synchronization. The capacity bound is read from the segment the
-        owning `LocalDiscovery` stamped, so a publisher never re-declares
-        it.
+        the registry a namespace's owner created, where subscribers can
+        discover them. Multiple publishers in different processes can
+        safely write to the same namespace using cross-platform file
+        locking for synchronization.
+
+        A publisher borrows: it binds to an existing registry and never
+        creates one. Entering it where no owner holds the namespace raises
+        `DiscoveryNamespaceNotFound`, as does publishing once the owner
+        has exited and reclaimed the registry — see `LocalDiscovery` for
+        the orphaning contract. The capacity bound is read from the
+        registry the owner stamped, so a publisher neither re-declares nor
+        overrides it.
 
         :param namespace:
             The namespace identifier for the shared memory region.
@@ -493,6 +535,19 @@ class LocalDiscovery(Discovery):
             )
 
         async def __aenter__(self) -> Self:
+            """Bind to the registry the namespace's owner created.
+
+            See `LocalDiscovery.Publisher` for the borrowing contract.
+
+            :returns:
+                This instance.
+            :raises DiscoveryNamespaceNotFound:
+                If no owner holds the namespace's registry.
+            """
+            # Bind before entering the block pool, so a rejected bind
+            # leaves nothing entered to unwind.
+            with _registry(self._namespace):
+                pass
             await self._shared_memory_pool.__aenter__()
             return self
 
@@ -550,9 +605,12 @@ class LocalDiscovery(Discovery):
             :raises TimeoutError:
                 If the cross-process file lock is not acquired within this
                 publisher's ``lock_timeout``.
+            :raises DiscoveryNamespaceNotFound:
+                If no owner holds the namespace's registry — it was never
+                created, or its owner has exited and reclaimed it.
             """
             async with _lock(self._namespace, timeout=self._lock_timeout):
-                with _shared_memory(_short_hash(self._namespace)) as address_space:
+                with _registry(self._namespace) as address_space:
                     if (
                         address_space.buf is None
                         or _read_capacity(address_space.buf) is None
@@ -727,10 +785,16 @@ class LocalDiscovery(Discovery):
         """Subscriber for receiving worker discovery events.
 
         Subscribes to worker discovery events (see `~wool.DiscoveryEvent`)
-        from a shared memory region, monitoring for changes via filesystem
-        notifications and yielding events as workers are added, updated, or
-        dropped. Multiple subscribers in different processes can read from
-        the same namespace independently.
+        from the registry a namespace's owner created, monitoring for
+        changes via filesystem notifications and yielding events as workers
+        are added, updated, or dropped. Multiple subscribers in different
+        processes can read from the same namespace independently.
+
+        A subscriber borrows: it binds to an existing registry and never
+        creates one, so iterating where no owner holds the namespace raises
+        `DiscoveryNamespaceNotFound`. An iteration already under way when
+        the owner exits keeps reading the mapping it holds — see
+        `LocalDiscovery` for the orphaning contract.
 
         Uses watchdog to monitor a notification file that publishers touch
         when modifying the shared memory, providing near-instant notification
@@ -808,7 +872,7 @@ class LocalDiscovery(Discovery):
             observer.start()
 
             try:
-                with _shared_memory(_short_hash(self._namespace)) as address_space:
+                with _registry(self._namespace) as address_space:
                     assert address_space.buf is not None
 
                     while True:
@@ -1131,6 +1195,28 @@ def _attach(name: str) -> SharedMemory:
 
 
 @contextmanager
+def _mapped(shared_memory: SharedMemory) -> Iterator[SharedMemory]:
+    """Yield an open mapping and close it on exit.
+
+    :param shared_memory:
+        The mapping to close once the body completes.
+    :yields:
+        The mapping, unchanged.
+
+    .. note::
+        Close errors are silently ignored to handle cases where the memory
+        region has been unlinked by another process.
+    """
+    try:
+        yield shared_memory
+    finally:
+        try:
+            shared_memory.close()
+        except Exception:
+            pass  # pragma: no cover
+
+
+@contextmanager
 def _shared_memory(name):
     """Open an existing shared memory region by name.
 
@@ -1143,19 +1229,37 @@ def _shared_memory(name):
         The name of the shared memory region to open.
     :yields:
         An open SharedMemory instance.
-
-    .. note::
-        Close errors are silently ignored to handle cases where the memory
-        region has been unlinked by another process.
     """
-    shared_memory = _attach(name)
-    try:
+    with _mapped(_attach(name)) as shared_memory:
         yield shared_memory
-    finally:
-        try:
-            shared_memory.close()
-        except Exception:
-            pass  # pragma: no cover
+
+
+@contextmanager
+def _registry(namespace: str) -> Iterator[SharedMemory]:
+    """Open the registry the namespace's owner created.
+
+    The borrowers' one point of contact with the registry. It never
+    creates one, and reports its absence as `DiscoveryNamespaceNotFound`
+    naming the namespace the caller asked for rather than the hashed
+    segment that namespace resolves to.
+
+    Only the mapping is translated. A `FileNotFoundError` raised inside
+    the body — a worker's own metadata block vanishing mid-scan, say — is
+    a different failure and propagates untouched.
+
+    :param namespace:
+        The namespace whose registry to open.
+    :yields:
+        The open registry mapping.
+    :raises DiscoveryNamespaceNotFound:
+        If no owner holds the namespace's registry.
+    """
+    try:
+        address_space = _attach(_short_hash(namespace))
+    except FileNotFoundError as error:
+        raise DiscoveryNamespaceNotFound(namespace) from error
+    with _mapped(address_space):
+        yield address_space
 
 
 @asynccontextmanager

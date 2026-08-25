@@ -65,3 +65,56 @@ class DiscoveryWorkerNotFound(WoolError):
         self.uid = uid
         detail = "" if uid is None else f" {uid}"
         super().__init__(f"Worker{detail} not found in address space")
+
+
+# public
+class DiscoveryNamespaceInUse(WoolError):
+    """Raised when a namespace's registry already has an owner.
+
+    A namespace's registry has exactly one owner: the `LocalDiscovery`
+    whose context entry created it. Entering a second `LocalDiscovery` on
+    a namespace whose registry is still live raises this rather than
+    silently attaching to it, so ownership is asserted rather than won by
+    whichever instance entered first. The namespace, when known, is
+    available as ``namespace``.
+
+    Where the owner is live this is transient: the namespace is
+    enterable again once that owner exits. Where the registry is stale —
+    its owner died without reclaiming it — it is permanent, because
+    adopting such a registry is the very race this exception exists to
+    remove. ``segment`` then names the shared-memory segment an operator
+    can remove to free the namespace.
+    """
+
+    def __init__(self, namespace: str | None = None, *, segment: str | None = None):
+        self.namespace = namespace
+        self.segment = segment
+        detail = "" if namespace is None else f" {namespace!r}"
+        hint = (
+            ""
+            if segment is None
+            else f"; remove shared memory {segment!r} if its owner is gone"
+        )
+        super().__init__(f"Discovery namespace{detail} already has an owner{hint}")
+
+
+# public
+class DiscoveryNamespaceNotFound(WoolError):
+    """Raised when a borrower finds no registry for its namespace.
+
+    `LocalDiscovery.Publisher` and `LocalDiscovery.Subscriber` borrow the
+    registry their namespace's owner created; neither ever creates one. A
+    borrower that binds before any owner exists — or after the owner has
+    exited and reclaimed the registry — raises this. The namespace, when
+    known, is available as ``namespace``.
+
+    Being orphaned this way is defined behaviour rather than a fault: the
+    owner's lifetime bounds the registry, so a borrower outliving that
+    owner loses what it was borrowing. The condition is transient — a new
+    owner on the namespace lets a retry succeed.
+    """
+
+    def __init__(self, namespace: str | None = None):
+        self.namespace = namespace
+        detail = "" if namespace is None else f" {namespace!r}"
+        super().__init__(f"No discovery registry for namespace{detail}")

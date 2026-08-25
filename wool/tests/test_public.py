@@ -93,6 +93,8 @@ def test_public_api_completeness_should_match_expected_surface():
         "DiscoveryEvent",
         "DiscoveryEventType",
         "DiscoveryLike",
+        "DiscoveryNamespaceInUse",
+        "DiscoveryNamespaceNotFound",
         "DiscoveryPublisherLike",
         "DiscoverySubscriberLike",
         "IneffectiveLeaseWarning",
