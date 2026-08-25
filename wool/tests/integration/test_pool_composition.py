@@ -212,24 +212,24 @@ class TestPoolComposition:
     async def test_build_pool_from_scenario_should_return_result_when_durable_joined(
         self, credentials_map, retry_grpc_internal
     ):
-        """Test building a pool with DURABLE_JOINED mode and LOCAL_CALLABLE.
+        """Test building a pool with DURABLE_BORROWED mode and LOCAL_CALLABLE.
 
         Given:
-            A complete scenario using DURABLE_JOINED pool mode with
-            LOCAL_CALLABLE discovery, where a non-owner joiner
-            discovers workers through an existing namespace.
+            A complete scenario using DURABLE_BORROWED pool mode with
+            LOCAL_CALLABLE discovery, where a borrowing subscriber
+            discovers workers through a namespace another owner holds.
         When:
             A pool is built and a coroutine routine is dispatched.
         Then:
-            It should return the correct result via the non-owner
-            LocalDiscovery.
+            It should return the correct result through the borrowed
+            registry.
         """
 
         async def body():
             # Arrange
             scenario = Scenario(
                 shape=RoutineShape.COROUTINE,
-                pool_mode=PoolMode.DURABLE_JOINED,
+                pool_mode=PoolMode.DURABLE_BORROWED,
                 discovery=DiscoveryFactory.LOCAL_CALLABLE,
                 lb=LbFactory.CLASS_REF,
                 credential=CredentialType.INSECURE,

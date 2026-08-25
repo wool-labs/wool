@@ -17,8 +17,10 @@ import uuid
 
 import pytest
 
+from wool import protocol
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
@@ -117,49 +119,51 @@ class TestLocalDiscoveryCapacity:
                     _ensure_killed(child.pid)
 
     @pytest.mark.asyncio
-    async def test___aenter___should_raise_when_non_owner_exceeds_owner_capacity(self):
-        """Test a pool attaching as a non-owner is bound by the owner's cap.
+    async def test_publish_should_raise_when_borrower_exceeds_owner_capacity(
+        self, retry_grpc_internal
+    ):
+        """Test the owner's capacity binds every borrower of its registry.
 
         Given:
-            A pre-entered owner LocalDiscovery holding the namespace at
-            capacity one, and a hybrid WorkerPool whose discovery attaches
-            to the same namespace as a non-owner declaring capacity 128 and
-            spawning two workers
+            A pool holding a namespace at capacity one, with its single
+            spawned worker already registered
         When:
-            The pool is entered so both workers announce themselves
+            A publisher borrowing that registry registers a further
+            worker
         Then:
-            It should abort entry with an ExceptionGroup carrying a
-            DiscoveryCapacityExhausted and leave no worker process alive — the
-            owner's stamped cap of one governs and the non-owner's declared
-            128 is ignored.
+            It should raise DiscoveryCapacityExhausted — the owner's
+            stamped cap of one governs, and a borrower is offered no
+            capacity of its own with which to raise it.
         """
-        # Arrange — an owner already holds the namespace at capacity one.
-        namespace = f"capacity-nonowner-{uuid.uuid4().hex[:12]}"
+        # Arrange
         before = {child.pid for child in multiprocessing.active_children()}
 
-        # Act & assert
+        async def body():
+            namespace = f"capacity-borrower-{uuid.uuid4().hex[:12]}"
+            intruder = WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="127.0.0.1:50051",
+                pid=1,
+                version=protocol.__version__,
+            )
+            async with asyncio.timeout(_TIMEOUT):
+                async with WorkerPool(
+                    spawn=1, discovery=LocalDiscovery(namespace, capacity=1)
+                ):
+                    assert await routines.add(1, 2) == 3
+
+                    # Act & assert — the sole slot is taken by the
+                    # owner's own worker
+                    async with LocalDiscovery.Publisher(namespace) as borrower:
+                        with pytest.raises(DiscoveryCapacityExhausted):
+                            await borrower.publish("worker-added", intruder)
+
+        # Act & assert. That a borrower has no capacity argument at all
+        # is a constructor contract, pinned in the unit suite; asserting
+        # it here would add a second behaviour to this test and run it
+        # against an already-reclaimed registry.
         try:
-            with LocalDiscovery(namespace, capacity=1):
-                with pytest.raises(ExceptionGroup) as excinfo:
-                    async with asyncio.timeout(_TIMEOUT):
-                        async with WorkerPool(
-                            spawn=2,
-                            discovery=LocalDiscovery(namespace, capacity=128),
-                        ):
-                            pass
-
-                leaves = list(_iter_leaf_exceptions(excinfo.value))
-                assert any(
-                    isinstance(leaf, DiscoveryCapacityExhausted) for leaf in leaves
-                ), f"expected a DiscoveryCapacityExhausted, got: {leaves!r}"
-
-                multiprocessing.active_children()
-                leaked = [
-                    child.pid
-                    for child in multiprocessing.active_children()
-                    if child.pid not in before
-                ]
-                assert leaked == []
+            await retry_grpc_internal(body)
         finally:
             for child in multiprocessing.active_children():
                 if child.pid not in before:

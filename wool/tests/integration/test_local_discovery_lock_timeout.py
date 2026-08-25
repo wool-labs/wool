@@ -75,8 +75,10 @@ class TestCrossProcessLockTimeout:
         """Test a cross-process lock holder surfaces as a bounded TimeoutError.
 
         Given:
-            An independent subprocess holding the namespace's discovery
-            lock, and a Publisher with a one-second lock_timeout
+            An owner holding the namespace's registry, an independent
+            subprocess holding that namespace's discovery lock, and a
+            Publisher borrowing the registry with a one-second
+            lock_timeout
         When:
             The publisher publishes a worker while the holder still holds
             the lock
@@ -96,17 +98,19 @@ class TestCrossProcessLockTimeout:
         lock_timeout = 1.0
         holder = spawn_script_subprocess(_HOLDER_SCRIPT, namespace, ready_line="locked")
 
-        # Act & assert
+        # Act & assert — an owner holds the registry the publisher
+        # borrows, so what the publish contends is the lock alone.
         try:
             publisher = LocalDiscovery.Publisher(namespace, lock_timeout=lock_timeout)
-            async with publisher:
-                start = time.monotonic()
-                with pytest.raises(TimeoutError):
-                    await asyncio.wait_for(
-                        publisher.publish("worker-added", metadata),
-                        timeout=lock_timeout + 5,
-                    )
-                elapsed = time.monotonic() - start
+            with LocalDiscovery(namespace):
+                async with publisher:
+                    start = time.monotonic()
+                    with pytest.raises(TimeoutError):
+                        await asyncio.wait_for(
+                            publisher.publish("worker-added", metadata),
+                            timeout=lock_timeout + 5,
+                        )
+                    elapsed = time.monotonic() - start
 
             # Bounded, not instant and not forever: it genuinely waited on
             # the contended lock (≥ half the timeout) and returned well

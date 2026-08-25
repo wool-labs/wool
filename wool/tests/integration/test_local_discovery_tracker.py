@@ -20,11 +20,11 @@ These tests are behavioral evidence, not coverage.
 import subprocess
 import sys
 import uuid
-from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.discovery.local import _attach
 from wool.runtime.discovery.local import _short_hash
 
 from .conftest import _TIMEOUT
@@ -95,6 +95,7 @@ print("done", flush=True)
 #: may unlink, and a tracked attach would have this process's tracker do it
 #: on the way out (bpo-38119).
 _ATTACHER_SCRIPT = """
+import asyncio
 import sys
 from types import SimpleNamespace
 
@@ -105,8 +106,17 @@ mode, namespace = sys.argv[1:3]
 if mode == "legacy":
     local.sys = SimpleNamespace(version_info=(3, 12, 0, "final", 0))
 
-with LocalDiscovery(namespace):
-    print("attached", flush=True)
+
+async def main():
+    # Borrow the owner's registry. Binding maps a segment this
+    # interpreter did not create, which is the mapping that must stay
+    # untracked; since #300 only the owner's process may enter the
+    # namespace itself.
+    async with LocalDiscovery.Publisher(namespace):
+        print("attached", flush=True)
+
+
+asyncio.run(main())
 print("done", flush=True)
 """
 
@@ -182,19 +192,19 @@ class TestCrossProcessTracker:
         assert "resource_tracker" not in result.stderr, result.stderr
 
     @pytest.mark.parametrize("mode", ["legacy", "native"])
-    def test___enter___should_keep_the_segment_when_an_attacher_exits(self, mode):
-        """Test a non-owner's exit leaves the owner's segment mapped.
+    def test___aenter___should_keep_the_segment_when_a_borrower_exits(self, mode):
+        """Test a borrower's exit leaves the owner's segment mapped.
 
         Given:
-            A namespace this process created, and an independent
-            interpreter that enters and leaves it as a non-owner on either
-            attach path.
+            A namespace this process owns, and an independent
+            interpreter that binds and releases a borrowing publisher on
+            it via either attach path.
         When:
             That interpreter exits and its resource tracker drains.
         Then:
             It should leave the segment mapped and warn about no leak —
             only the process that created a segment may unlink it, and a
-            tracked attach would have the attacher reclaim it instead
+            tracked attach would have the borrower reclaim it instead
             (bpo-38119).
         """
         # Arrange
@@ -210,7 +220,12 @@ class TestCrossProcessTracker:
             assert "attached" in result.stdout, result.stdout
             assert "leaked shared_memory" not in result.stderr, result.stderr
             assert "KeyError" not in result.stderr, result.stderr
-            SharedMemory(name=_short_hash(namespace)).close()
+            # Probe untracked. A plain `SharedMemory(...)` here would
+            # register the name with this process's resource tracker,
+            # which would then try to unlink it at session exit after
+            # the owner already had — the very fault this file asserts
+            # the absence of.
+            _attach(_short_hash(namespace)).close()
 
     def test_unregister_should_emit_tracker_output_when_an_attach_undoes_it(self):
         """Test the superseded pattern still faults, so silence means something.
