@@ -3134,17 +3134,20 @@ class TestWorkerPool:
         mock_worker_proxy.__aenter__.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_durable_mode_discovery_type_validation(
+    async def test___aenter___should_raise_when_discovery_satisfies_neither_protocol(
         self, mocker: MockerFixture, mock_worker_proxy
     ):
-        """Test raise ValueError.
+        """Test a durable pool rejects an object of neither protocol.
 
         Given:
-            A WorkerPool with invalid discovery object (not DiscoveryLike)
+            A WorkerPool with no spawn whose discovery satisfies
+            neither DiscoveryLike nor DiscoverySubscriberLike
         When:
-            Pool is started
+            The pool is entered
         Then:
-            Should raise TypeError
+            It should raise TypeError naming both accepted protocols —
+            matching on the shared "Expected DiscoveryLike" prefix
+            alone cannot tell this arm from the spawning one.
         """
 
         # Arrange - Create discovery that doesn't implement DiscoveryLike protocol
@@ -3161,22 +3164,146 @@ class TestWorkerPool:
         invalid_discovery = InvalidDiscovery()
 
         # Act & assert
-        with pytest.raises(TypeError, match="Expected DiscoveryLike"):
+        with pytest.raises(TypeError, match="DiscoveryLike or DiscoverySubscriberLike"):
             async with WorkerPool(discovery=invalid_discovery):
                 pass
 
     @pytest.mark.asyncio
-    async def test_hybrid_mode_discovery_type_validation(
-        self, mocker: MockerFixture, mock_worker_proxy, mock_local_worker
+    async def test___aenter___should_accept_a_subscriber_when_no_workers_spawned(
+        self, mocker: MockerFixture, mock_worker_proxy
     ):
-        """Test raise TypeError.
+        """Test a durable pool takes a bare subscriber.
 
         Given:
-            A WorkerPool with spawn and invalid discovery (not DiscoveryLike)
+            A WorkerPool with no spawn whose discovery is a bare
+            DiscoverySubscriberLike, the form used to join a namespace
+            another process owns
         When:
-            Pool is started
+            The pool is entered
         Then:
-            Should raise TypeError
+            It should accept it and hand that very subscriber to the
+            proxy — a pool that spawns nothing publishes nothing, so a
+            publisher is not needed.
+        """
+
+        # Arrange
+        class Subscriber:
+            """A subscriber with no publisher half."""
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        subscriber = Subscriber()
+
+        # Act
+        async with WorkerPool(discovery=subscriber) as pool:
+            assert pool is not None
+
+        # Assert
+        assert wp.WorkerProxy.call_args.kwargs["discovery"] is subscriber
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_prefer_the_subscriber_of_a_dual_protocol_service(
+        self, mocker: MockerFixture, mock_worker_proxy
+    ):
+        """Test a full service is reduced to its subscriber.
+
+        Given:
+            A durable WorkerPool whose discovery satisfies both
+            DiscoveryLike and DiscoverySubscriberLike — it exposes
+            publisher, subscriber and subscribe, and is itself iterable
+        When:
+            The pool is entered
+        Then:
+            It should hand the proxy the service's subscriber rather
+            than the service itself, DiscoveryLike being tested first
+            because DiscoverySubscriberLike is satisfied by __aiter__
+            alone.
+        """
+
+        # Arrange — a hand-written double: a MagicMock fails
+        # DiscoveryLike under `getattr_static`, so it cannot express
+        # "satisfies both", which is why the ordering is otherwise
+        # unobservable.
+        class DualProtocolDiscovery:
+            """A full discovery service that is also directly iterable."""
+
+            def __init__(self):
+                self.subscriber_sentinel = mocker.MagicMock()
+
+            @property
+            def publisher(self):
+                return mocker.MagicMock()
+
+            @property
+            def subscriber(self):
+                return self.subscriber_sentinel
+
+            def subscribe(self, filter=None, **kwargs):
+                raise AssertionError("durable mode must not call subscribe")
+
+            def __aiter__(self):
+                raise AssertionError("the service itself must not be iterated")
+
+        discovery = DualProtocolDiscovery()
+
+        # Act
+        async with WorkerPool(discovery=discovery):
+            pass
+
+        # Assert
+        assert (
+            wp.WorkerProxy.call_args.kwargs["discovery"] is discovery.subscriber_sentinel
+        )
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_reject_a_subscriber_when_workers_spawned(
+        self, mocker: MockerFixture, mock_worker_proxy, mock_local_worker
+    ):
+        """Test a spawning pool refuses a bare subscriber.
+
+        Given:
+            A WorkerPool with spawn set whose discovery is a bare
+            DiscoverySubscriberLike
+        When:
+            The pool is entered
+        Then:
+            It should raise TypeError — a pool that spawns workers
+            announces them, so it needs a publisher as well.
+        """
+
+        # Arrange
+        class Subscriber:
+            """A subscriber with no publisher half."""
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        # Act & assert
+        with pytest.raises(TypeError, match="needs a publisher"):
+            async with WorkerPool(spawn=1, discovery=Subscriber()):
+                pass
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_raise_when_spawning_discovery_lacks_a_publisher(
+        self, mocker: MockerFixture, mock_worker_proxy, mock_local_worker
+    ):
+        """Test a spawning pool rejects a discovery with no publisher.
+
+        Given:
+            A WorkerPool with spawn set whose discovery does not
+            satisfy DiscoveryLike
+        When:
+            The pool is entered
+        Then:
+            It should raise TypeError explaining that a pool which
+            spawns workers must be able to announce them.
         """
 
         # Arrange - Create discovery that doesn't implement DiscoveryLike protocol
@@ -3192,8 +3319,8 @@ class TestWorkerPool:
 
         invalid_discovery = InvalidDiscovery()
 
-        # Act & assert - This tests line 212 (TypeError)
-        with pytest.raises(TypeError, match="Expected DiscoveryLike"):
+        # Act & assert
+        with pytest.raises(TypeError, match="needs a publisher as well as a subscriber"):
             async with WorkerPool(spawn=2, discovery=invalid_discovery):
                 pass
 
