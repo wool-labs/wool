@@ -1,3 +1,4 @@
+import typing
 import uuid
 from types import MappingProxyType
 from typing import Any
@@ -9,8 +10,11 @@ from hypothesis import strategies as st
 
 from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.base import IdentifiedBoundWorkerFactory
+from wool.runtime.worker.base import IdentifiedWorkerFactory
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
+from wool.runtime.worker.base import WorkerFactoryLike
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -795,128 +799,56 @@ class TestWorkerLike:
         assert not isinstance(incompatible, WorkerLike)
 
 
-class TestWorkerFactory:
-    """Test suite for WorkerFactory protocol."""
+class TestFactoryProtocols:
+    """Test suite for the four worker factory protocol shapes."""
 
-    def test_isinstance_check_for_compatible_factory(self):
-        """Test isinstance check returns True for compatible factory.
+    @pytest.mark.parametrize(
+        "protocol",
+        [
+            WorkerFactory,
+            IdentifiedWorkerFactory,
+            BoundWorkerFactory,
+            IdentifiedBoundWorkerFactory,
+        ],
+        ids=lambda protocol: protocol.__name__,
+    )
+    def test_isinstance_should_be_unavailable_for_the_factory_protocols(self, protocol):
+        """Test the factory protocols are deliberately not runtime-checkable.
 
         Given:
-            A callable that implements WorkerFactory protocol
+            One of the four factory protocols and an object that plainly
+            is not a worker factory.
         When:
-            isinstance check is performed
+            An isinstance check is attempted against it.
         Then:
-            It should return True
+            It should raise TypeError rather than answer, because a
+            runtime_checkable protocol whose only member is __call__
+            tests nothing but callability — it would admit any callable,
+            `len` included. The pool classifies by binding the call it
+            intends to make; see `~wool.utilities.signature.accepts_kwarg`.
         """
-
-        # Arrange
-        def factory(*tags: str, host: str = "", **_) -> WorkerLike:
-            return ConcreteWorker(*tags)
-
         # Act & assert
-        assert isinstance(factory, WorkerFactory)
+        with pytest.raises(TypeError, match="runtime_checkable"):
+            isinstance(len, protocol)
 
-    def test_isinstance_check_for_incompatible_factory(self):
-        """Test isinstance check for incompatible factory.
+    def test_worker_factory_like_should_union_the_four_shapes(self):
+        """Test the public alias admits exactly the four shapes.
 
         Given:
-            A callable that doesn't match WorkerFactory signature
+            The `WorkerFactoryLike` alias.
         When:
-            isinstance check is performed
+            Its union members are inspected.
         Then:
-            It should return True (Protocol only checks for __call__)
-
-        Note:
-            Python's Protocol runtime checking is structural and only
-            verifies the presence of __call__, not the exact signature.
-            Runtime classification between WorkerFactory and
-            BoundWorkerFactory therefore relies on signature
-            inspection, exercised through the WorkerPool tests.
-        """
-
-        # Arrange
-        def incompatible_factory() -> str:
-            """Factory with wrong signature."""
-            return "not a worker"
-
-        # Act & assert
-        assert isinstance(incompatible_factory, WorkerFactory)
-
-    def test_isinstance_check_for_non_callable(self):
-        """Test isinstance check returns False for non-callable.
-
-        Given:
-            A non-callable object
-        When:
-            isinstance check is performed
-        Then:
-            It should return False
+            They should be the four factory protocols, which is the set
+            the pool's four-branch dispatch mirrors.
         """
         # Act
-        not_a_factory = "not callable"
+        members = set(typing.get_args(WorkerFactoryLike))
 
         # Assert
-        assert not isinstance(not_a_factory, WorkerFactory)
-
-
-class TestBoundWorkerFactory:
-    """Test suite for BoundWorkerFactory protocol."""
-
-    def test_isinstance_check_for_compatible_factory(self):
-        """Test isinstance check returns True for compatible factory.
-
-        Given:
-            A callable that implements BoundWorkerFactory protocol
-        When:
-            isinstance check is performed
-        Then:
-            It should return True
-        """
-
-        # Arrange
-        def factory(*tags: str, **_) -> WorkerLike:
-            return ConcreteWorker(*tags)
-
-        # Act & assert
-        assert isinstance(factory, BoundWorkerFactory)
-
-    def test_isinstance_check_for_incompatible_factory(self):
-        """Test isinstance check for incompatible factory.
-
-        Given:
-            A callable that doesn't match BoundWorkerFactory signature
-        When:
-            isinstance check is performed
-        Then:
-            It should return True (Protocol only checks for __call__)
-
-        Note:
-            Python's Protocol runtime checking is structural and only verifies
-            the presence of __call__, not the exact signature. This is a
-            known limitation of Protocol type checking.
-        """
-
-        # Arrange
-        def incompatible_factory() -> str:
-            """Factory with wrong signature."""
-            return "not a worker"
-
-        # Act & assert
-        # Protocol only checks for __call__ existence, not signature
-        assert isinstance(incompatible_factory, BoundWorkerFactory)
-
-    def test_isinstance_check_for_non_callable(self):
-        """Test isinstance check returns False for non-callable.
-
-        Given:
-            A non-callable object
-        When:
-            isinstance check is performed
-        Then:
-            It should return False
-        """
-        # Act
-        not_a_factory = "not callable"
-
-        # Assert
-        assert not isinstance(not_a_factory, BoundWorkerFactory)
+        assert members == {
+            WorkerFactory,
+            IdentifiedWorkerFactory,
+            BoundWorkerFactory,
+            IdentifiedBoundWorkerFactory,
+        }

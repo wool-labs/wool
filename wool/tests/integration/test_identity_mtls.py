@@ -6,10 +6,17 @@ verifying a worker against a stable logical identity (a SAN that is *not*
 the dialed address), surfacing a credential misconfiguration as a
 distinct, diagnosable signal, and adopting rotated material on both
 planes without a restart.
+
+Identity here always means the name a worker advertises: a client's
+``peers`` policy decides whether that worker is admitted, and the name
+it advertised is what the connection then verifies. ``test_worker_identity``
+covers the admission gate on its own; this module covers what the
+handshake does with the result.
 """
 
 import functools
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -46,28 +53,6 @@ def identity_cert_files(tmp_path):
     return files.ca_path, files.key_path, files.cert_path
 
 
-@pytest_asyncio.fixture
-async def started_worker():
-    """Start workers for a test and stop them at teardown.
-
-    Returns an async callable that starts the given `wool.LocalWorker`,
-    asserts the started worker announced its metadata, and registers it
-    to be stopped at teardown, so test bodies carry no start/stop
-    scaffolding.
-    """
-    workers = []
-
-    async def start(worker):
-        await worker.start()
-        workers.append(worker)
-        assert worker.metadata is not None
-        return worker
-
-    yield start
-    for worker in workers:
-        await worker.stop()
-
-
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_dispatch_should_succeed_when_identity_configured(identity_cert_files):
@@ -88,11 +73,12 @@ async def test_dispatch_should_succeed_when_identity_configured(identity_cert_fi
     # Arrange
     ca_path, key_path, cert_path = identity_cert_files
     provider = WorkerCredentials.from_files(ca_path, key_path, cert_path).as_provider(
-        identity=_WORKER_IDENTITY
+        peers=_WORKER_IDENTITY
     )
 
-    # Act
-    async with wool.WorkerPool(spawn=1, credentials=provider):
+    # Act — the pool advertises the identity its own client accepts, so its
+    # workers pass the proxy's identity arm.
+    async with wool.WorkerPool(spawn=1, identity=_WORKER_IDENTITY, credentials=provider):
         result = await add(2, 3)
 
     # Assert
@@ -152,19 +138,22 @@ async def test_dispatch_should_drain_to_no_workers_when_identity_mismatched(
     """Test a certificate that does not match the configured identity is rejected.
 
     Given:
-        A running worker whose certificate carries one logical identity,
-        and a client that trusts the same CA but expects a different
-        identity.
+        A running worker presented to the client through a record
+        claiming an identity its own certificate does not carry, and a
+        client that trusts the same CA and whose peers policy accepts
+        that claim.
     When:
         A routine is dispatched at the worker through that client.
     Then:
         The dispatch should drain to NoWorkersAvailable and the proxy
-        should log a warning identifying the handshake failure —
-        verifying against the configured identity strengthens, not
-        relaxes, the guarantee.
+        should log a warning identifying the handshake failure — an
+        advertisement selects which name is verified and never proves
+        it, so verifying against the advertised identity strengthens,
+        not relaxes, the guarantee.
     """
     # Arrange — one CA; the worker cert's SANs include loopback (so its own
-    # stop RPC validates) and a logical identity the client will not expect.
+    # stop RPC validates) and a logical identity, neither of which is the
+    # name its advertisement claims.
     files = generate_certificate_files(
         tmp_path, [*LOOPBACK_SANS, x509.DNSName(_WORKER_IDENTITY)]
     )
@@ -177,12 +166,18 @@ async def test_dispatch_should_drain_to_no_workers_when_identity_mismatched(
             )
         )
     )
+    # The claim is injected into the advertisement rather than declared on
+    # the worker, so the worker's own stop RPC keeps verifying the loopback
+    # address its certificate covers. What the client sees is identical
+    # either way, and the client side is this test's whole subject.
+    assert worker.metadata is not None
+    advertised = replace(worker.metadata, identity="does-not-match.example")
     client_credentials = WorkerCredentials.from_files(
         files.ca_path, files.key_path, files.cert_path
-    ).as_provider(identity="does-not-match.example")
+    ).as_provider(peers="does-not-match.example")
 
     # Act & assert
-    async with WorkerProxy(workers=[worker.metadata], credentials=client_credentials):
+    async with WorkerProxy(workers=[advertised], credentials=client_credentials):
         with caplog.at_level(logging.WARNING), pytest.raises(NoWorkersAvailable):
             await add(2, 3)
 
@@ -273,10 +268,12 @@ async def rotated_deployment(tmp_path, started_worker):
             original.key_path,
             original.cert_path,
         ),
-        identity=_WORKER_IDENTITY,
+        peers=_WORKER_IDENTITY,
         reloadable=True,
     )
-    worker = await started_worker(wool.LocalWorker(credentials=provider))
+    worker = await started_worker(
+        wool.LocalWorker(identity=_WORKER_IDENTITY, credentials=provider)
+    )
     async with WorkerProxy(workers=[worker.metadata], credentials=provider):
         assert await add(2, 3) == 5
         rotated = generate_certificate_files(tmp_path, sans)

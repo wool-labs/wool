@@ -1,3 +1,10 @@
+"""The client-side dispatch proxy.
+
+Provides `WorkerProxy`: the admission gate, the pooled connections it
+admits workers into, and the load-balanced routing between a
+`wool.routine` call and a worker fleet.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -269,34 +276,107 @@ class WorkerProxy:
     automatically.
 
     Every worker on every construction path — discovery stream, pool
-    URI, or static list — passes a security/version admission gate
-    before joining the pool: the worker's ``secure`` flag must match
-    the proxy's credentials, and its version must share the local
-    protocol version's major and be at least the local version.
-    Workers surfaced by a user-supplied ``discovery`` subscriber are
-    subject to the same gate — they are not trusted verbatim. The gate
-    is a non-overridable invariant rather than tunable policy. It fails
-    closed — a worker whose advertised version does not parse is
-    rejected, and if the local protocol version is unresolvable no
-    worker is admitted at all (observable as the quorum
-    `asyncio.TimeoutError`). The gate is re-derived from the
+    URI, or static list — passes an admission gate before joining the
+    pool. Each arm compares one advertised property against this
+    proxy's own posture: the worker's ``secure`` flag against the
+    proxy's credentials, its protocol version against the local one,
+    and its advertised identity against the configured ``peers``
+    policy, reported in order of how fundamental the mismatch is:
+    security, then version, then identity. Workers surfaced by a user-supplied
+    ``discovery`` subscriber are subject to the same gate — they are
+    not trusted verbatim. The gate is a non-overridable invariant
+    rather than tunable policy. It fails closed — a worker whose
+    advertised version does not parse is rejected, and if the local
+    protocol version is unresolvable no worker is admitted at all
+    (observable as the quorum `asyncio.TimeoutError`).
+
+    **Advertised identity.** With no ``peers`` policy on the proxy's
+    credentials, advertisements are ignored entirely, nothing is pinned,
+    and a connection verifies against the dialed address. With a
+    ``peers`` policy configured, a worker is admitted only if it
+    advertises a name the policy accepts, and that name is what the
+    connection pins; a worker advertising nothing is rejected, whatever
+    the policy's shape. The advertisement is the only source of a pinned
+    name; the policy's sole job is admission. An advertisement selects
+    which name is verified and never widens what is accepted, so a
+    worker claiming a name it holds no certificate for is admitted and
+    then fails the handshake. See `WorkerCredentialsProvider`'s
+    ``peers`` parameter for the accepted shapes.
+
+    The gate is re-derived from the
     credentials and protocol version of whichever process holds the proxy,
     so a static-worker proxy re-gated after serialization may admit
     fewer workers than at construction, and its construction-time
     quorum check (see ``:raises ValueError:``) does not carry across a
     pickle.
 
-    .. rubric:: Implementation notes
+    :param pool_uri:
+        Pool identifier for discovery-based connection.
+    :param tags:
+        Additional tags for filtering discovered workers.
+    :param discovery:
+        Discovery service or event stream. Workers it surfaces are
+        admitted only after passing the admission gate described above.
+    :param workers:
+        Static worker list for direct connection.
+    :param loadbalancer:
+        Load balancer instance, factory, or context manager.
+    :param credentials:
+        Optional credentials for TLS/mTLS connections to workers — either a
+        `WorkerCredentials` or a `WorkerCredentialsProvider` (from
+        `WorkerCredentials.as_provider`, or built with a factory callable for
+        credential rotation). A bare
+        `WorkerCredentials` is wrapped in a non-reloadable provider. When
+        omitted, a proxy created inside a worker defaults to that worker's
+        own credentials; otherwise connections are insecure.
+    :param lease:
+        Maximum number of workers this proxy will admit from discovery.
+        Defaults to ``None`` (unbounded).  The cap counts distinct
+        worker uids, so a worker re-announcing itself refreshes its
+        entry without consuming a slot; only a worker the proxy has
+        not admitted can be turned away.
+    :param quorum:
+        Minimum number of workers that must be discovered before the proxy
+        considers itself ready. Defaults to ``1`` — block until at least
+        one worker is admitted. Pass a larger integer to require more
+        workers, or ``None``/``0`` to disable the gate entirely
+        (``dispatch`` may then raise immediately if no workers have been
+        discovered yet). When ``lazy=True`` (default), the quorum wait is
+        deferred to the first dispatch; with ``lazy=False`` it blocks at
+        context entry.
+    :param quorum_timeout:
+        Seconds to wait for ``quorum`` workers to be discovered before
+        raising `asyncio.TimeoutError`. Only meaningful when
+        ``quorum`` is a positive integer; supplying it with
+        ``quorum=None`` or ``quorum=0`` records the value but never
+        consults it, accompanied by an
+        `IneffectiveQuorumTimeoutWarning`. Defaults to ``60``;
+        pass ``None`` to wait indefinitely.
+    :param lazy:
+        Whether to defer discovery setup and the quorum wait to the
+        first dispatch. When ``True`` (the default), construction
+        returns immediately and both happen on first use, so a quorum
+        that is never met surfaces as `asyncio.TimeoutError` from that
+        dispatch. When ``False``, both happen in `start`, and the
+        timeout surfaces there instead.
 
-    The gate is non-overridable because the version floor is a
-    wire-protocol guarantee the worker interceptor also enforces
-    server-side, and an uncredentialed proxy cannot complete a TLS
-    handshake with a ``secure`` worker.
+    :raises ValueError:
+        If ``quorum`` is negative, ``lease`` is non-positive, ``quorum``
+        exceeds ``lease``, ``quorum`` exceeds the compatible worker
+        count when constructed with a static ``workers`` list, or
+        ``quorum_timeout`` is non-positive or supplied without a
+        positive ``quorum``.
+    :raises asyncio.TimeoutError:
+        Raised at context entry (``lazy=False``) or first
+        `dispatch` (``lazy=True``) if ``quorum`` workers are not
+        admitted within ``quorum_timeout`` seconds.
 
-    .. versionchanged:: 0.12.0
-       Workers from every discovery path, including a user-supplied
-       ``discovery`` subscriber, are now screened by the admission gate;
-       previously such workers were admitted unconditionally.
+    .. caution::
+
+       Pre-called context manager instances passed as ``loadbalancer``
+       or ``discovery`` are not picklable and will cause nested routine
+       dispatch to fail.  Pass a callable returning the context manager
+       instead.  See `Factory`.
 
     **Connect via pool URI:**
 
@@ -361,66 +441,12 @@ class WorkerProxy:
         ) as proxy:
             result = await task()
 
-    :param pool_uri:
-        Pool identifier for discovery-based connection.
-    :param tags:
-        Additional tags for filtering discovered workers.
-    :param discovery:
-        Discovery service or event stream. Workers it surfaces are
-        admitted only after passing the admission gate described above.
-    :param workers:
-        Static worker list for direct connection.
-    :param loadbalancer:
-        Load balancer instance, factory, or context manager.
-    :param credentials:
-        Optional credentials for TLS/mTLS connections to workers — either a
-        `WorkerCredentials` or a `WorkerCredentialsProvider` (from
-        `WorkerCredentials.as_provider`, or built with a factory callable for
-        identity-based verification or credential rotation). A bare
-        `WorkerCredentials` is wrapped in a non-reloadable provider. When
-        omitted, a proxy created inside a worker defaults to that worker's
-        own credentials; otherwise connections are insecure.
-    :param lease:
-        Maximum number of workers this proxy will admit from discovery.
-        Defaults to ``None`` (unbounded).  The cap counts distinct
-        worker uids, so a worker re-announcing itself refreshes its
-        entry without consuming a slot; only a worker the proxy has
-        not admitted can be turned away.
-    :param quorum:
-        Minimum number of workers that must be discovered before the proxy
-        considers itself ready. Defaults to ``1`` — block until at least
-        one worker is admitted, preserving the pre-quorum implicit-wait
-        behaviour. Pass a larger integer to require more workers, or
-        ``None``/``0`` to disable the gate entirely (``dispatch`` may
-        then raise immediately if no workers have been discovered yet).
-        When ``lazy=True`` (default), the quorum wait is deferred to the
-        first dispatch; with ``lazy=False`` it blocks at context entry.
-    :param quorum_timeout:
-        Seconds to wait for ``quorum`` workers to be discovered before
-        raising `asyncio.TimeoutError`. Only meaningful when
-        ``quorum`` is a positive integer; supplying it with
-        ``quorum=None`` or ``quorum=0`` records the value but never
-        consults it, accompanied by an
-        `IneffectiveQuorumTimeoutWarning`. Defaults to ``60``;
-        pass ``None`` to wait indefinitely.
+    .. rubric:: Implementation notes
 
-    :raises ValueError:
-        If ``quorum`` is negative, ``lease`` is non-positive, ``quorum``
-        exceeds ``lease``, ``quorum`` exceeds the compatible worker
-        count when constructed with a static ``workers`` list, or
-        ``quorum_timeout`` is non-positive or supplied without a
-        positive ``quorum``.
-    :raises asyncio.TimeoutError:
-        Raised at context entry (``lazy=False``) or first
-        `dispatch` (``lazy=True``) if ``quorum`` workers are not
-        admitted within ``quorum_timeout`` seconds.
-
-    .. caution::
-
-       Pre-called context manager instances passed as ``loadbalancer``
-       or ``discovery`` are not picklable and will cause nested routine
-       dispatch to fail.  Pass a callable returning the context manager
-       instead.  See `Factory`.
+    The gate is non-overridable because the version floor is a
+    wire-protocol guarantee the worker interceptor also enforces
+    server-side, and an uncredentialed proxy cannot complete a TLS
+    handshake with a ``secure`` worker.
     """
 
     _discovery: DiscoverySubscriberLike | Factory[DiscoverySubscriberLike]
@@ -436,6 +462,7 @@ class WorkerProxy:
     _provider: WorkerCredentialsProvider | None
     _security_filter: Callable[[WorkerMetadata], bool]
     _version_filter: Callable[[WorkerMetadata], bool]
+    _identity_filter: Callable[[WorkerMetadata], bool]
 
     # ``wool.__proxy__`` is a plain ``contextvars.ContextVar``, invisible to
     # the chain-contention guard; this ``wool.ContextVar`` is the guarded
@@ -605,13 +632,12 @@ class WorkerProxy:
         # provider (see credentials_scope), for which this is a no-op.
         self._provider = WorkerCredentialsProvider.coerce(resolved)
 
-        # Build both halves of the admission gate from the resolved
-        # credentials and the local protocol version. Deliberately not
-        # serialized: __wool_reduce__ restores the proxy through __init__,
-        # so a restored proxy rebuilds the gate from its own credential
-        # context and protocol version.
+        # Deliberately not serialized: __wool_reduce__ restores the proxy
+        # through __init__, so a restored proxy rebuilds the gate from its
+        # own credential context and protocol version.
         self._security_filter = self._create_security_filter(self._provider)
         self._version_filter = self._create_version_filter()
+        self._identity_filter = self._create_identity_filter(self._provider)
 
         match (pool_uri, discovery, workers):
             case (pool_uri, None, None) if pool_uri is not None:
@@ -633,7 +659,7 @@ class WorkerProxy:
                     raise ValueError(
                         f"Quorum ({quorum}) cannot exceed compatible worker "
                         f"count ({len(compatible_workers)} of {len(workers)} "
-                        "after security/version filtering) — "
+                        "after security, version, and identity filtering) — "
                         "the quorum would never be satisfied"
                     )
                 self._discovery = ReducibleAsyncIterator(
@@ -1181,7 +1207,7 @@ class WorkerProxy:
     def _create_security_filter(
         self, provider: WorkerCredentialsProvider | None
     ) -> Callable[[WorkerMetadata], bool]:
-        """Create the security half of the sentinel admission gate.
+        """Create the security arm of the sentinel admission gate.
 
         Workers and proxies must have compatible security settings:
         - Proxy with credentials only admits workers with secure=True
@@ -1191,8 +1217,7 @@ class WorkerProxy:
             Credential provider for this proxy, or ``None``.
         :returns:
             Predicate function for filtering workers by security
-            compatibility, enforced at `_worker_sentinel`
-            admission.
+            compatibility.
         """
         if provider is not None:
             # Proxy has credentials: only accept secure workers
@@ -1202,8 +1227,44 @@ class WorkerProxy:
             return lambda metadata: not metadata.secure
 
     @staticmethod
+    def _create_identity_filter(
+        provider: WorkerCredentialsProvider | None,
+    ) -> Callable[[WorkerMetadata], bool]:
+        """Create the identity arm of the sentinel admission gate.
+
+        Applies the ``peers`` policy on ``provider`` to a worker's
+        advertised identity. `WorkerProxy` documents the two states and
+        what each admits.
+
+        :param provider:
+            Credential provider for this proxy, or ``None``.
+        :returns:
+            Predicate function for filtering workers by advertised
+            identity.
+
+        .. rubric:: Implementation notes
+
+        This arm decides admission only; it never takes the
+        advertisement as authority, since whether the discovery backend
+        is trustworthy is a property of the deployment rather than of
+        this predicate. A worker claiming a name it holds no
+        certificate for therefore passes this gate and fails to
+        connect, which is the intended outcome.
+
+        Rejecting an unnamed worker outright, rather than abstaining
+        and letting the handshake decide, is what keeps that true: an
+        unnamed worker whose certificate happens to carry a SAN for its
+        own address would otherwise verify successfully against that
+        address, admitting a worker whose logical name was never
+        checked at all.
+        """
+        if provider is None:
+            return lambda metadata: True
+        return lambda metadata: provider.accepts_peer(metadata.identity)
+
+    @staticmethod
     def _create_version_filter() -> Callable[[WorkerMetadata], bool]:
-        """Create the version half of the sentinel admission gate.
+        """Create the version arm of the sentinel admission gate.
 
         A worker is accepted when its version is greater than or
         equal to the local proxy version within the same major
@@ -1211,8 +1272,7 @@ class WorkerProxy:
 
         :returns:
             Predicate function for filtering workers by version
-            compatibility, enforced at `_worker_sentinel`
-            admission.
+            compatibility.
         """
         from wool import protocol
 
@@ -1235,15 +1295,27 @@ class WorkerProxy:
         return version_filter
 
     def _incompatibility_reason(self, metadata: WorkerMetadata) -> str | None:
-        """Return which gate half rejects ``metadata``, or None if it passes.
+        """Describe why the gate rejects ``metadata``, or None if it passes.
 
-        Security is reported first when both halves fail. Enforced by
-        `_worker_sentinel` on every discovery path.
+        Reported in order of how fundamental the mismatch is: security,
+        then version, then identity.
         """
         if not self._security_filter(metadata):
             return "security"
         if not self._version_filter(metadata):
             return "version"
+        if not self._identity_filter(metadata):
+            # Name the policy: an operator seeing an empty pool needs to
+            # know which names were expected, not merely that identity
+            # was the arm that refused.
+            accepted = (
+                self._provider.describe_peers() if self._provider is not None else ""
+            )
+            return (
+                f"identity {metadata.identity!r} (accepted peers: {accepted})"
+                if accepted
+                else f"identity {metadata.identity!r}"
+            )
         return None
 
     async def _await_workers(self):
@@ -1275,10 +1347,10 @@ class WorkerProxy:
         identically — each reconciles the worker's membership to its
         current eligibility, regardless of how the proxy was
         constructed (a subscription filter screens on tags or any
-        user-chosen metadata field, never on security/version
-        compatibility). An event whose metadata fails the combined
-        security/version predicate evicts the worker if it was admitted
-        and is otherwise ignored; an eligible worker not yet held is
+        user-chosen metadata field, never on the gate's own criteria).
+        An event whose metadata `_incompatibility_reason` rejects
+        evicts the worker if it was admitted and is otherwise ignored;
+        an eligible worker not yet held is
         admitted subject to the lease; an eligible worker already held
         is refreshed in place. Because either event type can admit or
         evict, a worker that crosses the compatibility boundary in
@@ -1291,13 +1363,24 @@ class WorkerProxy:
         assert self._discovery_stream is not None
         assert self._workers_changed is not None
 
+        # Pinning is gated on the policy being configured — see
+        # `WorkerProxy` for the two states. The local reason: a policy is
+        # what vets an advertisement, so with none, pinning here would
+        # let a worker choose the name it is checked against and pass by
+        # asserting itself. Gated, every pinned name is one the caller
+        # listed.
+        gated = self._provider is not None and self._provider.peers is not None
+
         def connect(metadata: WorkerMetadata) -> WorkerConnection:
             # The provider is passed through unresolved so each dispatch
             # resolves current material — see WorkerConnection.
+            if self._provider is None:
+                return WorkerConnection(metadata.address, options=metadata.options)
             return WorkerConnection(
                 metadata.address,
                 credentials=self._provider,
                 options=metadata.options,
+                peer=metadata.identity if gated else None,
             )
 
         async for event in self._discovery_stream:
@@ -1317,7 +1400,7 @@ class WorkerProxy:
                         # independent of the event type.
                         if present:
                             _logger.debug(
-                                "Admission gate evicted worker %s: %s incompatible",
+                                "Admission gate evicted worker %s: incompatible %s",
                                 uid,
                                 reason,
                             )
@@ -1330,7 +1413,7 @@ class WorkerProxy:
                             # Fires per rescan for standing chaff, so
                             # debug keeps it out of the default log.
                             _logger.debug(
-                                "Admission gate rejected worker %s: %s incompatible",
+                                "Admission gate rejected worker %s: incompatible %s",
                                 uid,
                                 reason,
                             )

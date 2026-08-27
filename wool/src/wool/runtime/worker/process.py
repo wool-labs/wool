@@ -31,6 +31,7 @@ from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.auth import credentials_scope
+from wool.runtime.worker.auth import normalize_peer
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.exceptions import SlowCredentialResolutionWarning
 from wool.runtime.worker.interceptor import VersionInterceptor
@@ -112,6 +113,10 @@ class WorkerProcess(Process):
         `~wool.runtime.worker.service.BackpressureLike`.
         Serialized via `wool.__serializer__` for transfer to
         the subprocess.
+    :param identity:
+        Logical workload identity this worker claims and advertises
+        through discovery. Requires ``credentials``, since the claim is
+        proven by a name in the worker's certificate.
     :param daemon:
         Whether the worker process is daemonic. Defaults to ``True``.
         ``False`` opts out, which a routine that must create
@@ -157,6 +162,7 @@ class WorkerProcess(Process):
         tags: frozenset[str] = frozenset(),
         extra: dict[str, Any] | None = None,
         backpressure: BackpressureLike | None = None,
+        identity: str | None = None,
         daemon: bool | None = True,
         **kwargs,
     ):
@@ -174,6 +180,17 @@ class WorkerProcess(Process):
             raise ValueError("Proxy pool TTL must be positive")
         self._proxy_pool_ttl = proxy_pool_ttl
         self._provider = WorkerCredentialsProvider.coerce(credentials)
+        # Not ``_identity``: `multiprocessing.BaseProcess` owns that name
+        # for the tuple it derives process names from and seeds child
+        # processes with, so binding a workload identity there would
+        # corrupt process naming.
+        self._workload_identity = normalize_peer(identity, parameter="identity")
+        if self._workload_identity is not None and self._provider is None:
+            raise ValueError(
+                "identity requires credentials: an identity is proven by a "
+                "name in the worker's certificate, so a worker serving "
+                "plaintext has nothing to back the one it claims."
+            )
         self._options = options or WorkerOptions()
         self._uid = uid if uid is not None else uuid.uuid4()
         self._tags = tags
@@ -524,6 +541,7 @@ class WorkerProcess(Process):
                         extra=MappingProxyType(self._extra),
                         secure=self._provider is not None,
                         options=self._options.channel,
+                        identity=self._workload_identity,
                     )
                     wool.__worker_metadata__ = metadata
                     wool.__worker_uds_address__ = uds_address

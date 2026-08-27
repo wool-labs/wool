@@ -315,7 +315,7 @@ Workers discover each other through pluggable discovery backends with no central
 
 ### Discovery events
 
-A `DiscoveryEvent` pairs a type — one of `worker-added`, `worker-dropped`, or `worker-updated` — with the affected worker's `WorkerMetadata` (UID, address, pid, version, tags, security flag, and transport options). Discovery subscribers yield these events as the set of known workers changes.
+A `DiscoveryEvent` pairs a type — one of `worker-added`, `worker-dropped`, or `worker-updated` — with the affected worker's `WorkerMetadata`. Discovery subscribers yield these events as the set of known workers changes.
 
 ### Built-in protocols
 
@@ -402,7 +402,7 @@ On the client side, a dead worker surfaces as `UNAVAILABLE` (transient), causing
 
 ## Security
 
-`WorkerCredentials` is a frozen dataclass holding PEM-encoded CA certificate, worker key, and worker cert bytes plus a `mutual` flag. It exposes `server_credentials` and `client_credentials` properties that produce the appropriate gRPC TLS objects. Workers bind a secure gRPC port when credentials are present, and proxies open secure channels to connect.
+`WorkerCredentials` is a frozen dataclass holding PEM-encoded CA certificate, worker key, and worker cert bytes plus a `mutual` flag. It exposes `server_credentials` and `client_credentials` methods that produce the appropriate gRPC TLS objects. Workers bind a secure gRPC port when credentials are present, and proxies open secure channels to connect.
 
 ```python
 creds = wool.WorkerCredentials.from_files(
@@ -420,15 +420,17 @@ async with wool.WorkerPool(spawn=4, credentials=creds):
 
 With mutual TLS (`mutual=True`), the server requires client authentication — both sides present and verify certificates signed by the same CA. With one-way TLS (`mutual=False`), the server presents its certificate for the client to verify, but the client remains anonymous at the transport layer. The `mutual` flag controls `require_client_auth` on the server and whether the client includes its key and cert when opening the channel.
 
-### Identity-based verification and rotation
+### Peer verification and rotation
 
-Platforms that assign a worker's address at startup and rotate credentials out of band (Kubernetes, ECS/Fargate) defeat a fixed credential snapshot, which can only be verified against the address it was dialed at. For those, supply a **credential provider** anywhere `credentials=` is accepted: `WorkerCredentials.from_files(...).as_provider(identity=...)` adapts fixed material, while `WorkerCredentialsProvider(factory, identity=..., reloadable=True)` wraps any callable returning the current `WorkerCredentials`, so long-running workers and pools adopt rotated material without a restart. See [`src/wool/runtime/worker/README.md`](src/wool/runtime/worker/README.md#credential-providers-identity-and-rotation) for the identity-verification and rotation mechanics.
+Platforms that assign a worker's address at startup and rotate credentials out of band (Kubernetes, ECS/Fargate) defeat fixed credential material, which can only be verified against the address it was dialed at. For those, supply a **credential provider** anywhere `credentials=` is accepted: `WorkerCredentials.from_files(...).as_provider(peers=...)` adapts fixed material, while `WorkerCredentialsProvider(factory, peers=..., reloadable=True)` wraps any callable returning the current `WorkerCredentials`, so long-running workers and pools adopt rotated material without a restart. See [`src/wool/runtime/worker/README.md`](src/wool/runtime/worker/README.md#credential-providers-admission-and-rotation) for the admission and rotation mechanics.
+
+A worker carries an `identity` — a logical name for the workload it is — which it advertises through discovery, and a client names the identities it accepts through `peers`: `WorkerPool(spawn=4, identity="api.wool.svc", credentials=provider)` paired with `as_provider(peers={"api.wool.svc", "batch.wool.svc"})`. The two are stated independently and must agree. See [Advertised worker identity](src/wool/runtime/worker/README.md#advertised-worker-identity).
 
 ### Discovery security filtering
 
 Each `WorkerMetadata` carries a `secure` boolean flag set at startup based on whether the worker was given credentials. The `WorkerProxy` applies a security filter to discovery events: a proxy with credentials only accepts workers with `secure=True`, and a proxy without credentials only accepts workers with `secure=False`. This prevents secure proxies from connecting to insecure workers and vice versa, but does not by itself guard against incompatible credentials between two secure peers (e.g., certificates signed by different CAs) — that case is caught at the handshake.
 
-Credentials that this client's own verification rejects — a worker signed by an untrusted authority, presenting an unexpected identity, or expired — surface as a `HandshakeError`; see [Error handling → gRPC handshake](#grpc-handshake) for how that classifies and what the load balancer does with it. The opposite direction, a worker rejecting this client's certificate, is not observable client-side and surfaces as an ordinary transport failure — see `HandshakeError` for why.
+Credentials that this client's own verification rejects — a worker signed by an untrusted authority, presenting an unexpected peer name, or expired — surface as a `HandshakeError`; see [Error handling → gRPC handshake](#grpc-handshake) for how that classifies and what the load balancer does with it. The opposite direction, a worker rejecting this client's certificate, is not observable client-side and surfaces as an ordinary transport failure — see `HandshakeError` for why.
 
 ## Error handling
 
@@ -545,13 +547,13 @@ sequenceDiagram
 
         Client ->> Pool: create pool (spawn, discovery, loadbalancer)
         activate Client
-        Pool ->> Pool: resolve mode from spawn and discovery
+        Pool ->> Pool: resolve mode; classify factory by binding the call; check identity against own peers policy
 
         opt If spawn specified, spawn ephemeral workers
             loop Per worker
                 Pool ->> Worker: spawn worker
                 Worker ->> Worker: start process, bind gRPC server
-                Worker -->> Pool: worker metadata (host, port, tags)
+                Worker -->> Pool: worker metadata (host, port, tags, identity)
                 Pool ->> Discovery: publish "worker added"
             end
         end
@@ -563,16 +565,19 @@ sequenceDiagram
 
     %% -- 2. Discovery --
     rect rgba(0, 0, 0, 0)
-        Note over Discovery, Loadbalancer: Worker discovery
+        Note over Discovery, Loadbalancer: Worker discovery (the admission gate is WorkerProxy's)
 
         par Worker discovery
             loop Per worker lifecycle event
                 Discovery -->> Loadbalancer: worker event
                 activate Discovery
-                alt Worker-added
-                    Loadbalancer ->> Loadbalancer: add worker
-                else Worker-updated
-                    Loadbalancer ->> Loadbalancer: update worker
+                alt Worker-added or worker-updated
+                    Loadbalancer ->> Loadbalancer: admission gate — secure flag, protocol version, advertised identity vs peers policy
+                    alt Admitted
+                        Loadbalancer ->> Loadbalancer: add or refresh worker, pinning the advertised name when a policy is configured
+                    else Rejected
+                        Loadbalancer ->> Loadbalancer: ignore if not held, evict if held
+                    end
                 else Worker-dropped
                     Loadbalancer ->> Loadbalancer: remove worker
                 end
@@ -592,7 +597,7 @@ sequenceDiagram
 
         loop Until handshake resolves or all workers exhausted
             Loadbalancer ->> Loadbalancer: select next worker
-            Loadbalancer ->> Worker: open stream, write task frame
+            Loadbalancer ->> Worker: open stream pinned to the advertised identity (when peers configured), write task frame
             Worker ->> Worker: VersionInterceptor, then DispatchSession.__aenter__ (parse)
             alt Ack
                 Worker -->> Loadbalancer: Ack
@@ -602,6 +607,8 @@ sequenceDiagram
                 Loadbalancer ->> Loadbalancer: deserialize, re-raise (no eviction)
                 Loadbalancer -->> Routine: typed exception
                 Routine -->> Client: re-raise
+            else Handshake failure (UNAUTHENTICATED, or UNAVAILABLE carrying TLS evidence — untrusted CA, name mismatch, expired)
+                Loadbalancer ->> Loadbalancer: skip without eviction, rate-limited warning
             else Transient gRPC error (UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED)
                 Loadbalancer ->> Loadbalancer: skip, continue
             else Non-transient gRPC error (incl. FAILED_PRECONDITION on version mismatch)

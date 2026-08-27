@@ -9,17 +9,19 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from dataclasses import replace
 from datetime import timedelta
 
 import cloudpickle
 import grpc
 
+from wool.runtime.worker.exceptions import IneffectivePeersWarning
 from wool.utilities.refreshing import Refreshing
 from wool.utilities.throttle import Throttle
 
@@ -63,14 +65,6 @@ class WorkerCredentials:
         Whether to use mutual TLS (mTLS). If ``True`` (default), both
         server and client authenticate. If ``False``, only the server is
         authenticated.
-    :param identity:
-        Expected server identity, i.e., the peer certificate's subject-
-        alternative name to verify dialed workers against, or ``None``
-        (default) to verify against the dialed address. A blank value
-        normalizes to ``None``. Only consumed client-side; inert when
-        presenting the worker's own server certificate. A provider-level
-        identity, when set, overrides this field — see
-        `WorkerCredentialsProvider` for precedence.
 
     **Mutual TLS (recommended for worker pools):**
 
@@ -101,10 +95,6 @@ class WorkerCredentials:
     worker_key: bytes
     worker_cert: bytes
     mutual: bool = True
-    identity: str | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "identity", _normalize_identity(self.identity))
 
     @classmethod
     def from_files(
@@ -147,20 +137,20 @@ class WorkerCredentials:
             mutual=mutual,
         )
 
-    def as_provider(self, *, identity: str | None = None) -> WorkerCredentialsProvider:
+    def as_provider(
+        self,
+        *,
+        peers: str | Iterable[str] | Callable[[str], bool] | None = None,
+    ) -> WorkerCredentialsProvider:
         """Adapt these fixed credentials into a non-reloadable provider.
-
-        Equivalent to supplying a bare `WorkerCredentials`. ``identity``
-        is forwarded to `WorkerCredentialsProvider`, whose ``identity``
-        parameter documents the precedence.
 
         For credentials that change over a process's lifetime, build a
         reloadable provider directly with a factory callable instead; the
         reload strategy then lives in ``factory``.
 
-        :param identity:
-            Provider-level expected server identity — see
-            `WorkerCredentialsProvider` for precedence.
+        :param peers:
+            The peer names the client accepts, passed along to the
+            `WorkerCredentialsProvider` constructor directly.
         :returns:
             A non-reloadable `WorkerCredentialsProvider` over this material.
 
@@ -175,7 +165,7 @@ class WorkerCredentials:
                 ca_path="certs/ca-cert.pem",
                 key_path="certs/worker-key.pem",
                 cert_path="certs/worker-cert.pem",
-            ).as_provider(identity="wool-worker.svc")
+            ).as_provider(peers="wool-worker.svc")
 
             # Material that rotates out of band: a factory instead, called
             # again once per freshness interval.
@@ -186,14 +176,16 @@ class WorkerCredentials:
                 "certs/worker-cert.pem",
             )
             provider = WorkerCredentialsProvider(
-                factory, identity="wool-worker.svc", reloadable=True
+                factory, peers="wool-worker.svc", reloadable=True
             )
 
             # Either goes anywhere ``credentials=`` is accepted.
-            async with WorkerPool(spawn=4, credentials=provider):
+            async with WorkerPool(
+                spawn=4, identity="wool-worker.svc", credentials=provider
+            ):
                 ...
         """
-        return WorkerCredentialsProvider(lambda: self, identity=identity)
+        return WorkerCredentialsProvider(lambda: self, peers=peers)
 
     def _material(self) -> tuple[list[tuple[bytes, bytes]], bytes | None]:
         """Map this material onto what the gRPC server builders take.
@@ -267,117 +259,129 @@ class WorkerCredentials:
             certificate_chain=self.worker_cert if self.mutual else None,
         )
 
-    def identity_channel_options(self) -> list[tuple[str, str]]:
-        """Build the identity-derived secure-channel options.
-
-        Use when building a gRPC channel yourself: these options verify the
-        peer's certificate against the configured identity rather than the
-        address it was dialed at, which is what lets a worker keep a stable
-        logical identity across a dynamically assigned address. See
-        `WorkerCredentials`'s ``identity`` field for the verification
-        semantics.
-
-        :returns:
-            ``[("grpc.ssl_target_name_override", identity)]`` when an
-            identity is configured, else an empty list.
-
-        .. rubric:: Implementation notes
-
-        Named for the identity it derives from, not for the channel it
-        configures, to keep it distinct from
-        `~wool.runtime.worker.base.ChannelOptions`, i.e., the message-size
-        and keepalive settings a worker advertises.
-        """
-        if self.identity is None:
-            return []
-        return [("grpc.ssl_target_name_override", self.identity)]
-
 
 # public
 class WorkerCredentialsProvider:
     """A credential provider backed by a user-supplied factory callable.
 
-    The provider adapts a source of credentials to the worker stack:
-    ``factory`` returns the current `WorkerCredentials`, and `credentials`
-    hands them back with the provider's ``identity`` applied. Where the
-    material comes from (e.g., a file, a secrets manager, a lease) belongs
-    to ``factory``. `WorkerCredentials.as_provider` is the shorthand for the
-    fixed-material case.
+    The provider mediates between a source of credential material and
+    the two consumers of it, the worker server and the dispatch client.
+    Three terms recur. *Material* is a `WorkerCredentials` value. A
+    *resolution* is one invocation of ``factory``, which returns the
+    current material. The *policy* is the admission rule compiled from
+    ``peers``, which names the workers a client built on this provider
+    will accept. Where material originates (e.g., a file, a secrets
+    manager, a lease) is ``factory``'s concern alone; the provider
+    prescribes no strategy for obtaining it. `credentials` exposes the
+    current material, and `WorkerCredentials.as_provider` constructs the
+    degenerate provider over fixed material.
 
-    A non-reloadable provider resolves once when constructed and serves that
-    result for its lifetime, so a broken ``factory`` fails at construction
-    rather than at the first handshake. ``factory`` is cloudpickled with the
-    provider, so it MUST be cloudpickle-serializable but need not be
-    reachable by name — a lambda or closure is fine, which is what
-    `WorkerCredentials.as_provider` relies on. A copy that crosses into a
-    worker subprocess re-consults ``factory`` once on its first read rather
-    than carrying the material, so a factory that closes over fixed material
-    reproduces it exactly while one that reads its source anew may observe a
-    later state.
+    A provider is either fixed or reloadable. A fixed provider resolves
+    exactly once, at construction, and serves that material for its
+    lifetime; a failing ``factory`` therefore fails construction rather
+    than the first handshake. A reloadable provider re-resolves on the
+    schedule `Refreshing` governs, so rotated material is adopted
+    without a restart.
 
-    A ``factory`` whose output never compares equal defeats channel pooling,
-    costing a TLS handshake and a pooled channel per change; consecutive
-    unequal resolutions are warned about.
+    The provider is a value and crosses process boundaries by
+    cloudpickle. ``factory`` MUST therefore be cloudpickle-serializable,
+    though it need not be importable by name; a lambda or a closure
+    satisfies the requirement, and `WorkerCredentials.as_provider` relies
+    on exactly that. A copy carries ``factory`` rather than material and
+    resolves once on its first read, so a factory closing over fixed
+    material reproduces it exactly, whereas one that reads its source
+    anew may observe a later state than the original did.
 
-    A reloadable ``factory`` MUST be safe to call concurrently from gRPC
-    handshake threads. It MUST NOT read its own provider's `credentials`:
-    a recursive read would join the very invocation it is running inside
-    and deadlock.
+    Resolutions are compared by value. Material that compares equal
+    across resolutions reuses pooled channels; material that does not
+    incurs a TLS handshake and a new pooled channel, and consecutive
+    unequal resolutions are reported by warning, since a ``factory``
+    whose output never compares equal defeats pooling entirely.
+
+    A reloadable ``factory`` MUST tolerate concurrent invocation from
+    gRPC handshake threads, and MUST NOT read its own provider's
+    `credentials`: such a read joins the resolution it is executing
+    within and deadlocks.
 
     :param factory:
         A zero-argument callable returning the current `WorkerCredentials`.
-    :param identity:
-        Expected server identity to verify discovered workers against.
-        Identity is deliberately settable at two levels: on the material
-        (the `WorkerCredentials.identity` field) and on the provider
-        (this parameter, which `WorkerCredentials.as_provider` forwards
-        to). Precedence: a configured provider identity is applied to
-        every credential the provider yields, overriding any identity
-        the credentials already carry; ``None`` (default) leaves the
-        credentials' own identity untouched, and verification falls
-        back to the dialed address only when the material carries no
-        identity either.
+    :param peers:
+        The names this client accepts from the workers it dials, each
+        verified in place of the dialed address: a single name, an
+        iterable of names, or a predicate over a candidate name. ``None``
+        (default), a blank name, and an empty iterable each leave the
+        policy unconfigured, which admits every worker and pins nothing;
+        the latter two are accompanied by an `IneffectivePeersWarning`.
+        The policy is outbound only: it decides whom a client will dial,
+        never whom a worker will serve. URI-form names such as SPIFFE IDs
+        are not currently supported.
+
+        A predicate MUST be cloudpickle-serializable, MUST be cheap and
+        non-blocking, and MUST NOT raise; a predicate that raises is
+        treated as having rejected the worker. Admission is the whole of
+        what ``peers`` decides — see `WorkerProxy` for the two admission
+        states and what each pins.
     :param reloadable:
-        Whether ``factory`` is consulted on every resolution. If ``False``
-        (default), ``factory`` is called once at construction and the result
-        is fixed for the provider's lifetime.
+        Whether ``factory`` is consulted on every resolution. When
+        ``False`` (default), ``factory`` is invoked once at construction
+        and the result is fixed for the provider's lifetime.
     :param fresh_for:
-        How long resolved material is served before a refresh is triggered,
-        bounding how often ``factory`` runs and, with it, how quickly a
-        rotation is adopted. One second by default, which caps ``factory``
-        at one call per second per provider per process while keeping
-        rotation adoption invisible against any real rotation schedule.
-        Ignored when not ``reloadable``. Lower it when credentials are
-        short-lived or revocation must land quickly; raise it when
-        ``factory`` is expensive.
+        The interval for which resolved material is served before a
+        refresh is triggered; see `Refreshing`. It bounds the rate at which
+        ``factory`` runs and, with it, the latency with which a rotation is
+        adopted. The default of one second caps ``factory`` at one call per
+        second per provider per process while keeping adoption latency
+        negligible against any real rotation schedule. Ignored unless
+        ``reloadable``. Lower it when material is short-lived or
+        revocation must take effect promptly; raise it when ``factory``
+        is expensive.
     :param stale_for:
-        How much longer past ``fresh_for`` material stays servable while
-        refreshes are attempted; see `Refreshing`. ``None`` (default) means
-        a persistently failing ``factory`` never fails a dispatch; set it to
-        stop presenting material whose age exceeds what the deployment
-        tolerates. Ignored when not ``reloadable``.
+        The interval beyond ``fresh_for`` for which material remains
+        servable while refreshes are attempted; see `Refreshing`.
+        ``None`` (default) means a persistently failing ``factory`` never
+        fails a dispatch; set it to withdraw material whose age exceeds
+        what the deployment tolerates. Ignored unless ``reloadable``.
     :param timeout:
-        How long a caller waits on a resolution another caller started
-        before giving up on it and serving whatever is still servable.
-        ``None`` (default) waits indefinitely. See `Refreshing` for what the
-        bound does and does not cover.
+        The interval a caller waits on a resolution another caller
+        started before abandoning it and serving whatever remains
+        servable; see `Refreshing`. ``None`` (default) waits indefinitely.
     :raises:
-        Whatever ``factory`` raises, when the provider is not ``reloadable``
-        and the construction-time resolution fails.
+        Whatever ``factory`` raises, when the provider is not
+        ``reloadable`` and the construction-time resolution fails.
+
+    .. rubric:: Implementation notes
+
+    ``peers`` compiles once into a `_PeerPolicy`, modelled on go-spiffe's
+    ``Authorizer``; the predicate form is the extension point for pattern
+    acceptance. A predicate executes synchronously inside the proxy's
+    admission loop, whose ``async for`` is unguarded, so an exception
+    escaping it would terminate that loop and leave the proxy admitting
+    and evicting nothing for the remainder of its life. Reading a raising
+    predicate as a rejection is the conservative interpretation of a
+    policy that could not decide, and it keeps a caller-supplied seam
+    from terminating the loop that invoked it.
+
+    Nothing inbound consults the policy: a worker accepts any caller
+    holding a certificate from its configured authority, and
+    authenticating inbound callers by name is separate work. gRPC's
+    client-side verifier never consults URI SANs (the forms it does
+    consult are on `WorkerMetadata`'s ``identity``), which is why a
+    URI-form name passes normalization and admission and then fails at
+    the handshake.
     """
 
     def __init__(
         self,
         factory: Callable[[], WorkerCredentials],
         *,
-        identity: str | None = None,
+        peers: str | Iterable[str] | Callable[[str], bool] | None = None,
         reloadable: bool = False,
         fresh_for: timedelta = _RESOLVE_DEBOUNCE,
         stale_for: timedelta | None = None,
         timeout: timedelta | None = None,
     ) -> None:
         self._factory = factory
-        self._identity = _normalize_identity(identity)
+        self._policy = _normalize_peers(peers)
         self._reloadable = bool(reloadable)
         # The material each refresh replaced comes from Refreshing, which
         # owns it.
@@ -403,33 +407,57 @@ class WorkerCredentialsProvider:
 
         .. rubric:: Implementation notes
 
-        ``factory`` is cloudpickled rather than left to the ambient pickler
-        because the provider crosses into a worker subprocess through
-        `multiprocessing`, whose spawn path uses plain `pickle` — which
-        cannot take the closures and lambdas a factory commonly is. Churn
-        accounting is per-process and resets with the copy.
+        ``factory`` is cloudpickled here rather than left to the ambient
+        pickler because the provider reaches a worker subprocess through
+        `multiprocessing`, whose spawn path uses plain `pickle`. The policy
+        takes the same path for the same reason: a predicate is commonly a
+        lambda, and a `frozenset` survives cloudpickle unchanged, so one path
+        serves both shapes. Churn accounting is per-process and resets with
+        the copy.
         """
         state = self.__dict__.copy()
         state["_factory"] = cloudpickle.dumps(self._factory)
+        state["_policy"] = cloudpickle.dumps(self._policy)
         state["_churn_count"] = 0
         state["_churn_throttle"] = Throttle(_CHURN_WARNING_INTERVAL_S)
         return state
 
     def __setstate__(self, state: dict) -> None:
-        """Restore pickled state, deserializing the factory."""
+        """Restore pickled state, deserializing the factory and policy."""
         state = dict(state)
         state["_factory"] = cloudpickle.loads(state["_factory"])
+        state["_policy"] = cloudpickle.loads(state["_policy"])
         self.__dict__.update(state)
 
     @property
-    def identity(self) -> str | None:
-        """The expected server identity, or ``None``."""
-        return self._identity
+    def peers(self) -> frozenset[str] | Callable[[str], bool] | None:
+        """The policy's value, or ``None`` when no policy is configured."""
+        return self._policy.value if self._policy is not None else None
 
     @property
     def reloadable(self) -> bool:
-        """Whether the credentials can change over the provider's lifetime."""
+        """Whether the provider re-resolves after construction."""
         return self._reloadable
+
+    @property
+    def credentials(self) -> Refreshing[WorkerCredentials]:
+        """The current material as a `Refreshing` resource.
+
+        .. rubric:: Implementation notes
+
+        The resource admits two reads. Awaiting it from an event loop
+        returns the servable material without suspending on a slow
+        ``factory``; calling `Refreshing.get` from a thread with no loop
+        performs a due refresh itself and returns the result.
+        `Refreshing.refresh` forces a new resolution when material must
+        be adopted at once, e.g., after a revocation. `Refreshing` owns
+        the full contract.
+
+        The synchronous read exists for gRPC's per-handshake certificate
+        fetcher, a callback the C-core invokes from its own thread, off
+        any event loop.
+        """
+        return self._refreshing
 
     @classmethod
     def coerce(
@@ -476,50 +504,58 @@ class WorkerCredentialsProvider:
             "WorkerCredentials instead."
         )
 
-    @property
-    def credentials(self) -> Refreshing[WorkerCredentials]:
-        """The current credentials, as a resource that reads either way.
+    def accepts_peer(self, peer: str | None) -> bool:
+        """Report whether a worker advertising ``peer`` is admitted by the policy.
 
-        Material carries the provider's ``identity``.
+        Vacuously ``True`` when no policy is configured. See `WorkerProxy`
+        for the two admission states and what each pins.
 
-        .. rubric:: Implementation notes
-
-        `Refreshing` documents the full contract; the two reads that matter
-        here are ``await provider.credentials`` from an event loop, which
-        never blocks it, and ``provider.credentials.get()`` from a thread
-        with no loop — a gRPC handshake thread being the case this exists
-        for. ``provider.credentials.refresh()`` bypasses the freshness
-        interval when material must be adopted immediately, e.g., after a
-        revocation.
+        :param peer:
+            The name a worker advertised, or ``None`` when it advertised
+            none.
+        :returns:
+            ``True`` if the policy admits the worker, otherwise ``False``
         """
-        return self._refreshing
+        if self._policy is None:
+            return True
+        if (peer := normalize_peer(peer)) is None:
+            return False
+        return self._policy.accepts(peer)
+
+    def describe_peers(self) -> str:
+        """Describe the accepted names for an admission diagnostic.
+
+        :returns:
+            The accepted names, a note that a predicate decides, or an empty
+            string if no policy is configured.
+        """
+        return "" if self._policy is None else self._policy.render()
 
     def _derive(self) -> WorkerCredentials:
-        """Invoke ``factory`` and return its material with identity applied.
+        """Invoke ``factory`` and return its material verbatim.
 
-        The loader handed to `Refreshing`. Runs off the lock and off the
-        event loop.
+        The loader handed to `Refreshing`; it runs off the lock and off
+        the event loop, and applies nothing to what ``factory`` returns.
         """
-        return self._apply(self._factory())
+        return self._factory()
 
     def _note_churn(
         self, material: WorkerCredentials, previous: WorkerCredentials | None
     ) -> None:
-        """Warn when consecutive refreshes keep producing unequal material.
+        """Warn when consecutive resolutions keep producing unequal material.
 
         A single rotation is expected and rare; a ``factory`` whose output
-        never compares equal defeats channel pooling, costing a TLS
-        handshake and a pooled channel per change. Rate-limited through
-        `Throttle` so a persistently churning factory does not flood the
-        log; the consecutive-count threshold is a pre-filter ahead of it.
+        never compares equal defeats channel pooling. The warning is rate-limited
+        through `Throttle` so a persistently churning factory does not flood the
+        log, with the consecutive-count threshold as a pre-filter ahead of it.
 
         .. rubric:: Implementation notes
 
         Reported through `Refreshing`'s ``on_refresh`` hook rather than by
         shadowing the previous material here, which is also why this
         accounting needs no lock of its own. The comparison is meaningful
-        only because `WorkerCredentials` compares by value, which is why the
-        detection lives here and not in `Refreshing`, whose values are
+        only because `WorkerCredentials` compares by value, which is why
+        the detection lives here and not in `Refreshing`, whose values are
         arbitrary.
         """
         if previous is None:
@@ -538,7 +574,7 @@ class WorkerCredentialsProvider:
             return
         _log.warning(
             "Reloadable credential factory produced %d consecutive "
-            "unequal snapshots; factory output that never compares "
+            "unequal results; factory output that never compares "
             "equal defeats channel pooling — each change costs a TLS "
             "handshake and a pooled channel. Return cached material "
             "for unchanged inputs.%s",
@@ -549,16 +585,17 @@ class WorkerCredentialsProvider:
     def _note_refresh_error(self, error: BaseException, served_stale: bool) -> None:
         """Log a refresh failure that previous material absorbed.
 
-        Reported for `Refreshing`'s ``on_error`` hook. A failure that left
-        previous material serving is invisible to callers, so the log is the
-        only signal it happened. A first resolution has nothing to absorb it
-        and raises to every waiting caller instead, which needs no log here.
+        Invoked through `Refreshing`'s ``on_error`` hook. A failure that
+        left previous material serving is invisible to callers, so the
+        log is the only signal that it occurred. A first resolution has
+        nothing to absorb it and raises to every waiting caller instead,
+        which needs no log here.
 
         .. rubric:: Implementation notes
 
         Rotation is daily-scale and the previous certificate is
-        overwhelmingly still valid, so failing dispatches over a transient
-        factory blip would be strictly worse than serving on.
+        overwhelmingly still valid, so failing dispatches over a
+        transient factory fault would be strictly worse than serving on.
         """
         if served_stale:
             _log.warning(
@@ -566,11 +603,43 @@ class WorkerCredentialsProvider:
                 exc_info=error,
             )
 
-    def _apply(self, credentials: WorkerCredentials) -> WorkerCredentials:
-        """Return ``credentials`` with the provider's identity applied."""
-        if self._identity is None:
-            return credentials
-        return replace(credentials, identity=self._identity)
+
+@dataclass(frozen=True)
+class _PeerPolicy:
+    """Which worker names a client accepts from the peers it dials.
+
+    A policy admits any name it covers: one naming a single peer admits
+    exactly that name, one naming several admits any of them, and a
+    predicate admits whatever it answers ``True`` for.
+
+    :param value:
+        The accepted names as a frozenset, or a predicate over a
+        candidate name.
+    """
+
+    value: frozenset[str] | Callable[[str], bool]
+
+    def accepts(self, name: str) -> bool:
+        """Report whether ``name`` is admitted by this policy."""
+        if isinstance(self.value, frozenset):
+            return name in self.value
+        try:
+            return bool(self.value(name))
+        except Exception:
+            # A raising predicate is a rejection — see the
+            # `WorkerCredentialsProvider` implementation notes.
+            _log.exception(
+                "Peer-name predicate raised for %r; treating the peer as "
+                "rejected. See WorkerCredentialsProvider's 'peers' parameter.",
+                name,
+            )
+            return False
+
+    def render(self) -> str:
+        """Describe the accepted names for a diagnostic."""
+        if isinstance(self.value, frozenset):
+            return ", ".join(sorted(self.value))
+        return "a peer-name predicate"
 
 
 @contextmanager
@@ -600,20 +669,105 @@ def current_credentials() -> WorkerCredentialsProvider | None:
     return _current.get()
 
 
-def _normalize_identity(identity: str | None) -> str | None:
-    """Collapse an empty or whitespace-only identity to ``None``.
+def normalize_peer(peer: str | None, *, parameter: str = "peer") -> str | None:
+    """Collapse an empty or whitespace-only peer name to ``None``.
 
-    A blank identity would otherwise emit an empty
-    ``grpc.ssl_target_name_override`` and fail verification opaquely;
-    ``None`` instead selects the address-based path, the intended
-    "no identity configured" behavior.
+    A blank name is not a name; ``None`` is the "no name configured"
+    state, whichever side of the connection the name belongs to.
 
-    :param identity:
-        The configured identity, or ``None``.
+    :param peer:
+        The configured name, or ``None``.
+    :param parameter:
+        Which caller-facing parameter supplied the name. Names the side
+        of the connection it belongs to, which decides what advice a
+        rejection can honestly give: a caller who passed a collection to
+        an accept-list wanted ``peers``, while one who passed a
+        collection to an advertised ``identity`` wanted something else
+        entirely and must not be sent across the connection to find it.
     :returns:
-        The stripped identity, or ``None`` if blank.
+        The stripped name, or ``None`` if blank.
+    :raises TypeError:
+        If ``peer`` is neither a string nor ``None``.
+
+    .. rubric:: Implementation notes
+
+    The single home for normalizing one logical name, whatever supplied
+    it. Routing every entry point through here is what makes a
+    non-string fail the same way everywhere, rather than surfacing as an
+    `AttributeError` from ``strip`` at whichever layer happened to
+    receive it. On the client ``peer`` path a blank name would otherwise
+    emit an empty ``grpc.ssl_target_name_override`` and fail verification
+    opaquely, where ``None`` selects the address-based path.
     """
-    if identity is None:
+    if peer is None:
         return None
-    identity = identity.strip()
-    return identity or None
+    if not isinstance(peer, str):
+        hint = (
+            " A collection of accepted names belongs in a provider's 'peers'."
+            if parameter == "peer"
+            else ""
+        )
+        raise TypeError(
+            f"expected a single peer name or None for '{parameter}'; got "
+            f"{type(peer).__name__}.{hint}"
+        )
+    peer = peer.strip()
+    return peer or None
+
+
+def _warn_unconfigured(peers: object) -> None:
+    """Report a ``peers`` value that named nothing after normalization."""
+    warnings.warn(
+        f"peers={peers!r} names no peers after normalization, which leaves "
+        "this provider unconfigured: advertisements are ignored and no name "
+        "is pinned. Pass at least one name to gate on identity",
+        IneffectivePeersWarning,
+        stacklevel=4,
+    )
+
+
+def _normalize_peers(
+    peers: str | Iterable[str] | Callable[[str], bool] | None,
+) -> _PeerPolicy | None:
+    """Compile ``peers`` into a policy, or ``None`` if none is configured.
+
+    :param peers:
+        A single name, an iterable of names, a predicate over a
+        candidate name, or ``None``.
+    :returns:
+        The compiled `_PeerPolicy`, or ``None`` when nothing is
+        configured.
+    :raises TypeError:
+        If ``peers`` is none of those shapes.
+
+    .. rubric:: Implementation notes
+
+    A blank name and an empty iterable both collapse to ``None`` — the
+    "nothing configured" state — rather than to a policy accepting
+    nothing, which would reject every peer and read as a silent outage.
+    This extends the blank-collapses-to-None rule `normalize_peer`
+    already applies to a single name.
+    """
+    if peers is None:
+        return None
+    if isinstance(peers, str):
+        name = normalize_peer(peers, parameter="peers")
+        if name is None:
+            _warn_unconfigured(peers)
+            return None
+        return _PeerPolicy(frozenset({name}))
+    if callable(peers):
+        return _PeerPolicy(peers)
+    if isinstance(peers, Iterable):
+        names: set[str] = set()
+        for each in peers:
+            if (name := normalize_peer(each, parameter="peers")) is not None:
+                names.add(name)
+        if not names:
+            _warn_unconfigured(peers)
+            return None
+        return _PeerPolicy(frozenset(names))
+    raise TypeError(
+        "peers must be a peer name, an iterable of names, a predicate "
+        f"over a name, or None; got {type(peers).__name__}."
+    )

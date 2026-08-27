@@ -13,6 +13,7 @@ import sys
 import uuid
 import warnings
 from contextlib import asynccontextmanager
+from typing import Any
 from typing import AsyncContextManager
 from typing import Awaitable
 from typing import ContextManager
@@ -34,10 +35,9 @@ from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
-from wool.runtime.worker.base import BoundWorkerFactory
-from wool.runtime.worker.base import WorkerFactory
+from wool.runtime.worker.auth import normalize_peer
+from wool.runtime.worker.base import WorkerFactoryLike
 from wool.runtime.worker.base import WorkerLike
-from wool.runtime.worker.base import declares_host
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.proxy import DEFAULT_LAZY
 from wool.runtime.worker.proxy import DEFAULT_QUORUM
@@ -47,14 +47,50 @@ from wool.runtime.worker.proxy import LoadBalancerLike
 from wool.runtime.worker.proxy import RoundRobinLoadBalancer
 from wool.runtime.worker.proxy import WorkerProxy
 from wool.utilities.noreentry import noreentry
+from wool.utilities.signature import accepts_kwarg
+from wool.utilities.signature import presupplies_kwarg
+from wool.utilities.signature import requires_kwarg
+from wool.utilities.signature import unbindable_call
 
 logger = logging.getLogger(__name__)
 
 
 # public
+class IneffectiveIdentityWarning(WoolWarning):
+    """Emitted when a `WorkerPool`'s ``identity`` is inert.
+
+    A pool that both spawns workers and dispatches through them hands one
+    credential provider to both roles. When the provider configures
+    ``peers`` but what the pool's workers will advertise is not something
+    that policy accepts (i.e., a name it refuses, or no name at all),
+    every worker the pool spawns is refused by the pool's own admission
+    gate, which surfaces far from the cause as a quorum timeout. A pool
+    with no ``discovery`` service raises instead — see `WorkerPool`'s
+    ``ValueError``. Checked only when the pool owns the default factory:
+    with a custom one it cannot know what its workers will advertise.
+
+    Separately, a factory that cannot accept an ``identity`` keyword owns
+    the name its workers advertise, so the pool has no way to pass its own
+    down and that value goes unused.
+
+    Finally, a pool that spawns no workers has nobody to advertise a name
+    on its behalf, so an ``identity`` given to a discovery-only pool is
+    inert.
+
+    Warned rather than raised because a hybrid pool may legitimately
+    contribute capacity it does not itself dial, because a factory
+    owning its identity is a valid configuration, and because an inert
+    parameter is not an invalid one. Users who want strict behaviour can
+    elevate the category to an error via `warnings.filterwarnings`.
+
+    Never emitted for a factory that *can* receive the value — see
+    `WorkerFactoryLike` for why the pool asserts nothing beyond that.
+    """
+
+
+# public
 class IneffectiveLeaseWarning(WoolWarning):
-    """Emitted when ``lease`` is supplied to a `WorkerPool` that has
-    no ``discovery`` service configured.
+    """Emitted when ``lease`` is supplied without ``discovery``.
 
     The pool's worker count is bounded by ``spawn`` alone in those
     modes — ``lease`` is recorded but never consulted, so the supplied
@@ -69,18 +105,10 @@ class WorkerPool:
     """Orchestrates distributed workers for task execution.
 
     The core of wool's distributed runtime. Manages worker lifecycle,
-    discovery, and load balancing across three modes:
-
-    - **Ephemeral pools** spawn local workers managed within the
-      pool's lifecycle. Perfect for development and single-machine
-      deployments.
-
-    - **Durable pools** connect to existing remote workers through
-      discovery services. Workers run independently, serving multiple
-      clients across distributed deployments.
-
-    - **Hybrid pools** spawn local workers and additionally admit
-      remote workers found through discovery.
+    discovery, and load balancing. Which mode a call resolves to follows
+    from whether ``spawn`` and ``discovery`` are given: a pool may spawn
+    workers it owns, admit workers others are running, or both. The
+    worker package README tabulates the modes and what each does.
 
     :param tags:
         Capability tags for spawned workers.
@@ -99,13 +127,12 @@ class WorkerPool:
         accompanied by an `IneffectiveLeaseWarning`. Admission semantics
         are `WorkerProxy`'s — see its ``lease`` parameter.
     :param worker:
-        Worker factory callable. A `WorkerFactory` declares a ``host``
-        keyword and receives the discovery publisher's prescribed bind
-        host. A `BoundWorkerFactory` declares no ``host`` and owns its
-        binding. Classification is by explicit signature declaration;
-        see `WorkerFactory` for the rules. Defaults to `LocalWorker`,
-        which declares ``host`` and therefore binds the publisher's
-        prescribed host.
+        Worker factory callable, in any of the four shapes
+        `WorkerFactoryLike` admits. Every keyword the pool forwards —
+        the bind host, the ``identity``, and the ``credentials`` — is
+        offered on one rule: passed when the factory can receive it and
+        has not already pre-supplied it. See `WorkerFactoryLike`.
+        Defaults to `LocalWorker`, which takes all three.
     :param discovery:
         Discovery service to attach — a `~wool.DiscoveryLike` instance
         or any `Factory` form resolving to one. The resolved object is
@@ -131,31 +158,51 @@ class WorkerPool:
     :param credentials:
         Optional credentials for TLS/mTLS — either a `WorkerCredentials` or a
         `WorkerCredentialsProvider` (from `WorkerCredentials.as_provider`, or
-        built with a factory callable for identity-based verification or
-        credential rotation). Applied to both spawned workers and the
-        dispatch proxy.
+        built with a factory callable for credential rotation) — see
+        `WorkerCredentialsProvider` for what a provider adds. Applied to
+        both spawned workers and the dispatch proxy.
+    :param identity:
+        Logical workload identity for the workers this pool spawns,
+        advertised through discovery so peers know which name to verify
+        them against. Every worker in a pool shares it: an identity
+        names the workload, not the instance, so replicas of one
+        workload are meant to be indistinguishable. Distinguishing
+        *between* pools is what this expresses.
+
+        Three states, distinguished because an explicit ``None`` is a
+        value and an unset parameter is not:
+
+        - ``Undefined`` (the default) — the keyword is withheld
+          entirely and the factory owns the name its workers advertise.
+          Nothing is inferred from ``peers``: a policy names which
+          workers this pool's client will accept, never what its own
+          workers claim to be.
+        - ``str`` or ``None`` — passed to a factory that can receive it.
+          ``None`` says this pool has no identity to give.
+        - ``str`` or ``None``, factory cannot accept it — withheld, and
+          construction reports an `IneffectiveIdentityWarning`.
+
+        .. caution::
+
+           Passing the value is all the pool can guarantee — see
+           `WorkerFactoryLike`. Where a factory accepts an ``identity``
+           and advertises something else, the ``peers`` policy refuses
+           the workers and nothing fails at construction: the proxy
+           admits none of them and it surfaces as a **startup timeout**.
+           Suspect this first when a pool with a custom factory hangs
+           waiting for quorum.
     :param quorum:
-        Minimum number of workers that must be discovered before the proxy
-        considers itself ready. Defaults to ``1`` — block until at least
-        one worker is admitted. Pass a larger integer to require more
-        workers, or ``None``/``0`` to disable the gate entirely
-        (``dispatch`` may then raise immediately if no workers have been
-        discovered yet). When ``lazy=True`` (default), the quorum wait is
-        deferred to the first dispatch; with ``lazy=False`` it blocks at
-        context entry.
+        Minimum number of workers admitted before the pool is ready.
+        Forwarded to this pool's `WorkerProxy`, which documents the
+        gate, its default, and how ``lazy`` decides when it is waited
+        on.
     :param quorum_timeout:
-        Seconds to wait for ``quorum`` workers to be discovered before
-        raising `asyncio.TimeoutError`. Only meaningful when
-        ``quorum`` is a positive integer; supplying it with
-        ``quorum=None`` or ``quorum=0`` records the value but never
-        consults it, accompanied by an `IneffectiveQuorumTimeoutWarning`.
-        Defaults to ``60``; pass ``None`` to wait indefinitely.  With
-        ``lazy=False`` the timeout fires at ``__aenter__``; the pool,
-        never having entered, is unusable per its single-use
-        semantics, so construct a new pool to retry.  With
-        ``lazy=True`` (default) the timeout fires on the first
-        `WorkerProxy.dispatch`; a later dispatch retries and recovers
-        once a worker is admitted.
+        Seconds to wait for ``quorum`` workers before raising
+        `asyncio.TimeoutError`. Forwarded to this pool's `WorkerProxy`,
+        which documents the bound and when it is inert. A timeout at
+        context entry (``lazy=False``) leaves the pool, never having
+        entered, unusable per its single-use semantics, so construct a
+        new pool to retry.
     :param shutdown_timeout:
         Maximum number of seconds to wait for spawned workers to stop
         during pool teardown, applied as a single deadline to the full
@@ -186,13 +233,16 @@ class WorkerPool:
            silently ignored unless the pool waits unbounded
            (``shutdown_timeout=None``).
     :param lazy:
-        When ``True`` (default), defer discovery setup and the quorum
-        wait to the first `WorkerProxy.dispatch`.  When ``False``,
-        eagerly enter the underlying proxy at ``__aenter__`` time and
-        run the quorum wait there.
+        Forwarded to this pool's `WorkerProxy`, which documents both
+        states and where the quorum timeout surfaces in each.
     :raises ValueError:
-        If configuration is invalid, CPU count unavailable, or
-        ``shutdown_timeout`` is not positive.
+        If configuration is invalid, CPU count unavailable,
+        ``shutdown_timeout`` is not positive, ``identity`` names a
+        workload without ``credentials`` to back it, the worker factory
+        requires an ``identity`` this pool has none to give, or this
+        pool spawns workers its own ``peers`` policy would refuse and
+        has no ``discovery`` service to supply others (see
+        `IneffectiveIdentityWarning`, which covers the hybrid case).
     :raises asyncio.TimeoutError:
         If the quorum wait does not complete within ``quorum_timeout``
         — raised by the underlying `WorkerProxy` at context entry
@@ -327,12 +377,13 @@ class WorkerPool:
         self,
         *tags: str,
         spawn: int = 0,
-        worker: WorkerFactory | BoundWorkerFactory = LocalWorker,
+        worker: WorkerFactoryLike = LocalWorker,
         discovery: None = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
+        identity: str | None | UndefinedType = Undefined,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
         shutdown_timeout: float | None = 60.0,
@@ -341,10 +392,14 @@ class WorkerPool:
         """Create an ephemeral pool of workers.
 
         Spawns the specified quantity of workers using the specified
-        worker factory.
+        worker factory. An ``identity`` reaches only a factory that
+        declares one — see the parameter's documentation.
         """
         ...
 
+    # Overload order is important: a call supplying only 'discovery'
+    # matches this overload and the hybrid one, since every other hybrid
+    # parameter defaults, and resolution takes the first match.
     @overload
     def __init__(
         self,
@@ -369,21 +424,19 @@ class WorkerPool:
         *tags: str,
         spawn: int = 0,
         lease: int | None = None,
-        worker: WorkerFactory | BoundWorkerFactory = LocalWorker,
+        worker: WorkerFactoryLike = LocalWorker,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
+        identity: str | None | UndefinedType = Undefined,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
         shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ):
-        """Create a hybrid pool that spawns local workers and
-        discovers remote workers through the specified discovery
-        protocol.
-        """
+        """Spawn local workers and discover remote ones too."""
         ...
 
     @overload
@@ -392,12 +445,13 @@ class WorkerPool:
         self,
         *tags: str,
         size: int,
-        worker: WorkerFactory | BoundWorkerFactory = LocalWorker,
+        worker: WorkerFactoryLike = LocalWorker,
         discovery: None = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
+        identity: str | None | UndefinedType = Undefined,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
         shutdown_timeout: float | None = 60.0,
@@ -411,12 +465,13 @@ class WorkerPool:
         *tags: str,
         size: int,
         lease: int | None = None,
-        worker: WorkerFactory | BoundWorkerFactory = LocalWorker,
+        worker: WorkerFactoryLike = LocalWorker,
         discovery: DiscoveryLike | Factory[DiscoveryLike],
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
+        identity: str | None | UndefinedType = Undefined,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None = DEFAULT_QUORUM_TIMEOUT,
         shutdown_timeout: float | None = 60.0,
@@ -429,12 +484,13 @@ class WorkerPool:
         spawn: int | None = None,
         size: int | None = None,
         lease: int | None = None,
-        worker: WorkerFactory | BoundWorkerFactory | None = None,
+        worker: WorkerFactoryLike | None = None,
         discovery: DiscoveryLike | Factory[DiscoveryLike] | None = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
         credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
+        identity: str | None | UndefinedType = Undefined,
         quorum: int | None = DEFAULT_QUORUM,
         quorum_timeout: float | None | UndefinedType = Undefined,
         shutdown_timeout: float | None = 60.0,
@@ -442,6 +498,13 @@ class WorkerPool:
     ):
         self._workers = {}
         self._provider = WorkerCredentialsProvider.coerce(credentials)
+        # Three-state — see the `identity` parameter. `normalize_peer`
+        # accepts only `str | None`, so `Undefined` bypasses it.
+        self._identity = (
+            identity
+            if identity is Undefined
+            else normalize_peer(identity, parameter="identity")
+        )
         self._lazy = lazy
 
         if size is not None and spawn is not None:
@@ -456,6 +519,141 @@ class WorkerPool:
                 stacklevel=2,
             )
             spawn = size
+
+        # The identity guards below concern workers this pool starts, so
+        # they key on whether it spawns at all rather than on whether
+        # 'spawn' was passed; keyed on the argument, they would refuse a
+        # discovery-only pool, which starts nothing and is purely a client.
+        spawns = spawn is not None or discovery is None
+
+        if not spawns and self._identity is not Undefined:
+            # Inert, not invalid — warned like 'lease' — see
+            # `IneffectiveIdentityWarning`.
+            warnings.warn(
+                "'identity' has no effect on a pool that spawns no workers; "
+                "it names what this pool's own workers advertise, and a "
+                "discovery-only pool starts none",
+                IneffectiveIdentityWarning,
+                stacklevel=2,
+            )
+
+        if spawns and isinstance(self._identity, str) and self._provider is None:
+            # `WorkerProcess` enforces the same precondition; hoisting it
+            # fails construction here rather than a subprocess at
+            # __aenter__. Only a name needs backing — `None` claims nothing.
+            raise ValueError(
+                "identity requires credentials: an identity is proven by a "
+                "name in the worker's certificate, so a worker serving "
+                "plaintext has nothing to back the one it claims."
+            )
+
+        # One rule governs every forwarded keyword — see `WorkerFactoryLike`.
+        # Each check binds the call this pool will make and so needs the
+        # rest of it; binding ignores values, so a placeholder stands in for
+        # the bind host, which the publisher supplies only at entry.
+        def forwards(keyword: str, *args: Any, **kwargs: Any) -> bool:
+            assert worker is not None
+            return accepts_kwarg(worker, keyword, *args, **kwargs) and not (
+                presupplies_kwarg(worker, keyword)
+            )
+
+        rest: dict[str, Any] = {}
+        if worker is not None:
+            self._forwards_credentials = forwards("credentials")
+            if self._forwards_credentials:
+                rest["credentials"] = self._provider
+            self._forwards_host = forwards("host", *tags, **rest)
+            if self._forwards_host:
+                rest["host"] = ""
+            identity_reaches_workers = forwards("identity", *tags, **rest)
+            identity_is_mandatory = requires_kwarg(worker, "identity", *tags, **rest)
+        else:
+            # The pool owns the default; no signature inspection required.
+            self._forwards_credentials = True
+            self._forwards_host = True
+            rest["credentials"] = self._provider
+            identity_reaches_workers = True
+            identity_is_mandatory = False
+
+        # Settled once: the answers are properties of the factory and of
+        # this configuration, neither of which changes before spawn, and
+        # one home keeps the diagnostics below consistent with the call
+        # they describe. `Undefined` withholds the keyword — see the
+        # `identity` parameter.
+        self._forwards_identity = (
+            identity_reaches_workers and self._identity is not Undefined
+        )
+
+        if spawns and self._identity is Undefined and identity_is_mandatory:
+            # The factory cannot be called without a value this pool does
+            # not have. Provable now; left alone, it surfaces as a TypeError
+            # inside __aenter__, far from the mistake.
+            raise ValueError(
+                "the worker factory requires an 'identity' keyword but this "
+                "pool has none configured; pass 'identity' to the pool or "
+                "give the factory a default."
+            )
+
+        if spawns and worker is not None:
+            # The per-keyword checks say nothing about the rest of the call,
+            # so a factory demanding something the pool never passes reaches
+            # this point. Bind the whole call once and name the argument at
+            # fault, rather than let a TypeError surface inside __aenter__
+            # against a signature the caller can no longer see.
+            if self._identity is not Undefined and identity_reaches_workers:
+                rest["identity"] = self._identity
+            if reason := unbindable_call(worker, *tags, **rest):
+                raise ValueError(
+                    f"the worker factory cannot be called by this pool: {reason}"
+                )
+
+        if spawns and self._provider is not None and worker is None:
+            # The pool is its own client — see `IneffectiveIdentityWarning`
+            # for the failure this predicts. Predictable only for the
+            # default factory: a custom one may accept the identity and
+            # advertise something else, and no signature distinguishes the
+            # two — see `WorkerFactoryLike`.
+            advertised = None if self._identity is Undefined else self._identity
+            configured = self._provider.peers is not None
+            if configured and not self._provider.accepts_peer(advertised):
+                detail = (
+                    f"advertises {advertised!r}"
+                    if advertised is not None
+                    else "advertises no identity"
+                )
+                message = (
+                    f"this pool {detail}, which its own 'peers' policy does "
+                    "not accept, so its proxy will refuse every worker it "
+                    "spawns. Set 'identity' to a name the policy accepts."
+                )
+                if discovery is None:
+                    # Ephemeral: the spawned workers are all the proxy will
+                    # ever see, so the pool is unsatisfiable rather than
+                    # merely wasteful.
+                    raise ValueError(message)
+                warnings.warn(message, IneffectiveIdentityWarning, stacklevel=2)
+
+        if spawns and self._identity is not Undefined and not identity_reaches_workers:
+            # Report only what is provable: which of the two ways the
+            # factory owns the name, since the remedies differ. See
+            # `WorkerFactoryLike`.
+            if worker is not None and presupplies_kwarg(worker, "identity"):
+                detail = (
+                    "the worker factory already binds its own 'identity', "
+                    "which this pool does not override. Drop one of the two"
+                )
+            else:
+                detail = (
+                    "the worker factory cannot accept an 'identity' keyword, "
+                    "so this pool has no way to pass it down. Give the "
+                    "factory an 'identity' keyword to receive it"
+                )
+            warnings.warn(
+                f"'identity' is set but {detail}; whatever identity its "
+                "workers advertise is the factory's, not this value.",
+                IneffectiveIdentityWarning,
+                stacklevel=2,
+            )
 
         if lease is not None and lease < 0:
             raise ValueError("Lease must be non-negative")
@@ -648,17 +846,17 @@ class WorkerPool:
         self,
         *tags: str,
         spawn: int,
-        factory: WorkerFactory | BoundWorkerFactory | None,
+        factory: WorkerFactoryLike | None,
         publisher: DiscoveryPublisherLike,
     ):
         """Spawn, publish, and reap the pool's local workers.
 
         Workers start concurrently and announce themselves through
         the entered publisher; any spawn failure aborts entry with an
-        `ExceptionGroup`. Factories that declare ``host``, including
-        the default `LocalWorker`, receive the publisher's prescribed
-        bind host (see `~wool.DiscoveryPublisherLike.bind_host`);
-        bound factories own their binding. Teardown applies the pool's
+        `ExceptionGroup`. Which keywords each factory receives is
+        settled at construction — see `WorkerFactoryLike`. Only the
+        bind host is resolved here, at publisher entry (see
+        `~wool.DiscoveryPublisherLike.bind_host`). Teardown applies the pool's
         ``shutdown_timeout`` as a single deadline across worker stops
         and publisher cleanup — see that parameter for the contract
         this implements — and runs even when publisher validation or
@@ -697,24 +895,20 @@ class WorkerPool:
                     f"Expected DiscoveryPublisherLike, got: {type(publisher_svc)}"
                 )
             if factory is None:
-                # The pool owns the default; no signature inspection required.
                 factory = LocalWorker
-                unbound = True
-            else:
-                unbound = declares_host(factory)
+
+            # Settled in `__init__`; only the bind host is resolved here.
+            kwargs: dict[str, Any] = {}
+            if self._forwards_credentials:
+                kwargs["credentials"] = self._provider
+            if self._forwards_host:
+                kwargs["host"] = publisher_svc.bind_host
+            if self._forwards_identity:
+                kwargs["identity"] = cast(str | None, self._identity)
 
             tasks = []
             for _ in range(spawn):
-                if unbound:
-                    worker = cast(WorkerFactory, factory)(
-                        *tags,
-                        credentials=self._provider,
-                        host=publisher_svc.bind_host,
-                    )
-                else:
-                    worker = cast(BoundWorkerFactory, factory)(
-                        *tags, credentials=self._provider
-                    )
+                worker = cast(WorkerFactoryLike, factory)(*tags, **kwargs)
 
                 async def start(worker):
                     await worker.start()

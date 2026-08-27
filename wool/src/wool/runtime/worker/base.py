@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import functools
-import inspect
 import uuid
 import warnings
 from abc import ABC
@@ -12,6 +10,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Final
 from typing import Protocol
+from typing import TypeAlias
 from typing import final
 from typing import runtime_checkable
 
@@ -29,9 +28,8 @@ class ChannelOptions:
     """Options for gRPC channel configuration.
 
     Controls the maximum message sizes and keepalive behaviour for
-    gRPC channels.  Workers advertise these options via
-    `WorkerMetadata` so that
-    clients connect with compatible settings automatically.
+    gRPC channels.  Workers advertise these options via `WorkerMetadata`
+    so that clients connect with compatible settings automatically.
 
     :param max_receive_message_length:
         Maximum inbound message size in bytes.
@@ -71,7 +69,7 @@ class ChannelOptions:
 class WorkerOptions:
     """Options for gRPC worker server configuration.
 
-    Composes :class:`ChannelOptions` (advertised to clients) with
+    Composes `ChannelOptions` (advertised to clients) with
     server-side settings that are not communicated over the wire.
 
     :param channel:
@@ -121,35 +119,84 @@ class WorkerOptions:
 
 
 # public
-@runtime_checkable
 class WorkerFactory(Protocol):
-    """Protocol for bind-host-aware worker factory callables.
+    """Protocol for fully pool-driven worker factory callables.
 
     Worker factories create `WorkerLike` instances with specific tags
     and configuration; `WorkerPool` uses them to spawn workers. This
-    protocol additionally receives the bind host prescribed by the
-    pool's discovery publisher, so factory-customized workers stay
-    reachable wherever the publisher advertises them. `LocalWorker`
-    satisfies this protocol as-is. Factories that own their binding
-    instead implement `BoundWorkerFactory`.
+    protocol receives both keywords the pool can prescribe: the bind
+    host from the pool's discovery publisher, so factory-customized
+    workers stay reachable wherever the publisher advertises them, and
+    the pool's ``identity``. `LocalWorker` satisfies it as-is.
+    """
 
-    The pool classifies a factory as bind-host-aware by inspecting
-    its signature for an **explicitly declared**, keyword-passable
-    ``host`` parameter:
+    def __call__(
+        self,
+        *tags: str,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
+        host: str,
+        identity: str | None,
+    ) -> WorkerLike:
+        """Create a new worker instance bound to the given host.
 
-    - The parameter name is the opt-in token: only a factory that
-      declares ``host`` receives it, and a misspelling silently
-      classifies the factory as bound.
-    - The parameter must be keyword-only. ``**kwargs`` does not count
-      — a factory that could merely absorb the keyword is treated as
-      bound rather than risk passing a host into a sink. Positional
-      declarations (positional-only or positional-or-keyword) are
-      likewise excluded: the pool passes the host by keyword, and a
-      positional ``host`` would collide with a forwarded tag at spawn.
-    - A `functools.partial` that pre-supplies ``host`` is treated as
-      bound — pre-bound values are never overridden.
-    - A callable whose signature cannot be inspected is treated as
-      bound, the safe default.
+        :param tags:
+            Capability tags for worker discovery and filtering.
+        :param credentials:
+            Credentials for the worker.
+        :param host:
+            Host the worker should bind, prescribed by the pool's
+            discovery publisher (see `~wool.DiscoveryPublisherLike.bind_host`).
+        :param identity:
+            The peer name the pool intends this worker to advertise, or
+            ``None`` when the pool has no identity to give. Declaring
+            it is what asks for it — see `WorkerFactoryLike` for when the
+            pool passes a value and when it withholds the keyword.
+        :returns:
+            Configured worker instance.
+        """
+        ...
+
+
+# public
+class BoundWorkerFactory(Protocol):
+    """Protocol for worker factory callables that own their binding.
+
+    Identical to `WorkerFactory` except the factory is never passed a
+    bind host: the pool never overrides the binding it produces.
+    """
+
+    def __call__(
+        self,
+        *tags: str,
+        credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
+        identity: str | None,
+    ) -> WorkerLike:
+        """Create a new worker instance.
+
+        :param tags:
+            Capability tags for worker discovery and filtering.
+        :param credentials:
+            Credentials for the worker.
+        :param identity:
+            The peer name the pool intends this worker to advertise, or
+            ``None`` when the pool has no identity to give. Declaring
+            it is what asks for it — see `WorkerFactoryLike` for when the
+            pool passes a value and when it withholds the keyword.
+        :returns:
+            Configured `WorkerLike` instance.
+        """
+        ...
+
+
+# public
+class IdentifiedWorkerFactory(Protocol):
+    """Protocol for factories owning the name their workers advertise.
+
+    `WorkerFactory` minus the pool's ``identity``: the factory decides
+    what its workers advertise, and the pool never passes a name.
+
+    One of the four shapes `WorkerFactoryLike` admits — see that alias
+    for the axes that separate them.
     """
 
     def __call__(
@@ -174,16 +221,14 @@ class WorkerFactory(Protocol):
 
 
 # public
-@runtime_checkable
-class BoundWorkerFactory(Protocol):
-    """Protocol for worker factory callables that own their binding.
+class IdentifiedBoundWorkerFactory(Protocol):
+    """Protocol for factories owning both their binding and their name.
 
-    Identical to `WorkerFactory` except the factory is never passed a
-    bind host — a bound factory always wins, and the pool never
-    overrides the binding it produces. Any callable without an
-    explicitly declared, keyword-passable ``host`` parameter is
-    classified bound; see `WorkerFactory` for the classification
-    rules.
+    `BoundWorkerFactory` minus the pool's ``identity``: the pool passes
+    only tags and credentials.
+
+    One of the four shapes `WorkerFactoryLike` admits — see that alias
+    for the axes that separate them.
     """
 
     def __call__(
@@ -203,26 +248,49 @@ class BoundWorkerFactory(Protocol):
         ...
 
 
-def declares_host(factory: WorkerFactory | BoundWorkerFactory) -> bool:
-    """Whether a factory explicitly declares a host parameter.
+# TODO: Replace this enumeration of factory protocols with a type
+# intersection if Python ever implements the capability.
+# public
+WorkerFactoryLike: TypeAlias = (
+    WorkerFactory
+    | IdentifiedWorkerFactory
+    | BoundWorkerFactory
+    | IdentifiedBoundWorkerFactory
+)
+"""Any callable `WorkerPool` accepts for its ``worker`` parameter.
 
-    Implements the classification rules documented on `WorkerFactory`.
+The four shapes vary along two orthogonal axes, each being a keyword
+the pool passes only to a factory that can receive it:
 
-    :param factory:
-        The worker factory callable to classify.
-    :returns:
-        True when the factory should receive the publisher-prescribed
-        bind host.
-    """
-    if isinstance(factory, functools.partial) and "host" in factory.keywords:
-        return False
-    try:
-        parameters = inspect.signature(factory).parameters
-    except (ValueError, TypeError):
-        return False
-    else:
-        parameter = parameters.get("host")
-        return parameter is not None and parameter.kind is inspect.Parameter.KEYWORD_ONLY
+==============================  ==========  ============
+Shape                           ``host``    ``identity``
+==============================  ==========  ============
+`WorkerFactory`                 yes         yes
+`IdentifiedWorkerFactory`       yes         no
+`BoundWorkerFactory`            no          yes
+`IdentifiedBoundWorkerFactory`  no          no
+==============================  ==========  ============
+
+Whichever keyword a factory does not take, it **owns**: ``Bound``
+owns its binding, ``Identified`` owns the name its workers advertise.
+The pool inspects the factory's signature to determine which keywords
+to pass it, with one exception: a `functools.partial` that pre-supplies
+the keyword keeps its own value; the pool defers to it rather than
+overriding what the partial function pins.
+
+.. rubric:: Implementation notes
+
+Classification binds the intended call — see
+`~wool.utilities.signature.accepts_kwarg` — because for a callable
+protocol ``isinstance`` tests only that the object is callable.
+
+The enumeration is a workaround. Expressing "accepts host **and**
+identity" as a composition of two constraints needs a type
+intersection, which Python does not have: protocol inheritance
+resolves ``__call__`` by MRO and silently keeps only the first base.
+This alias is the sole name callers need, so the shapes behind it can
+be replaced when the language grows one.
+"""
 
 
 # public
@@ -231,7 +299,7 @@ class WorkerLike(Protocol):
     """Protocol defining the worker interface.
 
     All worker implementations must satisfy this protocol. Prefer
-    :class:`WorkerLike` over :class:`Worker` for type annotations to
+    `WorkerLike` over `Worker` for type annotations to
     support structural subtyping.
 
     Workers execute distributed tasks within their own process and event
@@ -321,7 +389,7 @@ class Worker(ABC):
 
     Workers execute distributed tasks in dedicated processes, each running
     a gRPC server for task dispatch. Subclasses implement the actual worker
-    process lifecycle in :meth:`_start` and :meth:`_stop`.
+    process lifecycle in `_start` and `_stop`.
 
     **Implementing a custom worker:**
 

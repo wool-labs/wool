@@ -124,11 +124,20 @@ class TestLanDiscoveryRoundTrip:
             max_size=5,
         ),
         advertise_host=st.one_of(st.none(), st.just("127.0.0.1")),
+        identity=st.one_of(
+            st.none(),
+            st.text(
+                min_size=1,
+                max_size=40,
+                alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "abcdefghijklmnopqrstuvwxyz0123456789.-_",
+            ),
+        ),
     )
     @settings(max_examples=10, deadline=10000)
     @pytest.mark.asyncio
     async def test_publish_roundtrip_with_arbitrary_metadata(
-        self, address, pid, version, tags, advertise_host
+        self, address, pid, version, tags, advertise_host, identity
     ):
         """Test publish-discover roundtrip with arbitrary metadata.
 
@@ -148,6 +157,7 @@ class TestLanDiscoveryRoundTrip:
             version=version,
             tags=tags,
             extra=MappingProxyType({}),
+            identity=identity,
         )
         publisher = LanDiscovery.Publisher(
             _TEST_SERVICE_TYPE, advertise_host=advertise_host
@@ -192,5 +202,6 @@ class TestLanDiscoveryRoundTrip:
         assert event.metadata.pid == worker.pid
         assert event.metadata.version == worker.version
         assert event.metadata.tags == worker.tags
+        assert event.metadata.identity == worker.identity
         expected_port = int(address.split(":")[1])
         assert event.metadata.address == f"127.0.0.1:{expected_port}"

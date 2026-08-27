@@ -29,6 +29,14 @@ class CertificateMaterial(NamedTuple):
     cert_pem: bytes
 
 
+class CertificateAuthority(NamedTuple):
+    """A reusable signing authority, so several leaves share one bundle."""
+
+    ca_pem: bytes
+    key: object
+    certificate: object
+
+
 class CertificateFiles(NamedTuple):
     """Paths and PEM bytes for one certificate set written to disk."""
 
@@ -71,48 +79,72 @@ def context_is_unarmed() -> bool:
     return wool.__chain__.get(None) is None
 
 
-def generate_ca_and_leaf(sans, *, common_name="wool-worker", self_signed=False):
-    """Generate a fresh CA and a leaf certificate carrying *sans*.
+def _private_key():
+    """Generate a fresh RSA private key."""
+    return rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+
+
+def generate_authority(common_name="wool-test-ca"):
+    """Generate a certificate authority that can issue several leaves.
+
+    Pass the result as ``authority`` to `generate_ca_and_leaf` or
+    `generate_certificate_files` to issue peers that chain to one trust
+    bundle while carrying distinct names — the arrangement needed to
+    tell workers apart by identity rather than by authority.
+    """
+    now = datetime.datetime.now(datetime.UTC)
+    key = _private_key()
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256(), default_backend())
+    )
+    return CertificateAuthority(
+        ca_pem=certificate.public_bytes(serialization.Encoding.PEM),
+        key=key,
+        certificate=certificate,
+    )
+
+
+def generate_ca_and_leaf(
+    sans, *, common_name="wool-worker", self_signed=False, authority=None
+):
+    """Generate a leaf certificate carrying ``sans``, and the CA behind it.
 
     The leaf is granted both server and client extended key usages so it
     works on both sides of a mutual-TLS connection. By default the leaf
     is signed by a freshly generated CA; with ``self_signed=True`` the
     leaf signs itself and doubles as its own trust root (the degenerate
     single-certificate case), so the returned CA PEM is the leaf PEM.
+    Pass ``authority`` — a `CertificateAuthority` from
+    `generate_authority` — to issue under an existing CA instead, so
+    several leaves share one trust bundle.
 
     Returns a `CertificateMaterial`, so callers bind the three PEMs by
     name — all three are `bytes`, and a permuted positional unpack
     mis-wires silently rather than raising.
     """
-
-    def _key():
-        return rsa.generate_private_key(
-            public_exponent=65537, key_size=2048, backend=default_backend()
-        )
-
     now = datetime.datetime.now(datetime.UTC)
-    leaf_key = _key()
+    leaf_key = _private_key()
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     if self_signed:
         issuer = subject
         signing_key = leaf_key
         ca_cert = None
     else:
-        signing_key = _key()
-        issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "wool-test-ca")])
-        ca_cert = (
-            x509.CertificateBuilder()
-            .subject_name(issuer)
-            .issuer_name(issuer)
-            .public_key(signing_key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(now)
-            .not_valid_after(now + datetime.timedelta(days=365))
-            .add_extension(
-                x509.BasicConstraints(ca=True, path_length=None), critical=True
-            )
-            .sign(signing_key, hashes.SHA256(), default_backend())
-        )
+        authority = authority if authority is not None else generate_authority()
+        signing_key = authority.key
+        issuer = authority.certificate.subject
+        ca_cert = authority.certificate
 
     leaf_cert = (
         x509.CertificateBuilder()
@@ -165,14 +197,17 @@ def write_certificate_files(directory, ca_pem, key_pem, cert_pem):
     )
 
 
-def generate_certificate_files(directory, sans, *, common_name="wool-worker"):
-    """Generate a CA and leaf for *sans* and write them as PEM files.
+def generate_certificate_files(
+    directory, sans, *, common_name="wool-worker", authority=None
+):
+    """Generate a CA and leaf for ``sans`` and write them as PEM files.
 
     The generating layer over `write_certificate_files`: SANs in, paths
     out. Returns the same `CertificateFiles` that writing pre-generated
-    material returns.
+    material returns. ``authority`` issues under an existing CA — see
+    `generate_ca_and_leaf`.
     """
-    material = generate_ca_and_leaf(sans, common_name=common_name)
+    material = generate_ca_and_leaf(sans, common_name=common_name, authority=authority)
     return write_certificate_files(
         directory, material.ca_pem, material.key_pem, material.cert_pem
     )

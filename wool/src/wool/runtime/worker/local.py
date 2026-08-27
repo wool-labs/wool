@@ -1,3 +1,9 @@
+"""Workers running as local subprocesses.
+
+Provides `LocalWorker`, which owns a `WorkerProcess`, publishes what it
+advertises, and stops it on the way out.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +15,7 @@ from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import normalize_peer
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.connection import WorkerConnection
@@ -33,27 +40,6 @@ class LocalWorker(Worker):
     Spawns a dedicated process hosting a gRPC server for task execution.
     Handles multiple concurrent tasks in an isolated asyncio event loop.
 
-    **Basic usage:**
-
-    .. code-block:: python
-
-        worker = LocalWorker("gpu-capable")
-        await worker.start()
-        # Worker is now accepting tasks
-        await worker.stop()
-
-    **Custom configuration:**
-
-    .. code-block:: python
-
-        worker = LocalWorker(
-            "production",
-            "high-memory",
-            host="0.0.0.0",  # Listen on all interfaces
-            port=50051,  # Fixed port
-            shutdown_grace_period=30.0,
-        )
-
     :param tags:
         Capability tags for filtering and selection.
     :param host:
@@ -71,28 +57,63 @@ class LocalWorker(Worker):
           credentials for mutual TLS. Enables secure worker-to-worker
           communication.
         - `WorkerCredentialsProvider`: A provider —
-          `WorkerCredentials.as_provider` for fixed material, or one built
-          with a factory callable for identity-based verification or credential
-          rotation without restart.
+          `WorkerCredentials.as_provider` for fixed material, or one
+          built with a factory callable for credential rotation without
+          restart.
         - ``None``: Worker uses insecure connections.
     :param options:
         gRPC message size options. Defaults to
-        :class:`WorkerOptions` with 100 MB limits.
+        `WorkerOptions` with 100 MB limits.
     :param backpressure:
         Optional admission control hook. A callable receiving a
-        :class:`~wool.runtime.worker.service.BackpressureContext`
+        `~wool.runtime.worker.service.BackpressureContext`
         and returning ``True`` to **reject** the task or ``False``
         to **accept** it. Both sync and async callables are
         supported. When a task is rejected the worker responds with
         gRPC ``RESOURCE_EXHAUSTED``, causing the load balancer to
         skip to the next worker. ``None`` (default) accepts all
         tasks unconditionally.
+    :param identity:
+        Logical workload identity this worker claims and advertises
+        through discovery. Requires ``credentials``, since the claim is
+        proven by a name in the worker's certificate — see
+        `WorkerMetadata`'s ``identity`` for the forms that name may
+        take. ``None`` (default) declares none — see `WorkerProxy` for
+        how a client's ``peers`` policy treats each state.
     :param daemon:
         Whether the worker subprocess is daemonic. Forwarded to
         `WorkerProcess`, which owns the default and the per-value
         semantics; omit to accept that default.
     :param extra:
         Additional metadata as key-value pairs.
+
+    **Basic usage:**
+
+    .. code-block:: python
+
+        worker = LocalWorker("gpu-capable")
+        await worker.start()
+        # Worker is now accepting tasks
+        await worker.stop()
+
+    **Custom configuration:**
+
+    .. code-block:: python
+
+        credentials = WorkerCredentials.from_files(
+            ca_path="certs/ca-cert.pem",
+            key_path="certs/worker-key.pem",
+            cert_path="certs/worker-cert.pem",
+        )
+        worker = LocalWorker(
+            "production",
+            "high-memory",
+            host="0.0.0.0",  # Listen on all interfaces
+            port=50051,  # Fixed port
+            shutdown_grace_period=30.0,
+            credentials=credentials,
+            identity="api.wool.svc",  # A name in the worker's certificate
+        )
     """
 
     _worker_process: WorkerProcess
@@ -108,11 +129,13 @@ class LocalWorker(Worker):
         credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         options: WorkerOptions | None = None,
         backpressure: BackpressureLike | None = None,
+        identity: str | None = None,
         daemon: bool | None | UndefinedType = Undefined,
         **extra: Any,
     ):
         super().__init__(*tags, **extra)
         self._provider = WorkerCredentialsProvider.coerce(credentials)
+        self._identity = normalize_peer(identity, parameter="identity")
         self._worker_process = WorkerProcess(
             uid=self._uid,
             host=host,
@@ -124,6 +147,7 @@ class LocalWorker(Worker):
             tags=frozenset(self._tags),
             extra=self._extra,
             backpressure=backpressure,
+            identity=self._identity,
             **({} if daemon is Undefined else {"daemon": daemon}),
         )
 
@@ -184,7 +208,19 @@ class LocalWorker(Worker):
                 # releases the pooled channel this stop acquired. The
                 # provider rides along so the connection resolves
                 # current credential material per call.
-                connection = WorkerConnection(self.address, credentials=self._provider)
+                # Pin the worker's own identity — nothing else here
+                # supplies a name — see `WorkerProxy` for why. A worker
+                # declaring none keeps the dialed-address fallback,
+                # which its certificate must then cover.
+                connection = (
+                    WorkerConnection(self.address)
+                    if self._provider is None
+                    else WorkerConnection(
+                        self.address,
+                        credentials=self._provider,
+                        peer=self._identity,
+                    )
+                )
                 try:
                     # Only a bounded drain (positive grace) admits a
                     # finite deadline; a negative grace drains

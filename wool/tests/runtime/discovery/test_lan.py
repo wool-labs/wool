@@ -55,7 +55,9 @@ def worker_factory():
     """
 
     def _create_worker(
-        address: str, tags: frozenset[str] | None = None
+        address: str,
+        tags: frozenset[str] | None = None,
+        identity: str | None = None,
     ) -> WorkerMetadata:
         return WorkerMetadata(
             uid=uuid.uuid4(),
@@ -64,6 +66,7 @@ def worker_factory():
             version="1.0.0",
             tags=tags or frozenset(),
             extra=MappingProxyType({}),
+            identity=identity,
         )
 
     return _create_worker
@@ -1461,6 +1464,84 @@ class TestLanDiscoveryPublisher:
             assert service_info.addresses == [socket.inet_aton(bind_host)]
             assert service_info.port == port
 
+    @pytest.mark.asyncio
+    async def test_publish_should_advertise_the_declared_identity(
+        self, mock_zeroconf, worker_factory
+    ):
+        """Test a worker's advertised identity reaches the TXT record.
+
+        Given:
+            A publisher and a worker declaring a logical identity.
+        When:
+            The worker is published.
+        Then:
+            The registered record should carry that identity, so a
+            subscriber can read it back.
+        """
+        # Arrange
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
+        worker = worker_factory("127.0.0.1:5001", identity="alpha.svc")
+
+        # Act
+        async with publisher:
+            await publisher.publish("worker-added", worker)
+
+            # Assert
+            service_info = publisher.services[str(worker.uid)]
+            assert service_info.decoded_properties["identity"] == "alpha.svc"
+
+    @pytest.mark.asyncio
+    async def test_publish_should_raise_when_the_identity_exceeds_the_txt_limit(
+        self, mock_zeroconf, worker_factory
+    ):
+        """Test an identity too large for a TXT record fails loudly.
+
+        Given:
+            A publisher and a worker declaring an identity longer than a
+            single DNS-SD TXT string can hold.
+        When:
+            The worker is published.
+        Then:
+            It should raise rather than truncate, since a silently
+            shortened name would be advertised as a peer identity a
+            client then pins and cannot verify.
+        """
+        # Arrange
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
+        worker = worker_factory("127.0.0.1:5001", identity="a" * 250)
+
+        # Act & assert
+        async with publisher:
+            with pytest.raises(ValueError, match="range"):
+                await publisher.publish("worker-added", worker)
+
+    @pytest.mark.asyncio
+    async def test_publish_should_advertise_a_valueless_identity_when_none_declared(
+        self, mock_zeroconf, worker_factory
+    ):
+        """Test a worker declaring no identity advertises a valueless key.
+
+        Given:
+            A publisher and a worker declaring no identity.
+        When:
+            The worker is published.
+        Then:
+            The record's identity property should be None. Zeroconf
+            encodes that as a valueless TXT key rather than omitting
+            it, and a subscriber reads it back as no identity at all.
+        """
+        # Arrange
+        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
+        worker = worker_factory("127.0.0.1:5001")
+
+        # Act
+        async with publisher:
+            await publisher.publish("worker-added", worker)
+
+            # Assert
+            service_info = publisher.services[str(worker.uid)]
+            assert service_info.decoded_properties["identity"] is None
+
 
 class TestLanDiscoverySubscriber:
     """Tests for LanDiscovery.Subscriber class.
@@ -1722,3 +1803,64 @@ class TestLanDiscoverySubscriber:
         assert dropped.type == "worker-dropped"
         assert dropped.metadata.uid == uid
         assert dropped.metadata.tags == frozenset({"gpu"})
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_carry_the_advertised_identity(
+        self, subscriber_driver
+    ):
+        """Test an advertised identity reaches the subscriber verbatim.
+
+        Given:
+            A service record advertising a workload identity.
+        When:
+            The subscriber iterates events.
+        Then:
+            It should yield that worker carrying the same name, which
+            is what a client's peers policy is judged against.
+        """
+        # Arrange
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
+        record = _record(identity="api.wool.svc")
+
+        # Act
+        collected = asyncio.create_task(_collect(subscriber, 1))
+        await subscriber_driver.added(record)
+        (event,) = await collected
+
+        # Assert
+        assert event.metadata.identity == "api.wool.svc"
+
+    @pytest.mark.parametrize(
+        "identity_property",
+        [{}, {"identity": ""}],
+        ids=["key-absent", "key-present-but-blank"],
+    )
+    @pytest.mark.asyncio
+    async def test___aiter___should_default_identity_to_none_when_no_name_is_advertised(
+        self, identity_property, subscriber_driver
+    ):
+        """Test a record declaring no identity deserializes either way.
+
+        Given:
+            A raw service record carrying no identity property at all,
+            as published by a worker predating the field, or one
+            carrying the key with an empty value.
+        When:
+            The subscriber iterates events.
+        Then:
+            It should yield that worker with no identity in both cases,
+            rather than rejecting the record as malformed or admitting
+            a worker that advertises the empty string.
+        """
+        # Arrange
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
+        record = _record(**identity_property)
+
+        # Act
+        collected = asyncio.create_task(_collect(subscriber, 1))
+        await subscriber_driver.added(record)
+        (event,) = await collected
+
+        # Assert
+        assert event.type == "worker-added"
+        assert event.metadata.identity is None

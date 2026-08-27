@@ -18,6 +18,7 @@ from typing import Generic
 from typing import TypeAlias
 from typing import TypeVar
 from typing import cast
+from typing import overload
 
 import grpc.aio
 
@@ -29,6 +30,7 @@ from wool.runtime.routine.task import Task
 from wool.runtime.serializer import Serializer
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
+from wool.runtime.worker.auth import normalize_peer
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.frame import ExceptionResponseFrame
 from wool.runtime.worker.frame import Frame
@@ -64,7 +66,39 @@ _HANDSHAKE_TOKENS: Final = (
 )
 
 _DispatchCall: TypeAlias = grpc.aio.StreamStreamCall[protocol.Request, protocol.Response]
-_PoolKey: TypeAlias = tuple[str, WorkerCredentials | None, ChannelOptions]
+
+
+@dataclass(frozen=True)
+class _ChannelKey:
+    """What distinguishes one pooled gRPC channel from another.
+
+    Every field participates in equality, so a change to any of them
+    yields a different channel rather than reusing one configured for
+    something else.
+
+    :param target:
+        The worker URI the channel dials.
+    :param credentials:
+        The material the channel presents and verifies against; rotated
+        material compares unequal and earns a fresh handshake.
+    :param options:
+        The channel options the worker advertised.
+    :param peer:
+        The name this channel verifies its worker against, or ``None``
+        to verify against the dialed address.
+
+    .. rubric:: Implementation notes
+
+    ``peer`` is kept beside the material rather than inside it because
+    it is the client's decision per connection, not a property of the
+    material.
+    """
+
+    target: str
+    credentials: WorkerCredentials | None
+    options: ChannelOptions
+    peer: str | None
+
 
 _T = TypeVar("_T")
 
@@ -167,8 +201,8 @@ class HandshakeError(TransientRpcError):
     TLS/mTLS handshake or peer-authentication problem —
     ``UNAUTHENTICATED``, or ``UNAVAILABLE`` with TLS evidence in the
     error text.  Typical causes, every one of them this client's own
-    verification of a worker failing: a wrong certificate authority, an
-    identity that does not match what the client expects, an expired
+    verification of a worker failing: a wrong certificate authority, a
+    peer name that does not match what the client expects, an expired
     worker certificate, or a plaintext-versus-encrypted mismatch.  It is
     a *distinct, diagnosable* condition: an operator can tell "workers
     are present, but my credentials will not accept them" apart from "no
@@ -230,7 +264,7 @@ class WorkerConnection:
     pooled channel, whereas `stop` terminates the remote worker.
 
     Acquires pooled gRPC channels keyed by ``(target, credentials,
-    options)``.  Each `dispatch` call obtains a reference-counted
+    options, peer)``.  Each `dispatch` call obtains a reference-counted
     channel from the module-level pool, primes an async generator that
     holds its own reference, then releases the dispatch-scope reference.
     The channel stays alive until the caller finishes consuming the
@@ -275,6 +309,25 @@ class WorkerConnection:
         See `ChannelOptions` for defaults.  The
         ``max_concurrent_streams`` field sizes the per-channel
         concurrency semaphore.
+    :param peer:
+        Optional peer name to verify this specific worker against, and
+        the only way a name reaches the handshake at all. For a
+        connection to a discovered worker it is the identity that worker
+        advertised, since only one concrete name can be verified per
+        connection.
+
+        Not drawn from a provider's ``peers`` — see `WorkerProxy` for
+        where it does come from. It joins the channel-pool key alongside
+        the credential material, so connections pinned to different
+        peers never share a channel. Requires ``credentials``:
+        verification happens in the handshake, and an insecure channel
+        performs none, so a name with nothing to check it against is
+        refused rather than dropped.
+
+        A self-directed dispatch is the one exemption, and it is not
+        reachable through this parameter: a worker dialing itself rides
+        the loopback UDS, which is always insecure and never verifies a
+        peer, so the pin goes unconsulted on that route alone.
 
     **Usage:**
 
@@ -296,31 +349,63 @@ class WorkerConnection:
         grpc.StatusCode.RESOURCE_EXHAUSTED,
     }
 
+    @overload
+    def __init__(
+        self,
+        target: str,
+        *,
+        credentials: None = None,
+        options: ChannelOptions | None = None,
+    ): ...
+
+    @overload
+    def __init__(
+        self,
+        target: str,
+        *,
+        credentials: WorkerCredentials | WorkerCredentialsProvider,
+        options: ChannelOptions | None = None,
+        peer: str | None = None,
+    ): ...
+
     def __init__(
         self,
         target: str,
         *,
         credentials: WorkerCredentials | WorkerCredentialsProvider | None = None,
         options: ChannelOptions | None = None,
+        peer: str | None = None,
     ):
         self._target = target
         self._provider = WorkerCredentialsProvider.coerce(credentials)
         self._options = options if options is not None else ChannelOptions()
+        self._peer = normalize_peer(peer)
+        if self._peer is not None and self._provider is None:
+            # The same precondition WorkerProcess and WorkerPool enforce,
+            # from the other side of the connection. Refused rather than
+            # ignored: the parameter's contract promises the pin reaches
+            # the channel key, and on an insecure channel it does not.
+            raise ValueError(
+                "peer requires credentials: a peer name is verified during "
+                "the TLS handshake, so an insecure channel has nothing to "
+                "check it against."
+            )
         # The TCP key is recomputed on each TCP-routed dispatch from the
-        # resolved snapshot (so rotated material yields a new key); the last
+        # resolved material (so rotated material yields a new key); the last
         # one is retained for ``close`` and for expiring a superseded
         # key's pooled channel. ``None`` until the first TCP dispatch —
         # self-dispatches over the loopback UDS never set it.
-        self._key: _PoolKey | None = None
-        self._uds_key: _PoolKey | None = None
+        self._key: _ChannelKey | None = None
+        self._uds_key: _ChannelKey | None = None
 
-    async def _resolve_key(self) -> _PoolKey:
+    async def _resolve_key(self) -> _ChannelKey:
         """Resolve the pool key routing the next RPC.
 
-        Decides the route before touching credentials: a self-directed
-        call rides the loopback UDS, which is always insecure — the
-        worker never does TLS/identity against itself — so those calls
-        never pay a credential resolve whose result would be discarded.
+        Decides the route before touching credentials, so a
+        self-directed call never pays a credential resolve whose result
+        would be discarded — see the ``peer`` parameter for why that
+        route verifies nothing.
+
         Otherwise resolves current credential material per call so
         rotated material is adopted on the next connection (see class
         docstring); the resolve is awaited rather than read
@@ -330,20 +415,20 @@ class WorkerConnection:
         channel doomed so it finalizes as soon as in-flight work
         drains instead of idling out the pool's TTL.
         """
-        key: _PoolKey
+        key: _ChannelKey
         if (
             (metadata := wool.__worker_metadata__) is not None
             and metadata.address == self._target
             and (uds_address := wool.__worker_uds_address__) is not None
         ):
-            key = (uds_address, None, self._options)
+            key = _ChannelKey(uds_address, None, self._options, None)
             self._uds_key = key
         else:
             if self._provider is None:
                 credentials = None
             else:
                 credentials = await self._provider.credentials
-            key = (self._target, credentials, self._options)
+            key = _ChannelKey(self._target, credentials, self._options, self._peer)
             if self._key is not None and self._key != key:
                 await _channel_pool.expire(self._key)
             self._key = key
@@ -394,6 +479,15 @@ class WorkerConnection:
           default filter the per-entry warnings emit once during
           decode and the worker exception raises unchained.
 
+        An encode-side failure — a strict-mode
+        `wool.ChainSerializationError` aggregating
+        `wool.SerializationWarning` warnings from
+        `~wool.runtime.context.manifest.ChainManifest.to_protobuf`, say,
+        when an unpicklable `wool.ContextVar` value is set — propagates
+        unwrapped. The load-balancer contract treats only `RpcError`
+        instances as worker-health concerns, so a caller-side encode
+        failure reaches the caller rather than evicting workers.
+
         :param task:
             The `Task` instance to dispatch to the worker.
         :param timeout:
@@ -414,29 +508,14 @@ class WorkerConnection:
         :raises RpcError:
             If the worker returns a non-transient RPC error or
             rejects with a Nack whose dumped exception cannot be
-            deserialized (malformed-dump fallback).
+            deserialized. A parse-phase rejection whose Nack *is*
+            readable raises the original exception class instead, so
+            the caller observes the actual failure rather than an
+            opaque protocol error.
         :raises UnexpectedResponse:
             If the worker doesn't acknowledge the task.
         :raises ValueError:
             If the timeout value is not positive.
-
-        If the worker rejects the task during the parse phase due
-        to a malformed task payload, the original exception class
-        is deserialized from the Nack and re-raised so the caller
-        observes the actual failure class rather than an opaque
-        protocol error. A malformed Nack payload falls back to
-        `RpcError`.
-
-        Encode-side failures (e.g., a strict-mode
-        `wool.ChainSerializationError` aggregating
-        `wool.SerializationWarning` peers raised by
-        `~wool.runtime.context.manifest.ChainManifest.to_protobuf` when
-        an unpicklable `wool.ContextVar` value is set)
-        propagate unwrapped:
-        the load-balancer contract treats only `RpcError`
-        instances as worker-health concerns, so a caller-side encode
-        failure surfaces directly to the caller rather than evicting
-        workers.
         """
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
@@ -622,7 +701,7 @@ class WorkerConnection:
     async def _execute(
         self,
         task: Task,
-        key: _PoolKey,
+        key: _ChannelKey,
         timeout: float | None,
     ) -> AsyncGenerator[protocol.Message | None, None]:
         """Async generator that owns the full dispatch lifecycle.
@@ -732,16 +811,18 @@ class _Channel:
 def _channel_factory(key):
     """Create a new `_Channel` for the given pool key.
 
-    Builds a secure channel from the key's `WorkerCredentials` when present,
-    or an insecure channel otherwise; identity-derived channel options come
-    from `WorkerCredentials.identity_channel_options`.
+    Builds a secure channel from the key's `WorkerCredentials` when
+    present, or an insecure channel otherwise. A key carrying a ``peer``
+    adds the name override that verifies the worker against that name
+    instead of the address it was dialed at.
 
     :param key:
-        Tuple of ``(target, credentials, options)``.
+        The `_ChannelKey` this channel is being created for.
     :returns:
         A new `_Channel` instance.
     """
-    target, credentials, options = cast(_PoolKey, key)
+    key = cast(_ChannelKey, key)
+    options = key.options
     grpc_options: list[tuple[str, int | str]] = [
         ("grpc.max_receive_message_length", options.max_receive_message_length),
         ("grpc.max_send_message_length", options.max_send_message_length),
@@ -758,13 +839,14 @@ def _channel_factory(key):
             options.compression.value,
         ),
     ]
-    if credentials is not None:
-        grpc_options.extend(credentials.identity_channel_options())
+    if key.credentials is not None:
+        if key.peer is not None:
+            grpc_options.append(("grpc.ssl_target_name_override", key.peer))
         channel = grpc.aio.secure_channel(
-            target, credentials.client_credentials(), options=grpc_options
+            key.target, key.credentials.client_credentials(), options=grpc_options
         )
     else:
-        channel = grpc.aio.insecure_channel(target, options=grpc_options)
+        channel = grpc.aio.insecure_channel(key.target, options=grpc_options)
     stub = protocol.WorkerStub(channel)
     return _Channel(channel, stub, asyncio.Semaphore(options.max_concurrent_streams))
 
@@ -781,6 +863,20 @@ async def _channel_finalizer(channel: _Channel):
 _channel_pool: ResourcePool[_Channel] = ResourcePool(
     factory=_channel_factory, finalizer=_channel_finalizer, ttl=60
 )
+
+
+def channel_pool_stats() -> ResourcePool.Stats:
+    """Report what the process-wide channel pool currently holds.
+
+    Counts cached channels, how many are referenced by an in-flight
+    dispatch, and how many are awaiting their idle finalization. A
+    referenced count that never falls to zero while nothing is
+    dispatching means a permit or a pooled reference is leaking.
+
+    :returns:
+        A snapshot of the pool's counters at the moment of the call.
+    """
+    return _channel_pool.stats
 
 
 async def clear_channel_pool() -> None:

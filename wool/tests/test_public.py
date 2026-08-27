@@ -33,6 +33,8 @@ def test_public_api_completeness_should_match_expected_surface():
     """
     # Arrange
     expected_public_api = {
+        "IdentifiedBoundWorkerFactory",
+        "IdentifiedWorkerFactory",
         "IdleUnavailable",
         "RpcError",
         "TransientRpcError",
@@ -81,6 +83,7 @@ def test_public_api_completeness_should_match_expected_surface():
         "WoolError",
         "WoolWarning",
         "WorkerFactory",
+        "WorkerFactoryLike",
         "WorkerLike",
         "WorkerOptions",
         "WorkerPool",
@@ -95,7 +98,9 @@ def test_public_api_completeness_should_match_expected_surface():
         "DiscoveryLike",
         "DiscoveryPublisherLike",
         "DiscoverySubscriberLike",
+        "IneffectiveIdentityWarning",
         "IneffectiveLeaseWarning",
+        "IneffectivePeersWarning",
         "IneffectiveQuorumTimeoutWarning",
         "LanDiscovery",
         "LocalDiscovery",
