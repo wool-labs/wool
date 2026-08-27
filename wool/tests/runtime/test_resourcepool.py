@@ -233,6 +233,49 @@ def counting_factory():
 
 
 class TestResourcePool:
+    def test_acquire_should_serialize_when_contended_on_a_later_loop(self):
+        """Test a pool outliving one loop still serializes on the next.
+
+        Given:
+            A pool whose mutex has already been contended on one event
+            loop, which is what binds it, and that loop has since
+            closed.
+        When:
+            Two callers contend the same pool on a fresh loop.
+        Then:
+            The second should wait for the first rather than raising,
+            so a process-global pool -- the module-level channel pool
+            being one -- keeps working past the loop that first
+            contended it.
+        """
+        # Arrange
+        pool = ResourcePool(lambda key: object())
+
+        async def contend():
+            held = asyncio.Event()
+            waited = False
+
+            async def second():
+                nonlocal waited
+                await held.wait()
+                async with pool._lock:
+                    waited = True
+
+            async with pool._lock:
+                task = asyncio.ensure_future(second())
+                held.set()
+                await asyncio.sleep(0)
+            await task
+            return waited
+
+        # Act
+        first_loop = asyncio.run(contend())
+        second_loop = asyncio.run(contend())
+
+        # Assert
+        assert first_loop is True
+        assert second_loop is True
+
     @staticmethod
     @strategies.composite
     def setup(draw, *, max_key_count=5):

@@ -166,7 +166,34 @@ class ResourcePool(Generic[T]):
         self._finalizer = finalizer
         self._ttl = ttl
         self._cache: dict[Any, ResourcePool.CacheEntry] = {}
-        self._lock = asyncio.Lock()
+        self._serializer: asyncio.Lock | None = None
+        self._serializer_loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        """The mutex serializing this pool, bound to the running loop.
+
+        Rebuilt whenever the running loop differs from the one the
+        current mutex belongs to. Exclusion never spans loops: callers
+        on one loop serialize against each other, callers on another
+        loop against a mutex of their own, and ``_cache`` is not
+        synchronized between them.
+
+        .. rubric:: Implementation notes
+
+        `asyncio.Lock` binds to a loop the first time it is *contended*
+        — the uncontended acquire path never consults one — and never
+        unbinds, so a single mutex built at construction would serve
+        every uncontended caller and then raise `RuntimeError` for the
+        first contender on any later loop. A pool outliving the loop
+        that first contended it is ordinary — a module-level pool is
+        process-global while loops come and go.
+        """
+        loop = asyncio.get_running_loop()
+        if self._serializer is None or self._serializer_loop is not loop:
+            self._serializer = asyncio.Lock()
+            self._serializer_loop = loop
+        return self._serializer
 
     async def __aenter__(self):
         """Async context manager entry.

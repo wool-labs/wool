@@ -2290,9 +2290,6 @@ class TestWorkerConnection:
         # Arrange
         from wool.runtime.worker import connection as connection_module
 
-        # Contend the pool lock on a fresh instance so it does not
-        # bind the process-global lock to this test's event loop.
-        mocker.patch.object(connection_module._channel_pool, "_lock", asyncio.Lock())
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
@@ -2354,9 +2351,6 @@ class TestWorkerConnection:
         # Arrange
         from wool.runtime.worker import connection as connection_module
 
-        # Contend the pool lock on a fresh instance so it does not
-        # bind the process-global lock to this test's event loop.
-        mocker.patch.object(connection_module._channel_pool, "_lock", asyncio.Lock())
         cancellation = asyncio.CancelledError("worker self-raised cancel")
         responses = (
             protocol.Response(ack=protocol.Ack()),
@@ -2464,7 +2458,6 @@ class TestWorkerConnection:
 
         # Contend the pool lock on a fresh instance, and shorten the
         # teardown budget so the wedge resolves quickly.
-        mocker.patch.object(connection_module._channel_pool, "_lock", asyncio.Lock())
         mocker.patch.object(connection_module, "_TEARDOWN_TIMEOUT", 0.1)
         responses = (
             protocol.Response(ack=protocol.Ack()),
