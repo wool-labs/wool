@@ -22,7 +22,7 @@ class WorkerMetadata:
     :param uid:
         Unique identifier for the worker instance (UUID).
     :param address:
-        gRPC target address (e.g. ``"host:port"``,
+        gRPC target address (e.g., ``"host:port"``,
         ``"unix:path"``).
     :param pid:
         Process ID of the worker.

@@ -188,8 +188,8 @@ class WorkerProcess(Process):
     def address(self) -> str | None:
         """The network address where the gRPC server is listening.
 
-        After :meth:`start`, the address comes from the
-        :class:`WorkerMetadata` returned by the child process.
+        After `start`, the address comes from the `WorkerMetadata`
+        returned by the child process.
         Before start, returns ``host:port`` when a fixed port was
         given, or ``None`` when port is 0 (random).
 
@@ -224,7 +224,7 @@ class WorkerProcess(Process):
         """The worker metadata received from the child process.
 
         :returns:
-            :class:`WorkerMetadata` once started, or ``None``.
+            `WorkerMetadata` once started, or ``None``.
         """
         return self._metadata
 
@@ -232,8 +232,8 @@ class WorkerProcess(Process):
         """Start the worker process.
 
         Launches the worker process and waits until it has reported
-        its :class:`WorkerMetadata` back via pipe. After starting,
-        the :attr:`metadata` and :attr:`address` properties are
+        its `WorkerMetadata` back via pipe. After starting,
+        the `metadata` and `address` properties are
         populated.
 
         :param timeout:
@@ -615,7 +615,7 @@ def _signal_handlers(service: WorkerService):
     service when the process receives termination signals.
 
     :param service:
-        The :class:`WorkerService` instance to shut down on signal receipt.
+        The `WorkerService` instance to shut down on signal receipt.
     :yields:
         Control to the calling context with signal handlers installed.
     """
@@ -662,7 +662,7 @@ def _schedule_stop(
     if loop.is_running():
         # The loop can close between `is_running` and the dispatch; a
         # closed loop has nothing left to stop gracefully, so callers'
-        # fallbacks (e.g. the watchdog's hard exit) must survive the
+        # fallbacks (e.g., the watchdog's hard exit) must survive the
         # race.
         try:
             loop.call_soon_threadsafe(

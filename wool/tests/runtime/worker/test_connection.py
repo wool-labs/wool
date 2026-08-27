@@ -116,7 +116,7 @@ class MyAppError(Exception):
 
 @pytest.fixture
 def sample_task(mocker: MockerFixture):
-    """Provides a mock :class:`Task` for testing.
+    """Provides a mock `Task` for testing.
 
     Creates a Task with a simple async function that returns a
     test value.
@@ -443,8 +443,7 @@ class TestWorkerConnection:
         async_stream,
         cancel_raises: bool,
     ):
-        """Test task dispatch when stub yields an unexpected response after
-        successful acknowledgement.
+        """Test an unexpected response after a successful ack is reported.
 
         Given:
             A connection instance with capacity available
@@ -2120,11 +2119,11 @@ class TestWorkerConnection:
             A connection and a task whose ``to_protobuf`` raises a
             non-RPC exception.
         When:
-            :meth:`WorkerConnection.dispatch` is awaited.
+            `WorkerConnection.dispatch` is awaited.
         Then:
             It should propagate the original exception class
-            unchanged, not wrap it as :class:`RpcError` or
-            :class:`TransientRpcError`.
+            unchanged, not wrap it as `RpcError` or
+            `TransientRpcError`.
         """
 
         class EncodeError(Exception):
@@ -2272,8 +2271,7 @@ class TestWorkerConnection:
     async def test_dispatch_should_release_channel_ref_when_cancelled_during_teardown(
         self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
     ):
-        """Test external cancellation during teardown releases the
-        pooled channel reference.
+        """Test external cancellation during teardown releases the pooled channel.
 
         Given:
             A dispatched task whose result stream runs to exhaustion
@@ -2523,11 +2521,10 @@ class TestWorkerConnection:
         async_stream,
         mock_grpc_call,
     ):
-        """Test calling :meth:`WorkerConnection.close` a second time
-        after a UDS self-dispatch returns without raising.
+        """Test a second close after a UDS dispatch is a no-op.
 
         Given:
-            A :class:`WorkerConnection` that dispatched once over UDS
+            A `WorkerConnection` that dispatched once over UDS
             (so both TCP and UDS pool entries were primed and the
             connection records the UDS key) and was then closed once
             (clearing both pool entries).
@@ -4107,9 +4104,7 @@ class TestWorkerConnection:
         async_stream,
         mock_grpc_call,
     ):
-        """Test the caller-side response decoder surfaces both the
-        worker-raised exception and a per-var context-decode failure
-        as independent signals when a single frame carries both.
+        """Test the decoder surfaces the worker-raised exception and its cause.
 
         Given:
             A worker response that carries both a worker-raised
@@ -4237,8 +4232,7 @@ class TestWorkerConnection:
         async_stream,
         mock_grpc_call,
     ):
-        """Test that a caller can opt into strict semantics by promoting
-        SerializationWarning to an error.
+        """Test a caller can opt into strict semantics by promoting warnings.
 
         Given:
             The same response shape as the lenient-mode test (result
@@ -4249,7 +4243,7 @@ class TestWorkerConnection:
             for the duration of the dispatch
         Then:
             Iterating the dispatch raises a typed
-            :class:`wool.ChainSerializationError` aggregating the promoted
+            `wool.ChainSerializationError` aggregating the promoted
             warnings on ``.warnings``. On a result frame the decode
             error IS the primary — the routine's value is dropped
             because a result cannot be trusted alongside a context
@@ -4313,12 +4307,12 @@ class TestWorkerConnection:
             worker's address and a ContextVar with a value set
         When:
             The dispatch stream writes requests — the initial
-            :class:`TaskRequestFrame` ships pure dispatch metadata
+            `TaskRequestFrame` ships pure dispatch metadata
             with no chain manifest, and the first
-            :class:`NextRequestFrame` (sent by ``__anext__`` to pull
+            `NextRequestFrame` (sent by ``__anext__`` to pull
             the result) auto-captures the active chain
         Then:
-            The first mid-stream :class:`NextRequestFrame` should
+            The first mid-stream `NextRequestFrame` should
             carry the var with its value serialized via cloudpickle.
         """
         # Arrange
@@ -4369,10 +4363,10 @@ class TestWorkerConnection:
         When:
             dispatch() sends the initial task request (pure dispatch
             metadata, no chain manifest) and the first
-            :class:`NextRequestFrame` (which auto-captures the active
+            `NextRequestFrame` (which auto-captures the active
             chain)
         Then:
-            The first mid-stream :class:`NextRequestFrame` should
+            The first mid-stream `NextRequestFrame` should
             cloudpickle-encode the var so it round-trips back to the
             original value. Under the per-frame architecture the
             initial Task frame is intentionally manifest-free —
@@ -4483,8 +4477,7 @@ class TestWorkerConnection:
         async_stream,
         mock_grpc_call,
     ):
-        """Test self-dispatch round-trips arbitrary ContextVar values
-        on the first mid-stream request.
+        """Test self-dispatch round-trips ContextVar values on the first hop.
 
         Given:
             A self-dispatch WorkerConnection and any picklable
@@ -4544,22 +4537,20 @@ class TestWorkerConnection:
     async def test_dispatch_should_raise_unexpected_response_when_exc_payload_non_exc(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch wraps a non-Exception ``Response.exception``
-        payload as an :class:`UnexpectedResponse` so the load
-        balancer does not evict the worker for a routine-level fault.
+        """Test a non-Exception exception payload is wrapped, not raised raw.
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries a cloudpickle dump of a non-Exception value
             (a bare string)
         When:
             ``dispatch(task)`` is awaited and the result iterator is
             consumed
         Then:
-            It should raise :class:`UnexpectedResponse` (not
-            :class:`RpcError`) whose details name the malformed
-            payload type. :class:`UnexpectedResponse` is not a
-            :class:`RpcError` subclass, so the load-balancer
+            It should raise `UnexpectedResponse` (not
+            `RpcError`) whose details name the malformed
+            payload type. `UnexpectedResponse` is not a
+            `RpcError` subclass, so the load-balancer
             classification treats it as a caller-fault and does
             not evict the worker.
         """
@@ -4597,19 +4588,18 @@ class TestWorkerConnection:
     async def test_dispatch_should_preserve_base_exception_payload_on_context(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch preserves a non-Exception BaseException payload
-        on the wrapper's ``__context__``.
+        """Test a non-Exception BaseException payload is preserved.
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries a cloudpickle dump of a non-Exception
-            :class:`BaseException` (a ``KeyboardInterrupt``).
+            `BaseException` (a ``KeyboardInterrupt``).
         When:
             ``dispatch(task)`` is awaited and the result iterator is
             consumed.
         Then:
-            It should raise :class:`UnexpectedResponse` (not
-            :class:`RpcError`) with the original ``KeyboardInterrupt``
+            It should raise `UnexpectedResponse` (not
+            `RpcError`) with the original ``KeyboardInterrupt``
             preserved on ``__context__`` — a process-level signal is not
             smuggled across the wire as a raisable, but it is not lost.
         """
@@ -4660,16 +4650,16 @@ class TestWorkerConnection:
         asyncio expects).
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries a cloudpickle dump of
-            :class:`asyncio.CancelledError`
+            `asyncio.CancelledError`
         When:
             ``dispatch(task)`` is awaited and the result iterator is
             consumed
         Then:
             The caller's ``await`` should raise
-            :class:`asyncio.CancelledError` raw — not
-            :class:`UnexpectedResponse`, not :class:`RpcError`.
+            `asyncio.CancelledError` raw — not
+            `UnexpectedResponse`, not `RpcError`.
         """
         # Arrange
         cancellation = asyncio.CancelledError("worker self-raised cancel")
@@ -4719,11 +4709,10 @@ class TestWorkerConnection:
     async def test_dispatch_should_not_increment_cancelling_when_worker_cancels(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch does NOT increment ``current_task().cancelling()``
-        on a worker-side CancelledError.
+        """Test dispatch leaves ``cancelling()`` alone on a worker cancel.
 
         Matches stdlib ``await task`` semantics: when the awaitee
-        raises :class:`asyncio.CancelledError`, the awaiter's
+        raises `asyncio.CancelledError`, the awaiter's
         ``cancelling()`` count is **not** bumped. A caller that
         catches ``CancelledError`` and continues to ``await``
         something else (a recovery path) is therefore not
@@ -4733,9 +4722,9 @@ class TestWorkerConnection:
         (F9).
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries a cloudpickle dump of
-            :class:`asyncio.CancelledError`
+            `asyncio.CancelledError`
         When:
             ``dispatch(task)`` is awaited and the result iterator is
             consumed, and the resulting ``CancelledError`` is caught
@@ -4773,6 +4762,7 @@ class TestWorkerConnection:
                 assert current is not None
                 observed["cancelling"] = current.cancelling()
 
+        # Act
         await asyncio.ensure_future(body())
 
         # Assert
@@ -4786,21 +4776,20 @@ class TestWorkerConnection:
     async def test_dispatch_should_leave_task_cancelled_when_worker_cancels(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test re-raising a worker-side CancelledError ends the
-        surrounding task in the CANCELLED state.
+        """Test a re-raised worker CancelledError ends the surrounding task.
 
         Closes the loop with stdlib parity: a task that observes
-        :class:`asyncio.CancelledError` and re-raises (without
+        `asyncio.CancelledError` and re-raises (without
         ``uncancel``) must end as cancelled — same as a
         locally-cancelled task. The ``cancelling()`` bump on the
         caller is what lets asyncio transition the task to
         ``CANCELLED`` on re-raise.
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries a cloudpickle dump of
-            :class:`asyncio.CancelledError`, awaited inside a
-            wrapping :class:`asyncio.Task`
+            `asyncio.CancelledError`, awaited inside a
+            wrapping `asyncio.Task`
         When:
             The wrapping task observes ``CancelledError`` and
             re-raises without calling ``uncancel()``
@@ -4852,10 +4841,10 @@ class TestWorkerConnection:
             consumed.
         Then:
             It should raise the underlying serializer error
-            (:class:`pickle.UnpicklingError` for cloudpickle's
+            (`pickle.UnpicklingError` for cloudpickle's
             default deserializer) raw — no wrapper class, no
             indirection. The original exception type carries the
-            diagnostic detail. Since it isn't an :class:`RpcError`
+            diagnostic detail. Since it isn't an `RpcError`
             subclass the load-balancer classification treats it as
             a caller-fault and does not evict the worker.
         """
@@ -4904,10 +4893,10 @@ class TestWorkerConnection:
             consumed.
         Then:
             It should raise the underlying serializer error
-            (:class:`pickle.UnpicklingError` for cloudpickle's
+            (`pickle.UnpicklingError` for cloudpickle's
             default deserializer) raw — no wrapper class, no
             indirection. The original exception type carries the
-            diagnostic detail. Since it isn't an :class:`RpcError`
+            diagnostic detail. Since it isn't an `RpcError`
             subclass the load-balancer classification treats it as
             a caller-fault and does not evict the worker.
         """
@@ -4944,15 +4933,14 @@ class TestWorkerConnection:
 async def test_clear_channel_pool_should_close_cached_channels(
     mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
 ):
-    """Test :func:`clear_channel_pool` closes every cached gRPC
-    channel in the module-wide pool.
+    """Test `clear_channel_pool` closes every cached gRPC channel.
 
     Given:
         A populated module-wide channel pool — a successful
-        dispatch through a :class:`WorkerConnection` has primed the
+        dispatch through a `WorkerConnection` has primed the
         cache for a particular key.
     When:
-        :func:`clear_channel_pool` is awaited.
+        `clear_channel_pool` is awaited.
     Then:
         It should invoke the cached channel's ``close()`` method
         so the cached entry is torn down and subsequent dispatches
@@ -4988,15 +4976,14 @@ async def test_clear_channel_pool_should_close_cached_channels(
 
 @pytest.mark.asyncio
 async def test_clear_channel_pool_should_not_raise_when_pool_empty():
-    """Test :func:`clear_channel_pool` is a no-op when the pool is
-    empty.
+    """Test `clear_channel_pool` is a no-op when the pool is empty.
 
     Given:
         A module-wide channel pool with no cached entries (the
         autouse ``_clear_channel_pool`` fixture clears the pool
         between tests, so this test starts from an empty pool).
     When:
-        :func:`clear_channel_pool` is awaited.
+        `clear_channel_pool` is awaited.
     Then:
         It should return without raising — clearing an empty pool
         is a legitimate operation and must not surface a

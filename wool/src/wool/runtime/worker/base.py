@@ -30,7 +30,7 @@ class ChannelOptions:
 
     Controls the maximum message sizes and keepalive behaviour for
     gRPC channels.  Workers advertise these options via
-    :class:`~wool.runtime.discovery.base.WorkerMetadata` so that
+    `WorkerMetadata` so that
     clients connect with compatible settings automatically.
 
     :param max_receive_message_length:
@@ -469,7 +469,7 @@ class Worker(ABC):
         shutdown of their worker process and cleanup of resources.
 
         :param grace:
-            The shutdown grace period forwarded by `stop`; see `stop`
+            The shutdown grace period forwarded by `stop` — see `stop`
             for the ``None``/positive/negative domain, which
             implementations must honor.
         """

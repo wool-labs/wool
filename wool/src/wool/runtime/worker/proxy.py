@@ -68,7 +68,7 @@ def parse_version(version: str) -> Version | None:
     """Parse a PEP 440 version string.
 
     :param version:
-        A version string (e.g. ``"1.2.3"``).
+        A version string (e.g., ``"1.2.3"``).
     :returns:
         A `~packaging.version.Version` instance, or
         ``None`` if unparsable.

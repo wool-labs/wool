@@ -1,3 +1,9 @@
+"""Worker pools: local spawning, external discovery, or both.
+
+Provides `WorkerPool`, the lifecycle owner that starts workers, publishes
+them, and holds the dispatch proxy its callers route through.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -354,9 +360,7 @@ class WorkerPool:
         shutdown_timeout: float | None = 60.0,
         lazy: bool = DEFAULT_LAZY,
     ):
-        """Connect to an external pool of workers discovered by the
-        specified discovery protocol.
-        """
+        """Connect to workers a discovery protocol supplies."""
         ...
 
     @overload
@@ -456,10 +460,9 @@ class WorkerPool:
         if lease is not None and lease < 0:
             raise ValueError("Lease must be non-negative")
 
-        # Warn here rather than in WorkerProxy: _make_proxy elides
-        # quorum_timeout for falsy quorums (see its docstring), so the
-        # proxy never sees that the pool's user supplied one. Other
-        # quorum validations are delegated to WorkerProxy.
+        # Warned here rather than in WorkerProxy: `_make_proxy` drops
+        # quorum_timeout for a falsy quorum, so the proxy never sees that
+        # one was supplied. Every other quorum validation is WorkerProxy's.
         if quorum_timeout is Undefined:
             quorum_timeout = DEFAULT_QUORUM_TIMEOUT
         elif not quorum:
@@ -755,13 +758,11 @@ class WorkerPool:
                         )
                         raise
                     finally:
-                        # The stop outlives the cancellation above, bounded by
-                        # what remains of the deadline — see the docstring's
-                        # implementation notes. An unbounded teardown
-                        # (``shutdown_timeout=None``) asks the worker for an
-                        # indefinite drain, which the stop surface spells as
-                        # a negative grace — ``grace=None`` would mean no
-                        # grace at all.
+                        # Outlives the cancellation above on the deadline's
+                        # remainder — see the implementation notes. An
+                        # unbounded teardown asks for an indefinite drain,
+                        # which `Worker.stop` spells as a negative grace;
+                        # ``grace=None`` would mean no grace at all.
                         grace = remaining()
                         await worker.stop(grace=-1.0 if grace is None else grace)
 

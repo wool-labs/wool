@@ -28,7 +28,7 @@ class UnparsableVersionWarning(WoolWarning):
 
 # public
 class SlowCredentialResolutionWarning(WoolWarning):
-    """Warn that resolving a worker's own credentials was slow at startup.
+    """Emitted when resolving a worker's own credentials was slow.
 
     A worker resolves its credentials once before it serves. The
     resolution is awaited, so it never stalls the worker's event loop,

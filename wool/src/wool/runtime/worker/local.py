@@ -161,7 +161,7 @@ class LocalWorker(Worker):
 
         Sends the worker a stop RPC bounded by a deadline derived from
         ``grace`` (see `_STOP_RPC_MARGIN`), then — however the RPC
-        fared — reaps the subprocess; see `WorkerProcess.reap` for the
+        fared — reaps the subprocess — see `WorkerProcess.reap` for the
         escalation. The reap runs in an executor thread so it
         completes even when this coroutine is cancelled; only a second
         cancellation landing while the executor job is still queued
@@ -173,7 +173,7 @@ class LocalWorker(Worker):
 
         :param grace:
             Bound on the worker's graceful drain, forwarded in the
-            stop request; see `WorkerConnection.stop` for its
+            stop request — see `WorkerConnection.stop` for its
             semantics.
         """
         try:
@@ -199,7 +199,7 @@ class LocalWorker(Worker):
                 finally:
                     await connection.close()
         finally:
-            # `reap` blocks on `join`, so it must run off-loop; see
+            # `reap` blocks on `join`, so it must run off-loop — see
             # the docstring for the cancellation contract. A negative
             # grace (indefinite drain) must not reach `reap` — a
             # negative join bound elapses immediately and would

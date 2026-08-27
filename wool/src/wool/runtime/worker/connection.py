@@ -1,3 +1,9 @@
+"""The single-worker client surface.
+
+Provides `WorkerConnection` over a module-level pool of gRPC channels,
+and the `RpcError` hierarchy that dispatch failures classify into.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -77,8 +83,7 @@ class UnexpectedResponse(Exception):
 
 # public
 class RpcError(Exception):
-    """Raised when a gRPC call to a worker fails with a non-transient
-    error.
+    """Raised when a gRPC call to a worker fails non-transiently.
 
     Non-transient errors indicate persistent issues with the worker
     that are unlikely to be resolved by retrying (e.g., invalid
@@ -284,7 +289,7 @@ class WorkerConnection:
     # The codes dispatch maps to a *bare* TransientRpcError. Not the
     # definition of transience — HandshakeError is transient too and is
     # classified structurally, before this test. The type hierarchy is the
-    # contract callers program against; see RpcError.
+    # contract callers program against — see RpcError.
     _TRANSIENT_ERRORS: Final = {
         grpc.StatusCode.UNAVAILABLE,
         grpc.StatusCode.DEADLINE_EXCEEDED,
@@ -489,7 +494,7 @@ class WorkerConnection:
     async def idle(self, *, timeout: float | None = None) -> float:
         """Query how long the remote worker has been continuously idle.
 
-        Returns the worker's reported continuous idle duration; see
+        Returns the worker's reported continuous idle duration — see
         `WorkerService.idle` for how idle is defined and measured. The
         call draws a channel from this connection's pool, inheriting
         its credential and secure-channel handling.
