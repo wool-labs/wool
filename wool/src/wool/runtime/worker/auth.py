@@ -465,11 +465,9 @@ class WorkerCredentialsProvider:
     ) -> WorkerCredentialsProvider | None:
         """Return ``credentials`` as a provider.
 
-        A bare `WorkerCredentials` is wrapped via `WorkerCredentials.as_provider`;
-        an existing provider (i.e., any object exposing a ``credentials``
-        attribute and a boolean ``reloadable``, which includes duck-typed
-        providers) or ``None`` passes through unchanged. Anything else fails
-        fast here rather than with an opaque `AttributeError` mid-dispatch.
+        A bare `WorkerCredentials` is wrapped through
+        `WorkerCredentials.as_provider`; a `WorkerCredentialsProvider` or
+        ``None`` passes through unchanged. Any other value fails here.
 
         :param credentials:
             A bare value, a provider, or ``None``.
@@ -482,23 +480,21 @@ class WorkerCredentialsProvider:
 
         .. rubric:: Implementation notes
 
-        Public so third-party `WorkerFactory` and `WorkerLike`
+        Public so that third-party `WorkerFactory` and `WorkerLike`
         implementations accepting the same
-        ``WorkerCredentials | WorkerCredentialsProvider | None`` union get
-        the canonical normalization — and its fail-fast validation —
-        without reimplementing it.
+        ``WorkerCredentials | WorkerCredentialsProvider | None`` union
+        obtain the canonical normalization, and its fail-fast
+        validation, without reimplementing either.
         """
         if credentials is None:
             return None
         if isinstance(credentials, WorkerCredentials):
             return credentials.as_provider()
-        if hasattr(credentials, "credentials") and isinstance(
-            getattr(credentials, "reloadable", None), bool
-        ):
+        if isinstance(credentials, cls):
             return credentials
         raise TypeError(
-            "credentials must be a WorkerCredentials, a provider exposing "
-            "'credentials' and a boolean 'reloadable', or None; got "
+            "credentials must be a WorkerCredentials, a "
+            "WorkerCredentialsProvider, or None; got "
             f"{type(credentials).__name__}. A raw grpc.ChannelCredentials is "
             "no longer accepted — wrap the PEM material in a "
             "WorkerCredentials instead."

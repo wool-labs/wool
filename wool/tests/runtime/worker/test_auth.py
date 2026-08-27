@@ -1405,53 +1405,67 @@ class TestWorkerCredentialsProvider:
         # Assert
         assert coerced is None
 
-    def test_coerce_should_pass_duck_typed_provider_through(self):
-        """Test coerce passes a duck-typed provider through unchanged.
+    def test_coerce_should_raise_when_a_stand_in_mimics_the_surface(self):
+        """Test a look-alike is refused rather than admitted on shape.
 
         Given:
-            An object exposing the credentials resource and a reloadable
-            flag — the full contract consumers read — without subclassing
-            WorkerCredentialsProvider.
+            An object exposing every member a provider does — the
+            credentials resource, a reloadable flag, and all three
+            peer-gate members — without being a WorkerCredentialsProvider.
         When:
             It is passed to WorkerCredentialsProvider.coerce.
         Then:
-            It should be returned unchanged, keeping duck-typed providers
-            reachable.
+            It should raise TypeError, since satisfying each member in
+            isolation is no evidence that they agree with one another,
+            and a stand-in whose members disagree verifies workers
+            opposite to the real thing with no diagnostic.
         """
 
         # Arrange
-        class DuckProvider:
+        class StandIn:
             reloadable = False
             credentials = Refreshing(lambda: None, fresh_for=None)
+            peers = frozenset({"alpha.svc"})
 
-        provider = DuckProvider()
+            def accepts_peer(self, peer):
+                return peer in self.peers
+
+            def describe_peers(self):
+                return "alpha.svc"
+
+        # Act & assert
+        with pytest.raises(TypeError, match="WorkerCredentialsProvider"):
+            WorkerCredentialsProvider.coerce(StandIn())
+
+    def test_coerce_should_pass_a_subclass_through(self, test_certificates):
+        """Test the documented extension path survives concrete acceptance.
+
+        Given:
+            A WorkerCredentialsProvider subclass, which is how a third
+            party extends the provider surface.
+        When:
+            It is passed to WorkerCredentialsProvider.coerce.
+        Then:
+            It should be returned unchanged, so the refusal of a
+            look-alike is attributable to it not being a provider rather
+            than to extension being closed off.
+        """
+
+        # Arrange
+        class CustomProvider(WorkerCredentialsProvider):
+            pass
+
+        key_pem, cert_pem, ca_pem = test_certificates
+        credentials = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = CustomProvider(lambda: credentials)
 
         # Act
         coerced = WorkerCredentialsProvider.coerce(provider)
 
         # Assert
         assert coerced is provider
-
-    def test_coerce_should_raise_when_provider_lacks_reloadable(self):
-        """Test coerce rejects a provider missing half the contract.
-
-        Given:
-            An object exposing credentials but no reloadable flag, which
-            every consumer of a coerced provider also reads.
-        When:
-            It is passed to WorkerCredentialsProvider.coerce.
-        Then:
-            It should raise TypeError here rather than letting the gap
-            surface as an opaque AttributeError mid-dispatch.
-        """
-
-        # Arrange
-        class HalfProvider:
-            credentials = Refreshing(lambda: None, fresh_for=None)
-
-        # Act & assert
-        with pytest.raises(TypeError, match="reloadable"):
-            WorkerCredentialsProvider.coerce(HalfProvider())
 
     def test_coerce_should_raise_when_channel_credentials(self):
         """Test coerce rejects a raw gRPC channel credentials object.
