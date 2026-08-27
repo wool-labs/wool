@@ -50,14 +50,25 @@ def _rotating_provider(factory) -> WorkerCredentialsProvider:
 
 
 def _await_rotation_adopted(
-    provider: WorkerCredentialsProvider, previous: WorkerCredentials
+    provider: WorkerCredentialsProvider,
+    previous: WorkerCredentials,
+    *,
+    attempts: int = 10,
 ) -> None:
     """Drive the provider until it adopts material newer than *previous*.
 
-    `WorkerCredentialsProvider.refresh` consults the factory regardless of
-    age, so one call is enough for a factory whose output has changed.
+    One call is not enough. `Refreshing.refresh` joins a refresh already
+    in flight rather than starting a second, and a zero freshness
+    interval means the read preceding the rotation left one in flight —
+    derived from the pre-rotation files, so joining it returns exactly
+    the value the caller is waiting to see replaced. Repeat until the
+    re-read lands, which needs no sleep: each call either joins the
+    stale flight or starts a fresh one.
     """
-    assert provider.credentials.refresh() != previous, "rotation was not adopted"
+    for _ in range(attempts):
+        if provider.credentials.refresh() != previous:
+            return
+    raise AssertionError(f"rotation was not adopted within {attempts} refreshes")
 
 
 def _secure_provider(identity: str | None = None) -> WorkerCredentialsProvider:
