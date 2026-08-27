@@ -85,6 +85,120 @@ def mock_zeroconf(mocker: MockerFixture):
     return instance
 
 
+class _SubscriberDriver:
+    """Feeds a `LanDiscovery.Subscriber` service records directly.
+
+    Stands in for the mDNS network so the subscriber's own translation
+    of records into `DiscoveryEvent` values can be tested without
+    multicast, wall-clock waits, or a network the CI host may not have.
+    What crosses the wire is proved end to end in
+    ``tests/integration/test_lan_discovery.py``.
+    """
+
+    def __init__(self, service_type: str) -> None:
+        self._service_type = service_type
+        self._records: dict[str, ServiceInfo] = {}
+        self._listeners: list[object] = []
+        self.browsing = asyncio.Event()
+
+    def resolve(self, name: str) -> ServiceInfo | None:
+        """Answer what the subscriber's service-info lookup would."""
+        return self._records.get(name)
+
+    def attach(self, listener) -> None:
+        """Record the listener the subscriber installed on its browser."""
+        self._listeners.append(listener)
+        self.browsing.set()
+
+    async def _announce(self, callback: str, info: ServiceInfo) -> None:
+        """Invoke a listener callback and await the work it schedules.
+
+        The listener's callbacks are synchronous and schedule the real
+        handling with `asyncio.create_task`, so returning before those
+        tasks finish would let the next announcement overwrite a record
+        the previous handler has not read yet. Awaiting exactly the
+        tasks this call spawned keeps announcements ordered without a
+        sleep to tune.
+        """
+        await self.browsing.wait()
+        before = asyncio.all_tasks()
+        for listener in self._listeners:
+            getattr(listener, callback)(None, self._service_type, info.name)
+        if spawned := asyncio.all_tasks() - before:
+            await asyncio.wait(spawned)
+
+    async def added(self, info: ServiceInfo) -> None:
+        """Announce ``info`` as a newly discovered service."""
+        self._records[info.name] = info
+        await self._announce("add_service", info)
+
+    async def updated(self, info: ServiceInfo) -> None:
+        """Re-announce ``info`` with changed properties."""
+        self._records[info.name] = info
+        await self._announce("update_service", info)
+
+    async def removed(self, info: ServiceInfo) -> None:
+        """Withdraw a previously announced service."""
+        await self._announce("remove_service", info)
+        self._records.pop(info.name, None)
+
+
+@pytest.fixture
+def subscriber_driver(mocker: MockerFixture):
+    """Patch the subscriber's two zeroconf seams and drive them by hand.
+
+    `LanDiscovery.Subscriber` opens exactly two: it constructs an
+    ``AsyncZeroconf`` to resolve service info, and an
+    ``AsyncServiceBrowser`` that calls back as records appear. Both are
+    network boundaries, which is the only place the test guide permits
+    mocking, and replacing them leaves every line of wool's own
+    listener under test.
+    """
+    driver = _SubscriberDriver(_TEST_SERVICE_TYPE)
+
+    aiozc = mocker.MagicMock()
+    aiozc.async_close = mocker.AsyncMock()
+    aiozc.async_get_service_info = mocker.AsyncMock(
+        side_effect=lambda type_, name, *args, **kwargs: driver.resolve(name)
+    )
+    mocker.patch.object(lan, "AsyncZeroconf", return_value=aiozc)
+
+    def browse(zc, service_type, listener, *args, **kwargs):
+        driver.attach(listener)
+        browser = mocker.MagicMock()
+        browser.async_cancel = mocker.AsyncMock()
+        return browser
+
+    mocker.patch.object(lan, "AsyncServiceBrowser", side_effect=browse)
+    return driver
+
+
+def _record(uid=None, *, port=9999, address="127.0.0.1", **properties) -> ServiceInfo:
+    """Build a raw service record advertising ``properties``."""
+    uid = uid if uid is not None else uuid.uuid4()
+    return ServiceInfo(
+        _TEST_SERVICE_TYPE,
+        f"{uid}.{_TEST_SERVICE_TYPE}",
+        addresses=[socket.inet_aton(address)],
+        port=port,
+        properties={"pid": "1001", "version": "1.0.0", **properties},
+    )
+
+
+async def _collect(subscriber, count, *, timeout=2.0):
+    """Collect ``count`` events, failing rather than hanging."""
+    events = []
+
+    async def drain():
+        async for event in subscriber:
+            events.append(event)
+            if len(events) >= count:
+                return
+
+    await asyncio.wait_for(drain(), timeout=timeout)
+    return events
+
+
 @pytest.fixture
 def mock_route_probe(mocker: MockerFixture):
     """Patches the UDP probe socket with a deterministic routable IP.
@@ -1351,631 +1465,260 @@ class TestLanDiscoveryPublisher:
 class TestLanDiscoverySubscriber:
     """Tests for LanDiscovery.Subscriber class.
 
+    These drive the subscriber's own translation of service records
+    into `DiscoveryEvent` values through a stand-in for the mDNS
+    network — see the ``subscriber_driver`` fixture. What actually
+    crosses the wire between a publisher and a subscriber is proved in
+    ``tests/integration/test_lan_discovery.py``.
+
     Fully qualified name:
     wool.runtime.discovery.lan.LanDiscovery.Subscriber
     """
 
     @pytest.mark.asyncio
-    async def test___aiter___discovers_added_worker(self, metadata):
-        """Test async for yields worker-added event.
-
-        Given:
-            A Publisher that has registered a worker
-        When:
-            Subscriber is iterated via async for
-        Then:
-            It should yield a worker-added event with matching
-            metadata.
-        """
-        # Arrange
-        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
-        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
-
-        events = []
-        worker_discovered = asyncio.Event()
-
-        async def collect():
-            async for event in subscriber:
-                events.append(event)
-                if event.metadata.uid == metadata.uid:
-                    worker_discovered.set()
-                    break
-
-        # Act
-        async with publisher:
-            task = asyncio.create_task(collect())
-            await asyncio.sleep(0.1)
-
-            await publisher.publish("worker-added", metadata)
-
-            try:
-                await asyncio.wait_for(worker_discovered.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pytest.fail("Worker not discovered within timeout")
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # Assert
-        assert len(events) >= 1
-        assert events[0].type == "worker-added"
-        assert events[0].metadata.uid == metadata.uid
-
-    @pytest.mark.asyncio
-    async def test___aiter___detects_dropped_worker(self, metadata):
-        """Test async for yields worker-dropped event.
-
-        Given:
-            A published then dropped worker
-        When:
-            Subscriber is iterated via async for
-        Then:
-            It should yield a worker-dropped event.
-        """
-        # Arrange
-        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
-        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
-
-        events = []
-        worker_dropped = asyncio.Event()
-
-        async def collect():
-            async for event in subscriber:
-                events.append(event)
-                if event.type == "worker-dropped" and event.metadata.uid == metadata.uid:
-                    worker_dropped.set()
-                    break
-
-        # Act
-        async with publisher:
-            task = asyncio.create_task(collect())
-            await asyncio.sleep(0.1)
-
-            await publisher.publish("worker-added", metadata)
-            await asyncio.sleep(0.2)
-
-            await publisher.publish("worker-dropped", metadata)
-
-            try:
-                await asyncio.wait_for(worker_dropped.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pytest.fail("Worker drop not detected within timeout")
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # Assert
-        dropped = [e for e in events if e.type == "worker-dropped"]
-        assert len(dropped) >= 1
-        assert dropped[0].metadata.uid == metadata.uid
-
-    @pytest.mark.asyncio
-    async def test___aiter___detects_updated_worker(self, metadata):
-        """Test async for yields worker-updated event.
-
-        Given:
-            A published then updated worker
-        When:
-            Subscriber is iterated via async for
-        Then:
-            It should yield a worker-updated event with new metadata.
-        """
-        # Arrange
-        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
-        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
-
-        updated_worker = WorkerMetadata(
-            uid=metadata.uid,
-            address=metadata.address,
-            pid=metadata.pid,
-            version="2.0.0",
-            tags=frozenset(["updated"]),
-        )
-
-        events = []
-        worker_updated = asyncio.Event()
-
-        async def collect():
-            async for event in subscriber:
-                events.append(event)
-                if event.type == "worker-updated" and event.metadata.uid == metadata.uid:
-                    worker_updated.set()
-                    break
-
-        # Act
-        async with publisher:
-            task = asyncio.create_task(collect())
-            await asyncio.sleep(0.1)
-
-            await publisher.publish("worker-added", metadata)
-            await asyncio.sleep(0.2)
-
-            await publisher.publish("worker-updated", updated_worker)
-
-            try:
-                await asyncio.wait_for(worker_updated.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pytest.fail("Worker update not detected within timeout")
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # Assert
-        updated = [e for e in events if e.type == "worker-updated"]
-        assert len(updated) >= 1
-        assert updated[0].metadata.version == "2.0.0"
-
-    @pytest.mark.asyncio
-    async def test___aiter___with_filter_predicate(self, worker_factory):
-        """Test subscriber filtering with predicate.
-
-        Given:
-            A subscriber with a filter predicate
-        When:
-            Workers matching and not matching the filter are published
-        Then:
-            It should yield only matching workers.
-        """
-        # Arrange
-        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
-
-        def filter_fn(w):
-            return w.address.endswith(":50051")
-
-        subscriber = afilter(filter_fn, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
-
-        worker_match = worker_factory(
-            address="127.0.0.1:50051", tags=frozenset(["match"])
-        )
-        worker_no_match = worker_factory(
-            address="127.0.0.1:9999", tags=frozenset(["no-match"])
-        )
-
-        events = []
-        event_received = asyncio.Event()
-
-        async def collect():
-            async for event in subscriber:
-                events.append(event)
-                event_received.set()
-                await asyncio.sleep(0.3)
-                break
-
-        # Act
-        async with publisher:
-            task = asyncio.create_task(collect())
-            await asyncio.sleep(0.1)
-
-            await publisher.publish("worker-added", worker_match)
-            await publisher.publish("worker-added", worker_no_match)
-
-            try:
-                await asyncio.wait_for(event_received.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # Assert
-        assert len(events) >= 1
-        assert all(e.metadata.address.endswith(":50051") for e in events)
-        assert any(e.metadata.uid == worker_match.uid for e in events)
-
-    @pytest.mark.asyncio
-    async def test___aiter___with_independent_iterators(self, metadata):
-        """Test two subscriber iterators have isolated state.
-
-        Given:
-            Two independent subscriber iterators from the same
-            instance
-        When:
-            Workers are published
-        Then:
-            Each iterator should receive events independently.
-        """
-        # Arrange
-        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
-        subscriber1 = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
-        subscriber2 = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
-
-        events1 = []
-        events2 = []
-        both_discovered = asyncio.Event()
-
-        async def collect1():
-            async for event in subscriber1:
-                events1.append(event)
-                if len(events1) >= 1 and len(events2) >= 1:
-                    both_discovered.set()
-                    break
-
-        async def collect2():
-            async for event in subscriber2:
-                events2.append(event)
-                if len(events1) >= 1 and len(events2) >= 1:
-                    both_discovered.set()
-                    break
-
-        # Act
-        async with publisher:
-            task1 = asyncio.create_task(collect1())
-            task2 = asyncio.create_task(collect2())
-            await asyncio.sleep(0.1)
-
-            await publisher.publish("worker-added", metadata)
-
-            try:
-                await asyncio.wait_for(both_discovered.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                task1.cancel()
-                task2.cancel()
-                try:
-                    await asyncio.gather(task1, task2, return_exceptions=True)
-                except Exception:
-                    pass
-
-        # Assert
-        assert len(events1) >= 1
-        assert len(events2) >= 1
-
-    @pytest.mark.asyncio
-    async def test___aiter___with_dynamic_filter_transition(self, worker_factory):
-        """Test worker transitions from matching to non-matching filter.
-
-        Given:
-            A subscriber tracking a worker that updates to fail the
-            filter
-        When:
-            Worker properties change so the filter rejects it
-        Then:
-            It should yield a worker-dropped event for the
-            now-filtered worker.
-        """
-        # Arrange
-        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
-
-        def filter_fn(w):
-            return "gpu" in w.tags
-
-        subscriber = afilter(filter_fn, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
-
-        worker = worker_factory(address="127.0.0.1:50051", tags=frozenset(["gpu"]))
-
-        events = []
-        dropped_event = asyncio.Event()
-
-        async def collect():
-            async for event in subscriber:
-                events.append(event)
-                if event.type == "worker-dropped":
-                    dropped_event.set()
-                    break
-
-        # Act
-        async with publisher:
-            task = asyncio.create_task(collect())
-            await asyncio.sleep(0.1)
-
-            await publisher.publish("worker-added", worker)
-            await asyncio.sleep(0.2)
-
-            updated_worker = WorkerMetadata(
-                uid=worker.uid,
-                address=worker.address,
-                pid=worker.pid,
-                version=worker.version,
-                tags=frozenset(["cpu"]),
-                extra=worker.extra,
-            )
-            await publisher.publish("worker-updated", updated_worker)
-
-            try:
-                await asyncio.wait_for(dropped_event.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # Assert
-        dropped = [e for e in events if e.type == "worker-dropped"]
-        assert len(dropped) >= 1
-
-    @pytest.mark.asyncio
-    async def test___aiter___with_untracked_worker_promotion(self, worker_factory):
-        """Test untracked worker promotion via update event.
-
-        Given:
-            A subscriber with a filter that rejects the initial
-            worker
-        When:
-            The worker is updated to pass the filter
-        Then:
-            It should yield a worker-added event for the promoted
-            worker.
-        """
-        # Arrange
-        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
-
-        def filter_fn(w):
-            return "gpu" in w.tags
-
-        subscriber = afilter(filter_fn, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
-
-        worker = worker_factory(address="127.0.0.1:50051", tags=frozenset(["cpu"]))
-
-        events = []
-        event_received = asyncio.Event()
-
-        async def collect():
-            async for event in subscriber:
-                events.append(event)
-                if event.metadata.uid == worker.uid:
-                    event_received.set()
-                    break
-
-        # Act
-        async with publisher:
-            task = asyncio.create_task(collect())
-            await asyncio.sleep(0.1)
-
-            # Add worker that fails filter (no "gpu" tag)
-            await publisher.publish("worker-added", worker)
-            await asyncio.sleep(0.2)
-
-            # Update worker to pass filter (add "gpu" tag)
-            updated_worker = WorkerMetadata(
-                uid=worker.uid,
-                address=worker.address,
-                pid=worker.pid,
-                version=worker.version,
-                tags=frozenset(["gpu"]),
-                extra=worker.extra,
-            )
-            await publisher.publish("worker-updated", updated_worker)
-
-            try:
-                await asyncio.wait_for(event_received.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pytest.fail("Untracked worker promotion not detected within timeout")
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # Assert
-        assert len(events) >= 1
-        assert events[0].type == "worker-added"
-        assert "gpu" in events[0].metadata.tags
-
-    @pytest.mark.asyncio
-    async def test___aiter___end_to_end_publish_discover(self, metadata):
-        """Test end-to-end publish-discover flow.
-
-        Given:
-            A Publisher and Subscriber on the same host
-        When:
-            Worker is published via Publisher
-        Then:
-            Subscriber should discover the worker and yield an event
-            with matching metadata.
-        """
-        # Arrange
-        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
-        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
-
-        events = []
-        worker_discovered = asyncio.Event()
-
-        async def collect():
-            async for event in subscriber:
-                events.append(event)
-                if event.metadata.uid == metadata.uid:
-                    worker_discovered.set()
-                    break
-
-        # Act
-        async with publisher:
-            task = asyncio.create_task(collect())
-            await asyncio.sleep(0.1)
-
-            await publisher.publish("worker-added", metadata)
-
-            try:
-                await asyncio.wait_for(worker_discovered.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pytest.fail("Worker not discovered within timeout")
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # Assert
-        assert len(events) >= 1
-        discovered = events[0]
-        assert discovered.type == "worker-added"
-        assert discovered.metadata.uid == metadata.uid
-        assert discovered.metadata.address == metadata.address
-        assert discovered.metadata.pid == metadata.pid
-
-    @given(
-        address=st.one_of(
-            st.builds(
-                lambda p: f"127.0.0.1:{p}",
-                st.integers(min_value=1, max_value=65535),
-            ),
-            st.builds(
-                lambda p: f"localhost:{p}",
-                st.integers(min_value=1, max_value=65535),
-            ),
-        ),
-        pid=st.integers(min_value=1, max_value=2147483647),
-        version=st.text(
-            min_size=1,
-            max_size=20,
-            alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-_",
-        ),
-        tags=st.frozensets(
-            st.text(
-                min_size=1,
-                max_size=20,
-                alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
-            ),
-            max_size=5,
-        ),
-        advertise_host=st.one_of(st.none(), st.just("127.0.0.1")),
-    )
-    @settings(max_examples=10, deadline=10000)
-    @pytest.mark.asyncio
-    async def test_publish_roundtrip_with_arbitrary_metadata(
-        self, address, pid, version, tags, advertise_host
+    async def test___aiter___should_yield_worker_added_for_a_new_record(
+        self, subscriber_driver
     ):
-        """Test publish-discover roundtrip with arbitrary metadata.
+        """Test a newly announced service becomes a worker-added event.
 
         Given:
-            Arbitrary valid WorkerMetadata with DNS-SD-safe field
-            sizes and an optionally overridden loopback publish host
+            A subscriber being iterated, and a service record for a
+            worker it has not seen.
         When:
-            Worker is published then discovered via a subscriber
+            The record is announced.
         Then:
-            All metadata fields should match the published values.
+            It should yield a worker-added event carrying that worker's
+            deserialized metadata.
         """
         # Arrange
-        worker = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address=address,
-            pid=pid,
-            version=version,
-            tags=tags,
-            extra=MappingProxyType({}),
-        )
-        publisher = LanDiscovery.Publisher(
-            _TEST_SERVICE_TYPE, advertise_host=advertise_host
-        )
         subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
-
-        events = []
-        discovered = asyncio.Event()
-
-        async def collect():
-            async for event in subscriber:
-                events.append(event)
-                if event.metadata.uid == worker.uid:
-                    discovered.set()
-                    break
+        uid = uuid.uuid4()
+        record = _record(uid, port=50051)
 
         # Act
-        async with publisher:
-            task = asyncio.create_task(collect())
-            await asyncio.sleep(0.1)
-
-            await publisher.publish("worker-added", worker)
-
-            try:
-                await asyncio.wait_for(discovered.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                pytest.fail("Worker not discovered within timeout")
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # Assert — events[-1] is the matched event (collect breaks
-        # after finding worker.uid); earlier entries may be stale
-        # because the shared Zeroconf browser persists across
-        # hypothesis examples.
-        assert len(events) >= 1
-        event = events[-1]
-        assert event.metadata.uid == worker.uid
-        assert event.metadata.pid == worker.pid
-        assert event.metadata.version == worker.version
-        assert event.metadata.tags == worker.tags
-        expected_port = int(address.split(":")[1])
-        assert event.metadata.address == f"127.0.0.1:{expected_port}"
-
-    @pytest.mark.asyncio
-    async def test___aiter___ignores_malformed_zeroconf_service(self, metadata):
-        """Test subscriber ignores malformed Zeroconf services.
-
-        Given:
-            A malformed Zeroconf service with missing required
-            properties and a valid worker published normally
-        When:
-            Subscriber iterates events
-        Then:
-            It should only yield the valid worker's event.
-        """
-        # Arrange
-        publisher = LanDiscovery.Publisher(_TEST_SERVICE_TYPE)
-        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
-
-        malformed_uid = uuid.uuid4()
-        malformed_name = f"{malformed_uid}.{_TEST_SERVICE_TYPE}"
-        malformed_service = ServiceInfo(
-            _TEST_SERVICE_TYPE,
-            malformed_name,
-            addresses=[socket.inet_aton("127.0.0.1")],
-            port=9999,
-            properties={"some_key": "some_value"},
-        )
-
-        events = []
-        worker_discovered = asyncio.Event()
-
-        async def collect():
-            async for event in subscriber:
-                events.append(event)
-                if event.metadata.uid == metadata.uid:
-                    worker_discovered.set()
-                    break
-
-        # Act
-        async with publisher:
-            assert publisher.aiozc is not None
-            await publisher.aiozc.async_register_service(malformed_service)
-
-            task = asyncio.create_task(collect())
-            await asyncio.sleep(0.1)
-
-            await publisher.publish("worker-added", metadata)
-
-            try:
-                await asyncio.wait_for(worker_discovered.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pytest.fail("Valid worker not discovered within timeout")
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-            await publisher.aiozc.async_unregister_service(malformed_service)
+        collected = asyncio.create_task(_collect(subscriber, 1))
+        await subscriber_driver.added(record)
+        (event,) = await collected
 
         # Assert
-        assert len(events) >= 1
-        assert all(e.metadata.uid == metadata.uid for e in events)
+        assert event.type == "worker-added"
+        assert event.metadata.uid == uid
+        assert event.metadata.address == "127.0.0.1:50051"
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_yield_worker_dropped_when_a_record_withdraws(
+        self, subscriber_driver
+    ):
+        """Test withdrawing a tracked service becomes a worker-dropped event.
+
+        Given:
+            A subscriber that has already yielded a worker-added event
+            for a record.
+        When:
+            That record is withdrawn.
+        Then:
+            It should yield a worker-dropped event for the same worker,
+            since the subscriber tracks what it has admitted.
+        """
+        # Arrange
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
+        uid = uuid.uuid4()
+        record = _record(uid)
+
+        # Act
+        collected = asyncio.create_task(_collect(subscriber, 2))
+        await subscriber_driver.added(record)
+        await subscriber_driver.removed(record)
+        added, dropped = await collected
+
+        # Assert
+        assert added.type == "worker-added"
+        assert dropped.type == "worker-dropped"
+        assert dropped.metadata.uid == uid
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_yield_worker_updated_for_a_tracked_record(
+        self, subscriber_driver
+    ):
+        """Test re-announcing a tracked service becomes a worker-updated event.
+
+        Given:
+            A subscriber that has already yielded a worker-added event
+            for a record.
+        When:
+            The same record is re-announced with changed properties.
+        Then:
+            It should yield a worker-updated event carrying the new
+            values, rather than a second worker-added.
+        """
+        # Arrange
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
+        uid = uuid.uuid4()
+
+        # Act
+        collected = asyncio.create_task(_collect(subscriber, 2))
+        await subscriber_driver.added(_record(uid, version="1.0.0"))
+        await subscriber_driver.updated(_record(uid, version="2.0.0"))
+        added, updated = await collected
+
+        # Assert
+        assert added.type == "worker-added"
+        assert updated.type == "worker-updated"
+        assert updated.metadata.version == "2.0.0"
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_promote_an_update_for_an_untracked_record(
+        self, subscriber_driver
+    ):
+        """Test an update for a worker never added arrives as an addition.
+
+        Given:
+            A subscriber that has seen no record for a worker.
+        When:
+            An update is announced for it, as happens when the
+            subscriber starts after the worker did.
+        Then:
+            It should yield worker-added rather than worker-updated, so
+            a late subscriber still learns the worker exists.
+        """
+        # Arrange
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
+        uid = uuid.uuid4()
+
+        # Act
+        collected = asyncio.create_task(_collect(subscriber, 1))
+        await subscriber_driver.updated(_record(uid))
+        (event,) = await collected
+
+        # Assert
+        assert event.type == "worker-added"
+        assert event.metadata.uid == uid
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_skip_a_malformed_record(self, subscriber_driver):
+        """Test an unparsable announcement does not break the stream.
+
+        Given:
+            A subscriber being iterated, and a record missing the
+            properties every worker must advertise.
+        When:
+            The malformed record is announced, followed by a valid one.
+        Then:
+            It should yield only the valid worker, so one bad
+            announcement cannot stall discovery for the rest.
+        """
+        # Arrange
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
+        malformed = ServiceInfo(
+            _TEST_SERVICE_TYPE,
+            f"{uuid.uuid4()}.{_TEST_SERVICE_TYPE}",
+            addresses=[socket.inet_aton("127.0.0.1")],
+            port=9998,
+            properties={"garbage": "yes"},
+        )
+        uid = uuid.uuid4()
+
+        # Act
+        collected = asyncio.create_task(_collect(subscriber, 1))
+        await subscriber_driver.added(malformed)
+        await subscriber_driver.added(_record(uid))
+        (event,) = await collected
+
+        # Assert
+        assert event.metadata.uid == uid
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_yield_to_every_concurrent_iteration(
+        self, subscriber_driver
+    ):
+        """Test concurrent iterations each receive the full stream.
+
+        Given:
+            Two concurrent iterations of the same subscriber.
+        When:
+            A record is announced once.
+        Then:
+            Both should yield it, since the browser fans out rather
+            than handing each event to whichever consumer asks first.
+        """
+        # Arrange
+        subscriber = LanDiscovery.Subscriber(_TEST_SERVICE_TYPE)
+        uid = uuid.uuid4()
+
+        # Act
+        first = asyncio.create_task(_collect(subscriber, 1))
+        second = asyncio.create_task(_collect(subscriber, 1))
+        await subscriber_driver.added(_record(uid))
+        (one,), (two,) = await asyncio.gather(first, second)
+
+        # Assert
+        assert one.metadata.uid == uid
+        assert two.metadata.uid == uid
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_yield_only_workers_a_filter_admits(
+        self, subscriber_driver
+    ):
+        """Test a filter predicate excludes non-matching workers.
+
+        Given:
+            A subscriber wrapped in a predicate admitting one port.
+        When:
+            A matching and a non-matching worker are both announced.
+        Then:
+            It should yield only the matching one, so a caller filters
+            without seeing what it filtered out.
+        """
+
+        # Arrange
+        def matches(worker):
+            return worker.address.endswith(":50051")
+
+        subscriber = afilter(matches, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
+        wanted = uuid.uuid4()
+
+        # Act
+        collected = asyncio.create_task(_collect(subscriber, 1))
+        await subscriber_driver.added(_record(uuid.uuid4(), port=9999))
+        await subscriber_driver.added(_record(wanted, port=50051))
+        (event,) = await collected
+
+        # Assert
+        assert event.metadata.uid == wanted
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_drop_a_worker_that_stops_matching(
+        self, subscriber_driver
+    ):
+        """Test a worker whose properties leave a filter is reported dropped.
+
+        Given:
+            A subscriber filtering on a tag, and a worker that
+            initially carries it.
+        When:
+            The worker re-announces itself without that tag.
+        Then:
+            It should yield a synthetic worker-dropped carrying the
+            metadata the worker had while it still matched, so a
+            consumer tracking the filtered set learns it left rather
+            than silently keeping a worker the predicate now rejects.
+        """
+
+        # Arrange
+        def matches(worker):
+            return "gpu" in worker.tags
+
+        subscriber = afilter(matches, LanDiscovery.Subscriber(_TEST_SERVICE_TYPE))
+        uid = uuid.uuid4()
+
+        # Act
+        collected = asyncio.create_task(_collect(subscriber, 2))
+        await subscriber_driver.added(_record(uid, tags='["gpu"]'))
+        await subscriber_driver.updated(_record(uid, tags='["cpu"]'))
+        added, dropped = await collected
+
+        # Assert
+        assert added.type == "worker-added"
+        assert dropped.type == "worker-dropped"
+        assert dropped.metadata.uid == uid
+        assert dropped.metadata.tags == frozenset({"gpu"})
