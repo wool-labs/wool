@@ -34,6 +34,7 @@ from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.connection import channel_pool_stats
 from wool.runtime.worker.connection import clear_channel_pool
 
 from .conftest import PicklableMock
@@ -5248,6 +5249,57 @@ async def test_clear_channel_pool_should_close_cached_channels(
 
     # Assert
     mock_channel.close.assert_called_once()
+
+
+def test_dispatch_should_open_fresh_channel_when_run_on_a_later_loop(
+    mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+):
+    """Test the channel pool hands a later loop a channel of its own.
+
+    Given:
+        A dispatch on one event loop has primed the module-level channel
+        pool, and that loop has since closed with the channel idle in
+        the pool.
+    When:
+        A dispatch to the same target runs on a fresh event loop.
+    Then:
+        It should open a new channel rather than reuse the one the closed
+        loop left -- that entry is dropped, and its ``close`` is never
+        awaited, since a grpc.aio channel cannot be closed from another
+        loop -- leaving the pool with exactly one cached entry.
+    """
+    # Arrange
+    channel_a, channel_b = mocker.AsyncMock(), mocker.AsyncMock()
+    insecure_channel = mocker.patch.object(
+        grpc.aio, "insecure_channel", side_effect=[channel_a, channel_b]
+    )
+    mock_stub = mocker.MagicMock()
+    mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+    async def dispatch_once():
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+    # Act
+    asyncio.run(dispatch_once())
+    entries_after_first = channel_pool_stats().total_entries
+    asyncio.run(dispatch_once())
+
+    # Assert
+    assert entries_after_first == 1
+    assert insecure_channel.call_count == 2
+    channel_a.close.assert_not_awaited()
+    assert channel_pool_stats().total_entries == 1
 
 
 @pytest.mark.asyncio

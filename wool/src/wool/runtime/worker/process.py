@@ -91,7 +91,9 @@ class WorkerProcess(Process):
     :param shutdown_grace_period:
         Graceful shutdown timeout in seconds.
     :param proxy_pool_ttl:
-        Proxy pool TTL in seconds.
+        Proxy pool TTL in seconds. Idle proxies are also finalized when
+        the worker loop retires (see `WorkerService`), so reuse spans at
+        most the shorter of this TTL and the loop's idle TTL.
     :param credentials:
         Optional worker credentials for TLS/mTLS — either a
         `WorkerCredentials` or a `WorkerCredentialsProvider`. With a

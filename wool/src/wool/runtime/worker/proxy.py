@@ -952,8 +952,9 @@ class WorkerProxy:
     async def exit(self, *args) -> None:
         """Exit the proxy context.
 
-        Resets the context variable.  If the proxy was started,
-        delegates to `stop` to release resources.  Calling
+        Resets the context variable when this context minted its token;
+        a token from another context is discarded.  If the proxy was
+        started, delegates to `stop` to release resources.  Calling
         ``exit()`` on an un-started lazy proxy is a safe no-op.
 
         :raises RuntimeError:
@@ -961,7 +962,14 @@ class WorkerProxy:
             ``False``.
         """
         if self._proxy_token is not None:
-            wool.__proxy__.reset(self._proxy_token)
+            try:
+                wool.__proxy__.reset(self._proxy_token)
+            except ValueError:
+                # Minted in another context — the pool-finalizer path,
+                # where a different task exits the proxy its routine
+                # entered. That context died with its task, so there is
+                # nothing to restore.
+                pass
             self._proxy_token = None
         if not self._started:
             if not self._lazy:

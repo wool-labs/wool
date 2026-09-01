@@ -1582,7 +1582,11 @@ def credentials_map(test_certificates):
 
 @pytest_asyncio.fixture(autouse=True)
 async def _clear_channel_pool():
-    """Clear the module-level gRPC channel pool after each test."""
+    """Finalize the module-level gRPC channel pool on the loop that used it.
+
+    Prompt finalization only; the pool rebinds and drops orphans on its
+    own, so this is not required for correctness.
+    """
     yield
     import wool.runtime.worker.connection as _conn
 

@@ -1309,6 +1309,37 @@ class TestWorkerProxy:
         assert not proxy.started
 
     @pytest.mark.asyncio
+    async def test_exit_should_stop_proxy_when_called_from_another_context(
+        self, mock_discovery_service
+    ):
+        """Test exit from a foreign context still stops the proxy.
+
+        Given:
+            A lazy WorkerProxy entered and started in one contextvars
+            context, as a routine's task does, so its token belongs to
+            that context.
+        When:
+            exit() runs in a task of its own, whose context is a copy, as
+            a pool finalizer's task is.
+        Then:
+            It should discard the foreign token rather than raise, still
+            stop the proxy, and leave this context's binding untouched,
+            since the token was never valid where the reset ran.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service, quorum=0)
+        await proxy.enter()
+        await proxy.start()
+        assert proxy.started
+
+        # Act
+        await asyncio.create_task(proxy.exit())
+
+        # Assert
+        assert not proxy.started
+        assert wool.__proxy__.get() is proxy
+
+    @pytest.mark.asyncio
     async def test___aenter___enter_starts_proxy(
         self, mock_discovery_service, mock_proxy_session
     ):

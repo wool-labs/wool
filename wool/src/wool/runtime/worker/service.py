@@ -33,11 +33,12 @@ from wool.runtime.worker.session import Rejected
 _log = logging.getLogger(__name__)
 
 _DRAIN_TIMEOUT: Final[float] = 5.0
-"""Wall-clock timeout in seconds for the multi-generation task drain
-in `WorkerService._destroy_worker_loop`. Generous enough for a
-normal chain of ``finally``-scheduled cleanup tasks to unwind, short
-enough not to stall worker-loop teardown; past this timeout the drain
-gives up, with the daemon-thread reap as the backstop."""
+"""Wall-clock budget in seconds for `WorkerService._destroy_worker_loop`
+to finalize the pools bound to the worker loop and drain its
+multi-generation task chain. Generous enough for a normal chain of
+``finally``-scheduled cleanup tasks to unwind, short enough not to
+stall worker-loop teardown; past this budget the drain gives up, with
+the daemon-thread reap as the backstop."""
 
 _WORKER_LOOP_TTL: Final[float] = 30.0
 """Idle time-to-live in seconds for the worker event-loop held by
@@ -51,7 +52,10 @@ scheduled on the torn-down loop. The TTL only bounds how long an
 clears the pool immediately regardless of this value, so no daemon
 thread outlives the service. The 30s window is generous enough to span
 the gap between bursts of dispatches on a healthy worker while still
-reaping a loop that has gone quiet."""
+reaping a loop that has gone quiet. Retiring the loop also finalizes
+the proxy and discovery-subscriber pools bound to it (see
+`WorkerService._destroy_worker_loop`), so a cached proxy is reused only
+while the worker loop stays warm."""
 
 
 # public
@@ -646,6 +650,15 @@ class WorkerService(protocol.WorkerServicer):
     ) -> None:
         """Schedule worker-loop shutdown and optionally join the thread.
 
+        Finalizes the proxy and discovery-subscriber pools on the worker
+        loop first: they are bound to it, and a `ResourcePool` refuses
+        use from any other running loop, so this finalizer is the one
+        place they can still be cleared. A clear that raises or exceeds
+        the shared `_DRAIN_TIMEOUT` budget is logged and does not
+        prevent the stop; whatever it left cached is dropped when the
+        pool next rebinds. With ``timeout=0`` the clears run best-effort
+        on the daemon thread after this returns.
+
         Drains successive generations of pending tasks on the
         worker loop, then signals the loop to stop. A cancelled
         task's ``finally`` clause can schedule a second generation
@@ -674,12 +687,29 @@ class WorkerService(protocol.WorkerServicer):
             A tuple of the event loop and the thread running it.
         """
         loop, thread = loop_thread
+        pools = [
+            ("proxy", wool.__proxy_pool__.get()),
+            ("subscriber", __subscriber_pool__.get()),
+        ]
 
         async def _shutdown():
             current = asyncio.current_task()
             deadline = loop.time() + _DRAIN_TIMEOUT
             leaked: list[asyncio.Task] = []
             try:
+                for name, pool in pools:
+                    if pool is None:
+                        continue
+                    try:
+                        await asyncio.wait_for(
+                            pool.clear(), timeout=max(0.0, deadline - loop.time())
+                        )
+                    except Exception:
+                        _log.warning(
+                            f"Failed to clear the {name} pool during worker-loop "
+                            "teardown; continuing to drain and stop the loop.",
+                            exc_info=True,
+                        )
                 while True:
                     pending = [
                         task for task in asyncio.all_tasks() if task is not current
@@ -771,6 +801,7 @@ class WorkerService(protocol.WorkerServicer):
                 self._idle_since = time.monotonic()
 
     async def _stop(self, *, timeout: float | None = 0) -> None:
+        """Pre-empt in-flight work, then retire the worker loop and its pools."""
         if timeout is not None and timeout < 0:
             timeout = None
         # Stash the StopRequest's timeout for the loop-teardown
@@ -784,12 +815,10 @@ class WorkerService(protocol.WorkerServicer):
         self._stopping.set()
         await self._preempt(timeout=timeout)
         try:
-            if proxy_pool := wool.__proxy_pool__.get():
-                await proxy_pool.clear()
-            if subscriber_pool := __subscriber_pool__.get():
-                await subscriber_pool.clear()
-        finally:
+            # The proxy and subscriber pools are bound to the worker loop
+            # and are cleared by its finalizer — see `_destroy_worker_loop`.
             await self._loop_pool.clear()
+        finally:
             self._stopped.set()
 
     async def _preempt(self, *, timeout: float | None = 0) -> None:

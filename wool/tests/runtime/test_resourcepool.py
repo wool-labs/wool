@@ -1,5 +1,7 @@
 import asyncio
 import gc
+import logging
+import threading
 import time
 import warnings
 from types import SimpleNamespace
@@ -237,16 +239,15 @@ class TestResourcePool:
         """Test a pool outliving one loop still serializes on the next.
 
         Given:
-            A pool whose mutex has already been contended on one event
-            loop, which is what binds it, and that loop has since
-            closed.
+            A pool bound to one event loop by a contended acquire there,
+            and that loop has since closed.
         When:
             Two callers contend the same pool on a fresh loop.
         Then:
-            The second should wait for the first rather than raising,
-            so a process-global pool -- the module-level channel pool
-            being one -- keeps working past the loop that first
-            contended it.
+            The pool should rebind, so the second caller waits for the
+            first rather than raising and a process-global pool -- the
+            module-level channel pool being one -- keeps working past the
+            loop that first bound it.
         """
         # Arrange
         pool = ResourcePool(lambda key: object())
@@ -495,90 +496,269 @@ class TestResourcePool:
             assert resource.name == "second"
         assert factory.call_count == 2
 
-    def test_acquire_should_cancel_cross_loop_timer_threadsafe(self, mocker):
-        """Test acquire cancels a foreign-loop TTL timer cross-loop.
+    def test_acquire_should_rebuild_resource_when_bound_loop_closed(self, mocker):
+        """Test acquire rebuilds a resource whose loop has closed.
 
         Given:
-            A pool whose cached entry has an unfired TTL timer
-            scheduled on one event loop, which has since closed.
+            A pool whose cached entry, released with a pending TTL timer,
+            belongs to an event loop that has since closed.
         When:
-            The same key is re-acquired from a different event loop.
+            The same key is acquired from a fresh event loop.
         Then:
-            The timer should be cancelled on its own (now-closed) loop
-            via call_soon_threadsafe, the resulting RuntimeError
-            should be swallowed, the cached object should be returned,
-            and the pending cleanup should be cleared.
+            It should rebind to the fresh loop, drop the orphaned entry
+            without running the finalizer, invoke the factory again, and
+            leave no pending cleanup.
         """
         # Arrange
-        pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=60)
+        factory = mocker.Mock(return_value="obj")
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=60)
+        closed_loop = asyncio.new_event_loop()
 
-        # Acquire and release on a dedicated loop so a TTL timer is
-        # scheduled and bound to that loop, then close it.
-        foreign_loop = asyncio.new_event_loop()
-
-        async def schedule_cleanup_on_foreign_loop():
+        async def acquire_and_release():
             async with pool.get("key"):
                 pass
 
-        foreign_loop.run_until_complete(schedule_cleanup_on_foreign_loop())
-        pending_cleanup = pool.pending_cleanup["key"]
-        foreign_loop.close()
+        closed_loop.run_until_complete(acquire_and_release())
+        closed_loop.close()
 
-        acquiring_loop = asyncio.new_event_loop()
-        try:
-            # Act
-            acquired = acquiring_loop.run_until_complete(pool.acquire("key"))
+        # Act
+        acquired = asyncio.run(pool.acquire("key"))
 
-            # Assert
-            assert acquired == "obj"
-            assert pool.pending_cleanup == {}
-        finally:
-            acquiring_loop.close()
-            del pending_cleanup
+        # Assert
+        assert acquired == "obj"
+        assert factory.call_count == 2
+        finalizer.assert_not_awaited()
+        assert pool.pending_cleanup == {}
+        assert pool.stats.total_entries == 1
 
-    def test_clear_should_cancel_cross_loop_timer_threadsafe(self, mocker):
-        """Test clear cancels a foreign-loop TTL timer cross-loop.
+    def test_clear_should_skip_orphans_when_bound_loop_closed(self, mocker):
+        """Test clear drops, without finalizing, what another loop left.
 
         Given:
-            A pool whose cached entry has an unfired TTL timer
-            scheduled on one event loop, which has since closed.
+            A pool whose cached entry belongs to an event loop that has
+            since closed.
         When:
-            The key is cleared from a different event loop.
+            The pool is cleared from a fresh event loop.
         Then:
-            The timer should be cancelled on its own (now-closed) loop
-            via call_soon_threadsafe, the resulting RuntimeError
-            should be swallowed, the finalizer should still run, and
-            the entry should be evicted.
+            It should drop the orphaned entry without running its
+            finalizer -- the resource cannot be closed from another loop
+            -- and finish with an empty cache and no pending cleanup.
         """
         # Arrange
         finalizer = mocker.AsyncMock()
         pool = ResourcePool(
             factory=mocker.Mock(return_value="obj"), finalizer=finalizer, ttl=60
         )
+        closed_loop = asyncio.new_event_loop()
 
-        # Acquire and release on a dedicated loop so a TTL timer is
-        # scheduled and bound to that loop, then close it.
-        foreign_loop = asyncio.new_event_loop()
-
-        async def schedule_cleanup_on_foreign_loop():
+        async def acquire_and_release():
             async with pool.get("key"):
                 pass
 
-        foreign_loop.run_until_complete(schedule_cleanup_on_foreign_loop())
-        pending_cleanup = pool.pending_cleanup["key"]
-        foreign_loop.close()
+        closed_loop.run_until_complete(acquire_and_release())
+        closed_loop.close()
 
-        clearing_loop = asyncio.new_event_loop()
+        # Act
+        asyncio.run(pool.clear())
+
+        # Assert
+        finalizer.assert_not_awaited()
+        assert pool.stats.total_entries == 0
+        assert pool.pending_cleanup == {}
+
+    def test_acquire_should_raise_when_bound_to_another_running_loop(self, mocker):
+        """Test a pool refuses a second loop while its own is running.
+
+        Given:
+            A pool bound to an event loop that is still running on
+            another thread.
+        When:
+            The pool is used from a second event loop.
+        Then:
+            It should raise RuntimeError naming the other running loop
+            rather than rebinding, so one pool never serves two live
+            loops.
+        """
+        # Arrange
+        pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=60)
+        live_loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=live_loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            asyncio.run_coroutine_threadsafe(pool.acquire("key"), live_loop).result(
+                timeout=5
+            )
+
+            # Act & assert
+            with pytest.raises(RuntimeError, match="another running event loop"):
+                asyncio.run(pool.acquire("other"))
+        finally:
+            live_loop.call_soon_threadsafe(live_loop.stop)
+            thread.join(timeout=5)
+            live_loop.close()
+
+    def test_acquire_should_rebind_when_bound_loop_closed(self, mocker):
+        """Test a fresh loop starts from an empty cache.
+
+        Given:
+            A pool that cached and released an entry on an event loop
+            that has since closed, leaving that entry's TTL timer behind.
+        When:
+            A different key is acquired from a fresh event loop.
+        Then:
+            It should hold only the new entry: the old one and its timer
+            are gone, and its finalizer never ran.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(
+            factory=mocker.Mock(return_value="obj"), finalizer=finalizer, ttl=60
+        )
+        closed_loop = asyncio.new_event_loop()
+
+        async def acquire_and_release():
+            async with pool.get("key"):
+                pass
+
+        closed_loop.run_until_complete(acquire_and_release())
+        assert "key" in pool.pending_cleanup
+        closed_loop.close()
+
+        # Act
+        asyncio.run(pool.acquire("other"))
+
+        # Assert
+        assert pool.stats.total_entries == 1
+        assert pool.pending_cleanup == {}
+        finalizer.assert_not_awaited()
+
+    def test_acquire_should_warn_when_dropping_referenced_orphan(self, mocker, caplog):
+        """Test a still-referenced orphan is reported as a leak.
+
+        Given:
+            A pool whose bound loop closed while an entry was still
+            referenced.
+        When:
+            The pool is used from a fresh event loop.
+        Then:
+            It should log one WARNING from wool.runtime.resourcepool
+            reporting the referenced entry it dropped without finalizing.
+        """
+        # Arrange
+        pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=60)
+        closed_loop = asyncio.new_event_loop()
+        closed_loop.run_until_complete(pool.acquire("key"))
+        closed_loop.close()
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.resourcepool"):
+            asyncio.run(pool.acquire("other"))
+
+        # Assert
+        records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert "1 referenced" in records[0].getMessage()
+
+    def test_acquire_should_not_warn_when_dropping_idle_orphan(self, mocker, caplog):
+        """Test idle orphans are dropped silently.
+
+        Given:
+            A pool whose bound loop closed with only idle entries cached
+            (released, awaiting their TTL).
+        When:
+            The pool is used from a fresh event loop.
+        Then:
+            It should drop the idle entries with a DEBUG record and no
+            WARNING from wool.runtime.resourcepool, since nothing was in
+            use when the loop stopped.
+        """
+        # Arrange
+        pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=60)
+        closed_loop = asyncio.new_event_loop()
+
+        async def acquire_and_release():
+            async with pool.get("key"):
+                pass
+
+        closed_loop.run_until_complete(acquire_and_release())
+        closed_loop.close()
+
+        # Act
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            asyncio.run(pool.acquire("other"))
+
+        # Assert
+        records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
+        assert [r.levelno for r in records] == [logging.DEBUG]
+
+    def test_acquire_should_rebind_when_bound_loop_stopped_but_not_closed(self, mocker):
+        """Test liveness is whether the bound loop runs, not whether it closed.
+
+        Given:
+            A pool bound to an event loop that has stopped running but
+            has not been closed.
+        When:
+            The pool is used from a second event loop.
+        Then:
+            It should rebind rather than raise -- a loop that is not
+            running cannot be contending the mutex -- and rebuild the
+            resource on the new loop.
+        """
+        # Arrange
+        factory = mocker.Mock(return_value="obj")
+        pool = ResourcePool(factory=factory, ttl=60)
+        stopped_loop = asyncio.new_event_loop()
+        stopped_loop.run_until_complete(pool.acquire("key"))
         try:
             # Act
-            clearing_loop.run_until_complete(pool.clear())
-
-            # Assert
-            finalizer.assert_awaited_once_with("obj")
-            assert pool.stats.total_entries == 0
+            acquired = asyncio.run(pool.acquire("key"))
         finally:
-            clearing_loop.close()
-            del pending_cleanup
+            stopped_loop.close()
+
+        # Assert
+        assert acquired == "obj"
+        assert factory.call_count == 2
+
+    def test_release_should_ignore_stale_timer_from_a_loop_the_pool_left(self, mocker):
+        """Test a TTL timer left on an earlier loop cannot touch a later loop's cache.
+
+        Given:
+            A pool that released an entry on one event loop, scheduling
+            its TTL timer there, then rebound to a second loop that
+            acquired the same key and still holds it.
+        When:
+            The first loop resumes long enough for that stale timer to
+            fire.
+        Then:
+            It should leave the second loop's entry untouched -- still
+            cached and still referenced, its finalizer never run --
+            rather than finalize it or rebind the pool.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(
+            factory=mocker.Mock(return_value="obj"), finalizer=finalizer, ttl=0.05
+        )
+        first_loop = asyncio.new_event_loop()
+
+        async def acquire_and_release():
+            async with pool.get("key"):
+                pass
+
+        first_loop.run_until_complete(acquire_and_release())
+        asyncio.run(pool.acquire("key"))
+        try:
+            # Act
+            first_loop.run_until_complete(asyncio.sleep(0.1))
+        finally:
+            first_loop.close()
+
+        # Assert
+        assert pool.stats.total_entries == 1
+        assert pool.stats.referenced_entries == 1
+        finalizer.assert_not_awaited()
 
     def test_release_should_leave_no_pending_task_when_loop_closes_before_ttl(
         self, mocker

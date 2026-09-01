@@ -55,10 +55,13 @@ def _isolate_wool_context():
 
 @pytest_asyncio.fixture(autouse=True)
 async def _clear_channel_pool():
-    """Clear the module-level gRPC channel pool between tests.
+    """Finalize the module-level gRPC channel pool on the loop that used it.
 
-    Prevents stale cached channels (with outdated mocks) from leaking
-    across tests.
+    Not required for correctness: a `ResourcePool` rebinds to the next
+    test's loop and drops whatever a loop that is no longer running left
+    behind. Closing each test's channels here, on their own loop, is the
+    only place a ``grpc.aio`` channel can still be closed -- a dropped
+    orphan never is.
     """
     yield
     import wool.runtime.worker.connection as _conn

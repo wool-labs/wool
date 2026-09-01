@@ -358,7 +358,7 @@ A `WorkerConnection` is a gRPC client managing a pooled channel to a single work
 
 Dispatch is not the whole surface: `WorkerConnection.idle` polls how long the worker has been continuously idle, in seconds, over a channel from the same pool. The count runs from the moment the worker's in-flight task set last emptied — startup counts as empty — and reads zero whenever work is in flight, which is what makes it a usable retirement signal: a supervisor polls its workers and stops the ones that have been quiet past some threshold. A worker predating the capability answers `UNIMPLEMENTED`, surfacing as `IdleUnavailable`, which descends from `WoolError` rather than `RpcError` so that an absent capability is not mistaken for an unhealthy peer. See the worker package's [_Connections → Idle reporting_](src/wool/runtime/worker/README.md#idle-reporting) for the full contract.
 
-Channels are pooled with reference counting and a 60-second TTL. A dispatch acquires a pool reference, and the result stream holds its own reference to keep the channel alive during streaming. There is no pool-level health checking — dead channels are detected reactively when a dispatch attempt fails, and the failed worker is removed from the load balancer context by the error classification logic.
+Channels are pooled per event loop with reference counting and a 60-second TTL. A dispatch acquires a pool reference, and the result stream holds its own reference to keep the channel alive during streaming. There is no pool-level health checking — dead channels are detected reactively when a dispatch attempt fails, and the failed worker is removed from the load balancer context by the error classification logic.
 
 ### Transport configuration
 
