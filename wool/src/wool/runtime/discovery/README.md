@@ -22,7 +22,11 @@ Wool ships with two discovery protocols — `LocalDiscovery` and `LanDiscovery`.
 
 `LocalDiscovery`
 
-Shared-memory IPC for single-machine pools. This is the default when you create an ephemeral `WorkerPool` without specifying a discovery protocol. No network, no configuration — workers and subscribers communicate through a shared memory region identified by a namespace string. File-based locking ensures consistency across processes.
+Shared-memory IPC for single-machine pools. This is the default when you create an ephemeral `WorkerPool` without specifying a discovery protocol. No network, no configuration — workers and subscribers communicate through a shared-memory registry identified by a namespace string. File-based locking ensures consistency across processes.
+
+A namespace has exactly one owner. Entering a `LocalDiscovery` creates that namespace's registry and claims it; exiting reclaims it. Entering a namespace whose registry already exists raises `DiscoveryNamespaceInUse` rather than attaching to it, so ownership is asserted rather than won by whichever process got there first.
+
+Every other participant **borrows**. `LocalDiscovery.Publisher` and `LocalDiscovery.Subscriber` bind to the registry their namespace's owner created, never create one, and raise `DiscoveryNamespaceNotFound` where no owner holds it. Because the owner's lifetime bounds the registry, a borrower that outlives its owner is orphaned — a defined outcome, not a fault: whatever mapping it already holds stays readable, and its next bind raises.
 
 `LanDiscovery`
 
@@ -34,7 +38,7 @@ Both protocols optionally accept a filter predicate for targeted subscriptions.
 
 Wool supports custom discovery protocols via structural subtyping.
 
-`WorkerPool` accepts `DiscoveryLike` or `Factory[DiscoveryLike]` for its `discovery` parameter. The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables. This means you can pass a discovery instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` will manage it appropriately.
+`WorkerPool` accepts `DiscoveryLike` or `Factory[DiscoveryLike]` for its `discovery` parameter, and — for a pool with no `spawn`, which publishes nothing — a bare `DiscoverySubscriberLike` as well. The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables. This means you can pass a discovery instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` will manage it appropriately.
 
 ### `DiscoveryLike` protocol
 
@@ -57,6 +61,7 @@ class DiscoveryLike(Protocol):
 
 ```python
 bind_host: str
+
 
 async def publish(self, type: DiscoveryEventType, metadata: WorkerMetadata) -> None: ...
 ```
@@ -111,13 +116,13 @@ async def redis_discovery():
 
 ### Durable pool
 
-Connect to workers that are already running. No workers are spawned by the pool itself:
+Connect to workers that are already running. No workers are spawned by the pool itself, so the pool announces nothing and needs only the subscribing half of a discovery protocol — which is how a process joins a namespace another process owns:
 
 ```python
 import wool
 
-# Local
-async with wool.WorkerPool(discovery=wool.LocalDiscovery("my-namespace")):
+# Local — borrow the registry whichever process owns "my-namespace"
+async with wool.WorkerPool(discovery=wool.LocalDiscovery.Subscriber("my-namespace")):
     result = await my_routine()
 
 # LAN
@@ -127,13 +132,12 @@ async with wool.WorkerPool(discovery=wool.LanDiscovery()):
 
 ### Hybrid pool
 
-Spawn local workers **and** discover existing workers through the same
-protocol. Spawned workers are published and made available to other clients:
+Spawn local workers **and** discover existing workers through the same protocol. Spawned workers are published and made available to other clients, so the pool needs a full `DiscoveryLike` — both halves. For `LocalDiscovery` that makes it the namespace's owner, a role exactly one process may hold:
 
 ```python
 import wool
 
-# Local
+# Local — owns "my-namespace" for the life of the block
 async with wool.WorkerPool(spawn=4, discovery=wool.LocalDiscovery("my-namespace")):
     result = await my_routine()
 

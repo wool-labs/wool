@@ -48,7 +48,6 @@ from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.proxy import WorkerProxy
 from wool.runtime.worker.proxy import is_version_compatible
 from wool.runtime.worker.proxy import parse_version
-from wool.utilities.afilter import afilter
 
 
 async def _drain_until(predicate, *, timeout=2.0):
@@ -3262,9 +3261,11 @@ class TestWorkerProxy:
             DiscoveryEvent("worker-added", metadata=incompatible_worker),
             DiscoveryEvent("worker-added", metadata=compatible_worker),
         ]
-        mock_local_discovery = mocker.MagicMock()
-        mock_local_discovery.subscribe.return_value = wp.ReducibleAsyncIterator(events)
-        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local_discovery)
+        mocker.patch.object(
+            wp.LocalDiscovery,
+            "Subscriber",
+            return_value=wp.ReducibleAsyncIterator(events),
+        )
         proxy = WorkerProxy("pool-1", quorum=None, lazy=False)
 
         # Act
@@ -3334,11 +3335,7 @@ class TestWorkerProxy:
 
                 return gen()
 
-        mock_local = mocker.MagicMock()
-        mock_local.subscribe.side_effect = lambda filter=None, **_: afilter(
-            filter, _Inner()
-        )
-        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local)
+        mocker.patch.object(wp.LocalDiscovery, "Subscriber", return_value=_Inner())
         proxy = WorkerProxy("pool-1", credentials=None, quorum=None, lazy=False)
 
         try:
@@ -3411,11 +3408,7 @@ class TestWorkerProxy:
 
                 return gen()
 
-        mock_local = mocker.MagicMock()
-        mock_local.subscribe.side_effect = lambda filter=None, **_: afilter(
-            filter, _Inner()
-        )
-        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local)
+        mocker.patch.object(wp.LocalDiscovery, "Subscriber", return_value=_Inner())
         proxy = WorkerProxy("pool-1", credentials=None, quorum=None, lazy=False)
 
         try:
@@ -5565,26 +5558,37 @@ class TestWorkerProxy:
             assert len(proxy.workers) >= 2
 
     @pytest.mark.asyncio
-    async def test_proxy_with_pool_uri(self):
-        """Test it starts and stops correctly.
+    async def test___aenter___should_start_and_stop_when_pool_uri_supplied(self):
+        """Test a pool-URI proxy starts and stops over a live registry.
 
         Given:
-            A non-lazy WorkerProxy configured with a pool URI
+            A namespace held by a LocalDiscovery owner, and a non-lazy
+            WorkerProxy configured with that namespace as its pool URI
         When:
-            The proxy is used as a context manager
+            The proxy is entered, its sentinel is given a turn to bind
+            the borrowed registry, and the context exits
         Then:
-            It starts and stops correctly
+            It should report started inside the block and stopped
+            after, having borrowed the owner's registry rather than
+            creating one.
         """
-        # Arrange
-        proxy = WorkerProxy("test://pool", lazy=False, quorum=0)
+        # Arrange — an owner must hold the namespace for the borrowed
+        # subscriber to bind. Without the `sleep` below the sentinel is
+        # cancelled before it ever runs, so this test would pass
+        # against a proxy that never touched discovery at all.
+        namespace = f"proxy-uri-{uuid.uuid4().hex[:12]}"
 
-        # Act & assert
-        async with proxy as p:
-            assert p is not None
-            assert p.started
+        with LocalDiscovery(namespace):
+            proxy = WorkerProxy(namespace, lazy=False, quorum=0)
 
-        # After exit, proxy should be stopped
-        assert not proxy.started
+            # Act & assert
+            async with proxy as p:
+                await asyncio.sleep(0)
+                assert p is not None
+                assert p.started
+
+            # After exit, proxy should be stopped
+            assert not proxy.started
 
     @pytest.mark.asyncio
     async def test_workers_property_returns_workers_list(
@@ -6647,14 +6651,20 @@ class TestWorkerProxy:
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
         mock_subscriber = mocker.MagicMock()
-        mock_local_discovery = mocker.MagicMock()
-        mock_local_discovery.subscribe.return_value = mock_subscriber
-        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local_discovery)
+        subscriber_cls = mocker.patch.object(
+            wp.LocalDiscovery, "Subscriber", return_value=mock_subscriber
+        )
+        filtering = mocker.patch.object(wp, "afilter")
 
         WorkerProxy("pool-1", "extra-tag")
 
-        # Capture the filter passed to subscribe()
-        filter_fn = mock_local_discovery.subscribe.call_args.kwargs["filter"]
+        # Assert — the proxy borrows the pool URI's namespace, and
+        # filters that very subscriber rather than some other stream
+        subscriber_cls.assert_called_once_with("pool-1")
+        assert filtering.call_args.args[1] is mock_subscriber
+
+        # Capture the predicate the subscriber is filtered through
+        filter_fn = filtering.call_args.args[0]
 
         # Act & assert — matching tags pass
         matching = WorkerMetadata(
