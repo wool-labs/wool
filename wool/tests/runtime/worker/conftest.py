@@ -55,10 +55,13 @@ def _isolate_wool_context():
 
 @pytest_asyncio.fixture(autouse=True)
 async def _clear_channel_pool():
-    """Clear the module-level gRPC channel pool between tests.
+    """Finalize the module-level gRPC channel pool on the loop that used it.
 
-    Prevents stale cached channels (with outdated mocks) from leaking
-    across tests.
+    Not required for correctness: a `ResourcePool` rebinds to the next
+    test's loop and drops whatever a loop that is no longer running left
+    behind. Closing each test's channels here, on their own loop, is the
+    only place a ``grpc.aio`` channel can still be closed -- a dropped
+    orphan never is.
     """
     yield
     import wool.runtime.worker.connection as _conn
@@ -226,7 +229,7 @@ def _make_worker_metadata(*tags: str) -> WorkerMetadata:
     """Build a valid WorkerMetadata with a fresh UUID.
 
     Advertises the ambient protocol version — what a real in-process
-    worker would — so the metadata passes the proxy's security/version
+    worker would — so the metadata passes the proxy's
     admission gate.
     """
     return WorkerMetadata(
@@ -268,6 +271,11 @@ class MockWorker:
         return self._uid
 
     @property
+    def started(self):
+        """Whether ``start`` has run without a matching ``stop``."""
+        return self._started
+
+    @property
     def tags(self):
         """Worker capability tags."""
         return self._tags
@@ -302,7 +310,7 @@ class MockWorker:
 
         # Create WorkerMetadata after successful start; advertise the
         # ambient protocol version so the mock worker passes the
-        # proxy's security/version admission gate.
+        # proxy's admission gate.
         self._info = WorkerMetadata(
             uid=self._uid,
             address="localhost:50051",

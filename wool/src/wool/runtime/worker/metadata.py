@@ -8,6 +8,7 @@ from types import MappingProxyType
 import grpc
 
 from wool import protocol as wire
+from wool.runtime.worker.auth import normalize_peer
 from wool.runtime.worker.base import ChannelOptions
 
 
@@ -22,7 +23,7 @@ class WorkerMetadata:
     :param uid:
         Unique identifier for the worker instance (UUID).
     :param address:
-        gRPC target address (e.g. ``"host:port"``,
+        gRPC target address (e.g., ``"host:port"``,
         ``"unix:path"``).
     :param pid:
         Process ID of the worker.
@@ -38,6 +39,14 @@ class WorkerMetadata:
     :param options:
         Transport configuration advertised by the worker.  Clients
         use these settings when connecting.
+    :param identity:
+        Logical workload identity this worker claims, carried in its
+        certificate as a DNS SAN, an IP SAN, or the CN (i.e., the forms
+        gRPC's client-side verifier consults), or ``None`` when it
+        declares none.  A blank value normalizes to ``None``. What a
+        connecting peer does with the claim — which name it verifies,
+        and whether it admits a worker declaring none — is documented
+        on `WorkerProxy`.
     """
 
     uid: uuid.UUID
@@ -50,6 +59,17 @@ class WorkerMetadata:
     )
     secure: bool = field(default=False, hash=False)
     options: ChannelOptions = field(default_factory=ChannelOptions, hash=False)
+    identity: str | None = field(default=None, hash=False)
+
+    def __post_init__(self) -> None:
+        """Normalize the advertised identity, collapsing a blank name to ``None``.
+
+        :raises TypeError:
+            If ``identity`` is neither a string nor ``None``.
+        """
+        object.__setattr__(
+            self, "identity", normalize_peer(self.identity, parameter="identity")
+        )
 
     @classmethod
     def from_protobuf(cls, protobuf: wire.WorkerMetadata) -> WorkerMetadata:
@@ -72,6 +92,10 @@ class WorkerMetadata:
             extra=MappingProxyType(dict(protobuf.extra)),
             secure=protobuf.secure,
             options=cls._options_from_protobuf(protobuf),
+            # Absent on records from versions predating advertised
+            # identity, where proto3 yields the empty string rather than
+            # a missing field.
+            identity=protobuf.identity,
         )
 
     def to_protobuf(self) -> wire.WorkerMetadata:
@@ -89,6 +113,7 @@ class WorkerMetadata:
             tags=list(self.tags),
             extra=dict(self.extra),
             secure=self.secure,
+            identity=self.identity or "",
         )
         msg.connection.CopyFrom(
             wire.ChannelOptions(

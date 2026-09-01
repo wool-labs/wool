@@ -54,8 +54,11 @@ from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import BoundWorkerFactory
 from wool.runtime.worker.base import ChannelOptions
+from wool.runtime.worker.base import IdentifiedBoundWorkerFactory
+from wool.runtime.worker.base import IdentifiedWorkerFactory
 from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerFactory
+from wool.runtime.worker.base import WorkerFactoryLike
 from wool.runtime.worker.base import WorkerLike
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.connection import HandshakeError
@@ -64,10 +67,12 @@ from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.exceptions import IneffectivePeersWarning
 from wool.runtime.worker.exceptions import SlowCredentialResolutionWarning
 from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
+from wool.runtime.worker.pool import IneffectiveIdentityWarning
 from wool.runtime.worker.pool import IneffectiveLeaseWarning
 from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.proxy import IneffectiveQuorumTimeoutWarning
@@ -132,8 +137,12 @@ __all__ = [
     "DispatchingLoadBalancerLike",
     "Factory",
     "HandshakeError",
+    "IdentifiedBoundWorkerFactory",
+    "IdentifiedWorkerFactory",
     "IdleUnavailable",
+    "IneffectiveIdentityWarning",
     "IneffectiveLeaseWarning",
+    "IneffectivePeersWarning",
     "IneffectiveQuorumTimeoutWarning",
     "LanDiscovery",
     "LoadBalancerContextLike",
@@ -167,6 +176,7 @@ __all__ = [
     "WorkerCredentials",
     "WorkerCredentialsProvider",
     "WorkerFactory",
+    "WorkerFactoryLike",
     "WorkerLike",
     "WorkerMetadata",
     "WorkerOptions",

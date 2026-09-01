@@ -704,7 +704,7 @@ def _gate_event_scenarios(draw):
 
 
 def _gate_predicate(local_version):
-    """Build the public security/version predicate for an insecure proxy."""
+    """Build the public admission predicate for an insecure proxy."""
     local = parse_version(local_version)
     assert local is not None
 
@@ -1309,6 +1309,37 @@ class TestWorkerProxy:
         assert not proxy.started
 
     @pytest.mark.asyncio
+    async def test_exit_should_stop_proxy_when_called_from_another_context(
+        self, mock_discovery_service
+    ):
+        """Test exit from a foreign context still stops the proxy.
+
+        Given:
+            A lazy WorkerProxy entered and started in one contextvars
+            context, as a routine's task does, so its token belongs to
+            that context.
+        When:
+            exit() runs in a task of its own, whose context is a copy, as
+            a pool finalizer's task is.
+        Then:
+            It should discard the foreign token rather than raise, still
+            stop the proxy, and leave this context's binding untouched,
+            since the token was never valid where the reset ran.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=mock_discovery_service, quorum=0)
+        await proxy.enter()
+        await proxy.start()
+        assert proxy.started
+
+        # Act
+        await asyncio.create_task(proxy.exit())
+
+        # Assert
+        assert not proxy.started
+        assert wool.__proxy__.get() is proxy
+
+    @pytest.mark.asyncio
     async def test___aenter___enter_starts_proxy(
         self, mock_discovery_service, mock_proxy_session
     ):
@@ -1658,11 +1689,7 @@ class TestWorkerProxy:
         await asyncio.sleep(0.1)
 
         # Assert
-        mock_conn_cls.assert_called_once_with(
-            metadata.address,
-            credentials=None,
-            options=channel_opts,
-        )
+        mock_conn_cls.assert_called_once_with(metadata.address, options=channel_opts)
 
         # Cleanup
         await proxy.stop()
@@ -1702,11 +1729,7 @@ class TestWorkerProxy:
         await asyncio.sleep(0.1)
 
         # Assert
-        mock_conn_cls.assert_called_once_with(
-            metadata.address,
-            credentials=None,
-            options=None,
-        )
+        mock_conn_cls.assert_called_once_with(metadata.address, options=None)
 
         # Cleanup
         await proxy.stop()
@@ -3297,7 +3320,7 @@ class TestWorkerProxy:
             A pool-URI proxy whose real afilter-wrapped subscription
             first surfaces a tag-matching compatible worker, then a
             worker-updated for the same uid flipped incompatible on one
-            gate half
+            gate arm
         When:
             The sentinel admits the worker and then processes the flip
         Then:
@@ -3874,7 +3897,7 @@ class TestWorkerProxy:
     def test___init___should_raise_when_quorum_exceeds_insecure_worker_count(
         self, mocker: MockerFixture
     ):
-        """Test the security half reduces the construction-time count.
+        """Test the security arm reduces the construction-time count.
 
         Given:
             An explicit credentials=None proxy over a static list of
@@ -3884,7 +3907,7 @@ class TestWorkerProxy:
             The proxy is constructed
         Then:
             It should raise ValueError reporting "1 of 2" — the secure
-            worker fails the security half of the compatibility count
+            worker fails the security arm of the compatibility count
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
@@ -3968,7 +3991,7 @@ class TestWorkerProxy:
         Then:
             It should raise ValueError naming the compatible worker
             count exactly when the quorum exceeds the number of
-            workers passing the public security/version predicate, and
+            workers passing the public admission predicate, and
             construct successfully otherwise.
         """
         # Arrange
@@ -6348,9 +6371,10 @@ class TestWorkerProxy:
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
-        provider = WorkerCredentialsProvider(
-            lambda: worker_credentials, identity="wool-worker"
-        )
+        # No ``peers``: this test's subject is the security arm, and a
+        # configured policy would additionally gate these workers on the
+        # identity they do not advertise.
+        provider = WorkerCredentialsProvider(lambda: worker_credentials)
         secure_worker = WorkerMetadata(
             uid=uuid.uuid4(),
             address="192.168.1.100:50051",
@@ -6475,6 +6499,7 @@ class TestWorkerProxy:
             metadata.address,
             credentials=provider,
             options=channel_opts,
+            peer=None,
         )
 
         # Cleanup
@@ -6986,6 +7011,321 @@ class _GatedDiscovery:
         await self._gate.wait()
         for event in self._deferred:
             yield event
+
+
+#: Admission outcomes for the identity arm, as ``(peers, advertised)``.
+#: A configured policy admits only an advertised name it accepts, whatever
+#: the policy's shape; an unconfigured one ignores advertisements entirely.
+_IDENTITY_ADMITTED = [
+    pytest.param(None, None, id="unconfigured-admits-unnamed"),
+    pytest.param(None, "alpha.svc", id="unconfigured-admits-named"),
+    pytest.param("alpha.svc", "alpha.svc", id="single-admits-match"),
+    pytest.param(["alpha.svc", "beta.svc"], "beta.svc", id="several-admits-match"),
+    pytest.param(
+        lambda name: name.endswith(".wool.test"),
+        "alpha.wool.test",
+        id="predicate-admits-match",
+    ),
+]
+
+_IDENTITY_REJECTED = [
+    pytest.param("alpha.svc", "beta.svc", id="single-rejects-mismatch"),
+    pytest.param("alpha.svc", None, id="single-rejects-unnamed"),
+    pytest.param(["alpha.svc", "beta.svc"], "gamma.svc", id="several-rejects-mismatch"),
+    pytest.param(["alpha.svc", "beta.svc"], None, id="several-rejects-unnamed"),
+    pytest.param(
+        lambda name: name.endswith(".wool.test"),
+        None,
+        id="predicate-rejects-unnamed",
+    ),
+]
+
+
+def _identified(identity, *, secure=True):
+    """Build worker metadata advertising ``identity``."""
+    return WorkerMetadata(
+        uid=uuid.uuid4(),
+        address="192.168.1.100:50051",
+        pid=1001,
+        version="1.0.0",
+        secure=secure,
+        identity=identity,
+    )
+
+
+class TestWorkerProxyIdentityAdmission:
+    """Tests for the identity arm of the sentinel admission gate.
+
+    Driven entirely through the public surface: a proxy over a static
+    worker list gates eagerly at construction, so an admitted worker
+    appears in ``proxy.workers`` and a rejected one leaves the quorum
+    unsatisfiable, which `WorkerProxy` reports as a ValueError.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("peers", "advertised"), _IDENTITY_ADMITTED)
+    async def test_start_should_admit_worker_when_advertised_identity_accepted(
+        self, mock_proxy_session, worker_credentials, mocker, peers, advertised
+    ):
+        """Test a worker whose advertised identity is accepted is admitted.
+
+        Given:
+            A provider whose peers policy is unconfigured, names one
+            peer, names several, or is a predicate, and a worker
+            advertising a name that policy accepts.
+        When:
+            The proxy starts.
+        Then:
+            It should admit the worker.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        provider = WorkerCredentialsProvider(lambda: worker_credentials, peers=peers)
+        worker = _identified(advertised)
+
+        # Act
+        proxy = WorkerProxy(workers=[worker], credentials=provider, lazy=False)
+        await proxy.start()
+        await _drain_until(lambda: worker in proxy.workers)
+
+        # Assert
+        assert worker in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.parametrize(("peers", "advertised"), _IDENTITY_REJECTED)
+    def test___init___should_raise_when_no_worker_survives_identity_filtering(
+        self, worker_credentials, mocker, peers, advertised
+    ):
+        """Test a worker the peers policy rejects is gated out at construction.
+
+        Given:
+            A provider naming one peer, several, or a predicate, and a
+            single worker advertising a name that policy does not
+            accept — or advertising nothing at all.
+        When:
+            A proxy is constructed over that worker alone.
+        Then:
+            It should raise ValueError, since the quorum can never be
+            satisfied by a worker the gate refuses.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        provider = WorkerCredentialsProvider(lambda: worker_credentials, peers=peers)
+        worker = _identified(advertised)
+
+        # Act & assert — the same metadata is admitted under an
+        # unconfigured policy above, which is what isolates this to the
+        # identity arm rather than the security or version one.
+        with pytest.raises(
+            ValueError,
+            match=r"0 of 1 after security, version, and identity filtering",
+        ):
+            WorkerProxy(workers=[worker], credentials=provider, lazy=False)
+
+    @pytest.mark.asyncio
+    async def test_start_should_admit_named_worker_when_provider_omits_peer_gate(
+        self, mock_proxy_session, mocker, worker_credentials
+    ):
+        """Test a provider with no peers policy ignores advertisements.
+
+        Given:
+            A provider configuring no peers policy, which leaves
+            advertisements ungated.
+        When:
+            The proxy starts over a worker advertising an identity.
+        Then:
+            It should admit the worker, since no policy is available to
+            judge the advertisement against.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        provider = worker_credentials.as_provider()
+        worker = _identified("alpha.svc")
+
+        # Act
+        proxy = WorkerProxy(workers=[worker], credentials=provider, lazy=False)
+        await proxy.start()
+        await _drain_until(lambda: worker in proxy.workers)
+
+        # Assert
+        assert worker in proxy.workers
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_pin_the_advertised_identity_when_gated(
+        self, worker_credentials, mocker: MockerFixture
+    ):
+        """Test the name the gate accepted is the name the connection proves.
+
+        Given:
+            A proxy whose peers policy accepts several names, over a
+            discovery stream announcing a worker advertising one of
+            them.
+        When:
+            The proxy starts and builds that worker's connection.
+        Then:
+            It should pin the advertised name, which is the only one
+            the handshake can verify for this worker.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        provider = WorkerCredentialsProvider(
+            lambda: worker_credentials, peers=["alpha.svc", "beta.svc"]
+        )
+        metadata = _identified("beta.svc")
+        mock_conn_cls = mocker.patch.object(
+            wp, "WorkerConnection", return_value=mocker.MagicMock()
+        )
+        discovery = wp.ReducibleAsyncIterator(
+            [DiscoveryEvent("worker-added", metadata=metadata)]
+        )
+        proxy = WorkerProxy(discovery=discovery, credentials=provider, lazy=False)
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: mock_conn_cls.call_args is not None)
+
+        # Assert
+        assert mock_conn_cls.call_args.kwargs["peer"] == "beta.svc"
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_pin_no_peer_when_the_policy_is_unconfigured(
+        self, worker_credentials, mocker: MockerFixture
+    ):
+        """Test an advertisement cannot redirect an ungated client.
+
+        Given:
+            A proxy whose credentials configure no peers policy, over a
+            worker advertising a name.
+        When:
+            The proxy starts and builds that worker's connection.
+        Then:
+            It should pin no peer at all, leaving verification to the
+            dialed address. With no policy nothing vetted the
+            advertisement, so a worker's self-declared identity can
+            never become the name it is checked against.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        provider = WorkerCredentialsProvider(lambda: worker_credentials)
+        metadata = _identified("beta.svc")
+        mock_conn_cls = mocker.patch.object(
+            wp, "WorkerConnection", return_value=mocker.MagicMock()
+        )
+        discovery = wp.ReducibleAsyncIterator(
+            [DiscoveryEvent("worker-added", metadata=metadata)]
+        )
+        proxy = WorkerProxy(discovery=discovery, credentials=provider, lazy=False)
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: mock_conn_cls.call_args is not None)
+
+        # Assert
+        assert mock_conn_cls.call_args.kwargs["peer"] is None
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_reject_an_unaccepted_worker_from_the_stream(
+        self, worker_credentials, mocker: MockerFixture, caplog
+    ):
+        """Test the gate refuses on the discovery path, naming the policy.
+
+        Given:
+            A running proxy whose peers policy names two peers, and a
+            discovery stream announcing a worker advertising a third.
+        When:
+            The proxy processes the event with debug logging captured.
+        Then:
+            It should hold no workers and log a rejection enumerating
+            the accepted peers, so an operator reading an empty pool
+            learns which names were expected rather than only that
+            identity was the arm that refused.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        provider = WorkerCredentialsProvider(
+            lambda: worker_credentials, peers=["alpha.svc", "beta.svc"]
+        )
+        metadata = _identified("gamma.svc")
+        discovery = wp.ReducibleAsyncIterator(
+            [DiscoveryEvent("worker-added", metadata=metadata)]
+        )
+        # A falsy quorum: this proxy is expected to admit nobody, so
+        # waiting for one would block on a quorum that never arrives.
+        proxy = WorkerProxy(
+            discovery=discovery, credentials=provider, lazy=False, quorum=0
+        )
+
+        # Act
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.worker.proxy"):
+            await proxy.start()
+            await _drain_until(lambda: "gamma.svc" in caplog.text)
+
+        # Assert
+        assert metadata not in proxy.workers
+        assert "alpha.svc, beta.svc" in caplog.text
+        assert "gamma.svc" in caplog.text
+
+        # Cleanup
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_should_evict_a_worker_that_readvertises_an_unaccepted_name(
+        self, worker_credentials, mocker: MockerFixture
+    ):
+        """Test the identity arm reconciles membership in both directions.
+
+        Given:
+            A running proxy holding a worker admitted under its peers
+            policy.
+        When:
+            That worker re-announces itself advertising a name the
+            policy does not accept.
+        Then:
+            It should be evicted, since admission and eviction are one
+            authority and a worker crossing the boundary either way is
+            reconciled to current eligibility.
+        """
+        # Arrange
+        mocker.patch.object(protocol, "__version__", "1.0.0")
+        provider = WorkerCredentialsProvider(
+            lambda: worker_credentials, peers=["alpha.svc", "beta.svc"]
+        )
+        mocker.patch.object(wp, "WorkerConnection", return_value=mocker.MagicMock())
+        uid = uuid.uuid4()
+        admitted = replace(_identified("alpha.svc"), uid=uid)
+        readvertised = replace(admitted, identity="gamma.svc")
+        events = asyncio.Queue()
+        events.put_nowait(DiscoveryEvent("worker-added", metadata=admitted))
+
+        async def stream():
+            while (event := await events.get()) is not None:
+                yield event
+
+        proxy = WorkerProxy(discovery=stream(), credentials=provider, lazy=False)
+
+        # Act
+        await proxy.start()
+        await _drain_until(lambda: admitted in proxy.workers)
+        events.put_nowait(DiscoveryEvent("worker-updated", metadata=readvertised))
+        await _drain_until(lambda: admitted not in proxy.workers)
+
+        # Assert
+        assert admitted not in proxy.workers
+
+        # Cleanup
+        events.put_nowait(None)
+        await proxy.stop()
 
 
 class TestWorkerProxyDispatchRetryEviction:

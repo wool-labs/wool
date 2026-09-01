@@ -32,6 +32,11 @@ def _make_metadata(address="127.0.0.1:50051", pid=12345, secure=False) -> Worker
     )
 
 
+def _accepts_other_svc(name: str) -> bool:
+    """Module-level peers predicate, so a provider carrying it stays picklable."""
+    return name == "other.svc"
+
+
 def _make_started_process(mocker, *, alive=True):
     """Build a WorkerProcess mock and patch it into local_module."""
     mock_process = mocker.MagicMock(spec=WorkerProcess)
@@ -650,6 +655,64 @@ class TestLocalWorker:
         # Assert
         assert worker.metadata is None  # Not started yet, but construction succeeded
 
+    def test___init___should_raise_when_identity_configured_without_credentials(self):
+        """Test declaring an identity with no credentials is rejected.
+
+        Given:
+            An identity and no credentials.
+        When:
+            A LocalWorker is constructed.
+        Then:
+            It should raise ValueError, since an identity is proven by
+            a name in the worker's certificate and a worker serving
+            plaintext has none.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="identity requires credentials"):
+            LocalWorker(identity="alpha.svc")
+
+    def test___init___should_raise_when_identity_is_a_collection(self):
+        """Test a collection supplied as a worker's identity is refused.
+
+        Given:
+            A list of names supplied as a worker's identity, which is
+            singular by contract.
+        When:
+            A LocalWorker is constructed.
+        Then:
+            It should raise TypeError naming the received type, the same
+            way every other peer-name entry point does.
+        """
+        # Act & assert
+        with pytest.raises(TypeError, match="single peer name"):
+            LocalWorker(identity=["alpha.svc"])  # pyright: ignore[reportArgumentType]
+
+    @given(identity=st.one_of(st.none(), st.text()))
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    def test___init___should_normalize_the_declared_identity(
+        self, identity, mocker, worker_credentials
+    ):
+        """Test the declared identity is normalized before it is advertised.
+
+        Given:
+            Any declared identity, including blank and padded ones.
+        When:
+            A LocalWorker is constructed.
+        Then:
+            The worker process should receive the stripped name, or
+            none at all when nothing survives — so what the worker
+            advertises matches what it verifies against.
+        """
+        # Arrange
+        _make_started_process(mocker)
+
+        # Act
+        LocalWorker(identity=identity, credentials=worker_credentials)
+
+        # Assert
+        expected = identity.strip() or None if identity is not None else None
+        assert local_module.WorkerProcess.call_args.kwargs["identity"] == expected
+
     def test___init___with_no_credentials(self):
         """Test LocalWorker with no credentials.
 
@@ -847,35 +910,34 @@ class TestLocalWorker:
         mock_secure_channel.assert_called_once()
         mock_stub.stop.assert_called_once()
 
+    @pytest.mark.parametrize(
+        "peers",
+        [None, "other.svc", ["other.svc", "third.svc"], _accepts_other_svc],
+        ids=["no-policy", "one-name", "several-names", "predicate"],
+    )
     @pytest.mark.asyncio
-    async def test_stop_should_apply_identity_override_when_configured(
-        self, mocker, worker_credentials
+    async def test_stop_should_pin_its_own_identity_whatever_the_policy_accepts(
+        self, peers, mocker, worker_credentials
     ):
-        """Test the stop RPC verifies the worker against its identity.
+        """Test the stop RPC verifies against the worker's own identity.
 
         Given:
-            A running LocalWorker whose provider carries an expected
-            identity.
+            A running LocalWorker declaring an identity, over a provider
+            whose peers policy -- absent, or naming names that are not
+            the worker's -- can never be the source of the name.
         When:
             stop() is called.
         Then:
-            The secure stop channel should carry a
-            grpc.ssl_target_name_override option for that identity, so the
-            worker's own certificate verifies against its logical identity
-            rather than the loopback address.
+            The stop channel should verify against the worker's declared
+            identity and carry nothing from the policy. Keeping the two
+            disjoint is what makes the pin attributable: were they the
+            same string, an implementation reading the policy would pass
+            this test too.
         """
         # Arrange
-        provider = WorkerCredentialsProvider(
-            lambda: worker_credentials, identity="wool-worker"
-        )
-        mock_process = mocker.MagicMock(spec=WorkerProcess)
-        mock_process.address = "127.0.0.1:50051"
-        mock_process.metadata = _make_metadata()
-        mock_process.start.return_value = None
-        mock_process.is_alive.return_value = True
-        mocker.patch.object(local_module, "WorkerProcess", return_value=mock_process)
-
-        worker = LocalWorker(credentials=provider)
+        provider = WorkerCredentialsProvider(lambda: worker_credentials, peers=peers)
+        _make_started_process(mocker)
+        worker = LocalWorker(identity="wool-worker", credentials=provider)
         await worker.start()
 
         mock_channel = mocker.MagicMock()
@@ -893,6 +955,50 @@ class TestLocalWorker:
         # Assert
         options = mock_secure_channel.call_args.kwargs["options"]
         assert ("grpc.ssl_target_name_override", "wool-worker") in options
+        assert ("grpc.ssl_target_name_override", "other.svc") not in options
+
+    @pytest.mark.parametrize(
+        "peers",
+        [None, "other.svc", ["other.svc", "third.svc"], _accepts_other_svc],
+        ids=["no-policy", "one-name", "several-names", "predicate"],
+    )
+    @pytest.mark.asyncio
+    async def test_stop_should_verify_the_dialed_address_when_no_identity_declared(
+        self, peers, mocker, worker_credentials
+    ):
+        """Test a worker declaring no identity falls back to its address.
+
+        Given:
+            A running LocalWorker declaring no identity, over a provider
+            whose peers policy takes every shape, including the single
+            name a policy-reading implementation would be tempted by.
+        When:
+            stop() is called.
+        Then:
+            The stop channel should carry no name override, leaving
+            verification to the dialed address.
+        """
+        # Arrange
+        provider = WorkerCredentialsProvider(lambda: worker_credentials, peers=peers)
+        _make_started_process(mocker)
+        worker = LocalWorker(credentials=provider)
+        await worker.start()
+
+        mock_channel = mocker.MagicMock()
+        mock_channel.close = mocker.AsyncMock()
+        mock_stub = mocker.MagicMock()
+        mock_stub.stop = mocker.AsyncMock()
+        mock_secure_channel = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        # Act
+        await worker.stop()
+
+        # Assert
+        option_keys = [key for key, _ in mock_secure_channel.call_args.kwargs["options"]]
+        assert "grpc.ssl_target_name_override" not in option_keys
 
     @pytest.mark.parametrize("mutual", [True, False], ids=["mtls", "one_way_tls"])
     @pytest.mark.asyncio

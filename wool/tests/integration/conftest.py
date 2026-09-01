@@ -541,12 +541,15 @@ async def build_pool_from_scenario(
                 pool_kwargs = {
                     "loadbalancer": lb,
                     "credentials": creds,
-                    # Explicitly loopback-pinned factory by design: the
-                    # pre-supplied host classifies it bound, carrying the
-                    # options/backpressure dimensions while keeping LAN
-                    # scenarios deterministic (the test certs' SAN covers
-                    # loopback only). The publisher-prescribed bind host is
-                    # covered by test_lan_publish.py instead.
+                    # Carries the options/backpressure dimensions. The
+                    # pre-supplied host no longer pins the binding: a
+                    # partial's bound keyword is overridable, so a LAN
+                    # publisher's prescribed bind host wins over this
+                    # value (see `~wool.WorkerFactoryLike`). A factory
+                    # that must own its binding has to decline the
+                    # keyword outright rather than pre-supply it.
+                    # The publisher-prescribed bind host is covered by
+                    # test_lan_publish.py.
                     "worker": partial(
                         LocalWorker,
                         host="127.0.0.1",
@@ -1579,7 +1582,11 @@ def credentials_map(test_certificates):
 
 @pytest_asyncio.fixture(autouse=True)
 async def _clear_channel_pool():
-    """Clear the module-level gRPC channel pool after each test."""
+    """Finalize the module-level gRPC channel pool on the loop that used it.
+
+    Prompt finalization only; the pool rebinds and drops orphans on its
+    own, so this is not required for correctness.
+    """
     yield
     import wool.runtime.worker.connection as _conn
 
@@ -1596,6 +1603,28 @@ async def _clear_channel_pool():
 # autouse cleanup. (The previous sync ``_clear_proxy_context``
 # autouse fixture mutated the pytest main Chain, which async test
 # tasks never observe; it was load-bearing in appearance only.)
+
+
+@pytest_asyncio.fixture
+async def started_worker():
+    """Start workers for a test and stop them at teardown.
+
+    Returns an async callable that starts the given `wool.LocalWorker`,
+    asserts the started worker announced its metadata, and registers it
+    to be stopped at teardown, so test bodies carry no start/stop
+    scaffolding.
+    """
+    workers = []
+
+    async def start(worker):
+        await worker.start()
+        workers.append(worker)
+        assert worker.metadata is not None
+        return worker
+
+    yield start
+    for worker in workers:
+        await worker.stop()
 
 
 @pytest_asyncio.fixture

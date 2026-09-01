@@ -34,6 +34,7 @@ from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import UnexpectedResponse
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.connection import channel_pool_stats
 from wool.runtime.worker.connection import clear_channel_pool
 
 from .conftest import PicklableMock
@@ -50,26 +51,58 @@ def _rotating_provider(factory) -> WorkerCredentialsProvider:
 
 
 def _await_rotation_adopted(
-    provider: WorkerCredentialsProvider, previous: WorkerCredentials
+    provider: WorkerCredentialsProvider,
+    previous: WorkerCredentials,
+    *,
+    attempts: int = 10,
 ) -> None:
     """Drive the provider until it adopts material newer than *previous*.
 
-    `WorkerCredentialsProvider.refresh` consults the factory regardless of
-    age, so one call is enough for a factory whose output has changed.
+    One call is not enough. `Refreshing.refresh` joins a refresh already
+    in flight rather than starting a second, and a zero freshness
+    interval means the read preceding the rotation left one in flight —
+    derived from the pre-rotation files, so joining it returns exactly
+    the value the caller is waiting to see replaced. Repeat until the
+    re-read lands, which needs no sleep: each call either joins the
+    stale flight or starts a fresh one.
     """
-    assert provider.credentials.refresh() != previous, "rotation was not adopted"
+    for _ in range(attempts):
+        if provider.credentials.refresh() != previous:
+            return
+    raise AssertionError(f"rotation was not adopted within {attempts} refreshes")
 
 
-def _secure_provider(identity: str | None = None) -> WorkerCredentialsProvider:
+# The status codes `TransientRpcError` is specified for. Spelled out here
+# rather than read from `WorkerConnection._TRANSIENT_ERRORS` so the tests
+# assert the documented contract instead of restating the implementation —
+# a set that silently gained a member would then fail these tests rather
+# than agree with them.
+_TRANSIENT_CODES = frozenset(
+    {
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        grpc.StatusCode.RESOURCE_EXHAUSTED,
+    }
+)
+
+
+def _accepts_policy_svc(name: str) -> bool:
+    """Module-level peers predicate, so a provider carrying it stays picklable."""
+    return name == "policy.svc"
+
+
+def _secure_provider(peers=None) -> WorkerCredentialsProvider:
     """Build a static provider over dummy credential bytes.
 
     For tests that only need a secure (non-None) provider; gRPC defers PEM
-    validation to the handshake, which these tests never reach.
+    validation to the handshake, which these tests never reach. ``peers``
+    configures the admission policy — see `WorkerProxy` for what that
+    decides and what it does not.
     """
     credentials = WorkerCredentials(
         ca_cert=b"ca", worker_key=b"key", worker_cert=b"cert"
     )
-    return WorkerCredentialsProvider(lambda: credentials, identity=identity)
+    return WorkerCredentialsProvider(lambda: credentials, peers=peers)
 
 
 class _MockRpcError(grpc.RpcError):
@@ -78,7 +111,7 @@ class _MockRpcError(grpc.RpcError):
     Defined at module scope so property tests can raise a realistic
     gRPC error for any status code without redefining the class per
     example. ``str(self)`` is non-empty so the ``details() or
-    str(error)`` fallback in :class:`WorkerConnection` is observable
+    str(error)`` fallback in `WorkerConnection` is observable
     when ``details`` is empty.
     """
 
@@ -105,7 +138,7 @@ class MyAppError(Exception):
 
 @pytest.fixture
 def sample_task(mocker: MockerFixture):
-    """Provides a mock :class:`Task` for testing.
+    """Provides a mock `Task` for testing.
 
     Creates a Task with a simple async function that returns a
     test value.
@@ -432,8 +465,7 @@ class TestWorkerConnection:
         async_stream,
         cancel_raises: bool,
     ):
-        """Test task dispatch when stub yields an unexpected response after
-        successful acknowledgement.
+        """Test an unexpected response after a successful ack is reported.
 
         Given:
             A connection instance with capacity available
@@ -793,7 +825,7 @@ class TestWorkerConnection:
         When:
             A task is dispatched.
         Then:
-            It should raise HandshakeError, so an identity mismatch stays
+            It should raise HandshakeError, so a peer-name mismatch stays
             diagnosable as a handshake failure and is not mistaken for plain
             unreachability.
         """
@@ -829,21 +861,27 @@ class TestWorkerConnection:
                 pass
 
     @pytest.mark.asyncio
-    async def test_dispatch_should_override_target_name_when_identity_configured(
-        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    @pytest.mark.parametrize(
+        "peers",
+        ["policy.svc", ["policy.svc", "other.svc"], _accepts_policy_svc],
+        ids=["one-name", "several-names", "predicate"],
+    )
+    async def test_dispatch_should_not_override_target_name_when_only_peers_configured(
+        self, peers, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch verifies the worker against a configured identity.
+        """Test a peers policy never supplies the name a channel verifies.
 
         Given:
-            A connection whose provider carries an expected identity and a
-            target that is a bare network address.
+            A connection over a provider carrying a peers policy of any
+            shape -- one name, several, or a predicate -- and no peer
+            pinned on the connection itself.
         When:
             A task is dispatched.
         Then:
-            The secure channel should be built with a
-            grpc.ssl_target_name_override option for the identity, so the
-            certificate is verified against the identity rather than the
-            dialed address.
+            The secure channel should carry no name override, leaving
+            verification to the dialed address — whatever shape the
+            policy takes. See `WorkerProxy` for why a policy reaches no
+            channel.
         """
         # Arrange
         mock_channel = mocker.AsyncMock()
@@ -860,7 +898,59 @@ class TestWorkerConnection:
         )
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection(
-            "10.0.0.7:50051", credentials=_secure_provider(identity="wool-worker")
+            "10.0.0.7:50051", credentials=_secure_provider(peers=peers)
+        )
+
+        # Act
+        results = [result async for result in await connection.dispatch(sample_task)]
+
+        # Assert
+        assert results == ["ok"]
+        option_keys = [key for key, _ in secure_spy.call_args.kwargs["options"]]
+        assert "grpc.ssl_target_name_override" not in option_keys
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "peers",
+        ["policy.svc", ["policy.svc", "other.svc"], _accepts_policy_svc],
+        ids=["one-name", "several-names", "predicate"],
+    )
+    async def test_dispatch_should_ignore_the_peers_policy_when_a_peer_is_pinned(
+        self, peers, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test the pinned peer decides the name, never the policy.
+
+        Given:
+            A connection pinned to one name over a provider whose peers
+            policy names a different one, in any policy shape.
+        When:
+            A task is dispatched.
+        Then:
+            The secure channel should verify against the pinned name and
+            carry nothing from the policy, so the two cannot be confused
+            for one another.
+        """
+        # Arrange
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "10.0.0.7:50051",
+            credentials=_secure_provider(peers=peers),
+            peer="alpha.svc",
         )
 
         # Act
@@ -869,19 +959,20 @@ class TestWorkerConnection:
         # Assert
         assert results == ["ok"]
         options = secure_spy.call_args.kwargs["options"]
-        assert ("grpc.ssl_target_name_override", "wool-worker") in options
+        assert ("grpc.ssl_target_name_override", "alpha.svc") in options
+        assert ("grpc.ssl_target_name_override", "policy.svc") not in options
 
         # Cleanup
         await connection.close()
 
     @pytest.mark.asyncio
-    async def test_dispatch_should_not_override_target_name_when_identity_none(
+    async def test_dispatch_should_not_override_target_name_when_no_peer_is_pinned(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch leaves address verification intact without identity.
+        """Test dispatch leaves address verification intact without a peer name.
 
         Given:
-            A connection whose provider carries no identity.
+            A connection whose provider carries no peer name.
         When:
             A task is dispatched.
         Then:
@@ -916,21 +1007,81 @@ class TestWorkerConnection:
         # Cleanup
         await connection.close()
 
-    @pytest.mark.asyncio
-    async def test_dispatch_should_override_target_name_from_bare_credentials_identity(
-        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
-    ):
-        """Test a bare WorkerCredentials identity overrides the SAN target.
+    def test___init___should_raise_when_peer_is_a_collection(self):
+        """Test a collection supplied as the pinned peer is refused.
 
         Given:
-            A connection built from a bare `WorkerCredentials` (not a provider)
-            that carries an identity.
+            A list of names supplied as a connection's peer, which is
+            singular by contract.
+        When:
+            A WorkerConnection is constructed.
+        Then:
+            It should raise TypeError naming the received type and
+            pointing a collection at a provider's peers, rather than
+            failing later as an AttributeError from a missing strip.
+        """
+        # Act & assert
+        with pytest.raises(TypeError, match="single peer name"):
+            WorkerConnection(
+                "127.0.0.1:50051",
+                peer=["alpha.svc"],  # pyright: ignore[reportArgumentType,reportCallIssue]
+            )
+
+    def test___init___should_raise_when_peer_configured_without_credentials(self):
+        """Test a peer name with nothing to verify it is refused.
+
+        Given:
+            A peer name supplied to a connection carrying no
+            credentials, so the channel it opens is insecure.
+        When:
+            A WorkerConnection is constructed.
+        Then:
+            It should raise ValueError, since verification happens in
+            the TLS handshake and an insecure channel performs none, so
+            the pin the parameter promises could never take effect.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="peer requires credentials"):
+            WorkerConnection(
+                "127.0.0.1:50051",
+                peer="alpha.svc",  # pyright: ignore[reportCallIssue]
+            )
+
+    def test___init___should_accept_a_blank_peer_without_credentials(self):
+        """Test a blank name is not treated as a configured one.
+
+        Given:
+            A blank peer name supplied to a connection carrying no
+            credentials, which normalizes to None.
+        When:
+            A WorkerConnection is constructed.
+        Then:
+            It should construct, since nothing was configured to be
+            left unverifiable.
+        """
+        # Act
+        connection = WorkerConnection(
+            "127.0.0.1:50051",
+            peer="   ",  # pyright: ignore[reportCallIssue]
+        )
+
+        # Assert
+        assert isinstance(connection, WorkerConnection)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_override_target_name_when_peer_supplied(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test a per-connection peer name reaches the channel.
+
+        Given:
+            A connection pinned to a peer name, over a provider that
+            configures none of its own.
         When:
             A task is dispatched.
         Then:
-            The secure channel should carry the grpc.ssl_target_name_override
-            option for that identity — the ``credentials`` union coerces the
-            bare value and its identity flows through.
+            The secure channel should verify against the pinned name
+            rather than the dialed address.
         """
         # Arrange
         mock_channel = mocker.AsyncMock()
@@ -947,13 +1098,7 @@ class TestWorkerConnection:
         )
         mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
         connection = WorkerConnection(
-            "10.0.0.7:50051",
-            credentials=WorkerCredentials(
-                ca_cert=b"ca",
-                worker_key=b"key",
-                worker_cert=b"cert",
-                identity="wool-worker",
-            ),
+            "10.0.0.7:50051", credentials=_secure_provider(), peer="alpha.svc"
         )
 
         # Act
@@ -962,10 +1107,162 @@ class TestWorkerConnection:
         # Assert
         assert results == ["ok"]
         options = secure_spy.call_args.kwargs["options"]
-        assert ("grpc.ssl_target_name_override", "wool-worker") in options
+        assert ("grpc.ssl_target_name_override", "alpha.svc") in options
 
         # Cleanup
         await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_not_override_target_name_when_peer_blank(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test a blank peer name is treated as no name at all.
+
+        Given:
+            A connection pinned to a whitespace-only peer name.
+        When:
+            A task is dispatched.
+        Then:
+            The channel should carry no override, since a blank name
+            would otherwise fail verification opaquely.
+        """
+        # Arrange
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        connection = WorkerConnection(
+            "10.0.0.7:50051", credentials=_secure_provider(), peer="   "
+        )
+
+        # Act
+        results = [result async for result in await connection.dispatch(sample_task)]
+
+        # Assert
+        assert results == ["ok"]
+        option_keys = [key for key, _ in secure_spy.call_args.kwargs["options"]]
+        assert "grpc.ssl_target_name_override" not in option_keys
+
+        # Cleanup
+        await connection.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_not_share_a_channel_when_pinned_peers_differ(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test connections pinned to different peers get separate channels.
+
+        Given:
+            Two connections to one target over one provider, pinned to
+            different peer names.
+        When:
+            A task is dispatched through each.
+        Then:
+            Each should build its own channel, since one channel can
+            verify only one name — pooling them would verify a worker
+            against the wrong peer.
+        """
+        # Arrange
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        provider = _secure_provider()
+        alpha = WorkerConnection(
+            "10.0.0.7:50051", credentials=provider, peer="alpha.svc"
+        )
+        beta = WorkerConnection("10.0.0.7:50051", credentials=provider, peer="beta.svc")
+
+        # Act
+        [result async for result in await alpha.dispatch(sample_task)]
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        [result async for result in await beta.dispatch(sample_task)]
+
+        # Assert
+        assert secure_spy.call_count == 2
+        overrides = [
+            value
+            for call in secure_spy.call_args_list
+            for key, value in call.kwargs["options"]
+            if key == "grpc.ssl_target_name_override"
+        ]
+        assert overrides == ["alpha.svc", "beta.svc"]
+
+        # Cleanup
+        await alpha.close()
+        await beta.close()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_share_a_channel_when_pinned_peers_match(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test connections pinned to the same peer share one channel.
+
+        Given:
+            Two connections to one target over one provider, pinned to
+            the same peer name.
+        When:
+            A task is dispatched through each.
+        Then:
+            They should share one pooled channel, so the separation
+            above is attributable to the differing names rather than to
+            pooling being off entirely.
+        """
+        # Arrange
+        mock_channel = mocker.AsyncMock()
+        secure_spy = mocker.patch.object(
+            grpc.aio, "secure_channel", return_value=mock_channel
+        )
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub = mocker.MagicMock()
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+        provider = _secure_provider()
+        first = WorkerConnection(
+            "10.0.0.7:50051", credentials=provider, peer="alpha.svc"
+        )
+        second = WorkerConnection(
+            "10.0.0.7:50051", credentials=provider, peer="alpha.svc"
+        )
+
+        # Act
+        [result async for result in await first.dispatch(sample_task)]
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        [result async for result in await second.dispatch(sample_task)]
+
+        # Assert
+        assert secure_spy.call_count == 1
+
+        # Cleanup
+        await first.close()
+        await second.close()
 
     @pytest.mark.asyncio
     async def test_dispatch_should_reuse_channel_when_credentials_unchanged(
@@ -1146,7 +1443,7 @@ class TestWorkerConnection:
             grpc.aio, "secure_channel", return_value=mock_channel
         )
         connection = WorkerConnection(
-            target, credentials=_secure_provider(identity="wool-worker")
+            target, credentials=_secure_provider(), peer="wool-worker"
         )
 
         # Act
@@ -1298,7 +1595,7 @@ class TestWorkerConnection:
             A task is dispatched.
         Then:
             It should resolve the provider directly on the loop — the
-            constant-snapshot common case never pays asyncio.to_thread.
+            constant-material common case never pays asyncio.to_thread.
         """
         # Arrange
         to_thread_spy = mocker.patch.object(
@@ -1582,7 +1879,7 @@ class TestWorkerConnection:
             assert not isinstance(raised, RpcError)
             assert raised.__cause__ is error
         else:
-            if code in WorkerConnection._TRANSIENT_ERRORS:
+            if code in _TRANSIENT_CODES:
                 assert isinstance(raised, TransientRpcError)
             else:
                 assert isinstance(raised, RpcError)
@@ -1806,7 +2103,7 @@ class TestWorkerConnection:
 
         # Assert
         raised = exc_info.value
-        if code in WorkerConnection._TRANSIENT_ERRORS:
+        if code in _TRANSIENT_CODES:
             assert isinstance(raised, TransientRpcError)
         else:
             assert not isinstance(raised, TransientRpcError)
@@ -1989,22 +2286,19 @@ class TestWorkerConnection:
     async def test_dispatch_should_release_semaphore_when_handshake_fails(
         self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
     ):
-        """Test :meth:`WorkerConnection.dispatch` releases the
-        channel semaphore when the dispatch handshake fails after
-        the permit has been acquired.
+        """Test `WorkerConnection.dispatch` releases the channel semaphore.
 
         Given:
             A connection with ``max_concurrent_streams=1`` and a
             mock gRPC call whose ``write`` raises a non-transient
-            :class:`grpc.RpcError`.
+            `grpc.RpcError`.
         When:
-            :meth:`WorkerConnection.dispatch` is awaited.
+            `WorkerConnection.dispatch` is awaited.
         Then:
-            It should raise :class:`RpcError` and release the
+            It should raise `RpcError` and release the
             channel semaphore so the slot is available for the
             next dispatch on the same connection.
         """
-        from wool.runtime.worker import connection as connection_module
 
         class MockRpcError(grpc.RpcError):
             def code(self):
@@ -2036,19 +2330,22 @@ class TestWorkerConnection:
         # ``max_concurrent_streams=1`` a held permit means
         # ``locked() is True``; a released permit means
         # ``locked() is False``.
-        entry = connection_module._channel_pool._cache.get(connection._key)
-        assert entry is not None, "channel should be cached after dispatch acquire"
-        channel = entry.obj
-        assert not channel.semaphore.locked(), (
-            "channel.semaphore must be released after handshake failure"
+        # A leaked permit is observable without reaching into the pool:
+        # with ``max_concurrent_streams=1`` the next dispatch would park
+        # forever waiting for it, so completing at all proves release.
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(
+                async_stream((protocol.Response(ack=protocol.Ack()),))
+            )
         )
+        async with asyncio.timeout(1):
+            await connection.dispatch(sample_task)
 
     @pytest.mark.asyncio
     async def test_dispatch_should_release_semaphore_when_stream_acloses_early(
         self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
     ):
-        """Test that closing a primed stream before iterating any
-        value releases the channel semaphore.
+        """Test closing a primed stream releases the channel semaphore.
 
         Given:
             A connection with ``max_concurrent_streams=1`` and a
@@ -2062,8 +2359,6 @@ class TestWorkerConnection:
             subsequent dispatch on the same connection has a
             permit available.
         """
-        from wool.runtime.worker import connection as connection_module
-
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("unused"))),
@@ -2082,25 +2377,25 @@ class TestWorkerConnection:
         stream = await connection.dispatch(sample_task)
         await stream.aclose()
 
-        # Assert
-        entry = connection_module._channel_pool._cache.get(connection._key)
-        assert entry is not None, "channel should be cached after dispatch"
-        channel = entry.obj
-        assert not channel.semaphore.locked(), (
-            "channel.semaphore must be released after aclose, even "
-            "when no value was iterated from the primed stream"
+        # Assert — a leaked permit is observable without reaching into
+        # the pool: with ``max_concurrent_streams=1`` a second dispatch
+        # would park forever waiting for it, so completing at all proves
+        # the permit was released by ``aclose`` despite no value having
+        # been iterated from the primed stream.
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
         )
+        async with asyncio.timeout(1):
+            await connection.dispatch(sample_task)
 
     @pytest.mark.asyncio
     async def test_dispatch_should_propagate_unwrapped_when_task_encode_fails(
         self, mocker: MockerFixture, sample_task
     ):
-        """Test that a caller-side task encode failure propagates
-        in its original form rather than being wrapped as
-        :class:`RpcError`.
+        """Test that a caller-side task encode failure propagates.
 
-        The :meth:`WorkerConnection.dispatch` contract treats only
-        :class:`RpcError` as a worker-health concern; encode-side
+        The `WorkerConnection.dispatch` contract treats only
+        `RpcError` as a worker-health concern; encode-side
         failures surface to the caller in their original form so
         the load balancer does not evict workers on a caller-side
         bug.
@@ -2109,11 +2404,11 @@ class TestWorkerConnection:
             A connection and a task whose ``to_protobuf`` raises a
             non-RPC exception.
         When:
-            :meth:`WorkerConnection.dispatch` is awaited.
+            `WorkerConnection.dispatch` is awaited.
         Then:
             It should propagate the original exception class
-            unchanged, not wrap it as :class:`RpcError` or
-            :class:`TransientRpcError`.
+            unchanged, not wrap it as `RpcError` or
+            `TransientRpcError`.
         """
 
         class EncodeError(Exception):
@@ -2261,8 +2556,7 @@ class TestWorkerConnection:
     async def test_dispatch_should_release_channel_ref_when_cancelled_during_teardown(
         self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
     ):
-        """Test external cancellation during teardown releases the
-        pooled channel reference.
+        """Test external cancellation during teardown releases the pooled channel.
 
         Given:
             A dispatched task whose result stream runs to exhaustion
@@ -2279,9 +2573,6 @@ class TestWorkerConnection:
         # Arrange
         from wool.runtime.worker import connection as connection_module
 
-        # Contend the pool lock on a fresh instance so it does not
-        # bind the process-global lock to this test's event loop.
-        mocker.patch.object(connection_module._channel_pool, "_lock", asyncio.Lock())
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
@@ -2318,14 +2609,13 @@ class TestWorkerConnection:
                 pool._lock.release()
 
         # Assert
-        assert pool.stats.referenced_entries == 0
+        assert connection_module.channel_pool_stats().referenced_entries == 0
 
     @pytest.mark.asyncio
     async def test_dispatch_should_release_channel_ref_when_worker_cancels(
         self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
     ):
-        """Test a worker-side CancelledError releases the pooled
-        channel reference during teardown.
+        """Test a worker-side CancelledError releases the pooled channel reference.
 
         Given:
             A dispatched task whose worker ships an
@@ -2343,9 +2633,6 @@ class TestWorkerConnection:
         # Arrange
         from wool.runtime.worker import connection as connection_module
 
-        # Contend the pool lock on a fresh instance so it does not
-        # bind the process-global lock to this test's event loop.
-        mocker.patch.object(connection_module._channel_pool, "_lock", asyncio.Lock())
         cancellation = asyncio.CancelledError("worker self-raised cancel")
         responses = (
             protocol.Response(ack=protocol.Ack()),
@@ -2384,7 +2671,7 @@ class TestWorkerConnection:
                 pool._lock.release()
 
         # Assert
-        assert pool.stats.referenced_entries == 0
+        assert connection_module.channel_pool_stats().referenced_entries == 0
 
     @pytest.mark.asyncio
     async def test_dispatch_should_reraise_signal_when_teardown_raises_process_signal(
@@ -2422,7 +2709,6 @@ class TestWorkerConnection:
         connection = WorkerConnection(
             "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
         )
-        pool = connection_module._channel_pool
 
         # Act & assert
         with pytest.raises(SystemExit, match="teardown signal"):
@@ -2430,7 +2716,7 @@ class TestWorkerConnection:
                 pass
 
         # The pooled reference is still released despite the signal.
-        assert pool.stats.referenced_entries == 0
+        assert connection_module.channel_pool_stats().referenced_entries == 0
 
     @pytest.mark.asyncio
     async def test_dispatch_should_detach_teardown_when_release_exceeds_timeout(
@@ -2453,7 +2739,6 @@ class TestWorkerConnection:
 
         # Contend the pool lock on a fresh instance, and shorten the
         # teardown budget so the wedge resolves quickly.
-        mocker.patch.object(connection_module._channel_pool, "_lock", asyncio.Lock())
         mocker.patch.object(connection_module, "_TEARDOWN_TIMEOUT", 0.1)
         responses = (
             protocol.Response(ack=protocol.Ack()),
@@ -2519,11 +2804,10 @@ class TestWorkerConnection:
         async_stream,
         mock_grpc_call,
     ):
-        """Test calling :meth:`WorkerConnection.close` a second time
-        after a UDS self-dispatch returns without raising.
+        """Test a second close after a UDS dispatch is a no-op.
 
         Given:
-            A :class:`WorkerConnection` that dispatched once over UDS
+            A `WorkerConnection` that dispatched once over UDS
             (so both TCP and UDS pool entries were primed and the
             connection records the UDS key) and was then closed once
             (clearing both pool entries).
@@ -4103,9 +4387,7 @@ class TestWorkerConnection:
         async_stream,
         mock_grpc_call,
     ):
-        """Test the caller-side response decoder surfaces both the
-        worker-raised exception and a per-var context-decode failure
-        as independent signals when a single frame carries both.
+        """Test the decoder surfaces the worker-raised exception and its cause.
 
         Given:
             A worker response that carries both a worker-raised
@@ -4168,9 +4450,7 @@ class TestWorkerConnection:
         async_stream,
         mock_grpc_call,
     ):
-        """Test the caller-side response decoder delivers the routine's
-        return value and emits a SerializationWarning when a result
-        frame's accompanying context payload fails to deserialize.
+        """Test the caller-side response decoder delivers the routine's return value.
 
         Given:
             A worker response that carries a successful routine
@@ -4233,8 +4513,7 @@ class TestWorkerConnection:
         async_stream,
         mock_grpc_call,
     ):
-        """Test that a caller can opt into strict semantics by promoting
-        SerializationWarning to an error.
+        """Test a caller can opt into strict semantics by promoting warnings.
 
         Given:
             The same response shape as the lenient-mode test (result
@@ -4245,7 +4524,7 @@ class TestWorkerConnection:
             for the duration of the dispatch
         Then:
             Iterating the dispatch raises a typed
-            :class:`wool.ChainSerializationError` aggregating the promoted
+            `wool.ChainSerializationError` aggregating the promoted
             warnings on ``.warnings``. On a result frame the decode
             error IS the primary — the routine's value is dropped
             because a result cannot be trusted alongside a context
@@ -4309,12 +4588,12 @@ class TestWorkerConnection:
             worker's address and a ContextVar with a value set
         When:
             The dispatch stream writes requests — the initial
-            :class:`TaskRequestFrame` ships pure dispatch metadata
+            `TaskRequestFrame` ships pure dispatch metadata
             with no chain manifest, and the first
-            :class:`NextRequestFrame` (sent by ``__anext__`` to pull
+            `NextRequestFrame` (sent by ``__anext__`` to pull
             the result) auto-captures the active chain
         Then:
-            The first mid-stream :class:`NextRequestFrame` should
+            The first mid-stream `NextRequestFrame` should
             carry the var with its value serialized via cloudpickle.
         """
         # Arrange
@@ -4365,10 +4644,10 @@ class TestWorkerConnection:
         When:
             dispatch() sends the initial task request (pure dispatch
             metadata, no chain manifest) and the first
-            :class:`NextRequestFrame` (which auto-captures the active
+            `NextRequestFrame` (which auto-captures the active
             chain)
         Then:
-            The first mid-stream :class:`NextRequestFrame` should
+            The first mid-stream `NextRequestFrame` should
             cloudpickle-encode the var so it round-trips back to the
             original value. Under the per-frame architecture the
             initial Task frame is intentionally manifest-free —
@@ -4479,8 +4758,7 @@ class TestWorkerConnection:
         async_stream,
         mock_grpc_call,
     ):
-        """Test self-dispatch round-trips arbitrary ContextVar values
-        on the first mid-stream request.
+        """Test self-dispatch round-trips ContextVar values on the first hop.
 
         Given:
             A self-dispatch WorkerConnection and any picklable
@@ -4540,22 +4818,20 @@ class TestWorkerConnection:
     async def test_dispatch_should_raise_unexpected_response_when_exc_payload_non_exc(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch wraps a non-Exception ``Response.exception``
-        payload as an :class:`UnexpectedResponse` so the load
-        balancer does not evict the worker for a routine-level fault.
+        """Test a non-Exception exception payload is wrapped, not raised raw.
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries a cloudpickle dump of a non-Exception value
             (a bare string)
         When:
             ``dispatch(task)`` is awaited and the result iterator is
             consumed
         Then:
-            It should raise :class:`UnexpectedResponse` (not
-            :class:`RpcError`) whose details name the malformed
-            payload type. :class:`UnexpectedResponse` is not a
-            :class:`RpcError` subclass, so the load-balancer
+            It should raise `UnexpectedResponse` (not
+            `RpcError`) whose details name the malformed
+            payload type. `UnexpectedResponse` is not a
+            `RpcError` subclass, so the load-balancer
             classification treats it as a caller-fault and does
             not evict the worker.
         """
@@ -4593,19 +4869,18 @@ class TestWorkerConnection:
     async def test_dispatch_should_preserve_base_exception_payload_on_context(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch preserves a non-Exception BaseException payload
-        on the wrapper's ``__context__``.
+        """Test a non-Exception BaseException payload is preserved.
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries a cloudpickle dump of a non-Exception
-            :class:`BaseException` (a ``KeyboardInterrupt``).
+            `BaseException` (a ``KeyboardInterrupt``).
         When:
             ``dispatch(task)`` is awaited and the result iterator is
             consumed.
         Then:
-            It should raise :class:`UnexpectedResponse` (not
-            :class:`RpcError`) with the original ``KeyboardInterrupt``
+            It should raise `UnexpectedResponse` (not
+            `RpcError`) with the original ``KeyboardInterrupt``
             preserved on ``__context__`` — a process-level signal is not
             smuggled across the wire as a raisable, but it is not lost.
         """
@@ -4641,14 +4916,13 @@ class TestWorkerConnection:
     async def test_dispatch_should_propagate_cancelled_error_raw_when_worker_cancels(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch propagates a worker-side
-        :class:`asyncio.CancelledError` raw rather than degrading it.
+        """Test a worker-side CancelledError propagates raw, unwrapped.
 
         Mirrors stdlib's ``await task`` semantics where a coroutine
-        that self-raises :class:`asyncio.CancelledError` is
+        that self-raises `asyncio.CancelledError` is
         indistinguishable from one that was externally cancelled —
         both transition the task to ``CANCELLED`` and the caller's
-        ``await`` raises :class:`asyncio.CancelledError`. Wool's
+        ``await`` raises `asyncio.CancelledError`. Wool's
         wire ships ``CancelledError`` on the ``Response.exception``
         frame; the caller must re-raise the same class so user code
         can ``except asyncio.CancelledError`` (and allow the
@@ -4656,16 +4930,16 @@ class TestWorkerConnection:
         asyncio expects).
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries a cloudpickle dump of
-            :class:`asyncio.CancelledError`
+            `asyncio.CancelledError`
         When:
             ``dispatch(task)`` is awaited and the result iterator is
             consumed
         Then:
             The caller's ``await`` should raise
-            :class:`asyncio.CancelledError` raw — not
-            :class:`UnexpectedResponse`, not :class:`RpcError`.
+            `asyncio.CancelledError` raw — not
+            `UnexpectedResponse`, not `RpcError`.
         """
         # Arrange
         cancellation = asyncio.CancelledError("worker self-raised cancel")
@@ -4715,11 +4989,10 @@ class TestWorkerConnection:
     async def test_dispatch_should_not_increment_cancelling_when_worker_cancels(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch does NOT increment ``current_task().cancelling()``
-        on a worker-side CancelledError.
+        """Test dispatch leaves ``cancelling()`` alone on a worker cancel.
 
         Matches stdlib ``await task`` semantics: when the awaitee
-        raises :class:`asyncio.CancelledError`, the awaiter's
+        raises `asyncio.CancelledError`, the awaiter's
         ``cancelling()`` count is **not** bumped. A caller that
         catches ``CancelledError`` and continues to ``await``
         something else (a recovery path) is therefore not
@@ -4729,9 +5002,9 @@ class TestWorkerConnection:
         (F9).
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries a cloudpickle dump of
-            :class:`asyncio.CancelledError`
+            `asyncio.CancelledError`
         When:
             ``dispatch(task)`` is awaited and the result iterator is
             consumed, and the resulting ``CancelledError`` is caught
@@ -4769,6 +5042,7 @@ class TestWorkerConnection:
                 assert current is not None
                 observed["cancelling"] = current.cancelling()
 
+        # Act
         await asyncio.ensure_future(body())
 
         # Assert
@@ -4782,21 +5056,20 @@ class TestWorkerConnection:
     async def test_dispatch_should_leave_task_cancelled_when_worker_cancels(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test re-raising a worker-side CancelledError ends the
-        surrounding task in the CANCELLED state.
+        """Test a re-raised worker CancelledError ends the surrounding task.
 
         Closes the loop with stdlib parity: a task that observes
-        :class:`asyncio.CancelledError` and re-raises (without
+        `asyncio.CancelledError` and re-raises (without
         ``uncancel``) must end as cancelled — same as a
         locally-cancelled task. The ``cancelling()`` bump on the
         caller is what lets asyncio transition the task to
         ``CANCELLED`` on re-raise.
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries a cloudpickle dump of
-            :class:`asyncio.CancelledError`, awaited inside a
-            wrapping :class:`asyncio.Task`
+            `asyncio.CancelledError`, awaited inside a
+            wrapping `asyncio.Task`
         When:
             The wrapping task observes ``CancelledError`` and
             re-raises without calling ``uncancel()``
@@ -4836,11 +5109,10 @@ class TestWorkerConnection:
     async def test_dispatch_should_propagate_raw_when_result_payload_malformed(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch lets a malformed ``Response.result`` payload
-        deserialization error propagate with its original type.
+        """Test a malformed result payload surfaces its deserialization error.
 
         Given:
-            A :class:`protocol.Response` whose ``result`` field
+            A `protocol.Response` whose ``result`` field
             carries bytes that cannot be deserialized
             (b"not a valid pickle stream").
         When:
@@ -4848,10 +5120,10 @@ class TestWorkerConnection:
             consumed.
         Then:
             It should raise the underlying serializer error
-            (:class:`pickle.UnpicklingError` for cloudpickle's
+            (`pickle.UnpicklingError` for cloudpickle's
             default deserializer) raw — no wrapper class, no
             indirection. The original exception type carries the
-            diagnostic detail. Since it isn't an :class:`RpcError`
+            diagnostic detail. Since it isn't an `RpcError`
             subclass the load-balancer classification treats it as
             a caller-fault and does not evict the worker.
         """
@@ -4887,12 +5159,10 @@ class TestWorkerConnection:
     async def test_dispatch_should_propagate_raw_when_exception_payload_malformed(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
-        """Test dispatch lets a malformed ``Response.exception``
-        payload deserialization error propagate with its original
-        type.
+        """Test a malformed exception payload surfaces its own error.
 
         Given:
-            A :class:`protocol.Response` whose ``exception`` field
+            A `protocol.Response` whose ``exception`` field
             carries bytes that cannot be deserialized
             (b"not a valid pickle stream").
         When:
@@ -4900,10 +5170,10 @@ class TestWorkerConnection:
             consumed.
         Then:
             It should raise the underlying serializer error
-            (:class:`pickle.UnpicklingError` for cloudpickle's
+            (`pickle.UnpicklingError` for cloudpickle's
             default deserializer) raw — no wrapper class, no
             indirection. The original exception type carries the
-            diagnostic detail. Since it isn't an :class:`RpcError`
+            diagnostic detail. Since it isn't an `RpcError`
             subclass the load-balancer classification treats it as
             a caller-fault and does not evict the worker.
         """
@@ -4940,15 +5210,14 @@ class TestWorkerConnection:
 async def test_clear_channel_pool_should_close_cached_channels(
     mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
 ):
-    """Test :func:`clear_channel_pool` closes every cached gRPC
-    channel in the module-wide pool.
+    """Test `clear_channel_pool` closes every cached gRPC channel.
 
     Given:
         A populated module-wide channel pool — a successful
-        dispatch through a :class:`WorkerConnection` has primed the
+        dispatch through a `WorkerConnection` has primed the
         cache for a particular key.
     When:
-        :func:`clear_channel_pool` is awaited.
+        `clear_channel_pool` is awaited.
     Then:
         It should invoke the cached channel's ``close()`` method
         so the cached entry is torn down and subsequent dispatches
@@ -4982,17 +5251,67 @@ async def test_clear_channel_pool_should_close_cached_channels(
     mock_channel.close.assert_called_once()
 
 
+def test_dispatch_should_open_fresh_channel_when_run_on_a_later_loop(
+    mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+):
+    """Test the channel pool hands a later loop a channel of its own.
+
+    Given:
+        A dispatch on one event loop has primed the module-level channel
+        pool, and that loop has since closed with the channel idle in
+        the pool.
+    When:
+        A dispatch to the same target runs on a fresh event loop.
+    Then:
+        It should open a new channel rather than reuse the one the closed
+        loop left -- that entry is dropped, and its ``close`` is never
+        awaited, since a grpc.aio channel cannot be closed from another
+        loop -- leaving the pool with exactly one cached entry.
+    """
+    # Arrange
+    channel_a, channel_b = mocker.AsyncMock(), mocker.AsyncMock()
+    insecure_channel = mocker.patch.object(
+        grpc.aio, "insecure_channel", side_effect=[channel_a, channel_b]
+    )
+    mock_stub = mocker.MagicMock()
+    mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+    async def dispatch_once():
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        mock_stub.dispatch = mocker.MagicMock(
+            return_value=mock_grpc_call(async_stream(responses))
+        )
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+    # Act
+    asyncio.run(dispatch_once())
+    entries_after_first = channel_pool_stats().total_entries
+    asyncio.run(dispatch_once())
+
+    # Assert
+    assert entries_after_first == 1
+    assert insecure_channel.call_count == 2
+    channel_a.close.assert_not_awaited()
+    assert channel_pool_stats().total_entries == 1
+
+
 @pytest.mark.asyncio
 async def test_clear_channel_pool_should_not_raise_when_pool_empty():
-    """Test :func:`clear_channel_pool` is a no-op when the pool is
-    empty.
+    """Test `clear_channel_pool` is a no-op when the pool is empty.
 
     Given:
         A module-wide channel pool with no cached entries (the
         autouse ``_clear_channel_pool`` fixture clears the pool
         between tests, so this test starts from an empty pool).
     When:
-        :func:`clear_channel_pool` is awaited.
+        `clear_channel_pool` is awaited.
     Then:
         It should return without raising — clearing an empty pool
         is a legitimate operation and must not surface a
