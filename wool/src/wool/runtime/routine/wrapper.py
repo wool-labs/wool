@@ -347,4 +347,11 @@ async def _execute(fn, *args, **kwargs):
 
 
 async def _stream_to_coroutine(stream):
-    return await anext(stream, None)
+    # A coroutine routine yields one result frame. Close the stream once it
+    # is taken so the dispatch releases its pooled channel before the call
+    # returns, rather than whenever garbage collection finalizes the
+    # generator.
+    try:
+        return await anext(stream, None)
+    finally:
+        await stream.aclose()

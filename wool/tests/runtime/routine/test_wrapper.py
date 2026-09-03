@@ -383,6 +383,42 @@ async def test_routine_with_various_function_types(
             assert result == expected
 
 
+@pytest.mark.asyncio
+async def test_routine_should_close_dispatch_stream_when_coroutine_result_taken(
+    mocker: MockerFixture, mock_proxy_context
+):
+    """Test a coroutine routine closes its dispatch stream once the result is taken.
+
+    Given:
+        A proxy in context whose dispatch returns a result stream that
+        records when it is closed.
+    When:
+        A coroutine routine is awaited under dispatch.
+    Then:
+        It should return the first result and have closed the stream
+        before returning.
+    """
+    # Arrange
+    closed = False
+
+    async def dispatch_stream():
+        nonlocal closed
+        try:
+            yield 8
+            yield 9  # pragma: no cover — never reached
+        finally:
+            closed = True
+
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=dispatch_stream())
+
+    # Act
+    result = await foo(5, 3)
+
+    # Assert
+    assert result == 8
+    assert closed is True
+
+
 @settings(
     max_examples=20,
     deadline=None,
