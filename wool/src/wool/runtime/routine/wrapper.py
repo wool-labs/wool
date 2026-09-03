@@ -82,6 +82,15 @@ def routine(fn: C) -> C:
       Calling ``aclose()`` or breaking out of iteration properly cancels
       the remote worker task
 
+    **Dispatch cleanup:**
+
+    A completed dispatch releases its transport resources before control
+    returns to the caller — for a coroutine routine when the ``await``
+    returns, for an async generator on exhaustion or ``aclose()``.
+    Release is never deferred to garbage collection, so a routine
+    awaited on a loop that stops immediately afterwards strands nothing
+    on that loop.
+
     Best practices and considerations for designing tasks:
 
     1. **Picklability**: Arguments, return values, and yielded values
@@ -347,4 +356,19 @@ async def _execute(fn, *args, **kwargs):
 
 
 async def _stream_to_coroutine(stream):
-    return await anext(stream, None)
+    """Take a coroutine routine's single result frame and close the stream.
+
+    .. rubric:: Implementation notes
+
+    A coroutine dispatch yields exactly one result frame, leaving the
+    dispatch generator suspended at its yield. Closing it in a
+    ``finally`` — on every exit path, not only when a frame is taken —
+    drives the teardown `WorkerConnection._execute` pins on its exit
+    stack, binding release to this call returning rather than to the
+    event loop's async-generator finalizer, which a loop that stops
+    first never runs.
+    """
+    try:
+        return await anext(stream, None)
+    finally:
+        await stream.aclose()
