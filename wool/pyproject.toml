@@ -101,6 +101,7 @@ pythonpath = ["."]
 # legitimate test (the Hypothesis dispatch exploration, ~2-3 minutes).
 faulthandler_timeout = 300
 markers = [
+    "cicd: release tooling exercised through real git and bash subprocesses",
     "integration: end-to-end integration tests against real WorkerPool",
     "stdlib_parity: stdlib contextvars propagation parity pins",
 ]
