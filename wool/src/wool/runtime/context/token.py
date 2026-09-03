@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextvars
 import threading
 import weakref
+from collections import deque
 from collections.abc import Generator
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -67,13 +68,21 @@ _token_sink: Final[contextvars.ContextVar[list["Token"] | None]] = (
 
 #: Count of live `Token` instances per ID, consulted by
 #: `~wool.runtime.context.chain.Chain`'s ledger reap to bound ``spent_tokens``
-#: to token lifespan (see `_register_token` and `dead_token_ids`).
+#: to token lifespan.
 _token_counts: Final[dict[str, int]] = {}
 
-#: Serialises the read-modify-write on `_token_counts` so a register on one
-#: thread and a `weakref.finalize` release on another (finalizers fire during
-#: GC on whatever thread drops the token) cannot lose an increment — a lost
+#: IDs of collected `Token` instances whose decrement of `_token_counts` is
+#: still pending, applied by `_drain_released`. A `collections.deque` is the
+#: queue because the release path must stay off `_token_lock` (see
+#: `_release_token`).
+_released_token_ids: Final[deque[str]] = deque()
+
+#: Serialises the drain and read-modify-write on `_token_counts` so a register
+#: on one thread and a drain on another cannot lose an increment — a lost
 #: increment could zero a count early and reap an ID whose token is still live.
+#: Nothing run under it may mint or release a token: it is not re-entrant, so a
+#: second acquisition on the holding thread blocks that thread forever (see
+#: `_release_token`).
 _token_lock: Final[threading.Lock] = threading.Lock()
 
 
@@ -97,23 +106,72 @@ def _register_token(token: Token) -> None:
     """Record *token* as a live instance of its ID for ledger reaping.
 
     Increments the ID's live-instance count and attaches a `weakref.finalize`
-    that decrements it when this instance is collected. Counts each instance
-    rather than a single canonical one, so coexisting copies of one ID (a
-    returned clone alongside its origin, or a token both held and re-decoded)
-    keep the ID live until the last is collected.
+    that releases the ID when this instance is collected (see
+    `_release_token`). Counts each instance rather than a single canonical one,
+    so coexisting copies of one ID (a returned clone alongside its origin, or a
+    token both held and re-decoded) keep the ID live until the last is
+    collected.
+
+    .. rubric:: Implementation notes
+
+    The drain is here to bound `_released_token_ids` in a process that mints
+    and drops tokens without ever reaching a reap. Its position within the
+    block carries no correctness weight: each queued release matches exactly
+    one earlier increment, so draining before or after this one settles the
+    count alike. That makes the bound the drain's only effect here, and a
+    memory property no test can observe without reading the queue itself, so
+    it rests on this note rather than on a pin.
     """
     with _token_lock:
+        _drain_released()
         _token_counts[token._id] = _token_counts.get(token._id, 0) + 1
     weakref.finalize(token, _release_token, token._id)
 
 
 def _release_token(token_id: str) -> None:
-    """Decrement *token_id*'s live-instance count, dropping the key at zero.
+    """Queue *token_id* for a decrement of its live-instance count.
 
-    The `weakref.finalize` callback `_register_token` attaches to each instance;
-    it fires during garbage collection when that instance is reclaimed.
+    The `weakref.finalize` callback attached to each minted instance; it fires
+    when that instance is reclaimed, on whichever thread drops the last
+    reference.
+
+    .. rubric:: Implementation notes
+
+    Takes no lock, and that is the point. A finalizer runs wherever the
+    collector or a refcount drop happens to be, including inside
+    `_token_lock`'s own critical section on the thread already holding it,
+    where acquiring a `threading.Lock` a second time blocks that thread on
+    itself forever. Queuing the ID instead keeps the release path off the lock
+    entirely: a `collections.deque` append is a single atomic C-level
+    operation, so it cannot corrupt a concurrent drain, and it allocates
+    nothing the collector tracks, so it cannot start a collection of its own.
+
+    Deferral is safe in one direction only, and that is the direction the reap
+    needs: between drains a count can only be too high, so an ID is retained
+    one mount longer, never reaped early.
+
+    Survives as a named function rather than collapsing into a bound
+    ``append`` because it is the one home for the constraint above, and
+    because a named callback keeps the finalizer legible in a development-mode
+    traceback.
     """
-    with _token_lock:
+    _released_token_ids.append(token_id)
+
+
+def _drain_released() -> None:
+    """Apply the queued releases to `_token_counts`, dropping keys at zero.
+
+    Requires `_token_lock` held.
+
+    .. rubric:: Implementation notes
+
+    Only a lock holder pops, so nothing can empty the queue between the
+    emptiness test and the `collections.deque.popleft`. A finalizer firing
+    mid-drain only ever appends, so its release can be neither corrupted nor
+    lost: it is picked up by this drain or the next.
+    """
+    while _released_token_ids:
+        token_id = _released_token_ids.popleft()
         remaining = _token_counts.get(token_id, 0) - 1
         if remaining > 0:
             _token_counts[token_id] = remaining
@@ -128,13 +186,21 @@ def dead_token_ids(ids: Iterable[str]) -> frozenset[str]:
     from `_token_counts` has no surviving instance, so nothing local can reset
     or forward it and its consumed-token entry can be dropped. Keeps the
     registry encapsulated here: callers pass the spent IDs and get back the
-    dead ones.
+    dead ones. Reaping may lag by one mount: an instance collected concurrently
+    with this call is accounted for on the next query, never reported dead
+    while one lives.
 
     .. rubric:: Implementation notes
 
-    The membership read needs no lock: a transient miscount can only retain an
-    ID one mount longer, never reap one early.
+    Applies the queued releases first, so a release that landed before this
+    call is accounted for here rather than a mount later. The membership read
+    itself needs no lock, and is kept outside it: *ids* is caller-supplied, and
+    driving an arbitrary iterable under a lock no finalizer may take would put
+    back the hazard this queue exists to remove. A transient miscount is
+    harmless in the only direction it can go (see `_release_token`).
     """
+    with _token_lock:
+        _drain_released()
     return frozenset(id for id in ids if id not in _token_counts)
 
 
@@ -333,8 +399,7 @@ class Token(Generic[T]):
         dispatch reconstitution (`_reconstitute`) — building the token from its
         wire and anchor state directly rather than through the refusing
         ``__init__``. Every minted instance is counted for ledger reaping via
-        `_register_token`, so a consumed ID is reclaimed once no instance of it
-        remains live in this process.
+        `_register_token`, which owns the retention semantics that follow.
         """
         token: Token[T] = object.__new__(cls)
         token._var = var
@@ -370,9 +435,9 @@ def _reconstitute(
     method that fails cloudpickle's identity check, forcing a by-value pickle
     that would capture this module's `~wool.runtime.context.registry.lock`.
 
-    `Token._mint` counts this instance in `_token_counts`, so while the
-    reconstituted token lives its ID's consumed-token entry is retained for
-    reaping (see `dead_token_ids`) and reclaimed once it is collected.
+    `Token._mint` counts this instance for ledger reaping, so this token's
+    ID is retained while it lives; see `_register_token` for the retention
+    semantics.
     """
     token = Token._mint(
         var=var,
