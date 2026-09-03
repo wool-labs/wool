@@ -395,27 +395,29 @@ async def test_routine_should_close_dispatch_stream_when_coroutine_result_taken(
     When:
         A coroutine routine is awaited under dispatch.
     Then:
-        It should return the first result and have closed the stream
-        before returning.
+        It should have closed the stream before returning the result.
     """
     # Arrange
     closed = False
 
-    async def dispatch_stream():
+    async def mock_dispatch_stream():
         nonlocal closed
         try:
-            yield 8
-            yield 9  # pragma: no cover — never reached
+            yield 42
+            yield 43  # pragma: no cover — never reached
         finally:
             closed = True
 
-    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=dispatch_stream())
+    # Construct the stream eagerly so the mock holds a reference to it.
+    # Built lazily, it could be finalized by the event loop's
+    # async-generator hook, masking a missing aclose().
+    mock_proxy_context.dispatch = mocker.AsyncMock(return_value=mock_dispatch_stream())
 
     # Act
     result = await foo(5, 3)
 
     # Assert
-    assert result == 8
+    assert result == 42
     assert closed is True
 
 
