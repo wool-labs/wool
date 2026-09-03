@@ -759,7 +759,8 @@ def _serialize_metadata(
     :param info:
         WorkerMetadata instance to serialize.
     :returns:
-        Flat dict with pid, version, tags (JSON), extra (JSON), secure.
+        Flat dict of `WorkerMetadata`'s advertisable fields, each
+        rendered as a string or ``None`` when empty.
     """
     properties = {
         "pid": str(info.pid),
@@ -767,6 +768,7 @@ def _serialize_metadata(
         "tags": (json.dumps(list(info.tags)) if info.tags else None),
         "extra": (json.dumps(dict(info.extra)) if info.extra else None),
         "secure": "true" if info.secure else "false",
+        "identity": info.identity,
     }
     return properties
 
@@ -811,6 +813,10 @@ def _deserialize_metadata(info: ServiceInfo) -> WorkerMetadata:
     if "secure" in properties and properties["secure"]:
         secure = properties["secure"].lower() == "true"
 
+    # Likewise absent on records predating advertised identity, where a
+    # worker declaring none is indistinguishable from one that cannot.
+    identity = properties.get("identity")
+
     service_name = info.name
     uid_str = service_name.split(".")[0]
 
@@ -823,4 +829,5 @@ def _deserialize_metadata(info: ServiceInfo) -> WorkerMetadata:
         tags=tags,
         extra=MappingProxyType(extra),
         secure=secure,
+        identity=identity,
     )

@@ -2,7 +2,9 @@ import pytest
 
 from wool import AdvertiseHostError
 from wool import IdleUnavailable
+from wool import IneffectiveIdentityWarning
 from wool import IneffectiveLeaseWarning
+from wool import IneffectivePeersWarning
 from wool import IneffectiveQuorumTimeoutWarning
 from wool import LoopbackAdvertisementWarning
 from wool import SerializationWarning
@@ -47,7 +49,9 @@ class TestWoolWarning:
     @pytest.mark.parametrize(
         "category",
         [
+            IneffectiveIdentityWarning,
             IneffectiveLeaseWarning,
+            IneffectivePeersWarning,
             IneffectiveQuorumTimeoutWarning,
             LoopbackAdvertisementWarning,
             SerializationWarning,

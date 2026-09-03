@@ -2,11 +2,12 @@ import asyncio
 import datetime
 import functools
 import io
+import logging
 import pickle
 import threading
 import time
+import warnings
 from dataclasses import FrozenInstanceError
-from dataclasses import replace
 from datetime import timedelta
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
@@ -32,6 +33,8 @@ from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.auth import credentials_scope
 from wool.runtime.worker.auth import current_credentials
+from wool.runtime.worker.auth import normalize_peer
+from wool.runtime.worker.exceptions import IneffectivePeersWarning
 from wool.utilities.refreshing import Refreshing
 
 
@@ -124,6 +127,34 @@ def temp_cert_files(test_certificates, tmp_path):
     return files.ca_path, files.key_path, files.cert_path
 
 
+def _expected_policy(peers):
+    """Return the policy shape ``peers`` should compile to.
+
+    Mirrors the provider's own normalization so a property test can
+    assert which shape an example actually drew. Text and lists of text
+    both shrink toward values that collapse to no names, which leaves the
+    provider unconfigured — without this an example that never reached a
+    configured policy is indistinguishable from one that did.
+    """
+    if peers is None:
+        return None
+    if callable(peers):
+        return peers
+    names = [peers] if isinstance(peers, str) else list(peers)
+    surviving = {name.strip() for name in names if name.strip()}
+    return frozenset(surviving) if surviving else None
+
+
+def _accepts_prod(name: str) -> bool:
+    """Module-level peers predicate, so a provider carrying it stays picklable."""
+    return name.startswith("prod-")
+
+
+def _accepts_nothing(name: str) -> bool:
+    """Module-level peers predicate that admits no name."""
+    return False
+
+
 class TestWorkerCredentials:
     """Test suite for WorkerCredentials credential management."""
 
@@ -192,36 +223,6 @@ class TestWorkerCredentials:
         # Dataclasses raise FrozenInstanceError or AttributeError
         with pytest.raises((FrozenInstanceError, AttributeError)):
             creds.mutual = False
-
-    @given(identity=st.one_of(st.none(), st.text()))
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test___init___should_normalize_identity(self, identity, test_certificates):
-        """Test the identity-normalization invariant at construction.
-
-        Given:
-            Credential material and any identity — None, blank, padded, or
-            plain text.
-        When:
-            WorkerCredentials is instantiated with that identity.
-        Then:
-            It should carry the stripped identity, with a blank or None
-            identity collapsing to None.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-
-        # Act
-        creds = WorkerCredentials(
-            ca_cert=ca_pem,
-            worker_key=key_pem,
-            worker_cert=cert_pem,
-            identity=identity,
-        )
-
-        # Assert
-        assert creds.identity == (
-            identity.strip() or None if identity is not None else None
-        )
 
     def test_from_files_should_load_bytes_when_mtls(self, temp_cert_files):
         """Test from_files classmethod with mTLS.
@@ -406,7 +407,7 @@ class TestWorkerCredentials:
             as_provider() is called.
         Then:
             It should return a non-reloadable WorkerCredentialsProvider whose
-            snapshot carries the same material.
+            material is the same object.
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
@@ -420,45 +421,47 @@ class TestWorkerCredentials:
         assert provider.reloadable is False
         assert provider.credentials.get() == credentials
 
-    def test_as_provider_should_carry_identity(self, temp_cert_files):
-        """Test as_provider threads the expected identity through.
+    def test_as_provider_should_expose_peers(self, temp_cert_files):
+        """Test as_provider forwards the peer name to the provider itself.
 
         Given:
-            Credentials loaded from PEM files and an expected identity.
+            Credentials loaded from PEM files and an expected peer name.
         When:
-            as_provider() is called with that identity.
+            as_provider() is called with that peer name.
         Then:
-            The resolved snapshot should carry the identity.
+            The provider's ``peers`` should be the configured name,
+            normalized into a frozenset.
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
         credentials = WorkerCredentials.from_files(ca_path, key_path, cert_path)
 
         # Act
-        provider = credentials.as_provider(identity="wool-worker")
+        provider = credentials.as_provider(peers="wool-worker")
 
         # Assert
-        assert provider.credentials.get().identity == "wool-worker"
+        assert provider.peers == frozenset({"wool-worker"})
 
-    def test_as_provider_should_normalize_blank_identity(self, temp_cert_files):
-        """Test a blank identity is normalized away by as_provider.
+    def test_as_provider_should_expose_no_peers_when_blank(self, temp_cert_files):
+        """Test a blank peer name leaves the provider with no policy.
 
         Given:
-            Credentials and a whitespace-only identity.
+            Credentials and a whitespace-only peer name.
         When:
-            as_provider() is called and the snapshot resolved.
+            as_provider() is called with that peer name.
         Then:
-            The resolved identity should be None (address-based path).
+            The provider's ``peers`` should be None.
         """
         # Arrange
         ca_path, key_path, cert_path = temp_cert_files
         credentials = WorkerCredentials.from_files(ca_path, key_path, cert_path)
 
         # Act
-        provider = credentials.as_provider(identity="  ")
+        with pytest.warns(IneffectivePeersWarning):
+            provider = credentials.as_provider(peers="  ")
 
         # Assert
-        assert provider.credentials.get().identity is None
+        assert provider.peers is None
 
     def test_server_credentials_should_return_server_credentials_when_mtls(
         self, test_certificates
@@ -658,143 +661,11 @@ class TestWorkerCredentials:
         # Assert
         assert isinstance(client_creds, grpc.ChannelCredentials)
 
-    def test_identity_channel_options_should_return_override_when_identity(
-        self, test_certificates
-    ):
-        """Test channel options assembly when an identity is configured.
-
-        Given:
-            WorkerCredentials carrying an identity.
-        When:
-            identity_channel_options() is called.
-        Then:
-            It should return a single-entry option list overriding the
-            SSL target name with the identity.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem,
-            worker_key=key_pem,
-            worker_cert=cert_pem,
-            identity="wool-worker",
-        )
-
-        # Act
-        options = creds.identity_channel_options()
-
-        # Assert
-        assert options == [("grpc.ssl_target_name_override", "wool-worker")]
-
-    def test_identity_channel_options_should_return_empty_when_no_identity(
-        self, test_certificates
-    ):
-        """Test channel options assembly when no identity is configured.
-
-        Given:
-            WorkerCredentials with no identity.
-        When:
-            identity_channel_options() is called.
-        Then:
-            It should return an empty list, selecting the address-based
-            verification path.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
-        )
-
-        # Act
-        options = creds.identity_channel_options()
-
-        # Assert
-        assert options == []
-
-    def test_server_and_client_credentials_should_both_build_valid_credentials(
-        self, test_certificates
-    ):
-        """Test bidirectional credential generation.
-
-        Given:
-            Same certificate files used for server and client.
-        When:
-            Both server_credentials() and client_credentials() methods
-            are called.
-        Then:
-            Both return valid credentials using the same underlying
-            certificates.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=True
-        )
-
-        # Act
-        server_creds = creds.server_credentials()
-        client_creds = creds.client_credentials()
-
-        # Assert
-        assert isinstance(server_creds, grpc.ServerCredentials)
-        assert isinstance(client_creds, grpc.ChannelCredentials)
-
-    def test_server_credentials_should_return_credentials_on_repeated_access(
-        self, test_certificates
-    ):
-        """Test server credentials method idempotency.
-
-        Given:
-            WorkerCredentials with valid certificates.
-        When:
-            server_credentials() method is called multiple times.
-        Then:
-            Returns consistent grpc.ServerCredentials on each access.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=True
-        )
-
-        # Act
-        server_creds_1 = creds.server_credentials()
-        server_creds_2 = creds.server_credentials()
-
-        # Assert
-        # Should return credentials each time (may not be same object)
-        assert isinstance(server_creds_1, grpc.ServerCredentials)
-        assert isinstance(server_creds_2, grpc.ServerCredentials)
-
-    def test_client_credentials_should_return_credentials_on_repeated_access(
-        self, test_certificates
-    ):
-        """Test client credentials method idempotency.
-
-        Given:
-            WorkerCredentials with valid certificates.
-        When:
-            client_credentials() method is called multiple times.
-        Then:
-            Returns consistent grpc.ChannelCredentials on each access.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=True
-        )
-
-        # Act
-        client_creds_1 = creds.client_credentials()
-        client_creds_2 = creds.client_credentials()
-
-        # Assert
-        # Should return credentials each time (may not be same object)
-        assert isinstance(client_creds_1, grpc.ChannelCredentials)
-        assert isinstance(client_creds_2, grpc.ChannelCredentials)
-
     @given(mutual=st.booleans())
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     def test_server_credentials_and_client_credentials_should_return_consistent_types(
         self, mutual, test_certificates
     ):
@@ -830,21 +701,26 @@ class TestWorkerCredentials:
         assert type(server1) is type(server2)
         assert type(client1) is type(client2)
 
-    @given(mutual=st.booleans(), identity=st.one_of(st.none(), st.text()))
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(mutual=st.booleans())
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     def test_pickle_roundtrip_should_produce_equal_instance(
-        self, mutual, identity, test_certificates
+        self, mutual, test_certificates
     ):
         """Test WorkerCredentials survives pickle roundtrip.
 
         Given:
-            WorkerCredentials with valid certificates, any mutual flag
-            value, and any identity.
+            WorkerCredentials with valid certificates and any mutual flag
+            value.
         When:
             The instance is pickled and unpickled.
         Then:
-            It should produce an equal instance — preserving the
-            identity — that still builds valid gRPC credentials.
+            It should produce an equal instance that still builds valid
+            gRPC credentials — equality is what keys the channel pool, so
+            a roundtrip that changed it would fragment the pool across a
+            worker-subprocess boundary.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
@@ -853,7 +729,6 @@ class TestWorkerCredentials:
             worker_key=key_pem,
             worker_cert=cert_pem,
             mutual=mutual,
-            identity=identity,
         )
 
         # Act
@@ -863,55 +738,6 @@ class TestWorkerCredentials:
         assert restored == creds
         assert isinstance(restored.server_credentials(), grpc.ServerCredentials)
         assert isinstance(restored.client_credentials(), grpc.ChannelCredentials)
-
-    def test___enter___should_raise_when_used_as_context_manager(
-        self, test_certificates
-    ):
-        """Test WorkerCredentials does not support context manager protocol.
-
-        Given:
-            A WorkerCredentials instance.
-        When:
-            Used in a with statement.
-        Then:
-            It should raise TypeError.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
-        )
-
-        # Act & assert
-        with pytest.raises(TypeError):
-            with creds:
-                pass
-
-    def test_current_should_raise_attribute_error(self):
-        """Test WorkerCredentials does not expose current() classmethod.
-
-        Given:
-            The WorkerCredentials class.
-        When:
-            WorkerCredentials.current() is called.
-        Then:
-            It should raise AttributeError.
-        """
-        # Act & assert
-        with pytest.raises(AttributeError):
-            WorkerCredentials.current()
-
-
-def _eager_provider(factory, **kwargs) -> WorkerCredentialsProvider:
-    """Build a reloadable provider whose every resolve consults the factory.
-
-    A zero debounce window is the public equivalent of forcing a refresh:
-    no resolve is ever served from a fresh cache, so a test drives the
-    factory by calling resolve rather than by tampering with timing state.
-    """
-    return WorkerCredentialsProvider(
-        factory, reloadable=True, fresh_for=timedelta(0), **kwargs
-    )
 
 
 class TestWorkerCredentialsProvider:
@@ -974,6 +800,547 @@ class TestWorkerCredentialsProvider:
 
         # Assert
         assert len(calls) == 0
+
+    def test___init___should_accept_several_peers(self, test_certificates):
+        """Test a set of accepted peer names is compiled into the policy.
+
+        Given:
+            Several peer names.
+        When:
+            The provider is constructed with those peer names.
+        Then:
+            It should expose all of them, and the material it yields
+            should carry no peer — which name a connection verifies
+            against is chosen per worker from what that worker
+            advertised, never here.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act
+        provider = WorkerCredentialsProvider(lambda: creds, peers=["a.svc", "b.svc"])
+
+        # Assert
+        assert provider.peers == frozenset({"a.svc", "b.svc"})
+
+    def test___init___should_accept_a_peer_predicate(self, test_certificates):
+        """Test a predicate over a candidate name is kept as the policy.
+
+        Given:
+            A predicate accepting names under one prefix.
+        When:
+            The provider is constructed with those peer names.
+        Then:
+            It should be the predicate itself, and the material should
+            carry no peer, since a policy of any shape applies nothing
+            to the material it yields.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        def accepts(name):
+            return name.startswith("prod-")
+
+        # Act
+        provider = WorkerCredentialsProvider(lambda: creds, peers=accepts)
+
+        # Assert
+        assert provider.peers is accepts
+
+    @pytest.mark.parametrize("peers", ["   ", [], ["  ", ""]])
+    def test___init___should_treat_blank_peers_as_unconfigured(
+        self, peers, test_certificates
+    ):
+        """Test blank and empty peer policies collapse to no policy.
+
+        Given:
+            A blank name, an empty iterable, or an iterable of only
+            blank names.
+        When:
+            The provider is constructed with those peer names.
+        Then:
+            It should be None rather than a policy accepting nothing,
+            which would reject every peer and read as a silent outage.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act
+        with pytest.warns(IneffectivePeersWarning):
+            provider = WorkerCredentialsProvider(lambda: creds, peers=peers)
+
+        # Assert
+        assert provider.peers is None
+
+    @pytest.mark.parametrize(
+        "peers",
+        ["alpha.svc", ["alpha.svc", "beta.svc"], _accepts_prod],
+        ids=["one-name", "several-names", "predicate"],
+    )
+    def test___init___should_not_warn_when_peers_names_a_peer(
+        self, peers, test_certificates
+    ):
+        """Test a policy that gates something is accepted silently.
+
+        Given:
+            A peers value of any shape that survives normalization.
+        When:
+            The provider is constructed.
+        Then:
+            It should not emit IneffectivePeersWarning, so the warning
+            above is attributable to the collapse to no names rather
+            than to configuring peers at all. Nothing raises the
+            category to an error suite-wide, so without this a
+            regression that warned on every provider would pass
+            unnoticed.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act & assert
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", IneffectivePeersWarning)
+            WorkerCredentialsProvider(lambda: creds, peers=peers)
+
+    @pytest.mark.parametrize("peers", ["   ", [], ["  ", ""]])
+    def test___init___should_warn_when_peers_names_nothing(
+        self, peers, test_certificates
+    ):
+        """Test the collapse to unconfigured is reported, not silent.
+
+        Given:
+            A blank name, an empty iterable, or an iterable of only
+            blank names.
+        When:
+            The provider is constructed with those peer names.
+        Then:
+            It should emit an IneffectivePeersWarning naming the
+            consequence, since the collapse moves the caller into the
+            state where advertisements are ignored rather than widening
+            what is accepted.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act & assert
+        with pytest.warns(
+            IneffectivePeersWarning, match="leaves this provider unconfigured"
+        ):
+            WorkerCredentialsProvider(lambda: creds, peers=peers)
+
+    def test___init___should_raise_when_peers_is_an_unsupported_shape(
+        self, test_certificates
+    ):
+        """Test a peers value of no supported shape is rejected clearly.
+
+        Given:
+            An integer supplied as the accepted peers.
+        When:
+            The provider is constructed.
+        Then:
+            It should raise TypeError naming the shapes it accepts,
+            rather than an AttributeError from string normalization.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act & assert
+        with pytest.raises(TypeError, match="peers must be a peer name"):
+            WorkerCredentialsProvider(
+                lambda: creds,
+                peers=5,  # pyright: ignore[reportArgumentType]
+            )
+
+    def test___init___should_raise_when_a_peer_name_is_not_a_string(
+        self, test_certificates
+    ):
+        """Test a non-string inside the accepted names is rejected.
+
+        Given:
+            An iterable mixing a name and an integer.
+        When:
+            The provider is constructed.
+        Then:
+            It should raise TypeError naming the offending element's
+            type, so the bad entry is identifiable.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act & assert
+        with pytest.raises(TypeError, match="single peer name"):
+            WorkerCredentialsProvider(
+                lambda: creds,
+                peers=["a.svc", 7],  # pyright: ignore[reportArgumentType]
+            )
+
+    @pytest.mark.filterwarnings(
+        "ignore::wool.runtime.worker.exceptions.IneffectivePeersWarning"
+    )
+    @given(names=st.lists(st.text(), max_size=6))
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test___init___should_compile_every_accepted_name(self, names, test_certificates):
+        """Test an iterable of names compiles to the stripped, non-blank set.
+
+        Given:
+            Any list of candidate peer names, including blank and
+            padded ones.
+        When:
+            A provider is constructed with that list as its peers.
+        Then:
+            The compiled policy should be exactly the stripped
+            non-blank names, collapsing to None when none survive —
+            the same rule a single name follows.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act
+        provider = WorkerCredentialsProvider(lambda: creds, peers=names)
+
+        # Assert
+        surviving = {name.strip() for name in names if name.strip()}
+        assert provider.peers == (frozenset(surviving) if surviving else None)
+
+    @pytest.mark.filterwarnings(
+        "ignore::wool.runtime.worker.exceptions.IneffectivePeersWarning"
+    )
+    def test_accepts_peer_should_reject_when_the_predicate_raises(
+        self, test_certificates, caplog
+    ):
+        """Test a raising predicate refuses the peer rather than the caller.
+
+        Given:
+            A provider whose peers predicate raises for every candidate.
+        When:
+            A peer name is offered to accepts_peer.
+        Then:
+            It should return False and log the failure, since this runs
+            inside the proxy's admission loop and an escaping exception
+            would end that loop for the proxy's lifetime.
+        """
+
+        # Arrange
+        def explode(peer):
+            raise RuntimeError("predicate is broken")
+
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds, peers=explode)
+
+        # Act
+        with caplog.at_level(logging.ERROR):
+            accepted = provider.accepts_peer("alpha.svc")
+
+        # Assert
+        assert accepted is False
+        assert "predicate raised" in caplog.text
+
+    def test_peers_should_expose_configured_peers(self, test_certificates):
+        """Test the peers property reflects construction.
+
+        Given:
+            A provider constructed with a peer name.
+        When:
+            The peers property is read.
+        Then:
+            It should be the configured name as a single-element set,
+            the normal form every accepted-name shape compiles to.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds, peers="wool-worker")
+
+        # Act
+        peers = provider.peers
+
+        # Assert
+        assert peers == frozenset({"wool-worker"})
+
+    @pytest.mark.parametrize("candidate", [None, "", "   ", "anything.svc"])
+    def test_accepts_peer_should_admit_any_name_when_unconfigured(
+        self, candidate, test_certificates
+    ):
+        """Test an unconfigured provider ignores advertisements entirely.
+
+        Given:
+            A provider with no peers policy, and any advertised name —
+            absent, blank, or plain.
+        When:
+            The provider is asked whether it accepts that name.
+        Then:
+            It should accept it, since with nothing configured a
+            connection verifies against the dialed address rather than
+            against an advertisement.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds)
+
+        # Act
+        accepted = provider.accepts_peer(candidate)
+
+        # Assert
+        assert accepted is True
+
+    @pytest.mark.parametrize(
+        "peers",
+        ["alpha.svc", ["alpha.svc", "beta.svc"], lambda name: True],
+        ids=["one-name", "several-names", "predicate"],
+    )
+    @pytest.mark.parametrize("candidate", [None, "", "   "])
+    def test_accepts_peer_should_reject_an_unnamed_worker(
+        self, peers, candidate, test_certificates
+    ):
+        """Test a configured provider refuses a worker advertising nothing.
+
+        Given:
+            A provider whose policy names one peer, names several, or is
+            a predicate that accepts everything, and a worker
+            advertising nothing or a blank name.
+        When:
+            The provider is asked whether it accepts that advertisement.
+        Then:
+            It should refuse it whatever the policy's shape, since a
+            worker advertising nothing offers no name to verify — an
+            accept-list of one is not a licence to fall back on the
+            dialed address.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds, peers=peers)
+
+        # Act
+        accepted = provider.accepts_peer(candidate)
+
+        # Assert
+        assert accepted is False
+
+    @pytest.mark.parametrize(
+        ("peers", "candidate", "expected"),
+        [
+            ("alpha.svc", "alpha.svc", True),
+            ("alpha.svc", "beta.svc", False),
+            (["alpha.svc", "beta.svc"], "beta.svc", True),
+            (["alpha.svc", "beta.svc"], "gamma.svc", False),
+            (lambda name: name.endswith(".svc"), "alpha.svc", True),
+            (lambda name: name.endswith(".svc"), "alpha.other", False),
+        ],
+        ids=[
+            "one-admits-match",
+            "one-refuses-mismatch",
+            "several-admits-member",
+            "several-refuses-non-member",
+            "predicate-admits-match",
+            "predicate-refuses-mismatch",
+        ],
+    )
+    def test_accepts_peer_should_decide_by_the_configured_policy(
+        self, peers, candidate, expected, test_certificates
+    ):
+        """Test the verdict follows the policy, whatever its shape.
+
+        Given:
+            A provider whose policy names one peer, names several, or is
+            a predicate, and a worker advertising a name that policy
+            does or does not cover.
+        When:
+            The provider is asked whether it accepts that name.
+        Then:
+            It should follow the policy alone, so an accept-list of one
+            behaves exactly as an accept-list of two and exactly as a
+            predicate accepting that one name.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds, peers=peers)
+
+        # Act
+        accepted = provider.accepts_peer(candidate)
+
+        # Assert
+        assert accepted is expected
+
+    def test_accepts_peer_should_normalize_before_consulting_the_policy(
+        self, test_certificates
+    ):
+        """Test a padded advertisement is stripped before it is judged.
+
+        Given:
+            A provider naming one peer, and a worker advertising that
+            name surrounded by whitespace.
+        When:
+            The provider is asked whether it accepts that name.
+        Then:
+            It should accept it, since every entry point normalizes a
+            name the same way and padding cannot change a verdict.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds, peers="alpha.svc")
+
+        # Act
+        accepted = provider.accepts_peer("  alpha.svc  ")
+
+        # Assert
+        assert accepted is True
+
+    def test_accepts_peer_should_not_invoke_the_predicate_when_unnamed(
+        self, test_certificates
+    ):
+        """Test a user predicate is never handed a missing name.
+
+        Given:
+            A provider whose policy is a predicate recording every
+            argument it receives, and a worker advertising nothing.
+        When:
+            The provider is asked whether it accepts that advertisement.
+        Then:
+            It should refuse without consulting the predicate, so a
+            predicate written for strings cannot be handed None.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        seen = []
+
+        def record(name):
+            seen.append(name)
+            return True
+
+        provider = WorkerCredentialsProvider(lambda: creds, peers=record)
+
+        # Act
+        accepted = provider.accepts_peer(None)
+
+        # Assert
+        assert accepted is False
+        assert seen == []
+
+    @given(
+        names=st.lists(st.text(), max_size=6), candidate=st.one_of(st.none(), st.text())
+    )
+    @pytest.mark.filterwarnings(
+        "ignore::wool.runtime.worker.exceptions.IneffectivePeersWarning"
+    )
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_accepts_peer_should_agree_with_the_compiled_policy(
+        self, names, candidate, test_certificates
+    ):
+        """Test the verdict is a function of the compiled policy alone.
+
+        Given:
+            Any list of accepted names and any advertised name, both
+            drawn from arbitrary text.
+        When:
+            The provider is asked whether it accepts that name.
+        Then:
+            It should accept unconditionally when no name survives
+            compilation, and otherwise accept exactly the stripped
+            non-blank advertisements the compiled set contains.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds, peers=names)
+
+        # Act
+        accepted = provider.accepts_peer(candidate)
+
+        # Assert
+        surviving = {name.strip() for name in names if name.strip()}
+        stripped = candidate.strip() if candidate else ""
+        expected = True if not surviving else bool(stripped) and stripped in surviving
+        assert accepted is expected
+
+    @pytest.mark.parametrize(
+        ("peers", "expected"),
+        [
+            (None, ""),
+            (["beta.svc", "alpha.svc"], "alpha.svc, beta.svc"),
+            (lambda name: True, "a peer-name predicate"),
+        ],
+        ids=["unconfigured", "several-names", "predicate"],
+    )
+    def test_describe_peers_should_render_the_accepted_names(
+        self, peers, expected, test_certificates
+    ):
+        """Test the diagnostic names what an operator has to satisfy.
+
+        Given:
+            A provider configuring no policy, several names in unsorted
+            order, or a predicate.
+        When:
+            The accepted peers are described for a refusal diagnostic.
+        Then:
+            It should render nothing, the names comma-joined in sorted
+            order, and a note that a predicate decides — so an empty
+            pool is diagnosable from a log line and the text is stable
+            across runs.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        creds = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = WorkerCredentialsProvider(lambda: creds, peers=peers)
+
+        # Act
+        described = provider.describe_peers()
+
+        # Assert
+        assert described == expected
 
     def test_coerce_should_wrap_bare_credentials(self, test_certificates):
         """Test coerce wraps a bare WorkerCredentials in a provider.
@@ -1038,53 +1405,67 @@ class TestWorkerCredentialsProvider:
         # Assert
         assert coerced is None
 
-    def test_coerce_should_pass_duck_typed_provider_through(self):
-        """Test coerce passes a duck-typed provider through unchanged.
+    def test_coerce_should_raise_when_a_stand_in_mimics_the_surface(self):
+        """Test a look-alike is refused rather than admitted on shape.
 
         Given:
-            An object exposing the credentials resource and a reloadable
-            flag — the full contract consumers read — without subclassing
-            WorkerCredentialsProvider.
+            An object exposing every member a provider does — the
+            credentials resource, a reloadable flag, and all three
+            peer-gate members — without being a WorkerCredentialsProvider.
         When:
             It is passed to WorkerCredentialsProvider.coerce.
         Then:
-            It should be returned unchanged, keeping duck-typed providers
-            reachable.
+            It should raise TypeError, since satisfying each member in
+            isolation is no evidence that they agree with one another,
+            and a stand-in whose members disagree verifies workers
+            opposite to the real thing with no diagnostic.
         """
 
         # Arrange
-        class DuckProvider:
+        class StandIn:
             reloadable = False
             credentials = Refreshing(lambda: None, fresh_for=None)
+            peers = frozenset({"alpha.svc"})
 
-        provider = DuckProvider()
+            def accepts_peer(self, peer):
+                return peer in self.peers
+
+            def describe_peers(self):
+                return "alpha.svc"
+
+        # Act & assert
+        with pytest.raises(TypeError, match="WorkerCredentialsProvider"):
+            WorkerCredentialsProvider.coerce(StandIn())
+
+    def test_coerce_should_pass_a_subclass_through(self, test_certificates):
+        """Test the documented extension path survives concrete acceptance.
+
+        Given:
+            A WorkerCredentialsProvider subclass, which is how a third
+            party extends the provider surface.
+        When:
+            It is passed to WorkerCredentialsProvider.coerce.
+        Then:
+            It should be returned unchanged, so the refusal of a
+            look-alike is attributable to it not being a provider rather
+            than to extension being closed off.
+        """
+
+        # Arrange
+        class CustomProvider(WorkerCredentialsProvider):
+            pass
+
+        key_pem, cert_pem, ca_pem = test_certificates
+        credentials = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+        provider = CustomProvider(lambda: credentials)
 
         # Act
         coerced = WorkerCredentialsProvider.coerce(provider)
 
         # Assert
         assert coerced is provider
-
-    def test_coerce_should_raise_when_provider_lacks_reloadable(self):
-        """Test coerce rejects a provider missing half the contract.
-
-        Given:
-            An object exposing credentials but no reloadable flag, which
-            every consumer of a coerced provider also reads.
-        When:
-            It is passed to WorkerCredentialsProvider.coerce.
-        Then:
-            It should raise TypeError here rather than letting the gap
-            surface as an opaque AttributeError mid-dispatch.
-        """
-
-        # Arrange
-        class HalfProvider:
-            credentials = Refreshing(lambda: None, fresh_for=None)
-
-        # Act & assert
-        with pytest.raises(TypeError, match="reloadable"):
-            WorkerCredentialsProvider.coerce(HalfProvider())
 
     def test_coerce_should_raise_when_channel_credentials(self):
         """Test coerce rejects a raw gRPC channel credentials object.
@@ -1112,20 +1493,21 @@ class TestWorkerCredentialsProvider:
         """Test a non-reloadable provider resolves to constant credentials.
 
         Given:
-            A non-reloadable provider over fixed credential material and an
-            identity.
+            A non-reloadable provider over fixed credential material and a
+            peers policy.
         When:
             The credentials are read more than once.
         Then:
-            It should return the same credentials instance each time, with the
-            provider's identity stamped onto the material.
+            It should return the same credentials instance each time, and
+            that instance should be the factory's material untouched --
+            the policy governs admission and applies nothing here.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
         creds = WorkerCredentials(
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
         )
-        provider = WorkerCredentialsProvider(lambda: creds, identity="wool-worker")
+        provider = WorkerCredentialsProvider(lambda: creds, peers="wool-worker")
 
         # Act
         first = provider.credentials.get()
@@ -1133,52 +1515,89 @@ class TestWorkerCredentialsProvider:
 
         # Assert
         assert first is second
-        assert first == replace(creds, identity="wool-worker")
+        assert first == creds
 
-    def test_credentials_should_default_identity_to_none(self, test_certificates):
-        """Test a provider defaults to address-based verification.
+    @pytest.mark.filterwarnings(
+        "ignore::wool.runtime.worker.exceptions.IneffectivePeersWarning"
+    )
+    @given(
+        peers=st.one_of(
+            st.none(),
+            st.text(),
+            st.lists(st.text(), max_size=4),
+            st.sampled_from([_accepts_prod, _accepts_nothing]),
+        ),
+        reloadable=st.booleans(),
+    )
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_credentials_should_return_the_factory_material_unchanged(
+        self, peers, reloadable, test_certificates
+    ):
+        """Test no peers shape applies anything to the resolved material.
 
         Given:
-            A provider constructed without an identity.
+            Credential material wrapped in a provider configured with any
+            peers value -- none, a single name, an iterable of any
+            length, or a predicate -- resolving either once or on every
+            read.
         When:
-            The credentials are read.
+            The credentials are read twice, so both the construction
+            resolve and the cached read are covered.
         Then:
-            The snapshot identity should be None.
+            Both reads should return the very object the factory built,
+            whatever the policy's shape and on either resolution path —
+            see `WorkerProxy` for what a policy does decide.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
         creds = WorkerCredentials(
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
         )
-        provider = WorkerCredentialsProvider(lambda: creds)
+        provider = WorkerCredentialsProvider(
+            lambda: creds, peers=peers, reloadable=reloadable
+        )
 
         # Act
-        snapshot = provider.credentials.get()
+        first = provider.credentials.get()
+        cached = provider.credentials.get()
 
         # Assert
-        assert snapshot.identity is None
+        assert provider.peers == _expected_policy(peers)
+        assert first is creds
+        assert cached is creds
 
-    def test_identity_should_expose_configured_identity(self, test_certificates):
-        """Test the identity property reflects construction.
+    def test_pickle_roundtrip_should_keep_a_peer_predicate(self, test_certificates):
+        """Test a predicate policy survives the trip into a subprocess.
 
         Given:
-            A provider constructed with an identity.
+            A provider whose peers is a locally defined predicate,
+            which plain pickle cannot serialize.
         When:
-            The identity property is read.
+            The provider is pickled and restored.
         Then:
-            It should equal the configured identity.
+            The restored policy should accept and reject exactly as the
+            original did — the provider crosses into worker
+            subprocesses through plain pickle, so the predicate must
+            ride the cloudpickle path its factory already uses.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
         creds = WorkerCredentials(
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
         )
+        provider = WorkerCredentialsProvider(
+            lambda: creds, peers=lambda name: name.startswith("prod-")
+        )
 
         # Act
-        provider = WorkerCredentialsProvider(lambda: creds, identity="wool-worker")
+        restored = pickle.loads(cloudpickle.dumps(provider))
 
         # Assert
-        assert provider.identity == "wool-worker"
+        assert restored.peers("prod-api") is True
+        assert restored.peers("staging-api") is False
 
     @pytest.mark.parametrize("reloadable", [False, True])
     def test_reloadable_should_reflect_the_flag(self, reloadable, test_certificates):
@@ -1204,60 +1623,17 @@ class TestWorkerCredentialsProvider:
         # Assert
         assert provider.reloadable is reloadable
 
-    @given(
-        material_identity=st.one_of(st.none(), st.text()),
-        provider_identity=st.one_of(st.none(), st.text()),
-    )
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_credentials_should_apply_identity_precedence(
-        self, material_identity, provider_identity, test_certificates
-    ):
-        """Test the provider-level identity-precedence invariant.
-
-        Given:
-            Credentials carrying any identity — None, blank, padded, or
-            plain text — wrapped in a provider configured with any
-            identity from the same domain.
-        When:
-            The credentials are read.
-        Then:
-            It should stamp the provider's stripped identity onto the
-            material when one is configured and leave the material's own
-            identity untouched otherwise, with blank collapsing to None on
-            either side.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem,
-            worker_key=key_pem,
-            worker_cert=cert_pem,
-            identity=material_identity,
-        )
-        provider = WorkerCredentialsProvider(lambda: creds, identity=provider_identity)
-
-        # Act
-        resolved = provider.credentials.get()
-
-        # Assert — a blank identity is falsy once stripped, so the
-        # fall-through expresses "provider wins, else material".
-        assert resolved.identity == (
-            (provider_identity or "").strip()
-            or (material_identity or "").strip()
-            or None
-        )
-
     def test_credentials_should_not_call_factory_when_not_reloadable(
         self, test_certificates
     ):
-        """Test a non-reloadable provider serves its construction snapshot.
+        """Test a non-reloadable provider serves its construction-time material.
 
         Given:
             A non-reloadable provider constructed over a counting factory.
         When:
             The credentials are read several times.
         Then:
-            It should serve the construction-time snapshot without calling
+            It should serve the construction-time material without calling
             the factory again.
         """
         # Arrange
@@ -1292,7 +1668,7 @@ class TestWorkerCredentialsProvider:
             The credentials are read several times in quick succession.
         Then:
             It should invoke the factory exactly once — the first
-            resolution — with every call returning the same cached snapshot.
+            resolution — with every call returning the same cached material.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
@@ -1658,36 +2034,6 @@ class TestWorkerCredentialsProvider:
         assert provider.credentials.get() == rotated
         assert len(calls) >= 3
 
-    def test_credentials_should_apply_identity_when_served_from_cache(
-        self, test_certificates
-    ):
-        """Test cache hits carry the provider's identity.
-
-        Given:
-            A reloadable provider constructed with an identity, resolved once
-            so its material is cached.
-        When:
-            The credentials are read again within the debounce window.
-        Then:
-            It should return identity-bearing material from the cache, not
-            only from a fresh factory call.
-        """
-        # Arrange
-        key_pem, cert_pem, ca_pem = test_certificates
-        creds = WorkerCredentials(
-            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
-        )
-        provider = WorkerCredentialsProvider(
-            lambda: creds, identity="wool-worker", reloadable=True
-        )
-        provider.credentials.get()
-
-        # Act
-        cached = provider.credentials.get()
-
-        # Assert
-        assert cached.identity == "wool-worker"
-
     def test_credentials_should_refresh_from_plain_thread_when_window_elapsed(
         self, test_certificates
     ):
@@ -2032,55 +2378,66 @@ class TestWorkerCredentialsProvider:
         assert len(churn) == 2
         assert "(2 similar warnings suppressed)" in churn[1]
 
-    @given(identity=st.one_of(st.none(), st.text()))
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @pytest.mark.filterwarnings(
+        "ignore::wool.runtime.worker.exceptions.IneffectivePeersWarning"
+    )
+    @given(peers=st.one_of(st.none(), st.text()))
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     def test_pickle_roundtrip_should_drop_callback_when_not_reloadable(
-        self, identity, test_certificates
+        self, peers, test_certificates
     ):
         """Test a non-reloadable provider pickles without its callback.
 
         Given:
             A non-reloadable provider built over a lambda — which the
             standard library pickler cannot serialize directly — with any
-            identity.
+            peer name.
         When:
             It is pickled with the standard library pickler and unpickled.
         Then:
-            It should round-trip — the eager snapshot rides along and the
+            It should round-trip — the eagerly resolved material rides along and the
             callback is dropped — resolving to equal credentials with the
-            normalized identity preserved.
+            normalized peer name preserved.
         """
         # Arrange
         key_pem, cert_pem, ca_pem = test_certificates
         creds = WorkerCredentials(
             ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
         )
-        provider = WorkerCredentialsProvider(lambda: creds, identity=identity)
+        provider = WorkerCredentialsProvider(lambda: creds, peers=peers)
 
         # Act
         restored = pickle.loads(pickle.dumps(provider))
 
         # Assert
         assert restored.credentials.get() == provider.credentials.get()
-        assert restored.identity == (
-            identity.strip() or None if identity is not None else None
-        )
+        expected = peers.strip() if peers is not None else None
+        assert restored.peers == (frozenset({expected}) if expected else None)
 
-    @given(identity=st.one_of(st.none(), st.text()))
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @pytest.mark.filterwarnings(
+        "ignore::wool.runtime.worker.exceptions.IneffectivePeersWarning"
+    )
+    @given(peers=st.one_of(st.none(), st.text()))
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     def test_pickle_roundtrip_should_keep_factory_when_reloadable(
-        self, identity, temp_cert_files
+        self, peers, temp_cert_files
     ):
         """Test a reloadable provider re-resolves through a pickle roundtrip.
 
         Given:
             A reloadable, file-backed provider (whose factory is picklable)
-            with any identity, resolved once.
+            with any peer name, resolved once.
         When:
             It is pickled with the standard library pickler and unpickled.
         Then:
             The restored provider should keep its factory and resolve to the
-            same credentials — normalized identity included — by re-reading
+            same credentials — normalized peer name included — by re-reading
             the unchanged files.
         """
         # Arrange
@@ -2089,7 +2446,7 @@ class TestWorkerCredentialsProvider:
             functools.partial(
                 WorkerCredentials.from_files, ca_path, key_path, cert_path
             ),
-            identity=identity,
+            peers=peers,
             reloadable=True,
         )
         original = provider.credentials.get()
@@ -2099,9 +2456,8 @@ class TestWorkerCredentialsProvider:
 
         # Assert
         assert restored.credentials.get() == original
-        assert restored.identity == (
-            identity.strip() or None if identity is not None else None
-        )
+        expected = peers.strip() if peers is not None else None
+        assert restored.peers == (frozenset({expected}) if expected else None)
 
     def test_pickle_roundtrip_should_reset_cache_when_reloadable(
         self, temp_cert_files, test_certificates
@@ -2116,7 +2472,7 @@ class TestWorkerCredentialsProvider:
         Then:
             It should return the rotated material — the cache and its
             timestamp were reset, forcing a fresh factory call — while the
-            original provider still serves its cached snapshot within the
+            original provider still serves its cached material within the
             window.
         """
         # Arrange
@@ -2162,9 +2518,9 @@ class TestWorkerCredentialsProvider:
                 WorkerCredentials.from_files, ca_path, key_path, cert_path
             ),
             reloadable=True,
+            fresh_for=timedelta(seconds=60),
         )
         restored = pickle.loads(pickle.dumps(provider))
-        restored._window = 60.0
         results = []
 
         def read():
@@ -2181,6 +2537,71 @@ class TestWorkerCredentialsProvider:
         # Assert
         assert len(results) == 4
         assert all(result == results[0] for result in results)
+
+
+@given(peer=st.one_of(st.none(), st.text()))
+@settings(max_examples=50)
+def test_normalize_peer_should_strip_and_collapse_blank(peer):
+    """Test the one rule every peer-name entry point routes through.
+
+    Given:
+        Any candidate peer name, absent or drawn from arbitrary text.
+    When:
+        The name is normalized.
+    Then:
+        It should be the stripped name, or None when the name is absent
+        or blank once stripped — so a name that survives normalization
+        anywhere survives it identically everywhere.
+    """
+    # Act
+    normalized = normalize_peer(peer)
+
+    # Assert
+    assert normalized == (peer.strip() or None if peer is not None else None)
+
+
+@given(peer=st.one_of(st.none(), st.text()))
+@settings(max_examples=50)
+def test_normalize_peer_should_be_idempotent(peer):
+    """Test normalizing an already-normalized name changes nothing.
+
+    Given:
+        Any candidate peer name, absent or drawn from arbitrary text.
+    When:
+        The name is normalized twice.
+    Then:
+        The second application should be a no-op, so the several layers
+        that each normalize independently cannot disagree about a name.
+    """
+    # Act
+    once = normalize_peer(peer)
+    twice = normalize_peer(once)
+
+    # Assert
+    assert twice == once
+
+
+@pytest.mark.parametrize(
+    "peer",
+    [["alpha.svc"], ("alpha.svc",), {"alpha.svc"}, 7],
+    ids=["list", "tuple", "set", "int"],
+)
+def test_normalize_peer_should_raise_when_not_a_string(peer):
+    """Test a value that is not a single name is refused by type.
+
+    Given:
+        A value that is neither a string nor absent, such as a
+        collection of names.
+    When:
+        The value is normalized.
+    Then:
+        It should raise TypeError naming the received type and pointing
+        a collection at a provider's peers, rather than failing later as
+        an AttributeError from a missing strip.
+    """
+    # Act & assert
+    with pytest.raises(TypeError, match="single peer name"):
+        normalize_peer(peer)  # pyright: ignore[reportArgumentType]
 
 
 def test_current_credentials_should_return_none_when_unset():

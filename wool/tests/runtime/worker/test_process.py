@@ -692,6 +692,93 @@ class TestWorkerProcess:
         with pytest.raises(ValueError, match="Proxy pool TTL must be positive"):
             WorkerProcess(proxy_pool_ttl=0)
 
+    def test___init___should_raise_when_identity_configured_without_credentials(self):
+        """Test a name with no certificate behind it is refused.
+
+        Given:
+            An identity supplied to a worker process serving plaintext,
+            with no credentials to prove it.
+        When:
+            WorkerProcess is instantiated.
+        Then:
+            It should raise ValueError, since an identity is proven by a
+            name in the worker's certificate and there is none.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="identity requires credentials"):
+            WorkerProcess(identity="api.svc")
+
+    def test___init___should_raise_when_identity_is_a_collection(self):
+        """Test a collection supplied as a worker's identity is refused.
+
+        Given:
+            A list of names supplied as a worker process's identity,
+            which is singular by contract.
+        When:
+            WorkerProcess is instantiated.
+        Then:
+            It should raise TypeError naming the received type, the same
+            way every other peer-name entry point does, rather than
+            failing later as an AttributeError from a missing strip.
+        """
+        # Act & assert
+        with pytest.raises(TypeError, match="single peer name"):
+            WorkerProcess(identity=["api.svc"])  # pyright: ignore[reportArgumentType]
+
+    @given(identity=st.one_of(st.none(), st.text()))
+    @settings(max_examples=50)
+    def test___init___should_normalize_the_identity_before_requiring_credentials(
+        self, identity
+    ):
+        """Test what survives normalization is what needs backing.
+
+        Given:
+            Any declared identity, including blank and padded ones, with
+            no credentials to prove it.
+        When:
+            WorkerProcess is instantiated.
+        Then:
+            It should raise ValueError only when a name survives
+            stripping, so a blank identity is treated as no identity
+            rather than as one with nothing behind it.
+        """
+        # Act & assert
+        if identity is not None and identity.strip():
+            with pytest.raises(ValueError, match="identity requires credentials"):
+                WorkerProcess(identity=identity)
+        else:
+            assert isinstance(WorkerProcess(identity=identity), WorkerProcess)
+
+    def test___init___should_not_disturb_the_process_name_when_identified(
+        self, test_certificates
+    ):
+        """Test a workload identity is kept clear of multiprocessing's own.
+
+        Given:
+            A worker process constructed with a workload identity and
+            credentials backing it.
+        When:
+            The process's multiprocessing name is read.
+        Then:
+            It should be unchanged from an unidentified process, since
+            multiprocessing derives process names from an attribute of
+            its own and binding a workload identity there would corrupt
+            them.
+        """
+        # Arrange
+        key_pem, cert_pem, ca_pem = test_certificates
+        credentials = WorkerCredentials(
+            ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem
+        )
+
+        # Act
+        identified = WorkerProcess(identity="api.svc", credentials=credentials)
+        plain = WorkerProcess()
+
+        # Assert
+        assert identified.name.split("-")[0] == plain.name.split("-")[0]
+        assert "api.svc" not in identified.name
+
     def test_address_returns_none_when_port_is_zero(self):
         """Test address property returns None when port is zero.
 

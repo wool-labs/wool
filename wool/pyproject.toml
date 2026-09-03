@@ -102,8 +102,9 @@ pythonpath = ["."]
 faulthandler_timeout = 300
 markers = [
     "cicd: release tooling exercised through real git and bash subprocesses",
-    "integration: end-to-end integration tests against real WorkerPool",
+    "integration: end-to-end tests driving real subprocesses, sockets, or multicast",
     "stdlib_parity: stdlib contextvars propagation parity pins",
+    "subprocess_probe: unit regressions that spawn an interpreter to contain a hang",
 ]
 
 [tool.ruff]
