@@ -14,6 +14,10 @@ runs:
     - name: Checkout code
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
+        # Full history: the metadata hook derives the package version from
+        # the tag `git describe` reaches at HEAD, which a shallow checkout
+        # cannot answer.
+        fetch-depth: 0
         fetch-tags: true
         persist-credentials: false
         ref: ${{ inputs.version }}

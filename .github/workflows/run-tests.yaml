@@ -26,7 +26,7 @@ jobs:
         id: get-touched-files
         uses: ./.github/actions/get-touched-files
         with:
-          pathspec: 'wool/src/ wool/tests/ wool/pyproject.toml proto/ .github/'
+          pathspec: 'wool/src/ wool/tests/ wool/pyproject.toml proto/ .github/ build-hooks/'
 
   lint:
     name: Lint / pyright
