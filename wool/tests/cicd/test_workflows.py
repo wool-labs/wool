@@ -1,30 +1,93 @@
+"""Pins on the release workflow definitions themselves.
+
+The release scripts are exercised directly elsewhere in this package; what
+is pinned here is the wiring that decides whether they are called at all,
+and called with the history and the arguments they need.
+"""
+
 import os
-import pathlib
 import re
 
 import pytest
 import yaml
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+from tests.cicd.conftest import ACTIONS
+from tests.cicd.conftest import SCRIPTS
+from tests.cicd.conftest import WORKFLOWS
 
-WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+pytestmark = pytest.mark.cicd
 
-ACTIONS = REPO_ROOT / ".github" / "actions"
+#: The scripts that read a version out of the repository's tags. A job that
+#: calls one of these needs the history git walks to find them.
+VERSION_READERS = re.compile(r"\.github/scripts/(latest-version|cut-release)\.sh")
 
-#: Every `.github/scripts/<name>.sh` reference in a workflow or action body.
-SCRIPT_REFERENCE = re.compile(r"\.github/scripts/[\w-]+\.sh")
+#: Definitions are sorted so parametrization order does not follow the
+#: filesystem's.
+DEFINITIONS = sorted(WORKFLOWS.glob("*.yaml")) + sorted(ACTIONS.glob("*/action.yaml"))
+
+#: Every `.github/scripts/<name>.sh` the workflows or the scripts execute.
+#: Scripts nothing invokes are excluded -- their mode bit carries no risk.
+EXECUTED = sorted(
+    {
+        script
+        for source in (*DEFINITIONS, *SCRIPTS.glob("*.sh"))
+        for reference in re.findall(
+            r"(?:\.github/scripts/|BASH_SOURCE\[0\]\}\"\)/)([\w-]+\.sh)",
+            source.read_text(),
+        )
+        if (script := SCRIPTS / reference).exists()
+    }
+)
 
 
-def checkouts(definition: dict) -> list:
-    """Every ``actions/checkout`` step in a workflow or composite action."""
-    jobs = definition.get("jobs", {}).values()
-    steps = definition.get("runs", {}).get("steps", [])
-    for job in jobs:
-        steps = [*steps, *job.get("steps", [])]
-    return [step for step in steps if "actions/checkout" in step.get("uses", "")]
+def _jobs(definition: dict) -> list[dict]:
+    """Return every job of a workflow, or the single job of an action."""
+    if runs := definition.get("runs"):
+        return [runs]
+    return list(definition.get("jobs", {}).values())
 
 
-def test_build_release_should_check_out_the_full_history():
+def _checkouts(job: dict) -> list[dict]:
+    """Return every ``actions/checkout`` step of a job."""
+    return [
+        step
+        for step in job.get("steps", [])
+        if "actions/checkout" in step.get("uses", "")
+    ]
+
+
+def _run(job: dict) -> str:
+    """Return every shell body of a job, concatenated."""
+    return "\n".join(step.get("run", "") for step in job.get("steps", []))
+
+
+@pytest.mark.parametrize("path", DEFINITIONS, ids=lambda path: path.name)
+def test_every_job_that_reads_a_version_should_check_out_the_full_history(path):
+    """Test the history the release version is derived from.
+
+    Given:
+        A workflow or action whose job reads a version from the repository.
+    When:
+        That job's checkout step is read.
+    Then:
+        It should fetch the full history.
+    """
+    # Arrange
+    definition = yaml.safe_load(path.read_text())
+
+    # Act
+    readers = [job for job in _jobs(definition) if VERSION_READERS.search(_run(job))]
+
+    # Assert
+    # A shallow checkout makes the lookup report the zero version and exit
+    # zero, so the release publishes v0.0.1 rather than failing. Only the
+    # checkout the job starts from matters; a later one re-checks out a ref
+    # the version has already been read from.
+    for job in readers:
+        assert _checkouts(job)[0].get("with", {}).get("fetch-depth") == 0, path.name
+
+
+def test_build_release_should_check_out_the_tag_with_its_history():
     """Test the checkout the release build derives its version from.
 
     Given:
@@ -32,42 +95,72 @@ def test_build_release_should_check_out_the_full_history():
     When:
         Its checkout step is read.
     Then:
-        It should fetch the full history and the tags.
+        It should fetch the tags and the history they are reachable through.
     """
     # Arrange
     definition = yaml.safe_load((ACTIONS / "build-release" / "action.yaml").read_text())
 
     # Act
-    step = checkouts(definition)[0]
+    steps = _checkouts(_jobs(definition)[0])
 
     # Assert
-    # Without the full history the metadata hook cannot describe the tag it
-    # was checked out at, and the wheel is labelled 0.0.0 instead.
-    assert step["with"]["fetch-depth"] == 0
-    assert step["with"]["fetch-tags"] is True
+    # The metadata hook resolves any ref it is given, not only a tagged one;
+    # see the checkout step's own comment for what that buys.
+    assert [step["with"]["fetch-depth"] for step in steps] == [0]
+    assert [step["with"]["fetch-tags"] for step in steps] == [True]
 
 
-def test_publish_release_should_check_out_the_full_history_before_bumping():
-    """Test the checkout the published version is derived from.
+@pytest.mark.parametrize(
+    ("workflow", "channel"),
+    [
+        ("publish-release.yaml", '"$VERSION_CHANNEL"'),
+        ("manual-release.yaml", "production"),
+    ],
+)
+def test_each_release_workflow_should_read_its_channel_through_the_lookup(
+    workflow, channel
+):
+    """Test the wiring between the release workflows and the lookup.
+
+    Given:
+        A workflow that publishes a release.
+    When:
+        Its bump step is read.
+    Then:
+        It should read the old version from the channel lookup.
+    """
+    # Arrange
+    definition = yaml.safe_load((WORKFLOWS / workflow).read_text())
+
+    # Act
+    body = _run(definition["jobs"]["bump-version"])
+
+    # Assert
+    assert f".github/scripts/latest-version.sh {channel}" in body
+
+
+def test_publish_release_should_resolve_the_segment_through_the_contract():
+    """Test the wiring between the publish workflow and the branch contract.
 
     Given:
         The publish-release workflow.
     When:
-        The bump-version job's checkout step is read.
+        Its segment step is read.
     Then:
-        It should fetch the full history.
+        It should resolve the segment and channel through version-segment.
     """
     # Arrange
     definition = yaml.safe_load((WORKFLOWS / "publish-release.yaml").read_text())
 
     # Act
-    job = definition["jobs"]["bump-version"]
+    body = _run(definition["jobs"]["bump-version"])
 
     # Assert
-    assert checkouts({"jobs": {"bump-version": job}})[0]["with"]["fetch-depth"] == 0
+    assert ".github/scripts/version-segment.sh" in body
+    assert "$GITHUB_OUTPUT" in body
 
 
-def test_publish_release_should_not_be_triggered_by_this_suite():
+def test_publish_release_should_trigger_only_on_the_package_source():
     """Test the paths a merge publishes a release from.
 
     Given:
@@ -85,34 +178,24 @@ def test_publish_release_should_not_be_triggered_by_this_suite():
     paths = definition[True]["pull_request_target"]["paths"]
 
     # Assert
+    # Widening this filter to the test tree would make every change to this
+    # package publish a release.
     assert paths == ["wool/src/**", "wool/pyproject.toml"]
 
 
-@pytest.mark.parametrize(
-    "definition",
-    [
-        *WORKFLOWS.glob("*.yaml"),
-        *ACTIONS.glob("*/action.yaml"),
-    ],
-    ids=lambda path: path.parent.name + "/" + path.name,
-)
-def test_every_referenced_script_should_be_executable(definition):
-    """Test the release scripts the workflows invoke directly.
+@pytest.mark.parametrize("script", EXECUTED, ids=lambda path: path.name)
+def test_every_release_script_should_be_executable(script):
+    """Test the mode bits of the scripts the release runs.
 
     Given:
-        A workflow or action naming scripts under .github/scripts.
+        A script under .github/scripts.
     When:
-        Each referenced script is resolved.
+        Its mode is read.
     Then:
-        It should exist and be executable.
+        It should be executable.
     """
-    # Act
-    referenced = set(SCRIPT_REFERENCE.findall(definition.read_text()))
-
-    # Assert
-    for reference in referenced:
-        script = REPO_ROOT / reference
-        assert script.exists(), reference
-        # The workflows exec these directly rather than through bash, so a
-        # lost mode bit breaks the release at runtime and nowhere earlier.
-        assert os.access(script, os.X_OK), reference
+    # Act & assert
+    # The workflows and the scripts exec each other directly rather than
+    # through bash, so a lost mode bit breaks the release at runtime and
+    # nowhere earlier.
+    assert os.access(script, os.X_OK)
