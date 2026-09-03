@@ -3,9 +3,12 @@ from hypothesis import HealthCheck
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
+from packaging.version import Version
 
-#: Release cycles in ascending order, production last.
-_CYCLES = [None, "a", "b", "rc"]
+pytestmark = pytest.mark.cicd
+
+#: The pre-release cycles bump-version.sh moves through, and no cycle.
+_CYCLES = (None, "a", "b", "rc")
 
 
 @pytest.mark.parametrize(
@@ -13,6 +16,7 @@ _CYCLES = [None, "a", "b", "rc"]
     [
         ("patch", "v0.14.0", "v0.14.1"),
         ("patch", "v0.15.0-rc2", "v0.15.0-rc3"),
+        ("patch", "v0.15.0-rc9", "v0.15.0-rc10"),
         ("patch", "v0.0.0", "v0.0.1"),
         ("minor", "v0.14.0", "v0.15.0"),
         ("minor", "v0.15.0-rc2", "v0.15.0"),
@@ -96,9 +100,10 @@ def test_bump_version_should_exit_nonzero_when_the_version_is_malformed(script, 
     minor=st.integers(min_value=0, max_value=99),
     patch=st.integers(min_value=0, max_value=99),
     cycle=st.sampled_from(_CYCLES),
+    number=st.integers(min_value=0, max_value=99),
 )
 def test_bump_version_should_return_a_greater_version(
-    script, segment, major, minor, patch, cycle
+    script, segment, major, minor, patch, cycle, number
 ):
     """Test the ordering invariant every release bump rests on.
 
@@ -110,8 +115,10 @@ def test_bump_version_should_return_a_greater_version(
         It should return a version that ranks above the original.
     """
     # Arrange
+    # A pre-release always carries a zero patch segment: that is the only
+    # shape bump-version.sh emits, and the only one it can bump.
     if cycle:
-        old_version = f"v{major}.{minor}.0-{cycle}{patch}"
+        old_version = f"v{major}.{minor}.0-{cycle}{number}"
     else:
         old_version = f"v{major}.{minor}.{patch}"
 
@@ -120,48 +127,50 @@ def test_bump_version_should_return_a_greater_version(
 
     # Assert
     assert result.returncode == 0, result.stderr
-    bumped = result.stdout.strip()
-    # Ranked on the segments themselves rather than through SemanticVersion,
-    # whose pre-release ordering compares "rc10" against "rc9" as text.
-    assert _rank(bumped) > _rank(old_version)
-
-
-def _rank(version: str) -> tuple:
-    """Order a version by its numeric segments and its release cycle."""
-    core, _, pre = version.lstrip("v").partition("-")
-    major, minor, patch = (int(segment) for segment in core.split("."))
-    if pre:
-        cycle = pre.rstrip("0123456789")
-        return (major, minor, patch, _CYCLES.index(cycle), int(pre[len(cycle) :]))
-    return (major, minor, patch, len(_CYCLES), 0)
+    # Ordered by PEP 440 rather than through SemanticVersion; see the
+    # expected failure below for why the model is not the oracle here.
+    assert Version(result.stdout.strip()) > Version(old_version)
 
 
 @pytest.mark.xfail(
     strict=True,
     reason="SemanticVersion compares pre-release identifiers as text, so "
-    "rc10 ranks below rc9. Unreachable from the release path, which no "
-    "longer orders versions, but the model still reports it.",
+    "rc10 ranks below rc9. The release path does not order versions, so "
+    "nothing depends on it, but the model still reports it.",
 )
-def test_bump_version_should_return_a_version_semantic_version_ranks_above(
-    script, semantic_version
+def test_parse_should_rank_a_two_digit_cycle_above_a_single_digit_one(
+    semantic_version,
 ):
     """Test the version model's ordering of a two-digit release candidate.
 
     Given:
-        A release candidate whose next patch carries a two-digit cycle.
+        Two release candidates of one version, with one and two digit cycles.
     When:
-        The candidate's patch segment is bumped.
+        They are compared.
     Then:
-        It should return a version the version model ranks above it.
+        It should rank the two-digit candidate above the single-digit one.
     """
-    # Arrange
-    old_version = "v0.15.0-rc9"
+    # Act & assert
+    assert semantic_version.parse("v0.15.0-rc10") > semantic_version.parse("v0.15.0-rc9")
 
+
+@pytest.mark.parametrize("arguments", [("nightly", "v0.14.0"), ("patch",), ()])
+def test_bump_version_should_exit_nonzero_when_the_arguments_are_invalid(
+    script, arguments
+):
+    """Test the argument validation.
+
+    Given:
+        An unrecognized segment, or the wrong number of arguments.
+    When:
+        The version is bumped.
+    Then:
+        It should exit non-zero and print the usage line on stderr.
+    """
     # Act
-    result = script("bump-version.sh", "patch", old_version)
+    result = script("bump-version.sh", *arguments)
 
     # Assert
-    assert result.stdout.strip() == "v0.15.0-rc10"
-    assert semantic_version.parse(result.stdout.strip()) > semantic_version.parse(
-        old_version
-    )
+    assert result.returncode != 0
+    assert "Usage:" in result.stderr
+    assert result.stdout == ""

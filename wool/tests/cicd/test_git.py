@@ -1,8 +1,13 @@
+import pytest
+
+pytestmark = pytest.mark.cicd
+
+
 def test_parse_git_should_return_the_tag_when_head_is_tagged(repository, version):
     """Test the version of a commit that carries a tag.
 
     Given:
-        A repository whose head commit is tagged.
+        A repository whose head commit is tagged below a tag on an ancestor.
     When:
         The version is parsed from git.
     Then:
@@ -60,7 +65,7 @@ def test_parse_git_should_ignore_tags_off_the_head_lineage(repository, version):
     """Test the version of a commit a higher tag does not reach.
 
     Given:
-        A repository with a higher tag on a branch head does not reach.
+        A higher tag on a branch that head does not reach.
     When:
         The version is parsed from git.
     Then:
@@ -180,18 +185,17 @@ def test_parse_git_should_return_the_candidate_tag_when_head_is_a_candidate(
     assert result.build is None
 
 
-def test_parse_git_should_prefer_the_nearest_tag_when_a_merge_reaches_both(
+def test_parse_git_should_return_the_highest_tag_when_a_merge_reaches_both(
     repository, version
 ):
     """Test the version of a merge commit reaching both release channels.
 
     Given:
-        A commit past a merge that reaches a production tag and a higher
-        candidate tag.
+        A merge commit reaching a production tag and a lower candidate tag.
     When:
         The version is parsed from git.
     Then:
-        It should be the production tag qualified by the commit hash.
+        It should be the higher tag qualified by the commit hash.
     """
     # Arrange
     repository.commit()
@@ -200,7 +204,7 @@ def test_parse_git_should_prefer_the_nearest_tag_when_a_merge_reaches_both(
     repository.tag("v0.15.0-rc2")
     repository.checkout("master")
     repository.commit()
-    repository.tag("v0.14.1")
+    repository.tag("v0.15.0")
     repository.merge("release")
     commit = repository.git("rev-parse", "--short", "HEAD")
 
@@ -208,8 +212,9 @@ def test_parse_git_should_prefer_the_nearest_tag_when_a_merge_reaches_both(
     result = version()
 
     # Assert
-    # The wheel of a v0.14.1 build must not be labelled 0.15.0-rc2.
-    assert str(result) == f"0.14.1+{commit}"
+    # A promoted release outranks the candidate it was promoted from, so a
+    # build of it is never labelled with the candidate.
+    assert str(result) == f"0.15.0+{commit}"
 
 
 def test_parse_git_should_append_both_identifiers_when_untagged_and_dirty(
@@ -253,7 +258,7 @@ def test_parse_git_should_return_the_tag_when_head_is_detached(repository, versi
     repository.tag("v0.14.0")
     repository.commit()
     repository.tag("v0.14.1")
-    # The state `build-release` produces: `ref:` a tag, so HEAD detaches.
+    # build-release checks the release tag out by ref, detaching HEAD.
     repository.checkout("v0.14.0")
 
     # Act
@@ -287,3 +292,74 @@ def test_parse_git_should_return_the_tag_when_invoked_from_a_subdirectory(
 
     # Assert
     assert str(result) == "0.14.0"
+
+
+def test_parse_git_should_ignore_tags_that_are_not_versions(repository, version):
+    """Test the version of a commit carrying tags outside the scheme.
+
+    Given:
+        A tagged repository with non-version tags on a later commit.
+    When:
+        The version is parsed from git.
+    Then:
+        It should be the version tag rather than fail to parse one.
+    """
+    # Arrange
+    repository.commit()
+    repository.tag("v0.14.0")
+    repository.commit()
+    repository.tag("nightly-2026-01-01")
+    repository.tag("docs-rc-cleanup")
+    commit = repository.git("rev-parse", "--short", "HEAD")
+
+    # Act
+    result = version()
+
+    # Assert
+    assert str(result) == f"0.14.0+{commit}"
+
+
+def test_parse_git_should_return_the_highest_tag_when_head_carries_two(
+    repository, version
+):
+    """Test the version of a commit carrying more than one version tag.
+
+    Given:
+        A repository whose head commit carries two version tags.
+    When:
+        The version is parsed from git.
+    Then:
+        It should be the higher of them.
+    """
+    # Arrange
+    repository.commit()
+    repository.tag("v1.2.3")
+    repository.tag("v1.3.0")
+
+    # Act
+    result = version()
+
+    # Assert
+    assert str(result) == "1.3.0"
+
+
+@pytest.mark.parametrize("state", ["bare", "empty"])
+def test_parse_git_should_raise_when_the_repository_cannot_be_versioned(
+    repository, version, state
+):
+    """Test the repositories the hook refuses.
+
+    Given:
+        A repository that is bare, or that carries no commits.
+    When:
+        The version is parsed from git.
+    Then:
+        It should raise.
+    """
+    # Arrange
+    if state == "bare":
+        repository.git("config", "core.bare", "true")
+
+    # Act & assert
+    with pytest.raises(RuntimeError):
+        version()

@@ -7,7 +7,7 @@ case $# in
     2)
         ;;
     *)
-        echo $USAGE
+        echo "$USAGE" >&2
         exit 1
         ;;
 esac
@@ -19,7 +19,7 @@ case $1 in
         ;;
     *)
         echo "ERROR: Invalid version segment: $1" >&2
-        echo $USAGE
+        echo "$USAGE" >&2
         exit 1
         ;;
 esac

@@ -5,16 +5,18 @@ USAGE="Usage: $0 production|candidate|any [REF=HEAD]"
 # Evaluate release channel. Each channel matches the whole tag rather than
 # excluding cycle markers, so a tag that is not a version this tooling
 # produces -- a "nightly-2026-01-01", a "docs-rc-cleanup" -- can never be
-# bumped and published as one.
+# bumped and published as one. A pre-release always carries a zero patch
+# segment because that is the only shape bump-version.sh emits, and it is
+# the only shape split-version.sh can carry back through a bump.
 case $1 in
     production)
         PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+$'
         ;;
     candidate)
-        PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$'
+        PATTERN='^v[0-9]+\.[0-9]+\.0-rc[0-9]+$'
         ;;
     any)
-        PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+(-(a|b|rc)[0-9]+)?$'
+        PATTERN='^v[0-9]+\.[0-9]+\.([0-9]+|0-(a|b|rc)[0-9]+)$'
         ;;
     *)
         echo "ERROR: Invalid release channel: $1" >&2
