@@ -42,6 +42,7 @@ dev = [
     "allpairspy",
     "cryptography",
     "debugpy",
+    "gitpython",
     "hypothesis",
     "pyright",
     "pytest",
@@ -49,6 +50,7 @@ dev = [
     "pytest-cov",
     "pytest-grpc-aio~=0.3.0",
     "pytest-mock",
+    "pyyaml",
     "ruff",
     "uvloop",
 ]
