@@ -245,6 +245,21 @@ Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagat
 
 `wool.__proxy__` — the active proxy a nested `@wool.routine` reads to dispatch — is a plain `contextvars.ContextVar`, so it is invisible to the [chain-contention guard](../context/README.md#the-chain-contention-guard). To stop two tasks that share one `contextvars.Context` from silently clobbering each other's proxy (last-write-wins, so both dispatch through the wrong proxy), `WorkerProxy.__aenter__` arms a guarded marker (`WorkerProxy._armed`, a `wool.ContextVar`) before binding the proxy, so a contended second entry fails loud instead of corrupting the first task's dispatch — see `WorkerProxy.__aenter__` for the precise contract. A consequence is that entering a proxy with `async with` arms the chain, even when the routine sets no `wool.ContextVar` of its own. Only the `async with` path arms: the worker pool binds `wool.__proxy__` through `enter()` directly, which deliberately leaves the chain unarmed.
 
+### Subprocesses
+
+Routines are free to launch subprocesses, but the launch path CPython takes decides whether the worker's gRPC threads are involved.
+
+Wool spawns every worker with `GRPC_ENABLE_FORK_SUPPORT=0`; an embedder who sets the variable themselves keeps their value, since Wool only supplies the default. See `WorkerProcess` for why gRPC's atfork handlers are wrong for a spawned worker, and `~wool.runtime.worker.process._default_grpc_fork_support` for what the process hosting the pool sees while a spawn is in flight. The symptom the default suppresses is gRPC's postfork output surfacing inside a live subprocess's captured stderr (`ev_poll_posix.cc: FD from fork parent still in poll list`), observed on macOS.
+
+The launch path is the embedder's to choose, and it is worth knowing that on macOS there is effectively no choice. CPython takes the `posix_spawn` fast path only under the narrow set of conditions in `subprocess.Popen._execute_child`; among them, the executable must carry a directory component, `start_new_session` must be false, and `close_fds` must be false unless the platform has `os.POSIX_SPAWN_CLOSEFROM`. `close_fds` defaults to true and `asyncio` does not override it, and macOS has no `POSIX_SPAWN_CLOSEFROM`, so in practice every `asyncio.create_subprocess_exec` there goes through `_posixsubprocess.fork_exec` — a real `fork()` from a worker thread while the gRPC server's threads are live. A bare command name resolved through `PATH`, or `start_new_session=True`, disqualifies the fast path on every platform:
+
+```python
+# Always the forking path: new session, and a bare name resolved through PATH
+await asyncio.create_subprocess_exec("tabix", *args, start_new_session=True)
+```
+
+Because the fast path is out of reach on macOS, treat the forking path as the one a routine will take and rely on the fork-support default rather than trying to route around it. Where the fast path *is* reachable (Linux with glibc ≥ 2.34, given a directory-qualified executable, no new session, and `close_fds=False`), it runs no atfork handlers at all, at the cost of process-group semantics: `start_new_session=True` puts the child in its own process group, which is what makes group-wide signalling possible (e.g., cancelling a whole shell pipeline with one `killpg`), and the fast path leaves the child in the worker's group and gives that up.
+
 ## Connections
 
 `WorkerProxy` is the client-side bridge between routines and workers. It manages discovery, connection pooling, and load-balanced dispatch.
