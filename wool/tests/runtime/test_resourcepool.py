@@ -4,12 +4,14 @@ import logging
 import threading
 import time
 import warnings
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
 import pytest
 from hypothesis import given
+from hypothesis import settings
 from hypothesis import strategies
 
 from wool.runtime.resourcepool import Resource
@@ -166,6 +168,20 @@ def resource_pool_immediate_cleanup(mock_resource_factory, mock_finalizer):
 
 
 @pytest.fixture
+def retired_entry_pool(mocker):
+    """Build a long-TTL pool holding one entry retired while referenced.
+
+    Returns the pool, its finalizer mock and its factory mock. The
+    factory yields ``"first"`` then ``"second"``, so a test can prove
+    eviction by acquiring again and getting the second object.
+    """
+    factory = mocker.Mock(side_effect=["first", "second"])
+    finalizer = mocker.AsyncMock()
+    pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=60)
+    return pool, finalizer, factory
+
+
+@pytest.fixture
 def expiry_race_pool(mocker):
     """Build a short-TTL pool whose lock can be parked via a blocker key.
 
@@ -316,6 +332,7 @@ class TestResourcePool:
         return setup
 
     @pytest.mark.asyncio
+    @settings(max_examples=50, deadline=None)
     @given(setup=setup())
     async def test_get_should_return_resource_instance(self, setup):
         """Test that get returns a Resource instance.
@@ -445,16 +462,24 @@ class TestResourcePool:
             await ttl_pool.release(unique_key)
 
     @pytest.mark.asyncio
-    async def test_finalizer_should_still_evict_entry_when_raising_base_exception(self):
+    @pytest.mark.parametrize(
+        "ttl, retire_first",
+        [(0, False), (60, True)],
+        ids=["zero-ttl", "retired-while-referenced"],
+    )
+    async def test_finalizer_should_still_evict_entry_when_raising_base_exception(
+        self, ttl, retire_first
+    ):
         """Test a cancelled finalizer still evicts the cache entry.
 
         Given:
-            A ``ttl=0`` pool whose finalizer raises
-            ``CancelledError`` — a ``BaseException``, not an
-            ``Exception`` — on its first call, modelling cleanup that
-            runs under a cancelled teardown
+            A pool that finalizes inline — either because it has no TTL
+            or because the entry was retired by ``expire`` while still
+            referenced — whose finalizer raises ``CancelledError`` — a
+            ``BaseException``, not an ``Exception`` — on its first call,
+            modelling cleanup that runs under a cancelled teardown
         When:
-            A resource is acquired and released, driving immediate
+            A resource is acquired and released, driving the inline
             cleanup whose finalizer raises
         Then:
             The ``CancelledError`` propagates, but the torn-down entry
@@ -478,14 +503,15 @@ class TestResourcePool:
                 SimpleNamespace(name="second"),
             ]
         )
-        pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=0)
+        pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=ttl)
 
         # Act
-        # Acquire then release: rc -> 0 drives immediate cleanup, whose
+        # Acquire then release: rc -> 0 drives inline cleanup, whose
         # finalizer raises CancelledError out of the release.
         with pytest.raises(asyncio.CancelledError):
             async with pool.get("key"):
-                pass
+                if retire_first:
+                    await pool.expire("key")
 
         # Assert
         # The finalized resource must not survive in the cache.
@@ -870,42 +896,63 @@ class TestResourcePool:
         assert pool.stats.total_entries == 1
 
     @pytest.mark.asyncio
+    @settings(max_examples=50, deadline=None)
     @given(
         operations=strategies.lists(
             strategies.tuples(
-                strategies.sampled_from(["acquire", "release"]),
+                strategies.sampled_from(["acquire", "release", "expire"]),
                 strategies.sampled_from(["a", "b", "c"]),
             ),
             max_size=30,
         )
     )
     async def test_release_should_maintain_bookkeeping_invariants(self, operations):
-        """Test acquire and release keep TTL bookkeeping consistent.
+        """Test acquire, release and expire keep bookkeeping consistent.
 
         Given:
-            Any interleaved sequence of acquire and release
+            Any interleaved sequence of acquire, release and expire
             operations over a small key domain, where releases are
             applied only while a reference is held
         When:
             The sequence is applied step by step to a long-TTL pool
         Then:
-            It should keep total entries equal to the keys ever
-            acquired, referenced entries equal to the keys with live
-            references, and pending cleanup on exactly the keys whose
-            references all released
+            It should evict a retired key the instant the release that
+            drops its last reference returns, keeping total entries,
+            referenced entries, pending cleanup and the finalized
+            objects equal to the model's at every step
         """
         # Arrange
-        pool = ResourcePool(factory=lambda key: f"obj-{key}", ttl=60)
+        finalized = []
+        pool = ResourcePool(
+            factory=lambda key: f"obj-{key}",
+            finalizer=finalized.append,
+            ttl=60,
+        )
         model_refcount = {}
+        model_doomed = set()
+        model_finalized = []
 
         # Act & assert
         for operation, key in operations:
             if operation == "acquire":
                 await pool.acquire(key)
                 model_refcount[key] = model_refcount.get(key, 0) + 1
+                model_doomed.discard(key)
+            elif operation == "expire":
+                if key in model_refcount:
+                    if model_refcount[key] > 0:
+                        model_doomed.add(key)
+                    else:
+                        del model_refcount[key]
+                        model_finalized.append(f"obj-{key}")
+                await pool.expire(key)
             elif model_refcount.get(key, 0) > 0:
                 await pool.release(key)
                 model_refcount[key] -= 1
+                if model_refcount[key] == 0 and key in model_doomed:
+                    model_doomed.discard(key)
+                    del model_refcount[key]
+                    model_finalized.append(f"obj-{key}")
 
             stats = pool.stats
             assert stats.total_entries == len(model_refcount)
@@ -915,6 +962,7 @@ class TestResourcePool:
             assert set(pool.pending_cleanup) == {
                 key for key, count in model_refcount.items() if count == 0
             }
+            assert finalized == model_finalized
 
     @pytest.mark.asyncio
     async def test_clear_should_finalize_all_resources(self):
@@ -1046,34 +1094,160 @@ class TestResourcePool:
         assert pool.stats.total_entries == 1
 
     @pytest.mark.asyncio
-    async def test_expire_should_finalize_at_last_release_when_expired(self):
-        """Test an expired entry is finalized as soon as its users drain.
+    async def test_release_should_finalize_retired_entry_when_last_reference_released(
+        self, retired_entry_pool
+    ):
+        """Test a retired entry is finalized as soon as its users drain.
 
         Given:
-            A long-TTL pool holding an entry that has been expired while
-            still referenced.
+            A long-TTL pool holding an entry that has been retired by
+            ``expire`` while still referenced.
         When:
             The last reference is released.
         Then:
-            It should finalize the resource promptly, without waiting out
-            the TTL. The finalizer is spawned rather than awaited by
-            release, so draining the loop is what settles it.
+            It should have awaited the finalizer before the release
+            returns, without waiting out the TTL and without leaving
+            pending cleanup behind for the loop to drain.
         """
         # Arrange
-        mock_factory = Mock(return_value="resource")
-        mock_finalizer = AsyncMock()
-        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
+        pool, finalizer, _ = retired_entry_pool
         await pool.acquire("key")
         await pool.expire("key")
 
         # Act
         await pool.release("key")
-        await asyncio.sleep(0)
 
         # Assert
-        mock_finalizer.assert_awaited_once_with("resource")
+        finalizer.assert_awaited_once_with("first")
         assert pool.stats.total_entries == 0
         assert not pool.pending_cleanup
+
+    @pytest.mark.asyncio
+    async def test_release_should_not_finalize_retired_entry_when_references_remain(
+        self, retired_entry_pool
+    ):
+        """Test a retired entry survives a release that does not drain it.
+
+        Given:
+            A long-TTL pool holding an entry with two live references
+            that has been retired by ``expire`` while referenced.
+        When:
+            Only one of the two references is released.
+        Then:
+            It should leave the resource unfinalized and the entry
+            cached and still referenced, with no cleanup pending.
+        """
+        # Arrange
+        pool, finalizer, _ = retired_entry_pool
+        await pool.acquire("key")
+        await pool.acquire("key")
+        await pool.expire("key")
+
+        # Act
+        await pool.release("key")
+
+        # Assert
+        finalizer.assert_not_awaited()
+        assert pool.stats.total_entries == 1
+        assert pool.stats.referenced_entries == 1
+        assert not pool.pending_cleanup
+
+    @pytest.mark.asyncio
+    async def test_release_should_evict_retired_entry_when_cancelled_mid_finalizer(
+        self, mocker
+    ):
+        """Test cancelling a release mid-finalize still evicts the entry.
+
+        Given:
+            A long-TTL pool holding an entry retired by ``expire`` while
+            still referenced, whose finalizer parks on an event so the
+            release is suspended inside it.
+        When:
+            The releasing task is cancelled while the finalizer is
+            parked.
+        Then:
+            It should raise ``CancelledError`` and still evict the entry,
+            so no torn-down resource is handed back to a later acquire.
+        """
+        # Arrange
+        parked = asyncio.Event()
+        factory = mocker.Mock(side_effect=["first", "second"])
+
+        async def finalizer(_):
+            parked.set()
+            await asyncio.Event().wait()
+
+        pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=60)
+        await pool.acquire("key")
+        await pool.expire("key")
+        release = asyncio.ensure_future(pool.release("key"))
+        # Bounded: a regression that never enters the finalizer must
+        # fail here rather than idle out the pool's own TTL.
+        await asyncio.wait_for(parked.wait(), timeout=2.0)
+
+        # Act & assert
+        release.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await release
+
+        assert pool.stats.total_entries == 0
+        assert await pool.acquire("key") == "second"
+
+    def test_release_should_finalize_retired_entry_when_loop_ends_immediately(
+        self, mocker, caplog
+    ):
+        """Test a release during shutdown closes the resource before returning.
+
+        Given:
+            A long-TTL pool holding an entry retired by ``expire`` while
+            still referenced, on a loop that closes as soon as the last
+            reference is released.
+        When:
+            That release is awaited and the loop is closed with no
+            further iterations.
+        Then:
+            It should have run the finalizer to completion before
+            returning, leaving no pending task on the loop and no
+            destroyed-while-pending report from asyncio.
+        """
+        # Arrange
+        closed = []
+
+        # The suspension point is load-bearing: a finalizer that never
+        # awaits would finish inside a single loop step, so this test
+        # could not tell an inline finalize from deferred work the loop
+        # happens to run before closing.
+        async def finalizer(obj):
+            await asyncio.sleep(0)
+            closed.append(obj)
+
+        pool = ResourcePool(
+            factory=mocker.Mock(return_value="obj"), finalizer=finalizer, ttl=60
+        )
+        loop = asyncio.new_event_loop()
+
+        async def acquire_and_retire():
+            await pool.acquire("key")
+            await pool.expire("key")
+
+        loop.run_until_complete(acquire_and_retire())
+
+        # Act
+        with caplog.at_level(logging.ERROR, logger="asyncio"):
+            loop.run_until_complete(pool.release("key"))
+            pending = asyncio.all_tasks(loop)
+            loop.close()
+            gc.collect()
+
+        # Assert
+        assert closed == ["obj"]
+        assert pending == set()
+        assert pool.stats.total_entries == 0
+        assert not [
+            record
+            for record in caplog.records
+            if "Task was destroyed" in record.getMessage()
+        ]
 
     @pytest.mark.asyncio
     async def test_expire_should_resurrect_entry_when_reacquired(self):
@@ -1315,11 +1489,20 @@ class TestResourcePool:
             assert pool.stats.pending_cleanup == 1
 
     @pytest.mark.asyncio
-    async def test_finalizer_should_catch_exception_and_remove_resource(self):
+    @pytest.mark.parametrize(
+        "ttl, retire_first",
+        [(0, False), (60, True)],
+        ids=["zero-ttl", "retired-while-referenced"],
+    )
+    async def test_finalizer_should_catch_exception_and_remove_resource(
+        self, ttl, retire_first
+    ):
         """Test finalizer exceptions are caught and logged.
 
         Given:
-            A finalizer that raises an exception
+            A pool that finalizes inline — either because it has no TTL
+            or because the entry was retired by ``expire`` while still
+            referenced — whose finalizer raises an exception
         When:
             Resource cleanup occurs
         Then:
@@ -1331,7 +1514,7 @@ class TestResourcePool:
         async def failing_finalizer(_):
             raise ValueError("Finalizer failed")
 
-        pool = ResourcePool(factory=mock_factory, finalizer=failing_finalizer)
+        pool = ResourcePool(factory=mock_factory, finalizer=failing_finalizer, ttl=ttl)
 
         mock_resource = Mock()
         mock_factory.return_value = mock_resource
@@ -1341,7 +1524,8 @@ class TestResourcePool:
         # Act & assert
         # This should not raise despite finalizer failing
         async with pool.get(key):
-            pass
+            if retire_first:
+                await pool.expire(key)
 
         # Resource should still be cleaned up
         assert pool.stats.total_entries == 0
@@ -1469,6 +1653,47 @@ class TestResource:
 
         # Should be automatically cleaned up after context exit
         assert pool.stats.total_entries == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body_error",
+        [None, KeyError("boom")],
+        ids=["clean-exit", "body-raises"],
+    )
+    async def test_context_manager_should_finalize_when_retired_in_body(
+        self, retired_entry_pool, body_error
+    ):
+        """Test exiting the context finalizes a resource retired inside it.
+
+        Given:
+            A long-TTL pool whose key is retired by ``expire`` from
+            inside an ``async with pool.get(key)`` body while still
+            referenced, where the body then either returns or raises.
+        When:
+            The context manager exits, normally or on the exceptional
+            unwind.
+        Then:
+            It should have awaited the finalizer before the statement
+            following the block runs, leaving the entry evicted with no
+            cleanup pending and any original exception propagating
+            unchanged.
+        """
+        # Arrange
+        pool, finalizer, _ = retired_entry_pool
+        guard = pytest.raises(KeyError, match="boom") if body_error else nullcontext()
+
+        # Act & assert
+        with guard:
+            async with pool.get("key"):
+                await pool.expire("key")
+                # Guard: still referenced, so nothing is finalized yet.
+                finalizer.assert_not_awaited()
+                if body_error:
+                    raise body_error
+
+        finalizer.assert_awaited_once_with("first")
+        assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
 
     @pytest.mark.asyncio
     async def test_resource_should_have_no_manual_release_method(self):
