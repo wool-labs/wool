@@ -36,8 +36,8 @@ if git show-ref --verify --quiet refs/heads/$BRANCH; then
     exit 1
 fi
 
-# Get the latest version tag, default to 0.0.0
-VERSION=$(git describe --tags --abbrev=0)
+# Get the latest version tag reachable from main, default to 0.0.0
+VERSION=$("$(dirname "${BASH_SOURCE[0]}")/latest-version.sh" any)
 
 # Verify no active release candidates exist
 if [[ $VERSION == *-rc* ]]; then
@@ -45,7 +45,7 @@ if [[ $VERSION == *-rc* ]]; then
     exit 1
 fi
 
-read MAJOR MINOR PATCH <<< $(.github/scripts/split-version.sh $VERSION)
+read MAJOR MINOR PATCH <<< $("$(dirname "${BASH_SOURCE[0]}")/split-version.sh" $VERSION)
 
 # Bump the version
 case $RELEASE_TYPE in

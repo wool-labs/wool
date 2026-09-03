@@ -30,8 +30,15 @@ jobs:
     outputs:
       version: ${{ steps.bump-version.outputs.version }}
     steps:
+      # No `ref:` here, for the reason spelled out in `tag-version` below.
+      # `fetch-depth: 0` gives the tag history `git describe` walks; the
+      # merge commit itself is fetched explicitly in the bump step, since
+      # `github.sha` under `pull_request_target` is only documented as the
+      # last commit on the base branch, not as the merge commit.
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/get-wool-labs-app-token
         id: get-wool-labs-app-token
         with:
@@ -45,32 +52,17 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
         run: |
-          case "$BASE_REF" in
-            master)
-              case "$HEAD_REF" in
-                release)
-                  echo "segment=minor" >> $GITHUB_OUTPUT
-                  ;;
-                *)
-                  echo "segment=patch" >> $GITHUB_OUTPUT
-                  ;;
-              esac
-              ;;
-            release)
-              echo "segment=patch" >> $GITHUB_OUTPUT
-              ;;
-            *)
-              echo "Error: Unsupported base branch $BASE_REF" >&2
-              exit 1
-              ;;
-          esac
+          .github/scripts/version-segment.sh "$BASE_REF" "$HEAD_REF" >> $GITHUB_OUTPUT
       - name: Bump version
         id: bump-version
         env:
           GH_TOKEN: ${{ steps.get-wool-labs-app-token.outputs.access-token }}
           REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.base_ref }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
           VERSION_SEGMENT: ${{ steps.determine-version-segment.outputs.segment }}
+          VERSION_CHANNEL: ${{ steps.determine-version-segment.outputs.channel }}
         run: |
           git config --local --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
@@ -78,8 +70,16 @@ jobs:
             new_version="$INPUT_VERSION"
             echo "Using manually specified version: $new_version"
           else
-            git fetch --unshallow
-            old_version=$(git describe --tags $(git rev-list --tags --max-count=1))
+            # The version is read from the lineage of the commit that
+            # `tag-version` tags, so the tag it lands beside is the tag it
+            # was derived from. Falling back to the base branch tip covers
+            # a merge commit the API did not report.
+            git fetch --tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            describe_ref="$MERGE_SHA"
+            if ! git cat-file -e "${describe_ref}^{commit}" 2>/dev/null; then
+              describe_ref="origin/${BASE_REF}"
+            fi
+            old_version=$(.github/scripts/latest-version.sh "$VERSION_CHANNEL" "$describe_ref")
             new_version=$(.github/scripts/bump-version.sh "$VERSION_SEGMENT" "$old_version")
             echo "Bumping $old_version to $new_version"
           fi

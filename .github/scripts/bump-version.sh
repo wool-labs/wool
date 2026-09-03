@@ -24,8 +24,17 @@ case $1 in
         ;;
 esac
 
-# Determine release cycle
+# Evaluate version
 VERSION=$2
+if ! [[ "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-(a|b|rc)[0-9]+)?$ ]]; then
+    # Without this the arithmetic below fails on stderr, echoes the version
+    # back unchanged and still exits 0, which publishes whatever it was given.
+    echo "ERROR: Invalid version: $VERSION" >&2
+    echo "$USAGE" >&2
+    exit 1
+fi
+
+# Determine release cycle
 case $VERSION in
     *-a*)
         CYCLE="-a"
@@ -51,7 +60,7 @@ if [ "$PRE_RELEASE" = true ] && [[ "$SEGMENT" == "major" ]]; then
 fi
 
 #Split version
-read MAJOR MINOR PATCH <<< $(.github/scripts/split-version.sh $VERSION)
+read MAJOR MINOR PATCH <<< $("$(dirname "${BASH_SOURCE[0]}")/split-version.sh" $VERSION)
 
 case $SEGMENT in
     major)
