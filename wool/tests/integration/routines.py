@@ -1672,3 +1672,37 @@ async def read_adopted_worker_ca() -> bytes:
     assert provider is not None
     material = await asyncio.to_thread(force_adoption, provider)
     return material.ca_cert
+
+
+@wool.routine
+async def read_grpc_fork_support() -> str | None:
+    """Report the gRPC fork-support setting the worker was spawned with.
+
+    Reads the child's own environment, so the value witnessed is the one
+    the spawn delivered.
+    """
+    return os.environ.get("GRPC_ENABLE_FORK_SUPPORT")
+
+
+@wool.routine
+async def probe_subprocess_stderr() -> list[tuple[int | None, str]]:
+    """Launch subprocesses on the fork path, reporting each rc and stderr.
+
+    The bare command name and ``start_new_session=True`` are what force
+    the forking launch path — see the worker README's Subprocesses
+    section. Three launches, because the atfork output depends on which
+    descriptors the fork happens to collide with.
+    """
+    results = []
+    for _ in range(3):
+        process = await asyncio.create_subprocess_exec(
+            "sh",
+            "-c",
+            "exit 0",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        _, stderr = await process.communicate()
+        results.append((process.returncode, stderr.decode()))
+    return results

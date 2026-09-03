@@ -98,6 +98,25 @@ def metadata_pipe(mocker):
 
 
 @pytest.fixture
+def spawn_env(mocker):
+    """Stub the spawn and record the environment each one is handed.
+
+    Patches the spawn seam with a side effect that samples
+    GRPC_ENABLE_FORK_SUPPORT as the real fork/exec would read it, and
+    returns the list those samples land in. The context manager restores
+    the variable before start() returns, so sampling inside the spawn is
+    the only window onto it.
+    """
+    observed = []
+    mocker.patch.object(
+        process_module.Process,
+        "start",
+        side_effect=lambda: observed.append(os.environ.get("GRPC_ENABLE_FORK_SUPPORT")),
+    )
+    return observed
+
+
+@pytest.fixture
 def run_harness(mocker):
     """Stub the run() lifecycle collaborators behind one seam.
 
@@ -852,7 +871,7 @@ class TestWorkerProcess:
         with pytest.raises(ValueError, match="Proxy pool TTL must be positive"):
             WorkerProcess(proxy_pool_ttl=ttl)
 
-    def test_start_raises_error_for_non_positive_timeout(self):
+    def test_start_should_raise_when_the_timeout_is_not_positive(self):
         """Test start raises ValueError for non-positive timeout.
 
         Given:
@@ -869,15 +888,15 @@ class TestWorkerProcess:
         with pytest.raises(ValueError, match="Timeout must be positive"):
             process.start(timeout=0)
 
-    def test_start_calls_parent_start(self, mocker, metadata_pipe):
-        """Test start method calls parent Process.start.
+    def test_start_should_spawn_the_worker_process(self, mocker, metadata_pipe):
+        """Test start delegates the spawn to Process.start.
 
         Given:
             A WorkerProcess with mocked parent start and pipe
         When:
             start() is called
         Then:
-            It should call Process.start
+            It should call Process.start once
         """
         # Arrange
         mock_parent_start = mocker.patch.object(process_module.Process, "start")
@@ -885,15 +904,38 @@ class TestWorkerProcess:
         process = WorkerProcess()
 
         # Act
-        process.start(timeout=60.0)
+        process.start()
 
         # Assert
         mock_parent_start.assert_called_once()
+
+    def test_start_should_wait_for_metadata_up_to_the_given_timeout(
+        self, mocker, metadata_pipe
+    ):
+        """Test start polls the metadata pipe with the caller's timeout.
+
+        Given:
+            A WorkerProcess and an explicit startup timeout
+        When:
+            start() is called with that timeout
+        Then:
+            It should poll the metadata pipe once with it
+        """
+        # Arrange
+        mocker.patch.object(process_module.Process, "start")
+
+        process = WorkerProcess()
+
+        # Act
+        process.start(timeout=60.0)
+
+        # Assert
         metadata_pipe.poll.assert_called_once_with(timeout=60.0)
         metadata_pipe.recv.assert_called_once()
-        metadata_pipe.close.assert_called_once()
 
-    def test_start_receives_port_from_pipe(self, mocker, metadata_pipe):
+    def test_start_should_adopt_the_address_reported_by_the_child(
+        self, mocker, metadata_pipe
+    ):
         """Test start receives port from pipe and updates address.
 
         Given:
@@ -904,6 +946,7 @@ class TestWorkerProcess:
             It should receive the port and provide correct address
         """
         # Arrange
+        metadata_pipe.recv.return_value = _metadata_bytes(address="127.0.0.1:50051")
         mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
@@ -915,7 +958,9 @@ class TestWorkerProcess:
         assert process.port == 50051
         assert process.address == "127.0.0.1:50051"
 
-    def test_start_raises_runtime_error_on_timeout(self, mocker, metadata_pipe):
+    def test_start_should_raise_and_reap_when_metadata_never_arrives(
+        self, mocker, metadata_pipe
+    ):
         """Test start raises RuntimeError when process fails to start in time.
 
         Given:
@@ -940,7 +985,9 @@ class TestWorkerProcess:
 
         mock_reap.assert_called_once_with(timeout=0)
 
-    def test_start_closes_pipe_after_receiving_port(self, mocker, metadata_pipe):
+    def test_start_should_close_the_metadata_pipe_when_metadata_arrives(
+        self, mocker, metadata_pipe
+    ):
         """Test start closes the pipe connection after receiving port.
 
         Given:
@@ -961,7 +1008,7 @@ class TestWorkerProcess:
         # Assert
         metadata_pipe.close.assert_called_once()
 
-    def test_start_deserializes_metadata_with_extra_from_pipe(
+    def test_start_should_populate_extra_and_tags_from_the_reported_metadata(
         self, mocker, metadata_pipe
     ):
         """Test start deserializes metadata with extra and tags from pipe.
@@ -990,6 +1037,225 @@ class TestWorkerProcess:
         assert process.metadata.extra == MappingProxyType({"key": "value"})
         assert isinstance(process.metadata.extra, MappingProxyType)
         assert process.metadata.tags == frozenset({"gpu"})
+
+    def test_start_should_disable_grpc_fork_support_for_the_child_when_unset(
+        self, monkeypatch, metadata_pipe, spawn_env
+    ):
+        """Test start hands the spawned child disabled gRPC fork support.
+
+        Given:
+            A WorkerProcess and an environment carrying no
+            GRPC_ENABLE_FORK_SUPPORT setting
+        When:
+            start() is called
+        Then:
+            It should scope GRPC_ENABLE_FORK_SUPPORT="0" to the spawn
+        """
+        # Arrange
+        monkeypatch.delenv("GRPC_ENABLE_FORK_SUPPORT", raising=False)
+
+        process = WorkerProcess()
+
+        # Act
+        process.start()
+
+        # Assert
+        assert spawn_env == ["0"]
+        assert "GRPC_ENABLE_FORK_SUPPORT" not in os.environ
+
+    @pytest.mark.parametrize("preset", ["1", "0", ""])
+    def test_start_should_preserve_grpc_fork_support_when_already_set(
+        self, monkeypatch, metadata_pipe, spawn_env, preset
+    ):
+        """Test start leaves a deliberate fork-support setting intact.
+
+        Given:
+            An environment in which the embedder set
+            GRPC_ENABLE_FORK_SUPPORT, including to a falsy value
+        When:
+            start() is called
+        Then:
+            It should expose that exact value to the spawn and leave it
+            set
+        """
+        # Arrange
+        monkeypatch.setenv("GRPC_ENABLE_FORK_SUPPORT", preset)
+
+        process = WorkerProcess()
+
+        # Act
+        process.start()
+
+        # Assert
+        assert spawn_env == [preset]
+        assert os.environ["GRPC_ENABLE_FORK_SUPPORT"] == preset
+
+    @given(
+        preset=st.text().filter(lambda value: "\x00" not in value and "=" not in value)
+    )
+    @settings(
+        max_examples=50,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_start_should_preserve_any_value_the_embedder_set(
+        self, mocker, monkeypatch, preset
+    ):
+        """Test the preserved value is carried verbatim, whatever it is.
+
+        Given:
+            Any string the embedder may have put in
+            GRPC_ENABLE_FORK_SUPPORT
+        When:
+            start() is called
+        Then:
+            It should expose that exact value to the spawn and leave it
+            set
+        """
+        # Arrange
+        monkeypatch.setenv("GRPC_ENABLE_FORK_SUPPORT", preset)
+        receiver = mocker.MagicMock()
+        receiver.poll.return_value = True
+        receiver.recv.return_value = _metadata_bytes()
+        mocker.patch.object(
+            process_module, "Pipe", return_value=(receiver, mocker.MagicMock())
+        )
+        observed = []
+        mocker.patch.object(
+            process_module.Process,
+            "start",
+            side_effect=lambda: observed.append(
+                os.environ.get("GRPC_ENABLE_FORK_SUPPORT")
+            ),
+        )
+
+        process = WorkerProcess()
+
+        # Act
+        process.start()
+
+        # Assert
+        assert observed == [preset]
+        assert os.environ["GRPC_ENABLE_FORK_SUPPORT"] == preset
+
+    def test_start_should_restore_the_environment_when_the_spawn_fails(
+        self, mocker, monkeypatch, metadata_pipe
+    ):
+        """Test a failed spawn leaves no fork-support setting behind.
+
+        Given:
+            An environment carrying no GRPC_ENABLE_FORK_SUPPORT and a
+            spawn that raises
+        When:
+            start() is called
+        Then:
+            It should propagate the error and leave the variable unset
+        """
+        # Arrange
+        monkeypatch.delenv("GRPC_ENABLE_FORK_SUPPORT", raising=False)
+        mocker.patch.object(
+            process_module.Process, "start", side_effect=OSError("spawn failed")
+        )
+
+        process = WorkerProcess()
+
+        # Act & assert
+        with pytest.raises(OSError, match="spawn failed"):
+            process.start()
+
+        assert "GRPC_ENABLE_FORK_SUPPORT" not in os.environ
+
+    def test_start_should_spawn_again_when_an_earlier_spawn_failed(
+        self, mocker, monkeypatch, metadata_pipe
+    ):
+        """Test a failed spawn releases the hold for the next start.
+
+        Given:
+            A WorkerProcess whose spawn raised, after which the
+            environment is clean again
+        When:
+            A second WorkerProcess is started
+        Then:
+            It should spawn without wedging and observe
+            GRPC_ENABLE_FORK_SUPPORT="0"
+        """
+        # Arrange
+        monkeypatch.delenv("GRPC_ENABLE_FORK_SUPPORT", raising=False)
+        observed = []
+
+        def spawn():
+            observed.append(os.environ.get("GRPC_ENABLE_FORK_SUPPORT"))
+            if len(observed) == 1:
+                raise OSError("spawn failed")
+
+        mocker.patch.object(process_module.Process, "start", side_effect=spawn)
+        with pytest.raises(OSError, match="spawn failed"):
+            WorkerProcess().start()
+        # Distinguishes a released hold from a leaked one: a leaked
+        # setting would satisfy the spawn assertion below just as a
+        # restored environment does.
+        assert "GRPC_ENABLE_FORK_SUPPORT" not in os.environ
+
+        # Act
+        second = threading.Thread(target=lambda: WorkerProcess().start())
+        second.start()
+        second.join(timeout=10.0)
+
+        # Assert
+        assert not second.is_alive()
+        assert observed == ["0", "0"]
+
+    def test_start_should_disable_grpc_fork_support_for_every_concurrent_spawn(
+        self, mocker, monkeypatch, metadata_pipe
+    ):
+        """Test overlapping spawns each see fork support disabled.
+
+        Given:
+            An environment carrying no GRPC_ENABLE_FORK_SUPPORT and
+            eight workers started from their own threads
+        When:
+            Their spawns are all in flight at once
+        Then:
+            Every spawn should observe "0", and the environment should
+            be clean once the last one returns
+        """
+        # Arrange
+        monkeypatch.delenv("GRPC_ENABLE_FORK_SUPPORT", raising=False)
+        spawns = 8
+        # The barrier is the overlap proof: it releases only once all
+        # eight spawns are inside, so a design that serialized them
+        # would time out here rather than pass.
+        rendezvous = threading.Barrier(spawns, timeout=10.0)
+        observed = []
+        errors = []
+        recorded = threading.Lock()
+
+        def spawn():
+            rendezvous.wait()
+            value = os.environ.get("GRPC_ENABLE_FORK_SUPPORT")
+            with recorded:
+                observed.append(value)
+
+        def start():
+            try:
+                WorkerProcess().start()
+            except BaseException as error:  # noqa: BLE001 - reported below
+                with recorded:
+                    errors.append(error)
+
+        mocker.patch.object(process_module.Process, "start", side_effect=spawn)
+        threads = [threading.Thread(target=start) for _ in range(spawns)]
+
+        # Act
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15.0)
+
+        # Assert
+        assert not errors
+        assert not any(thread.is_alive() for thread in threads)
+        assert observed == ["0"] * spawns
+        assert "GRPC_ENABLE_FORK_SUPPORT" not in os.environ
 
     def test_run_sets_up_proxy_pool_and_starts_server(self, mocker):
         """Test run method sets up proxy pool and starts gRPC server.
