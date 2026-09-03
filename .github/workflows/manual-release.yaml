@@ -79,7 +79,15 @@ jobs:
         run: |
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
           git fetch --tags
-          old_version=$(git describe --tags $(git rev-list --tags --max-count=1))
+          # The same rule the merge path applies, for the branch this commit
+          # is on. `validate-inputs` requires the commit to be a head of
+          # `master`, the production line, so the version moves from the last
+          # production release reachable at that commit -- for a minor as
+          # well as a patch. Reading the candidate channel here would move
+          # from a candidate `master` has already consumed and produce a
+          # version that is already tagged. The checkout is at the requested
+          # commit, so HEAD is its lineage.
+          old_version=$(.github/scripts/latest-version.sh production HEAD)
           new_version=$(.github/scripts/bump-version.sh "$BUMP" "$old_version")
           echo "Bumping $old_version to $new_version"
           echo "version=$new_version" >> $GITHUB_OUTPUT
