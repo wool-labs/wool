@@ -991,6 +991,7 @@ class TestResourcePool:
             assert pool.stats.total_entries == 1
             assert "key2" in pool.pending_cleanup
 
+    @pytest.mark.asyncio
     async def test_expire_should_finalize_immediately_when_unreferenced(self):
         """Test expiring an unreferenced entry skips its remaining TTL.
 
@@ -1381,7 +1382,7 @@ class TestResourcePool:
 
     @pytest.mark.asyncio
     async def test_resource_pool_should_cleanup_immediately_when_zero_ttl(
-        self, resource_pool_immediate_cleanup
+        self, resource_pool_immediate_cleanup, mock_resource_factory, mock_finalizer
     ):
         """Test TTL=0 performs immediate cleanup as expected.
 
@@ -1395,7 +1396,7 @@ class TestResourcePool:
         # Arrange
         pool = resource_pool_immediate_cleanup
         mock_resource = Mock()
-        pool._factory.return_value = mock_resource
+        mock_resource_factory.return_value = mock_resource
 
         # Act
         async with pool.get("test-key") as resource:
@@ -1409,7 +1410,7 @@ class TestResourcePool:
         assert pool.stats.total_entries == 0
         assert pool.stats.referenced_entries == 0
         assert pool.stats.pending_cleanup == 0  # No pending cleanup tasks
-        pool._finalizer.assert_called_once_with(mock_resource)
+        mock_finalizer.assert_awaited_once_with(mock_resource)
 
     @pytest.mark.asyncio
     async def test_get_should_handle_none_key(self):
