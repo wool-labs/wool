@@ -9,7 +9,7 @@ case $1 in
         ;;
     *)
         echo "ERROR: Invalid release type: $1" >&2
-        echo $USAGE
+        echo "$USAGE" >&2
         exit 1
         ;;
 esac
@@ -21,17 +21,30 @@ case $# in
         BRANCH=$2
         ;;
     *)
-        echo $USAGE
+        echo "$USAGE" >&2
         exit 1
         ;;
 esac
 
 git fetch --unshallow >/dev/null 2>&1
-git checkout main >/dev/null 2>&1
-git pull >/dev/null 2>&1
 
-# Check if the release branch already exists
-if git show-ref --verify --quiet refs/heads/$BRANCH; then
+# The release is cut from main, so failing to get there must stop the cut --
+# discarding the exit status here would cut and push a release branch from
+# whatever HEAD happened to be on.
+if ! git checkout main >/dev/null 2>&1; then
+    echo "ERROR: Cannot check out 'main'." >&2
+    exit 1
+fi
+if ! git pull >/dev/null 2>&1; then
+    echo "ERROR: Cannot update 'main' from origin." >&2
+    exit 1
+fi
+
+# Check if the release branch already exists, locally or on the remote. A
+# CI checkout has only the branch it cloned, so an existing release branch
+# is visible there as a remote ref and nowhere else.
+if git show-ref --verify --quiet "refs/heads/$BRANCH" ||
+    git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
     echo "ERROR: Branch '$BRANCH' already exists." >&2
     exit 1
 fi

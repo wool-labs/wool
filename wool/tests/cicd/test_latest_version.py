@@ -1,4 +1,18 @@
+import subprocess
+import uuid
+
 import pytest
+from hypothesis import HealthCheck
+from hypothesis import given
+from hypothesis import settings
+from hypothesis import strategies as st
+from packaging.version import Version
+
+from tests.cicd.conftest import SCRIPTS
+from tests.cicd.conftest import Repository
+from tests.cicd.conftest import environment
+
+pytestmark = pytest.mark.cicd
 
 
 def test_latest_version_should_return_production_tag_when_candidate_is_nearer(
@@ -135,7 +149,7 @@ def test_latest_version_should_exclude_alpha_and_beta_from_production(
     assert result.stdout.strip() == "v0.14.0"
 
 
-def test_latest_version_should_return_nearest_tag_when_channel_is_any(
+def test_latest_version_should_return_the_highest_tag_when_channel_is_any(
     repository, script
 ):
     """Test the unscoped lookup.
@@ -145,7 +159,7 @@ def test_latest_version_should_return_nearest_tag_when_channel_is_any(
     When:
         The any channel is queried.
     Then:
-        It should return the nearest tag of either channel.
+        It should return the highest tag of either channel.
     """
     # Arrange
     repository.commit()
@@ -192,7 +206,7 @@ def test_latest_version_should_return_zero_version_when_repository_has_no_tags(
     Given:
         A repository with a commit and no tags.
     When:
-        Any channel is queried.
+        Each channel is queried.
     Then:
         It should return the zero version.
     """
@@ -276,10 +290,14 @@ def test_latest_version_should_return_the_highest_reachable_tag(repository, scri
     repository.checkout("master")
     repository.merge("feature")
 
+    # Act
+    # git describe ties these two and resolves the tie itself; see
+    # latest-version.sh for why that metric is not the one used.
+    result = script("latest-version.sh", "production")
+
     # Assert
-    # Commit distance ranks v0.13.1 nearer here, and bumping it would
-    # publish a version below one already released.
-    assert script("latest-version.sh", "production").stdout.strip() == "v0.14.0"
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "v0.14.0"
 
 
 def test_latest_version_should_return_the_highest_candidate_when_cycles_are_two_digit(
@@ -299,8 +317,12 @@ def test_latest_version_should_return_the_highest_candidate_when_cycles_are_two_
         repository.commit()
         repository.tag(tag)
 
+    # Act
+    result = script("latest-version.sh", "candidate")
+
     # Assert
-    assert script("latest-version.sh", "candidate").stdout.strip() == "v0.15.0-rc10"
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "v0.15.0-rc10"
 
 
 def test_latest_version_should_rank_a_release_above_its_candidate(repository, script):
@@ -319,8 +341,12 @@ def test_latest_version_should_rank_a_release_above_its_candidate(repository, sc
     repository.commit()
     repository.tag("v0.15.0")
 
+    # Act
+    result = script("latest-version.sh", "any")
+
     # Assert
-    assert script("latest-version.sh", "any").stdout.strip() == "v0.15.0"
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "v0.15.0"
 
 
 def test_latest_version_should_resolve_both_channels_when_one_commit_carries_both(
@@ -340,21 +366,32 @@ def test_latest_version_should_resolve_both_channels_when_one_commit_carries_bot
     repository.tag("v0.16.0")
     repository.tag("v0.16.0-rc9")
 
+    # Act
+    production = script("latest-version.sh", "production")
+    candidate = script("latest-version.sh", "candidate")
+
     # Assert
-    assert script("latest-version.sh", "production").stdout.strip() == "v0.16.0"
-    assert script("latest-version.sh", "candidate").stdout.strip() == "v0.16.0-rc9"
+    assert production.stdout.strip() == "v0.16.0"
+    assert candidate.stdout.strip() == "v0.16.0-rc9"
 
 
-@pytest.mark.parametrize("channel", ["production", "candidate", "any"])
+@pytest.mark.parametrize(
+    ("channel", "expected"),
+    [
+        ("production", "v0.14.0"),
+        ("candidate", "v0.15.0-rc2"),
+        ("any", "v0.15.0-rc2"),
+    ],
+)
 def test_latest_version_should_ignore_tags_that_are_not_versions(
-    repository, script, channel
+    repository, script, channel, expected
 ):
     """Test the lookup against tags outside the versioning scheme.
 
     Given:
         Non-version tags nearer than the version tags.
     When:
-        Any channel is queried.
+        Each channel is queried.
     Then:
         It should never return a non-version tag.
     """
@@ -372,7 +409,7 @@ def test_latest_version_should_ignore_tags_that_are_not_versions(
     result = script("latest-version.sh", channel)
 
     # Assert
-    assert result.stdout.strip() in {"v0.14.0", "v0.15.0-rc2"}
+    assert result.stdout.strip() == expected
 
 
 def test_latest_version_should_exit_nonzero_when_the_ref_cannot_be_resolved(
@@ -395,7 +432,7 @@ def test_latest_version_should_exit_nonzero_when_the_ref_cannot_be_resolved(
     result = script("latest-version.sh", "production", "origin/master")
 
     # Assert
-    # Reporting v0.0.0 here would bump to v0.0.1 and publish it.
+    # See latest-version.sh for what a silent v0.0.0 would publish.
     assert result.returncode != 0
     assert "origin/master" in result.stderr
 
@@ -408,7 +445,7 @@ def test_latest_version_should_exit_nonzero_when_run_outside_a_repository(
     Given:
         A working directory that is not a git repository.
     When:
-        Any channel is queried.
+        Each channel is queried.
     Then:
         It should exit non-zero rather than report the zero version.
     """
@@ -445,3 +482,84 @@ def test_latest_version_should_exit_nonzero_when_given_extra_arguments(
     # Assert
     assert result.returncode != 0
     assert "[REF=HEAD]" in result.stderr
+
+
+#: The channel each generated tag shape belongs to.
+_CHANNELS = {
+    "production": lambda cycle: cycle is None,
+    "candidate": lambda cycle: cycle == "rc",
+    "any": lambda cycle: True,
+}
+
+
+@st.composite
+def _tags(draw):
+    """Draw a set of version tags of the shapes the release tooling emits."""
+    versions = draw(
+        st.lists(
+            st.tuples(
+                st.integers(min_value=0, max_value=9),
+                st.integers(min_value=0, max_value=9),
+                st.integers(min_value=0, max_value=9),
+                st.sampled_from([None, "a", "b", "rc"]),
+                st.integers(min_value=0, max_value=11),
+            ),
+            max_size=6,
+        )
+    )
+    tags = {}
+    for major, minor, patch, cycle, number in versions:
+        if cycle:
+            tags[f"v{major}.{minor}.0-{cycle}{number}"] = cycle
+        else:
+            tags[f"v{major}.{minor}.{patch}"] = None
+    return tags
+
+
+# Each example needs a repository of its own: a function-scoped fixture is
+# shared across a test's examples, so tags from one would survive into the
+# next. The deadline is lifted because every example forks git.
+@settings(
+    max_examples=25,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+)
+@given(channel=st.sampled_from(sorted(_CHANNELS)), tags=_tags())
+def test_latest_version_should_return_the_highest_tag_of_the_channel(
+    tmp_path, channel, tags
+):
+    """Test the selection invariant the release lookup rests on.
+
+    Given:
+        Any set of version tags on one lineage, and any channel.
+    When:
+        That channel is queried.
+    Then:
+        It should return the channel's highest tag, or the zero version.
+    """
+    # Arrange
+    repository = Repository(tmp_path / f"repository-{uuid.uuid4().hex}")
+    repository.path.mkdir()
+    repository.git("init", "--initial-branch", "master")
+    repository.git("config", "user.email", "tests@wool.io")
+    repository.git("config", "user.name", "Tests")
+    # An unborn HEAD is an unresolvable ref, which the lookup rejects; a
+    # repository being released always has a commit.
+    repository.commit()
+    for tag in tags:
+        repository.commit()
+        repository.tag(tag)
+    members = [tag for tag, cycle in tags.items() if _CHANNELS[channel](cycle)]
+
+    # Act
+    result = subprocess.run(
+        (str(SCRIPTS / "latest-version.sh"), channel),
+        capture_output=True,
+        cwd=repository.path,
+        env=environment(repository.path),
+        text=True,
+    )
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == max(members, key=Version, default="v0.0.0")
