@@ -1,6 +1,8 @@
 import copy
 import gc
 import pickle
+import subprocess
+import sys
 import uuid
 
 import cloudpickle
@@ -11,6 +13,7 @@ from hypothesis import strategies as st
 
 import wool
 from tests.helpers import scoped_context
+from tests.runtime.context import _finalizer_reentry_probe
 from wool.runtime.context.token import Token
 from wool.runtime.context.token import dead_token_ids
 from wool.runtime.context.token import token_sink
@@ -27,6 +30,11 @@ loads = cloudpickle.loads
 # Sentinel distinguishing "the variable was never set" from a drawn prior
 # value of None in the roundtrip property below.
 _UNSET = object()
+
+#: Wall-clock bound on the out-of-process finalizer probe. Generous enough to
+#: absorb interpreter startup on a loaded CI runner, while still turning a
+#: re-entrant registry deadlock into a bounded failure.
+_PROBE_TIMEOUT = 60
 
 
 def _unique(stem: str) -> str:
@@ -487,6 +495,21 @@ def test_token_sink_should_scope_wire_token_capture_to_the_decode():
     assert not any(outside is captured for captured in collected)
 
 
+def test_dead_token_ids_should_return_empty_when_given_no_ids():
+    """Test dead_token_ids over no ids returns an empty set.
+
+    Given:
+        No token ids — the degenerate empty input the reap passes on every
+        mount of a chain that carries no spent tokens.
+    When:
+        dead_token_ids is queried with an empty iterable.
+    Then:
+        It should return an empty frozenset without error.
+    """
+    # Arrange, act, & assert
+    assert dead_token_ids(frozenset()) == frozenset()
+
+
 def test_dead_token_ids_should_report_only_ids_with_no_live_instance():
     """Test dead_token_ids returns exactly the ids whose tokens are gone.
 
@@ -522,16 +545,140 @@ def test_dead_token_ids_should_report_only_ids_with_no_live_instance():
         assert isinstance(held, Token)  # keep the held instance alive
 
 
-def test_dead_token_ids_should_return_empty_when_given_no_ids():
-    """Test dead_token_ids over no ids returns an empty set.
+def test_dead_token_ids_should_not_report_an_id_when_a_round_trip_clone_lives():
+    """Test a shared id stays live while one of its two instances survives.
 
     Given:
-        No token ids — the degenerate empty input the reap passes on every
-        mount of a chain that carries no spent tokens.
+        A set token and its dispatch round-trip clone — two instances sharing
+        one id — with the original dropped and collected, leaving the clone's
+        instance the only live one.
     When:
-        dead_token_ids is queried with an empty iterable.
+        dead_token_ids is queried with the shared id.
     Then:
-        It should return an empty frozenset without error.
+        It should report nothing dead — releasing one instance decrements the
+        id's count without zeroing it, so a surviving instance is never reaped
+        out from under a caller that can still reset or forward it.
     """
-    # Arrange, act, & assert
-    assert dead_token_ids(frozenset()) == frozenset()
+    # Arrange
+    var = ContextVar(_unique("clone_liveness"))
+    key = (var.namespace, var.name)
+    with scoped_context():
+        origin = var.set("x")
+        token_id = next(iter(wool.__chain__.get().to_manifest().unspent_tokens[key]))
+        clone = loads(dumps(origin))
+        del origin
+        gc.collect()
+
+        # Act
+        result = dead_token_ids({token_id})
+
+        # Assert
+        assert result == frozenset()
+        assert isinstance(clone, Token)  # keep the surviving instance alive
+
+
+def test_dead_token_ids_should_report_every_id_when_many_released_at_once():
+    """Test one query applies every release queued since the previous query.
+
+    Given:
+        Eight live token instances under one key, their ids read from the
+        public chain manifest, all dropped and collected together with no
+        registration in between.
+    When:
+        dead_token_ids is queried once with all eight ids.
+    Then:
+        It should report every one of them dead — a query applies the whole
+        backlog of releases, so a batch of collections cannot strand ids in the
+        ledger for the life of the chain.
+    """
+    # Arrange
+    var = ContextVar(_unique("release_backlog"))
+    key = (var.namespace, var.name)
+    with scoped_context():
+        tokens = [var.set(value) for value in range(8)]
+        token_ids = wool.__chain__.get().to_manifest().unspent_tokens[key]
+        assert len(token_ids) == len(tokens), (
+            "the manifest yielded no ids, which would vacate the assertion below"
+        )
+        tokens.clear()
+        gc.collect()
+
+        # Act
+        result = dead_token_ids(token_ids)
+
+        # Assert
+        assert result == token_ids
+
+
+@settings(max_examples=25, deadline=None)
+@given(instances=st.integers(min_value=1, max_value=6), data=st.data())
+def test_dead_token_ids_should_report_a_shared_id_only_when_no_instance_lives(
+    instances, data
+):
+    """Test a shared id is reported dead exactly when its last instance goes.
+
+    Given:
+        Any number of instances of one token id — an origin plus dispatch
+        round-trip clones — of which any number are dropped and collected.
+    When:
+        dead_token_ids is queried with the shared id.
+    Then:
+        It should report the id dead if and only if every instance was
+        released, since a deferred release may leave a count too high between
+        drains but never too low.
+    """
+    # Arrange
+    released = data.draw(st.integers(min_value=0, max_value=instances))
+    var = ContextVar(_unique("shared_id_liveness"))
+    key = (var.namespace, var.name)
+    with scoped_context():
+        origin = var.set("x")
+        token_id = next(iter(wool.__chain__.get().to_manifest().unspent_tokens[key]))
+        payload = dumps(origin)
+        live = [origin] + [loads(payload) for _ in range(instances - 1)]
+        del origin
+        del live[:released]
+        gc.collect()
+
+        # Act
+        result = dead_token_ids({token_id})
+
+        # Assert
+        assert (result == frozenset({token_id})) is (released == instances)
+        assert len(live) == instances - released  # keep the survivors alive
+
+
+@pytest.mark.subprocess_probe
+def test_dead_token_ids_should_report_an_id_when_released_inside_a_registration():
+    """Test a release firing inside a registration is neither blocked nor lost.
+
+    Given:
+        A token whose last reference is dropped from inside the registry's
+        read-modify-write for another token's registration, so its finalizer
+        runs on the registering thread while the registry is mid-update.
+    When:
+        dead_token_ids is queried for the dropped token's id.
+    Then:
+        It should report the id dead within the bound — a finalizer must never
+        wait on the thread that is already registering, and deferring its
+        decrement must not drop it.
+    """
+    # Arrange
+    probe = _finalizer_reentry_probe.__file__
+
+    # Act & assert
+    try:
+        result = subprocess.run(
+            [sys.executable, probe],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"token registration did not complete within {_PROBE_TIMEOUT}s: a "
+            "finalizer firing inside the token registry's critical section "
+            "blocked the registering thread"
+        )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout

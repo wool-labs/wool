@@ -101,6 +101,7 @@ faulthandler_timeout = 300
 markers = [
     "integration: end-to-end integration tests against real WorkerPool",
     "stdlib_parity: stdlib contextvars propagation parity pins",
+    "subprocess_probe: unit regressions that spawn an interpreter to contain a hang",
 ]
 
 [tool.ruff]
