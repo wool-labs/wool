@@ -112,7 +112,13 @@ class ResourcePool(Generic[T]):
     :param factory:
         Function to create new objects (sync or async).
     :param finalizer:
-        Optional cleanup function (sync or async).
+        Optional cleanup function (sync or async). It runs while the pool
+        holds its internal lock, so it must not await `acquire`,
+        `release`, `expire` or `clear` — those take the same lock and the
+        call deadlocks; the read-only members are lock-free and safe. An
+        `Exception` it raises is suppressed, a `BaseException` propagates
+        to whichever operation ran the finalizer, and the entry is
+        evicted either way.
     :param ttl:
         Time-to-live in seconds after last reference is released.
     """
@@ -338,8 +344,10 @@ class ResourcePool(Generic[T]):
         Release a reference to the cached object.
 
         Decrements reference count. If count reaches 0, schedules cleanup
-        after TTL expires (if TTL > 0). Releasing a key that is not
-        cached is a silent no-op.
+        after TTL expires (if TTL > 0); an entry retired by `expire` is
+        finalized here rather than deferred — see `expire` for the
+        retirement contract. Releasing a key that is not cached is a
+        silent no-op.
 
         :param key:
             The cache key.
@@ -357,16 +365,9 @@ class ResourcePool(Generic[T]):
             entry.reference_count -= 1
 
             if entry.reference_count <= 0:
-                if entry.doomed:
-                    # An entry expired while still referenced, whose last
-                    # reference just drained. Spawn the cleanup rather than
-                    # awaiting it here: the finalizer can be a real teardown
-                    # (closing a gRPC channel) and release sits on the
-                    # caller's unwind path, so it must not run while this
-                    # holds the pool lock. Same path a TTL expiry takes.
-                    self._expire(key)
-                elif self._ttl <= 0:
-                    # No TTL to defer to, so finalize inline.
+                if entry.doomed or self._ttl <= 0:
+                    # Inline rather than a spawned task: with nothing to
+                    # defer to, a task spawned here may never be run.
                     await self._cleanup(key)
                 else:
                     # Defer cleanup with a plain timer rather than a
@@ -386,13 +387,14 @@ class ResourcePool(Generic[T]):
         the reference count callers hold through `acquire` and `release`.
         An unreferenced entry, including one already idling out its TTL,
         is finalized immediately; a referenced entry is marked and
-        finalized when its last reference is released, so in-flight users
-        always drain first. Re-acquiring a marked entry before that
-        release clears the mark — re-access resurrects, matching the
-        pool's timer-cancellation semantics. Unlike `clear`, which tears
-        the whole pool down regardless of reference count, this never
-        finalizes a resource out from under an active reference. Expiring
-        a key that is not cached is a silent no-op.
+        finalized by the release that drops its last reference, before
+        that release returns, so in-flight users always drain first.
+        Re-acquiring a marked entry before that release clears the mark —
+        re-access resurrects, matching the pool's timer-cancellation
+        semantics. Unlike `clear`, which tears the whole pool down
+        regardless of reference count, this never finalizes a resource out
+        from under an active reference. Expiring a key that is not cached
+        is a silent no-op.
 
         :param key:
             The cache key to expire.
