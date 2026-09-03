@@ -19,6 +19,8 @@ import wool
 from wool import protocol
 from wool.protocol import WorkerStub
 from wool.protocol import add_WorkerServicer_to_server
+from wool.runtime.discovery import __subscriber_pool__
+from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
 from wool.runtime.worker.interceptor import VersionInterceptor
@@ -1622,8 +1624,9 @@ class TestWorkerService:
             within the test's budget — operator-preempt cancels the
             worker driver task on its loop, propagating cancellation
             into the routine's `asyncio.sleep`. The service
-            should signal stopped state and call
-            `proxy_pool.clear`.
+            should signal stopped state and schedule
+            `proxy_pool.clear` on the worker loop before that loop
+            stops.
         """
         global _stop_cancellation_observed, _stop_routine_started
         _stop_cancellation_observed = threading.Event()
@@ -1682,6 +1685,15 @@ class TestWorkerService:
             assert isinstance(stop_result, protocol.Void)
             assert grpc_servicer.stopping.is_set()
             assert grpc_servicer.stopped.is_set()
+            # ``timeout=0`` does not join the worker thread, so the clear
+            # scheduled on the worker loop may land a step after the
+            # routine observes its cancellation; wait for it rather than
+            # racing it.
+            deadline = loop.time() + 5.0
+            while (
+                mock_worker_proxy_cache.clear.call_count == 0 and loop.time() < deadline
+            ):
+                await asyncio.sleep(0.01)
             mock_worker_proxy_cache.clear.assert_called_once()
         finally:
             _stop_cancellation_observed = None
@@ -2004,17 +2016,20 @@ class TestWorkerService:
             assert service.stopped.is_set()
 
     @pytest.mark.asyncio
-    async def test_stop_should_signal_stopped_when_idle(
+    async def test_stop_should_signal_stopped_without_clearing_proxy_pool_when_idle(
         self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache
     ):
-        """Test `WorkerService` stop method gracefully shuts down.
+        """Test `WorkerService` stop with no worker loop leaves the pool alone.
 
         Given:
-            A running `WorkerService` with no active tasks
+            A running `WorkerService` that has never serviced a dispatch,
+            so no worker loop exists
         When:
             stop RPC is called
         Then:
-            It should signal stopped state and call proxy_pool.clear()
+            It should signal stopped state and leave `proxy_pool.clear`
+            uncalled: the pool is bound to no loop, and there is no
+            worker loop on which its proxies could be finalized
         """
         # Arrange
         stop_request = protocol.StopRequest(timeout=10)
@@ -2027,8 +2042,7 @@ class TestWorkerService:
         assert isinstance(stop_result, protocol.Void)
         assert grpc_servicer.stopping.is_set()
         assert grpc_servicer.stopped.is_set()
-        # Assert proxy_pool.clear() was called
-        mock_worker_proxy_cache.clear.assert_called_once()
+        mock_worker_proxy_cache.clear.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stop_should_return_immediately_when_already_stopping(
@@ -2326,6 +2340,138 @@ class TestWorkerService:
             "the idle TTL elapses; it is still alive, so the positive "
             "TTL did not finalize the idle loop"
         )
+
+    @pytest.mark.asyncio
+    async def test_stop_should_clear_proxy_pool_on_worker_loop_when_warm(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+    ):
+        """Test `WorkerService.stop` clears the proxy pool on the loop that owns it.
+
+        Given:
+            A `WorkerService` that has serviced a dispatch, leaving one
+            worker event-loop warm on a daemon thread, and a proxy pool
+            whose ``clear`` records the thread it runs on
+        When:
+            The stop RPC is invoked with a positive timeout
+        Then:
+            It should call ``clear`` exactly once, on the worker loop's
+            daemon thread -- the loop the pool is bound to -- before that
+            loop is stopped
+        """
+        # Arrange
+        cleared_on: list[str] = []
+
+        async def record_thread():
+            cleared_on.append(threading.current_thread().name)
+
+        mock_worker_proxy_cache.clear = mocker.AsyncMock(side_effect=record_thread)
+        wool_task = make_task(_worker_loop_identity_probe)
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+            _, _, worker_thread_name = cloudpickle.loads(result.result.dump)
+            stop_result = await asyncio.wait_for(
+                stub.stop(protocol.StopRequest(timeout=5)), 10
+            )
+
+        # Assert
+        assert isinstance(stop_result, protocol.Void)
+        assert grpc_servicer.stopped.is_set()
+        assert cleared_on == [worker_thread_name]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_clear_proxy_pool_when_idle_worker_loop_expires(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test retiring an idle worker loop finalizes the proxy pool bound to it.
+
+        Given:
+            A `WorkerService` whose loop pool holds one worker loop warm
+            for a short idle TTL after a dispatch
+        When:
+            The idle TTL elapses with no further dispatch and no stop RPC
+        Then:
+            It should call ``proxy_pool.clear`` once as part of retiring
+            the loop, so no proxy bound to the retired loop is handed to
+            the next one
+        """
+        # Arrange
+        mocker.patch("wool.runtime.worker.service._WORKER_LOOP_TTL", 0.2)
+        service = WorkerService()
+        wool_task = make_task(_worker_loop_identity_probe)
+
+        # Act
+        async with grpc_aio_stub(servicer=service) as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.0
+            while (
+                mock_worker_proxy_cache.clear.call_count == 0 and loop.time() < deadline
+            ):
+                await asyncio.sleep(0.05)
+
+        # Assert
+        mock_worker_proxy_cache.clear.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_should_clear_subscriber_pool_when_warm(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+    ):
+        """Test `WorkerService.stop` clears the subscriber pool on the worker loop.
+
+        Given:
+            A `WorkerService` that has serviced a dispatch, leaving a warm
+            worker loop, and a discovery subscriber pool set in the
+            service's context
+        When:
+            The stop RPC is invoked with a positive timeout
+        Then:
+            It should call the subscriber pool's ``clear`` exactly once
+            while retiring the worker loop
+        """
+        # Arrange
+        subscriber_pool = mocker.MagicMock(spec=ResourcePool)
+        subscriber_pool.clear = mocker.AsyncMock()
+        token = __subscriber_pool__.set(subscriber_pool)
+        wool_task = make_task(_worker_loop_identity_probe)
+        try:
+            # Act
+            async with grpc_aio_stub() as stub:
+                stream = stub.dispatch()
+                await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+                await stream.done_writing()
+                ack, result = [r async for r in stream]
+                assert ack.HasField("ack")
+                assert result.HasField("result")
+                stop_result = await asyncio.wait_for(
+                    stub.stop(protocol.StopRequest(timeout=5)), 10
+                )
+
+            # Assert
+            assert isinstance(stop_result, protocol.Void)
+            assert grpc_servicer.stopped.is_set()
+            subscriber_pool.clear.assert_called_once()
+        finally:
+            __subscriber_pool__.reset(token)
 
     @pytest.mark.asyncio
     async def test_dispatch_should_yield_results_in_order_when_async_generator(
@@ -4883,54 +5029,62 @@ class TestWorkerService:
             assert exc_info.value.code() == StatusCode.UNAVAILABLE
 
     @pytest.mark.asyncio
-    async def test_stop_should_set_stopped_when_proxy_pool_clear_raises(
-        self, grpc_aio_stub, mocker: MockerFixture
+    async def test_stop_should_set_stopped_and_log_when_proxy_pool_clear_raises(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        caplog,
     ):
-        """Test `WorkerService.stop` still sets
-        `stopped` when the proxy-pool's ``clear`` coroutine
-        raises — the loop-pool clear runs in the ``finally``.
+        """Test `WorkerService.stop` survives a failing proxy-pool clear.
 
         Given:
-            A `WorkerService.stop` invocation while the
-            proxy-pool ``clear`` coroutine raises
+            A `WorkerService` that has serviced one dispatch, leaving a
+            warm worker loop, while the proxy-pool ``clear`` coroutine
+            raises
         When:
-            The stop RPC is invoked
+            The stop RPC is invoked with a positive timeout
         Then:
-            It should still set ``stopped`` (the loop-pool clear runs
-            in the ``finally``); the raised proxy-pool exception
-            surfaces to the caller.
+            It should return ``Void`` rather than an ``RpcError``, set
+            ``stopping`` and ``stopped``, call ``clear`` once on the
+            worker loop, and log the failure at WARNING from
+            ``wool.runtime.worker.service`` so the loop still stops
         """
-        from wool.runtime.resourcepool import ResourcePool
-
         # Arrange
-        mock_pool = mocker.MagicMock(spec=ResourcePool)
-        mock_pool.clear = mocker.AsyncMock(
+        mock_worker_proxy_cache.clear = mocker.AsyncMock(
             side_effect=RuntimeError("synthetic proxy-pool clear failure")
         )
-        token = wool.__proxy_pool__.set(mock_pool)
 
-        service = WorkerService()
+        async def sample_task():
+            return "ok"
 
-        try:
-            # Act & assert — the proxy-pool exception propagates
-            # through the gRPC layer; the caller observes an
-            # ``RpcError`` while the underlying service still
-            # transitioned to stopped.
-            async with grpc_aio_stub(servicer=service) as stub:
-                with pytest.raises(grpc.RpcError):
-                    await asyncio.wait_for(
-                        stub.stop(protocol.StopRequest(timeout=0)),
-                        timeout=2,
-                    )
+        wool_task = make_task(sample_task)
 
-            # Assert — stopped event is set even when proxy-pool
-            # clear raised, because the finally-block always runs
-            # the loop-pool clear and sets the event.
-            assert service.stopping.is_set()
-            assert service.stopped.is_set()
-            mock_pool.clear.assert_called_once()
-        finally:
-            wool.__proxy_pool__.reset(token)
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+            with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.service"):
+                stop_result = await asyncio.wait_for(
+                    stub.stop(protocol.StopRequest(timeout=5)), timeout=10
+                )
+
+        # Assert
+        assert isinstance(stop_result, protocol.Void)
+        assert grpc_servicer.stopping.is_set()
+        assert grpc_servicer.stopped.is_set()
+        mock_worker_proxy_cache.clear.assert_called_once()
+        assert any(
+            record.name == "wool.runtime.worker.service"
+            and record.levelno == logging.WARNING
+            and "proxy pool" in record.getMessage()
+            for record in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_dispatch_should_ship_synthesized_runtime_error_when_routine_exception_unpicklable(  # noqa: E501

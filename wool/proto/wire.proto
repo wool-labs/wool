@@ -168,6 +168,16 @@ message WorkerMetadata {
     // gRPC channel configuration advertised by the worker.
     // Clients use these settings when connecting to this worker.
     ChannelOptions connection = 8;
+
+    // Logical workload identity this worker claims, carried as a name
+    // in its certificate's subject alternative names. Empty when the
+    // worker declares none, including on records published by versions
+    // predating this field.
+    //
+    // The advertisement selects which name a connecting peer verifies
+    // this worker against; it never widens what that peer accepts. A
+    // forged claim only causes a pin that the handshake then fails.
+    string identity = 9;
 }
 
 message ChannelOptions {

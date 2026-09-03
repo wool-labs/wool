@@ -6,12 +6,15 @@ subprocess overhead and ensure deterministic behavior.
 """
 
 import asyncio
+import functools
 import logging
 import os
 import time
 import uuid
+import warnings
 from contextlib import AsyncExitStack
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import partial
 from types import MappingProxyType
 from typing import cast
@@ -31,9 +34,11 @@ from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
+from wool.runtime.worker import pool as pool_module
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.metadata import WorkerMetadata
+from wool.runtime.worker.pool import IneffectiveIdentityWarning
 from wool.runtime.worker.pool import IneffectiveLeaseWarning
 from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.proxy import IneffectiveQuorumTimeoutWarning
@@ -117,6 +122,23 @@ class _FakePublisher:
         self.publish = mocker.AsyncMock()
 
 
+def _declaring_factory(*tags: str, credentials=None, host, identity=None):
+    """A worker factory declaring a keyword-only ``identity``; never invoked."""
+    raise AssertionError("factory should never be called")
+
+
+def _closure_factory(*tags: str, credentials=None, host):
+    """A worker factory owning what its workers advertise; never invoked."""
+    raise AssertionError("factory should never be called")
+
+
+class _CallableFactory:
+    """A callable object that owns the identity its workers advertise."""
+
+    def __call__(self, *tags: str, credentials=None, host):
+        raise AssertionError("factory should never be called")
+
+
 class _FakeDiscovery(DiscoveryLike):
     """Custom ``DiscoveryLike`` double for admission-gate pool tests.
 
@@ -154,10 +176,6 @@ class _FakeDiscovery(DiscoveryLike):
 class TestWorkerPool:
     """Test suite for WorkerPool orchestration."""
 
-    # =========================================================================
-    # Constructor Tests
-    # =========================================================================
-
     def test___init___uses_cpu_count_as_default_spawn(self, mocker: MockerFixture):
         """Test successfully create a pool using CPU count.
 
@@ -169,7 +187,7 @@ class TestWorkerPool:
             It should successfully create a pool using CPU count
         """
         # Arrange
-        mock_cpu_count = mocker.patch("os.cpu_count", return_value=4)
+        mock_cpu_count = mocker.patch.object(os, "cpu_count", return_value=4)
 
         # Act
         pool = WorkerPool()
@@ -177,6 +195,614 @@ class TestWorkerPool:
         # Assert
         assert isinstance(pool, WorkerPool)
         mock_cpu_count.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            lambda: _closure_factory,
+            lambda: lambda *tags, credentials=None, host: None,
+            lambda: _CallableFactory(),
+        ],
+        ids=["closure", "lambda", "callable-class"],
+    )
+    def test___init___should_warn_when_identity_cannot_reach_the_factory(
+        self, build, worker_credentials
+    ):
+        """Test a factory owning its identity leaves the pool's value unused.
+
+        Given:
+            An identity and a worker factory that cannot accept an
+            identity keyword — a closure, a lambda, or a callable class.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should construct and warn that the value cannot be
+            delivered, which is the only thing a signature proves.
+        """
+        # Act & assert
+        with pytest.warns(IneffectiveIdentityWarning, match="cannot accept"):
+            WorkerPool(
+                spawn=1,
+                identity="api.svc",
+                credentials=worker_credentials,
+                worker=build(),
+            )
+
+    def test___init___should_warn_when_the_factory_presupplies_an_identity(
+        self, worker_credentials
+    ):
+        """Test a name the factory already bound is reported, not replaced.
+
+        Given:
+            An identity and a partial pre-binding its own identity.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should warn that the factory already binds one, since the
+            pool leaves a value the factory decided for itself alone and
+            its own therefore goes unused.
+        """
+        # Act & assert
+        with pytest.warns(
+            IneffectiveIdentityWarning, match="already binds its own 'identity'"
+        ):
+            WorkerPool(
+                spawn=1,
+                identity="api.svc",
+                credentials=worker_credentials,
+                worker=partial(_declaring_factory, identity="batch.svc"),
+            )
+
+    def test___init___should_not_warn_when_the_factory_absorbs_kwargs(
+        self, worker_credentials
+    ):
+        """Test a ``**kwargs`` factory is passed the identity.
+
+        Given:
+            An identity and a factory absorbing keywords through
+            ``**kwargs``.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should not warn, since the pool demonstrably can pass the
+            value — whether the factory then uses it is not something a
+            signature reveals, so there is nothing to report.
+        """
+        # Act & assert
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", IneffectiveIdentityWarning)
+            WorkerPool(
+                spawn=1,
+                identity="api.svc",
+                credentials=worker_credentials,
+                worker=lambda *tags, credentials=None, **kwargs: None,
+            )
+
+    def test___init___should_raise_when_the_factory_requires_an_identity(
+        self, worker_credentials
+    ):
+        """Test a mandatory identity with none configured fails early.
+
+        Given:
+            A factory requiring an identity keyword, and a pool with no
+            identity configured.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should raise, because the factory cannot be called at all
+            without a value this pool does not have — provable now, and
+            otherwise a TypeError from inside __aenter__.
+        """
+
+        # Arrange
+        def mandatory(*tags, credentials=None, host, identity): ...
+
+        # Act & assert
+        with pytest.raises(ValueError, match="requires an 'identity'"):
+            WorkerPool(spawn=1, credentials=worker_credentials, worker=mandatory)
+
+    def test___init___should_not_warn_when_the_factory_declares_identity(
+        self, worker_credentials
+    ):
+        """Test a declaring factory leaves the pool's value effective.
+
+        Given:
+            An identity, credentials to back it, and a factory
+            declaring a keyword-only identity parameter.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should construct without warning, so the warning above is
+            attributable to the factory owning the identity rather than
+            to any identity being configured.
+        """
+        # Act & assert
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", IneffectiveIdentityWarning)
+            WorkerPool(
+                spawn=1,
+                identity="api.svc",
+                credentials=worker_credentials,
+                worker=_declaring_factory,
+            )
+
+    def test___init___should_not_gate_peers_when_the_factory_owns_the_identity(
+        self, worker_credentials
+    ):
+        """Test the peers self-check is skipped when it cannot predict.
+
+        Given:
+            An ephemeral pool whose peers policy is configured, and a
+            factory that owns the identity its workers advertise.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should construct without warning, rather than refusing a
+            name its workers may never claim or adopting one it cannot
+            deliver: the pool supplies no identity to those workers and
+            cannot predict what they advertise.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", IneffectiveIdentityWarning)
+            pool = WorkerPool(spawn=1, credentials=provider, worker=_closure_factory)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___should_raise_when_a_spawning_pool_advertises_no_identity(
+        self, worker_credentials
+    ):
+        """Test a lone accepted name is not adopted as the identity.
+
+        Given:
+            An ephemeral pool whose peers policy accepts exactly one
+            name, and which configures no identity of its own.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should raise ValueError saying the pool advertises no
+            identity. A policy names which workers this pool's own
+            client will accept, never what its workers claim to be —
+            see `WorkerProxy` for the admission states.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act & assert
+        with pytest.raises(ValueError, match="advertises no identity"):
+            WorkerPool(spawn=1, credentials=provider)
+
+    def test___init___should_warn_when_identity_is_set_on_a_discovery_only_pool(
+        self, mocker: MockerFixture
+    ):
+        """Test an inert identity is reported rather than swallowed.
+
+        Given:
+            A pool attached to a discovery service and spawning no
+            workers of its own, configured with an identity.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should emit an IneffectiveIdentityWarning, since the
+            parameter names what this pool's own workers advertise and
+            this pool starts none.
+        """
+        # Arrange
+        discovery = mocker.MagicMock(spec=DiscoveryLike)
+
+        # Act
+        with pytest.warns(
+            IneffectiveIdentityWarning,
+            match="'identity' has no effect on a pool that spawns no workers",
+        ):
+            pool = WorkerPool(discovery=discovery, identity="api.svc")
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___should_raise_when_an_explicit_none_identity_is_refused(
+        self, worker_credentials
+    ):
+        """Test disclaiming a name is honored rather than filled in.
+
+        Given:
+            An ephemeral pool whose peers policy accepts exactly one
+            name, and an explicit identity of None.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should raise ValueError, since a caller who disclaims a
+            name has stated something the pool must not overwrite with
+            whichever name its policy happens to accept.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act & assert
+        with pytest.raises(ValueError, match="advertises no identity"):
+            WorkerPool(spawn=1, credentials=provider, identity=None)
+
+    def test___init___with_the_canonical_worker_factory_shape(self, worker_credentials):
+        """Test the shape WorkerFactory declares is usable.
+
+        Given:
+            A factory whose signature is exactly what the public
+            WorkerFactory protocol declares -- host and identity both
+            keyword-only with no default -- and a pool configured with
+            an identity.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should construct without warning. Each keyword is probed
+            separately, so neither required parameter may defeat the
+            probe for the other; if it did, the protocol's own canonical
+            shape would be classified as accepting neither keyword.
+        """
+
+        # Arrange
+        def canonical(*tags, credentials=None, host, identity):
+            raise AssertionError("factory should never be called")
+
+        # Act & assert
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", IneffectiveIdentityWarning)
+            WorkerPool(
+                spawn=1,
+                identity="api.svc",
+                credentials=worker_credentials,
+                worker=canonical,
+            )
+
+    def test___init___with_a_factory_requiring_an_unrelated_keyword(self):
+        """Test the diagnostic names the parameter actually at fault.
+
+        Given:
+            A factory requiring a keyword this pool never passes, and
+            which never declares an identity at all.
+        When:
+            WorkerPool is initialized without an identity.
+        Then:
+            It should raise naming that keyword rather than 'identity'.
+            A check that read any binding failure as a missing identity
+            would send the caller to add a parameter their factory does
+            not have.
+        """
+
+        # Arrange
+        def elsewhere(*tags, credentials=None, host, region):
+            raise AssertionError("factory should never be called")
+
+        # Act & assert
+        with pytest.raises(ValueError, match="region") as excinfo:
+            WorkerPool(spawn=1, worker=elsewhere)
+        assert "identity" not in str(excinfo.value)
+
+    def test___init___with_an_explicit_none_identity_and_no_credentials(self):
+        """Test an explicit None needs nothing to back it.
+
+        Given:
+            A spawning pool given identity=None and no credentials.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should construct. Only a name needs a certificate behind
+            it; an explicit None claims nothing.
+        """
+        # Act
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", IneffectiveIdentityWarning)
+            pool = WorkerPool(spawn=1, identity=None)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_an_explicit_none_identity_and_a_mandatory_factory(self):
+        """Test an explicit None satisfies a factory that requires one.
+
+        Given:
+            A factory requiring an identity keyword, and a pool given
+            identity=None.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should construct: None is a value the pool can deliver,
+            and only an unset identity leaves the factory uncallable.
+        """
+
+        # Arrange
+        def mandatory(*tags, credentials=None, host, identity):
+            raise AssertionError("factory should never be called")
+
+        # Act
+        pool = WorkerPool(spawn=1, identity=None, worker=mandatory)
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    def test___init___with_an_explicit_none_identity_and_a_closed_factory(self):
+        """Test an explicit None is still a configured value.
+
+        Given:
+            A pool given identity=None and a factory that cannot accept
+            an identity keyword.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should warn. The warning turns on whether a value was
+            configured, not on whether that value names anything, so
+            passing None deliberately is still reported as undelivered.
+        """
+        # Act & assert
+        with pytest.warns(IneffectiveIdentityWarning, match="cannot accept"):
+            WorkerPool(spawn=1, identity=None, worker=_closure_factory)
+
+    def test___init___with_a_custom_factory_and_a_refusing_peers_policy(
+        self, mocker: MockerFixture, worker_credentials
+    ):
+        """Test the self-check is skipped for a factory the pool does not own.
+
+        Given:
+            An ephemeral pool whose own peers policy refuses its
+            identity, and any custom worker factory.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should construct rather than raise. The pool can only
+            predict what its workers advertise when it owns the factory;
+            with a custom one the prediction is unfounded, so the check
+            is not made. The cost is a startup timeout instead of a
+            construction error, which is the documented trade.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers=["other.svc"])
+
+        # Act
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", IneffectiveIdentityWarning)
+            pool = WorkerPool(
+                spawn=1,
+                identity="api.svc",
+                credentials=provider,
+                worker=_declaring_factory,
+            )
+
+        # Assert
+        assert isinstance(pool, WorkerPool)
+
+    @pytest.mark.parametrize(
+        "spawning",
+        [{}, {"spawn": 1}],
+        ids=["default-mode", "explicit-spawn"],
+    )
+    def test___init___should_raise_when_identity_configured_without_credentials(
+        self, spawning
+    ):
+        """Test a pool that spawns rejects an identity nothing can prove.
+
+        Given:
+            A pool advertising an identity with no credentials behind
+            it, either spawning by default or with a spawn count given.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should raise ValueError at construction, since a name
+            with no certificate proves nothing — and the default mode
+            spawns just as surely as an explicit count, so deferring the
+            failure into a subprocess is no less wrong there.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="identity requires credentials"):
+            WorkerPool(identity="api.svc", **spawning)
+
+    @pytest.mark.parametrize(
+        "spawning",
+        [{}, {"spawn": 1}],
+        ids=["default-mode", "explicit-spawn"],
+    )
+    def test___init___should_raise_when_its_own_policy_refuses_its_workers(
+        self, spawning, worker_credentials
+    ):
+        """Test an ephemeral pool refuses to gate out everything it starts.
+
+        Given:
+            A pool that spawns its own workers and dispatches through
+            them, advertising an identity its own peers policy does not
+            accept, with no discovery service to supply others.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should raise ValueError, since the workers it spawns are
+            the only ones its proxy can ever see and it would refuse
+            every one of them.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act & assert
+        with pytest.raises(ValueError, match="does not accept"):
+            WorkerPool(identity="refused.svc", credentials=provider, **spawning)
+
+    def test___init___should_name_the_absent_identity_when_it_advertises_none(
+        self, worker_credentials
+    ):
+        """Test the diagnostic distinguishes an absent name from a wrong one.
+
+        Given:
+            A pool that spawns, whose peers policy accepts names it
+            does not advertise, and which advertises no identity at all.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should raise ValueError saying the pool advertises no
+            identity, so an operator is not left reading a message
+            about a name that was never set.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(
+            peers={"accepted.svc", "also-accepted.svc"}
+        )
+
+        # Act & assert
+        with pytest.raises(ValueError, match="advertises no identity"):
+            WorkerPool(spawn=1, credentials=provider)
+
+    def test___init___should_warn_when_a_hybrid_pool_refuses_its_workers(
+        self, mocker: MockerFixture, worker_credentials
+    ):
+        """Test a hybrid pool contributing capacity it will not dial warns.
+
+        Given:
+            A pool that spawns workers and also attaches a discovery
+            service, advertising an identity its own peers policy does
+            not accept.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should warn rather than raise, since a hybrid pool may
+            legitimately contribute capacity to a fleet it does not
+            itself dispatch through.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act & assert
+        with pytest.warns(IneffectiveIdentityWarning, match="does not accept"):
+            WorkerPool(
+                spawn=1,
+                identity="refused.svc",
+                credentials=provider,
+                discovery=mocker.MagicMock(),
+            )
+
+    def test___init___should_warn_when_a_hybrid_pool_advertises_no_identity(
+        self, mocker: MockerFixture, worker_credentials
+    ):
+        """Test the absent-identity case warns rather than raises when hybrid.
+
+        Given:
+            A pool that spawns workers and also attaches a discovery
+            service, whose peers policy is configured but which
+            advertises no identity at all.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should warn naming the absent identity rather than
+            raising, since discovery may still supply acceptable workers
+            from elsewhere. This is the arm a single-name policy used to
+            repair silently, so it is what an upgrading caller meets
+            first.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act & assert
+        with pytest.warns(IneffectiveIdentityWarning, match="advertises no identity"):
+            WorkerPool(spawn=1, credentials=provider, discovery=mocker.MagicMock())
+
+    def test___init___should_accept_an_identity_its_own_policy_admits(
+        self, worker_credentials
+    ):
+        """Test the guard is attributable to the mismatch, not the identity.
+
+        Given:
+            A pool that spawns, advertising an identity its own peers
+            policy accepts.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should neither raise nor warn, so the refusals above are
+            caused by the policy mismatch rather than by an identity
+            being configured at all.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act & assert
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", IneffectiveIdentityWarning)
+            WorkerPool(spawn=1, identity="accepted.svc", credentials=provider)
+
+    def test___init___should_not_gate_a_pool_that_spawns_nothing(
+        self, mocker: MockerFixture, worker_credentials
+    ):
+        """Test a pure client is never judged against workers it never starts.
+
+        Given:
+            A pool with a discovery service and no spawn count, so it
+            only dispatches to workers other processes started, whose
+            peers policy would not accept the identity it carries.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should not raise, and the only complaint it makes should
+            be that the parameter is inert — not that its own policy
+            refuses workers it never starts.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", IneffectiveIdentityWarning)
+            WorkerPool(
+                identity="refused.svc",
+                credentials=provider,
+                discovery=mocker.MagicMock(),
+            )
+
+        # Assert
+        assert [str(each.message) for each in caught] == [
+            "'identity' has no effect on a pool that spawns no workers; it "
+            "names what this pool's own workers advertise, and a "
+            "discovery-only pool starts none"
+        ]
+
+    def test___init___should_strip_the_advertised_identity_before_gating(
+        self, worker_credentials
+    ):
+        """Test a padded identity is normalized before its own policy sees it.
+
+        Given:
+            A pool that spawns, advertising an accepted name surrounded
+            by whitespace, whose peers policy names that name.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should construct, since every entry point strips a name
+            the same way and padding cannot decide admission.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act & assert
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", IneffectiveIdentityWarning)
+            WorkerPool(spawn=1, identity="  accepted.svc  ", credentials=provider)
+
+    def test___init___should_treat_a_blank_identity_as_declaring_none(
+        self, worker_credentials
+    ):
+        """Test a whitespace-only identity is no identity at all.
+
+        Given:
+            A pool that spawns, whose peers policy is configured, and
+            which advertises a whitespace-only identity.
+        When:
+            WorkerPool is initialized.
+        Then:
+            It should raise the same refusal as a pool advertising
+            nothing, so a blank name cannot pass for a declared one.
+        """
+        # Arrange
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act & assert
+        with pytest.raises(ValueError, match="advertises no identity"):
+            WorkerPool(spawn=1, identity="   ", credentials=provider)
 
     def test___init___raises_error_when_cpu_count_unavailable(
         self, mocker: MockerFixture
@@ -191,7 +817,7 @@ class TestWorkerPool:
             Should raise ValueError with appropriate message
         """
         # Arrange
-        mock_cpu_count = mocker.patch("os.cpu_count", return_value=None)
+        mock_cpu_count = mocker.patch.object(os, "cpu_count", return_value=None)
 
         # Act & assert
         with pytest.raises(ValueError, match="Unable to determine CPU count"):
@@ -212,7 +838,7 @@ class TestWorkerPool:
             Should raise ValueError indicating CPU count cannot be determined
         """
         # Arrange
-        mocker.patch("os.cpu_count", return_value=None)
+        mocker.patch.object(os, "cpu_count", return_value=None)
 
         # Act & assert
         with pytest.raises(ValueError, match="Unable to determine CPU count"):
@@ -388,7 +1014,7 @@ class TestWorkerPool:
             It should emit a DeprecationWarning and create a valid pool
         """
         # Arrange
-        mocker.patch("os.cpu_count", return_value=4)
+        mocker.patch.object(os, "cpu_count", return_value=4)
 
         # Act
         with pytest.warns(DeprecationWarning, match="'size' parameter is deprecated"):
@@ -479,7 +1105,7 @@ class TestWorkerPool:
             Should use CPU count as the pool spawn count
         """
         # Arrange
-        mock_cpu_count = mocker.patch("os.cpu_count", return_value=8)
+        mock_cpu_count = mocker.patch.object(os, "cpu_count", return_value=8)
 
         # Act
         pool = WorkerPool(spawn=0)
@@ -601,10 +1227,6 @@ class TestWorkerPool:
 
         # Assert
         assert isinstance(pool, WorkerPool)
-
-    # =========================================================================
-    # Credential Passing Tests
-    # =========================================================================
 
     @pytest.mark.asyncio
     async def test_worker_context_with_credentials(
@@ -766,8 +1388,8 @@ class TestWorkerPool:
 
         Given:
             A hybrid pool whose discovery publisher prescribes
-            bind_host="0.0.0.0" and a factory without an explicit
-            host parameter (a MagicMock accepts only **kwargs)
+            bind_host="0.0.0.0" and a factory whose signature has no
+            host parameter at all.
         When:
             A worker is created
         Then:
@@ -776,25 +1398,413 @@ class TestWorkerPool:
         """
         # Arrange
         mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
-        spy_factory = mocker.MagicMock()
-        mock_worker = mocker.MagicMock(spec=LocalWorker)
-        mock_worker.start = mocker.AsyncMock()
-        mock_worker.stop = mocker.AsyncMock()
-        mock_worker.metadata = _make_worker_metadata()
-        spy_factory.return_value = mock_worker
+        received = []
+
+        def bound_factory(*tags, credentials=None):
+            received.append(True)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
 
         # Act
         async with WorkerPool(
             spawn=1,
-            worker=spy_factory,
+            worker=bound_factory,
+            discovery=mock_discovery_service_for_pool,
+        ):
+            pass
+
+        # Assert — the call binding at all is the assertion: a host
+        # argument would have raised TypeError from this signature.
+        assert received == [True]
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_pass_identity_to_a_declaring_factory(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        worker_credentials,
+    ):
+        """Test a factory declaring the parameter receives the identity.
+
+        Given:
+            A pool configured with an identity and a factory declaring a
+            keyword-only identity parameter.
+        When:
+            The pool is entered and a worker is created.
+        Then:
+            It should pass the pool's identity to the factory, so the
+            worker advertises what the pool configured.
+        """
+        # Arrange
+        received = []
+
+        def factory(*tags, credentials=None, host, identity=None):
+            received.append(identity)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            identity="api.svc",
+            credentials=worker_credentials,
+            worker=factory,
+        ):
+            pass
+
+        # Assert
+        assert received == ["api.svc"]
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_forward_the_identity_its_own_policy_admits(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        worker_credentials,
+    ):
+        """Test the name a pool forwards is the one its own gate admits.
+
+        Given:
+            A pool whose peers policy accepts a name, configured with
+            that same name as its identity, and a factory declaring a
+            keyword-only identity parameter.
+        When:
+            The pool is entered and a worker is created.
+        Then:
+            It should hand the factory the name its own policy admits.
+            The construction gate and the forwarding are covered apart
+            from each other elsewhere; this pins them together, so a
+            pool cannot pass its gate and then start workers under a
+            different name.
+        """
+        # Arrange
+        received = []
+
+        def factory(*tags, credentials=None, host, identity=None):
+            received.append(identity)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        provider = worker_credentials.as_provider(peers="accepted.svc")
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            identity="accepted.svc",
+            credentials=provider,
+            worker=factory,
+        ):
+            pass
+
+        # Assert
+        assert received == ["accepted.svc"]
+        assert provider.accepts_peer(received[0])
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_pass_identity_to_the_default_worker(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        worker_credentials,
+    ):
+        """Test the identity reaches LocalWorker when no factory is supplied.
+
+        Given:
+            A pool configured with an identity and no worker argument,
+            so the default LocalWorker applies — the path the
+            construction-time factory check deliberately skips.
+        When:
+            The pool is entered and a worker is created.
+        Then:
+            It should pass the identity to LocalWorker, which declares
+            the keyword, so a pool that names no factory still
+            advertises what it configured.
+        """
+        # Arrange
+        spawned = mocker.patch.object(wp, "LocalWorker", autospec=True)
+        worker = spawned.return_value
+        worker.start = mocker.AsyncMock()
+        worker.stop = mocker.AsyncMock()
+        worker.metadata = _make_worker_metadata()
+
+        # Act
+        async with WorkerPool(
+            spawn=1, identity="api.svc", credentials=worker_credentials
+        ):
+            pass
+
+        # Assert
+        assert spawned.call_args.kwargs["identity"] == "api.svc"
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_pass_identity_to_a_bound_factory(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        worker_credentials,
+    ):
+        """Test a bound factory still receives the identity.
+
+        Given:
+            A pool with an identity and a factory that accepts an
+            identity keyword and declares no host — the shape that owns
+            its binding but not its name, and the one no other test
+            reaches.
+        When:
+            The pool is entered and a worker is created.
+        Then:
+            It should deliver the identity and no host, so a factory can
+            take one of the two keywords without being forced to take
+            both.
+        """
+        # Arrange
+        received = []
+
+        def factory(*tags, credentials=None, identity=None):
+            received.append(identity)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            identity="api.svc",
+            credentials=worker_credentials,
+            worker=factory,
+        ):
+            pass
+
+        # Assert
+        assert received == ["api.svc"]
+
+    @pytest.mark.asyncio
+    async def test___aenter___with_the_canonical_worker_factory_shape(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        mock_discovery_service_for_pool,
+        worker_credentials,
+    ):
+        """Test both keywords reach a factory that requires both.
+
+        Given:
+            A factory whose signature is exactly what the public
+            WorkerFactory protocol declares, with host and identity
+            both required.
+        When:
+            The pool is entered and a worker is created.
+        Then:
+            It should deliver both. Probing either keyword in a way that
+            required the other to be satisfied would classify the shape
+            as taking neither, and the call would then raise for the two
+            arguments it never received.
+        """
+        # Arrange
+        mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
+        received = []
+
+        def canonical(*tags, credentials=None, host, identity):
+            received.append((host, identity))
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            identity="api.svc",
+            credentials=worker_credentials,
+            worker=canonical,
             discovery=mock_discovery_service_for_pool,
         ):
             pass
 
         # Assert
-        spy_factory.assert_called_once()
-        _, kwargs = spy_factory.call_args
-        assert "host" not in kwargs
+        assert received == [("0.0.0.0", "api.svc")]
+
+    @pytest.mark.asyncio
+    async def test___aenter___with_an_explicit_none_identity(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+    ):
+        """Test an explicit None is delivered rather than withheld.
+
+        Given:
+            A pool given identity=None and a factory that accepts the
+            keyword.
+        When:
+            The pool is entered and a worker is created.
+        Then:
+            It should pass identity=None. An explicit None is a value
+            meaning this pool has no name to give, which is a different
+            statement from configuring no identity at all.
+        """
+        # Arrange
+        received = []
+
+        def factory(*tags, credentials=None, host, identity=None):
+            received.append(identity)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(spawn=1, identity=None, worker=factory):
+            pass
+
+        # Assert
+        assert received == [None]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [({}, False), ({"identity": None}, True)],
+        ids=["unset", "explicit-none"],
+    )
+    async def test___aenter___with_an_unset_versus_none_identity(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        configured,
+        expected,
+    ):
+        """Test the two unnamed states differ at the call site.
+
+        Given:
+            A pool with no worker argument, configured either without an
+            identity or with an explicit None.
+        When:
+            The pool is entered and LocalWorker is called.
+        Then:
+            The keyword should be absent in the first case and present
+            as None in the second. Both leave the worker unnamed, so the
+            call itself is where the distinction is observable: an unset
+            identity leaves the name to the factory, while None is the
+            pool stating it has none.
+        """
+        # Arrange
+        spawned = mocker.patch.object(wp, "LocalWorker", autospec=True)
+        worker = spawned.return_value
+        worker.start = mocker.AsyncMock()
+        worker.stop = mocker.AsyncMock()
+        worker.metadata = _make_worker_metadata()
+
+        # Act
+        async with WorkerPool(spawn=1, **configured):
+            pass
+
+        # Assert
+        assert ("identity" in spawned.call_args.kwargs) is expected
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_pass_no_identity_when_the_pool_declares_none(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        worker_credentials,
+    ):
+        """Test a pool without an identity hands the factory no keyword.
+
+        Given:
+            A pool configured with no identity and a factory that would
+            absorb any keyword through **kwargs.
+        When:
+            The pool is entered and a worker is created.
+        Then:
+            It should pass no identity keyword at all, rather than
+            injecting an empty one a factory would have to interpret.
+        """
+        # Arrange
+        received = []
+
+        def sink_factory(*tags, credentials=None, host, **kwargs):
+            received.append(kwargs)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            credentials=worker_credentials,
+            worker=sink_factory,
+        ):
+            pass
+
+        # Assert
+        assert received == [{}]
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_keep_a_presupplied_identity(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        worker_credentials,
+    ):
+        """Test a pre-bound identity is left alone.
+
+        Given:
+            A pool configured with one identity and a factory that
+            pre-supplies a different one through functools.partial.
+        When:
+            The pool is entered and a worker is created.
+        Then:
+            The factory should observe its own, since the pool does not
+            override a value the factory already decided — the same rule
+            that governs host and credentials.
+        """
+        # Arrange
+        received = []
+
+        def factory(*tags, credentials=None, host, identity=None):
+            received.append(identity)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        with pytest.warns(IneffectiveIdentityWarning):
+            pool = WorkerPool(
+                spawn=1,
+                identity="api.svc",
+                credentials=worker_credentials,
+                worker=partial(factory, identity="batch.svc"),
+            )
+        async with pool:
+            pass
+
+        # Assert
+        assert received == ["batch.svc"]
 
     @pytest.mark.asyncio
     async def test_worker_context_with_unbound_factory(
@@ -846,17 +1856,19 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_discovery_service_for_pool,
     ):
-        """Test a kwargs-accepting factory is classified bound.
+        """Test a kwargs-absorbing factory receives the bind host.
 
         Given:
             A hybrid pool whose discovery publisher prescribes
-            bind_host="0.0.0.0" and a factory accepting **kwargs but
-            declaring no explicit host parameter
+            bind_host="0.0.0.0" and a forwarding factory that absorbs
+            keywords through **kwargs.
         When:
             A worker is created
         Then:
-            It should call the factory without a host argument rather
-            than pass a host into a keyword sink.
+            It should receive the publisher host. Withholding it would
+            leave such a factory binding its own default — loopback for
+            `LocalWorker` — making the worker unreachable on a LAN pool
+            that advertises it at a routable address.
         """
         # Arrange
         mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
@@ -879,7 +1891,7 @@ class TestWorkerPool:
             pass
 
         # Assert
-        assert received == [{}]
+        assert received == [{"host": "0.0.0.0"}]
 
     @pytest.mark.asyncio
     async def test_worker_context_with_positional_host_factory(
@@ -889,19 +1901,19 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_discovery_service_for_pool,
     ):
-        """Test a positional host parameter is classified bound.
+        """Test a positional host is passable when no tags are forwarded.
 
         Given:
-            A hybrid pool whose discovery publisher prescribes
-            bind_host="0.0.0.0" and a factory declaring host as a
-            positional-or-keyword parameter rather than keyword-only
+            A hybrid pool with no capability tags, whose discovery
+            publisher prescribes bind_host="0.0.0.0", and a factory
+            declaring host as positional-or-keyword.
         When:
             A worker is created
         Then:
-            It should call the factory without injecting the publisher
-            host — only a keyword-only host opts in — so the factory
-            observes its own default and a positional host cannot
-            collide with a forwarded tag at spawn.
+            It should receive the publisher host, because with no
+            positional forwarded there is nothing for the keyword to
+            collide with. Classification is a property of the call, not
+            of the parameter's kind.
         """
         # Arrange
         mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
@@ -924,7 +1936,7 @@ class TestWorkerPool:
             pass
 
         # Assert
-        assert received == ["127.0.0.1"]
+        assert received == ["0.0.0.0"]
 
     @pytest.mark.asyncio
     async def test_worker_context_with_prebound_partial_factory(
@@ -934,7 +1946,7 @@ class TestWorkerPool:
         mock_worker_proxy,
         mock_discovery_service_for_pool,
     ):
-        """Test a partial pre-supplying host is classified bound.
+        """Test a pre-bound host pins the binding.
 
         Given:
             A hybrid pool whose discovery publisher prescribes
@@ -943,8 +1955,10 @@ class TestWorkerPool:
         When:
             A worker is created
         Then:
-            It should not override the pre-bound value — the factory
-            observes "10.0.0.5".
+            It should observe "10.0.0.5": the factory decided its own
+            binding, and the pool does not override what a factory has
+            already bound — so pinning a host cannot be undone by a
+            publisher that happens to prescribe one.
         """
         # Arrange
         mock_discovery_service_for_pool.publisher.bind_host = "0.0.0.0"
@@ -968,6 +1982,49 @@ class TestWorkerPool:
 
         # Assert
         assert received == ["10.0.0.5"]
+
+    @pytest.mark.asyncio
+    async def test_worker_context_with_prebound_credentials_factory(
+        self,
+        mocker: MockerFixture,
+        mock_shared_memory,
+        mock_worker_proxy,
+        worker_credentials,
+    ):
+        """Test pre-bound credentials are left alone.
+
+        Given:
+            A pool configured with credentials and a factory that
+            pre-supplies different ones through functools.partial.
+        When:
+            The pool is entered and a worker is created.
+        Then:
+            The factory should observe its own, since every keyword the
+            pool forwards is offered on the same terms and a value the
+            factory already bound is one it owns.
+        """
+        # Arrange
+        received = []
+        theirs = replace(worker_credentials, mutual=False)
+
+        def factory(*tags, credentials=None):
+            received.append(credentials)
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+            worker.stop = mocker.AsyncMock()
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            spawn=1,
+            credentials=worker_credentials,
+            worker=partial(factory, credentials=theirs),
+        ):
+            pass
+
+        # Assert
+        assert received == [theirs]
 
     @pytest.mark.asyncio
     async def test_worker_context_with_partial_unbound_factory(
@@ -1282,10 +2339,6 @@ class TestWorkerPool:
         for _, kwargs in wp.LocalWorker.call_args_list:
             assert kwargs["host"] == "127.0.0.1"
 
-    # =========================================================================
-    # Context Manager Lifecycle Tests
-    # =========================================================================
-
     @pytest.mark.asyncio
     async def test___aenter___lifecycle(self, mock_worker_factory):
         """Test workers are started and stopped correctly.
@@ -1585,14 +2638,18 @@ class TestWorkerPool:
         mock_proxy_exit = mocker.AsyncMock(side_effect=OSError("Cleanup error"))
         mock_worker_proxy.__aexit__ = mock_proxy_exit
 
-        # Act - Should not raise exceptions despite cleanup failures
+        # Act
         pool = WorkerPool(spawn=1)
+        raised = None
         try:
             async with pool:
                 pass
-        except OSError:
-            # Expected - cleanup error propagates as it should
-            pass
+        except OSError as error:
+            raised = error
+
+        # Assert — a cleanup failure surfaces as itself rather than
+        # being swallowed or reshaped into a pool-level error.
+        assert raised is None or isinstance(raised, OSError)
 
     @pytest.mark.asyncio
     async def test___aexit___bounds_teardown_when_worker_stop_hangs(
@@ -2481,55 +3538,37 @@ class TestWorkerPool:
             # Assert
             assert pool is not None
 
-    # =========================================================================
-    # Worker Management Tests
-    # =========================================================================
-
+    @pytest.mark.parametrize("spawn", [1, 3, 10])
     @pytest.mark.asyncio
-    async def test_start_creates_workers_spawn_3(self, mock_worker_factory):
-        """Test the pool successfully starts and stops.
+    async def test___aenter___should_start_one_worker_per_spawn(
+        self, spawn, mock_worker_factory
+    ):
+        """Test the pool starts exactly the number of workers configured.
 
         Given:
-            A WorkerPool configured with spawn=3
+            A WorkerPool configured with a spawn count.
         When:
-            The pool is started via context manager
+            The pool is entered.
         Then:
-            The pool successfully starts and stops
+            It should have started exactly that many workers. Asserting
+            the count is what distinguishes this from a pool that starts
+            none: a bare ``pool is not None`` passes either way.
         """
-        # Arrange, act, & assert
-        async with WorkerPool(worker=mock_worker_factory, spawn=3) as pool:
-            # Pool started successfully - this validates workers were created
-            assert pool is not None
+        # Arrange
+        created = []
 
-    @pytest.mark.asyncio
-    async def test_start_with_specific_spawn_1(self, mock_worker_factory):
-        """Test 1 worker is created.
+        @functools.wraps(mock_worker_factory)
+        def recording_factory(*tags, **kwargs):
+            worker = mock_worker_factory(*tags, **kwargs)
+            created.append(worker)
+            return worker
 
-        Given:
-            A WorkerPool configured with spawn=1
-        When:
-            The pool is started
-        Then:
-            1 worker is created
-        """
-        # Arrange, act, & assert
-        async with WorkerPool(worker=mock_worker_factory, spawn=1) as pool:
-            assert pool is not None
+        # Act
+        async with WorkerPool(worker=recording_factory, spawn=spawn):
+            started = [worker.started for worker in created]
 
-    @pytest.mark.asyncio
-    async def test_start_with_specific_spawn_10(self, mock_worker_factory):
-        """Test 10 workers are created.
-
-        Given:
-            A WorkerPool configured with spawn=10
-        When:
-            The pool is started
-        Then:
-            10 workers are created
-        """
-        # Arrange, act, & assert
-        async with WorkerPool(worker=mock_worker_factory, spawn=10) as pool:
-            assert pool is not None
+        # Assert
+        assert started == [True] * spawn
 
     @pytest.mark.asyncio
     async def test_start_with_failing_worker(self, mocker: MockerFixture):
@@ -2658,54 +3697,44 @@ class TestWorkerPool:
         # Context exits cleanly (implicit assertion - no exception raised)
 
     @pytest.mark.asyncio
-    async def test___aenter___preserves_metadata(
+    async def test___aenter___should_collect_metadata_from_every_started_worker(
         self,
         mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
+        mock_worker_factory,
     ):
-        """Test pool context manager should complete successfully.
+        """Test the pool gathers the metadata its workers advertise.
 
         Given:
-            A WorkerPool with workers that have info
+            A WorkerPool over a factory whose workers each carry
+            distinct metadata.
         When:
-            Pool is started
+            The pool is entered.
         Then:
-            Pool context manager should complete successfully
+            Every started worker should expose metadata carrying its own
+            uid, which is what the pool publishes and the proxy admits
+            on. A pool that started workers but gathered nothing would
+            pass a bare liveness check and fail here.
         """
+        # Arrange
+        created = []
+
+        @functools.wraps(mock_worker_factory)
+        def recording_factory(*tags, **kwargs):
+            worker = mock_worker_factory(*tags, **kwargs)
+            created.append(worker)
+            return worker
+
         # Act
-        async with WorkerPool(spawn=2) as pool:
-            assert pool is not None
-            # Pool successfully started and workers are initialized
-            assert isinstance(pool, WorkerPool)
+        async with WorkerPool(worker=recording_factory, spawn=2):
+            metadata = [worker.metadata for worker in created]
 
-    @pytest.mark.asyncio
-    async def test_metadata_collection_after_startup(
-        self,
-        mock_shared_memory,
-        mock_worker_proxy,
-        mock_local_worker,
-        mock_discovery_service,
-    ):
-        """Test pool context manager should complete successfully.
-
-        Given:
-            Workers with various info states
-        When:
-            Pool startup completes
-        Then:
-            Pool context manager should complete successfully
-        """
-        # Act
-        async with WorkerPool(spawn=2) as pool:
-            assert pool is not None
-            # Pool successfully started - workers have been configured
-            assert isinstance(pool, WorkerPool)
-
-    # =========================================================================
-    # Advanced Configuration Tests
-    # =========================================================================
+        # Assert
+        assert len(metadata) == 2
+        assert all(each is not None for each in metadata)
+        assert {each.uid for each in metadata} == {worker.uid for worker in created}
 
     @pytest.mark.asyncio
     async def test___aenter___with_custom_worker_factory(
@@ -2792,10 +3821,6 @@ class TestWorkerPool:
         # Assert: Pool was created successfully
         mock_worker_proxy.__aenter__.assert_called_once()
 
-    # =========================================================================
-    # Concurrency and Performance Tests
-    # =========================================================================
-
     @pytest.mark.asyncio
     async def test_concurrent_start_stop(self, mock_worker_factory):
         """Test the pool handles concurrent operations correctly.
@@ -2808,14 +3833,23 @@ class TestWorkerPool:
             The pool handles concurrent operations correctly
         """
         # Arrange
-        pool = WorkerPool(worker=mock_worker_factory, spawn=2)
+        created = []
 
-        # Act - Start pool
+        @functools.wraps(mock_worker_factory)
+        def recording_factory(*tags, **kwargs):
+            worker = mock_worker_factory(*tags, **kwargs)
+            created.append(worker)
+            return worker
+
+        pool = WorkerPool(worker=recording_factory, spawn=2)
+
+        # Act
         async with pool:
-            # Pool is running
-            pass
+            running = [worker.started for worker in created]
 
-        # Assert - pool lifecycle completes without deadlock
+        # Assert
+        assert running == [True, True]
+        assert [worker.started for worker in created] == [False, False]
 
     @pytest.mark.asyncio
     async def test___aenter___concurrent_operations(
@@ -2909,10 +3943,6 @@ class TestWorkerPool:
         startup_time = end_time - start_time
         assert startup_time < 1.0
 
-    # =========================================================================
-    # Constructor Overload Coverage Tests
-    # =========================================================================
-
     @pytest.mark.asyncio
     async def test_hybrid_mode_spawn_and_discovery(
         self,
@@ -2960,7 +3990,7 @@ class TestWorkerPool:
             Should use CPU count for worker spawn count
         """
         # Arrange
-        mocker.patch("os.cpu_count", return_value=4)
+        mocker.patch.object(os, "cpu_count", return_value=4)
         discovery_service = mock_discovery_service_for_pool
 
         # Act
@@ -3012,7 +4042,7 @@ class TestWorkerPool:
             Should use CPU count as default spawn count
         """
         # Arrange - This tests the (None, None) case at line 297
-        mocker.patch("os.cpu_count", return_value=8)
+        mocker.patch.object(os, "cpu_count", return_value=8)
 
         # Act
         async with WorkerPool() as pool:
@@ -3065,7 +4095,7 @@ class TestWorkerPool:
             Should use CPU count for worker spawn count
         """
         # Arrange - Tests spawn=0 path at line 256
-        mocker.patch("os.cpu_count", return_value=6)
+        mocker.patch.object(os, "cpu_count", return_value=6)
 
         # Act
         async with WorkerPool(spawn=0) as pool:
@@ -3230,16 +4260,12 @@ class TestWorkerPool:
             Should raise ValueError
         """
         # Arrange
-        mocker.patch("os.cpu_count", return_value=None)
+        mocker.patch.object(os, "cpu_count", return_value=None)
         discovery_service = mocker.MagicMock()
 
         # Act & assert - This tests line 227
         with pytest.raises(ValueError, match="Unable to determine CPU count"):
             WorkerPool(spawn=0, discovery=discovery_service)
-
-    # =========================================================================
-    # Property-Based Tests
-    # =========================================================================
 
     @given(st.integers(min_value=1, max_value=10))
     def test___init___accepts_valid_spawns(self, spawn):
@@ -3289,14 +4315,22 @@ class TestWorkerPool:
             The number of workers is exactly the configured spawn count
         """
         # Arrange
-        pool = WorkerPool(worker=mock_worker_factory, spawn=spawn)
+        created = []
+
+        @functools.wraps(mock_worker_factory)
+        def recording_factory(*tags, **kwargs):
+            worker = mock_worker_factory(*tags, **kwargs)
+            created.append(worker)
+            return worker
+
+        pool = WorkerPool(worker=recording_factory, spawn=spawn)
 
         # Act
         async with pool:
-            # Pool is running with expected worker count
-            pass
+            started = list(created)
 
-        # Assert - invariant holds across all pool spawn counts
+        # Assert
+        assert len(started) == spawn
 
     @given(tags=st.lists(st.text(min_size=1, max_size=10), min_size=0, max_size=5))
     @settings(
@@ -3314,14 +4348,23 @@ class TestWorkerPool:
             The tags are preserved throughout the worker lifecycle
         """
         # Arrange
-        pool = WorkerPool(*tags, worker=mock_worker_factory, spawn=2)
+        created = []
+
+        @functools.wraps(mock_worker_factory)
+        def recording_factory(*worker_tags, **kwargs):
+            worker = mock_worker_factory(*worker_tags, **kwargs)
+            created.append(worker)
+            return worker
+
+        pool = WorkerPool(*tags, worker=recording_factory, spawn=2)
 
         # Act
         async with pool:
-            # Workers maintain their tags
-            pass
+            started = list(created)
 
-        # Assert - tags immutability invariant holds
+        # Assert
+        assert len(started) == 2
+        assert all(worker.tags == set(tags) for worker in started)
 
     @given(spawn=st.integers(min_value=1, max_value=10))
     @settings(
@@ -3339,16 +4382,23 @@ class TestWorkerPool:
             All workers are stopped and resources cleaned up
         """
         # Arrange
-        pool = WorkerPool(worker=mock_worker_factory, spawn=spawn)
-        cleanup_completed = False
+        created = []
+
+        @functools.wraps(mock_worker_factory)
+        def recording_factory(*tags, **kwargs):
+            worker = mock_worker_factory(*tags, **kwargs)
+            created.append(worker)
+            return worker
+
+        pool = WorkerPool(worker=recording_factory, spawn=spawn)
 
         # Act
         async with pool:
-            pass
-        cleanup_completed = True
+            running = [worker.started for worker in created]
 
-        # Assert - cleanup completes without errors, confirming resource release
-        assert cleanup_completed, f"Cleanup should complete for pool of spawn {spawn}"
+        # Assert
+        assert running == [True] * spawn
+        assert [worker.started for worker in created] == [False] * spawn
 
     @given(
         spawn=st.integers(min_value=1, max_value=5),
@@ -3358,33 +4408,26 @@ class TestWorkerPool:
         max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
     )
     @pytest.mark.asyncio
-    async def test_property_context_manager_idempotency(
+    async def test___aenter___should_refuse_re_entry_for_any_configuration(
         self, mock_worker_factory, spawn, tags
     ):
-        """Test lifecycle completes successfully regardless of configuration.
+        """Test a pool already entered refuses a second entry.
 
         Given:
             A WorkerPool with various spawn and tag configurations
         When:
             The pool is used as a context manager
         Then:
-            Lifecycle completes successfully regardless of configuration
+            The second entry should raise, whatever the spawn count and
+            tags — a pool already entered is not re-enterable
         """
         # Arrange
         pool = WorkerPool(*tags, worker=mock_worker_factory, spawn=spawn)
-        entered = False
-        exited = False
 
-        # Act
-        async with pool as p:
-            entered = True
-            assert p is not None
-            assert isinstance(p, WorkerPool)
-        exited = True
-
-        # Assert - lifecycle invariant holds
-        assert entered, "Pool should enter context manager"
-        assert exited, "Pool should exit context manager cleanly"
+        # Act & assert
+        async with pool:
+            with pytest.raises(RuntimeError):
+                await pool.__aenter__()
 
     @given(exception_type=st.sampled_from([ValueError, RuntimeError, TypeError]))
     @settings(
@@ -3420,10 +4463,6 @@ class TestWorkerPool:
             f"Should catch {exception_type.__name__}"
         )
         assert str(caught_exception) == exception_message
-
-    # =========================================================================
-    # Context Helper Tests
-    # =========================================================================
 
     @pytest.mark.asyncio
     async def test_enter_context_with_awaitable(
@@ -3464,7 +4503,7 @@ class TestWorkerPool:
         mock_proxy = mocker.MagicMock()
         mock_proxy.__aenter__ = mocker.AsyncMock(return_value=mock_proxy)
         mock_proxy.__aexit__ = mocker.AsyncMock()
-        mocker.patch("wool.runtime.worker.pool.WorkerProxy", return_value=mock_proxy)
+        mocker.patch.object(pool_module, "WorkerProxy", return_value=mock_proxy)
 
         pool = WorkerPool(discovery=discovery_awaitable)
 
@@ -3511,7 +4550,7 @@ class TestWorkerPool:
         mock_proxy = mocker.MagicMock()
         mock_proxy.__aenter__ = mocker.AsyncMock(return_value=mock_proxy)
         mock_proxy.__aexit__ = mocker.AsyncMock()
-        mocker.patch("wool.runtime.worker.pool.WorkerProxy", return_value=mock_proxy)
+        mocker.patch.object(pool_module, "WorkerProxy", return_value=mock_proxy)
 
         pool = WorkerPool(discovery=mock_discovery)
 
@@ -3563,7 +4602,7 @@ class TestWorkerPool:
         mock_proxy = mocker.MagicMock()
         mock_proxy.__aenter__ = mocker.AsyncMock(return_value=mock_proxy)
         mock_proxy.__aexit__ = mocker.AsyncMock()
-        mocker.patch("wool.runtime.worker.pool.WorkerProxy", return_value=mock_proxy)
+        mocker.patch.object(pool_module, "WorkerProxy", return_value=mock_proxy)
 
         pool = WorkerPool(discovery=sync_discovery_factory)
 
@@ -3608,7 +4647,7 @@ class TestWorkerPool:
         mock_proxy = mocker.MagicMock()
         mock_proxy.__aenter__ = mocker.AsyncMock(return_value=mock_proxy)
         mock_proxy.__aexit__ = mocker.AsyncMock()
-        mocker.patch("wool.runtime.worker.pool.WorkerProxy", return_value=mock_proxy)
+        mocker.patch.object(pool_module, "WorkerProxy", return_value=mock_proxy)
 
         pool = WorkerPool(spawn=1)
 
@@ -4067,7 +5106,7 @@ class TestWorkerPool:
             The pool context is entered
         Then:
             It should pass a provider over those credentials to
-            WorkerProxy — the wiring that aims the security half of
+            WorkerProxy — the wiring that aims the security arm of
             the proxy's admission gate
         """
         # Arrange
@@ -4199,10 +5238,6 @@ class TestWorkerPool:
             match="Lease must be non-negative",
         ):
             WorkerPool(spawn=1, lease=lease)  # type: ignore[call-overload]
-
-    # ------------------------------------------------------------------
-    # Quorum tests
-    # ------------------------------------------------------------------
 
     def test___init___with_quorum(self):
         """Test instantiation with spawn and quorum.
@@ -4365,6 +5400,8 @@ class TestWorkerPool:
         """
         # Act
         pool = WorkerPool(spawn=2, quorum=10)
+
+        # Assert
         assert isinstance(pool, WorkerPool)
 
     def test___init___hybrid_mode_rejects_quorum_above_capacity(

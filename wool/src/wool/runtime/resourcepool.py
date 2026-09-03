@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any
 from typing import Awaitable
@@ -10,6 +11,8 @@ from typing import TypeVar
 from typing import cast
 
 T = TypeVar("T")
+
+_log = logging.getLogger(__name__)
 
 
 class Resource(Generic[T]):
@@ -96,6 +99,16 @@ class ResourcePool(Generic[T]):
     automatically cleaned up after all references are released and the TTL
     expires.
 
+    **Loop affinity.** A pool serves one running event loop at a time. It
+    binds to the first loop that uses it and rebinds when used from
+    another loop once the bound loop is no longer running, dropping every
+    cached entry without running its finalizer: a resource cannot be torn
+    down from a loop other than the one that made it. Entries still
+    referenced when their loop stopped are reported at warning level,
+    idle ones at debug. Using a bound pool from a second *running* loop
+    raises `RuntimeError`, so tearing a pool down belongs to the loop that
+    owns it.
+
     :param factory:
         Function to create new objects (sync or async).
     :param finalizer:
@@ -117,10 +130,6 @@ class ResourcePool(Generic[T]):
             Optional TTL timer scheduled when the reference count
             reaches zero; spawns the cleanup task once the TTL
             elapses.
-        :param timer_loop:
-            The event loop that owns ``timer``, kept for thread-safe
-            cross-loop cancellation (a `asyncio.TimerHandle` does not
-            expose its loop).
         :param cleanup:
             Optional cleanup task created when the TTL timer fires.
         :param doomed:
@@ -134,7 +143,6 @@ class ResourcePool(Generic[T]):
         obj: Any
         reference_count: int
         timer: asyncio.TimerHandle | None = None
-        timer_loop: asyncio.AbstractEventLoop | None = None
         cleanup: asyncio.Task | None = None
         doomed: bool = False
 
@@ -166,7 +174,68 @@ class ResourcePool(Generic[T]):
         self._finalizer = finalizer
         self._ttl = ttl
         self._cache: dict[Any, ResourcePool.CacheEntry] = {}
-        self._lock = asyncio.Lock()
+        self._mutex: asyncio.Lock | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        """Return the mutex serializing this pool on its bound loop.
+
+        Binds the pool on first use and rebinds it when the running loop
+        differs from the bound one and the bound one is no longer running
+        — see the class docstring for what a rebind drops. Every method
+        that touches ``_cache`` takes this lock first, so the loop check
+        happens once per operation.
+
+        :raises RuntimeError:
+            If the pool is bound to another loop that is still running.
+
+        .. rubric:: Implementation notes
+
+        `asyncio.Lock` binds to a loop the first time it is *contended*
+        — the uncontended acquire path never consults one — and never
+        unbinds, so a single mutex built at construction would serve
+        every uncontended caller and then raise for the first contender
+        on any later loop. Liveness is `is_running`, not `is_closed`: a
+        loop that has stopped but not yet closed cannot contend the
+        mutex, and both the worker's loop rotation and the test fixtures
+        stop a loop before closing it. `is_running` reads one attribute,
+        so it is safe to call from another thread.
+        """
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            if self._loop is not None and self._loop.is_running():
+                raise RuntimeError(
+                    "ResourcePool is bound to another running event loop; "
+                    "use one pool per loop"
+                )
+            self._rebind(loop)
+        assert self._mutex is not None
+        return self._mutex
+
+    def _rebind(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Bind this pool to ``loop``, dropping what the previous loop left.
+
+        The dropped entries are never finalized: their finalizer would
+        run against a loop that is no longer running. Entries still
+        referenced when that loop stopped are a leak and are logged at
+        warning level; idle entries are what the TTL would have
+        discarded and are logged at debug level.
+        """
+        if self._cache:
+            referenced = sum(1 for e in self._cache.values() if e.reference_count > 0)
+            idle = len(self._cache) - referenced
+            log = _log.warning if referenced else _log.debug
+            log(
+                "ResourcePool rebinding to a new event loop; dropping %d "
+                "referenced and %d idle entries left by a loop that is no "
+                "longer running (finalizers not run)",
+                referenced,
+                idle,
+            )
+            self._cache.clear()
+        self._mutex = asyncio.Lock()
+        self._loop = loop
 
     async def __aenter__(self):
         """Async context manager entry.
@@ -308,7 +377,6 @@ class ResourcePool(Generic[T]):
                     # "never awaited" RuntimeWarning.
                     loop = asyncio.get_running_loop()
                     entry.timer = loop.call_later(self._ttl, self._expire, key)
-                    entry.timer_loop = loop
 
     async def expire(self, key: Any) -> None:
         """Treat *key* as TTL-expired now, finalizing it once unreferenced.
@@ -355,40 +423,24 @@ class ResourcePool(Generic[T]):
         """
         Cancel an entry's pending TTL timer, if any.
 
-        Same-loop timers are cancelled directly; timers owned by a
-        different loop are cancelled via that loop's
-        `call_soon_threadsafe`, best-effort — a closed foreign loop
-        can never fire its timers, so a failed cancellation is safe
-        to ignore.
+        The timer always belongs to the bound loop, so a plain cancel
+        suffices.
 
         :param entry:
             The cache entry whose timer to cancel.
         """
-        if entry.timer is None or entry.timer_loop is None:
+        if entry.timer is None:
             return
-        timer, timer_loop = entry.timer, entry.timer_loop
-        entry.timer = None
-        entry.timer_loop = None
-
-        if timer_loop is asyncio.get_running_loop():
-            timer.cancel()
-        else:
-            try:
-                timer_loop.call_soon_threadsafe(timer.cancel)
-            except RuntimeError:
-                pass
+        timer, entry.timer = entry.timer, None
+        timer.cancel()
 
     async def _cancel_cleanup(self, entry: ResourcePool.CacheEntry) -> None:
         """
         Cancel an entry's in-flight cleanup task, if any.
 
-        A task on the running loop is cancelled and awaited; a task
-        owned by a different loop is cancelled via that loop's
-        `call_soon_threadsafe`, best-effort — a closed foreign loop
-        can never run its tasks, so a failed cancellation is safe to
-        ignore. The current task is left alone: on the expiry path
-        this runs *inside* the entry's own cleanup task
-        (`_finalize`), which must not cancel itself.
+        The task is cancelled and awaited. The current task is left
+        alone: on the expiry path this runs *inside* the entry's own
+        cleanup task (`_finalize`), which must not cancel itself.
 
         :param entry:
             The cache entry whose cleanup task to cancel.
@@ -397,35 +449,30 @@ class ResourcePool(Generic[T]):
         entry.cleanup = None
         if cleanup is None or cleanup.done() or cleanup is asyncio.current_task():
             return
-
-        if cleanup.get_loop() is asyncio.get_running_loop():
-            cleanup.cancel()
-            try:
-                await cleanup
-            except asyncio.CancelledError:
-                pass
-        else:
-            try:
-                cleanup.get_loop().call_soon_threadsafe(cleanup.cancel)
-            except RuntimeError:
-                pass
+        cleanup.cancel()
+        try:
+            await cleanup
+        except asyncio.CancelledError:
+            pass
 
     def _expire(self, key: Any) -> None:
         """
         Spawn the cleanup task for an expired entry.
 
-        Runs synchronously, as a timer callback, on the loop that
-        scheduled the timer; see `_finalize` for how the spawned task
-        tolerates a concurrent re-acquire.
+        Runs synchronously, as a timer callback, on the bound loop; see
+        `_finalize` for how the spawned task tolerates a concurrent
+        re-acquire. A timer that fires on a loop this pool has since
+        left is ignored — its entry was dropped at the rebind.
 
         :param key:
             The cache key whose TTL elapsed.
         """
+        if asyncio.get_running_loop() is not self._loop:
+            return
         entry = self._cache.get(key)
         if entry is None:
             return
         entry.timer = None
-        entry.timer_loop = None
         entry.cleanup = asyncio.get_running_loop().create_task(self._finalize(key))
 
     async def _finalize(self, key: Any) -> None:

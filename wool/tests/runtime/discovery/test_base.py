@@ -5,6 +5,7 @@ from typing import AsyncIterator
 import grpc
 import pytest
 from hypothesis import given
+from hypothesis import settings
 from hypothesis import strategies as st
 
 from wool import protocol as wire
@@ -319,10 +320,174 @@ class TestWorkerMetadata:
         # Assert
         assert restored.secure is True
 
+    @given(identity=st.one_of(st.none(), st.text()))
+    @settings(max_examples=50)
+    def test___init___should_normalize_the_advertised_identity(self, identity):
+        """Test every path producing metadata collapses a blank identity.
+
+        Given:
+            Any advertised identity — absent, blank, padded, or plain.
+        When:
+            A WorkerMetadata is constructed.
+        Then:
+            It should carry the stripped name, with blank and absent
+            alike collapsing to None, so the wire, a discovery backend,
+            and a caller building metadata directly cannot disagree
+            about whether a worker declares an identity.
+        """
+        # Act
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="localhost:50051",
+            pid=123,
+            version="1.0.0",
+            identity=identity,
+        )
+
+        # Assert
+        assert worker.identity == (identity.strip() or None if identity else None)
+
+    def test___init___should_raise_when_identity_is_a_collection(self):
+        """Test a collection supplied as the advertised identity is refused.
+
+        Given:
+            A list of names supplied as a worker's identity, which is
+            singular by contract.
+        When:
+            A WorkerMetadata is constructed.
+        Then:
+            It should raise TypeError naming the received type, rather
+            than failing later as an AttributeError from a missing
+            strip.
+        """
+        # Act & assert
+        with pytest.raises(TypeError, match="single peer name"):
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address="localhost:50051",
+                pid=123,
+                version="1.0.0",
+                identity=["alpha.svc"],  # pyright: ignore[reportArgumentType]
+            )
+
+    def test_from_protobuf_should_default_identity_to_none_when_unset(self):
+        """Test a record predating the identity field declares none.
+
+        Given:
+            A protobuf WorkerMetadata whose identity field was never
+            set, as published by a worker from a version predating it,
+            where proto3 yields the empty string.
+        When:
+            Converting to WorkerMetadata.
+        Then:
+            It should yield a worker declaring no identity rather than
+            one advertising the empty string, so a mixed-version fleet
+            reads older workers correctly.
+        """
+        # Arrange
+        message = wire.WorkerMetadata(
+            uid=str(uuid.uuid4()), address="localhost:50051", pid=1, version="1.0.0"
+        )
+
+        # Act
+        worker = WorkerMetadata.from_protobuf(message)
+
+        # Assert
+        assert worker.identity is None
+
+    def test_to_protobuf_should_emit_empty_string_when_no_identity(self):
+        """Test declaring no identity encodes as the proto3 default.
+
+        Given:
+            A WorkerMetadata declaring no identity.
+        When:
+            Converting to protobuf.
+        Then:
+            It should set the field to the empty string, so "declares
+            none" and "predates the field" are indistinguishable on the
+            wire and both read back as None.
+        """
+        # Arrange
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=1, version="1.0.0"
+        )
+
+        # Act
+        message = worker.to_protobuf()
+
+        # Assert
+        assert message.identity == ""
+
+    def test___hash___should_ignore_the_advertised_identity(self):
+        """Test identity is not part of a worker's membership key.
+
+        Given:
+            Two WorkerMetadata records sharing a uid and differing only
+            in the identity they advertise.
+        When:
+            Their hashes are compared.
+        Then:
+            They should hash alike, since membership is keyed on uid.
+        """
+        # Arrange
+        uid = uuid.uuid4()
+        alpha = WorkerMetadata(
+            uid=uid,
+            address="localhost:50051",
+            pid=1,
+            version="1.0.0",
+            identity="alpha.svc",
+        )
+        beta = WorkerMetadata(
+            uid=uid,
+            address="localhost:50051",
+            pid=1,
+            version="1.0.0",
+            identity="beta.svc",
+        )
+
+        # Act & assert
+        assert hash(alpha) == hash(beta)
+
+    def test___eq___should_distinguish_workers_by_advertised_identity(self):
+        """Test a re-announcement under a new identity registers as a change.
+
+        Given:
+            Two WorkerMetadata records sharing a uid and differing only
+            in the identity they advertise.
+        When:
+            They are compared for equality.
+        Then:
+            They should compare unequal, so a worker re-announcing
+            itself under a different identity is seen as an update
+            rather than as the record already held.
+        """
+        # Arrange
+        uid = uuid.uuid4()
+        alpha = WorkerMetadata(
+            uid=uid,
+            address="localhost:50051",
+            pid=1,
+            version="1.0.0",
+            identity="alpha.svc",
+        )
+        beta = WorkerMetadata(
+            uid=uid,
+            address="localhost:50051",
+            pid=1,
+            version="1.0.0",
+            identity="beta.svc",
+        )
+
+        # Act & assert
+        assert alpha != beta
+
+    @settings(max_examples=50)
     @given(
         address=st.from_regex(r"^[a-zA-Z0-9._-]+:[0-9]+$", fullmatch=True),
         pid=st.integers(min_value=1, max_value=2147483647),
         version=st.text(min_size=1),
+        identity=st.one_of(st.none(), st.text()),
         options=st.builds(
             ChannelOptions,
             max_receive_message_length=st.integers(
@@ -339,16 +504,19 @@ class TestWorkerMetadata:
             compression=st.sampled_from(grpc.Compression),
         ),
     )
-    def test_roundtrip_conversion(self, address, pid, version, options):
+    def test_roundtrip_conversion(self, address, pid, version, identity, options):
         """Test round-trip conversion preserves WorkerMetadata data.
 
         Given:
             A WorkerMetadata instance with arbitrary field values
-            including optional ChannelOptions drawn from the full domain
+            including any advertised identity and optional
+            ChannelOptions drawn from the full domain
         When:
             Converting to protobuf and back to WorkerMetadata
         Then:
-            It should preserve all field values
+            It should preserve all field values, the identity having
+            already been normalized on construction so a blank one
+            round-trips as None rather than as the empty string
         """
         # Arrange
         uid = uuid.uuid4()
@@ -357,6 +525,7 @@ class TestWorkerMetadata:
             address=address,
             pid=pid,
             version=version,
+            identity=identity,
             options=options,
         )
 
@@ -371,6 +540,7 @@ class TestWorkerMetadata:
         assert deserialized.version == original.version
         assert deserialized.tags == original.tags
         assert deserialized.extra == original.extra
+        assert deserialized.identity == original.identity
         assert deserialized.options == original.options
 
 

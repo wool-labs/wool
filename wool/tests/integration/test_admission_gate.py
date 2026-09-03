@@ -1,7 +1,7 @@
 """Admission-gate integration tests (issue #293).
 
 These are targeted standalone tests rather than pairwise scenarios: the
-security/version admission gate is observable only through deliberate
+admission gate is observable only through deliberate
 pool/worker mismatches, and a mismatched-posture dimension member would
 break the pairwise array's single dispatch-success oracle. The oracle
 here is the exact admitted-worker set read from the active proxy, which

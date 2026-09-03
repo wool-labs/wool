@@ -318,10 +318,10 @@ class TestLanPublish:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_lan_pool_explicit_factory_advertises_bind_host_verbatim(
+    async def test_lan_pool_prebound_factory_advertises_its_pinned_host(
         self, retry_grpc_internal
     ):
-        """Test an explicit concrete factory is never overridden.
+        """Test a pre-bound host survives a publisher that prescribes one.
 
         Given:
             A pool with worker=partial(LocalWorker, host="127.0.0.1")
@@ -330,9 +330,11 @@ class TestLanPublish:
             A routine is dispatched and an observer collects the
             advertised worker address
         Then:
-            It should return the routine result and advertise the
-            explicit bind host verbatim — the pool neither rebinds the
-            worker nor rewrites its concrete advertised address.
+            It should advertise the pinned loopback host, not the
+            publisher's routable one: a factory that has already bound a
+            value owns it. The bound-factory case below pins the same
+            outcome through the other spelling, so neither way of owning
+            a binding is quieter than the other.
         """
 
         async def body():
@@ -346,6 +348,49 @@ class TestLanPublish:
                     spawn=1,
                     discovery=LanDiscovery(namespace),
                     worker=partial(LocalWorker, host="127.0.0.1"),
+                ):
+                    (address,) = await _advertised_addresses(observer, 1)
+                    result = await routines.add(1, 2)
+
+            # Assert
+            assert result == 3
+            assert _host_of(address) == "127.0.0.1"
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_lan_pool_bound_factory_advertises_its_own_host_verbatim(
+        self, retry_grpc_internal
+    ):
+        """Test a factory owning its binding is never overridden.
+
+        Given:
+            A pool whose factory accepts no ``host`` keyword and binds
+            loopback itself, and LanDiscovery with no advertise_host
+        When:
+            A routine is dispatched and an observer collects the
+            advertised worker address
+        Then:
+            It should advertise loopback verbatim. Paired with the
+            pre-bound case above, this pins the equivalence: declining
+            the keyword and binding it are two spellings of the same
+            decision, and a publisher overrides neither.
+        """
+
+        def bound_factory(*tags, credentials=None):
+            return LocalWorker(*tags, credentials=credentials, host="127.0.0.1")
+
+        async def body():
+            # Arrange
+            namespace = f"lan-publish-{uuid.uuid4().hex[:12]}"
+            observer = LanDiscovery(namespace)
+
+            # Act
+            async with asyncio.timeout(_TIMEOUT):
+                async with WorkerPool(
+                    spawn=1,
+                    discovery=LanDiscovery(namespace),
+                    worker=bound_factory,
                 ):
                     (address,) = await _advertised_addresses(observer, 1)
                     result = await routines.add(1, 2)
