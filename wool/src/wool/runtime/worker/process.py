@@ -67,6 +67,18 @@ _REAP_GRACE: Final[float] = 5.0
 # ceiling exceeds the advertised client concurrency gate.
 _SERVER_STREAM_CEILING_MULTIPLIER: Final[int] = 2
 
+#: Environment variable gating gRPC's POSIX fork handlers.
+_GRPC_FORK_SUPPORT_ENV: Final[str] = "GRPC_ENABLE_FORK_SUPPORT"
+
+# Guards the two counters below. Held only across their updates, never
+# across a spawn, so workers still fork in parallel.
+_spawn_lock: Final = threading.Lock()
+
+# How many spawns currently hold the fork-support default in place, and
+# whether wool is the one that installed it.
+_fork_support_holds: int = 0
+_fork_support_owned: bool = False
+
 
 class WorkerProcess(Process):
     """Subprocess hosting a gRPC worker server.
@@ -83,6 +95,12 @@ class WorkerProcess(Process):
     `concurrent.futures.ProcessPoolExecutor`), so a routine that must
     create them requires a non-daemonic worker; `subprocess` and
     `asyncio` subprocesses are unaffected.
+
+    Spawned with ``GRPC_ENABLE_FORK_SUPPORT=0`` unless the environment
+    already carries a value, which is left untouched — the supported way
+    to override the default. See `_default_grpc_fork_support` for what
+    the calling process's own environment sees while a spawn is in
+    flight.
 
     :param host:
         Host address to bind.
@@ -140,6 +158,22 @@ class WorkerProcess(Process):
     fire until the parent is already gone, so the join wedges
     interpreter exit. The watchdog covers the reverse case, where the
     parent dies first.
+
+    gRPC's atfork handlers exist so a process can survive a fork
+    *without* exec. A spawned worker never inherits gRPC across a fork,
+    so in the ordinary case its only forks are the immediately-exec'd
+    ones CPython performs to launch a subprocess, where the handlers can
+    only be useless or harmful — they have been observed reporting stale
+    descriptors against fd numbers asyncio has since reused for a live
+    subprocess's pipes. Hence the fork-support default. A non-daemonic
+    worker that forks `multiprocessing` children with the ``fork`` start
+    method is the exception: that is a fork without exec, and with the
+    handlers off gRPC makes no guarantee about the child.
+
+    The default has to ride the spawn from the parent's environment.
+    gRPC reads the variable once, as it initializes at import, and the
+    child imports this module — and through it `grpc.aio` — while
+    unpickling the process object, so `run` is already too late.
     """
 
     _port: int | None
@@ -251,9 +285,8 @@ class WorkerProcess(Process):
         """Start the worker process.
 
         Launches the worker process and waits until it has reported
-        its `WorkerMetadata` back via pipe. After starting,
-        the `metadata` and `address` properties are
-        populated.
+        its `WorkerMetadata` back via pipe. After starting, the
+        `metadata` and `address` properties are populated.
 
         :param timeout:
             Maximum time in seconds to wait for worker process startup.
@@ -264,7 +297,8 @@ class WorkerProcess(Process):
         """
         if timeout is not None and timeout <= 0:
             raise ValueError("Timeout must be positive")
-        super().start()
+        with _default_grpc_fork_support():
+            super().start()
         if self._get_metadata.poll(timeout=timeout):
             self._metadata = WorkerMetadata.from_protobuf(
                 protocol.WorkerMetadata.FromString(self._get_metadata.recv())
@@ -582,6 +616,39 @@ class WorkerProcess(Process):
             Address string in "host:port" format.
         """
         return f"{host}:{port}"
+
+
+@contextmanager
+def _default_grpc_fork_support():
+    """Hold wool's gRPC fork-support default in place across a spawn.
+
+    An environment that already carries the variable is never written,
+    so an embedder who set it deliberately keeps their value. Otherwise
+    the variable is installed for as long as any hold is open and
+    removed when the last one closes, leaving the calling process's own
+    environment as it was found.
+
+    Holds nest and overlap: concurrent spawns each take one, the
+    variable is present from the first entry until the last exit, and no
+    exit can strip it from a spawn still in flight. The window is
+    process-global while it is open, so an unrelated subprocess launched
+    from another thread inherits the setting, and a host that first
+    imports gRPC during it latches the default too.
+    """
+    global _fork_support_holds, _fork_support_owned
+    with _spawn_lock:
+        if not _fork_support_holds and _GRPC_FORK_SUPPORT_ENV not in os.environ:
+            os.environ[_GRPC_FORK_SUPPORT_ENV] = "0"
+            _fork_support_owned = True
+        _fork_support_holds += 1
+    try:
+        yield
+    finally:
+        with _spawn_lock:
+            _fork_support_holds -= 1
+            if not _fork_support_holds and _fork_support_owned:
+                os.environ.pop(_GRPC_FORK_SUPPORT_ENV, None)
+                _fork_support_owned = False
 
 
 def _parent_watchdog(
