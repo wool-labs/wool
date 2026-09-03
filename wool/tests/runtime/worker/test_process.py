@@ -67,6 +67,36 @@ def watchdog_env(mocker):
     return mock_parent, mock_exit, exited
 
 
+def _metadata_bytes(**overrides):
+    """Serialize a WorkerMetadata payload the way the child sends it."""
+    fields = {
+        "uid": uuid.uuid4(),
+        "address": "127.0.0.1:50051",
+        "pid": 12345,
+        "version": "1.0.0",
+    }
+    fields.update(overrides)
+    return WorkerMetadata(**fields).to_protobuf().SerializeToString()
+
+
+@pytest.fixture
+def metadata_pipe(mocker):
+    """Stub the metadata pipe and return its receiving end.
+
+    Patches the Pipe seam so a constructed WorkerProcess gets mock pipe
+    ends, and primes the receiving end to deliver one WorkerMetadata
+    payload. Tests that need a different payload — or a startup that
+    never reports one — reshape the returned mock's recv and poll.
+    """
+    receiver = mocker.MagicMock()
+    receiver.poll.return_value = True
+    receiver.recv.return_value = _metadata_bytes()
+    mocker.patch.object(
+        process_module, "Pipe", return_value=(receiver, mocker.MagicMock())
+    )
+    return receiver
+
+
 @pytest.fixture
 def run_harness(mocker):
     """Stub the run() lifecycle collaborators behind one seam.
@@ -839,7 +869,7 @@ class TestWorkerProcess:
         with pytest.raises(ValueError, match="Timeout must be positive"):
             process.start(timeout=0)
 
-    def test_start_calls_parent_start(self, mocker):
+    def test_start_calls_parent_start(self, mocker, metadata_pipe):
         """Test start method calls parent Process.start.
 
         Given:
@@ -850,24 +880,6 @@ class TestWorkerProcess:
             It should call Process.start
         """
         # Arrange
-        mock_get_meta = mocker.MagicMock()
-        mock_get_meta.poll.return_value = True
-        mock_get_meta.recv.return_value = (
-            WorkerMetadata(
-                uid=uuid.uuid4(),
-                address="127.0.0.1:50051",
-                pid=12345,
-                version="1.0.0",
-            )
-            .to_protobuf()
-            .SerializeToString()
-        )
-        mock_set_meta = mocker.MagicMock()
-        mocker.patch(
-            "wool.runtime.worker.process.Pipe",
-            return_value=(mock_get_meta, mock_set_meta),
-        )
-
         mock_parent_start = mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
@@ -877,11 +889,11 @@ class TestWorkerProcess:
 
         # Assert
         mock_parent_start.assert_called_once()
-        mock_get_meta.poll.assert_called_once_with(timeout=60.0)
-        mock_get_meta.recv.assert_called_once()
-        mock_get_meta.close.assert_called_once()
+        metadata_pipe.poll.assert_called_once_with(timeout=60.0)
+        metadata_pipe.recv.assert_called_once()
+        metadata_pipe.close.assert_called_once()
 
-    def test_start_receives_port_from_pipe(self, mocker):
+    def test_start_receives_port_from_pipe(self, mocker, metadata_pipe):
         """Test start receives port from pipe and updates address.
 
         Given:
@@ -892,24 +904,6 @@ class TestWorkerProcess:
             It should receive the port and provide correct address
         """
         # Arrange
-        mock_get_meta = mocker.MagicMock()
-        mock_get_meta.poll.return_value = True
-        mock_get_meta.recv.return_value = (
-            WorkerMetadata(
-                uid=uuid.uuid4(),
-                address="127.0.0.1:50051",
-                pid=12345,
-                version="1.0.0",
-            )
-            .to_protobuf()
-            .SerializeToString()
-        )
-        mock_set_meta = mocker.MagicMock()
-        mocker.patch(
-            "wool.runtime.worker.process.Pipe",
-            return_value=(mock_get_meta, mock_set_meta),
-        )
-
         mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
@@ -921,7 +915,7 @@ class TestWorkerProcess:
         assert process.port == 50051
         assert process.address == "127.0.0.1:50051"
 
-    def test_start_raises_runtime_error_on_timeout(self, mocker):
+    def test_start_raises_runtime_error_on_timeout(self, mocker, metadata_pipe):
         """Test start raises RuntimeError when process fails to start in time.
 
         Given:
@@ -932,14 +926,7 @@ class TestWorkerProcess:
             It should raise RuntimeError and reap the process
         """
         # Arrange
-        mock_get_meta = mocker.MagicMock()
-        mock_get_meta.poll.return_value = False
-        mock_set_meta = mocker.MagicMock()
-        mocker.patch(
-            "wool.runtime.worker.process.Pipe",
-            return_value=(mock_get_meta, mock_set_meta),
-        )
-
+        metadata_pipe.poll.return_value = False
         mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
@@ -953,7 +940,7 @@ class TestWorkerProcess:
 
         mock_reap.assert_called_once_with(timeout=0)
 
-    def test_start_closes_pipe_after_receiving_port(self, mocker):
+    def test_start_closes_pipe_after_receiving_port(self, mocker, metadata_pipe):
         """Test start closes the pipe connection after receiving port.
 
         Given:
@@ -964,24 +951,6 @@ class TestWorkerProcess:
             It should close the pipe connection
         """
         # Arrange
-        mock_get_meta = mocker.MagicMock()
-        mock_get_meta.poll.return_value = True
-        mock_get_meta.recv.return_value = (
-            WorkerMetadata(
-                uid=uuid.uuid4(),
-                address="127.0.0.1:50051",
-                pid=12345,
-                version="1.0.0",
-            )
-            .to_protobuf()
-            .SerializeToString()
-        )
-        mock_set_meta = mocker.MagicMock()
-        mocker.patch(
-            "wool.runtime.worker.process.Pipe",
-            return_value=(mock_get_meta, mock_set_meta),
-        )
-
         mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
@@ -990,9 +959,11 @@ class TestWorkerProcess:
         process.start()
 
         # Assert
-        mock_get_meta.close.assert_called_once()
+        metadata_pipe.close.assert_called_once()
 
-    def test_start_deserializes_metadata_with_extra_from_pipe(self, mocker):
+    def test_start_deserializes_metadata_with_extra_from_pipe(
+        self, mocker, metadata_pipe
+    ):
         """Test start deserializes metadata with extra and tags from pipe.
 
         Given:
@@ -1004,28 +975,10 @@ class TestWorkerProcess:
             and metadata.tags as frozenset
         """
         # Arrange
-        metadata_bytes = (
-            WorkerMetadata(
-                uid=uuid.uuid4(),
-                address="127.0.0.1:50051",
-                pid=12345,
-                version="1.0.0",
-                tags=frozenset({"gpu"}),
-                extra=MappingProxyType({"key": "value"}),
-            )
-            .to_protobuf()
-            .SerializeToString()
+        metadata_pipe.recv.return_value = _metadata_bytes(
+            tags=frozenset({"gpu"}),
+            extra=MappingProxyType({"key": "value"}),
         )
-
-        mock_get_meta = mocker.MagicMock()
-        mock_get_meta.poll.return_value = True
-        mock_get_meta.recv.return_value = metadata_bytes
-        mock_set_meta = mocker.MagicMock()
-        mocker.patch(
-            "wool.runtime.worker.process.Pipe",
-            return_value=(mock_get_meta, mock_set_meta),
-        )
-
         mocker.patch.object(process_module.Process, "start")
 
         process = WorkerProcess()
