@@ -25,6 +25,7 @@ from wool.runtime.context.factory import install_task_factory
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
+from wool.runtime.worker.connection import clear_channel_pool
 from wool.runtime.worker.frame import AckResponseFrame
 from wool.runtime.worker.frame import NackResponseFrame
 from wool.runtime.worker.session import DispatchSession
@@ -650,14 +651,14 @@ class WorkerService(protocol.WorkerServicer):
     ) -> None:
         """Schedule worker-loop shutdown and optionally join the thread.
 
-        Finalizes the proxy and discovery-subscriber pools on the worker
-        loop first: they are bound to it, and a `ResourcePool` refuses
-        use from any other running loop, so this finalizer is the one
-        place they can still be cleared. A clear that raises or exceeds
-        the shared `_DRAIN_TIMEOUT` budget is logged and does not
-        prevent the stop; whatever it left cached is dropped when the
-        pool next rebinds. With ``timeout=0`` the clears run best-effort
-        on the daemon thread after this returns.
+        Finalizes the proxy and discovery-subscriber pools, then the
+        channel pool, on the worker loop first: they are bound to it, and
+        a `ResourcePool` refuses use from any other running loop, so this
+        finalizer is the one place they can still be cleared. A clear
+        that raises or exceeds the shared `_DRAIN_TIMEOUT` budget is
+        logged and does not prevent the stop; whatever it left cached is
+        dropped when the pool next rebinds. With ``timeout=0`` the clears
+        run best-effort on the daemon thread after this returns.
 
         Drains successive generations of pending tasks on the
         worker loop, then signals the loop to stop. A cancelled
@@ -687,9 +688,18 @@ class WorkerService(protocol.WorkerServicer):
             A tuple of the event loop and the thread running it.
         """
         loop, thread = loop_thread
-        pools = [
-            ("proxy", wool.__proxy_pool__.get()),
-            ("subscriber", __subscriber_pool__.get()),
+        proxy_pool = wool.__proxy_pool__.get()
+        subscriber_pool = __subscriber_pool__.get()
+        # Proxies first: exiting them releases the loop's channel-pool
+        # hold, so the channel clear that follows finds nothing to
+        # force-close on a rotation that drained cleanly.
+        clears = [
+            ("proxy", proxy_pool.clear if proxy_pool is not None else None),
+            (
+                "subscriber",
+                subscriber_pool.clear if subscriber_pool is not None else None,
+            ),
+            ("channel", clear_channel_pool),
         ]
 
         async def _shutdown():
@@ -697,12 +707,12 @@ class WorkerService(protocol.WorkerServicer):
             deadline = loop.time() + _DRAIN_TIMEOUT
             leaked: list[asyncio.Task] = []
             try:
-                for name, pool in pools:
-                    if pool is None:
+                for name, clear in clears:
+                    if clear is None:
                         continue
                     try:
                         await asyncio.wait_for(
-                            pool.clear(), timeout=max(0.0, deadline - loop.time())
+                            clear(), timeout=max(0.0, deadline - loop.time())
                         )
                     except Exception:
                         _log.warning(

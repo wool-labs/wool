@@ -58,6 +58,7 @@ from wool.runtime.worker.connection import HandshakeError
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.connection import channel_pool_hold
 from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.noreentry import noreentry
@@ -877,13 +878,15 @@ class WorkerProxy:
     async def start(self) -> None:
         """Start the proxy by initiating discovery and load balancing.
 
-        Subscribes to worker discovery, initializes the load-balancer
-        context, and launches the worker sentinel task.  A start that
-        fails at any step, the quorum wait included, releases what it had
-        acquired in reverse order and leaves the proxy un-started and
-        free to retry; a load balancer or discovery source configured as
-        a context manager is exited with the failure, as a ``with`` block
-        would exit it.
+        Takes a hold on the loop's channel pool (see `channel_pool_hold`)
+        for the period between this call and `stop`, subscribes to worker
+        discovery, initializes the load-balancer context, and launches
+        the worker sentinel task.  A start that fails at any step, the
+        quorum wait included, releases what it had acquired in reverse
+        order and leaves the proxy un-started and free to retry; a load
+        balancer or discovery source configured as a context manager is
+        exited with the failure, and its return value is ignored, so a
+        manager that suppresses cannot leave the proxy half-started.
 
         :raises RuntimeError:
             If the proxy is starting, started, stopping, or stopped.
@@ -903,63 +906,61 @@ class WorkerProxy:
             raise RuntimeError(_LIFECYCLE_MESSAGES[self._state])
 
         self._state = _Lifecycle.STARTING
+        stack = AsyncExitStack()
         try:
-            async with AsyncExitStack() as stack:
-                # Pushed first so it runs last, after every context has
-                # exited, on both the rollback and the stop path.
-                stack.callback(self._reset_state)
-                self._loadbalancer_service = await stack.enter_async_context(
-                    _resolved(self._loadbalancer)
+            # Pushed first so it unwinds last, after every context has
+            # exited.
+            stack.callback(self._reset_state)
+            await stack.enter_async_context(channel_pool_hold())
+            self._loadbalancer_service = await stack.enter_async_context(
+                _resolved(self._loadbalancer)
+            )
+            if not isinstance(
+                self._loadbalancer_service,
+                (LoadBalancerLike, DispatchingLoadBalancerLike),
+            ):
+                raise ValueError
+            # Classify the balancer once, here, so dispatch() need not
+            # re-run a @runtime_checkable isinstance on the hot path.
+            self._delegating = isinstance(self._loadbalancer_service, LoadBalancerLike)
+            if (
+                not self._delegating
+                and isinstance(self._loadbalancer_service, DispatchingLoadBalancerLike)
+                and not self._dispatching_deprecation_warned
+            ):
+                warnings.warn(
+                    DISPATCHING_LOADBALANCER_DEPRECATION_MESSAGE,
+                    DeprecationWarning,
+                    stacklevel=2,
                 )
-                if not isinstance(
-                    self._loadbalancer_service,
-                    (LoadBalancerLike, DispatchingLoadBalancerLike),
-                ):
-                    raise ValueError
-                # Classify the balancer once, here, so dispatch() need not
-                # re-run a @runtime_checkable isinstance on the hot path.
-                self._delegating = isinstance(
-                    self._loadbalancer_service, LoadBalancerLike
-                )
-                if (
-                    not self._delegating
-                    and isinstance(
-                        self._loadbalancer_service, DispatchingLoadBalancerLike
-                    )
-                    and not self._dispatching_deprecation_warned
-                ):
-                    warnings.warn(
-                        DISPATCHING_LOADBALANCER_DEPRECATION_MESSAGE,
-                        DeprecationWarning,
-                        stacklevel=2,
-                    )
-                    self._dispatching_deprecation_warned = True
+                self._dispatching_deprecation_warned = True
 
-                self._discovery_stream = await stack.enter_async_context(
-                    _resolved(self._discovery)
-                )
-                if not isinstance(self._discovery_stream, DiscoverySubscriberLike):
-                    raise ValueError
+            self._discovery_stream = await stack.enter_async_context(
+                _resolved(self._discovery)
+            )
+            if not isinstance(self._discovery_stream, DiscoverySubscriberLike):
+                raise ValueError
 
-                self._loadbalancer_context = LoadBalancerContext()
-                # Built here, not in __init__, so its keys cannot outlive the
-                # pool membership they mirror: a uid stranded by teardown could
-                # never be discarded again, since a respawned worker gets a
-                # fresh one.
-                self._handshake_throttle = _HandshakeWarningThrottle()
-                self._workers_changed = asyncio.Event()
-                self._sentinel_task = asyncio.create_task(self._worker_sentinel())
-                stack.push_async_callback(self._cancel_sentinel)
+            self._loadbalancer_context = LoadBalancerContext()
+            # Built here, not in __init__, so its keys cannot outlive the
+            # pool membership they mirror: a uid stranded by teardown could
+            # never be discarded again, since a respawned worker gets a
+            # fresh one.
+            self._handshake_throttle = _HandshakeWarningThrottle()
+            self._workers_changed = asyncio.Event()
+            self._sentinel_task = asyncio.create_task(self._worker_sentinel())
+            stack.push_async_callback(self._cancel_sentinel)
 
-                if self._quorum:
-                    await asyncio.wait_for(self._await_workers(), self._quorum_timeout)
-
-                self._teardown = stack.pop_all()
-
-        except BaseException:
+            if self._quorum:
+                await asyncio.wait_for(self._await_workers(), self._quorum_timeout)
+        except BaseException as exc:
             self._state = _Lifecycle.NEW
+            # The verdict is discarded: a dependency that suppresses the
+            # failure must not turn a failed start into a started proxy.
+            await stack.__aexit__(type(exc), exc, exc.__traceback__)
             raise
 
+        self._teardown = stack
         self._state = _Lifecycle.STARTED
 
     async def exit(self, *args) -> None:
@@ -990,18 +991,26 @@ class WorkerProxy:
             return
         await self.stop(*args)
 
-    async def stop(self, *args) -> None:
+    async def stop(self, exc_type=None, exc=None, tb=None) -> None:
         """Stop the proxy, terminating discovery and clearing connections.
 
         Unwinds what `start` acquired in reverse order: sentinel first
-        (so it stops reading from the discovery stream), then
-        discovery, then load balancer.  Every step runs even if an
-        earlier one raises, each context manager among them receives the
-        exception info passed to ``stop``, and the proxy is stopping from
-        the moment the unwind begins and stopped once it returns, so a
-        second ``stop``, or a ``start``, raises rather than racing the
-        unwind.
+        (so it stops reading from the discovery stream), then discovery,
+        then load balancer, and last the proxy's hold on the channel pool
+        (see `channel_pool_hold`).  Every step runs even if an earlier one
+        raises; each context manager among them receives the exception
+        info passed here, with its return value ignored; and the proxy
+        is stopping from the moment the unwind begins and stopped once
+        it returns, so a second ``stop``, or a ``start``, raises rather
+        than racing the unwind.
 
+        :param exc_type:
+            Exception type if the proxy is stopping on an error, else
+            ``None``.
+        :param exc:
+            The exception, else ``None``.
+        :param tb:
+            Its traceback, else ``None``.
         :raises RuntimeError:
             If the proxy is not started, or is already stopping or
             stopped.
@@ -1012,7 +1021,7 @@ class WorkerProxy:
         teardown, self._teardown = self._teardown, None
         assert teardown is not None, "a started proxy holds its teardown stack"
         try:
-            await teardown.__aexit__(*(args or (None, None, None)))
+            await teardown.__aexit__(exc_type, exc, tb)
         finally:
             self._state = _Lifecycle.STOPPED
 
@@ -1155,6 +1164,7 @@ class WorkerProxy:
                     if not isinstance(exc, TransientRpcError):
                         ctx.remove_worker(metadata)
                         self._handshake_throttle.discard(metadata.uid)
+                        await self._close_departed(connection)
                     elif isinstance(exc, HandshakeError):
                         # Transient by the worker-health contract, so the
                         # split above already skips without eviction; this
@@ -1203,28 +1213,6 @@ class WorkerProxy:
             # Runs on every exit path: success, NoWorkersAvailable,
             # cancellation, and contract violations.
             await generator.aclose()
-
-    async def _cancel_sentinel(self) -> None:
-        """Cancel the worker sentinel task, if any, and await its exit."""
-        if self._sentinel_task:
-            self._sentinel_task.cancel()
-            try:
-                await self._sentinel_task
-            except asyncio.CancelledError:
-                pass
-            self._sentinel_task = None
-
-    def _reset_state(self) -> None:
-        """Null every attribute `start` populates.
-
-        Runs last on both the rollback and the stop path, so neither a
-        failed start nor a stopped proxy keeps stale references.
-        """
-        self._loadbalancer_context = None
-        self._handshake_throttle = None
-        self._loadbalancer_service = None
-        self._discovery_stream = None
-        self._workers_changed = None
 
     def _create_security_filter(
         self, provider: WorkerCredentialsProvider | None
@@ -1361,6 +1349,39 @@ class WorkerProxy:
             await self._workers_changed.wait()
             self._workers_changed.clear()
 
+    async def _cancel_sentinel(self) -> None:
+        """Cancel the worker sentinel task, if any, and await its exit."""
+        if self._sentinel_task:
+            self._sentinel_task.cancel()
+            try:
+                await self._sentinel_task
+            except asyncio.CancelledError:
+                pass
+            self._sentinel_task = None
+
+    def _reset_state(self) -> None:
+        """Null the per-start collaborator references."""
+        self._loadbalancer_context = None
+        self._handshake_throttle = None
+        self._loadbalancer_service = None
+        self._discovery_stream = None
+        self._workers_changed = None
+
+    async def _close_departed(self, connection: WorkerConnection) -> None:
+        """Close the connection of a worker that left this proxy's pool.
+
+        Retires the worker's channel keys now rather than after the
+        pool's idle TTL — see `WorkerConnection.close`. A close that
+        fails is logged and contained, so a departure can neither kill
+        the sentinel nor derail a dispatch's retry loop.
+        """
+        try:
+            await connection.close()
+        except Exception:
+            _logger.debug(
+                "Closing the connection of a departed worker failed", exc_info=True
+            )
+
     async def _worker_sentinel(self):
         """Reconcile discovery events against the load-balancer context.
 
@@ -1426,11 +1447,13 @@ class WorkerProxy:
                                 uid,
                                 reason,
                             )
+                            _, connection = workers[uid]
                             self._loadbalancer_context.remove_worker(event.metadata)
                             # Departed the pool — see
                             # _HandshakeWarningThrottle.
                             self._handshake_throttle.discard(uid)
                             self._workers_changed.set()
+                            await self._close_departed(connection)
                         else:
                             # Fires per rescan for standing chaff, so
                             # debug keeps it out of the default log.
@@ -1442,9 +1465,12 @@ class WorkerProxy:
                         continue
                     if present:
                         # Refresh in place; membership is unchanged, so
-                        # the quorum wait need not re-evaluate. Displaced
-                        # connections are not closed — see
-                        # LoadBalancerContextLike.
+                        # the quorum wait need not re-evaluate. A refresh
+                        # is not a departure: the displaced connection is
+                        # left to the pool, whose idle TTL retires its
+                        # channel when the update changed the channel key,
+                        # and closing on every rescan would force a
+                        # handshake for the common unchanged-key case.
                         self._loadbalancer_context.update_worker(
                             event.metadata, connect(event.metadata)
                         )
@@ -1454,17 +1480,18 @@ class WorkerProxy:
                         continue
                     else:
                         _logger.debug("Admission gate admitted worker %s", uid)
-                        # Displaced connections are not closed — see
-                        # LoadBalancerContextLike.
                         self._loadbalancer_context.add_worker(
                             event.metadata, connect(event.metadata)
                         )
                         self._workers_changed.set()
                 case "worker-dropped":
+                    departed = self._loadbalancer_context.workers.get(event.metadata.uid)
                     self._loadbalancer_context.remove_worker(event.metadata)
                     # Departed the pool — see _HandshakeWarningThrottle.
                     self._handshake_throttle.discard(event.metadata.uid)
                     self._workers_changed.set()
+                    if departed is not None:
+                        await self._close_departed(departed[1])
 
 
 @asynccontextmanager
