@@ -724,6 +724,44 @@ def _gate_predicate(local_version):
 # ============================================================================
 
 
+def _recording_loadbalancer(mocker, *, suppress=False):
+    """Build a load-balancer context manager that records how it is exited.
+
+    Returns the manager class and the list its exit arguments are appended
+    to; the manager yields a `LoadBalancerLike` mock and its exit returns
+    ``suppress``.
+    """
+    balancer = mocker.MagicMock(spec=wp.LoadBalancerLike)
+    balancer.dispatch = mocker.AsyncMock()
+    exits: list[tuple] = []
+
+    class Recording:
+        async def __aenter__(self):
+            return balancer
+
+        async def __aexit__(self, *args):
+            exits.append(args)
+            return suppress
+
+    return Recording, exits
+
+
+def _discovery_context(*, on_enter=None, on_exit=None):
+    """Build a discovery context manager whose enter and exit await the hooks."""
+
+    class Discovery:
+        async def __aenter__(self):
+            if on_enter is not None:
+                await on_enter()
+            return MockDiscoveryService()
+
+        async def __aexit__(self, *args):
+            if on_exit is not None:
+                await on_exit()
+
+    return Discovery
+
+
 class TestWorkerProxy:
     """Comprehensive test suite for WorkerProxy."""
 
@@ -1475,6 +1513,78 @@ class TestWorkerProxy:
         # Assert
         assert cm.exited
         assert not proxy.started
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_forward_exception_to_loadbalancer_context(
+        self, mock_discovery_service, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test the body's exception reaches the load balancer's exit.
+
+        Given:
+            A started proxy whose load balancer is an async context
+            manager recording the exception info its ``__aexit__``
+            receives.
+        When:
+            The proxy's ``async with`` block raises.
+        Then:
+            It should exit the load balancer with that exception, as a
+            plain ``async with`` over the manager would.
+        """
+        # Arrange
+        manager, exits = _recording_loadbalancer(mocker)
+        error = ValueError("body failed")
+        proxy = WorkerProxy(
+            discovery=mock_discovery_service,
+            loadbalancer=manager,
+            lazy=False,
+            quorum=0,
+        )
+
+        # Act
+        with pytest.raises(ValueError):
+            async with proxy:
+                raise error
+
+        # Assert
+        assert not proxy.started
+        assert len(exits) == 1
+        assert exits[0][:2] == (ValueError, error)
+        assert exits[0][2] is not None
+
+    @pytest.mark.asyncio
+    async def test_start_should_exit_loadbalancer_context_with_failure_when_rolled_back(
+        self, mock_proxy_session, mocker: MockerFixture
+    ):
+        """Test a failed start hands its exception to the entered contexts.
+
+        Given:
+            A proxy whose load balancer is an async context manager
+            recording the exception info its ``__aexit__`` receives, and
+            a discovery object that is not a subscriber, so ``start``
+            raises after the load balancer has been entered.
+        When:
+            The proxy is started.
+        Then:
+            It should raise, leave the proxy un-started, and exit the
+            load balancer with that same exception.
+        """
+        # Arrange
+        manager, exits = _recording_loadbalancer(mocker)
+        proxy = WorkerProxy(
+            discovery=object(),  # type: ignore[arg-type]
+            loadbalancer=manager,
+            lazy=False,
+            quorum=0,
+        )
+
+        # Act
+        with pytest.raises(ValueError) as excinfo:
+            await proxy.start()
+
+        # Assert
+        assert not proxy.started
+        assert len(exits) == 1
+        assert exits[0][:2] == (ValueError, excinfo.value)
 
     @pytest.mark.asyncio
     async def test_start_with_awaitable_loadbalancer(
