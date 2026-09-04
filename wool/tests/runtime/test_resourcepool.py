@@ -462,6 +462,103 @@ class TestResourcePool:
             await ttl_pool.release(unique_key)
 
     @pytest.mark.asyncio
+    async def test_expire_should_await_finalizer_when_it_returns_an_awaitable(self):
+        """Test a finalizer's non-coroutine awaitable is awaited.
+
+        Given:
+            A pool whose synchronous finalizer returns an object that is
+            awaitable but not a coroutine.
+        When:
+            An idle entry is expired.
+        Then:
+            It should await that object as part of the finalization.
+        """
+        # Arrange
+        awaited = []
+
+        class Completion:
+            def __await__(self):
+                awaited.append(True)
+                yield from ()
+
+        pool = ResourcePool(
+            factory=lambda key: f"obj-{key}",
+            finalizer=lambda obj: Completion(),
+            ttl=60,
+        )
+        async with pool.get("key"):
+            pass
+
+        # Act
+        await pool.expire("key")
+
+        # Assert
+        assert awaited == [True]
+        assert pool.stats.total_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_acquire_should_cache_an_awaitable_object_as_is(self):
+        """Test a factory's non-coroutine awaitable is the cached object.
+
+        Given:
+            A pool whose synchronous factory returns an object that is
+            awaitable but not a coroutine.
+        When:
+            A key is acquired.
+        Then:
+            It should hand back that object itself rather than await it.
+        """
+
+        # Arrange
+        class Handle:
+            def __await__(self):
+                raise AssertionError("the handle must not be awaited")
+                yield
+
+        handle = Handle()
+        pool = ResourcePool(factory=lambda key: handle, ttl=60)
+
+        # Act
+        async with pool.get("key") as resource:
+            # Assert
+            assert resource is handle
+
+    @pytest.mark.asyncio
+    async def test_expire_should_log_warning_when_finalizer_raises(self, caplog):
+        """Test a finalizer's contained failure is still reported.
+
+        Given:
+            A pool whose finalizer raises an Exception.
+        When:
+            An idle entry is expired.
+        Then:
+            It should evict the entry and log one warning naming the
+            pool's factory and the key.
+        """
+
+        # Arrange
+        def factory(key):
+            return f"obj-{key}"
+
+        async def finalizer(obj):
+            raise RuntimeError("close failed")
+
+        pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=60)
+        async with pool.get("key"):
+            pass
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.resourcepool"):
+            await pool.expire("key")
+
+        # Assert
+        records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
+        assert len(records) == 1
+        assert "factory" in records[0].getMessage()
+        assert "'key'" in records[0].getMessage()
+        assert pool.stats.total_entries == 0
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "ttl, retire_first",
         [(0, False), (60, True)],
@@ -602,7 +699,7 @@ class TestResourcePool:
         When:
             The pool is used from a second event loop.
         Then:
-            It should raise RuntimeError naming the other running loop
+            It should raise RuntimeError naming the pool by its factory
             rather than rebinding, so one pool never serves two live
             loops.
         """
@@ -617,7 +714,10 @@ class TestResourcePool:
             )
 
             # Act & assert
-            with pytest.raises(RuntimeError, match="another running event loop"):
+            with pytest.raises(
+                RuntimeError,
+                match=r"ResourcePool\(.*\) is bound to another running event loop",
+            ):
                 asyncio.run(pool.acquire("other"))
         finally:
             live_loop.call_soon_threadsafe(live_loop.stop)

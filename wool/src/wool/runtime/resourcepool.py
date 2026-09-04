@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import Any
 from typing import Awaitable
 from typing import Callable
+from typing import Final
 from typing import Generic
 from typing import TypeVar
 from typing import cast
+
+#: Process-level interrupts — see `ResourcePool.expire_all` for their rank in a sweep.
+_INTERRUPTS: Final = (KeyboardInterrupt, SystemExit)
 
 T = TypeVar("T")
 
@@ -92,8 +97,7 @@ class Resource(Generic[T]):
 
 
 class ResourcePool(Generic[T]):
-    """
-    An asynchronous reference-counted cache with TTL-based cleanup.
+    """Cache objects by key with reference counting and TTL-based cleanup.
 
     Objects are created on-demand via a factory function (sync or async) and
     automatically cleaned up after all references are released and the TTL
@@ -115,15 +119,25 @@ class ResourcePool(Generic[T]):
     to the loop that owns it.
 
     :param factory:
-        Function to create new objects (sync or async).
+        Function to create new objects (sync or async). A coroutine a
+        sync factory returns is awaited; any other awaitable is cached
+        as the object itself.
     :param finalizer:
         Optional cleanup function (sync or async). It runs while the pool
-        holds its internal lock, so it must not await `acquire`,
-        `release`, `expire` or `clear` — those take the same lock and the
-        call deadlocks; the read-only members are lock-free and safe. An
-        `Exception` it raises is suppressed, a `BaseException` propagates
-        to whichever operation ran the finalizer, and the entry is
-        evicted either way.
+        holds its internal lock, so it must not await any operation of
+        *this* pool that mutates the cache — they all take the same lock
+        and the call deadlocks, and reaching a resource through `get`
+        counts; the read-only members are lock-free and safe, and so are
+        the mutating members of a different pool, provided the
+        finalizer-to-pool relation stays acyclic: two pools whose
+        finalizers each mutate the other deadlock. An `Exception` it
+        raises is contained — reported at warning level against the
+        pool's factory name and the key, then suppressed — a
+        `BaseException` propagates to whichever operation ran the
+        finalizer (`expire_all` defers it to the end of its sweep), and
+        the entry is evicted either way; a failure inside a cleanup the
+        TTL spawned has no caller to propagate to and is reported the
+        same way.
     :param ttl:
         Time-to-live in seconds after last reference is released.
     """
@@ -144,11 +158,11 @@ class ResourcePool(Generic[T]):
         :param cleanup:
             Optional cleanup task created when the TTL timer fires.
         :param doomed:
-            Whether `ResourcePool.expire` marked this entry for
-            finalization as soon as its reference count reaches zero.
-            Cleared when the entry is re-acquired first — re-access
-            resurrects, matching the pool's timer-cancellation
-            semantics.
+            Whether the entry has been retired (see `ResourcePool.expire`
+            for the retirement contract) and is finalized as soon as its
+            reference count reaches zero. Cleared when the entry is
+            re-acquired first — re-access resurrects, matching the pool's
+            timer-cancellation semantics.
         """
 
         obj: Any
@@ -247,20 +261,17 @@ class ResourcePool(Generic[T]):
         }
 
     def get(self, key: Any) -> Resource[T]:
-        """
-        Get a resource acquisition that can be awaited or used as context
-        manager.
+        """Return a single-use `Resource` for ``key``, entered with ``async with``.
 
         :param key:
             The cache key.
         :returns:
-            `Resource` that can be awaited or used with 'async with'.
+            The `Resource` for ``key``.
         """
         return Resource(self, key)
 
     async def acquire(self, key: Any) -> T:
-        """
-        Internal acquire method - acquires a reference to the cached object.
+        """Acquire a reference to the cached object, creating it on a miss.
 
         Creates a new object via the factory if not cached. Increments
         reference count and cancels any pending cleanup.
@@ -280,7 +291,8 @@ class ResourcePool(Generic[T]):
                 return entry.obj
             else:
                 # Cache miss - create new object
-                obj = await self._await(self._factory, key)
+                created = self._factory(key)
+                obj = cast(T, await created if asyncio.iscoroutine(created) else created)
                 self._cache[key] = self.CacheEntry(obj=obj, reference_count=1)
                 return obj
 
@@ -289,15 +301,23 @@ class ResourcePool(Generic[T]):
         Release a reference to the cached object.
 
         Decrements reference count. If count reaches 0, schedules cleanup
-        after TTL expires (if TTL > 0); an entry retired by `expire` is
-        finalized here rather than deferred — see `expire` for the
-        retirement contract. Releasing a key that is not cached is a
-        silent no-op.
+        after TTL expires (if TTL > 0); an entry retired by `expire` or
+        `expire_all` is finalized here rather than deferred — see `expire`
+        for the retirement contract. Releasing a key that is not cached is
+        a silent no-op.
 
         :param key:
             The cache key.
         :raises ValueError:
             If the key's reference count is already 0.
+
+        .. rubric:: Implementation notes
+
+        Finalizing inline rather than in a spawned task is what lets a
+        release that lands while its loop is shutting down still close
+        the resource: with nothing left to defer to, a task spawned there
+        may never run — the closing loop would orphan it, and the
+        resource with it.
         """
         async with self._lock:
             if key not in self._cache:
@@ -311,8 +331,7 @@ class ResourcePool(Generic[T]):
 
             if entry.reference_count <= 0:
                 if entry.doomed or self._ttl <= 0:
-                    # Inline rather than a spawned task: with nothing to
-                    # defer to, a task spawned here may never be run.
+                    # Inline — see the implementation notes on this method.
                     await self._cleanup(key)
                 else:
                     # Defer cleanup with a plain timer rather than a
@@ -348,23 +367,79 @@ class ResourcePool(Generic[T]):
             entry = self._cache.get(key)
             if entry is None:
                 return
-            if entry.reference_count <= 0:
-                # Also cancels any pending TTL timer or cleanup task.
-                await self._cleanup(key)
-            else:
-                entry.doomed = True
+            await self._retire(key, entry)
+
+    async def expire_all(self) -> None:
+        """Treat every cached key as TTL-expired now.
+
+        `expire` applied to every cached key at once (see `expire` for
+        the per-key drain-first and resurrection semantics), with one
+        difference: the sweep never stops early. It is the
+        retirement primitive for a pool whose loop stays running.
+
+        Retirement is all-or-nothing in reach, not in outcome: every
+        cached key is retired even if finalizing one of them fails. A
+        finalizer's `Exception` is contained as it is for every
+        operation (see ``finalizer``), here per entry, so a failure does
+        not end the sweep; any other `BaseException`, e.g., a cancelled
+        teardown's `asyncio.CancelledError`, propagates once the sweep
+        is over, not in place of it.
+
+        A failure the ranking below does not re-raise or chain is logged
+        at warning level and discarded, and a cancellation absorbed that
+        way is uncancelled, so the caller's cancellation count is left
+        as it found it.
+
+        :raises asyncio.CancelledError:
+            A cancellation delivered to a finalizer, re-raised once every
+            remaining key has been retired.
+        :raises KeyboardInterrupt:
+            A process-level interrupt raised in a finalizer, re-raised
+            likewise; it supersedes an earlier cancellation, which is
+            chained as its ``__cause__``.
+        :raises SystemExit:
+            As `KeyboardInterrupt`.
+
+        .. rubric:: Implementation notes
+
+        The sweep deliberately outlives its own failures. This is the
+        primitive a loop retires its resources through, and it is
+        reached on teardown paths that are themselves cancellable, so
+        abandoning the loop at the first `BaseException` would strand
+        every key it had not reached yet, i.e., the leak the primitive
+        exists to close, reappearing under cancellation. A delivered
+        cancellation is consumed by the finalizer it lands in and the
+        finalizers after it run uncancelled, so the sweep defers a single
+        delivered ``cancel()`` by at most one finalizer, and uncancels
+        what it absorbed so `asyncio.timeout` and `TaskGroup` see the
+        count they expect.
+        """
+        async with self._lock:
+            await self._sweep(self._retire)
 
     async def clear(self) -> None:
         """Finalize every cached entry and cancel pending cleanups.
 
         The teardown primitive: it force-finalizes regardless of reference
         count, which is correct when the pool itself is going away and
-        there is nothing left to drain for. To retire a single key while
-        the pool stays in use, use `expire`, which drains first.
+        there is nothing left to drain for. To retire keys while the pool
+        stays in use, use `expire` or `expire_all`, which drain first. A
+        finalizer that raises does not end the sweep: every key is
+        reached, and an uncontained failure is re-raised afterwards under
+        `expire_all`'s contract.
+
+        :raises BaseException:
+            As `expire_all`.
         """
         async with self._lock:
-            for key in list(self._cache.keys()):
-                await self._cleanup(key)
+            await self._sweep(lambda key, _: self._cleanup(key))
+
+    @property
+    def _name(self) -> str:
+        """Return the name the pool's log records carry: its factory's."""
+        return (
+            getattr(self._factory, "__qualname__", None) or type(self._factory).__name__
+        )
 
     @property
     def _lock(self) -> asyncio.Lock:
@@ -395,8 +470,8 @@ class ResourcePool(Generic[T]):
         if self._loop is not loop:
             if self._loop is not None and self._loop.is_running():
                 raise RuntimeError(
-                    "ResourcePool is bound to another running event loop; "
-                    "use one pool per loop"
+                    f"ResourcePool({self._name}) is bound to another running "
+                    "event loop; use one pool per loop"
                 )
             self._rebind(loop)
         assert self._mutex is not None
@@ -415,8 +490,7 @@ class ResourcePool(Generic[T]):
                 "ResourcePool(%s) rebinding to a new event loop; dropping %d "
                 "referenced and %d idle entries left by a loop that is no "
                 "longer running (finalizers not run)",
-                getattr(self._factory, "__qualname__", None)
-                or type(self._factory).__name__,
+                self._name,
                 referenced,
                 idle,
             )
@@ -502,6 +576,70 @@ class ResourcePool(Generic[T]):
         except asyncio.CancelledError:
             pass
 
+    async def _sweep(
+        self, retire: Callable[[Any, ResourcePool.CacheEntry], Awaitable[None]]
+    ) -> None:
+        """Apply ``retire`` to every cached entry, deferring failures to the end.
+
+        See `expire_all` for the contract this implements.
+
+        .. warning::
+            Must be called while holding the lock.
+
+        :param retire:
+            The per-entry retirement, given the key and its entry.
+        """
+        failure: BaseException | None = None
+        superseded: BaseException | None = None
+        absorbed = 0
+        for key, entry in list(self._cache.items()):
+            try:
+                await retire(key, entry)
+            except BaseException as error:
+                if isinstance(error, asyncio.CancelledError):
+                    absorbed += 1
+                # Ranking — see expire_all's :raises: contract.
+                if failure is None:
+                    failure = error
+                elif isinstance(error, _INTERRUPTS) and not isinstance(
+                    failure, _INTERRUPTS
+                ):
+                    failure, superseded = error, failure
+                else:
+                    _log.warning(
+                        "ResourcePool(%s) sweep discarding a later failure for key %r",
+                        self._name,
+                        key,
+                        exc_info=error,
+                    )
+        if isinstance(failure, asyncio.CancelledError):
+            absorbed -= 1
+        # Uncancel what the sweep absorbed — see expire_all.
+        task = asyncio.current_task()
+        if task is not None:
+            for _ in range(absorbed):
+                task.uncancel()
+        if failure is not None:
+            if superseded is not None:
+                raise failure from superseded
+            raise failure
+
+    async def _retire(self, key: Any, entry: ResourcePool.CacheEntry) -> None:
+        """Retire one entry under `expire`'s drain-first contract.
+
+        .. warning::
+            Must be called while holding the lock.
+
+        :param key:
+            The cache key to retire.
+        :param entry:
+            The entry cached under ``key``.
+        """
+        if entry.reference_count <= 0:
+            await self._cleanup(key)
+        else:
+            entry.doomed = True
+
     async def _cleanup(self, key: Any) -> None:
         """
         Remove entry from cache and call finalizer.
@@ -531,31 +669,15 @@ class ResourcePool(Generic[T]):
             try:
                 if self._finalizer:
                     try:
-                        await self._await(self._finalizer, entry.obj)
+                        result = self._finalizer(entry.obj)
+                        if inspect.isawaitable(result):
+                            await result
                     except Exception:
-                        pass
+                        _log.warning(
+                            "ResourcePool(%s) finalizer failed for key %r",
+                            self._name,
+                            key,
+                            exc_info=True,
+                        )
             finally:
                 del self._cache[key]
-
-    async def _await(self, func: Callable, *args) -> Any:
-        """
-        Call a function that might be sync or async.
-
-        If the function is a coroutine function, await it. Otherwise, call it
-        synchronously. If the result is a coroutine, await that as well.
-
-        :param func:
-            The function to call.
-        :param args:
-            Arguments to pass to the function.
-        :returns:
-            The result of the function call.
-        """
-        if asyncio.iscoroutinefunction(func):
-            return await func(*args)
-        else:
-            result = func(*args)
-            # Check if the result is a coroutine and await it if so
-            if asyncio.iscoroutine(result):
-                return await result
-            return result

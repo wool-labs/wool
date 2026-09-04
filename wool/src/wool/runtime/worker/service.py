@@ -751,9 +751,6 @@ class WorkerService(protocol.WorkerServicer):
         if timeout is None or timeout > 0:
             # Offload the synchronous ``thread.join`` to a worker
             # thread so the main loop keeps pumping while we wait.
-            # ``ResourcePool._await`` already dispatches coroutine
-            # finalizers, so changing this function to ``async def``
-            # is transparent at the call site.
             await asyncio.get_running_loop().run_in_executor(None, thread.join, timeout)
 
     @asynccontextmanager
