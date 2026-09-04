@@ -25,7 +25,9 @@ class Resource(Generic[T]):
 
     This class can only be used once as an async context manager. After
     acquisition, it cannot be reacquired, and after release, it cannot be
-    released again.
+    released again. The cached object may be any value, ``None`` and other
+    falsy values included: the release is tied to the acquisition, not to
+    the value acquired.
 
     :param pool:
         The `ResourcePool` this resource belongs to.
@@ -58,7 +60,7 @@ class Resource(Generic[T]):
         try:
             self._resource = await self._pool.acquire(self._key)
             return cast(T, self._resource)
-        except Exception:
+        except BaseException:
             self._acquired = False
             raise
 
@@ -91,8 +93,7 @@ class Resource(Generic[T]):
             )
 
         self._released = True
-        if self._resource:
-            await self._pool.release(self._key)
+        await self._pool.release(self._key)
 
 
 class ResourcePool(Generic[T]):
@@ -343,10 +344,22 @@ class ResourcePool(Generic[T]):
         async with self._lock:
             if key in self._cache:
                 entry = self._cache[key]
+                try:
+                    await self._cancel_cleanup(entry)
+                except BaseException:
+                    # Interrupted after the cleanup task was cancelled:
+                    # the entry is unreferenced with neither timer nor
+                    # cleanup, so re-arm its TTL rather than orphan it.
+                    if (
+                        entry.reference_count == 0
+                        and entry.timer is None
+                        and self._ttl > 0
+                    ):
+                        self._arm_timer(key, entry)
+                    raise
+                self._cancel_timer(entry)
                 entry.reference_count += 1
                 entry.doomed = False
-                self._cancel_timer(entry)
-                await self._cancel_cleanup(entry)
                 return entry.obj
             else:
                 # Cache miss - create new object
@@ -392,14 +405,7 @@ class ResourcePool(Generic[T]):
                     # Inline — see the implementation notes on this method.
                     await self._cleanup(key)
                 else:
-                    # Defer cleanup with a plain timer rather than a
-                    # task parked on a TTL sleep: an unfired
-                    # TimerHandle is discarded silently at loop close,
-                    # whereas a parked task is destroyed pending —
-                    # and, if never started, its coroutine emits a
-                    # "never awaited" RuntimeWarning.
-                    loop = asyncio.get_running_loop()
-                    entry.timer = loop.call_later(self._ttl, self._expire, key)
+                    self._arm_timer(key, entry)
 
     async def expire(self, key: Any) -> None:
         """Treat *key* as TTL-expired now, finalizing it once unreferenced.
@@ -490,6 +496,24 @@ class ResourcePool(Generic[T]):
             for key in list(self._cache.keys()):
                 await self._cleanup(key)
 
+    def _arm_timer(self, key: Any, entry: ResourcePool.CacheEntry) -> None:
+        """
+        Schedule an unreferenced entry's TTL expiry on the bound loop.
+
+        Defers cleanup with a plain timer rather than a task parked on a
+        TTL sleep: an unfired `asyncio.TimerHandle` is discarded silently
+        at loop close, whereas a parked task is destroyed pending — and,
+        if never started, its coroutine emits a "never awaited"
+        `RuntimeWarning`.
+
+        :param key:
+            The cache key whose TTL to start.
+        :param entry:
+            The entry cached under ``key``.
+        """
+        loop = asyncio.get_running_loop()
+        entry.timer = loop.call_later(self._ttl, self._expire, key)
+
     def _cancel_timer(self, entry: ResourcePool.CacheEntry) -> None:
         """
         Cancel an entry's pending TTL timer, if any.
@@ -509,9 +533,11 @@ class ResourcePool(Generic[T]):
         """
         Cancel an entry's in-flight cleanup task, if any.
 
-        The task is cancelled and awaited. The current task is left
-        alone: on the expiry path this runs *inside* the entry's own
-        cleanup task (`_finalize`), which must not cancel itself.
+        The task is cancelled and waited for; its own cancellation is
+        not re-raised here, while a cancellation of the current task is
+        honored. The current task is left alone: on the expiry path this
+        runs *inside* the entry's own cleanup task (`_finalize`), which
+        must not cancel itself.
 
         :param entry:
             The cache entry whose cleanup task to cancel.
@@ -521,10 +547,7 @@ class ResourcePool(Generic[T]):
         if cleanup is None or cleanup.done() or cleanup is asyncio.current_task():
             return
         cleanup.cancel()
-        try:
-            await cleanup
-        except asyncio.CancelledError:
-            pass
+        await asyncio.wait({cleanup})
 
     def _expire(self, key: Any) -> None:
         """
