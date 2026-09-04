@@ -6,8 +6,12 @@ import time
 import uuid
 from types import MappingProxyType
 from typing import Any
+from typing import Callable
+from typing import Coroutine
 from unittest.mock import MagicMock
 
+import cloudpickle
+import grpc.aio
 import pytest
 import pytest_asyncio
 from cryptography import x509
@@ -24,8 +28,12 @@ from wool import protocol
 from wool.runtime.context.factory import _loops_with_factory
 from wool.runtime.context.factory import install_task_factory
 from wool.runtime.discovery.base import DiscoveryEvent
+from wool.runtime.routine.task import Task
+from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker import connection
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.metadata import WorkerMetadata
+from wool.runtime.worker.proxy import WorkerProxy
 
 
 class PicklableMock(MagicMock):
@@ -57,16 +65,15 @@ def _isolate_wool_context():
 async def _clear_channel_pool():
     """Finalize the module-level gRPC channel pool on the loop that used it.
 
-    Not required for correctness: a `ResourcePool` rebinds to the next
-    test's loop and drops whatever a loop that is no longer running left
-    behind. Closing each test's channels here, on their own loop, is the
-    only place a ``grpc.aio`` channel can still be closed -- a dropped
-    orphan never is.
+    Covers tests that dispatch through a bare `WorkerConnection` and
+    never close it: this loop is the only place its channel can still
+    be closed, and a started proxy left behind would strand its hold
+    for the next loop to report — see
+    `wool.runtime.resourcepool.ResourcePool` for what a stopped loop's
+    leftovers become.
     """
     yield
-    import wool.runtime.worker.connection as _conn
-
-    await _conn.clear_channel_pool()
+    await connection.clear_channel_pool()
 
 
 @pytest.fixture(autouse=True)
@@ -593,6 +600,125 @@ def mock_grpc_stub_factory():
 
 
 @pytest.fixture
+def sample_task():
+    """Build a `Task` whose callable returns ``"test_result"``.
+
+    The task carries a picklable mock proxy, so it survives the
+    serialization a dispatch performs.
+    """
+
+    async def sample_task():
+        return "test_result"
+
+    mock_proxy = PicklableMock(spec=WorkerProxyLike, id="test-proxy-id")
+
+    return Task(
+        id=uuid.uuid4(),
+        callable=sample_task,
+        args=(),
+        kwargs={},
+        proxy=mock_proxy,
+    )
+
+
+@pytest.fixture
+def async_stream():
+    """Return a factory that turns an iterable into an async generator.
+
+    The generator yields each item as a mock gRPC response, calling any
+    callable item and awaiting any coroutine item in place of yielding
+    it, so a stream can interleave side effects with responses.
+    """
+
+    async def create_async_stream(iterable):
+        """Convert an iterable into an async generator.
+
+        :param iterable:
+            Any iterable (list, tuple, generator, etc.).
+        """
+        for item in iterable:
+            if isinstance(item, Callable):
+                item()
+            elif isinstance(item, Coroutine):
+                await item
+            else:
+                yield item
+
+    return create_async_stream
+
+
+@pytest.fixture
+def mock_grpc_call(mocker: MockerFixture):
+    """Return a factory for mock bidi-streaming gRPC calls.
+
+    Each call wraps a caller-supplied stream iterator and exposes async
+    ``write`` and ``done_writing`` plus a configurable ``cancel``.
+    """
+
+    def create_call(stream_iterator, cancel_raises=False):
+        """Create a mock gRPC call object for bidi-streaming.
+
+        :param stream_iterator:
+            The async iterator the call iterates over.
+        :param cancel_raises:
+            If ``True``, ``cancel()`` raises `RuntimeError`.
+        """
+        mock_call = mocker.MagicMock()
+        mock_call.__aiter__ = lambda _: stream_iterator
+        mock_call.write = mocker.AsyncMock()
+        mock_call.done_writing = mocker.AsyncMock()
+
+        if cancel_raises:
+            mock_call.cancel = mocker.MagicMock(
+                side_effect=RuntimeError("cancel failed")
+            )
+        else:
+            mock_call.cancel = mocker.MagicMock()
+
+        return mock_call
+
+    return create_call
+
+
+@pytest.fixture
+def dispatching_stub(mocker: MockerFixture, async_stream, mock_grpc_call):
+    """Patch `protocol.WorkerStub` with a stub whose dispatch always succeeds.
+
+    Every call builds a fresh ack-then-result stream, so a test may
+    dispatch any number of times without exhausting a shared generator.
+    Returns the stub, for tests that assert on the dispatch calls.
+    """
+
+    def fresh_call(*args, **kwargs):
+        responses = (
+            protocol.Response(ack=protocol.Ack()),
+            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+        )
+        return mock_grpc_call(async_stream(responses))
+
+    stub = mocker.MagicMock()
+    stub.dispatch = mocker.MagicMock(side_effect=fresh_call)
+    mocker.patch.object(protocol, "WorkerStub", return_value=stub)
+    return stub
+
+
+@pytest.fixture
+def pooled_channel(mocker: MockerFixture):
+    """Patch `grpc.aio.insecure_channel` with a mock channel.
+
+    Every insecure dispatch made while this fixture is active caches the
+    returned channel in the module-level channel pool, so a test asserts
+    on the pool's lifecycle through the channel's ``close``.
+
+    :returns:
+        The `AsyncMock` channel the patched factory hands out.
+    """
+    channel = mocker.AsyncMock()
+    mocker.patch.object(grpc.aio, "insecure_channel", return_value=channel)
+    return channel
+
+
+@pytest.fixture
 async def worker_proxy(mock_discovery_service, mock_grpc_stub_factory, metadata):
     """Pre-configured WorkerProxy with mock discovery and gRPC stubs.
 
@@ -724,3 +850,26 @@ def worker_credentials_one_way(test_certificates):
     return WorkerCredentials(
         ca_cert=ca_pem, worker_key=key_pem, worker_cert=cert_pem, mutual=False
     )
+
+
+@pytest_asyncio.fixture
+async def proxy_factory():
+    """Build `WorkerProxy` instances and stop any still started at teardown.
+
+    A started proxy holds the loop's channel pool, so a test that
+    starts one and never stops it would strand that hold for the next
+    loop to report; building through this factory makes the stop part
+    of teardown rather than of the test body.
+    """
+    proxies: list[WorkerProxy] = []
+
+    def factory(**kwargs) -> WorkerProxy:
+        proxy = WorkerProxy(**kwargs)
+        proxies.append(proxy)
+        return proxy
+
+    yield factory
+
+    for proxy in proxies:
+        if proxy.started:
+            await proxy.stop()
