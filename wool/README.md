@@ -358,7 +358,7 @@ A `WorkerConnection` is a gRPC client managing a pooled channel to a single work
 
 Dispatch is not the whole surface: `WorkerConnection.idle` polls how long the worker has been continuously idle, in seconds, over a channel from the same pool. The count runs from the moment the worker's in-flight task set last emptied — startup counts as empty — and reads zero whenever work is in flight, which is what makes it a usable retirement signal: a supervisor polls its workers and stops the ones that have been quiet past some threshold. A worker predating the capability answers `UNIMPLEMENTED`, surfacing as `IdleUnavailable`, which descends from `WoolError` rather than `RpcError` so that an absent capability is not mistaken for an unhealthy peer. See the worker package's [_Connections → Idle reporting_](src/wool/runtime/worker/README.md#idle-reporting) for the full contract.
 
-Channels are pooled per event loop with reference counting and a 60-second TTL. A dispatch acquires a pool reference, and the result stream holds its own reference to keep the channel alive during streaming. There is no pool-level health checking — dead channels are detected reactively when a dispatch attempt fails, and the failed worker is removed from the load balancer context by the error classification logic.
+Channels are pooled per event loop with reference counting and a 60-second idle TTL, and are retired sooner when a `WorkerConnection` is closed or the last `WorkerProxy` on the loop stops — see the worker package's [_Connections → Connection pooling_](src/wool/runtime/worker/README.md#connection-pooling) for the full contract. A dispatch acquires a pool reference, and the result stream holds its own reference to keep the channel alive during streaming. There is no pool-level health checking — dead channels are detected reactively when a dispatch attempt fails, and the failed worker is removed from the load balancer context and its connection closed.
 
 ### Transport configuration
 
@@ -538,7 +538,7 @@ sequenceDiagram
     participant Routine
     participant Pool
     participant Discovery
-    participant Loadbalancer
+    participant Proxy
     participant Worker
 
     %% -- 1. Pool startup --
@@ -547,7 +547,7 @@ sequenceDiagram
 
         Client ->> Pool: create pool (spawn, discovery, loadbalancer)
         activate Client
-        Pool ->> Pool: resolve mode; classify factory by binding the call; check identity against own peers policy
+        Pool ->> Pool: resolve mode, classify the worker factory, check identity against own peers policy
 
         opt If spawn specified, spawn ephemeral workers
             loop Per worker
@@ -558,28 +558,33 @@ sequenceDiagram
             end
         end
 
-        Pool ->> Pool: create proxy (discovery subscriber, loadbalancer)
+        Pool ->> Proxy: create proxy (discovery subscriber, loadbalancer, lazy)
+        opt Eager proxy now, lazy proxy on its first dispatch
+            Proxy ->> Proxy: start — take a hold on the loop's channel pool, enter the load balancer, subscribe to discovery, launch the worker sentinel
+        end
         Pool -->> Client: pool ready
         deactivate Client
     end
 
     %% -- 2. Discovery --
     rect rgba(0, 0, 0, 0)
-        Note over Discovery, Loadbalancer: Worker discovery (the admission gate is WorkerProxy's)
+        Note over Discovery, Proxy: Worker discovery (the proxy's sentinel applies the admission gate)
 
         par Worker discovery
             loop Per worker lifecycle event
-                Discovery -->> Loadbalancer: worker event
+                Discovery -->> Proxy: worker event
                 activate Discovery
                 alt Worker-added or worker-updated
-                    Loadbalancer ->> Loadbalancer: admission gate — secure flag, protocol version, advertised identity vs peers policy
-                    alt Admitted
-                        Loadbalancer ->> Loadbalancer: add or refresh worker, pinning the advertised name when a policy is configured
+                    Proxy ->> Proxy: admission gate — secure flag, protocol version, advertised identity vs peers policy
+                    alt Admitted, not yet held
+                        Proxy ->> Proxy: add worker with a connection pinned to the advertised name when a policy is configured
+                    else Admitted, already held
+                        Proxy ->> Proxy: refresh in place — keep the connection when the channel key is unchanged, otherwise build a fresh one and leave the displaced channel to the idle TTL
                     else Rejected
-                        Loadbalancer ->> Loadbalancer: ignore if not held, evict if held
+                        Proxy ->> Proxy: ignore if not held, otherwise evict and close its connection
                     end
                 else Worker-dropped
-                    Loadbalancer ->> Loadbalancer: remove worker
+                    Proxy ->> Proxy: remove worker and close its connection (retiring its channel now rather than at the idle TTL)
                 end
                 deactivate Discovery
             end
@@ -593,30 +598,30 @@ sequenceDiagram
         Client ->> Routine: invoke wool routine
         activate Client
         Routine ->> Routine: create task, serialize via cloudpickle
-        Routine ->> Loadbalancer: route task
+        Routine ->> Proxy: route task
 
         loop Until handshake resolves or all workers exhausted
-            Loadbalancer ->> Loadbalancer: select next worker
-            Loadbalancer ->> Worker: open stream pinned to the advertised identity (when peers configured), write task frame
+            Proxy ->> Proxy: load balancer selects next worker
+            Proxy ->> Worker: acquire the worker's pooled channel, open a stream pinned to the advertised identity (when peers configured), write task frame
             Worker ->> Worker: VersionInterceptor, then DispatchSession.__aenter__ (parse)
             alt Ack
-                Worker -->> Loadbalancer: Ack
-                Loadbalancer ->> Loadbalancer: break
+                Worker -->> Proxy: Ack
+                Proxy ->> Proxy: break (the result stream holds its own channel reference until drained)
             else Nack with cloudpickled parse-failure exception
-                Worker -->> Loadbalancer: Nack
-                Loadbalancer ->> Loadbalancer: deserialize, re-raise (no eviction)
-                Loadbalancer -->> Routine: typed exception
+                Worker -->> Proxy: Nack
+                Proxy ->> Proxy: deserialize, re-raise (no eviction)
+                Proxy -->> Routine: typed exception
                 Routine -->> Client: re-raise
             else Handshake failure (UNAUTHENTICATED, or UNAVAILABLE carrying TLS evidence — untrusted CA, name mismatch, expired)
-                Loadbalancer ->> Loadbalancer: skip without eviction, rate-limited warning
+                Proxy ->> Proxy: skip without eviction, rate-limited warning
             else Transient gRPC error (UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED)
-                Loadbalancer ->> Loadbalancer: skip, continue
+                Proxy ->> Proxy: skip, continue
             else Non-transient gRPC error (incl. FAILED_PRECONDITION on version mismatch)
-                Loadbalancer ->> Loadbalancer: evict worker, continue
+                Proxy ->> Proxy: evict worker, close its connection, continue
             end
         end
         opt All workers exhausted
-            Loadbalancer -->> Client: raise NoWorkersAvailable
+            Proxy -->> Client: raise NoWorkersAvailable
         end
 
         Worker ->> Worker: DispatchSession.__aiter__ schedules worker driver lazily
@@ -652,18 +657,21 @@ sequenceDiagram
         Client ->> Pool: exit pool
         activate Client
 
-        Pool ->> Pool: stop proxy
+        Pool ->> Proxy: stop proxy
+        Proxy ->> Proxy: cancel the sentinel, exit discovery and the load balancer, release the hold
+        opt Last hold on the loop
+            Proxy ->> Proxy: retire every channel cached on the loop, drain-first (a channel a stream still uses closes when that stream drains)
+        end
 
         opt Stop ephemeral workers
             loop Per worker
-                Pool ->> Discovery: publish "worker dropped"
-                Discovery -->> Loadbalancer: worker event
-                Loadbalancer ->> Loadbalancer: remove worker
-                Pool ->> Worker: stop worker
+                Pool ->> Discovery: publish "worker dropped" (this proxy has already stopped, other subscribers evict)
+                Pool ->> Worker: stop RPC over a WorkerConnection entered as a context manager, so its channel closes on exit
                 Worker ->> Worker: stop service, exit process
             end
         end
 
+        Pool ->> Discovery: exit the publisher, bounded by what remains of shutdown_timeout
         Pool ->> Discovery: close discovery
         Pool -->> Client: pool exited
         deactivate Client

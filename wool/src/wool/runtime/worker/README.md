@@ -206,7 +206,7 @@ async with wool.WorkerPool(
 Each worker subprocess has a two-loop architecture:
 
 - The **gRPC event loop** runs the gRPC server (`WorkerService`). It receives dispatch RPCs, sends acknowledgments, and streams results back.
-- A dedicated **worker event loop** runs on a daemon thread. Routines are scheduled here so that long-running work never blocks gRPC operations. The pools a routine draws on — the proxy pool and the discovery-subscriber pool — are bound to this loop and are finalized on it when the loop retires; a `ResourcePool` serves one running loop at a time.
+- A dedicated **worker event loop** runs on a daemon thread. Routines are scheduled here so that long-running work never blocks gRPC operations. The pools a routine draws on — its proxies, its discovery subscribers, and the gRPC channels a nested dispatch opens — are finalized on this loop when it retires, because a `ResourcePool` serves one running loop at a time; see `WorkerService` for the teardown order.
 
 Per-dispatch, the gRPC handler instantiates a `DispatchSession` — an async context manager and async iterator that owns the dispatch's full worker-side lifecycle as a uniform driver for both coroutine and async-generator Wool routines. The session has four phases:
 
@@ -266,7 +266,7 @@ Signal handlers map `SIGTERM` to timeout 0 (cancel immediately) and `SIGINT` to 
 
 ### Nested routines
 
-Worker subprocesses can dispatch tasks to other workers. Each subprocess is configured with a `ResourcePool` of `WorkerProxy` instances (via `wool.__proxy_pool__`), so `@wool.routine` calls within a task transparently route to the target pool. Spinning up a `WorkerProxy` is not free — it involves establishing a discovery subscription, starting a worker-sentinel task (a background coroutine that keeps the proxy's connection context alive), and opening gRPC connections — so the resource pool caches proxies with a configurable TTL (default 60 seconds, set via `proxy_pool_ttl` on `LocalWorker`). If the interval between dispatches for a given pool on a given worker is shorter than the TTL, the cached proxy is reused. If it exceeds the TTL, the proxy is finalized and must be recreated on the next dispatch. The proxy pool is bound to the worker event loop that dispatches through it, so proxies are also finalized when that loop retires after its own idle TTL; a proxy is reused only while the interval between dispatches is shorter than both. Tuning `proxy_pool_ttl` above the expected dispatch interval keeps proxies warm and avoids this cold-start overhead.
+Worker subprocesses can dispatch tasks to other workers. Each subprocess is configured with a `ResourcePool` of `WorkerProxy` instances (via `wool.__proxy_pool__`), so `@wool.routine` calls within a task transparently route to the target pool. Spinning up a `WorkerProxy` is not free — it involves establishing a discovery subscription, starting a worker-sentinel task (a background coroutine that keeps the proxy's connection context alive), and opening gRPC connections — so the resource pool caches proxies with a configurable TTL (default 60 seconds, set via `proxy_pool_ttl` on `LocalWorker`). If the interval between dispatches for a given pool on a given worker is shorter than the TTL, the cached proxy is reused. If it exceeds the TTL, the proxy is finalized and must be recreated on the next dispatch. The proxy pool is bound to the worker event loop that dispatches through it, so proxies are also finalized when that loop retires after its own idle TTL; a proxy is reused only while the interval between dispatches is shorter than both. Tuning `proxy_pool_ttl` above the expected dispatch interval keeps proxies warm and avoids this cold-start overhead. Retiring the last cached proxy also releases the worker loop's hold on the channel pool, so the loop's gRPC channels are retired with it — see [Connection pooling](#connection-pooling).
 
 Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagates its `lazy` flag to every `WorkerProxy` it constructs, and each task serializes the proxy (including the flag) so that workers receiving the task inherit the same laziness setting. A lazy proxy defers discovery subscription and worker-sentinel task setup until its first `dispatch()` call, so workers that never invoke nested routines pay no startup cost.
 
@@ -303,18 +303,18 @@ Because the fast path is out of reach on macOS, treat the forking path as the on
 
 ### Lazy startup
 
-`WorkerProxy` accepts a `lazy` parameter (default `True`) that controls when the proxy actually starts — i.e., when it subscribes to discovery, launches the worker sentinel task, and initializes the load balancer context.
+`WorkerProxy` accepts a `lazy` parameter (default `True`) that controls when the proxy actually starts, i.e., when it acquires the resources it dispatches through — the channel-pool hold, the load-balancer context, the discovery subscription, and the worker sentinel — see `WorkerProxy.start`.
 
 | `lazy` | `enter()` / `__aenter__` | `dispatch()` | `exit()` on un-started proxy |
 | ------ | ------------------------ | ------------- | ----------------------------- |
-| `True` | Sets context var only | Calls `start()` on first call (retrying on a later call if it failed), then dispatches | No-op (safe to call) |
+| `True` | Sets context var only | Calls `start()` on first call (retrying on a later call if it failed), then dispatches; raises `RuntimeError` once the proxy has been stopped | No-op (safe to call) |
 | `False` | Sets context var, calls `start()` | Raises `RuntimeError` if not started | Raises `RuntimeError` |
 
 When `lazy=True`, concurrent `dispatch()` calls use a double-checked lock to ensure the proxy starts exactly once. The `lazy` flag is preserved through `cloudpickle` serialization, so proxies sent to worker subprocesses as part of a task retain their laziness setting.
 
 ### Context lifecycle
 
-Both `WorkerPool` and `WorkerProxy` are **single-use** async context managers. Once entered and exited, the same instance cannot be entered again — create a new instance instead. Attempting to call `enter()` or `__aenter__()` a second time raises `RuntimeError`. This prevents silent state corruption from reentrant or repeated context usage (e.g., accidentally nesting `async with proxy:` blocks or calling `enter()` in a retry loop).
+Both `WorkerPool` and `WorkerProxy` are **single-use** async context managers. Once entered and exited, the same instance cannot be entered again — create a new instance instead. Attempting to call `enter()` or `__aenter__()` a second time raises `RuntimeError`. This prevents silent state corruption from reentrant or repeated context usage (e.g., accidentally nesting `async with proxy:` blocks or calling `enter()` in a retry loop). `start()` and `stop()` are likewise single-use: a proxy is started once and stopped once, and a stopped proxy cannot be restarted or dispatched through — see `WorkerProxy` for the states and the error each rejected call carries.
 
 ```python
 # Correct — one instance per context
@@ -332,7 +332,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 ### Connection pooling
 
-`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options, peer)`, with a 60-second TTL — idle channels are finalized after the TTL expires. The pool serves one running event loop at a time: a process that runs successive loops gets a fresh channel set per loop, channels left by a loop that is no longer running are dropped without being closed, and using the pool from two running loops at once raises. Keying on the `WorkerCredentials` value (a frozen dataclass, so hashable and value-equal) is what makes rotation observable at the channel layer — see [Credential providers: admission and rotation](#credential-providers-admission-and-rotation). Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams` — the client-side dispatch gate. The worker's own HTTP/2 `MAX_CONCURRENT_STREAMS` ceiling is set to twice that value to absorb transient permit-turnover overshoot without faulting the connection. See issue #290.
+`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options, peer)`, with a 60-second idle TTL, i.e., a channel no dispatch still references is finalized 60 seconds after its last reference drops. The pool serves one running event loop at a time: a process that runs successive loops gets a fresh channel set per loop, and using the pool from two running loops at once raises. A `WorkerConnection` used as an async context manager closes on exit, retiring its own keys drain-first; each `WorkerProxy` holds the pool for its started lifetime and closes the connections of workers that depart it — see `WorkerProxy` for the contract, `channel_pool_hold` for the hold, and `ResourcePool` for what a stopped loop's leftovers become. Keying on the `WorkerCredentials` value (a frozen dataclass, so hashable and value-equal) is what makes rotation observable at the channel layer — see [Credential providers: admission and rotation](#credential-providers-admission-and-rotation). Each channel's concurrency semaphore — the client-side dispatch gate — is sized by the worker's advertised `max_concurrent_streams`. The worker's own HTTP/2 `MAX_CONCURRENT_STREAMS` ceiling is set to twice that value to absorb transient permit-turnover overshoot without faulting the connection. See issue #290.
 
 ### Idle reporting
 
@@ -340,7 +340,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 Idle is measured as the time since the worker's in-flight task set last emptied, with worker startup counting as the initial empty state. It reads `0.0` while any task is in flight and restarts from zero each time the set drains again, so the value answers "how long has this worker had nothing to do", not "how long since it was started". The measurement is taken on a monotonic clock, so a wall-clock adjustment cannot distort it. Polling creates no `DispatchSession` and never enters the in-flight set, so reading the measurement cannot disturb it.
 
-This is worker idleness, not channel idleness: the 60-second `ResourcePool` TTL above and `WorkerOptions.max_connection_idle_ms` govern how long an unused *channel* survives within the loop that opened it, and neither is affected by whether the worker at the other end is executing tasks.
+This is worker idleness, not channel idleness: the channel-lifetime rules in [Connection pooling](#connection-pooling) and the `max_connection_idle_ms` limit below govern how long an unused *channel* survives within the loop that opened it, and none of them is affected by whether the worker at the other end is executing tasks.
 
 A worker that predates the idle capability answers the RPC with gRPC `UNIMPLEMENTED`, which surfaces as `IdleUnavailable`. It descends from `WoolError` rather than `RpcError`, so `except RpcError` does not catch it — an absent capability is not an RPC-health fault, and a polling client should treat it as "idle reporting is unavailable on this worker" rather than as a transient hiccup or an unhealthy peer. Every other gRPC failure classifies as it does for dispatch: transient codes raise `TransientRpcError`, everything else raises `RpcError`.
 
@@ -370,7 +370,9 @@ options = WorkerOptions(
 async with wool.WorkerPool(
     spawn=4,
     worker=lambda *tags, credentials=None: LocalWorker(
-        *tags, credentials=credentials, options=options,
+        *tags,
+        credentials=credentials,
+        options=options,
     ),
 ):
     result = await my_routine()

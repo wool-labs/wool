@@ -204,10 +204,11 @@ class LocalWorker(Worker):
             if self._worker_process.is_alive():
                 assert self.address
 
-                # Route the stop RPC through WorkerConnection; ``close``
-                # releases the pooled channel this stop acquired. The
-                # provider rides along so the connection resolves
-                # current credential material per call.
+                # Route the stop RPC through `WorkerConnection` so the
+                # stop's channel is retired on exit — see
+                # `WorkerConnection.close`. The provider rides along so
+                # the connection resolves current credential material
+                # per call.
                 # Pin the worker's own identity — nothing else here
                 # supplies a name — see `WorkerProxy` for why. A worker
                 # declaring none keeps the dialed-address fallback,
@@ -221,7 +222,7 @@ class LocalWorker(Worker):
                         peer=self._identity,
                     )
                 )
-                try:
+                async with connection:
                     # Only a bounded drain (positive grace) admits a
                     # finite deadline; a negative grace drains
                     # indefinitely, and ``None`` keeps the pre-existing
@@ -232,8 +233,6 @@ class LocalWorker(Worker):
                     else:
                         deadline = grace + _STOP_RPC_MARGIN
                     await connection.stop(grace=grace, timeout=deadline)
-                finally:
-                    await connection.close()
         finally:
             # `reap` blocks on `join`, so it must run off-loop — see
             # the docstring for the cancellation contract. A negative

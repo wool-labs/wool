@@ -25,6 +25,7 @@ from wool.runtime.context.factory import install_task_factory
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
+from wool.runtime.worker.connection import clear_channel_pool
 from wool.runtime.worker.frame import AckResponseFrame
 from wool.runtime.worker.frame import NackResponseFrame
 from wool.runtime.worker.session import DispatchSession
@@ -650,14 +651,23 @@ class WorkerService(protocol.WorkerServicer):
     ) -> None:
         """Schedule worker-loop shutdown and optionally join the thread.
 
-        Finalizes the proxy and discovery-subscriber pools on the worker
-        loop first: they are bound to it, and a `ResourcePool` refuses
-        use from any other running loop, so this finalizer is the one
-        place they can still be cleared. A clear that raises or exceeds
-        the shared `_DRAIN_TIMEOUT` budget is logged and does not
-        prevent the stop; whatever it left cached is dropped when the
-        pool next rebinds. With ``timeout=0`` the clears run best-effort
-        on the daemon thread after this returns.
+        Finalizes the proxy and discovery-subscriber pools, then the
+        channel pool, on the worker loop first: they are bound to it, and
+        a `ResourcePool` refuses use from any other running loop, so this
+        finalizer is the one place they can still be cleared. A clear
+        that raises or exceeds the shared `_DRAIN_TIMEOUT` budget is
+        logged and does not prevent the stop; the budget bounds when a
+        clear is cancelled, not when it returns, since a clear finishes
+        its sweep before re-raising (see `ResourcePool.clear`), a clear
+        reached with the budget already exhausted is cancelled before it
+        starts and logged the same way, and whatever a clear left cached
+        is dropped when the pool next rebinds.
+        With ``timeout=0`` the clears run best-effort on the daemon
+        thread after this returns; on that path the channel clear can
+        race a successor loop's first use of the process-wide pool, and
+        a pool partitioned per loop (#381) removes the race. An
+        interrupt raised by a clear still drains the loop before
+        propagating.
 
         Drains successive generations of pending tasks on the
         worker loop, then signals the loop to stop. A cancelled
@@ -687,54 +697,65 @@ class WorkerService(protocol.WorkerServicer):
             A tuple of the event loop and the thread running it.
         """
         loop, thread = loop_thread
-        pools = [
-            ("proxy", wool.__proxy_pool__.get()),
-            ("subscriber", __subscriber_pool__.get()),
+        proxy_pool = wool.__proxy_pool__.get()
+        subscriber_pool = __subscriber_pool__.get()
+        # Proxies first: exiting them releases the loop's channel-pool
+        # hold, so the channel clear that follows finds nothing to
+        # force-close on a rotation that drained cleanly.
+        clears = [
+            (name, pool.clear)
+            for name, pool in (("proxy", proxy_pool), ("subscriber", subscriber_pool))
+            if pool is not None
         ]
+        clears.append(("channel", clear_channel_pool))
 
         async def _shutdown():
             current = asyncio.current_task()
             deadline = loop.time() + _DRAIN_TIMEOUT
             leaked: list[asyncio.Task] = []
             try:
-                for name, pool in pools:
-                    if pool is None:
-                        continue
-                    try:
-                        await asyncio.wait_for(
-                            pool.clear(), timeout=max(0.0, deadline - loop.time())
-                        )
-                    except Exception:
+                try:
+                    for name, clear in clears:
+                        try:
+                            await asyncio.wait_for(
+                                clear(), timeout=max(0.0, deadline - loop.time())
+                            )
+                        except Exception:
+                            _log.warning(
+                                f"Failed to clear the {name} pool during "
+                                "worker-loop teardown; continuing to drain and "
+                                "stop the loop.",
+                                exc_info=True,
+                            )
+                finally:
+                    # The drain runs whatever a clear raised — see the
+                    # docstring.
+                    while True:
+                        pending = [
+                            task for task in asyncio.all_tasks() if task is not current
+                        ]
+                        if not pending:
+                            break
+                        for task in pending:
+                            task.cancel()
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            leaked = pending
+                            break
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*pending, return_exceptions=True),
+                                timeout=remaining,
+                            )
+                        except TimeoutError:
+                            leaked = pending
+                            break
+                    if leaked:
                         _log.warning(
-                            f"Failed to clear the {name} pool during worker-loop "
-                            "teardown; continuing to drain and stop the loop.",
-                            exc_info=True,
+                            f"Worker-loop teardown drain timed out after "
+                            f"{_DRAIN_TIMEOUT}s; {len(leaked)} task(s) still "
+                            "pending."
                         )
-                while True:
-                    pending = [
-                        task for task in asyncio.all_tasks() if task is not current
-                    ]
-                    if not pending:
-                        break
-                    for task in pending:
-                        task.cancel()
-                    remaining = deadline - loop.time()
-                    if remaining <= 0:
-                        leaked = pending
-                        break
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*pending, return_exceptions=True),
-                            timeout=remaining,
-                        )
-                    except TimeoutError:
-                        leaked = pending
-                        break
-                if leaked:
-                    _log.warning(
-                        f"Worker-loop teardown drain timed out after "
-                        f"{_DRAIN_TIMEOUT}s; {len(leaked)} task(s) still pending."
-                    )
             finally:
                 loop.stop()
 
