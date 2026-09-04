@@ -103,11 +103,16 @@ class ResourcePool(Generic[T]):
     binds to the first loop that uses it and rebinds when used from
     another loop once the bound loop is no longer running, dropping every
     cached entry without running its finalizer: a resource cannot be torn
-    down from a loop other than the one that made it. Entries still
-    referenced when their loop stopped are reported at warning level,
-    idle ones at debug. Using a bound pool from a second *running* loop
-    raises `RuntimeError`, so tearing a pool down belongs to the loop that
-    owns it.
+    down from a loop other than the one that made it. Every dropped
+    entry is reported at warning level, referenced and idle alike: a
+    drop is not an expiry, so an idle entry the TTL would have closed
+    is abandoned rather than finalized, and both counts name a resource
+    that outlived every chance to finalize it. The record names the pool
+    by its factory, and it is expected only of a loop that stopped with
+    entries it did not clear: a loop that clears its pools before
+    stopping leaves nothing to report. Using a bound pool from a second
+    *running* loop raises `RuntimeError`, so tearing a pool down belongs
+    to the loop that owns it.
 
     :param factory:
         Function to create new objects (sync or async).
@@ -182,66 +187,6 @@ class ResourcePool(Generic[T]):
         self._cache: dict[Any, ResourcePool.CacheEntry] = {}
         self._mutex: asyncio.Lock | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-
-    @property
-    def _lock(self) -> asyncio.Lock:
-        """Return the mutex serializing this pool on its bound loop.
-
-        Binds the pool on first use and rebinds it when the running loop
-        differs from the bound one and the bound one is no longer running
-        — see the class docstring for what a rebind drops. Every method
-        that touches ``_cache`` takes this lock first, so the loop check
-        happens once per operation.
-
-        :raises RuntimeError:
-            If the pool is bound to another loop that is still running.
-
-        .. rubric:: Implementation notes
-
-        `asyncio.Lock` binds to a loop the first time it is *contended*
-        — the uncontended acquire path never consults one — and never
-        unbinds, so a single mutex built at construction would serve
-        every uncontended caller and then raise for the first contender
-        on any later loop. Liveness is `is_running`, not `is_closed`: a
-        loop that has stopped but not yet closed cannot contend the
-        mutex, and both the worker's loop rotation and the test fixtures
-        stop a loop before closing it. `is_running` reads one attribute,
-        so it is safe to call from another thread.
-        """
-        loop = asyncio.get_running_loop()
-        if self._loop is not loop:
-            if self._loop is not None and self._loop.is_running():
-                raise RuntimeError(
-                    "ResourcePool is bound to another running event loop; "
-                    "use one pool per loop"
-                )
-            self._rebind(loop)
-        assert self._mutex is not None
-        return self._mutex
-
-    def _rebind(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Bind this pool to ``loop``, dropping what the previous loop left.
-
-        The dropped entries are never finalized: their finalizer would
-        run against a loop that is no longer running. Entries still
-        referenced when that loop stopped are a leak and are logged at
-        warning level; idle entries are what the TTL would have
-        discarded and are logged at debug level.
-        """
-        if self._cache:
-            referenced = sum(1 for e in self._cache.values() if e.reference_count > 0)
-            idle = len(self._cache) - referenced
-            log = _log.warning if referenced else _log.debug
-            log(
-                "ResourcePool rebinding to a new event loop; dropping %d "
-                "referenced and %d idle entries left by a loop that is no "
-                "longer running (finalizers not run)",
-                referenced,
-                idle,
-            )
-            self._cache.clear()
-        self._mutex = asyncio.Lock()
-        self._loop = loop
 
     async def __aenter__(self):
         """Async context manager entry.
@@ -420,6 +365,64 @@ class ResourcePool(Generic[T]):
         async with self._lock:
             for key in list(self._cache.keys()):
                 await self._cleanup(key)
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        """Return the mutex serializing this pool on its bound loop.
+
+        Binds the pool on first use and rebinds it when the running loop
+        differs from the bound one and the bound one is no longer running
+        — see the class docstring for what a rebind drops. Every method
+        that touches ``_cache`` takes this lock first, so the loop check
+        happens once per operation.
+
+        :raises RuntimeError:
+            If the pool is bound to another loop that is still running.
+
+        .. rubric:: Implementation notes
+
+        `asyncio.Lock` binds to a loop the first time it is *contended*
+        — the uncontended acquire path never consults one — and never
+        unbinds, so a single mutex built at construction would serve
+        every uncontended caller and then raise for the first contender
+        on any later loop. Liveness is `is_running`, not `is_closed`: a
+        loop that has stopped but not yet closed cannot contend the
+        mutex, and both the worker's loop rotation and the test fixtures
+        stop a loop before closing it. `is_running` reads one attribute,
+        so it is safe to call from another thread.
+        """
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            if self._loop is not None and self._loop.is_running():
+                raise RuntimeError(
+                    "ResourcePool is bound to another running event loop; "
+                    "use one pool per loop"
+                )
+            self._rebind(loop)
+        assert self._mutex is not None
+        return self._mutex
+
+    def _rebind(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Bind this pool to ``loop``, dropping what the previous loop left.
+
+        Both counts are logged — see the class docstring for why an idle
+        drop is a leak and not a deferred expiry.
+        """
+        if self._cache:
+            referenced = sum(1 for e in self._cache.values() if e.reference_count > 0)
+            idle = len(self._cache) - referenced
+            _log.warning(
+                "ResourcePool(%s) rebinding to a new event loop; dropping %d "
+                "referenced and %d idle entries left by a loop that is no "
+                "longer running (finalizers not run)",
+                getattr(self._factory, "__qualname__", None)
+                or type(self._factory).__name__,
+                referenced,
+                idle,
+            )
+            self._cache.clear()
+        self._mutex = asyncio.Lock()
+        self._loop = loop
 
     def _cancel_timer(self, entry: ResourcePool.CacheEntry) -> None:
         """
