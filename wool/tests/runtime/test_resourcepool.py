@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import gc
 import logging
 import threading
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
 import pytest
+from hypothesis import HealthCheck
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies
@@ -787,8 +789,8 @@ class TestResourcePool:
         assert records[0].levelno == logging.WARNING
         assert "1 referenced" in records[0].getMessage()
 
-    def test_acquire_should_not_warn_when_dropping_idle_orphan(self, mocker, caplog):
-        """Test idle orphans are dropped silently.
+    def test_acquire_should_warn_when_dropping_idle_orphan(self, mocker, caplog):
+        """Test an idle orphan is reported as a leak too.
 
         Given:
             A pool whose bound loop closed with only idle entries cached
@@ -796,9 +798,10 @@ class TestResourcePool:
         When:
             The pool is used from a fresh event loop.
         Then:
-            It should drop the idle entries with a DEBUG record and no
-            WARNING from wool.runtime.resourcepool, since nothing was in
-            use when the loop stopped.
+            It should log one WARNING from wool.runtime.resourcepool
+            reporting the idle entry it dropped without finalizing,
+            since a drop abandons the resource where the TTL it was
+            waiting on would have closed it.
         """
         # Arrange
         pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=60)
@@ -812,12 +815,14 @@ class TestResourcePool:
         closed_loop.close()
 
         # Act
-        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.resourcepool"):
             asyncio.run(pool.acquire("other"))
 
         # Assert
         records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
-        assert [r.levelno for r in records] == [logging.DEBUG]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert "1 idle" in records[0].getMessage()
 
     def test_acquire_should_rebind_when_bound_loop_stopped_but_not_closed(self, mocker):
         """Test liveness is whether the bound loop runs, not whether it closed.
@@ -963,31 +968,38 @@ class TestResourcePool:
         assert pool.stats.total_entries == 2
 
     @pytest.mark.asyncio
-    async def test_expire_should_cancel_in_flight_cleanup_when_expired_after_ttl(
-        self, expiry_race_pool
+    @pytest.mark.parametrize(
+        "retire",
+        [
+            pytest.param(lambda pool: pool.expire("expired"), id="expire"),
+            pytest.param(lambda pool: pool.expire_all(), id="expire_all"),
+        ],
+    )
+    async def test_retirement_should_cancel_in_flight_cleanup_when_expired_after_ttl(
+        self, expiry_race_pool, retire
     ):
-        """Test expire cancels a fired cleanup racing on the pool lock.
+        """Test retirement cancels a fired cleanup racing on the pool lock.
 
         Given:
             A pool whose expired key's TTL timer has fired while the
-            pool lock is held by another key's acquire, so the
-            spawned cleanup task and a queued expiry of the expired
-            key both wait on the lock with the expiry first
+            pool lock is held by another key's acquire, so the spawned
+            cleanup task and a queued retirement of that key both wait
+            on the lock with the retirement first.
         When:
-            The lock holder completes and the queued expiry runs
+            The lock holder completes and the queued retirement runs.
         Then:
             It should cancel the in-flight cleanup, still run the
-            finalizer exactly once, and evict the entry
+            finalizer exactly once, and evict the entry.
         """
         # Arrange
         pool, finalizer, factory_calls, release_blocker = expiry_race_pool
-        blocker_task, clear_task = await _queue_behind_fired_cleanup(
-            pool, factory_calls, pool.expire("expired")
+        blocker_task, retire_task = await _queue_behind_fired_cleanup(
+            pool, factory_calls, retire(pool)
         )
 
         # Act
         release_blocker.set()
-        await clear_task
+        await retire_task
         await blocker_task
 
         # Assert
@@ -1140,32 +1152,41 @@ class TestResourcePool:
             assert "key2" in pool.pending_cleanup
 
     @pytest.mark.asyncio
-    async def test_expire_should_finalize_immediately_when_unreferenced(self):
-        """Test expiring an unreferenced entry skips its remaining TTL.
+    @pytest.mark.parametrize(
+        "retire",
+        [
+            pytest.param(lambda pool: pool.expire("idle"), id="expire"),
+            pytest.param(lambda pool: pool.expire_all(), id="expire_all"),
+        ],
+    )
+    async def test_retirement_should_finalize_only_the_idle_entry_when_one_is_held(
+        self, mocker, retire
+    ):
+        """Test an idle entry is finalized at once and a referenced one left alone.
 
         Given:
-            A long-TTL pool holding an unreferenced entry whose TTL timer is
-            pending.
+            A long-TTL pool holding one idle entry awaiting its TTL and
+            one still referenced.
         When:
-            expire() is called with that entry's key.
+            The idle key is expired, or expire_all() is awaited.
         Then:
-            It should run the finalizer immediately, remove the entry, and
-            leave no pending cleanup — no TTL wait.
+            It should finalize the idle entry immediately, skipping its
+            TTL, and leave the referenced one cached with no pending
+            cleanup.
         """
         # Arrange
-        mock_factory = Mock(return_value="resource")
-        mock_finalizer = AsyncMock()
-        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
-        async with pool.get("key"):
-            pass  # Released: the TTL timer is now armed.
-        assert "key" in pool.pending_cleanup
+        mock_finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=lambda key: key, finalizer=mock_finalizer, ttl=60)
+        async with pool.get("idle"):
+            pass
+        await pool.acquire("held")
 
         # Act
-        await pool.expire("key")
+        await retire(pool)
 
         # Assert
-        mock_finalizer.assert_awaited_once_with("resource")
-        assert pool.stats.total_entries == 0
+        mock_finalizer.assert_awaited_once_with("idle")
+        assert pool.stats.total_entries == 1
         assert not pool.pending_cleanup
 
     @pytest.mark.asyncio
@@ -1194,25 +1215,31 @@ class TestResourcePool:
         assert pool.stats.total_entries == 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "retire",
+        [
+            pytest.param(lambda pool: pool.expire("key"), id="expire"),
+            pytest.param(lambda pool: pool.expire_all(), id="expire_all"),
+        ],
+    )
     async def test_release_should_finalize_retired_entry_when_last_reference_released(
-        self, retired_entry_pool
+        self, retired_entry_pool, retire
     ):
-        """Test a retired entry is finalized as soon as its users drain.
+        """Test a retired entry is finalized by the release that drains it.
 
         Given:
-            A long-TTL pool holding an entry that has been retired by
-            ``expire`` while still referenced.
+            A long-TTL pool whose only entry is referenced and has been
+            retired.
         When:
             The last reference is released.
         Then:
-            It should have awaited the finalizer before the release
-            returns, without waiting out the TTL and without leaving
-            pending cleanup behind for the loop to drain.
+            It should finalize the entry then, ending with an empty pool
+            and no pending cleanup.
         """
         # Arrange
         pool, finalizer, _ = retired_entry_pool
         await pool.acquire("key")
-        await pool.expire("key")
+        await retire(pool)
 
         # Act
         await pool.release("key")
@@ -1350,59 +1377,603 @@ class TestResourcePool:
         ]
 
     @pytest.mark.asyncio
-    async def test_expire_should_resurrect_entry_when_reacquired(self):
-        """Test re-acquiring an expired entry cancels its doom.
+    @pytest.mark.parametrize(
+        "retire",
+        [
+            pytest.param(lambda pool: pool.expire("key"), id="expire"),
+            pytest.param(lambda pool: pool.expire_all(), id="expire_all"),
+        ],
+    )
+    async def test_acquire_should_clear_retirement_when_entry_reacquired(
+        self, mocker, retire
+    ):
+        """Test re-acquiring a retired entry clears its retirement.
 
         Given:
-            A long-TTL pool holding a referenced entry that has been
-            expired.
+            A long-TTL pool whose only entry is referenced and has been
+            retired.
         When:
-            The key is acquired again before the references drain and both
-            references are then released.
+            The same key is acquired again and both references are
+            released.
         Then:
-            It should keep the entry cached on the normal TTL schedule — the
-            re-acquire resurrects it — with the finalizer never called.
+            It should hand back the cached object without rebuilding it
+            and keep it cached under its normal TTL schedule, the
+            retirement cleared.
         """
         # Arrange
-        mock_factory = Mock(return_value="resource")
-        mock_finalizer = AsyncMock()
+        mock_factory = mocker.Mock(return_value="resource")
+        mock_finalizer = mocker.AsyncMock()
         pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
-        async with pool:
-            await pool.acquire("key")
-            await pool.expire("key")
-
-            # Act
-            await pool.acquire("key")  # Resurrection: clears the mark.
-            await pool.release("key")
-            await pool.release("key")
-
-            # Assert
-            mock_finalizer.assert_not_awaited()
-            assert pool.stats.total_entries == 1
-            assert "key" in pool.pending_cleanup  # Normal TTL schedule.
-
-    @pytest.mark.asyncio
-    async def test_expire_should_not_raise_when_key_unknown(self):
-        """Test expiring an uncached key is a silent no-op.
-
-        Given:
-            A pool that has never cached the given key.
-        When:
-            expire() is called with that key.
-        Then:
-            It should neither raise nor invoke the finalizer.
-        """
-        # Arrange
-        mock_factory = Mock(return_value="resource")
-        mock_finalizer = AsyncMock()
-        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
+        await pool.acquire("key")
+        await retire(pool)
 
         # Act
-        await pool.expire("missing")
+        acquired = await pool.acquire("key")
+        await pool.release("key")
+        await pool.release("key")
+
+        # Assert
+        assert acquired == "resource"
+        assert mock_factory.call_count == 1
+        mock_finalizer.assert_not_awaited()
+        assert pool.stats.total_entries == 1
+        assert "key" in pool.pending_cleanup
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "retire",
+        [
+            pytest.param(lambda pool: pool.expire("missing"), id="expire"),
+            pytest.param(lambda pool: pool.expire_all(), id="expire_all"),
+        ],
+    )
+    async def test_retirement_should_not_raise_when_nothing_cached(self, mocker, retire):
+        """Test retiring what is not cached is a no-op.
+
+        Given:
+            A pool that has never cached anything.
+        When:
+            expire() is awaited for an unknown key, or expire_all() on
+            the empty pool.
+        Then:
+            It should return without raising, invoke no finalizer, and
+            leave the pool empty with no pending cleanup.
+        """
+        # Arrange
+        mock_finalizer = mocker.AsyncMock()
+        pool = ResourcePool(
+            factory=mocker.Mock(return_value="resource"),
+            finalizer=mock_finalizer,
+            ttl=60,
+        )
+
+        # Act
+        await retire(pool)
 
         # Assert
         mock_finalizer.assert_not_awaited()
         assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
+
+    @pytest.mark.asyncio
+    async def test_expire_all_should_finalize_retired_entry_when_release_is_late(
+        self, mocker
+    ):
+        """Test a late release finalizes the entry it was taken against.
+
+        Given:
+            A pool whose only entry is referenced and has been retired
+            by expire_all().
+        When:
+            The outstanding reference is released and the same key is
+            acquired again afterwards.
+        Then:
+            It should finalize the retired object exactly once on that
+            release and build a fresh object for the new acquire, so a
+            release landing after retirement can never finalize a
+            resource handed out since.
+        """
+        # Arrange
+        mock_factory = mocker.Mock(side_effect=["first", "second"])
+        mock_finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
+        await pool.acquire("key")
+        await pool.expire_all()
+
+        # Act
+        await pool.release("key")
+        reacquired = await pool.acquire("key")
+
+        # Assert
+        mock_finalizer.assert_awaited_once_with("first")
+        assert mock_factory.call_count == 2
+        assert reacquired == "second"
+        assert pool.stats.referenced_entries == 1
+
+    @pytest.mark.asyncio
+    @given(reference_counts=strategies.lists(strategies.integers(0, 3), max_size=5))
+    @settings(max_examples=25, deadline=None)
+    async def test_expire_all_should_finalize_every_entry_exactly_once(
+        self, reference_counts
+    ):
+        """Test retirement drains a whole pool without double finalizing.
+
+        Given:
+            Any pool of up to five distinct keys whose entries carry
+            reference counts between zero and three.
+        When:
+            expire_all() is awaited and every outstanding reference is
+            then released.
+        Then:
+            It should finalize each cached object exactly once and end
+            with an empty pool holding no pending cleanup.
+        """
+        # Arrange
+        finalized = []
+
+        async def finalizer(obj):
+            finalized.append(obj)
+
+        pool = ResourcePool(
+            factory=lambda key: f"obj-{key}", finalizer=finalizer, ttl=60
+        )
+        keys = [f"key-{index}" for index in range(len(reference_counts))]
+        for key, count in zip(keys, reference_counts):
+            # One seeding reference caches the entry; the extra
+            # acquires and the single release leave `count` behind.
+            await pool.acquire(key)
+            for _ in range(count):
+                await pool.acquire(key)
+            await pool.release(key)
+
+        # Act
+        await pool.expire_all()
+        for key, count in zip(keys, reference_counts):
+            for _ in range(count):
+                await pool.release(key)
+
+        # Assert
+        assert sorted(finalized) == sorted(f"obj-{key}" for key in keys)
+        assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
+
+    @pytest.mark.asyncio
+    async def test_expire_all_should_finalize_idle_entry_when_ttl_zero(self, mocker):
+        """Test retirement holds for a pool with no idle grace at all.
+
+        Given:
+            A pool with no TTL holding one idle entry and one still
+            referenced.
+        When:
+            expire_all() is awaited and the outstanding reference is
+            then released.
+        Then:
+            It should finalize both without ever scheduling pending
+            cleanup, since a zero TTL leaves nothing to defer to.
+        """
+        # Arrange
+        mock_finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=lambda key: key, finalizer=mock_finalizer, ttl=0)
+        async with pool.get("idle"):
+            pass
+        await pool.acquire("held")
+
+        # Act
+        await pool.expire_all()
+        await pool.release("held")
+
+        # Assert
+        assert sorted(c.args[0] for c in mock_finalizer.await_args_list) == [
+            "held",
+            "idle",
+        ]
+        assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("failures", "expected", "cause", "discarded"),
+        [
+            pytest.param(
+                {"obj-b": RuntimeError("teardown failed")},
+                None,
+                None,
+                0,
+                id="exception-contained",
+            ),
+            pytest.param(
+                {"obj-a": asyncio.CancelledError()},
+                "obj-a",
+                None,
+                0,
+                id="expire_all-cancelled",
+            ),
+            pytest.param(
+                {"obj-a": asyncio.CancelledError(), "obj-b": asyncio.CancelledError()},
+                "obj-a",
+                None,
+                1,
+                id="first-cancellation-wins",
+            ),
+            pytest.param(
+                {"obj-a": asyncio.CancelledError(), "obj-b": KeyboardInterrupt()},
+                "obj-b",
+                "obj-a",
+                0,
+                id="signal-outranks-cancellation",
+            ),
+            pytest.param(
+                {"obj-a": SystemExit(), "obj-b": KeyboardInterrupt()},
+                "obj-a",
+                None,
+                1,
+                id="two-signals",
+            ),
+        ],
+    )
+    async def test_expire_all_should_finish_sweep_when_finalizer_fails(
+        self, failures, expected, cause, discarded, caplog
+    ):
+        """Test a failing finalizer does not spare the entries after it.
+
+        Given:
+            A long-TTL pool of three idle entries whose finalizer raises
+            the given failures: a contained Exception, a cancellation,
+            two distinct cancellations, a cancellation followed by a
+            process-level signal, or two signals.
+        When:
+            expire_all() is awaited.
+        Then:
+            It should attempt every finalizer, leave the pool empty with
+            no pending cleanup, and propagate the expected failure
+            afterwards: nothing for a contained Exception, the first
+            cancellation otherwise, unless a signal arrived later, which
+            chains the cancellation it superseded as its cause; a failure
+            it neither re-raises nor chains is logged at warning level.
+        """
+        # Arrange
+        attempted = []
+
+        async def finalizer(obj):
+            attempted.append(obj)
+            if obj in failures:
+                raise failures[obj]
+
+        pool = ResourcePool(
+            factory=lambda key: f"obj-{key}", finalizer=finalizer, ttl=60
+        )
+        for key in ("a", "b", "c"):
+            async with pool.get(key):
+                pass
+        expectation = (
+            pytest.raises(type(failures[expected]))
+            if expected is not None
+            else contextlib.nullcontext()
+        )
+
+        # Act
+        with (
+            caplog.at_level(logging.WARNING, logger="wool.runtime.resourcepool"),
+            expectation as raised,
+        ):
+            await pool.expire_all()
+
+        # Assert
+        if expected is not None:
+            assert raised is not None and raised.value is failures[expected]
+            assert raised.value.__cause__ is (failures[cause] if cause else None)
+        assert attempted == ["obj-a", "obj-b", "obj-c"]
+        assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
+        assert (
+            sum("discarding" in record.getMessage() for record in caplog.records)
+            == discarded
+        )
+
+    @pytest.mark.asyncio
+    async def test_clear_should_finish_sweep_when_finalizer_cancelled(self, caplog):
+        """Test a cancelled finalizer does not spare the entries after it under clear.
+
+        Given:
+            A long-TTL pool of three idle entries whose first finalizer
+            raises a cancellation.
+        When:
+            clear() is awaited.
+        Then:
+            It should attempt every finalizer, leave the pool empty with
+            no pending cleanup, and re-raise the cancellation afterwards
+            without discarding anything.
+        """
+        # Arrange
+        attempted = []
+
+        async def finalizer(obj):
+            attempted.append(obj)
+            if obj == "obj-a":
+                raise asyncio.CancelledError()
+
+        pool = ResourcePool(
+            factory=lambda key: f"obj-{key}", finalizer=finalizer, ttl=60
+        )
+        for key in ("a", "b", "c"):
+            async with pool.get(key):
+                pass
+
+        # Act
+        with (
+            caplog.at_level(logging.WARNING, logger="wool.runtime.resourcepool"),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await pool.clear()
+
+        # Assert
+        assert attempted == ["obj-a", "obj-b", "obj-c"]
+        assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
+        assert not [r for r in caplog.records if "discarding" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    @given(
+        outcomes=strategies.lists(
+            strategies.sampled_from(["clean", "error", "cancel", "interrupt", "exit"]),
+            min_size=1,
+            max_size=5,
+        )
+    )
+    @settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    async def test_expire_all_should_rank_failures_for_any_sequence_of_outcomes(
+        self, outcomes, caplog
+    ):
+        """Test the sweep's failure ranking holds for any run of finalizer outcomes.
+
+        Given:
+            A long-TTL pool of one to five idle entries whose finalizers
+            each finish cleanly, raise a contained Exception, raise a
+            cancellation, raise KeyboardInterrupt, or raise SystemExit,
+            in any order.
+        When:
+            expire_all() is awaited.
+        Then:
+            It should attempt every finalizer in cache order, leave the
+            pool empty with no pending cleanup, raise the first
+            uncontained failure unless a later process-level signal
+            superseded it, chaining the superseded failure as its cause,
+            log every other uncontained failure as discarded, and leave
+            the task's cancellation count at zero.
+        """
+        # Arrange
+        raised = {
+            "error": RuntimeError,
+            "cancel": asyncio.CancelledError,
+            "interrupt": KeyboardInterrupt,
+            "exit": SystemExit,
+        }
+        keys = [f"k{index}" for index in range(len(outcomes))]
+        failures = {
+            key: raised[outcome]()
+            for key, outcome in zip(keys, outcomes)
+            if outcome != "clean"
+        }
+        attempted = []
+
+        async def finalizer(obj):
+            attempted.append(obj)
+            if obj in failures:
+                raise failures[obj]
+
+        pool = ResourcePool(factory=lambda key: key, finalizer=finalizer, ttl=60)
+        for key in keys:
+            async with pool.get(key):
+                pass
+        # The expectation, walked the way the ranking is documented: a
+        # contained Exception never reaches the sweep, the first failure
+        # latches, a later signal supersedes a latched cancellation, and
+        # anything else is discarded.
+        expected = cause = None
+        discarded = 0
+        for key, outcome in zip(keys, outcomes):
+            if outcome in ("clean", "error"):
+                continue
+            if expected is None:
+                expected = (key, outcome)
+            elif outcome in ("interrupt", "exit") and expected[1] == "cancel":
+                expected, cause = (key, outcome), expected
+            else:
+                discarded += 1
+        expectation = (
+            pytest.raises(type(failures[expected[0]]))
+            if expected is not None
+            else contextlib.nullcontext()
+        )
+        caplog.clear()
+
+        # Act
+        with (
+            caplog.at_level(logging.WARNING, logger="wool.runtime.resourcepool"),
+            expectation as raised_failure,
+        ):
+            await pool.expire_all()
+
+        # Assert
+        assert attempted == keys
+        assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
+        if expected is not None:
+            assert raised_failure is not None
+            assert raised_failure.value is failures[expected[0]]
+            assert raised_failure.value.__cause__ is (
+                failures[cause[0]] if cause is not None else None
+            )
+        assert (
+            sum(
+                "discarding" in record.getMessage()
+                for record in caplog.records
+                if record.name == "wool.runtime.resourcepool"
+            )
+            == discarded
+        )
+        task = asyncio.current_task()
+        assert task is not None
+        assert task.cancelling() == 0
+
+    @pytest.mark.asyncio
+    async def test_expire_all_should_uncancel_when_a_signal_supersedes_a_cancellation(
+        self,
+    ):
+        """Test an absorbed cancellation is uncancelled when a signal wins.
+
+        Given:
+            A long-TTL pool of two idle entries whose first finalizer
+            parks until the sweeping task is cancelled and whose second
+            raises KeyboardInterrupt.
+        When:
+            expire_all() runs in a task that is cancelled while parked.
+        Then:
+            It should raise the KeyboardInterrupt with the cancellation
+            chained as its cause and leave the task's cancellation count
+            at zero, since the cancellation it absorbed is not the
+            failure it re-raised.
+        """
+        # Arrange
+        parked = asyncio.Event()
+
+        async def finalizer(obj):
+            if obj == "obj-a":
+                parked.set()
+                await asyncio.Event().wait()
+            raise KeyboardInterrupt()
+
+        pool = ResourcePool(
+            factory=lambda key: f"obj-{key}", finalizer=finalizer, ttl=60
+        )
+        for key in ("a", "b"):
+            async with pool.get(key):
+                pass
+
+        async def sweep():
+            # Caught here: a KeyboardInterrupt escaping a task ends the loop.
+            try:
+                await pool.expire_all()
+            except KeyboardInterrupt as error:
+                task = asyncio.current_task()
+                assert task is not None
+                return error, task.cancelling()
+
+        sweeping = asyncio.ensure_future(sweep())
+        await asyncio.wait_for(parked.wait(), timeout=2.0)
+
+        # Act
+        sweeping.cancel()
+        outcome = await sweeping
+
+        # Assert
+        assert outcome is not None
+        error, cancelling = outcome
+        assert isinstance(error.__cause__, asyncio.CancelledError)
+        assert cancelling == 0
+        assert pool.stats.total_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_expire_all_should_preserve_cancellation_count_when_it_reraises(
+        self,
+    ):
+        """Test a re-raised cancellation leaves the task's cancellation count alone.
+
+        Given:
+            A long-TTL pool of two idle entries whose first finalizer
+            parks until the sweeping task is cancelled and whose second
+            finalizes cleanly.
+        When:
+            expire_all() runs in a task that is cancelled while parked.
+        Then:
+            It should finish the sweep, re-raise the cancellation, and
+            leave the task's cancellation count at one, since the
+            cancellation it re-raises is the one it absorbed.
+        """
+        # Arrange
+        parked = asyncio.Event()
+        counts = []
+
+        async def finalizer(obj):
+            if obj == "obj-a":
+                parked.set()
+                await asyncio.Event().wait()
+
+        pool = ResourcePool(
+            factory=lambda key: f"obj-{key}", finalizer=finalizer, ttl=60
+        )
+        for key in ("a", "b"):
+            async with pool.get(key):
+                pass
+
+        async def sweep():
+            try:
+                await pool.expire_all()
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                assert task is not None
+                counts.append(task.cancelling())
+                raise
+
+        sweeping = asyncio.ensure_future(sweep())
+        await asyncio.wait_for(parked.wait(), timeout=2.0)
+
+        # Act
+        sweeping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sweeping
+
+        # Assert
+        assert counts == [1]
+        assert pool.stats.total_entries == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "retire",
+        [
+            pytest.param(lambda pool: pool.expire("key"), id="expire"),
+            pytest.param(lambda pool: pool.expire_all(), id="expire_all"),
+        ],
+    )
+    async def test_release_should_finalize_before_returning_when_entry_retired(
+        self, mocker, retire
+    ):
+        """Test the release of a retired entry finalizes it inline.
+
+        Given:
+            A long-TTL pool holding a referenced entry retired by either
+            expire() for its key or expire_all() for the whole pool.
+        When:
+            The last reference is released.
+        Then:
+            It should have awaited the finalizer and emptied the pool by
+            the time release returns, spawning no task to do it later — a
+            task would be orphaned by a loop that stops straight after
+            the release.
+        """
+        # Arrange
+        mock_finalizer = mocker.AsyncMock()
+        pool = ResourcePool(
+            factory=mocker.Mock(return_value="resource"),
+            finalizer=mock_finalizer,
+            ttl=60,
+        )
+        await pool.acquire("key")
+        await retire(pool)
+        tasks_before = asyncio.all_tasks()
+
+        # Act
+        await pool.release("key")
+
+        # Assert
+        mock_finalizer.assert_awaited_once_with("resource")
+        assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
+        assert asyncio.all_tasks() == tasks_before
 
     @pytest.mark.asyncio
     async def test_ttl_cleanup_should_schedule_resource_removal(self):

@@ -23,6 +23,7 @@ from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker import service as service_module
 from wool.runtime.worker.interceptor import VersionInterceptor
 from wool.runtime.worker.service import WorkerService
 from wool.runtime.worker.session import DispatchSession
@@ -324,6 +325,30 @@ async def _stop_streaming_routine():
         if _stop_cancellation_observed is not None:
             _stop_cancellation_observed.set()
         raise
+
+
+#: Set by `_park_on_worker_loop`'s background task when the worker-loop
+#: teardown drain cancels it.
+_drained = threading.Event()
+
+
+async def _park_on_worker_loop():
+    """Leave a task parked on the worker loop and report that it was drained.
+
+    The parked task records its cancellation on `_drained`, so a stop
+    that skips the teardown drain leaves the event clear. Defined at
+    module level so cloudpickle can serialize the callable for dispatch.
+    """
+
+    async def park():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            _drained.set()
+            raise
+
+    asyncio.get_running_loop().create_task(park())
+    return "parked"
 
 
 async def _worker_loop_identity_probe():
@@ -2388,6 +2413,67 @@ class TestWorkerService:
         assert isinstance(stop_result, protocol.Void)
         assert grpc_servicer.stopped.is_set()
         assert cleared_on == [worker_thread_name]
+
+    @pytest.mark.asyncio
+    async def test_stop_should_clear_channel_pool_after_the_proxy_pool_when_warm(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+    ):
+        """Test `WorkerService.stop` sweeps the channel pool after the proxy pool.
+
+        Given:
+            A `WorkerService` that has serviced a dispatch, leaving one
+            worker event-loop warm on a daemon thread, a proxy pool whose
+            ``clear`` records its turn, and a channel-pool clear that
+            records its turn and the thread it runs on
+        When:
+            The stop RPC is invoked with a positive timeout
+        Then:
+            It should clear the channel pool exactly once, on the worker
+            loop's daemon thread, after the proxy pool -- so exiting the
+            proxies releases their hold before the channels are swept
+        """
+        # Arrange
+        order: list[str] = []
+        cleared_on: list[str] = []
+
+        async def record_proxy():
+            order.append("proxy")
+
+        async def record_channel():
+            order.append("channel")
+            cleared_on.append(threading.current_thread().name)
+
+        mock_worker_proxy_cache.clear = mocker.AsyncMock(side_effect=record_proxy)
+        clear_channel_pool = mocker.patch.object(
+            service_module,
+            "clear_channel_pool",
+            mocker.AsyncMock(side_effect=record_channel),
+        )
+        wool_task = make_task(_worker_loop_identity_probe)
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+            _, _, worker_thread_name = cloudpickle.loads(result.result.dump)
+            stop_result = await asyncio.wait_for(
+                stub.stop(protocol.StopRequest(timeout=5)), 10
+            )
+
+        # Assert
+        assert isinstance(stop_result, protocol.Void)
+        assert grpc_servicer.stopped.is_set()
+        clear_channel_pool.assert_awaited_once()
+        assert cleared_on == [worker_thread_name]
+        assert order == ["proxy", "channel"]
 
     @pytest.mark.asyncio
     async def test_dispatch_should_clear_proxy_pool_when_idle_worker_loop_expires(
@@ -5085,6 +5171,54 @@ class TestWorkerService:
             and "proxy pool" in record.getMessage()
             for record in caplog.records
         )
+
+    @pytest.mark.asyncio
+    async def test_stop_should_still_drain_when_proxy_pool_clear_raises_base_exception(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+    ):
+        """Test `WorkerService.stop` drains the worker loop past a failing clear.
+
+        Given:
+            A `WorkerService` that has serviced one dispatch, leaving a
+            warm worker loop with a task parked on it, while the
+            proxy-pool ``clear`` coroutine raises a ``BaseException``
+            the teardown's ``except Exception`` cannot contain
+        When:
+            The stop RPC is invoked with a positive timeout
+        Then:
+            It should still cancel the parked task before stopping the
+            loop, and set ``stopped``, so an escaping clear does not
+            skip the drain
+        """
+
+        # Arrange
+        class Interrupt(BaseException):
+            pass
+
+        mock_worker_proxy_cache.clear = mocker.AsyncMock(side_effect=Interrupt())
+        _drained.clear()
+        wool_task = make_task(_park_on_worker_loop)
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+
+            # Act
+            stop_result = await asyncio.wait_for(
+                stub.stop(protocol.StopRequest(timeout=5)), timeout=10
+            )
+
+        # Assert
+        assert isinstance(stop_result, protocol.Void)
+        assert grpc_servicer.stopped.is_set()
+        assert _drained.wait(timeout=5)
 
     @pytest.mark.asyncio
     async def test_dispatch_should_ship_synthesized_runtime_error_when_routine_exception_unpicklable(  # noqa: E501
