@@ -103,11 +103,16 @@ class ResourcePool(Generic[T]):
     binds to the first loop that uses it and rebinds when used from
     another loop once the bound loop is no longer running, dropping every
     cached entry without running its finalizer: a resource cannot be torn
-    down from a loop other than the one that made it. Entries still
-    referenced when their loop stopped are reported at warning level,
-    idle ones at debug. Using a bound pool from a second *running* loop
-    raises `RuntimeError`, so tearing a pool down belongs to the loop that
-    owns it.
+    down from a loop other than the one that made it. Every dropped
+    entry is reported at warning level, referenced and idle alike: a
+    drop is not an expiry, so an idle entry the TTL would have closed
+    is abandoned rather than finalized, and both counts name a resource
+    that outlived every chance to release it. The record names the pool
+    by its factory, and it is expected only of a loop that stopped with
+    entries it did not clear; a loop wool owns clears its pools before
+    it stops. Using a bound pool from a second *running* loop raises
+    `RuntimeError`, so tearing a pool down belongs to the loop that owns
+    it.
 
     :param factory:
         Function to create new objects (sync or async).
@@ -219,23 +224,27 @@ class ResourcePool(Generic[T]):
         assert self._mutex is not None
         return self._mutex
 
+    @property
+    def _name(self) -> str:
+        """Identify this pool in log records by its factory."""
+        return getattr(self._factory, "__qualname__", None) or repr(self._factory)
+
     def _rebind(self, loop: asyncio.AbstractEventLoop) -> None:
         """Bind this pool to ``loop``, dropping what the previous loop left.
 
         The dropped entries are never finalized: their finalizer would
-        run against a loop that is no longer running. Entries still
-        referenced when that loop stopped are a leak and are logged at
-        warning level; idle entries are what the TTL would have
-        discarded and are logged at debug level.
+        run against a loop that is no longer running. Both counts are
+        logged — see the class docstring for why an idle drop is a leak
+        and not a deferred expiry.
         """
         if self._cache:
             referenced = sum(1 for e in self._cache.values() if e.reference_count > 0)
             idle = len(self._cache) - referenced
-            log = _log.warning if referenced else _log.debug
-            log(
-                "ResourcePool rebinding to a new event loop; dropping %d "
+            _log.warning(
+                "ResourcePool(%s) rebinding to a new event loop; dropping %d "
                 "referenced and %d idle entries left by a loop that is no "
                 "longer running (finalizers not run)",
+                self._name,
                 referenced,
                 idle,
             )
