@@ -561,6 +561,56 @@ class TestResourcePool:
         assert pool.stats.total_entries == 0
 
     @pytest.mark.asyncio
+    async def test_ttl_cleanup_should_log_warning_when_spawned_cleanup_fails(
+        self, caplog
+    ):
+        """Test a failure inside a spawned cleanup task is reported.
+
+        Given:
+            A short-TTL pool whose finalizer raises a BaseException that
+            is neither a cancellation nor a process-level interrupt, so
+            the spawned cleanup ends with it and no caller receives it.
+        When:
+            An entry's TTL elapses and its cleanup task runs.
+        Then:
+            It should evict the entry and log one warning naming the
+            pool's factory and the key, rather than leave the failure
+            unretrieved.
+        """
+
+        # Arrange
+        class Interrupt(BaseException):
+            pass
+
+        def factory(key):
+            return f"obj-{key}"
+
+        async def finalizer(obj):
+            raise Interrupt()
+
+        pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=0.01)
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.resourcepool"):
+            async with pool.get("key"):
+                pass
+            # The report lands one tick after the eviction, so poll for
+            # the record rather than the empty pool.
+            deadline = time.monotonic() + 2.0
+            while (
+                not any(r.name == "wool.runtime.resourcepool" for r in caplog.records)
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.01)
+
+        # Assert
+        records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
+        assert len(records) == 1
+        assert "factory" in records[0].getMessage()
+        assert "'key'" in records[0].getMessage()
+        assert pool.stats.total_entries == 0
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "ttl, retire_first",
         [(0, False), (60, True)],
@@ -968,6 +1018,53 @@ class TestResourcePool:
         assert pool.stats.total_entries == 2
 
     @pytest.mark.asyncio
+    async def test_get_should_not_mark_acquired_when_the_acquire_is_cancelled(self):
+        """Test a cancelled entry leaves the resource enterable again.
+
+        Given:
+            A pool whose factory parks until released, and a Resource
+            for a key it has never cached.
+        When:
+            A task entering the Resource is cancelled while the factory
+            is parked, and the Resource is entered again once the
+            factory is released.
+        Then:
+            It should leave the pool with nothing cached or referenced
+            after the cancellation, and hand back the object on the
+            second entry rather than refuse a re-acquire.
+        """
+        # Arrange
+        parked = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def factory(key):
+            parked.set()
+            await gate.wait()
+            return f"obj-{key}"
+
+        pool = ResourcePool(factory=factory, ttl=60)
+        resource = pool.get("key")
+
+        async def enter():
+            async with resource:
+                pass
+
+        entering = asyncio.ensure_future(enter())
+        await asyncio.wait_for(parked.wait(), timeout=2.0)
+
+        # Act
+        entering.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await entering
+        gate.set()
+
+        # Assert
+        assert pool.stats.total_entries == 0
+        assert pool.stats.referenced_entries == 0
+        async with resource as obj:
+            assert obj == "obj-key"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "retire",
         [
@@ -1319,6 +1416,65 @@ class TestResourcePool:
 
         assert pool.stats.total_entries == 0
         assert await pool.acquire("key") == "second"
+
+    @pytest.mark.asyncio
+    async def test_release_should_drop_reference_when_cancelled_waiting_on_the_lock(
+        self,
+    ):
+        """Test a release cancelled while contending the lock still releases.
+
+        Given:
+            A pool of two entries whose sweep is parked inside the idle
+            first entry's finalizer, holding the lock, while the second
+            is still referenced.
+        When:
+            A release of the second entry, parked behind that lock, is
+            cancelled, and the sweep then completes.
+        Then:
+            It should raise CancelledError to the releasing task yet still
+            drop the reference, so the retired second entry is finalized
+            rather than held forever.
+        """
+        # Arrange
+        parked = asyncio.Event()
+        gate = asyncio.Event()
+        done = asyncio.Event()
+        finalized = []
+
+        async def finalizer(obj):
+            finalized.append(obj)
+            if obj == "obj-a":
+                parked.set()
+                await gate.wait()
+            else:
+                done.set()
+
+        pool = ResourcePool(
+            factory=lambda key: f"obj-{key}", finalizer=finalizer, ttl=60
+        )
+        await pool.acquire("a")
+        await pool.acquire("b")
+        await pool.release("a")
+        sweep = asyncio.ensure_future(pool.expire_all())
+        await asyncio.wait_for(parked.wait(), timeout=2.0)
+        release = asyncio.ensure_future(pool.release("b"))
+        # The lock is held by the parked finalizer for the whole window,
+        # so any number of ticks past the shield's entry leaves the
+        # release waiting on it.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # Act
+        release.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await release
+        gate.set()
+        await sweep
+
+        # Assert
+        await asyncio.wait_for(done.wait(), timeout=2.0)
+        assert finalized == ["obj-a", "obj-b"]
+        assert pool.stats.total_entries == 0
 
     def test_release_should_finalize_retired_entry_when_loop_ends_immediately(
         self, mocker, caplog
@@ -1929,6 +2085,51 @@ class TestResourcePool:
 
         # Assert
         assert counts == [1]
+        assert pool.stats.total_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_acquire_should_leave_entry_unreferenced_when_cancelled_mid_cleanup(
+        self, expiry_race_pool
+    ):
+        """Test a cancelled acquire neither leaks a reference nor orphans the entry.
+
+        Given:
+            A pool whose expired key's TTL timer has fired while the
+            pool lock is held by another key's acquire, so the spawned
+            cleanup task and a queued acquire of that key both wait on
+            the lock with the acquire first.
+        When:
+            The lock holder completes and the acquire is cancelled while
+            it waits for the cleanup task it has just cancelled.
+        Then:
+            It should raise CancelledError, leave the entry cached and
+            unreferenced with its TTL re-armed, and finalize it once
+            that TTL elapses.
+        """
+        # Arrange
+        pool, finalizer, factory_calls, release_blocker = expiry_race_pool
+        blocker_task, acquire_task = await _queue_behind_fired_cleanup(
+            pool, factory_calls, pool.acquire("expired")
+        )
+
+        # Act
+        release_blocker.set()
+        while "expired" in pool.pending_cleanup:
+            await asyncio.sleep(0)
+        acquire_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await acquire_task
+        await blocker_task
+        rearmed = isinstance(pool.pending_cleanup.get("expired"), asyncio.TimerHandle)
+        await pool.release("blocker")
+        referenced = pool.stats.referenced_entries
+        await asyncio.sleep(0.1)
+
+        # Assert
+        assert rearmed
+        assert referenced == 0
+        assert finalizer.await_count == 2
+        finalizer.assert_any_await("obj-expired")
         assert pool.stats.total_entries == 0
 
     @pytest.mark.asyncio
@@ -2549,3 +2750,42 @@ class TestResource:
             match="Cannot release a resource that has already been released",
         ):
             await resource.__aexit__(None, None, None)
+
+    @pytest.mark.asyncio
+    @given(
+        resource=strategies.sampled_from(
+            [None, 0, 0.0, False, "", b"", (), [], {}, set()]
+        )
+    )
+    @settings(max_examples=10, deadline=None)
+    async def test___aexit___should_release_when_resource_is_falsy(self, resource):
+        """Test a falsy resource is still released on context exit.
+
+        Given:
+            A zero-TTL pool whose factory yields a falsy object (e.g.,
+            None, zero, False, or an empty string, bytes, tuple, list,
+            dict, or set).
+        When:
+            The Resource is used as an async context manager and exits.
+        Then:
+            It should drop the reference and finalize the entry, so the
+            release follows the acquisition rather than the value.
+        """
+        # Arrange
+        finalized = []
+        pool = ResourcePool(
+            factory=lambda key: resource,
+            finalizer=lambda obj: finalized.append(obj),
+            ttl=0,
+        )
+
+        # Act
+        async with pool.get("key") as acquired:
+            referenced = pool.stats.referenced_entries
+
+        # Assert
+        assert acquired is resource
+        assert referenced == 1
+        assert pool.stats.total_entries == 0
+        assert len(finalized) == 1
+        assert finalized[0] is resource

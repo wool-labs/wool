@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import logging
 from dataclasses import dataclass
@@ -21,12 +22,13 @@ _log = logging.getLogger(__name__)
 
 
 class Resource(Generic[T]):
-    """
-    A single-use async context manager for resource acquisition.
+    """Acquire one cached object for the duration of an ``async with`` block.
 
     This class can only be used once as an async context manager. After
     acquisition, it cannot be reacquired, and after release, it cannot be
-    released again.
+    released again. The cached object may be any value, ``None`` and other
+    falsy values included: the release is tied to the acquisition, not to
+    the value acquired.
 
     :param pool:
         The `ResourcePool` this resource belongs to.
@@ -59,7 +61,7 @@ class Resource(Generic[T]):
         try:
             self._resource = await self._pool.acquire(self._key)
             return cast(T, self._resource)
-        except Exception:
+        except BaseException:
             self._acquired = False
             raise
 
@@ -92,8 +94,7 @@ class Resource(Generic[T]):
             )
 
         self._released = True
-        if self._resource:
-            await self._pool.release(self._key)
+        await self._pool.release(self._key)
 
 
 class ResourcePool(Generic[T]):
@@ -144,8 +145,7 @@ class ResourcePool(Generic[T]):
 
     @dataclass
     class CacheEntry:
-        """
-        Internal cache entry tracking an object and its metadata.
+        """Track a cached object and the lifecycle state the pool keeps for it.
 
         :param obj:
             The cached object.
@@ -284,10 +284,22 @@ class ResourcePool(Generic[T]):
         async with self._lock:
             if key in self._cache:
                 entry = self._cache[key]
+                try:
+                    await self._cancel_cleanup(entry)
+                except BaseException:
+                    # Interrupted after the cleanup task was cancelled:
+                    # the entry is unreferenced with neither timer nor
+                    # cleanup, so re-arm its TTL rather than orphan it.
+                    if (
+                        entry.reference_count == 0
+                        and entry.timer is None
+                        and self._ttl > 0
+                    ):
+                        self._arm_timer(key, entry)
+                    raise
+                self._cancel_timer(entry)
                 entry.reference_count += 1
                 entry.doomed = False
-                self._cancel_timer(entry)
-                await self._cancel_cleanup(entry)
                 return entry.obj
             else:
                 # Cache miss - create new object
@@ -297,14 +309,17 @@ class ResourcePool(Generic[T]):
                 return obj
 
     async def release(self, key: Any) -> None:
-        """
-        Release a reference to the cached object.
+        """Release a reference to the cached object.
 
         Decrements reference count. If count reaches 0, schedules cleanup
         after TTL expires (if TTL > 0); an entry retired by `expire` or
         `expire_all` is finalized here rather than deferred — see `expire`
         for the retirement contract. Releasing a key that is not cached is
         a silent no-op.
+
+        A cancellation delivered while the release waits for the pool's
+        lock does not abandon the decrement; the release completes and
+        the caller still observes the cancellation.
 
         :param key:
             The cache key.
@@ -318,30 +333,18 @@ class ResourcePool(Generic[T]):
         the resource: with nothing left to defer to, a task spawned there
         may never run — the closing loop would orphan it, and the
         resource with it.
+
+        A cancellation delivered while this waits on a contended lock
+        would abandon the decrement, i.e., the reference would be held
+        forever and the entry never finalized, so the contended path
+        runs shielded: the release completes on its own task after the
+        caller has been cancelled. The uncontended path never suspends
+        before the decrement, so it needs no shield and no task.
         """
-        async with self._lock:
-            if key not in self._cache:
-                return
-            entry = self._cache[key]
-
-            if entry.reference_count <= 0:
-                raise ValueError(f"Reference count for key '{key}' is already 0")
-
-            entry.reference_count -= 1
-
-            if entry.reference_count <= 0:
-                if entry.doomed or self._ttl <= 0:
-                    # Inline — see the implementation notes on this method.
-                    await self._cleanup(key)
-                else:
-                    # Defer cleanup with a plain timer rather than a
-                    # task parked on a TTL sleep: an unfired
-                    # TimerHandle is discarded silently at loop close,
-                    # whereas a parked task is destroyed pending —
-                    # and, if never started, its coroutine emits a
-                    # "never awaited" RuntimeWarning.
-                    loop = asyncio.get_running_loop()
-                    entry.timer = loop.call_later(self._ttl, self._expire, key)
+        if self._lock.locked():
+            await asyncio.shield(self._release(key))
+        else:
+            await self._release(key)
 
     async def expire(self, key: Any) -> None:
         """Treat *key* as TTL-expired now, finalizing it once unreferenced.
@@ -498,6 +501,50 @@ class ResourcePool(Generic[T]):
         self._mutex = asyncio.Lock()
         self._loop = loop
 
+    async def _release(self, key: Any) -> None:
+        """Drop one reference under the lock — see `release`.
+
+        :param key:
+            The cache key.
+        :raises ValueError:
+            If the key's reference count is already 0.
+        """
+        async with self._lock:
+            if key not in self._cache:
+                return
+            entry = self._cache[key]
+
+            if entry.reference_count <= 0:
+                raise ValueError(f"Reference count for key '{key}' is already 0")
+
+            entry.reference_count -= 1
+
+            if entry.reference_count <= 0:
+                if entry.doomed or self._ttl <= 0:
+                    # Inline — see the implementation notes on release.
+                    await self._cleanup(key)
+                else:
+                    self._arm_timer(key, entry)
+
+    def _arm_timer(self, key: Any, entry: ResourcePool.CacheEntry) -> None:
+        """Schedule an unreferenced entry's TTL expiry on the bound loop.
+
+        :param key:
+            The cache key whose TTL to start.
+        :param entry:
+            The entry cached under ``key``.
+
+        .. rubric:: Implementation notes
+
+        Defers cleanup with a plain timer rather than a task parked on a
+        TTL sleep: an unfired `asyncio.TimerHandle` is discarded silently
+        at loop close, whereas a parked task is destroyed pending — and,
+        if never started, its coroutine emits a "never awaited"
+        `RuntimeWarning`.
+        """
+        loop = asyncio.get_running_loop()
+        entry.timer = loop.call_later(self._ttl, self._expire, key)
+
     def _cancel_timer(self, entry: ResourcePool.CacheEntry) -> None:
         """
         Cancel an entry's pending TTL timer, if any.
@@ -517,9 +564,11 @@ class ResourcePool(Generic[T]):
         """
         Cancel an entry's in-flight cleanup task, if any.
 
-        The task is cancelled and awaited. The current task is left
-        alone: on the expiry path this runs *inside* the entry's own
-        cleanup task (`_finalize`), which must not cancel itself.
+        The task is cancelled and waited for; its own cancellation is
+        not re-raised here, while a cancellation of the current task is
+        honored. The current task is left alone: on the expiry path this
+        runs *inside* the entry's own cleanup task (`_finalize`), which
+        must not cancel itself.
 
         :param entry:
             The cache entry whose cleanup task to cancel.
@@ -529,10 +578,7 @@ class ResourcePool(Generic[T]):
         if cleanup is None or cleanup.done() or cleanup is asyncio.current_task():
             return
         cleanup.cancel()
-        try:
-            await cleanup
-        except asyncio.CancelledError:
-            pass
+        await asyncio.wait({cleanup})
 
     def _expire(self, key: Any) -> None:
         """
@@ -553,6 +599,30 @@ class ResourcePool(Generic[T]):
             return
         entry.timer = None
         entry.cleanup = asyncio.get_running_loop().create_task(self._finalize(key))
+        entry.cleanup.add_done_callback(functools.partial(self._report_cleanup, key))
+
+    def _report_cleanup(self, key: Any, cleanup: asyncio.Task[None]) -> None:
+        """Log a cleanup task that ended in a failure.
+
+        A `BaseException` a finalizer raises inside a spawned cleanup has
+        no caller to propagate to, so it is retrieved and reported here
+        rather than left for the loop's unretrieved-exception hook.
+
+        :param key:
+            The cache key the cleanup was for.
+        :param cleanup:
+            The finished cleanup task.
+        """
+        if cleanup.cancelled():
+            return
+        error = cleanup.exception()
+        if error is not None:
+            _log.warning(
+                "ResourcePool(%s) cleanup of key %r failed",
+                self._name,
+                key,
+                exc_info=error,
+            )
 
     async def _finalize(self, key: Any) -> None:
         """
