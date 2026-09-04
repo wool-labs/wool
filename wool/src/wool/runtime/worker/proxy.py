@@ -12,14 +12,12 @@ import logging
 import uuid
 import warnings
 from contextlib import AsyncExitStack
-from contextlib import asynccontextmanager
 from enum import Enum
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import AsyncContextManager
 from typing import AsyncGenerator
 from typing import AsyncIterator
-from typing import Awaitable
 from typing import Callable
 from typing import ClassVar
 from typing import ContextManager
@@ -51,6 +49,7 @@ from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
+from wool.runtime.typing import resolved
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.auth import current_credentials
@@ -913,7 +912,7 @@ class WorkerProxy:
             stack.callback(self._reset_state)
             await stack.enter_async_context(channel_pool_hold())
             self._loadbalancer_service = await stack.enter_async_context(
-                _resolved(self._loadbalancer)
+                resolved(self._loadbalancer)
             )
             if not isinstance(
                 self._loadbalancer_service,
@@ -936,7 +935,7 @@ class WorkerProxy:
                 self._dispatching_deprecation_warned = True
 
             self._discovery_stream = await stack.enter_async_context(
-                _resolved(self._discovery)
+                resolved(self._discovery)
             )
             if not isinstance(self._discovery_stream, DiscoverySubscriberLike):
                 raise ValueError
@@ -1492,28 +1491,3 @@ class WorkerProxy:
                     self._workers_changed.set()
                     if departed is not None:
                         await self._close_departed(departed[1])
-
-
-@asynccontextmanager
-async def _resolved(dependency: Any) -> AsyncIterator[Any]:
-    """Enter a configured dependency and yield the live object.
-
-    Accepts a bare instance, a callable factory producing any of these
-    forms, an awaitable, or a sync or async context manager.  A context
-    manager is entered for the duration of the block and exited with
-    the block's exception info, so a dependency configured as a manager
-    sees the same exit semantics as a plain ``with`` over it would.
-    """
-    if isinstance(dependency, ContextManager):
-        with dependency as obj:
-            yield obj
-    elif isinstance(dependency, AsyncContextManager):
-        async with dependency as obj:
-            yield obj
-    elif callable(dependency):
-        async with _resolved(dependency()) as obj:
-            yield obj
-    elif isinstance(dependency, Awaitable):
-        yield await dependency
-    else:
-        yield dependency
