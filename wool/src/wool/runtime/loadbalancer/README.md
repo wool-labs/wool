@@ -18,7 +18,7 @@ Wool ships with `RoundRobinLoadBalancer`, the default when no load balancer is e
 
 Wool supports custom load balancers via structural subtyping.
 
-`WorkerPool` and `WorkerProxy` accept any `LoadBalancerLike` (or `Factory[LoadBalancerLike]`). The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables. You can pass a load balancer instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` manages it appropriately.
+`WorkerPool` and `WorkerProxy` accept a `LoadBalancerLike` instance or any `Factory` form — see `Factory` for the forms and `resolved` for how one is entered. You can pass a load balancer instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` manages it appropriately.
 
 ### `LoadBalancerLike` protocol
 

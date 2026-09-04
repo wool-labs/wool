@@ -12,7 +12,6 @@ import logging
 import uuid
 import warnings
 from contextlib import AsyncExitStack
-from contextlib import asynccontextmanager
 from enum import Enum
 from types import TracebackType
 from typing import TYPE_CHECKING
@@ -20,7 +19,6 @@ from typing import Any
 from typing import AsyncContextManager
 from typing import AsyncGenerator
 from typing import AsyncIterator
-from typing import Awaitable
 from typing import Callable
 from typing import ClassVar
 from typing import ContextManager
@@ -52,6 +50,7 @@ from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
+from wool.runtime.typing import resolved
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.auth import current_credentials
@@ -484,15 +483,9 @@ class WorkerProxy:
     """
 
     _discovery: DiscoverySubscriberLike | Factory[DiscoverySubscriberLike]
-    _discovery_manager: (
-        AsyncContextManager[DiscoverySubscriberLike]
-        | ContextManager[DiscoverySubscriberLike]
-    )
-
-    _loadbalancer = LoadBalancerLike | Factory[LoadBalancerLike]
-    _loadbalancer_manager: (
-        AsyncContextManager[LoadBalancerLike] | ContextManager[LoadBalancerLike]
-    )
+    _discovery_stream: DiscoverySubscriberLike | None
+    _loadbalancer: LoadBalancerLike | Factory[LoadBalancerLike]
+    _loadbalancer_service: LoadBalancerLike | DispatchingLoadBalancerLike | None
     _provider: WorkerCredentialsProvider | None
     _security_filter: Callable[[WorkerMetadata], bool]
     _version_filter: Callable[[WorkerMetadata], bool]
@@ -661,13 +654,13 @@ class WorkerProxy:
             self._dispatching_deprecation_warned = True
 
         if credentials is Undefined:
-            resolved = current_credentials()
+            material = current_credentials()
         else:
-            resolved = credentials
+            material = credentials
         # Normalize an explicitly passed value into a provider the sentinel
         # resolves per connection; an ambient read already yields a coerced
         # provider (see credentials_scope), for which this is a no-op.
-        self._provider = WorkerCredentialsProvider.coerce(resolved)
+        self._provider = WorkerCredentialsProvider.coerce(material)
 
         # Deliberately not serialized: __wool_reduce__ restores the proxy
         # through __init__, so a restored proxy rebuilds the gate from its
@@ -713,6 +706,7 @@ class WorkerProxy:
         self._sentinel_task: asyncio.Task[None] | None = None
         self._loadbalancer_context: LoadBalancerContext | None = None
         self._handshake_throttle: _HandshakeWarningThrottle | None = None
+        self._workers_changed: asyncio.Event | None = None
 
     async def __aenter__(self):
         """Enter the proxy context and set it as the active proxy.
@@ -897,17 +891,24 @@ class WorkerProxy:
         Takes a hold on the loop's channel pool (see `channel_pool_hold`),
         enters the load balancer, then the discovery stream, and launches
         the worker sentinel, handing all of it to `stop` to unwind in
-        reverse.  A start that fails at any step, the
-        quorum wait included, releases what it had acquired in reverse
-        order and leaves the proxy un-started and free to retry; a load
-        balancer or discovery source configured as a context manager is
-        exited with the failure (see `_resolved` for the exit contract),
-        and a failed start stays failed.
+        reverse. A start that fails at any step, the quorum wait
+        included, releases what it had acquired in reverse order and
+        leaves the proxy un-started, so a later `start` may retry. A
+        load balancer or discovery source configured as a context
+        manager is exited with the failure and its suppression verdict
+        ignored — see `wool.runtime.typing.resolved` — so a failed start
+        is never reported as a started proxy. The proxy is starting for
+        the whole of a failed start's unwind and new only once it
+        returns, so a concurrent start, or a lazy dispatch, raises
+        rather than racing it.
 
         :raises RuntimeError:
             If the proxy is starting, started, stopping, or stopped, or
             the channel pool is bound to another running event loop (see
             `wool.runtime.resourcepool.ResourcePool`).
+        :raises TypeError:
+            If the resolved load balancer or discovery source does not
+            implement its protocol.
         :raises asyncio.TimeoutError:
             If the quorum wait does not complete within
             ``quorum_timeout``.
@@ -931,13 +932,11 @@ class WorkerProxy:
             stack.callback(self._reset_state)
             await stack.enter_async_context(channel_pool_hold())
             self._loadbalancer_service = await stack.enter_async_context(
-                _resolved(self._loadbalancer)
+                resolved(
+                    self._loadbalancer,
+                    expect=(LoadBalancerLike, DispatchingLoadBalancerLike),
+                )
             )
-            if not isinstance(
-                self._loadbalancer_service,
-                (LoadBalancerLike, DispatchingLoadBalancerLike),
-            ):
-                raise ValueError
             # Classify the balancer once, here, so dispatch() need not
             # re-run a @runtime_checkable isinstance on the hot path.
             self._delegating = isinstance(self._loadbalancer_service, LoadBalancerLike)
@@ -954,10 +953,8 @@ class WorkerProxy:
                 self._dispatching_deprecation_warned = True
 
             self._discovery_stream = await stack.enter_async_context(
-                _resolved(self._discovery)
+                resolved(self._discovery, expect=DiscoverySubscriberLike)
             )
-            if not isinstance(self._discovery_stream, DiscoverySubscriberLike):
-                raise ValueError
 
             self._loadbalancer_context = LoadBalancerContext()
             # Built here, not in __init__, so its keys cannot outlive the
@@ -1569,28 +1566,3 @@ class WorkerProxy:
                         changed.set()
                 case "worker-dropped":
                     await self._evict(context, throttle, changed, event.metadata)
-
-
-@asynccontextmanager
-async def _resolved(dependency: Any) -> AsyncIterator[Any]:
-    """Enter a configured dependency and yield the live object.
-
-    Accepts a bare instance, a callable factory producing any of these
-    forms, an awaitable, or a sync or async context manager.  A context
-    manager is entered for the duration of the block and exited with
-    the block's exception info, so a dependency configured as a manager
-    sees the same exit semantics as a plain ``with`` over it would.
-    """
-    if isinstance(dependency, ContextManager):
-        with dependency as obj:
-            yield obj
-    elif isinstance(dependency, AsyncContextManager):
-        async with dependency as obj:
-            yield obj
-    elif callable(dependency):
-        async with _resolved(dependency()) as obj:
-            yield obj
-    elif isinstance(dependency, Awaitable):
-        yield await dependency
-    else:
-        yield dependency

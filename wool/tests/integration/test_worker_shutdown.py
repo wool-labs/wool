@@ -563,8 +563,8 @@ class _BrokenDropPublisher:
 
     Every other event, and the publisher's context-manager protocol,
     delegate to the wrapped publisher: `LocalDiscovery.Publisher` is an
-    async context manager, and hiding that would send
-    ``WorkerPool._enter_context`` down the passthrough path, leaving the
+    async context manager, and hiding that would send the pool's
+    dependency resolution down the passthrough path, leaving the
     real publisher neither entered nor exited and teardown's publisher
     cleanup a no-op. Passing `_HANG` hangs the announcement instead of
     raising it, modelling an unresponsive discovery service.

@@ -414,7 +414,7 @@ class _DirectDiscovery:
     """Wraps an already-entered discovery service as a plain object.
 
     Does NOT implement ``__enter__``/``__exit__``/``__aenter__``/
-    ``__aexit__``, forcing ``WorkerPool._enter_context`` to take the
+    ``__aexit__``, so the pool's dependency resolution takes the
     passthrough path. Used for the ``*_DIRECT`` factory form arrangements.
 
     ``publisher`` overrides the wrapped service's publisher, for tests

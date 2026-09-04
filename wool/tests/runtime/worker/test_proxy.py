@@ -1353,7 +1353,7 @@ class TestWorkerProxy:
         )
 
         # Act
-        with pytest.raises(ValueError):
+        with pytest.raises(TypeError):
             await proxy.start()
         # The probe hold.
         async with channel_pool_hold():
@@ -1804,7 +1804,7 @@ class TestWorkerProxy:
         )
 
         # Act
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(TypeError) as excinfo:
             await proxy.start()
 
         # Assert
@@ -2416,13 +2416,13 @@ class TestWorkerProxy:
         )
 
         # Act
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(TypeError) as excinfo:
             await proxy.start()
 
         # Assert
         assert not proxy.started
         assert len(exits) == 1
-        assert exits[0][:2] == (ValueError, excinfo.value)
+        assert exits[0][:2] == (TypeError, excinfo.value)
 
     @pytest.mark.asyncio
     async def test_start_with_awaitable_loadbalancer(
@@ -7508,7 +7508,7 @@ class TestWorkerProxy:
     async def test_start_invalid_loadbalancer_type_raises_error(
         self, mocker: MockerFixture
     ):
-        """Test raise ValueError.
+        """Test raise TypeError.
 
         Given:
             A non-lazy WorkerProxy with a loadbalancer that doesn't
@@ -7516,7 +7516,7 @@ class TestWorkerProxy:
         When:
             Start() is called
         Then:
-            It should raise ValueError
+            It should raise TypeError
         """
 
         # Arrange
@@ -7532,14 +7532,14 @@ class TestWorkerProxy:
         )
 
         # Act & assert
-        with pytest.raises(ValueError):
+        with pytest.raises(TypeError):
             await proxy.start()
 
     @pytest.mark.asyncio
     async def test_start_invalid_discovery_type_raises_error(
         self, mocker: MockerFixture
     ):
-        """Test raise ValueError.
+        """Test raise TypeError.
 
         Given:
             A non-lazy WorkerProxy with a discovery that doesn't
@@ -7547,7 +7547,7 @@ class TestWorkerProxy:
         When:
             Start() is called
         Then:
-            It should raise ValueError
+            It should raise TypeError
         """
         # Arrange - use a simple string which is definitely not an AsyncIterator
         invalid_discovery = "not_an_async_iterator"
@@ -7555,7 +7555,7 @@ class TestWorkerProxy:
         proxy = WorkerProxy(discovery=lambda: invalid_discovery, lazy=False)
 
         # Act & assert
-        with pytest.raises(ValueError):
+        with pytest.raises(TypeError):
             await proxy.start()
 
     @pytest.mark.asyncio

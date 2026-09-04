@@ -2622,7 +2622,7 @@ class TestWorkerPool:
         assert isinstance(pool, WorkerPool)
 
     @pytest.mark.asyncio
-    async def test___aexit___handles_shared_memory_cleanup_exceptions(
+    async def test___aexit___should_not_reshape_error_when_proxy_exit_raises(
         self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
     ):
         """Test handle exceptions gracefully without propagating them.
@@ -2652,7 +2652,8 @@ class TestWorkerPool:
         assert raised is None or isinstance(raised, OSError)
 
     @pytest.mark.asyncio
-    async def test___aexit___bounds_teardown_when_worker_stop_hangs(
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test___aexit___should_bound_teardown_when_worker_stop_hangs(
         self, mocker: MockerFixture
     ):
         """Test pool teardown returns within the configured shutdown bound.
@@ -2693,6 +2694,145 @@ class TestWorkerPool:
         assert elapsed < shutdown_timeout * 5
 
     @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test___aexit___should_exit_publisher_when_shutdown_deadline_exhausted(
+        self, mocker: MockerFixture
+    ):
+        """Test the publisher's exit still runs once the deadline is spent.
+
+        Given:
+            A WorkerPool whose worker has a stop() that never returns and
+            whose discovery publisher is a context manager recording its
+            exit
+        When:
+            The async-with block exits and the worker stop exhausts
+            shutdown_timeout
+        Then:
+            It should still enter the publisher's exit exactly once
+            rather than skip it, leaving no coroutine un-awaited
+        """
+        # Arrange
+        exits: list[tuple] = []
+
+        class ExitRecordingDiscovery(_FakeDiscovery):
+            @property
+            def publisher(self):
+                publisher = self._publisher
+
+                class Manager:
+                    async def __aenter__(self):
+                        return publisher
+
+                    async def __aexit__(self, *args):
+                        exits.append(args)
+                        return False
+
+                return Manager()
+
+        def hanging_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+
+            async def hang(*, grace=None):
+                await asyncio.sleep(60)
+
+            worker.stop = hang
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            worker=hanging_factory,
+            spawn=1,
+            shutdown_timeout=0.05,
+            discovery=ExitRecordingDiscovery(mocker),
+        ):
+            pass
+
+        # Assert
+        assert exits == [(None, None, None)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test___aexit___should_cancel_publisher_exit_when_cleanup_exceeds_budget(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test a publisher exit that outlives the deadline is cancelled and reported.
+
+        Given:
+            A WorkerPool whose worker has a stop() that never returns and
+            whose discovery publisher is a context manager whose exit
+            parks until cancelled
+        When:
+            The async-with block exits and the worker stop exhausts
+            shutdown_timeout
+        Then:
+            It should still enter the publisher's exit, cancel it once
+            the budget is spent, log one warning saying so, and return
+            within a small multiple of shutdown_timeout
+        """
+        # Arrange
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        class ParkingDiscovery(_FakeDiscovery):
+            @property
+            def publisher(self):
+                publisher = self._publisher
+
+                class Manager:
+                    async def __aenter__(self):
+                        return publisher
+
+                    async def __aexit__(self, *args):
+                        entered.set()
+                        try:
+                            await asyncio.Event().wait()
+                        except asyncio.CancelledError:
+                            cancelled.set()
+                            raise
+                        return False
+
+                return Manager()
+
+        def hanging_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+
+            async def hang(*, grace=None):
+                await asyncio.sleep(60)
+
+            worker.stop = hang
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        shutdown_timeout = 0.05
+
+        # Act
+        start = time.monotonic()
+        with caplog.at_level(logging.WARNING, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=hanging_factory,
+                spawn=1,
+                shutdown_timeout=shutdown_timeout,
+                discovery=ParkingDiscovery(mocker),
+            ):
+                pass
+        elapsed = time.monotonic() - start
+
+        # Assert
+        assert entered.is_set()
+        assert cancelled.is_set()
+        messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert [
+            "publisher cleanup did not complete" in message for message in messages
+        ].count(True) == 1
+        assert elapsed < shutdown_timeout * 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
     async def test___aexit___should_log_warning_when_workers_reaped(
         self, mocker: MockerFixture, caplog
     ):
@@ -2740,7 +2880,8 @@ class TestWorkerPool:
         )
 
     @pytest.mark.asyncio
-    async def test___aexit___cancels_pending_stops_after_timeout(
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test___aexit___should_cancel_pending_stops_when_shutdown_bound_elapses(
         self, mocker: MockerFixture
     ):
         """Test pending stop coroutines receive CancelledError on timeout.
@@ -2821,7 +2962,8 @@ class TestWorkerPool:
         )
 
     @pytest.mark.asyncio
-    async def test___aexit___does_not_block_other_cleanup_when_one_worker_hangs(
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test___aexit___should_stop_other_workers_when_one_worker_hangs(
         self, mocker: MockerFixture
     ):
         """Test fast worker still stops when a sibling worker's stop hangs.
@@ -3077,6 +3219,7 @@ class TestWorkerPool:
         stop.assert_awaited_once_with(grace=pytest.approx(5.0, abs=0.1))
 
     @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
     async def test___aexit___should_stop_worker_when_drop_announcement_hangs(
         self, mocker: MockerFixture
     ):
@@ -3206,6 +3349,7 @@ class TestWorkerPool:
         stop.assert_awaited_once_with(grace=-1.0)
 
     @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
     async def test___aexit___should_log_error_when_drop_announcement_hangs(
         self, mocker: MockerFixture, caplog
     ):
@@ -4465,17 +4609,18 @@ class TestWorkerPool:
         assert str(caught_exception) == exception_message
 
     @pytest.mark.asyncio
-    async def test_enter_context_with_awaitable(
+    async def test___aenter___should_resolve_discovery_when_awaitable(
         self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
     ):
-        """Test await the Awaitable and return the result.
+        """Test entering the pool awaits an awaitable discovery factory.
 
         Given:
             WorkerPool with a discovery factory that returns an Awaitable
         When:
-            _enter_context is called
+            The pool is entered
         Then:
-            It should await the Awaitable and return the result
+            It should await the Awaitable and hand its subscriber to the
+            proxy
         """
 
         # Arrange
@@ -4496,8 +4641,10 @@ class TestWorkerPool:
             def subscribe(self, filter=None):
                 return self._subscriber
 
+        discovery = ConcreteDiscovery()
+
         async def discovery_awaitable():
-            return ConcreteDiscovery()
+            return discovery
 
         # Patch WorkerProxy to avoid actual proxy initialization
         mock_proxy = mocker.MagicMock()
@@ -4507,23 +4654,28 @@ class TestWorkerPool:
 
         pool = WorkerPool(discovery=discovery_awaitable)
 
-        # Act & assert - should not raise
+        # Act
         async with pool:
             pass
 
+        # Assert
+        assert (
+            pool_module.WorkerProxy.call_args.kwargs["discovery"] is discovery.subscriber
+        )
+
     @pytest.mark.asyncio
-    async def test_enter_context_with_plain_object(
+    async def test___aenter___should_resolve_discovery_when_plain_object(
         self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
     ):
-        """Test return the object directly.
+        """Test entering the pool passes a plain discovery object through.
 
         Given:
             WorkerPool with a discovery that is a plain object (not
             callable/context manager)
         When:
-            _enter_context is called
+            The pool is entered
         Then:
-            It should return the object directly
+            It should hand the object's subscriber to the proxy
         """
 
         # Arrange
@@ -4554,20 +4706,26 @@ class TestWorkerPool:
 
         pool = WorkerPool(discovery=mock_discovery)
 
-        # Act & assert - should not raise
+        # Act
         async with pool:
             pass
 
+        # Assert
+        assert (
+            pool_module.WorkerProxy.call_args.kwargs["discovery"]
+            is mock_discovery.subscriber
+        )
+
     @pytest.mark.asyncio
-    async def test_exit_context_with_sync_context_manager(
+    async def test___aexit___should_exit_sync_context_manager_when_discovery_is_one(
         self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
     ):
-        """Test call __exit__ on the context manager.
+        """Test exiting the pool exits a synchronous discovery context manager.
 
         Given:
             WorkerPool with a discovery that is a synchronous ContextManager
         When:
-            _exit_context is called
+            The pool is exited
         Then:
             It should call __exit__ on the context manager
         """
