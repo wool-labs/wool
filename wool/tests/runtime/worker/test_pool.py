@@ -4465,7 +4465,7 @@ class TestWorkerPool:
         assert str(caught_exception) == exception_message
 
     @pytest.mark.asyncio
-    async def test_enter_context_with_awaitable(
+    async def test___aenter___should_resolve_discovery_when_awaitable(
         self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
     ):
         """Test await the Awaitable and return the result.
@@ -4473,7 +4473,7 @@ class TestWorkerPool:
         Given:
             WorkerPool with a discovery factory that returns an Awaitable
         When:
-            _enter_context is called
+            The pool is entered
         Then:
             It should await the Awaitable and return the result
         """
@@ -4512,7 +4512,7 @@ class TestWorkerPool:
             pass
 
     @pytest.mark.asyncio
-    async def test_enter_context_with_plain_object(
+    async def test___aenter___should_resolve_discovery_when_plain_object(
         self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
     ):
         """Test return the object directly.
@@ -4521,7 +4521,7 @@ class TestWorkerPool:
             WorkerPool with a discovery that is a plain object (not
             callable/context manager)
         When:
-            _enter_context is called
+            The pool is entered
         Then:
             It should return the object directly
         """
@@ -4559,7 +4559,7 @@ class TestWorkerPool:
             pass
 
     @pytest.mark.asyncio
-    async def test_exit_context_with_sync_context_manager(
+    async def test___aexit___should_exit_sync_context_manager_when_discovery_is_one(
         self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
     ):
         """Test call __exit__ on the context manager.
@@ -4567,7 +4567,7 @@ class TestWorkerPool:
         Given:
             WorkerPool with a discovery that is a synchronous ContextManager
         When:
-            _exit_context is called
+            The pool is exited
         Then:
             It should call __exit__ on the context manager
         """

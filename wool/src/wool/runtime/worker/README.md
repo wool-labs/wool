@@ -332,7 +332,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 ### Connection pooling
 
-`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options, peer)`, with a 60-second TTL — idle channels are finalized after the TTL expires. The pool serves one running event loop at a time: a process that runs successive loops gets a fresh channel set per loop, channels left by a loop that is no longer running are dropped without being closed, and using the pool from two running loops at once raises. Keying on the `WorkerCredentials` value (a frozen dataclass, so hashable and value-equal) is what makes rotation observable at the channel layer — see [Credential providers: admission and rotation](#credential-providers-admission-and-rotation). Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams` — the client-side dispatch gate. The worker's own HTTP/2 `MAX_CONCURRENT_STREAMS` ceiling is set to twice that value to absorb transient permit-turnover overshoot without faulting the connection. See issue #290.
+`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options, peer)`, with a 60-second TTL, i.e., idle channels are finalized after the TTL expires. The pool serves one running event loop at a time: a process that runs successive loops gets a fresh channel set per loop, and using the pool from two running loops at once raises. A `WorkerConnection` used as an async context manager closes on exit, retiring its own keys drain-first; each `WorkerProxy` takes a reference-counted hold on the pool for the period from start to stop, so the last proxy to leave a loop closes that loop's channels without waiting for the TTL, and closes the connection of a worker that departs its pool. See `channel_pool_hold` for the hold semantics and `ResourcePool` for what a stopped loop's leftovers become. Keying on the `WorkerCredentials` value (a frozen dataclass, so hashable and value-equal) is what makes rotation observable at the channel layer — see [Credential providers: admission and rotation](#credential-providers-admission-and-rotation). Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams`, i.e., the client-side dispatch gate. The worker's own HTTP/2 `MAX_CONCURRENT_STREAMS` ceiling is set to twice that value to absorb transient permit-turnover overshoot without faulting the connection. See issue #290.
 
 ### Idle reporting
 
@@ -340,7 +340,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 Idle is measured as the time since the worker's in-flight task set last emptied, with worker startup counting as the initial empty state. It reads `0.0` while any task is in flight and restarts from zero each time the set drains again, so the value answers "how long has this worker had nothing to do", not "how long since it was started". The measurement is taken on a monotonic clock, so a wall-clock adjustment cannot distort it. Polling creates no `DispatchSession` and never enters the in-flight set, so reading the measurement cannot disturb it.
 
-This is worker idleness, not channel idleness: the 60-second `ResourcePool` TTL above and `WorkerOptions.max_connection_idle_ms` govern how long an unused *channel* survives within the loop that opened it, and neither is affected by whether the worker at the other end is executing tasks.
+This is worker idleness, not channel idleness: the channel-lifetime rules above govern how long an unused *channel* survives within the loop that opened it, and none of them is affected by whether the worker at the other end is executing tasks.
 
 A worker that predates the idle capability answers the RPC with gRPC `UNIMPLEMENTED`, which surfaces as `IdleUnavailable`. It descends from `WoolError` rather than `RpcError`, so `except RpcError` does not catch it — an absent capability is not an RPC-health fault, and a polling client should treat it as "idle reporting is unavailable on this worker" rather than as a transient hiccup or an unhealthy peer. Every other gRPC failure classifies as it does for dispatch: transient codes raise `TransientRpcError`, everything else raises `RpcError`.
 
@@ -370,7 +370,9 @@ options = WorkerOptions(
 async with wool.WorkerPool(
     spawn=4,
     worker=lambda *tags, credentials=None: LocalWorker(
-        *tags, credentials=credentials, options=options,
+        *tags,
+        credentials=credentials,
+        options=options,
     ),
 ):
     result = await my_routine()
