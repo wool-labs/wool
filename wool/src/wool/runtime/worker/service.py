@@ -658,10 +658,10 @@ class WorkerService(protocol.WorkerServicer):
         that raises or exceeds the shared `_DRAIN_TIMEOUT` budget is
         logged and does not prevent the stop; the budget bounds when a
         clear is cancelled, not when it returns, since a clear finishes
-        its sweep before re-raising (see `ResourcePool.clear`), a clear
-        reached with the budget already exhausted is cancelled before it
-        starts and logged the same way, and whatever a clear left cached
-        is dropped when the pool next rebinds.
+        its sweep before re-raising (see `ResourcePool.clear`). Every
+        clear starts, and one reached with the budget already exhausted
+        is cancelled in flight rather than skipped; whatever a clear left
+        cached is dropped when the pool next rebinds.
         With ``timeout=0`` the clears run best-effort on the daemon
         thread after this returns; on that path the channel clear can
         race a successor loop's first use of the process-wide pool, and
@@ -716,9 +716,16 @@ class WorkerService(protocol.WorkerServicer):
             try:
                 try:
                     for name, clear in clears:
+                        # One tick before the deadline is enforced, so a
+                        # clear meeting an exhausted budget is cancelled
+                        # in flight rather than before its first step —
+                        # see the docstring.
+                        pending_clear = asyncio.ensure_future(clear())
+                        await asyncio.sleep(0)
                         try:
                             await asyncio.wait_for(
-                                clear(), timeout=max(0.0, deadline - loop.time())
+                                pending_clear,
+                                timeout=max(0.0, deadline - loop.time()),
                             )
                         except Exception:
                             _log.warning(

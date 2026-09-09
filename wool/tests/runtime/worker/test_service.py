@@ -2476,6 +2476,77 @@ class TestWorkerService:
         assert order == ["proxy", "channel"]
 
     @pytest.mark.asyncio
+    async def test_stop_should_start_channel_pool_clear_when_budget_exhausted(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        caplog,
+    ):
+        """Test `WorkerService.stop` starts every clear even once the budget is spent.
+
+        Given:
+            A `WorkerService` that has serviced a dispatch, leaving one
+            worker event-loop warm, a proxy-pool ``clear`` that outlives
+            the whole drain budget, and a channel-pool clear that records
+            its first step and then also never returns
+        When:
+            The stop RPC is invoked with a positive timeout
+        Then:
+            It should take the channel clear's first step before
+            cancelling it, and log both clears as failed at WARNING from
+            ``wool.runtime.worker.service``
+        """
+        # Arrange
+        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
+        channel_clear_started = threading.Event()
+
+        async def outlive_budget():
+            await asyncio.sleep(60)
+
+        async def record_then_outlive_budget():
+            channel_clear_started.set()
+            await asyncio.sleep(60)
+
+        mock_worker_proxy_cache.clear = mocker.AsyncMock(side_effect=outlive_budget)
+        mocker.patch.object(
+            service_module,
+            "clear_channel_pool",
+            mocker.AsyncMock(side_effect=record_then_outlive_budget),
+        )
+        wool_task = make_task(_worker_loop_identity_probe)
+
+        # Act
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+            with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.service"):
+                stop_result = await asyncio.wait_for(
+                    stub.stop(protocol.StopRequest(timeout=5)), 10
+                )
+
+        # Assert
+        assert isinstance(stop_result, protocol.Void)
+        assert grpc_servicer.stopped.is_set()
+        assert channel_clear_started.is_set()
+        failed = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and record.levelno == logging.WARNING
+            and "Failed to clear" in record.getMessage()
+        ]
+        assert [message.split(" pool")[0] for message in failed] == [
+            "Failed to clear the proxy",
+            "Failed to clear the channel",
+        ]
+
+    @pytest.mark.asyncio
     async def test_dispatch_should_clear_proxy_pool_when_idle_worker_loop_expires(
         self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
     ):
