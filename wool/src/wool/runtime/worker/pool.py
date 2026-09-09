@@ -14,9 +14,6 @@ import uuid
 import warnings
 from contextlib import asynccontextmanager
 from typing import Any
-from typing import AsyncContextManager
-from typing import Awaitable
-from typing import ContextManager
 from typing import Coroutine
 from typing import Final
 from typing import cast
@@ -33,6 +30,7 @@ from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
+from wool.runtime.typing import resolved
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.auth import normalize_peer
@@ -683,13 +681,9 @@ class WorkerPool:
 
                 @asynccontextmanager
                 async def create_proxy():
-                    discovery_svc, discovery_ctx = await self._enter_context(discovery)
-                    if not isinstance(discovery_svc, DiscoveryLike):
-                        raise TypeError(
-                            f"Expected DiscoveryLike, got: {type(discovery_svc)}"
-                        )
-
-                    try:
+                    async with resolved(
+                        discovery, expect=DiscoveryLike
+                    ) as discovery_svc:
                         async with self._worker_context(
                             *tags,
                             spawn=spawn,
@@ -705,8 +699,6 @@ class WorkerPool:
                                 lazy=self._lazy,
                             ):
                                 yield
-                    finally:
-                        await self._exit_context(discovery_ctx)
 
             case (spawn, None) if spawn is not None:
                 if lease is not None:
@@ -747,12 +739,9 @@ class WorkerPool:
 
                 @asynccontextmanager
                 async def create_proxy():
-                    discovery_svc, discovery_ctx = await self._enter_context(discovery)
-                    if not isinstance(discovery_svc, DiscoveryLike):
-                        raise TypeError(
-                            f"Expected DiscoveryLike, got: {type(discovery_svc)}"
-                        )
-                    try:
+                    async with resolved(
+                        discovery, expect=DiscoveryLike
+                    ) as discovery_svc:
                         async with self._make_proxy(
                             discovery=discovery_svc.subscriber,
                             loadbalancer=loadbalancer,
@@ -762,8 +751,6 @@ class WorkerPool:
                             lazy=self._lazy,
                         ):
                             yield
-                    finally:
-                        await self._exit_context(discovery_ctx)
 
             case (None, None):
                 if lease is not None:
@@ -859,12 +846,10 @@ class WorkerPool:
         `~wool.DiscoveryPublisherLike.bind_host`). Teardown applies the pool's
         ``shutdown_timeout`` as a single deadline across worker stops
         and publisher cleanup — see that parameter for the contract
-        this implements — and runs even when publisher validation or
-        worker construction fails, so an entered publisher context is
-        always exited rather than dropped on the floor. Cleanup is
-        itself bounded by what remains of the deadline, so a teardown
-        that exhausts the deadline can time cleanup out before the
-        publisher's ``__aexit__`` runs.
+        this implements. The publisher's exit always starts, and an
+        exhausted deadline cancels it in flight rather than skipping
+        it; a publisher that fails validation is exited by `resolved`
+        before this context is entered at all.
 
         :yields:
             Metadata for the spawned workers.
@@ -888,12 +873,9 @@ class WorkerPool:
         below exists to enforce — trading a leaked worker for an
         unbounded teardown.
         """
-        publisher_svc, publisher_ctx = await self._enter_context(publisher)
+        publisher_ctx = resolved(publisher, expect=DiscoveryPublisherLike)
+        publisher_svc = await publisher_ctx.__aenter__()
         try:
-            if not isinstance(publisher_svc, DiscoveryPublisherLike):
-                raise TypeError(
-                    f"Expected DiscoveryPublisherLike, got: {type(publisher_svc)}"
-                )
             if factory is None:
                 factory = LocalWorker
 
@@ -1018,13 +1000,18 @@ class WorkerPool:
                         extra={"reaped_worker_uids": reaped_uids},
                     )
 
+            exit_task = asyncio.ensure_future(publisher_ctx.__aexit__(*sys.exc_info()))
+            # One tick so the exit takes its first step before the deadline
+            # is enforced: wait_for with an exhausted budget cancels a
+            # coroutine before it starts, which would skip the exit and
+            # strand resolved's generators instead of bounding them.
+            await asyncio.sleep(0)
             try:
-                await asyncio.wait_for(
-                    self._exit_context(publisher_ctx), timeout=remaining()
-                )
+                await asyncio.wait_for(exit_task, timeout=remaining())
             except TimeoutError:
                 logger.warning(
-                    "WorkerPool publisher cleanup did not complete within %ss",
+                    "WorkerPool publisher cleanup did not complete within %ss "
+                    "and was cancelled",
                     self._shutdown_timeout,
                 )
 
@@ -1064,40 +1051,6 @@ class WorkerPool:
             quorum=None,
             lazy=lazy,
         )
-
-    async def _enter_context(self, factory):
-        """Normalize a configured dependency into a live object.
-
-        Accepts a bare instance, a callable factory, an awaitable, or
-        a sync/async context manager (entering the latter) and
-        returns ``(object, owning_context)``, where the context is
-        ``None`` unless this call entered one and owes it an exit via
-        `_exit_context`.
-        """
-        ctx = None
-        if isinstance(factory, ContextManager):
-            ctx = factory
-            obj = ctx.__enter__()
-        elif isinstance(factory, AsyncContextManager):
-            ctx = factory
-            obj = await ctx.__aenter__()
-        elif callable(factory):
-            return await self._enter_context(factory())
-        elif isinstance(factory, Awaitable):
-            obj = await factory
-        else:
-            obj = factory
-        return obj, ctx
-
-    async def _exit_context(self, ctx: AsyncContextManager | ContextManager | None):
-        """Exit a sync or async context manager, if any.
-
-        Forwards the active exception info; ``None`` is a no-op.
-        """
-        if isinstance(ctx, AsyncContextManager):
-            await ctx.__aexit__(*sys.exc_info())
-        elif isinstance(ctx, ContextManager):
-            ctx.__exit__(*sys.exc_info())
 
 
 def _resolve_spawn(spawn: int) -> int:

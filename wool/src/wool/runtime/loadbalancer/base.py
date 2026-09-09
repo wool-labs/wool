@@ -92,10 +92,10 @@ class LoadBalancerContextLike(LoadBalancerContextView, Protocol):
     from. Writes are last-writer-wins: the stored entry is replaced
     with the given record wholesale, so a caller writing a record it
     captured earlier regresses a fresher one for the same uid.
-    A displaced `WorkerConnection` is *not* closed — see
-    `wool.runtime.worker.connection.WorkerConnection` for why channel
-    lifetime belongs to the pooling layer rather than to the holder of
-    a connection handle.
+    The context does not close connections: closing belongs to whoever
+    created the connection, and channel lifetime otherwise belongs to
+    the pooling layer — see
+    `wool.runtime.worker.connection.WorkerConnection`.
     """
 
     def add_worker(
@@ -125,7 +125,8 @@ class LoadBalancerContextLike(LoadBalancerContextView, Protocol):
         :param metadata:
             Information about the worker to refresh.
         :param connection:
-            New `WorkerConnection` for this worker.
+            The `WorkerConnection` to store for this worker; it may be the
+            one already held.
         """
         ...
 

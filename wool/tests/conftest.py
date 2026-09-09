@@ -4,9 +4,11 @@ from typing import Final
 
 import debugpy
 import pytest
+import pytest_asyncio
 
 import wool
 from wool.runtime.resourcepool import ResourcePool
+from wool.runtime.worker.connection import clear_channel_pool
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,20 @@ def pytest_addoption(parser):
         default=False,
         help="Wait for a debugpy client to attach before running tests",
     )
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clear_channel_pool():
+    """Finalize the module-level gRPC channel pool on the loop that used it.
+
+    This loop is the only place a channel a test left cached can still
+    be closed, and a hold a test left open would strand its entry for
+    the next loop to report (see
+    `wool.runtime.resourcepool.ResourcePool`), where a record is meant
+    to mean a real leak.
+    """
+    yield
+    await clear_channel_pool()
 
 
 @pytest.fixture

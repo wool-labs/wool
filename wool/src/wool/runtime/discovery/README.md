@@ -34,7 +34,7 @@ Both protocols optionally accept a filter predicate for targeted subscriptions.
 
 Wool supports custom discovery protocols via structural subtyping.
 
-`WorkerPool` accepts `DiscoveryLike` or `Factory[DiscoveryLike]` for its `discovery` parameter. The `Factory` type alias covers bare instances, context managers, async context managers, callables, and awaitables. This means you can pass a discovery instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` will manage it appropriately.
+`WorkerPool` accepts a `DiscoveryLike` instance or any `Factory` form for its `discovery` parameter — see `Factory` for the forms and `resolved` for how one is entered. This means you can pass a discovery instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` will manage it appropriately.
 
 ### `DiscoveryLike` protocol
 

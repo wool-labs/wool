@@ -10,11 +10,14 @@ import asyncio
 import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from types import TracebackType
 from typing import Any
+from typing import AsyncContextManager
 from typing import AsyncGenerator
 from typing import Coroutine
 from typing import Final
 from typing import Generic
+from typing import Self
 from typing import TypeAlias
 from typing import TypeVar
 from typing import cast
@@ -260,8 +263,8 @@ class WorkerConnection:
 
     Exposes `dispatch` (task execution), `idle` (poll the worker's
     continuous idle duration), and `stop` (shut the remote worker
-    down). ``close`` is distinct: it releases this connection's local
-    pooled channel, whereas `stop` terminates the remote worker.
+    down). `close` is distinct: it retires this connection's pooled
+    channel keys, whereas `stop` terminates the remote worker.
 
     Acquires pooled gRPC channels keyed by ``(target, credentials,
     options, peer)``.  Each `dispatch` call obtains a reference-counted
@@ -272,9 +275,13 @@ class WorkerConnection:
 
     A connection is a lazy handle, not a channel owner: channel lifetime
     belongs to the pool, which reaps a channel by refcount and TTL once
-    no handle is using it. Discarding a connection therefore does not
-    close its channel, and closing one retires its keys without
-    disturbing a channel another handle is still using.
+    no handle is using it, or sooner when the loop's last
+    `channel_pool_hold` is released. Discarding a connection therefore
+    does not close its channel, and a loop that stops before the pool
+    reaps it strands the channel, which `ResourcePool` reports; entering
+    the connection as an async context manager, or calling `close`,
+    retires this connection's keys first — see `close` — and leaves the
+    handle usable afterwards.
 
     **Cleanup semantics on cancellation.** Every code path that owns
     an in-flight gRPC call wraps its body in
@@ -333,10 +340,9 @@ class WorkerConnection:
 
     .. code-block:: python
 
-        conn = WorkerConnection("localhost:50051")
-        async for result in conn.dispatch(task):
-            process(result)
-        await conn.close()
+        async with WorkerConnection("localhost:50051") as conn:
+            async for result in conn.dispatch(task):
+                process(result)
     """
 
     # The codes dispatch maps to a *bare* TransientRpcError. Not the
@@ -397,6 +403,19 @@ class WorkerConnection:
         # self-dispatches over the loopback UDS never set it.
         self._key: _ChannelKey | None = None
         self._uds_key: _ChannelKey | None = None
+
+    async def __aenter__(self) -> Self:
+        """Enter the connection, returning it for use in the block."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Close the connection on exit — see `close`."""
+        await self.close()
 
     async def _resolve_key(self) -> _ChannelKey:
         """Resolve the pool key routing the next RPC.
@@ -553,7 +572,7 @@ class WorkerConnection:
         return cast(AsyncGenerator[protocol.Message, None], stream)
 
     async def close(self):
-        """Close the connection and release all pooled resources.
+        """Retire this connection's pooled channel keys.
 
         Retires the pooled channel entries for the most recent TCP key
         and, if this connection ever routed over the loopback, the UDS
@@ -860,6 +879,9 @@ async def _channel_finalizer(channel: _Channel):
     await channel.close()
 
 
+# One pool for the whole process, so every handle to the same worker
+# shares a channel. Retirement: see `channel_pool_hold` and
+# `WorkerConnection.close`. What a stopped loop strands: see `ResourcePool`.
 _channel_pool: ResourcePool[_Channel] = ResourcePool(
     factory=_channel_factory, finalizer=_channel_finalizer, ttl=60
 )
@@ -879,13 +901,76 @@ def channel_pool_stats() -> ResourcePool.Stats:
     return _channel_pool.stats
 
 
+# A def rather than a lambda so a stranded hold's rebind record names this
+# pool by qualname — see ResourcePool.
+def _channel_pool_hold_factory(key: Any) -> None:
+    """Return the inert entry behind a hold."""
+    return None
+
+
+# A one-key pool whose reference count is the hold count — see
+# channel_pool_hold.
+_channel_pool_holds: ResourcePool[None] = ResourcePool(
+    factory=_channel_pool_hold_factory,
+    finalizer=lambda _: _channel_pool.expire_all(),
+    ttl=0,
+)
+
+
 async def clear_channel_pool() -> None:
     """Close and clear every gRPC channel in the process-wide pool.
 
-    Invalidates cached channels across every pool key, including
-    UDS targets.
+    The teardown primitive: runs `ResourcePool.clear` over the channel
+    pool, across every pool key, including UDS targets. Holds are not
+    dropped: each is released by its holder, and a hold a loop strands
+    is reported by `ResourcePool` at the next rebind. To retire while
+    the loop keeps dispatching, exit or close a `WorkerConnection` for
+    its own keys, or let the last `channel_pool_hold` release retire the
+    loop's channels drain-first.
     """
     await _channel_pool.clear()
+
+
+def channel_pool_hold() -> AsyncContextManager[None]:
+    """Return a hold on the channel pool for the calling event loop.
+
+    A hold declares a period during which repeated dispatches are
+    expected on the loop, and exists to keep the loop's channels cached
+    for that period: while any hold is open an idle channel is left to
+    the pool's TTL, and a hold nested inside another retires nothing on
+    its own. The last release ends the period and retires every cached
+    channel on the loop, whether or not a holder opened it, through
+    `ResourcePool.expire_all` without waiting for the idle TTL — with no
+    period declared there is nothing to keep a channel warm for.
+    A hold belongs to a component with a start-to-stop lifetime on the
+    loop; a handle with no lifecycle of its own takes none.
+
+    :returns:
+        A single-use async context manager whose entered value is
+        ``None``: the hold is the count, not a handle on the pool.
+
+    .. rubric:: Implementation notes
+
+    The holds are references on a one-key `ResourcePool` whose finalizer
+    retires the channel pool: a reference count that finalizes on the
+    last release is exactly what `ResourcePool` already is, so composing
+    it avoids a second counter that would have to reproduce the same
+    rules — and, because both pools bind by loop the same way, a hold
+    can never outlive the channels it governs. ``ttl=0`` makes the final
+    release retire the channels inline rather than after a grace period.
+    Retirement is `ResourcePool.expire_all` rather than
+    `ResourcePool.clear` because the loop keeps running: a dispatch whose
+    teardown lands after the last hold is released still holds its
+    channel reference, and force-closing under it would let that late
+    release corrupt an entry rebuilt for the same key. The sweep is
+    loop-scoped rather than holder-scoped by design: the leak the hold
+    exists to close is a channel nobody holds (e.g., a bare
+    `WorkerConnection`'s or a departed worker's), and a sweep limited to
+    the keys the holders opened would strand exactly those. The price is
+    a fresh handshake for a bare connection kept warm on the loop when
+    its last proxy stops.
+    """
+    return _channel_pool_holds.get(None)
 
 
 _TEARDOWN_TIMEOUT: Final = 60.0
