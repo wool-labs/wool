@@ -5,9 +5,11 @@ import logging
 import threading
 import time
 import warnings
+import weakref
 from contextlib import AsyncExitStack
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
@@ -19,6 +21,103 @@ from hypothesis import strategies
 
 from wool.runtime.resourcepool import Resource
 from wool.runtime.resourcepool import ResourcePool
+
+
+def make_resource(key):
+    """Build a placeholder resource for ``key``.
+
+    A module-level ``def`` so the pool's records name it
+    ``ResourcePool(make_resource)``.
+    """
+    return f"obj-{key}"
+
+
+#: Handles `_acquire` holds open, keyed by pool, loop, and key, so a test
+#: can take and drop references non-lexically through the public surface.
+_handles: dict[tuple[int, int, Any], list[AsyncExitStack]] = {}
+
+
+async def _acquire(pool, key):
+    """Take a reference on ``key`` through ``pool.get`` and return the object.
+
+    The handle stays open until `_release` closes it on the same loop.
+    """
+    stack = AsyncExitStack()
+    obj = await stack.enter_async_context(pool.get(key))
+    _handles.setdefault((id(pool), id(asyncio.get_running_loop()), key), []).append(
+        stack
+    )
+    return obj
+
+
+async def _release(pool, key):
+    """Drop the most recent reference `_acquire` took on ``key`` on this loop."""
+    slot = (id(pool), id(asyncio.get_running_loop()), key)
+    stack = _handles[slot].pop()
+    if not _handles[slot]:
+        del _handles[slot]
+    await stack.aclose()
+
+
+@pytest.fixture(autouse=True)
+def _drop_handles():
+    """Forget the handles a test left open."""
+    yield
+    _handles.clear()
+
+
+async def _read(value):
+    """Return an already-read value, so a property read can be awaited."""
+    return value
+
+
+async def _pool_stats(pool):
+    """Read a pool's stats from the loop this coroutine runs on."""
+    return pool.stats
+
+
+async def _cache_idle_entry(pool, key):
+    """Acquire and release ``key``, leaving it cached and idle."""
+    async with pool.get(key):
+        pass
+
+
+async def _use_resource(resource):
+    """Enter and immediately exit an already-built resource."""
+    async with resource:
+        pass
+
+
+async def _close_stack_elsewhere(resource):
+    """Exit ``resource`` from whichever loop runs this coroutine."""
+    stack = AsyncExitStack()
+    stack.push_async_exit(resource)
+    await stack.aclose()
+
+
+async def _poll_until(predicate, timeout=2.0):
+    """Wait for ``predicate`` to hold, failing rather than hanging."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "the condition never held"
+        await asyncio.sleep(0.01)
+
+
+def _pool_records(caplog):
+    """Return the records the pool's own logger emitted."""
+    return [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
+
+
+@strategies.composite
+def _loop_mixes(draw):
+    """Draw a (running, stopped) split of one to four loops.
+
+    At least one loop stays running, since a stopped loop cannot touch
+    the pool.
+    """
+    total = draw(strategies.integers(1, 4))
+    stopped = draw(strategies.integers(0, total - 1))
+    return total - stopped, stopped
 
 
 @strategies.composite
@@ -151,26 +250,6 @@ def finalizer_functions(draw):
 
 
 @pytest.fixture
-def mock_resource_factory():
-    """Create a mock factory with consistent behavior."""
-    factory = Mock()
-    factory.return_value = Mock(name="test-resource")
-    return factory
-
-
-@pytest.fixture
-def mock_finalizer():
-    """Create a mock finalizer that tracks calls."""
-    return AsyncMock()
-
-
-@pytest.fixture
-def resource_pool_immediate_cleanup(mock_resource_factory, mock_finalizer):
-    """Create a resource pool with TTL=0 for immediate cleanup testing."""
-    return ResourcePool(factory=mock_resource_factory, finalizer=mock_finalizer, ttl=0)
-
-
-@pytest.fixture
 def retired_entry_pool(mocker):
     """Build a long-TTL pool holding one entry retired while referenced.
 
@@ -182,79 +261,6 @@ def retired_entry_pool(mocker):
     finalizer = mocker.AsyncMock()
     pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=60)
     return pool, finalizer, factory
-
-
-@pytest.fixture
-def background_loops():
-    """Run event loops on daemon threads for cross-loop tests.
-
-    Yields a ``spawn()`` returning a handle onto a freshly started
-    loop: ``handle.loop`` is the loop itself, ``handle.submit(coro)``
-    schedules a coroutine on it and returns the concurrent future,
-    ``handle.run(coro)`` submits and waits for the result, and
-    ``handle.close()`` stops, joins, and closes it. Every spawned loop
-    is closed at teardown, so a test only calls ``close`` when it needs
-    the loop to stop mid-test.
-    """
-
-    class BackgroundLoop:
-        def __init__(self):
-            self.loop = asyncio.new_event_loop()
-            self._thread = threading.Thread(target=self.loop.run_forever, daemon=True)
-            self._thread.start()
-
-        def submit(self, coro):
-            return asyncio.run_coroutine_threadsafe(coro, self.loop)
-
-        def run(self, coro, timeout=5):
-            return self.submit(coro).result(timeout=timeout)
-
-        def close(self, timeout=5):
-            if self.loop.is_closed():
-                return
-            self.loop.call_soon_threadsafe(self.loop.stop)
-            self._thread.join(timeout=timeout)
-            self.loop.close()
-
-    handles = []
-
-    def spawn():
-        handle = BackgroundLoop()
-        handles.append(handle)
-        return handle
-
-    yield spawn
-
-    for handle in handles:
-        handle.close()
-
-
-@pytest.fixture
-def stranded_loop():
-    """Leave pool entries behind on a loop that has stopped running.
-
-    Yields a ``strand(coro, *, close=True)`` that drives the coroutine
-    to completion on a fresh event loop and returns
-    ``(loop, result)``. The loop is closed on the way out by default,
-    or merely stopped when ``close=False``, so a test can distinguish
-    a closed loop from one that stopped without closing, or resume it
-    to let a stale timer fire. Every loop is closed at teardown.
-    """
-    loops = []
-
-    def strand(coro, *, close=True):
-        loop = asyncio.new_event_loop()
-        loops.append(loop)
-        try:
-            return loop, loop.run_until_complete(coro)
-        finally:
-            if close:
-                loop.close()
-
-    yield strand
-
-    for loop in loops:
-        loop.close()
 
 
 @pytest.fixture
@@ -291,7 +297,7 @@ async def _queue_behind_fired_cleanup(pool, factory_calls, queued_coroutine):
     async with pool.get("expired"):
         pass
 
-    blocker_task = asyncio.create_task(pool.acquire("blocker"))
+    blocker_task = asyncio.create_task(_acquire(pool, "blocker"))
 
     async def blocker_parked():
         while "blocker" not in factory_calls:
@@ -394,7 +400,7 @@ class TestResourcePool:
         Given:
             A pool with resources that have active references
         When:
-            Resources are released via pool.release()
+            Resources are released via _release(pool, )
         Then:
             Should properly decrement ref counts or cleanup and remove resources
         """
@@ -414,86 +420,17 @@ class TestResourcePool:
         assert pool.stats.referenced_entries == 0  # All released from context
 
         # Now manually acquire some resources to test release
-        await pool.acquire("key1")
-        await pool.acquire("key2")
+        await _acquire(pool, "key1")
+        await _acquire(pool, "key2")
 
         assert pool.stats.referenced_entries == 2
 
         # Act & assert
-        await pool.release("key1")
+        await _release(pool, "key1")
         assert pool.stats.referenced_entries == 1
 
-        await pool.release("key2")
+        await _release(pool, "key2")
         assert pool.stats.referenced_entries == 0
-
-    @pytest.mark.asyncio
-    async def test_release_should_not_affect_existing_resources_when_key_nonexistent(
-        self, counting_factory
-    ):
-        """Test releasing a nonexistent key is a silent no-op.
-
-        Given:
-            A pool with some existing resources
-        When:
-            Release is called with a nonexistent key
-        Then:
-            Should exit without affecting existing resources
-        """
-        # Arrange
-        pool = ResourcePool(factory=counting_factory, ttl=1.0)
-
-        # Create some resources to establish initial state
-        keys = ["key1", "key2"]
-        for key in keys:
-            async with pool.get(key):
-                pass  # Just acquire and release to populate cache
-
-        initial_cache_size = pool.stats.total_entries
-
-        # Act & assert
-        # Try to release a nonexistent key
-        await pool.release("nonexistent")
-
-        # Should not affect existing resources
-        assert pool.stats.total_entries == initial_cache_size
-        # All keys should have zero references (since they were released)
-        assert pool.stats.referenced_entries == 0
-
-    @pytest.mark.asyncio
-    async def test_release_should_raise_value_error_when_zero_reference_count(self):
-        """Test releasing key with zero ref count raises ValueError.
-
-        Given:
-            A pool with a resource that has zero reference count
-        When:
-            Release is called on that key
-        Then:
-            Should raise ValueError indicating reference count is already
-            zero
-        """
-        # Arrange
-        # Create a new resource with unique key using a pool with TTL > 0
-        # so the resource stays in cache after release
-        mock_factory = Mock()
-        mock_finalizer = AsyncMock()
-        ttl_pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
-
-        unique_key = "test-zero-ref-count"
-        mock_resource = Mock()
-        mock_resource.name = unique_key
-        mock_factory.return_value = mock_resource
-
-        # Act & assert
-        # Acquire and release once to get ref count to 0 (but stays in cache due to TTL)
-        async with ttl_pool.get(unique_key):
-            pass
-
-        # Now try to release again - should raise ValueError
-        with pytest.raises(
-            ValueError,
-            match=f"Reference count for key '{unique_key}' is already 0",
-        ):
-            await ttl_pool.release(unique_key)
 
     @pytest.mark.asyncio
     async def test_expire_should_await_finalizer_when_it_returns_an_awaitable(self):
@@ -773,7 +710,7 @@ class TestResourcePool:
 
         async def acquire_twice():
             first, second = await asyncio.gather(
-                pool.acquire("key"), pool.acquire("key")
+                _acquire(pool, "key"), _acquire(pool, "key")
             )
             entries = pool.stats.total_entries
             await pool.clear()
@@ -824,7 +761,7 @@ class TestResourcePool:
 
         async def acquire_twice():
             first, second = await asyncio.gather(
-                pool.acquire("key"), pool.acquire("key")
+                _acquire(pool, "key"), _acquire(pool, "key")
             )
             entries = pool.stats.total_entries
             await pool.clear()
@@ -845,46 +782,6 @@ class TestResourcePool:
         assert all(first is second for first, second, _ in results)
         assert len({id(first) for first, _, _ in results}) == loop_count
         assert [entries for _, _, entries in results] == [1] * loop_count
-
-    def test_release_should_ignore_key_cached_only_on_another_loop(
-        self, mocker, background_loops
-    ):
-        """Test releasing another loop's key touches nothing.
-
-        Given:
-            A pool holding one referenced entry on an event loop still
-            running on another thread, and a second loop that has
-            cached nothing.
-        When:
-            That key is released and then expired from the second loop.
-        Then:
-            It should treat both as silent no-ops against an empty
-            partition, leaving the first loop's entry cached, still
-            referenced, and never finalized.
-        """
-        # Arrange
-        finalizer = mocker.AsyncMock()
-        pool = ResourcePool(factory=lambda key: key, finalizer=finalizer, ttl=60)
-        live = background_loops()
-        live.run(pool.acquire("key"))
-
-        async def release_and_expire_elsewhere():
-            await pool.release("key")
-            await pool.expire("key")
-            return pool.stats.total_entries
-
-        async def live_stats():
-            return pool.stats
-
-        # Act
-        entries = asyncio.run(release_and_expire_elsewhere())
-
-        # Assert
-        live_snapshot = live.run(live_stats())
-        assert entries == 0
-        finalizer.assert_not_awaited()
-        assert live_snapshot.total_entries == 1
-        assert live_snapshot.referenced_entries == 1
 
     def test_expire_all_should_finalize_only_current_loop_partition(
         self, mocker, background_loops
@@ -951,14 +848,14 @@ class TestResourcePool:
         live = background_loops()
 
         async def clear_own_entry():
-            await pool.acquire("second")
+            await _acquire(pool, "second")
             await pool.clear()
             return pool.stats.total_entries
 
         async def live_stats():
             return pool.stats
 
-        live.run(pool.acquire("first"))
+        live.run(_acquire(pool, "first"))
 
         # Act
         remaining = asyncio.run(clear_own_entry())
@@ -988,7 +885,7 @@ class TestResourcePool:
 
         async def acquire_many(*keys):
             for key in keys:
-                await pool.acquire(key)
+                await _acquire(pool, key)
             return pool.stats.total_entries
 
         # Act
@@ -1028,7 +925,7 @@ class TestResourcePool:
         _, pending_before = stranded_loop(acquire_and_release())
 
         async def acquire_again():
-            acquired = await pool.acquire("key")
+            acquired = await _acquire(pool, "key")
             return acquired, pool.stats.total_entries, pool.pending_cleanup
 
         # Act
@@ -1060,10 +957,10 @@ class TestResourcePool:
         # Arrange
         factory = mocker.Mock(return_value="obj")
         pool = ResourcePool(factory=factory, ttl=60)
-        stranded_loop(pool.acquire("key"), close=False)
+        stranded_loop(_acquire(pool, "key"), close=False)
 
         # Act
-        acquired = asyncio.run(pool.acquire("key"))
+        acquired = asyncio.run(_acquire(pool, "key"))
 
         # Assert
         assert acquired == "obj"
@@ -1101,7 +998,7 @@ class TestResourcePool:
 
         # Act
         with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
-            asyncio.run(pool.acquire("other"))
+            asyncio.run(_acquire(pool, "other"))
 
         # Assert
         assert [r for r in caplog.records if r.name == "wool.runtime.resourcepool"] == []
@@ -1126,11 +1023,11 @@ class TestResourcePool:
             return "obj"
 
         pool = ResourcePool(factory=make_resource, ttl=60)
-        stranded_loop(pool.acquire("key"))
+        stranded_loop(_acquire(pool, "key"))
 
         # Act
         with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
-            asyncio.run(pool.acquire("other"))
+            asyncio.run(_acquire(pool, "other"))
 
         # Assert
         records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
@@ -1168,7 +1065,7 @@ class TestResourcePool:
 
         # Act
         with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
-            asyncio.run(pool.acquire("other"))
+            asyncio.run(_acquire(pool, "other"))
 
         # Assert
         records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
@@ -1199,59 +1096,56 @@ class TestResourcePool:
         pool = ResourcePool(factory=make_resource, ttl=60)
         handles = [background_loops() for _ in range(3)]
         for index, handle in enumerate(handles):
-            handle.run(pool.acquire(f"key-{index}"))
+            handle.run(_acquire(pool, f"key-{index}"))
         for handle in handles:
             handle.close()
 
         # Act
         with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
-            asyncio.run(pool.acquire("other"))
+            asyncio.run(_acquire(pool, "other"))
 
         # Assert
         records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
         assert [r.levelno for r in records] == [logging.WARNING] * 3
         assert all("1 referenced and 0 idle" in r.getMessage() for r in records)
 
-    def test_release_should_ignore_stale_timer_from_a_swept_partition(
-        self, mocker, stranded_loop
+    def test_release_should_fire_only_its_own_timer_when_its_loop_resumes(
+        self, mocker, caplog, stranded_loop
     ):
-        """Test a TTL timer left on a swept partition cannot touch a later loop's.
+        """Test a paused loop's TTL timer reaches only that loop's entry.
 
         Given:
             A pool that released an entry on one event loop, scheduling
-            its TTL timer there, whose partition was then swept when a
-            second loop acquired the same key and still holds it.
+            its TTL timer there, which then paused while a second loop
+            acquired the same key and still holds it.
         When:
-            The first loop resumes long enough for that stale timer to
-            fire.
+            The first loop resumes long enough for that timer to fire.
         Then:
-            It should leave the second loop's entry untouched -- still
-            cached and still referenced, its finalizer never run.
+            It should finalize the first loop's own idle entry and leave
+            the second loop's entry untouched, still cached and still
+            referenced, reporting nothing.
         """
         # Arrange
         finalizer = mocker.AsyncMock()
-        pool = ResourcePool(
-            factory=mocker.Mock(return_value="obj"), finalizer=finalizer, ttl=0.05
-        )
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=0.05)
 
-        async def acquire_and_release():
-            async with pool.get("key"):
-                pass
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            first_loop, _ = stranded_loop(_cache_idle_entry(pool, "key"), close=False)
+            second_loop, _ = stranded_loop(_acquire(pool, "key"), close=False)
 
-        async def stats():
-            return pool.stats
-
-        first_loop, _ = stranded_loop(acquire_and_release(), close=False)
-        second_loop, _ = stranded_loop(pool.acquire("key"), close=False)
-
-        # Act
-        first_loop.run_until_complete(asyncio.sleep(0.1))
-        second = second_loop.run_until_complete(stats())
+            # Act
+            first_loop.run_until_complete(
+                _poll_until(lambda: finalizer.await_count == 1, timeout=2.0)
+            )
+            first = first_loop.run_until_complete(_pool_stats(pool))
+            second = second_loop.run_until_complete(_pool_stats(pool))
 
         # Assert
+        finalizer.assert_awaited_once_with("obj-key")
+        assert first.total_entries == 0
         assert second.total_entries == 1
         assert second.referenced_entries == 1
-        finalizer.assert_not_awaited()
+        assert _pool_records(caplog) == []
 
     def test_acquire_should_sweep_stranded_partition_when_calling_loop_registered(
         self, caplog, background_loops, stranded_loop
@@ -1277,17 +1171,1009 @@ class TestResourcePool:
 
         pool = ResourcePool(factory=make_resource, ttl=60)
         live = background_loops()
-        live.run(pool.acquire("first"))
-        stranded_loop(pool.acquire("stranded"))
+        live.run(_acquire(pool, "first"))
+        stranded_loop(_acquire(pool, "stranded"))
 
         # Act
         with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
-            live.run(pool.acquire("second"))
+            live.run(_acquire(pool, "second"))
 
         # Assert
         records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
         assert [r.levelno for r in records] == [logging.WARNING]
         assert "1 referenced and 0 idle" in records[0].getMessage()
+
+    def test_acquire_should_serve_each_loop_when_two_race_the_registry(
+        self, background_loops
+    ):
+        """Test the partition registry holds up under real contention.
+
+        Given:
+            One pool and two event loops on their own threads, each
+            parked on a barrier immediately before its first acquire, so
+            both reach the registry at the same instant.
+        When:
+            Both loops acquire the same key at once.
+        Then:
+            It should invoke the factory once per loop, hand each loop
+            its own object, and report exactly one entry to each.
+        """
+        # Arrange
+        barrier = threading.Barrier(2)
+        objects = []
+        objects_lock = threading.Lock()
+
+        def factory(key):
+            obj = object()
+            with objects_lock:
+                objects.append(obj)
+            return obj
+
+        pool = ResourcePool(factory, ttl=60)
+        handles = [background_loops() for _ in range(2)]
+
+        async def race():
+            # Blocking the loop's own thread is what puts both threads
+            # inside the registry lock's window together.
+            barrier.wait(timeout=5)
+            acquired = await _acquire(pool, "key")
+            entries = pool.stats.total_entries
+            await pool.clear()
+            return acquired, entries
+
+        # Act
+        futures = [handle.submit(race()) for handle in handles]
+        results = [future.result(timeout=10) for future in futures]
+
+        # Assert
+        assert len(objects) == 2
+        assert results[0][0] is not results[1][0]
+        assert [entries for _, entries in results] == [1, 1]
+
+    @given(loop_count=strategies.integers(2, 4), acquires=strategies.integers(1, 8))
+    @settings(
+        max_examples=10,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_acquire_should_build_one_object_per_loop_for_any_concurrency(
+        self, background_loops, loop_count, acquires
+    ):
+        """Test the partition lock and the registry compose at any width.
+
+        Given:
+            Any two to four event loops sharing one pool, each making
+            between one and eight concurrent acquires of the same key.
+        When:
+            Every acquire runs, every reference is released, and each
+            loop clears its own partition.
+        Then:
+            It should invoke the factory once per loop, hand all of a
+            loop's acquires the same object, hand different loops
+            different objects, and finalize each object exactly once.
+        """
+        # Arrange
+        objects = []
+        finalized = []
+        records_lock = threading.Lock()
+
+        async def factory(key):
+            await asyncio.sleep(0)
+            obj = object()
+            with records_lock:
+                objects.append(obj)
+            return obj
+
+        def finalizer(obj):
+            with records_lock:
+                finalized.append(obj)
+
+        pool = ResourcePool(factory, finalizer=finalizer, ttl=60)
+        handles = [background_loops() for _ in range(loop_count)]
+
+        async def acquire_many():
+            acquired = await asyncio.gather(
+                *(_acquire(pool, "key") for _ in range(acquires))
+            )
+            for _ in range(acquires):
+                await _release(pool, "key")
+            await pool.clear()
+            return acquired
+
+        # Act
+        try:
+            futures = [handle.submit(acquire_many()) for handle in handles]
+            results = [future.result(timeout=10) for future in futures]
+        finally:
+            # Retire each example's loops eagerly; the fixture would
+            # otherwise hold every loop of every example open.
+            for handle in handles:
+                handle.close()
+
+        # Assert
+        assert len(objects) == loop_count
+        assert all(len({id(obj) for obj in acquired}) == 1 for acquired in results)
+        held = [acquired[0] for acquired in results]
+        assert len({id(obj) for obj in held}) == loop_count
+        assert sorted(id(obj) for obj in finalized) == sorted(id(obj) for obj in held)
+
+    def test___aexit___should_clear_only_the_calling_loops_partition(
+        self, mocker, background_loops
+    ):
+        """Test the pool's own context manager clears one partition.
+
+        Given:
+            A pool holding one referenced entry on an event loop still
+            running on another thread.
+        When:
+            A second loop enters ``async with pool``, caches a key
+            inside the block, and leaves it.
+        Then:
+            It should finalize the second loop's entry alone, leaving
+            the first loop's entry cached and still referenced.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
+        live = background_loops()
+        live.run(_acquire(pool, "live"))
+
+        async def use_pool():
+            async with pool:
+                await _acquire(pool, "own")
+            return pool.stats.total_entries
+
+        # Act
+        remaining = asyncio.run(use_pool())
+
+        # Assert
+        live_snapshot = live.run(_pool_stats(pool))
+        assert remaining == 0
+        finalizer.assert_awaited_once_with("obj-own")
+        assert live_snapshot.total_entries == 1
+        assert live_snapshot.referenced_entries == 1
+
+    def test_clear_should_finalize_nothing_when_the_calling_loop_has_no_partition(
+        self, mocker, background_loops
+    ):
+        """Test clearing from a loop that never reached the pool is a no-op.
+
+        Given:
+            A pool holding one referenced entry on an event loop still
+            running on another thread, and a second loop that has never
+            touched the pool.
+        When:
+            clear() is awaited on the second loop.
+        Then:
+            It should run no finalizer and report an empty partition,
+            leaving the first loop's entry cached and referenced.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
+        live = background_loops()
+        live.run(_acquire(pool, "live"))
+
+        async def clear_nothing():
+            await pool.clear()
+            return pool.stats.total_entries
+
+        # Act
+        remaining = asyncio.run(clear_nothing())
+
+        # Assert
+        live_snapshot = live.run(_pool_stats(pool))
+        assert remaining == 0
+        finalizer.assert_not_awaited()
+        assert live_snapshot.total_entries == 1
+        assert live_snapshot.referenced_entries == 1
+
+    def test_expire_all_should_finalize_nothing_when_the_loop_has_no_partition(
+        self, mocker, background_loops
+    ):
+        """Test retiring from a loop that never reached the pool is a no-op.
+
+        Given:
+            A pool holding one referenced entry on an event loop still
+            running on another thread, and a second loop that has never
+            touched the pool.
+        When:
+            expire_all() is awaited on the second loop.
+        Then:
+            It should run no finalizer and report an empty partition,
+            leaving the first loop's entry cached and referenced.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
+        live = background_loops()
+        live.run(_acquire(pool, "live"))
+
+        async def retire_nothing():
+            await pool.expire_all()
+            return pool.stats.total_entries
+
+        # Act
+        remaining = asyncio.run(retire_nothing())
+
+        # Assert
+        live_snapshot = live.run(_pool_stats(pool))
+        assert remaining == 0
+        finalizer.assert_not_awaited()
+        assert live_snapshot.total_entries == 1
+        assert live_snapshot.referenced_entries == 1
+
+    def test_stats_should_leave_a_paused_loops_partition_intact(
+        self, caplog, stranded_loop
+    ):
+        """Test a paused loop's partition survives another loop's read.
+
+        Given:
+            A pool holding one idle entry on an event loop that is
+            neither running nor closed, paused between two
+            run_until_complete calls.
+        When:
+            stats is read from a fresh loop.
+        Then:
+            It should report an empty partition to the fresh loop, log
+            nothing, and leave the paused loop's entry cached for when
+            it resumes, since a loop that can resume is alive.
+        """
+        # Arrange
+        pool = ResourcePool(factory=make_resource, ttl=60)
+        paused, _ = stranded_loop(_cache_idle_entry(pool, "key"), close=False)
+
+        # Act
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            fresh = asyncio.run(_pool_stats(pool))
+            resumed = paused.run_until_complete(_pool_stats(pool))
+
+        # Assert
+        assert _pool_records(caplog) == []
+        assert fresh.total_entries == 0
+        assert resumed.total_entries == 1
+
+    def test_acquire_should_find_its_entry_when_its_loop_resumes(
+        self, mocker, caplog, stranded_loop
+    ):
+        """Test a paused loop resumes with its cache where it left it.
+
+        Given:
+            A pool whose paused loop cached an idle entry, and a fresh
+            loop that has since read the pool and cached and cleared an
+            entry of its own under the same key.
+        When:
+            The paused loop resumes and acquires the same key.
+        Then:
+            It should hand back the object it cached, calling the factory
+            once for that loop, and report nothing.
+        """
+        # Arrange
+        factory = mocker.Mock(side_effect=["first", "second"])
+        pool = ResourcePool(factory=factory, ttl=60)
+        paused, _ = stranded_loop(_cache_idle_entry(pool, "key"), close=False)
+
+        async def read_use_and_clear():
+            pool.stats
+            await _cache_idle_entry(pool, "key")
+            await pool.clear()
+
+        asyncio.run(read_use_and_clear())
+        caplog.clear()
+
+        # Act
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            acquired = paused.run_until_complete(_acquire(pool, "key"))
+            resumed = paused.run_until_complete(_pool_stats(pool))
+
+        # Assert
+        assert acquired == "first"
+        assert factory.call_count == 2
+        assert resumed.total_entries == 1
+        assert _pool_records(caplog) == []
+
+    def test_get_should_cache_in_its_own_partition_when_factory_spans_a_pause(
+        self,
+    ):
+        """Test an acquire suspended in its factory lands in the right partition.
+
+        Given:
+            A pool whose async factory parks until released, entered on a
+            loop that pauses while the factory is parked, and a fresh
+            loop that uses and clears the pool meanwhile.
+        When:
+            The paused loop resumes and the factory completes.
+        Then:
+            It should cache the object in the paused loop's partition,
+            where a second acquire finds it without calling the factory
+            again.
+        """
+        # Arrange
+        gate = asyncio.Event()
+        built = []
+
+        async def factory(key):
+            built.append(key)
+            if key == "key":
+                await gate.wait()
+            return f"obj-{key}"
+
+        async def use_and_clear():
+            await _cache_idle_entry(pool, "other")
+            await pool.clear()
+
+        pool = ResourcePool(factory=factory, ttl=60)
+        loop = asyncio.new_event_loop()
+        stack = AsyncExitStack()
+        try:
+            entering = loop.create_task(stack.enter_async_context(pool.get("key")))
+            loop.run_until_complete(_poll_until(lambda: built == ["key"]))
+            asyncio.run(use_and_clear())
+            gate.set()
+
+            # Act
+            acquired = loop.run_until_complete(entering)
+            again = loop.run_until_complete(_acquire(pool, "key"))
+            snapshot = loop.run_until_complete(_pool_stats(pool))
+
+            # Assert
+            assert acquired == again == "obj-key"
+            assert built == ["key", "other"]
+            assert snapshot.total_entries == 1
+            assert snapshot.referenced_entries == 1
+        finally:
+            loop.run_until_complete(stack.aclose())
+            loop.close()
+
+    def test_get_should_finalize_once_when_a_runner_pauses_between_runs(
+        self, mocker, background_loops
+    ):
+        """Test the Runner idiom keeps its references across its runs.
+
+        Given:
+            A zero-TTL pool, an asyncio.Runner that enters a resource in
+            one run, and a background loop that uses and clears the pool
+            between that run and the next.
+        When:
+            A second run on the same Runner exits the resource.
+        Then:
+            It should finalize the object exactly once, the reference
+            having survived the pause between runs.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=0)
+        stack = AsyncExitStack()
+        other = background_loops()
+
+        async def use_and_clear():
+            await _cache_idle_entry(pool, "key")
+            await pool.clear()
+
+        # Act
+        with asyncio.Runner() as runner:
+            runner.run(stack.enter_async_context(pool.get("key")))
+            for _ in range(20):
+                other.run(use_and_clear())
+            finalizer.reset_mock()
+            runner.run(stack.aclose())
+
+        # Assert
+        finalizer.assert_awaited_once_with("obj-key")
+
+    def test_release_should_finalize_when_its_loop_resumes_after_the_ttl(
+        self, mocker, stranded_loop
+    ):
+        """Test a TTL outlives a pause no other loop interrupts.
+
+        Given:
+            A pool whose short-TTL entry was released on a loop that
+            then paused for longer than the TTL, with no other loop
+            touching the pool meanwhile.
+        When:
+            That loop resumes.
+        Then:
+            It should fire the timer on resume and finalize the entry
+            exactly once, leaving the partition empty.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=0.05)
+        paused, _ = stranded_loop(_cache_idle_entry(pool, "key"), close=False)
+        time.sleep(0.1)
+
+        # Act
+        paused.run_until_complete(
+            _poll_until(lambda: finalizer.await_count == 1, timeout=2.0)
+        )
+
+        # Assert
+        finalizer.assert_awaited_once_with("obj-key")
+        assert paused.run_until_complete(_pool_stats(pool)).total_entries == 0
+
+    def test_release_should_not_report_a_failure_when_its_cleanup_outlives_a_pause(
+        self, caplog, stranded_loop
+    ):
+        """Test a finalizer parked across a pause still ends quietly.
+
+        Given:
+            A pool whose TTL cleanup task is parked inside its finalizer
+            on a loop that then paused, and whose pool a fresh loop has
+            since read and used.
+        When:
+            The paused loop resumes and the finalizer completes.
+        Then:
+            It should finish without reporting anything, the entry gone
+            from the resumed loop's partition and the fresh loop's own
+            partition untouched.
+        """
+        # Arrange
+        parked = asyncio.Event()
+        gate = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def finalizer(obj):
+            parked.set()
+            await gate.wait()
+            finished.set()
+
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=0.01)
+        paused, _ = stranded_loop(_cache_idle_entry(pool, "key"), close=False)
+        # Drive the loop only until the cleanup task has entered the
+        # finalizer, so it is parked mid-cleanup when the loop stops.
+        paused.run_until_complete(asyncio.wait_for(parked.wait(), timeout=2.0))
+
+        async def resume():
+            gate.set()
+            await asyncio.wait_for(finished.wait(), timeout=2.0)
+            # Let the cleanup task's done callback run before the loop
+            # pauses again, so a failure it reports would be seen.
+            await asyncio.sleep(0.05)
+            return pool.stats
+
+        async def read_and_use():
+            before = pool.stats
+            await pool.expire("none")
+            return before
+
+        # Act
+        with caplog.at_level(logging.DEBUG):
+            fresh = asyncio.run(read_and_use())
+            resumed = paused.run_until_complete(resume())
+            gc.collect()
+
+        # Assert
+        assert fresh.total_entries == 0
+        assert resumed.total_entries == 0
+        assert _pool_records(caplog) == []
+        assert not [r for r in caplog.records if "never retrieved" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_pending_cleanup_should_report_an_entry_inside_its_finalizer(self):
+        """Test an entry mid-finalization is still pending, not vanished.
+
+        Given:
+            A short-TTL pool whose finalizer parks on a gate, holding
+            one idle entry whose TTL has fired.
+        When:
+            stats and pending_cleanup are read while the finalizer is
+            parked.
+        Then:
+            It should count the entry in total_entries and report its
+            cleanup task as pending, until the gate opens and the entry
+            is evicted.
+        """
+        # Arrange
+        parked = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def finalizer(obj):
+            parked.set()
+            await gate.wait()
+
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=0.01)
+        await _cache_idle_entry(pool, "key")
+        await asyncio.wait_for(parked.wait(), timeout=2.0)
+
+        # Act
+        during = pool.stats
+        pending = pool.pending_cleanup
+        gate.set()
+        await _poll_until(lambda: pool.stats.total_entries == 0)
+
+        # Assert
+        assert during.total_entries == 1
+        assert during.pending_cleanup == 1
+        assert isinstance(pending.get("key"), asyncio.Task)
+
+    def test_acquire_should_name_the_pool_by_type_when_the_factory_has_no_qualname(
+        self, caplog, counting_factory, stranded_loop
+    ):
+        """Test a callable object still gives the pool's records a name.
+
+        Given:
+            A pool whose factory is a callable object rather than a
+            function, holding one entry stranded on a closed loop.
+        When:
+            The pool is used from a fresh loop.
+        Then:
+            It should name the pool by its factory's type in the record
+            it logs, having no qualified name to fall back on.
+        """
+        # Arrange
+        pool = ResourcePool(factory=counting_factory, ttl=60)
+        stranded_loop(_acquire(pool, "key"))
+
+        # Act
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            asyncio.run(_acquire(pool, "other"))
+
+        # Assert
+        records = _pool_records(caplog)
+        assert [r.levelno for r in records] == [logging.WARNING]
+        assert "ResourcePool(CountingFactory)" in records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_acquire_should_leave_the_partition_empty_when_the_factory_raises(
+        self, mocker
+    ):
+        """Test a factory failure leaves a fresh partition usable.
+
+        Given:
+            A pool on a loop with no partition yet, whose factory raises
+            on its first call and succeeds on the second.
+        When:
+            The key is acquired, the failure propagates, and the same
+            key is acquired again.
+        Then:
+            It should propagate the failure, leave the new partition
+            empty with no pending cleanup, and serve the retry.
+        """
+        # Arrange
+        factory = mocker.Mock(side_effect=[RuntimeError("factory failed"), "obj"])
+        pool = ResourcePool(factory=factory, ttl=60)
+
+        # Act
+        with pytest.raises(RuntimeError, match="factory failed"):
+            await _acquire(pool, "key")
+
+        # Assert
+        assert pool.stats.total_entries == 0
+        assert not pool.pending_cleanup
+        assert await _acquire(pool, "key") == "obj"
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            pytest.param(lambda pool: pool.expire("fresh"), id="expire"),
+            pytest.param(lambda pool: pool.expire_all(), id="expire_all"),
+            pytest.param(lambda pool: pool.clear(), id="clear"),
+            pytest.param(lambda pool: _use_resource(pool.get("fresh")), id="get"),
+        ],
+    )
+    def test_entry_point_should_warn_once_when_a_partition_was_stranded(
+        self, caplog, stranded_loop, operation
+    ):
+        """Test every mutating entry point sweeps, and reports, once.
+
+        Given:
+            A pool holding one referenced entry stranded on a closed
+            loop.
+        When:
+            Any one of the pool's mutating operations runs on a fresh
+            loop.
+        Then:
+            It should log exactly one WARNING for the stranded
+            partition, whichever operation reached the pool first.
+        """
+        # Arrange
+        pool = ResourcePool(factory=make_resource, ttl=60)
+        stranded_loop(_acquire(pool, "key"))
+
+        async def touch():
+            await operation(pool)
+
+        # Act
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            asyncio.run(touch())
+
+        # Assert
+        records = _pool_records(caplog)
+        assert [r.levelno for r in records] == [logging.WARNING]
+        assert "1 referenced and 0 idle" in records[0].getMessage()
+
+    @pytest.mark.parametrize(
+        "read",
+        [
+            pytest.param(lambda pool: pool.stats, id="stats"),
+            pytest.param(lambda pool: pool.pending_cleanup, id="pending_cleanup"),
+        ],
+    )
+    def test_stats_should_not_sweep_a_stranded_partition(
+        self, caplog, stranded_loop, read
+    ):
+        """Test a read leaves a stranded partition for a mutating access.
+
+        Given:
+            A pool holding one referenced entry stranded on a closed
+            loop.
+        When:
+            stats or pending_cleanup is read on a fresh loop, and the
+            pool is then expired on that loop.
+        Then:
+            It should log nothing for the read and report the stranded
+            partition once, from the expire that follows it.
+        """
+        # Arrange
+        pool = ResourcePool(factory=make_resource, ttl=60)
+        stranded_loop(_acquire(pool, "key"))
+
+        async def read_then_expire():
+            read(pool)
+            after_read = list(_pool_records(caplog))
+            await pool.expire("none")
+            return after_read
+
+        # Act
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            after_read = asyncio.run(read_then_expire())
+
+        # Assert
+        assert after_read == []
+        records = _pool_records(caplog)
+        assert [r.levelno for r in records] == [logging.WARNING]
+        assert "1 referenced and 0 idle" in records[0].getMessage()
+
+    def test_stats_should_not_pin_the_reading_loop(self):
+        """Test a read registers nothing for the loop that made it.
+
+        Given:
+            A pool an event loop only ever read stats from, then closed
+            and dropped.
+        When:
+            A collection runs, with no further pool access.
+        Then:
+            It should have kept no reference to that loop, so the weakly
+            referenced loop is collected.
+        """
+        # Arrange
+        pool = ResourcePool(factory=make_resource, ttl=60)
+        loop = asyncio.new_event_loop()
+        reference = weakref.ref(loop)
+        loop.run_until_complete(_pool_stats(pool))
+        loop.close()
+
+        # Act
+        del loop
+        gc.collect()
+
+        # Assert
+        assert reference() is None
+
+    @given(referenced=strategies.integers(0, 4), idle=strategies.integers(0, 4))
+    @settings(
+        max_examples=25,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_acquire_should_report_the_stranded_counts_for_any_mix(
+        self, caplog, stranded_loop, referenced, idle
+    ):
+        """Test the sweep's record counts whatever the loop stranded.
+
+        Given:
+            Any zero to four referenced and zero to four idle entries
+            left on a loop that has closed.
+        When:
+            A fresh loop touches the pool.
+        Then:
+            It should stay silent when the partition is empty and
+            otherwise log exactly one WARNING whose message reports the
+            two counts against the pool's factory name.
+        """
+        # Arrange
+        pool = ResourcePool(factory=make_resource, ttl=60)
+
+        async def strand():
+            # Clear first, so the partition exists even when the loop
+            # strands nothing in it.
+            await pool.clear()
+            for index in range(referenced):
+                await _acquire(pool, f"referenced-{index}")
+            for index in range(idle):
+                await _cache_idle_entry(pool, f"idle-{index}")
+
+        stranded_loop(strand())
+        caplog.clear()
+
+        # Act
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            asyncio.run(_acquire(pool, "fresh"))
+
+        # Assert
+        records = _pool_records(caplog)
+        if referenced == 0 and idle == 0:
+            assert records == []
+        else:
+            assert [r.levelno for r in records] == [logging.WARNING]
+            assert records[0].getMessage() == (
+                f"ResourcePool(make_resource) dropping {referenced} referenced "
+                f"and {idle} idle entries stranded by an event loop that "
+                "closed without clearing its partition (finalizers not run)"
+            )
+
+    @given(
+        operations=strategies.lists(
+            strategies.tuples(
+                strategies.integers(0, 1),
+                strategies.sampled_from(["acquire", "release", "expire"]),
+                strategies.sampled_from(["a", "b", "c"]),
+            ),
+            max_size=12,
+        )
+    )
+    @settings(
+        max_examples=15,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_release_should_keep_each_loops_bookkeeping_independent(
+        self, background_loops, operations
+    ):
+        """Test two loops' books never leak into one another.
+
+        Given:
+            Any interleaving of acquire, release and expire over three
+            shared keys, each step tagged to one of two live loops,
+            where releases are applied only while that loop holds a
+            reference.
+        When:
+            The sequence is applied step by step to a long-TTL pool.
+        Then:
+            It should keep each loop's counters, pending keys and
+            finalized objects equal to an independent model of that
+            loop alone, after every step.
+        """
+        # Arrange
+        handles = [background_loops() for _ in range(2)]
+        index_by_loop = {handle.loop: index for index, handle in enumerate(handles)}
+        finalized = ([], [])
+        finalized_lock = threading.Lock()
+
+        def finalizer(obj):
+            with finalized_lock:
+                finalized[index_by_loop[asyncio.get_running_loop()]].append(obj)
+
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
+        models = [{"references": {}, "doomed": set(), "finalized": []} for _ in range(2)]
+
+        async def step(operation, key):
+            if operation == "acquire":
+                await _acquire(pool, key)
+            elif operation == "expire":
+                await pool.expire(key)
+            else:
+                await _release(pool, key)
+            return pool.stats, sorted(pool.pending_cleanup)
+
+        # Act & assert
+        try:
+            for index, operation, key in operations:
+                model = models[index]
+                references = model["references"]
+                if operation == "acquire":
+                    references[key] = references.get(key, 0) + 1
+                    model["doomed"].discard(key)
+                elif operation == "expire":
+                    if key in references:
+                        if references[key] > 0:
+                            model["doomed"].add(key)
+                        else:
+                            del references[key]
+                            model["finalized"].append(make_resource(key))
+                elif references.get(key, 0) > 0:
+                    references[key] -= 1
+                    if references[key] == 0 and key in model["doomed"]:
+                        model["doomed"].discard(key)
+                        del references[key]
+                        model["finalized"].append(make_resource(key))
+                else:
+                    # The pool raises on a release with no reference;
+                    # the model only ever drives a legal sequence.
+                    continue
+
+                stats, pending = handles[index].run(step(operation, key))
+                other = handles[1 - index].run(_pool_stats(pool))
+                other_references = models[1 - index]["references"]
+                assert stats.total_entries == len(references)
+                assert stats.referenced_entries == sum(
+                    1 for count in references.values() if count > 0
+                )
+                assert pending == sorted(
+                    key for key, count in references.items() if count == 0
+                )
+                assert other.total_entries == len(other_references)
+                assert finalized[index] == model["finalized"]
+                assert finalized[1 - index] == models[1 - index]["finalized"]
+        finally:
+            # Retire each example's loops eagerly; the fixture would
+            # otherwise hold every loop of every example open.
+            for handle in handles:
+                handle.close()
+
+    @given(mix=_loop_mixes())
+    @settings(
+        max_examples=15,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test_acquire_should_sweep_only_the_stopped_loops_for_any_mix(
+        self, caplog, background_loops, mix
+    ):
+        """Test the sweep is selective however the loops are mixed.
+
+        Given:
+            Any one to four loops sharing a pool, each holding one
+            referenced entry, of which any number but at least one is
+            still running.
+        When:
+            A running loop that holds entries of its own acquires
+            another key.
+        Then:
+            It should log exactly one WARNING per stopped loop and leave
+            every running loop's entries, the sweeping loop's included,
+            cached.
+        """
+        # Arrange
+        running_count, stopped_count = mix
+        pool = ResourcePool(factory=make_resource, ttl=60)
+        running = [background_loops() for _ in range(running_count)]
+        stopped = [background_loops() for _ in range(stopped_count)]
+        try:
+            for index, handle in enumerate(running + stopped):
+                handle.run(_acquire(pool, f"key-{index}"))
+            for handle in stopped:
+                handle.close()
+            caplog.clear()
+
+            # Act
+            with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+                running[0].run(_acquire(pool, "swept-by"))
+
+            # Assert
+            records = _pool_records(caplog)
+            assert [r.levelno for r in records] == [logging.WARNING] * stopped_count
+            assert all("1 referenced and 0 idle" in r.getMessage() for r in records)
+            assert running[0].run(_pool_stats(pool)).total_entries == 2
+            for handle in running[1:]:
+                assert handle.run(_pool_stats(pool)).total_entries == 1
+        finally:
+            # Retire each example's loops eagerly; the fixture would
+            # otherwise hold every loop of every example open.
+            for handle in running + stopped:
+                handle.close()
+
+    def test_acquire_should_report_only_the_pool_it_is_called_on(
+        self, caplog, stranded_loop
+    ):
+        """Test one pool's sweep never speaks for another's.
+
+        Given:
+            Two pools that each cached an entry on the same loop, which
+            has since closed.
+        When:
+            A fresh loop touches the first pool, and later the second.
+        Then:
+            It should report the first pool's stranded entry alone on
+            the first touch, the second pool's registry being reached
+            only when that pool is used.
+        """
+
+        # Arrange
+        def make_second(key):
+            return "obj"
+
+        first = ResourcePool(factory=make_resource, ttl=60)
+        second = ResourcePool(factory=make_second, ttl=60)
+
+        async def strand():
+            await _acquire(first, "key")
+            await _acquire(second, "key")
+
+        stranded_loop(strand())
+
+        # Act
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            asyncio.run(_acquire(first, "other"))
+            first_records = _pool_records(caplog)
+            caplog.clear()
+            asyncio.run(_acquire(second, "other"))
+            second_records = _pool_records(caplog)
+
+        # Assert
+        assert [r.levelno for r in first_records] == [logging.WARNING]
+        assert "ResourcePool(make_resource)" in first_records[0].getMessage()
+        assert [r.levelno for r in second_records] == [logging.WARNING]
+        # A nested function's qualified name carries its enclosing scopes.
+        assert ".make_second)" in second_records[0].getMessage()
+
+    def test_clear_should_reach_only_this_loops_entries_of_a_finalizers_pool(
+        self, background_loops
+    ):
+        """Test a finalizer reaching another pool stays on its own loop.
+
+        Given:
+            A pool whose finalizer retires a second pool, where that
+            second pool holds one entry on the clearing loop and one on
+            another loop still running.
+        When:
+            The first pool is cleared on the first loop.
+        Then:
+            It should finalize the second pool's entry on that loop and
+            leave the other loop's entry cached, a finalizer reaching
+            only as far as the loop it runs on.
+        """
+        # Arrange
+        finalized = []
+        finalized_lock = threading.Lock()
+
+        def record(obj):
+            with finalized_lock:
+                finalized.append(obj)
+
+        second = ResourcePool(factory=make_resource, finalizer=record, ttl=60)
+
+        async def finalizer(obj):
+            await second.expire_all()
+
+        first = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
+        live = background_loops()
+        live.run(_cache_idle_entry(second, "live"))
+
+        async def clear_first():
+            await _acquire(first, "key")
+            await _cache_idle_entry(second, "own")
+            await first.clear()
+            return second.stats.total_entries
+
+        # Act
+        remaining = asyncio.run(clear_first())
+
+        # Assert
+        live_snapshot = live.run(_pool_stats(second))
+        assert remaining == 0
+        assert finalized == ["obj-own"]
+        assert live_snapshot.total_entries == 1
+
+    def test_acquire_should_drop_the_loop_reference_when_it_sweeps_a_partition(self):
+        """Test a swept partition does not pin its loop forever.
+
+        Given:
+            A pool holding an entry stranded on a closed loop the
+            registry is the last thing to reference.
+        When:
+            A fresh loop touches the pool and a collection runs.
+        Then:
+            It should have dropped the registry's reference, so the
+            weakly referenced loop is collected.
+        """
+        # Arrange
+        pool = ResourcePool(factory=make_resource, ttl=60)
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(_cache_idle_entry(pool, "key"))
+        loop.close()
+        reference = weakref.ref(loop)
+        del loop
+        gc.collect()
+        # Guard: the registry is what is keeping the loop alive.
+        assert reference() is not None
+
+        # Act
+        asyncio.run(_acquire(pool, "other"))
+        gc.collect()
+
+        # Assert
+        assert reference() is None
 
     def test_release_should_leave_no_pending_task_when_loop_closes_before_ttl(
         self, mocker
@@ -1350,7 +2236,7 @@ class TestResourcePool:
         # Arrange
         pool, finalizer, factory_calls, release_blocker = expiry_race_pool
         blocker_task, reacquire_task = await _queue_behind_fired_cleanup(
-            pool, factory_calls, pool.acquire("expired")
+            pool, factory_calls, _acquire(pool, "expired")
         )
 
         # Act
@@ -1366,51 +2252,47 @@ class TestResourcePool:
         assert pool.stats.total_entries == 2
 
     @pytest.mark.asyncio
-    async def test_get_should_not_mark_acquired_when_the_acquire_is_cancelled(self):
-        """Test a cancelled entry leaves the resource enterable again.
+    async def test_acquire_should_report_nothing_when_it_cancels_a_fired_cleanup(
+        self, caplog, mocker
+    ):
+        """Test a cleanup cancelled before it ran is not a failure.
 
         Given:
-            A pool whose factory parks until released, and a Resource
-            for a key it has never cached.
+            A short-TTL pool holding one idle entry, and a caller
+            spinning on the ready queue so that it re-acquires the key
+            in the loop step after the fired timer spawned the cleanup
+            task and before that task takes its first step.
         When:
-            A task entering the Resource is cancelled while the factory
-            is parked, and the Resource is entered again once the
-            factory is released.
+            The re-acquire cancels the cleanup task and its done
+            callback runs.
         Then:
-            It should leave the pool with nothing cached or referenced
-            after the cancellation, and hand back the object on the
-            second entry rather than refuse a re-acquire.
+            It should log nothing at all, a cleanup cancelled by a
+            re-acquire being an expected outcome rather than a failure
+            to report.
         """
         # Arrange
-        parked = asyncio.Event()
-        gate = asyncio.Event()
-
-        async def factory(key):
-            parked.set()
-            await gate.wait()
-            return f"obj-{key}"
-
-        pool = ResourcePool(factory=factory, ttl=60)
-        resource = pool.get("key")
-
-        async def enter():
-            async with resource:
-                pass
-
-        entering = asyncio.ensure_future(enter())
-        await asyncio.wait_for(parked.wait(), timeout=2.0)
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=0.01)
+        await _cache_idle_entry(pool, "key")
 
         # Act
-        entering.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await entering
-        gate.set()
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            # Spinning keeps this task at the head of the ready queue,
+            # ahead of the cleanup task the timer callback appends
+            # behind it.
+            deadline = time.monotonic() + 2.0
+            while not isinstance(pool.pending_cleanup.get("key"), asyncio.Task):
+                assert time.monotonic() < deadline, "the TTL timer never fired"
+                await asyncio.sleep(0)
+            acquired = await _acquire(pool, "key")
+            # The cancelled task's done callback lands a tick later.
+            await asyncio.sleep(0.05)
 
         # Assert
-        assert pool.stats.total_entries == 0
-        assert pool.stats.referenced_entries == 0
-        async with resource as obj:
-            assert obj == "obj-key"
+        assert acquired == "obj-key"
+        finalizer.assert_not_awaited()
+        assert _pool_records(caplog) == []
+        assert "key" not in pool.pending_cleanup
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1492,7 +2374,7 @@ class TestResourcePool:
         # Act & assert
         for operation, key in operations:
             if operation == "acquire":
-                await pool.acquire(key)
+                await _acquire(pool, key)
                 model_refcount[key] = model_refcount.get(key, 0) + 1
                 model_doomed.discard(key)
             elif operation == "expire":
@@ -1504,7 +2386,7 @@ class TestResourcePool:
                         model_finalized.append(f"obj-{key}")
                 await pool.expire(key)
             elif model_refcount.get(key, 0) > 0:
-                await pool.release(key)
+                await _release(pool, key)
                 model_refcount[key] -= 1
                 if model_refcount[key] == 0 and key in model_doomed:
                     model_doomed.discard(key)
@@ -1582,10 +2464,10 @@ class TestResourcePool:
 
         pool = ResourcePool(factory, finalizer=finalizer, ttl=3600)
         async with pool:
-            await pool.acquire("key1")
-            await pool.acquire("key2")
-            await pool.release("key1")
-            await pool.release("key2")
+            await _acquire(pool, "key1")
+            await _acquire(pool, "key2")
+            await _release(pool, "key1")
+            await _release(pool, "key2")
             assert pool.stats.total_entries == 2
 
             # Act
@@ -1624,7 +2506,7 @@ class TestResourcePool:
         pool = ResourcePool(factory=lambda key: key, finalizer=mock_finalizer, ttl=60)
         async with pool.get("idle"):
             pass
-        await pool.acquire("held")
+        await _acquire(pool, "held")
 
         # Act
         await retire(pool)
@@ -1650,7 +2532,7 @@ class TestResourcePool:
         mock_factory = Mock(return_value="resource")
         mock_finalizer = AsyncMock()
         pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
-        await pool.acquire("key")
+        await _acquire(pool, "key")
 
         # Act
         await pool.expire("key")
@@ -1683,11 +2565,11 @@ class TestResourcePool:
         """
         # Arrange
         pool, finalizer, _ = retired_entry_pool
-        await pool.acquire("key")
+        await _acquire(pool, "key")
         await retire(pool)
 
         # Act
-        await pool.release("key")
+        await _release(pool, "key")
 
         # Assert
         finalizer.assert_awaited_once_with("first")
@@ -1711,12 +2593,12 @@ class TestResourcePool:
         """
         # Arrange
         pool, finalizer, _ = retired_entry_pool
-        await pool.acquire("key")
-        await pool.acquire("key")
+        await _acquire(pool, "key")
+        await _acquire(pool, "key")
         await pool.expire("key")
 
         # Act
-        await pool.release("key")
+        await _release(pool, "key")
 
         # Assert
         finalizer.assert_not_awaited()
@@ -1725,45 +2607,51 @@ class TestResourcePool:
         assert not pool.pending_cleanup
 
     @pytest.mark.asyncio
-    async def test_release_should_evict_retired_entry_when_cancelled_mid_finalizer(
+    async def test_release_should_finish_finalizing_when_cancelled_mid_finalizer(
         self, mocker
     ):
-        """Test cancelling a release mid-finalize still evicts the entry.
+        """Test cancelling a release does not interrupt the finalizer it runs.
 
         Given:
             A long-TTL pool holding an entry retired by ``expire`` while
-            still referenced, whose finalizer parks on an event so the
+            still referenced, whose finalizer parks on a gate so the
             release is suspended inside it.
         When:
             The releasing task is cancelled while the finalizer is
-            parked.
+            parked, and the gate then opens.
         Then:
-            It should raise ``CancelledError`` and still evict the entry,
-            so no torn-down resource is handed back to a later acquire.
+            It should raise ``CancelledError`` to the releaser, let the
+            finalizer complete on its own, and evict the entry, so a
+            later acquire builds a fresh object.
         """
         # Arrange
         parked = asyncio.Event()
+        gate = asyncio.Event()
         factory = mocker.Mock(side_effect=["first", "second"])
 
         async def finalizer(_):
             parked.set()
-            await asyncio.Event().wait()
+            await gate.wait()
 
         pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=60)
-        await pool.acquire("key")
+        await _acquire(pool, "key")
         await pool.expire("key")
-        release = asyncio.ensure_future(pool.release("key"))
+        release = asyncio.ensure_future(_release(pool, "key"))
         # Bounded: a regression that never enters the finalizer must
         # fail here rather than idle out the pool's own TTL.
         await asyncio.wait_for(parked.wait(), timeout=2.0)
 
-        # Act & assert
+        # Act
         release.cancel()
         with pytest.raises(asyncio.CancelledError):
             await release
+        held = pool.stats.total_entries
+        gate.set()
+        await _poll_until(lambda: pool.stats.total_entries == 0)
 
-        assert pool.stats.total_entries == 0
-        assert await pool.acquire("key") == "second"
+        # Assert
+        assert held == 1
+        assert await _acquire(pool, "key") == "second"
 
     @pytest.mark.asyncio
     async def test_release_should_drop_reference_when_cancelled_waiting_on_the_lock(
@@ -1800,12 +2688,12 @@ class TestResourcePool:
         pool = ResourcePool(
             factory=lambda key: f"obj-{key}", finalizer=finalizer, ttl=60
         )
-        await pool.acquire("a")
-        await pool.acquire("b")
-        await pool.release("a")
+        await _acquire(pool, "a")
+        await _acquire(pool, "b")
+        await _release(pool, "a")
         sweep = asyncio.ensure_future(pool.expire_all())
         await asyncio.wait_for(parked.wait(), timeout=2.0)
-        release = asyncio.ensure_future(pool.release("b"))
+        release = asyncio.ensure_future(_release(pool, "b"))
         # The lock is held by the parked finalizer for the whole window,
         # so any number of ticks past the shield's entry leaves the
         # release waiting on it.
@@ -1823,6 +2711,63 @@ class TestResourcePool:
         await asyncio.wait_for(done.wait(), timeout=2.0)
         assert finalized == ["obj-a", "obj-b"]
         assert pool.stats.total_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_release_should_drop_reference_when_cancelled_behind_a_woken_waiter(
+        self,
+    ):
+        """Test a release cancelled in the woken-waiter window still releases.
+
+        Given:
+            A pool whose sweep, parked inside an idle first entry's
+            finalizer, holds the lock with a second acquire queued
+            behind it, while a third entry is still referenced.
+        When:
+            The sweep is released and, in the same tick, a release of
+            the third entry starts, so it runs after the lock is freed
+            but before the queued acquire has taken it, and that release
+            is then cancelled.
+        Then:
+            It should raise CancelledError to the releasing task yet still
+            drop the reference, so the retired third entry is finalized
+            rather than held forever.
+        """
+        # Arrange
+        parked = asyncio.Event()
+        gate = asyncio.Event()
+        finalized = []
+
+        async def finalizer(obj):
+            finalized.append(obj)
+            if obj == "obj-a":
+                parked.set()
+                await gate.wait()
+
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
+        await _cache_idle_entry(pool, "a")
+        await _acquire(pool, "b")
+        sweep = asyncio.ensure_future(pool.expire_all())
+        await asyncio.wait_for(parked.wait(), timeout=2.0)
+        waiter = asyncio.ensure_future(_acquire(pool, "c"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        # Act -- no suspension between the two, so the release is queued
+        # behind the sweep's resumption and ahead of the waiter's.
+        gate.set()
+        release = asyncio.ensure_future(_release(pool, "b"))
+        for _ in range(2):
+            await asyncio.sleep(0)
+        release.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await release
+        await sweep
+        await waiter
+
+        # Assert
+        await _poll_until(lambda: "obj-b" in finalized)
+        assert finalized == ["obj-a", "obj-b"]
+        await _release(pool, "c")
 
     def test_release_should_finalize_retired_entry_when_loop_ends_immediately(
         self, mocker, caplog
@@ -1858,7 +2803,7 @@ class TestResourcePool:
         loop = asyncio.new_event_loop()
 
         async def acquire_and_retire():
-            await pool.acquire("key")
+            await _acquire(pool, "key")
             await pool.expire("key")
 
         loop.run_until_complete(acquire_and_retire())
@@ -1868,7 +2813,7 @@ class TestResourcePool:
 
         # Act
         with caplog.at_level(logging.ERROR, logger="asyncio"):
-            loop.run_until_complete(pool.release("key"))
+            loop.run_until_complete(_release(pool, "key"))
             pending = asyncio.all_tasks(loop)
             entries = loop.run_until_complete(stats()).total_entries
             loop.close()
@@ -1912,13 +2857,13 @@ class TestResourcePool:
         mock_factory = mocker.Mock(return_value="resource")
         mock_finalizer = mocker.AsyncMock()
         pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
-        await pool.acquire("key")
+        await _acquire(pool, "key")
         await retire(pool)
 
         # Act
-        acquired = await pool.acquire("key")
-        await pool.release("key")
-        await pool.release("key")
+        acquired = await _acquire(pool, "key")
+        await _release(pool, "key")
+        await _release(pool, "key")
 
         # Assert
         assert acquired == "resource"
@@ -1985,12 +2930,12 @@ class TestResourcePool:
         mock_factory = mocker.Mock(side_effect=["first", "second"])
         mock_finalizer = mocker.AsyncMock()
         pool = ResourcePool(factory=mock_factory, finalizer=mock_finalizer, ttl=60)
-        await pool.acquire("key")
+        await _acquire(pool, "key")
         await pool.expire_all()
 
         # Act
-        await pool.release("key")
-        reacquired = await pool.acquire("key")
+        await _release(pool, "key")
+        reacquired = await _acquire(pool, "key")
 
         # Assert
         mock_finalizer.assert_awaited_once_with("first")
@@ -2029,16 +2974,16 @@ class TestResourcePool:
         for key, count in zip(keys, reference_counts):
             # One seeding reference caches the entry; the extra
             # acquires and the single release leave `count` behind.
-            await pool.acquire(key)
+            await _acquire(pool, key)
             for _ in range(count):
-                await pool.acquire(key)
-            await pool.release(key)
+                await _acquire(pool, key)
+            await _release(pool, key)
 
         # Act
         await pool.expire_all()
         for key, count in zip(keys, reference_counts):
             for _ in range(count):
-                await pool.release(key)
+                await _release(pool, key)
 
         # Assert
         assert sorted(finalized) == sorted(f"obj-{key}" for key in keys)
@@ -2064,11 +3009,11 @@ class TestResourcePool:
         pool = ResourcePool(factory=lambda key: key, finalizer=mock_finalizer, ttl=0)
         async with pool.get("idle"):
             pass
-        await pool.acquire("held")
+        await _acquire(pool, "held")
 
         # Act
         await pool.expire_all()
-        await pool.release("held")
+        await _release(pool, "held")
 
         # Assert
         assert sorted(c.args[0] for c in mock_finalizer.await_args_list) == [
@@ -2440,6 +3385,62 @@ class TestResourcePool:
         assert pool.stats.total_entries == 0
 
     @pytest.mark.asyncio
+    async def test_expire_all_should_not_uncancel_for_a_cancellation_it_did_not_receive(
+        self,
+    ):
+        """Test uncancel accounting counts deliveries, not CancelledErrors.
+
+        Given:
+            A long-TTL pool of two idle entries whose first finalizer
+            parks until the sweeping task is cancelled, and whose second
+            awaits a future a third party cancelled.
+        When:
+            expire_all() is awaited on a task that is cancelled once
+            while the first finalizer is parked.
+        Then:
+            It should re-raise the delivered cancellation with the task's
+            cancellation count still one, not consumed on account of the
+            cancellation the second finalizer merely observed.
+        """
+        # Arrange
+        parked = asyncio.Event()
+        counts = []
+        doomed_future = asyncio.get_running_loop().create_future()
+        doomed_future.cancel()
+
+        async def finalizer(obj):
+            if obj == "obj-a":
+                parked.set()
+                await asyncio.Event().wait()
+            else:
+                await doomed_future
+
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
+        for key in ("a", "b"):
+            await _cache_idle_entry(pool, key)
+
+        async def sweep():
+            try:
+                await pool.expire_all()
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                assert task is not None
+                counts.append(task.cancelling())
+                raise
+
+        sweeping = asyncio.ensure_future(sweep())
+        await asyncio.wait_for(parked.wait(), timeout=2.0)
+
+        # Act
+        sweeping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sweeping
+
+        # Assert
+        assert counts == [1]
+        assert pool.stats.total_entries == 0
+
+    @pytest.mark.asyncio
     async def test_acquire_should_leave_entry_unreferenced_when_cancelled_mid_cleanup(
         self, expiry_race_pool
     ):
@@ -2461,7 +3462,7 @@ class TestResourcePool:
         # Arrange
         pool, finalizer, factory_calls, release_blocker = expiry_race_pool
         blocker_task, acquire_task = await _queue_behind_fired_cleanup(
-            pool, factory_calls, pool.acquire("expired")
+            pool, factory_calls, _acquire(pool, "expired")
         )
 
         # Act
@@ -2473,7 +3474,7 @@ class TestResourcePool:
             await acquire_task
         await blocker_task
         rearmed = isinstance(pool.pending_cleanup.get("expired"), asyncio.TimerHandle)
-        await pool.release("blocker")
+        await _release(pool, "blocker")
         referenced = pool.stats.referenced_entries
         await asyncio.sleep(0.1)
 
@@ -2515,12 +3516,12 @@ class TestResourcePool:
             finalizer=mock_finalizer,
             ttl=60,
         )
-        await pool.acquire("key")
+        await _acquire(pool, "key")
         await retire(pool)
         tasks_before = asyncio.all_tasks()
 
         # Act
-        await pool.release("key")
+        await _release(pool, "key")
 
         # Assert
         mock_finalizer.assert_awaited_once_with("resource")
@@ -2788,37 +3789,27 @@ class TestResourcePool:
         # Pool should be consistent after all operations
         assert pool.stats.total_entries <= 1  # 0 or 1 depending on TTL timing
 
-    @pytest.mark.asyncio
-    async def test_resource_pool_should_cleanup_immediately_when_zero_ttl(
-        self, resource_pool_immediate_cleanup, mock_resource_factory, mock_finalizer
-    ):
-        """Test TTL=0 performs immediate cleanup as expected.
+    def test_get_should_return_a_resource_when_no_loop_is_running(self, mocker):
+        """Test building a resource needs no loop of its own.
 
         Given:
-            A resource pool with TTL=0
+            A pool reached from synchronous code, with no event loop
+            running.
         When:
-            A resource is acquired and released
+            get() is called for a key.
         Then:
-            Should perform immediate cleanup without scheduling
+            It should return a Resource without raising, the loop being
+            bound where the resource is entered rather than where it is
+            built.
         """
         # Arrange
-        pool = resource_pool_immediate_cleanup
-        mock_resource = Mock()
-        mock_resource_factory.return_value = mock_resource
+        pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=60)
 
         # Act
-        async with pool.get("test-key") as resource:
-            # While in context, resource should exist
-            assert resource is mock_resource
-            assert pool.stats.total_entries == 1
-            assert pool.stats.referenced_entries == 1
+        resource = pool.get("key")
 
         # Assert
-        # After context exit with TTL=0, should be immediately cleaned up
-        assert pool.stats.total_entries == 0
-        assert pool.stats.referenced_entries == 0
-        assert pool.stats.pending_cleanup == 0  # No pending cleanup tasks
-        mock_finalizer.assert_awaited_once_with(mock_resource)
+        assert isinstance(resource, Resource)
 
     @pytest.mark.asyncio
     async def test_get_should_handle_none_key(self):
@@ -2920,226 +3911,582 @@ class TestResource:
         assert not pool.pending_cleanup
 
     @pytest.mark.asyncio
-    async def test_resource_should_have_no_manual_release_method(self):
-        """Test Resource has no manual release method.
+    async def test___aenter___should_raise_when_entered_twice(self, mocker):
+        """Test a resource is a single-use context manager.
 
         Given:
-            A Resource instance
+            A resource that has already been entered and exited once.
         When:
-            Checking for release method
+            The same resource is entered again.
         Then:
-            Should not have a release method
+            It should raise RuntimeError rather than take a second
+            reference against one acquisition.
         """
         # Arrange
-        mock_factory = Mock()
-        mock_resource = Mock()
-        mock_factory.return_value = mock_resource
-
-        pool = ResourcePool(factory=mock_factory, ttl=0)
-
-        resource_acquisition = pool.get("test-key")
+        pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=0)
+        resource = pool.get("key")
+        async with resource as acquired:
+            assert acquired == "obj"
 
         # Act & assert
-        # Manual release method should not exist
-        assert not hasattr(resource_acquisition, "release")
-
-    @pytest.mark.asyncio
-    async def test_resource_should_stay_cached_when_ttl_set(self):
-        """Test Resource lifecycle with TTL keeps resource in cache.
-
-        Given:
-            A Resource instance with TTL pool
-        When:
-            Used as context manager
-        Then:
-            Should handle lifecycle correctly and resource stays cached due to TTL
-        """
-        # Arrange
-        mock_factory = Mock()
-        mock_resource = Mock()
-        mock_factory.return_value = mock_resource
-
-        pool = ResourcePool(factory=mock_factory, ttl=60)  # Use TTL to keep resource
-
-        resource_acquisition = pool.get("test-key")
-
-        # Use as context manager
-        async with resource_acquisition as resource:
-            assert resource is mock_resource
-            assert pool.stats.referenced_entries == 1
-
-        # Resource should still exist due to TTL but no longer referenced
-        assert pool.stats.total_entries == 1
-        assert pool.stats.referenced_entries == 0
-
-    @pytest.mark.asyncio
-    async def test_context_manager_should_handle_lifecycle(self):
-        """Test using Resource only as context manager.
-
-        Given:
-            A Resource instance
-        When:
-            Used only as context manager
-        Then:
-            Should handle acquisition and release correctly
-        """
-        # Arrange
-        mock_factory = Mock()
-        mock_resource = Mock()
-        mock_factory.return_value = mock_resource
-
-        pool = ResourcePool(factory=mock_factory, ttl=0)
-
-        # Act & assert
-        # Use only as context manager
-        async with pool.get("test-key") as resource:
-            assert resource is mock_resource
-            assert pool.stats.referenced_entries == 1
-
-        # After context exit, should be cleaned up (TTL=0)
-        assert pool.stats.total_entries == 0
-
-    @pytest.mark.asyncio
-    async def test_acquire_should_raise_runtime_error_when_acquired_twice(self):
-        """Test that re-acquiring the same Resource instance raises error.
-
-        Given:
-            A Resource that has been used as context manager once
-        When:
-            Attempting to use it as context manager again
-        Then:
-            Should raise RuntimeError
-        """
-        mock_factory = Mock()
-        mock_resource = Mock()
-        mock_factory.return_value = mock_resource
-
-        pool = ResourcePool(factory=mock_factory, ttl=0)
-        resource_acquisition = pool.get("test-key")
-
-        # First use as context manager
-        async with resource_acquisition as resource:
-            assert resource is mock_resource
-
-        # Second use as context manager should fail
         with pytest.raises(RuntimeError, match="Cannot re-acquire a resource"):
-            async with resource_acquisition:
-                pass
-
-    @pytest.mark.asyncio
-    async def test_resource_context_should_propagate_acquire_exception(self):
-        """Test Resource context manager handles acquire exceptions properly.
-
-        Given:
-            A Resource instance from a pool that fails during acquire
-        When:
-            Entering the context manager
-        Then:
-            Should propagate the exception and set _acquired to False
-        """
-        # Arrange
-        mock_pool = AsyncMock()
-        mock_pool.acquire.side_effect = RuntimeError("Acquire failed")
-
-        resource = Resource(pool=mock_pool, key="test-key")
-
-        # Act & assert
-        with pytest.raises(RuntimeError, match="Acquire failed"):
             async with resource:
                 pass
 
-        # Verify _acquired was set to False during exception handling
-        assert resource._acquired is False
-
     @pytest.mark.asyncio
-    async def test_resource_context_should_raise_runtime_error_when_not_acquired(self):
-        """Test Resource release when not acquired raises RuntimeError.
+    async def test___aenter___should_propagate_when_factory_raises(self, mocker):
+        """Test a failed acquisition leaves the resource enterable.
 
         Given:
-            A Resource instance that was never acquired
+            A resource for a key whose factory raises on its first call
+            and succeeds on the second.
         When:
-            Attempting to exit context without entering properly
+            The resource is entered, the failure propagates, and it is
+            entered again.
         Then:
-            Should raise RuntimeError indicating resource was not acquired
+            It should propagate the factory's failure, cache nothing,
+            and treat the second entry as the first real acquisition
+            rather than refuse it as a re-acquire.
         """
         # Arrange
-        mock_pool = AsyncMock()
-        resource = Resource(pool=mock_pool, key="test-key")
+        factory = mocker.Mock(side_effect=[RuntimeError("factory failed"), "obj"])
+        pool = ResourcePool(factory=factory, ttl=60)
+        resource = pool.get("key")
 
-        # Act & assert - manually call __aexit__ without calling __aenter__
+        # Act
+        with pytest.raises(RuntimeError, match="factory failed"):
+            async with resource:
+                pass
+
+        # Assert
+        assert pool.stats.total_entries == 0
+        async with resource as acquired:
+            assert acquired == "obj"
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_allow_reentry_when_the_acquire_is_cancelled(self):
+        """Test a cancelled entry leaves the resource enterable again.
+
+        Given:
+            A pool whose factory parks until released, and a Resource
+            for a key it has never cached.
+        When:
+            A task entering the Resource is cancelled while the factory
+            is parked, and the Resource is entered again once the
+            factory is released.
+        Then:
+            It should leave the pool with nothing cached or referenced
+            after the cancellation, and hand back the object on the
+            second entry rather than refuse a re-acquire.
+        """
+        # Arrange
+        parked = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def factory(key):
+            parked.set()
+            await gate.wait()
+            return f"obj-{key}"
+
+        pool = ResourcePool(factory=factory, ttl=60)
+        resource = pool.get("key")
+
+        entering = asyncio.ensure_future(_use_resource(resource))
+        await asyncio.wait_for(parked.wait(), timeout=2.0)
+
+        # Act
+        entering.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await entering
+        gate.set()
+
+        # Assert
+        assert pool.stats.total_entries == 0
+        assert pool.stats.referenced_entries == 0
+        async with resource as obj:
+            assert obj == "obj-key"
+
+    def test___aenter___should_cache_in_the_entering_loops_partition(
+        self, background_loops
+    ):
+        """Test entering a resource binds it to the loop that enters it.
+
+        Given:
+            A resource built from synchronous code, with no loop
+            running, for a pool no loop has reached.
+        When:
+            It is entered and exited on an event loop running on
+            another thread.
+        Then:
+            It should cache the object in that loop's partition alone,
+            leaving the building loop with nothing.
+        """
+        # Arrange
+        pool = ResourcePool(factory=make_resource, ttl=60)
+        resource = pool.get("key")
+        live = background_loops()
+
+        async def use():
+            async with resource as acquired:
+                held = pool.stats
+            return acquired, held, pool.stats
+
+        # Act
+        acquired, held, released = live.run(use())
+
+        # Assert
+        assert acquired == "obj-key"
+        assert held.referenced_entries == 1
+        assert released.total_entries == 1
+        assert released.referenced_entries == 0
+        assert asyncio.run(_pool_stats(pool)).total_entries == 0
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_raise_when_never_entered(self, mocker):
+        """Test exiting a resource that was never entered is an error.
+
+        Given:
+            A resource that has never been entered, pushed onto an exit
+            stack so its exit runs without its entry.
+        When:
+            The stack is closed.
+        Then:
+            It should raise RuntimeError, a release being tied to an
+            acquisition it never made.
+        """
+        # Arrange
+        pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=60)
+        stack = AsyncExitStack()
+        stack.push_async_exit(pool.get("key"))
+
+        # Act & assert
         with pytest.raises(
             RuntimeError, match="Cannot release a resource that was not acquired"
         ):
-            await resource.__aexit__(None, None, None)
+            await stack.aclose()
 
     @pytest.mark.asyncio
-    async def test_resource_context_should_raise_runtime_error_when_already_released(
-        self,
-    ):
-        """Test Resource release when already released raises RuntimeError.
+    async def test___aexit___should_raise_when_already_released(self, mocker):
+        """Test exiting a released resource a second time is an error.
 
         Given:
-            A Resource instance that was already released
+            A resource entered and exited once, then pushed onto an exit
+            stack so its exit runs again.
         When:
-            Attempting to exit context again after normal usage
+            The stack is closed.
         Then:
-            Should raise RuntimeError indicating resource was already released
+            It should raise RuntimeError rather than drop a second
+            reference for one acquisition.
         """
         # Arrange
-        mock_pool = AsyncMock()
-        mock_resource = Mock()
-        mock_pool.acquire.return_value = mock_resource
-
-        resource = Resource(pool=mock_pool, key="test-key")
-
-        # Use normally once (which sets _released = True)
+        pool = ResourcePool(factory=mocker.Mock(return_value="obj"), ttl=60)
+        resource = pool.get("key")
         async with resource:
             pass
+        stack = AsyncExitStack()
+        stack.push_async_exit(resource)
 
-        # Act & assert - manually call __aexit__ again
+        # Act & assert
         with pytest.raises(
             RuntimeError,
             match="Cannot release a resource that has already been released",
         ):
-            await resource.__aexit__(None, None, None)
+            await stack.aclose()
 
-    def test___aexit___should_raise_when_exited_on_another_loop(
+    def test___aexit___should_hand_the_release_back_when_exited_on_another_loop(
         self, mocker, background_loops
     ):
-        """Test a resource refuses to release on a loop other than its own.
+        """Test a cross-loop exit is refused but the reference is not lost.
 
         Given:
             A resource entered on an event loop running on another
-            thread, through an exit stack that a second loop then
-            closes.
+            thread.
         When:
-            The exit stack is closed on the second loop.
+            The resource is exited on a second loop.
         Then:
-            It should raise RuntimeError naming the pool and key, and
-            leave the first loop's entry cached and still referenced
-            rather than silently dropping the reference.
+            It should raise RuntimeError naming the pool and the key and
+            saying the release was handed to the acquiring loop, which
+            then drops the reference: the entry stays cached on that
+            loop, unreferenced, with its TTL armed and its finalizer not
+            run.
         """
         # Arrange
         finalizer = mocker.AsyncMock()
-        pool = ResourcePool(factory=lambda key: key, finalizer=finalizer, ttl=60)
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
+        live = background_loops()
+        resource = pool.get("key")
+        stack = AsyncExitStack()
+        live.run(stack.enter_async_context(resource))
+
+        # Act
+        with pytest.raises(RuntimeError) as raised:
+            asyncio.run(_close_stack_elsewhere(resource))
+        live.run(_poll_until(lambda: pool.stats.referenced_entries == 0))
+
+        # Assert
+        assert str(raised.value) == (
+            "ResourcePool(make_resource) cannot release key 'key' on a loop "
+            "other than the one that acquired it; the release was handed to "
+            "the acquiring loop"
+        )
+        live_snapshot = live.run(_pool_stats(pool))
+        assert live_snapshot.total_entries == 1
+        assert live_snapshot.pending_cleanup == 1
+        finalizer.assert_not_awaited()
+
+    def test___aexit___should_arm_the_ttl_when_the_stack_closes_on_its_own_loop(
+        self, mocker, background_loops
+    ):
+        """Test the loop check passes for the loop that entered.
+
+        Given:
+            A resource entered on an event loop running on another
+            thread, through an exit stack that same loop closes.
+        When:
+            The stack is closed there.
+        Then:
+            It should release the reference and leave the entry cached
+            with its TTL armed, the refusal being reserved for another
+            loop.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
         live = background_loops()
         stack = AsyncExitStack()
+        live.run(stack.enter_async_context(pool.get("key")))
 
-        async def enter():
-            await stack.enter_async_context(pool.get("key"))
+        # Act
+        live.run(stack.aclose())
 
-        async def live_stats():
-            return pool.stats
+        # Assert
+        live_snapshot = live.run(_pool_stats(pool))
+        assert live_snapshot.total_entries == 1
+        assert live_snapshot.referenced_entries == 0
+        assert live_snapshot.pending_cleanup == 1
+        finalizer.assert_not_awaited()
 
-        live.run(enter())
+    def test___aexit___should_raise_as_released_when_retried_after_a_refusal(
+        self, mocker, background_loops
+    ):
+        """Test a refused exit consumes the resource's one release.
+
+        Given:
+            A resource entered on an event loop running on another
+            thread, whose exit a second loop has already been refused
+            and handed back.
+        When:
+            It is exited again on the loop that entered it.
+        Then:
+            It should raise RuntimeError as already released, the
+            handed-back release having dropped the reference once.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
+        live = background_loops()
+        resource = pool.get("key")
+        stack = AsyncExitStack()
+        live.run(stack.enter_async_context(resource))
+        with pytest.raises(RuntimeError, match="cannot release"):
+            asyncio.run(_close_stack_elsewhere(resource))
+        live.run(_poll_until(lambda: pool.stats.referenced_entries == 0))
 
         # Act & assert
-        with pytest.raises(RuntimeError, match=r"ResourcePool\(.*\) cannot release"):
-            asyncio.run(stack.aclose())
-        live_snapshot = live.run(live_stats())
+        with pytest.raises(RuntimeError, match="already been released"):
+            live.run(stack.aclose())
+
+        live_snapshot = live.run(_pool_stats(pool))
         assert live_snapshot.total_entries == 1
-        assert live_snapshot.referenced_entries == 1
+        assert live_snapshot.referenced_entries == 0
         finalizer.assert_not_awaited()
+
+    def test___aexit___should_raise_when_the_exiting_loop_cached_the_same_key(
+        self, background_loops
+    ):
+        """Test the refusal is about the resource, not the key.
+
+        Given:
+            A resource entered on an event loop running on another
+            thread, and a second loop that independently cached and
+            still holds the same key.
+        When:
+            The resource is exited on the second loop.
+        Then:
+            It should raise RuntimeError naming the pool and the key,
+            leave the exiting loop's own reference count unchanged, and
+            drop only the acquiring loop's, through the handed-back
+            release.
+        """
+        # Arrange
+        pool = ResourcePool(factory=make_resource, ttl=60)
+        live = background_loops()
+        resource = pool.get("key")
+        stack = AsyncExitStack()
+        live.run(stack.enter_async_context(resource))
+        snapshots = []
+
+        async def exit_where_the_key_is_cached():
+            await _acquire(pool, "key")
+            snapshots.append(pool.stats)
+            try:
+                await _close_stack_elsewhere(resource)
+            finally:
+                snapshots.append(pool.stats)
+
+        # Act
+        with pytest.raises(RuntimeError) as raised:
+            asyncio.run(exit_where_the_key_is_cached())
+
+        # Assert
+        assert str(raised.value) == (
+            "ResourcePool(make_resource) cannot release key 'key' on a loop "
+            "other than the one that acquired it; the release was handed to "
+            "the acquiring loop"
+        )
+        assert [(s.total_entries, s.referenced_entries) for s in snapshots] == [
+            (1, 1),
+            (1, 1),
+        ]
+        live.run(_poll_until(lambda: pool.stats.referenced_entries == 0))
+        live_snapshot = live.run(_pool_stats(pool))
+        assert live_snapshot.total_entries == 1
+        assert live_snapshot.referenced_entries == 0
+
+    def test___aexit___should_raise_as_released_when_released_before_the_loop_check(
+        self, background_loops
+    ):
+        """Test the release guards are ordered, released before loop.
+
+        Given:
+            A resource entered and exited on an event loop running on
+            another thread.
+        When:
+            It is exited once more from a second loop.
+        Then:
+            It should report the resource as already released rather
+            than as released on the wrong loop, the double release
+            being the more specific fault.
+        """
+        # Arrange
+        pool = ResourcePool(factory=make_resource, ttl=60)
+        live = background_loops()
+        resource = pool.get("key")
+        stack = AsyncExitStack()
+        live.run(stack.enter_async_context(resource))
+        live.run(stack.aclose())
+
+        # Act & assert
+        with pytest.raises(
+            RuntimeError,
+            match="Cannot release a resource that has already been released",
+        ):
+            asyncio.run(_close_stack_elsewhere(resource))
+
+    def test___aexit___should_release_when_its_loop_resumes(
+        self, mocker, caplog, stranded_loop
+    ):
+        """Test an outstanding resource survives its loop's pause.
+
+        Given:
+            A resource entered on a loop that then paused, and a fresh
+            loop that read and used the pool meanwhile.
+        When:
+            The paused loop resumes and exits the resource.
+        Then:
+            It should release into the entry it acquired, leaving it
+            cached and unreferenced with its finalizer not run, and
+            report nothing.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=60)
+        resource = pool.get("key")
+        stack = AsyncExitStack()
+        paused, _ = stranded_loop(stack.enter_async_context(resource), close=False)
+
+        async def read_and_use():
+            pool.stats
+            await pool.expire("none")
+
+        asyncio.run(read_and_use())
+        caplog.clear()
+
+        # Act
+        with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+            paused.run_until_complete(stack.aclose())
+            resumed = paused.run_until_complete(_pool_stats(pool))
+
+        # Assert
+        assert _pool_records(caplog) == []
+        assert resumed.total_entries == 1
+        assert resumed.referenced_entries == 0
+        finalizer.assert_not_awaited()
+
+    def test___aexit___should_finalize_once_when_its_loop_paused_while_held(
+        self, mocker, stranded_loop
+    ):
+        """Test a held resource outlives a pause other loops use the pool through.
+
+        Given:
+            A zero-TTL pool and a resource entered on a loop that then
+            paused, while a fresh loop read the pool and cached and
+            cleared an entry of its own under the same key.
+        When:
+            The paused loop resumes and exits the resource.
+        Then:
+            It should finalize the object exactly once, leaving that
+            loop's partition empty.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=0)
+        resource = pool.get("key")
+        stack = AsyncExitStack()
+        paused, _ = stranded_loop(stack.enter_async_context(resource), close=False)
+
+        async def read_use_and_clear():
+            pool.stats
+            await _cache_idle_entry(pool, "key")
+            await pool.clear()
+
+        asyncio.run(read_use_and_clear())
+        finalizer.reset_mock()
+
+        # Act
+        paused.run_until_complete(stack.aclose())
+
+        # Assert
+        finalizer.assert_awaited_once_with("obj-key")
+        assert paused.run_until_complete(_pool_stats(pool)).total_entries == 0
+
+    def test___aexit___should_keep_a_second_holders_object_when_its_loop_paused(
+        self, mocker, stranded_loop
+    ):
+        """Test a pause never lets one release finalize under another holder.
+
+        Given:
+            A zero-TTL pool and two resources for one key entered on a
+            loop that then paused, while a fresh loop used the pool.
+        When:
+            The paused loop resumes and exits the first resource, then
+            the second.
+        Then:
+            It should leave the object unfinalized and referenced after
+            the first exit and finalize it once after the second.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=0)
+        first, second = AsyncExitStack(), AsyncExitStack()
+
+        async def enter_both():
+            await first.enter_async_context(pool.get("key"))
+            await second.enter_async_context(pool.get("key"))
+
+        paused, _ = stranded_loop(enter_both(), close=False)
+        asyncio.run(pool.expire("none"))
+
+        # Act
+        paused.run_until_complete(first.aclose())
+        after_first = paused.run_until_complete(_pool_stats(pool))
+        awaited_after_first = finalizer.await_count
+        paused.run_until_complete(second.aclose())
+
+        # Assert
+        assert (after_first.total_entries, after_first.referenced_entries) == (1, 1)
+        assert awaited_after_first == 0
+        finalizer.assert_awaited_once_with("obj-key")
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_release_nothing_when_its_entry_was_cleared(
+        self, mocker
+    ):
+        """Test a release lands on the entry it acquired, not on its key.
+
+        Given:
+            A zero-TTL pool, a resource entered for a key, the pool then
+            cleared under it, and a second resource entered for the same
+            key since.
+        When:
+            The first resource exits, then the second.
+        Then:
+            It should leave the second resource's object referenced and
+            unfinalized after the first exit and finalize it once after
+            the second, the first exit having dropped nothing.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        factory = mocker.Mock(side_effect=["first", "second"])
+        pool = ResourcePool(factory=factory, finalizer=finalizer, ttl=0)
+        stale, live = AsyncExitStack(), AsyncExitStack()
+        await stale.enter_async_context(pool.get("key"))
+        await pool.clear()
+        await live.enter_async_context(pool.get("key"))
+        finalizer.reset_mock()
+
+        # Act
+        await stale.aclose()
+        after_stale = pool.stats
+        awaited_after_stale = finalizer.await_count
+        await live.aclose()
+
+        # Assert
+        assert (after_stale.total_entries, after_stale.referenced_entries) == (1, 1)
+        assert awaited_after_stale == 0
+        finalizer.assert_awaited_once_with("second")
+
+    @given(
+        key=strategies.one_of(
+            strategies.none(),
+            strategies.booleans(),
+            strategies.integers(),
+            strategies.floats(allow_nan=False),
+            strategies.text(),
+            strategies.binary(),
+            strategies.tuples(strategies.integers(), strategies.text()),
+        )
+    )
+    @settings(
+        max_examples=25,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    def test___aexit___should_raise_for_any_key_when_exited_on_another_loop(
+        self, background_loops, key
+    ):
+        """Test the cross-loop refusal holds over the key domain.
+
+        Given:
+            Any hashable key — none, a boolean, an integer, a float,
+            text, bytes, or a tuple — entered on an event loop running
+            on another thread.
+        When:
+            The resource is exited on a second loop.
+        Then:
+            It should always raise RuntimeError and hand the release to
+            the first loop, leaving its entry cached and unreferenced.
+        """
+        # Arrange
+        pool = ResourcePool(factory=make_resource, ttl=60)
+        live = background_loops()
+        try:
+            resource = pool.get(key)
+            stack = AsyncExitStack()
+            live.run(stack.enter_async_context(resource))
+
+            # Act & assert
+            with pytest.raises(RuntimeError, match="cannot release key"):
+                asyncio.run(_close_stack_elsewhere(resource))
+
+            live.run(_poll_until(lambda: pool.stats.referenced_entries == 0))
+            live_snapshot = live.run(_pool_stats(pool))
+            assert live_snapshot.total_entries == 1
+            assert live_snapshot.referenced_entries == 0
+        finally:
+            # Retire each example's loop eagerly; the fixture would
+            # otherwise hold every loop of every example open.
+            live.close()
 
     @pytest.mark.asyncio
     @given(

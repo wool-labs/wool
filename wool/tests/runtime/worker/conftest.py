@@ -4,6 +4,7 @@ import multiprocessing.shared_memory
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from types import MappingProxyType
 from typing import Any
 from typing import Callable
@@ -28,11 +29,15 @@ from tests.helpers import scoped_context
 from wool import protocol
 from wool.runtime.context.factory import _loops_with_factory
 from wool.runtime.context.factory import install_task_factory
+from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.discovery.base import DiscoveryEvent
+from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker import connection as connection_module
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.connection import clear_channel_pool
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.proxy import WorkerProxy
 
@@ -716,6 +721,103 @@ def pooled_channel(insecure_channel):
         The `AsyncMock` channel the patched factory hands out.
     """
     return insecure_channel.return_value
+
+
+@pytest.fixture
+def channel_per_call(mocker: MockerFixture):
+    """Patch `grpc.aio.insecure_channel` to build a fresh channel per call.
+
+    `pooled_channel` hands every dispatch one shared mock, which cannot
+    tell one loop's channel from another's. This patch records each
+    ``(target, channel)`` pair as it is built, under a lock because two
+    loops on two threads may call the factory at once.
+
+    :returns:
+        The list of ``(target, channel)`` pairs built so far.
+    """
+    built: list[tuple[str, Any]] = []
+    guard = threading.Lock()
+
+    def build(target, *args, **kwargs):
+        channel = mocker.AsyncMock()
+        with guard:
+            built.append((target, channel))
+        return channel
+
+    mocker.patch.object(grpc.aio, "insecure_channel", side_effect=build)
+    return built
+
+
+@pytest.fixture
+def channel_pool_loop(background_loops):
+    """Spawn a background loop that clears its channel-pool partition on close.
+
+    A loop that stops with channels cached strands them for the next
+    pool operation on any loop to report, which would land a warning in
+    an unrelated test's log capture. This handle runs `clear_channel_pool`
+    on the loop before stopping it.
+
+    :returns:
+        A `background_loops` handle.
+    """
+    return background_loops(teardown=clear_channel_pool)
+
+
+@pytest.fixture
+def mock_subscriber_pool(mocker: MockerFixture):
+    """Install a mock discovery subscriber pool for the test's duration.
+
+    :returns:
+        A `ResourcePool`-shaped mock whose ``clear`` is an `AsyncMock`.
+    """
+    pool = mocker.MagicMock(spec=ResourcePool)
+    pool.clear = mocker.AsyncMock()
+    token = __subscriber_pool__.set(pool)
+    try:
+        yield pool
+    finally:
+        __subscriber_pool__.reset(token)
+
+
+@pytest.fixture
+def wedged_channel_pool():
+    """Return a context manager that holds the calling loop's channel-pool lock.
+
+    The one place the worker suite reaches past `ResourcePool`'s public
+    API, and deliberately so: a test that needs a pool operation to
+    suspend mid-flight has no public lever for it. The channel factory
+    is synchronous, so no factory call can be made to block, and every
+    public entry point acquires and releases the lock within a single
+    await, leaving the partition's own lock as the only way to park a
+    release where a test can observe it.
+
+    The context manager yields a ``release`` callable so a test can free
+    the lock at a chosen point in the block; the block's exit releases it
+    if the test did not, so a failed assertion cannot leave the pool
+    wedged for the rest of the session.
+
+    :returns:
+        An async context manager factory.
+    """
+
+    @asynccontextmanager
+    async def wedge():
+        lock = connection_module._channel_pool._partition()._lock
+        await lock.acquire()
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                lock.release()
+
+        try:
+            yield release
+        finally:
+            release()
+
+    return wedge
 
 
 @pytest.fixture
