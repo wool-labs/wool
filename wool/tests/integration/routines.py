@@ -555,6 +555,26 @@ async def nested_gen(n: int):
 
 
 @wool.routine
+async def nested_cancellable_sleep(sentinel_path: str, duration: float = 30.0):
+    """Coroutine that dispatches :func:`cancellable_sleep`, nesting the sleep.
+
+    Nested counterpart of :func:`cancellable_sleep`: the outer routine
+    runs on one worker and dispatches the sleep through that worker's
+    own proxy, so a nested proxy and its outbound channel are live on
+    the worker loop for as long as the inner sleep is suspended. Lets a
+    test land a shutdown on a worker whose loop is holding pooled
+    resources it must still clear.
+
+    :param sentinel_path:
+        Filesystem path the inner routine writes its termination reason
+        to — see :func:`cancellable_sleep`.
+    :param duration:
+        Sleep duration in seconds, forwarded to the inner routine.
+    """
+    return await cancellable_sleep(sentinel_path, duration)
+
+
+@wool.routine
 async def get_pid() -> int:
     """Coroutine that returns the worker process id.
 

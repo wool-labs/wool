@@ -19,11 +19,23 @@ from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.process import WorkerProcess
+from wool.runtime.worker.proxy import WorkerProxy
 
 from . import routines
 from .conftest import _DirectDiscovery
+from .conftest import _ensure_killed
+from .conftest import _pid_alive
 from .conftest import build_pool_from_scenario
 from .conftest import default_scenario
+from .conftest import poll_until
+
+#: Bound, in seconds, on a stop that asks the worker for no drain at
+#: all. Such a stop returns as soon as its RPC does, so the bound is the
+#: margin that RPC allows itself over the grace
+#: (``wool.runtime.worker.local._STOP_RPC_MARGIN``, five seconds) plus
+#: room for the reap on a loaded machine — far below the minute a
+#: teardown wedged on an in-flight dispatch would spend in its join.
+_STOP_BOUND = 15.0
 
 #: Hang the ``worker-dropped`` announcement rather than failing it,
 #: modelling a discovery service that has stopped responding rather
@@ -76,11 +88,10 @@ asyncio.run(main())
 @pytest.mark.integration
 class TestWorkerLoopDrain:
     @pytest.mark.asyncio
-    async def test_graceful_shutdown_drains_second_generation_cleanup_tasks(
-        self, tmp_path, credentials_map, retry_grpc_internal
+    async def test_stop_should_drain_every_cleanup_generation(
+        self, tmp_path, credentials_map, retry_grpc_internal, worker_log
     ):
-        """Test that worker-loop teardown drains every generation of
-        pending cleanup tasks.
+        """Test worker-loop teardown drains every generation of cleanup tasks.
 
         Given:
             A routine whose finally clause schedules an orphaned cleanup
@@ -90,7 +101,10 @@ class TestWorkerLoopDrain:
             A worker pool is dispatched the routine and then torn down.
         Then:
             It should drain every generation, so the deepest cleanup
-            task runs its finally clause and writes its sentinel file.
+            task runs its finally clause and writes its sentinel file,
+            and it should clear the worker loop's pools without a
+            failure — the clears and the drain share one budget, and a
+            drain this deep must not spend the clears' share of it.
         """
         # Arrange
         sentinel = tmp_path / "drain-sentinel.txt"
@@ -106,6 +120,132 @@ class TestWorkerLoopDrain:
 
         # Assert
         assert sentinel.read_text() == "drained"
+        log = worker_log()
+        assert "WORKER[" in log
+        assert "Failed to clear the" not in log
+
+
+@pytest.mark.integration
+class TestWorkerLoopTeardownClears:
+    @pytest.mark.asyncio
+    async def test_stop_should_clear_the_worker_loops_pools_when_grace_given(
+        self, worker_log
+    ):
+        """Test a stop with a grace clears what the worker loop pooled.
+
+        Given:
+            A started `wool.LocalWorker` that served a nested dispatch,
+            so its worker loop holds a cached proxy, the subscriber pool
+            behind it, and the channel that dispatch opened.
+        When:
+            The worker is stopped with a five-second grace.
+        Then:
+            It should reap the process having cleared each of those
+            pools on the worker loop itself, logging neither a failed
+            clear nor a dropped-entry record — the loop is the only
+            party that can finalize its own partitions.
+        """
+        # Arrange
+        worker = LocalWorker()
+        await worker.start(timeout=30)
+        assert worker.metadata is not None
+        pid = worker.metadata.pid
+
+        try:
+            async with WorkerProxy(workers=[worker.metadata]):
+                assert await routines.nested_add(1, 2) == 3
+                # Guards the assertions below against passing vacuously
+                # on a worker loop that pooled nothing to clear.
+                served = await routines.worker_channel_pool_stats()
+                assert served.total_entries == 1
+
+            # Act
+            await worker.stop(grace=5.0)
+
+            # Assert
+            assert not _pid_alive(pid)
+            log = worker_log(pid)
+            assert f"WORKER[{pid}]" in log
+            assert "Failed to clear the" not in log
+            assert "ResourcePool(" not in log
+        finally:
+            _ensure_killed(pid)
+
+    @pytest.mark.asyncio
+    async def test_stop_should_return_when_a_nested_dispatch_is_in_flight(
+        self, tmp_path, worker_log
+    ):
+        """Test a stop lands cleanly on a worker mid nested dispatch.
+
+        Given:
+            A started `wool.LocalWorker` running a routine that has
+            dispatched a sleep of its own back through the worker and
+            is parked in it, so a nested proxy, an outbound channel and
+            a live stream are all in use on the worker loop.
+        When:
+            The worker is stopped with its default grace, which asks
+            the worker for no drain at all.
+        Then:
+            It should return within the stop's own bound, reap the
+            process, and log neither a failed clear nor a dropped-entry
+            record on the worker: the teardown clears are best-effort
+            under a live dispatch, and a clear the stop cancels is not
+            an error.
+        """
+        # Arrange
+        sentinel = tmp_path / "nested-sleep.txt"
+        worker = LocalWorker()
+        await worker.start(timeout=30)
+        assert worker.metadata is not None
+        pid = worker.metadata.pid
+
+        try:
+            async with WorkerProxy(workers=[worker.metadata]):
+                dispatch = asyncio.create_task(
+                    routines.nested_cancellable_sleep(str(sentinel))
+                )
+                # The inner routine writes its marker as it suspends, so
+                # the stop lands on a dispatch that is genuinely parked
+                # rather than one still being routed.
+                await poll_until(
+                    lambda: sentinel.exists() and sentinel.read_text() == "started",
+                    bool,
+                    description="nested sleep never started",
+                    timeout=30.0,
+                    interval=0.1,
+                )
+
+                # Act
+                started = time.monotonic()
+                await worker.stop()
+                elapsed = time.monotonic() - started
+
+                dispatch.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await dispatch
+
+            # Assert
+            assert elapsed < _STOP_BOUND
+            await poll_until(
+                lambda: _pid_alive(pid),
+                lambda alive: not alive,
+                description="worker process never exited",
+                timeout=15.0,
+                interval=0.1,
+            )
+            # Scoped to the teardown's own records rather than the
+            # whole log: a stop landing here also races
+            # `wool.runtime.worker.session.DispatchSession`'s
+            # completion callback, which logs an ``InvalidStateError``
+            # when the future it settles was already cancelled. That is
+            # a defect of the session, not of the clears this test is
+            # about, so it is reported rather than pinned here.
+            log = worker_log(pid)
+            assert f"WORKER[{pid}]" in log
+            assert "Failed to clear the" not in log
+            assert "ResourcePool(" not in log
+        finally:
+            _ensure_killed(pid)
 
 
 @pytest.mark.integration
@@ -589,21 +729,3 @@ class _BrokenDropPublisher:
                 await asyncio.Event().wait()
             raise self._error
         return await self._publisher.publish(type, metadata)
-
-
-def _pid_alive(pid: int) -> bool:
-    """Return whether a process with the given pid currently exists."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _ensure_killed(pid: int | None) -> None:
-    """Best-effort SIGKILL so a failing run cannot leak the orphan under test."""
-    if pid is not None and _pid_alive(pid):
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)

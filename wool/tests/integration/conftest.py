@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -35,7 +36,6 @@ from wool.runtime.context.runtime import dispatch_timeout
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
-from wool.runtime.worker import connection
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
@@ -64,7 +64,7 @@ async def poll_until(
     satisfies ``predicate`` within the deadline, naming ``description``
     and the last value, or tolerated exception, seen.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while True:
         try:
@@ -652,18 +652,18 @@ async def build_pool_from_scenario(
                 }
                 match scenario.pool_mode:
                     case PoolMode.DEFAULT:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
                     case PoolMode.EPHEMERAL:
-                        pool_kwargs["size"] = 2
+                        pool_kwargs["spawn"] = 2
                     case PoolMode.HYBRID:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
                         pool_kwargs["discovery"] = discovery_obj
                     case PoolMode.NESTED_DEFAULT_IN_EPHEMERAL:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
                     case PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
                     case PoolMode.NESTED_RETIRED_IN_EPHEMERAL:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
 
                 pool = WorkerPool(**pool_kwargs)
                 async with pool:
@@ -700,7 +700,7 @@ async def build_pool_from_scenario(
                             else 1
                         )
                         nested_pool = WorkerPool(
-                            size=nested_size,
+                            spawn=nested_size,
                             credentials=creds,
                             worker=partial(LocalWorker, options=options),
                         )
@@ -1689,39 +1689,28 @@ def credentials_map(test_certificates):
     }
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_makereport(item, call):
-    """Record each phase's report on the item so a fixture can read the outcome."""
-    outcome = yield
-    setattr(item, f"rep_{call.when}", outcome.get_result())
-
-
 @pytest_asyncio.fixture(autouse=True)
-async def _clear_channel_pool(request):
-    """Fail a test that leaves a gRPC channel cached, then clear the pool.
+async def _channel_pool_gate(request):
+    """Fail a test that leaves a gRPC channel cached on its loop.
 
     Every construct that opens a channel — a pool, a proxy, a bare
     `WorkerConnection` — owns closing it, so a test that ends with
     channels still cached on its loop has stranded one: the pool sweeps
-    and reports what a stopped loop leaves behind, but never closes it.
+    and reports what a closed loop leaves behind, but never closes it.
     The gate makes that a failure of the test that caused it rather than
     a warning attributed to whichever test runs next, and it stands down
-    for a test that already failed, whose leftovers are a symptom rather
-    than a second finding. The clear still runs either way, so one leak
-    does not cascade into the rest of the suite; the holds pool is
-    cleared first, so a hold a test left open is not reported against
-    the next test either. The holds pool has no public teardown — a hold
-    is released only by its holder — so this is the one place the suite
-    reaches into ``connection`` for it.
+    for a test that already failed in setup or in its body, whose
+    leftovers are a symptom rather than a second finding. The clearing
+    itself belongs to the root ``_clear_channel_pool`` fixture, whose
+    teardown runs after this one and covers holds as well as channels,
+    so one leak does not cascade into the rest of the suite.
     """
     yield
-    try:
-        call = getattr(request.node, "rep_call", None)
-        if call is None or call.passed:
-            await poll_until_channel_pool_settles()
-    finally:
-        await connection._channel_pool_holds.clear()
-        await connection.clear_channel_pool()
+    reports = [
+        getattr(request.node, f"rep_{phase}", None) for phase in ("setup", "call")
+    ]
+    if all(report is not None and report.passed for report in reports):
+        await poll_until_channel_pool_settles()
 
 
 # Integration tests rely on pytest-asyncio's Task-per-test scoping
@@ -1754,8 +1743,11 @@ async def started_worker():
         return worker
 
     yield start
+    # ``LocalWorker.stop`` raises on an already-stopped worker, and one
+    # raise must not leave the remaining workers running.
     for worker in workers:
-        await worker.stop()
+        with suppress(RuntimeError):
+            await worker.stop()
 
 
 @pytest_asyncio.fixture
@@ -1845,6 +1837,46 @@ def retry_grpc_internal():
                 raise
 
     return run
+
+
+#: The prefix a worker's log record opens with -- see
+#: `wool.runtime.worker.process.WorkerProcess.run` for the format.
+_WORKER_RECORD = re.compile(r"^\S+ \S+ - WORKER\[(\d+)\] - ")
+
+
+@pytest.fixture
+def worker_log(capfd):
+    """Read what the spawned worker processes wrote to stderr.
+
+    Returns a callable ``read(pid=None)`` that drains pytest's
+    file-descriptor capture and returns it as text, narrowed to the
+    records one worker emitted when a pid is given: a worker configures
+    logging with a ``WORKER[<pid>]`` prefix on the stderr it inherits
+    (see `wool.runtime.worker.process.WorkerProcess.run`), so a record's
+    continuation lines — a traceback's, say — are kept with the prefixed
+    line that opened them, and a line that opens another worker's record
+    ends the one being kept. Only fd capture sees that stream: ``caplog``
+    never does, and under ``-s`` there is no capture at all and every
+    read returns the empty string. A read drains what has accumulated so
+    far, so a caller reads once — after the worker has exited or after
+    awaiting the RPC whose log it is asserting on — and keeps the text.
+    """
+
+    def read(pid=None):
+        captured = capfd.readouterr().err
+        if pid is None:
+            return captured
+        lines = []
+        keeping = False
+        for line in captured.splitlines(keepends=True):
+            record = _WORKER_RECORD.match(line)
+            if record is not None:
+                keeping = int(record.group(1)) == pid
+            if keeping:
+                lines.append(line)
+        return "".join(lines)
+
+    return read
 
 
 def _pid_alive(pid: int) -> bool:

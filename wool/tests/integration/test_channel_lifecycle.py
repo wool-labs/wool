@@ -1,22 +1,33 @@
 """Channel-pool lifecycle integration tests.
 
 These pin the symptom the channel-pool hold exists to remove: a channel
-left unclosed when the loop that opened it stops. They stand apart from
-the pairwise array because the oracle here is what the pool holds after
-a successful dispatch, which the array's dispatch-success oracle cannot
-express.
+left unclosed when the loop that opened it stops. Their second subject
+is partition isolation: the pool serves every running loop at once,
+each through a partition only that loop can reach, so a lifecycle run
+on one loop must leave every other loop's channels — a worker's own
+included — exactly as it found them. They stand apart from the pairwise
+array because the oracle here is what the pool holds after a successful
+dispatch, which the array's dispatch-success oracle cannot express.
+
+`TestChannelPoolLifecycle` is named for the behavior it pins rather
+than for a class under test, under the test guide's exception for a
+behavior-pinning suite: the subject is a process-wide pool reached
+through module functions, not one class.
 """
 
 import asyncio
+import inspect
 import logging
 import threading
 import uuid
+from contextlib import AsyncExitStack
 
 import pytest
 
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.connection import channel_pool_hold
 from wool.runtime.worker.connection import channel_pool_stats
 from wool.runtime.worker.connection import clear_channel_pool
 from wool.runtime.worker.local import LocalWorker
@@ -56,6 +67,11 @@ _BARRIER_TIMEOUT = 60.0
 #: a stranded-channel claim filters on this name as well.
 _CHANNEL_POOL = "_channel_factory"
 
+#: The name the holds behind `channel_pool_hold` are reported under.
+#: Holds live in their own pool with their own registry, so what a
+#: stopped loop stranded there is a separate record from its channels'.
+_HOLD_POOL = "_channel_pool_hold_factory"
+
 
 def _resourcepool_records(caplog, *, pool=_CHANNEL_POOL):
     """Return the records the resource pool's logger holds for ``pool``."""
@@ -67,20 +83,40 @@ def _resourcepool_records(caplog, *, pool=_CHANNEL_POOL):
     ]
 
 
-async def _records_after_stranding(caplog, factory):
+async def _records_after_stranding(
+    caplog, factory, *, trigger=clear_channel_pool, sweep_holds=False
+):
     """Run ``factory()`` on a foreign loop and report what its sweep drops.
 
-    Returns the coroutine's result and the resource pool's records from
-    this loop's next channel-pool operation afterwards, which is what
-    sweeps the stopped loop's partition and drops whatever it left (see
-    `wool.runtime.resourcepool.ResourcePool`).
+    Returns the coroutine's result and the channel pool's records from
+    this loop's next mutating channel-pool operation afterwards, which
+    is what sweeps the closed loop's partition and drops whatever it
+    left (see `wool.runtime.resourcepool.ResourcePool`). ``trigger`` is
+    that operation, `clear_channel_pool` by default; a caller holding
+    channels of its own passes a dispatch or an ``idle`` call instead,
+    since a read sweeps nothing and a clear would close what the caller
+    is measuring. A sync or async trigger is equally accepted.
+
+    The holds keep their own pool and their own registry, so a hold a
+    stopped loop stranded is reported only once a live loop enters
+    `channel_pool_hold`: ``sweep_holds`` takes and releases one before
+    the trigger for a caller that means to observe it. That release also
+    retires this loop's own channels, so a caller with channels to keep
+    leaves it alone. Only the channel pool's records are returned; a
+    caller reading the holds pool's asks `_resourcepool_records` for
+    them.
     """
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger=_RESOURCEPOOL_LOGGER):
         result = await run_on_foreign_loop(factory)
-        # Deliberately this loop's next channel-pool operation — that
-        # is when the sweep runs.
-        await clear_channel_pool()
+        if sweep_holds:
+            async with channel_pool_hold():
+                pass
+        # Deliberately this loop's next mutating channel-pool operation
+        # — that is when the sweep runs.
+        swept = trigger()
+        if inspect.isawaitable(swept):
+            await swept
     return result, _resourcepool_records(caplog)
 
 
@@ -108,8 +144,105 @@ def _concurrent_lifecycle_probe(scenario, credentials_map, barrier):
     return probe
 
 
+def _concurrent_proxy_probe(metadata, barrier):
+    """Build a coroutine factory that runs one proxy lifecycle and reports.
+
+    Shaped like `_concurrent_lifecycle_probe`, but over a static
+    `wool.WorkerProxy` on a worker started outside it, so every loop
+    dials the same worker under the same pool key. The coroutine
+    dispatches, waits on *barrier* so both loops hold their channel at
+    the same instant, reads the total while still inside the proxy,
+    exits, and reports ``(pid, live_total, settled_total)``.
+    """
+
+    async def probe():
+        async with WorkerProxy(workers=[metadata]):
+            pid = await routines.get_pid()
+            # Block on the barrier off-loop, for the reason
+            # `_concurrent_lifecycle_probe` gives.
+            await asyncio.to_thread(barrier.wait, _BARRIER_TIMEOUT)
+            live = channel_pool_stats().total_entries
+        settled = await poll_until_channel_pool_settles()
+        return pid, live, settled.total_entries
+
+    return probe
+
+
+async def _gather_probes(barrier, *factories):
+    """Run each factory on its own foreign loop and report their results.
+
+    Gathers with ``return_exceptions=True`` so a probe that fails does
+    not leave its peer running detached into the next test, aborts
+    *barrier* in a ``finally`` so no thread is left waiting on it once
+    the gather returns, and re-raises the exception a probe reported so
+    the failure is the test's. A failing probe aborts the barrier on its
+    way out too, releasing a peer parked on a rendezvous it will now
+    never reach rather than leaving it there for the barrier's own
+    timeout; the failure re-raised is the probe's own, not the broken
+    barrier its peer reports as a consequence, so a transient gRPC
+    error in either probe is still the one the retry fixture sees.
+    """
+
+    async def probe(factory):
+        try:
+            return await run_on_foreign_loop(factory)
+        except BaseException:
+            barrier.abort()
+            raise
+
+    try:
+        results = await asyncio.gather(
+            *(probe(factory) for factory in factories), return_exceptions=True
+        )
+    finally:
+        barrier.abort()
+    errors = [result for result in results if isinstance(result, BaseException)]
+    if errors:
+        raise next(
+            (e for e in errors if not isinstance(e, threading.BrokenBarrierError)),
+            errors[0],
+        )
+    return results
+
+
 @pytest.mark.integration
 class TestChannelPoolLifecycle:
+    @pytest.mark.asyncio
+    async def test_poll_until_channel_pool_settles_should_fail_when_channel_cached(
+        self, started_worker
+    ):
+        """Test the settle helper fails on a channel nobody closed.
+
+        Given:
+            A running worker polled for its idle duration by a
+            `wool.runtime.worker.connection.WorkerConnection` entered
+            nowhere and never closed, so this loop keeps one channel
+            cached.
+        When:
+            The channel pool is polled for a settle within half a
+            second.
+        Then:
+            It should fail, naming the settle it never saw, and settle
+            once the connection is closed — every claim in this file
+            rests on that helper, and a gate that cannot fail is not a
+            gate.
+        """
+        # Arrange
+        worker = await started_worker(LocalWorker())
+        connection = WorkerConnection(worker.address)
+        await connection.idle()
+
+        try:
+            # Act & assert
+            with pytest.raises(AssertionError, match="never settled"):
+                await poll_until_channel_pool_settles(timeout=0.5)
+        finally:
+            await connection.close()
+
+        # Assert: the same poll passes once the channel is closed, so
+        # the failure above was the cached channel and nothing else.
+        await poll_until_channel_pool_settles()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "pool_mode",
@@ -206,8 +339,10 @@ class TestChannelPoolLifecycle:
             completion under ``asyncio.run`` on another thread, whose
             loop then stops.
         When:
-            This test's loop makes its next channel-pool operation,
-            which is what sweeps the stopped loop's partition.
+            This test's loop makes its next channel-pool operation —
+            `clear_channel_pool`, as it happens, since this loop holds
+            nothing of its own to keep — which is what sweeps the
+            stopped loop's partition.
         Then:
             It should drop nothing, reporting no record at all on the
             resource pool's logger.
@@ -230,7 +365,6 @@ class TestChannelPoolLifecycle:
 
         # Assert
         assert stranded == 0
-        assert channel_pool_stats().total_entries == 0
         assert records == []
 
     @pytest.mark.asyncio
@@ -269,6 +403,110 @@ class TestChannelPoolLifecycle:
         assert "0 referenced and 1 idle" in records[0].getMessage()
 
     @pytest.mark.asyncio
+    async def test_dispatch_should_keep_this_loops_entry_when_it_sweeps(
+        self, started_worker, retry_grpc_internal, caplog
+    ):
+        """Test a sweep drops the stopped loop's entries and only those.
+
+        Given:
+            This loop already owning a partition, from a dispatch under
+            a live `wool.WorkerProxy`, and a bare
+            `wool.runtime.worker.connection.WorkerConnection` abandoned
+            on another thread's loop that then stops.
+        When:
+            This loop dispatches again, a mutating pool access that
+            sweeps without closing anything of its own.
+        Then:
+            It should report exactly one warning for the entry the
+            stopped loop stranded, and leave this loop's own entry
+            cached and dispatchable.
+        """
+        # Arrange
+        worker = await started_worker(LocalWorker())
+
+        async def strand():
+            connection = WorkerConnection(worker.address)
+            # Deliberately never closed: this is the entry the sweep
+            # has to find.
+            await connection.idle()
+
+        async def body():
+            # Arrange
+            async with WorkerProxy(workers=[worker.metadata]):
+                assert await routines.add(1, 2) == 3
+                # Guards the isolation claim below against passing
+                # vacuously on a loop that cached nothing itself.
+                assert channel_pool_stats().total_entries == 1
+
+                # Act: the trigger is a dispatch, not a clear — a clear
+                # would close the very entry this test is measuring.
+                _, records = await _records_after_stranding(
+                    caplog, strand, trigger=lambda: routines.add(3, 4)
+                )
+                mine = channel_pool_stats()
+                # The dispatchability probe has to run while the proxy
+                # is still entered, so it stays inside the block.
+                assert await routines.add(3, 4) == 7
+
+            # Assert
+            assert len(records) == 1
+            assert records[0].levelno == logging.WARNING
+            assert "0 referenced and 1 idle" in records[0].getMessage()
+            assert mine.total_entries == 1
+            await poll_until_channel_pool_settles()
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_clear_channel_pool_should_keep_the_channels_another_loop_cached(
+        self, started_worker, retry_grpc_internal, caplog
+    ):
+        """Test a clear on one loop leaves another loop's channels alone.
+
+        Given:
+            An idle channel cached on this loop under a still-entered
+            `wool.WorkerProxy`, and another thread's loop whose only
+            channel-pool operation is `clear_channel_pool` before it
+            stops.
+        When:
+            That loop clears and stops.
+        Then:
+            It should leave this loop's entry cached and dispatchable,
+            and report nothing — a clear reaches the calling loop's
+            partition only, and an empty partition strands nothing.
+        """
+        # Arrange
+        worker = await started_worker(LocalWorker())
+
+        async def clear_only():
+            # A loop that touches the pool only to clear it: its
+            # partition is created empty and stays that way.
+            await clear_channel_pool()
+
+        async def body():
+            # Arrange
+            async with WorkerProxy(workers=[worker.metadata]):
+                assert await routines.add(1, 2) == 3
+                before = channel_pool_stats()
+
+                # Act
+                _, records = await _records_after_stranding(
+                    caplog, clear_only, trigger=lambda: routines.add(3, 4)
+                )
+                after = channel_pool_stats()
+                # The dispatchability probe has to run while the proxy
+                # is still entered, so it stays inside the block.
+                assert await routines.add(3, 4) == 7
+
+            # Assert
+            assert before.total_entries == 1
+            assert after.total_entries == 1
+            assert records == []
+            await poll_until_channel_pool_settles()
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
     async def test___aexit___should_strand_no_channel_when_connection_used_as_context(
         self, started_worker, caplog
     ):
@@ -298,6 +536,59 @@ class TestChannelPoolLifecycle:
 
         # Assert
         assert records == []
+
+    @pytest.mark.asyncio
+    async def test_channel_pool_hold_should_keep_another_loops_channel_on_release(
+        self, started_worker, retry_grpc_internal, caplog
+    ):
+        """Test the last hold's release retires the releasing loop only.
+
+        Given:
+            A `wool.runtime.worker.connection.WorkerConnection` entered
+            on this loop, and a whole `wool.WorkerProxy` lifecycle on
+            another thread's loop, whose exit releases that loop's last
+            hold.
+        When:
+            The foreign hold releases and its loop stops.
+        Then:
+            It should retire that loop's channels alone, leaving this
+            loop's cached and still able to poll the worker's idle
+            duration, and report nothing.
+        """
+        # Arrange
+        worker = await started_worker(LocalWorker())
+
+        async def proxy_lifecycle():
+            async with WorkerProxy(workers=[worker.metadata]):
+                assert await routines.add(1, 2) == 3
+            # The last release retires that loop's channels drain-first;
+            # the settle proves it finished before the loop stopped.
+            settled = await poll_until_channel_pool_settles()
+            return settled.total_entries
+
+        async def body():
+            # Arrange
+            async with WorkerConnection(worker.address) as connection:
+                assert await connection.idle() >= 0
+                before = channel_pool_stats()
+
+                # Act
+                stranded, records = await _records_after_stranding(
+                    caplog, proxy_lifecycle, trigger=connection.idle
+                )
+                after = channel_pool_stats()
+                # The usability probe has to run while the connection
+                # is still entered, so it stays inside the block.
+                assert await connection.idle() >= 0
+
+            # Assert
+            assert stranded == 0
+            assert before.total_entries == 1
+            assert after.total_entries == 1
+            assert records == []
+            await poll_until_channel_pool_settles()
+
+        await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
     async def test___aexit___should_close_channels_when_proxy_loop_stops_at_once(
@@ -335,6 +626,48 @@ class TestChannelPoolLifecycle:
         assert total == 1
         assert referenced == 0
         assert records == []
+
+    @pytest.mark.asyncio
+    async def test_channel_pool_hold_should_report_a_stranded_hold_when_loop_stops(
+        self, started_worker, caplog
+    ):
+        """Test a hold a stopped loop never released is reported too.
+
+        Given:
+            A `wool.WorkerProxy` entered on an exit stack that is never
+            closed, dispatched through, on another thread's loop that
+            then stops — so the loop strands both the proxy's hold and
+            the dispatch's idle channel.
+        When:
+            This loop takes and releases a hold of its own, then clears.
+        Then:
+            It should report one record against the channel pool for
+            the idle channel and one against the holds pool for the
+            hold: separate pools with separate registries, each swept
+            only by an operation that reaches it.
+        """
+        # Arrange
+        worker = await started_worker(LocalWorker())
+
+        async def strand():
+            stack = AsyncExitStack()
+            await stack.enter_async_context(WorkerProxy(workers=[worker.metadata]))
+            assert await routines.add(1, 2) == 3
+            # Deliberately never closed: the stack goes out of scope
+            # with the proxy still entered and its hold still held.
+
+        # Act
+        _, channel_records = await _records_after_stranding(
+            caplog, strand, sweep_holds=True
+        )
+        hold_records = _resourcepool_records(caplog, pool=_HOLD_POOL)
+
+        # Assert
+        assert len(channel_records) == 1
+        assert "0 referenced and 1 idle" in channel_records[0].getMessage()
+        assert len(hold_records) == 1
+        assert hold_records[0].levelno == logging.WARNING
+        assert "1 referenced and 0 idle" in hold_records[0].getMessage()
 
     @pytest.mark.asyncio
     async def test___aexit___should_keep_outer_pool_channels_when_inner_pool_exits(
@@ -383,7 +716,47 @@ class TestChannelPoolLifecycle:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_stop_should_close_worker_channels_when_pooled_proxy_retires(
+    async def test_channel_pool_stats_should_report_no_reference_when_nested_retired(
+        self, credentials_map, retry_grpc_internal, caplog
+    ):
+        """Test an outer pool still dispatches once a nested pool retired.
+
+        Given:
+            An outer pool entered on a loop where a second pool has
+            already been entered, dispatched through, and left again,
+            so its channels were retired before the body starts.
+        When:
+            The outer pool dispatches, with the pool's counters read on
+            entry and after the dispatch.
+        Then:
+            It should carry no reference over from the retired pool,
+            return the dispatch, settle its own partition on exit, and
+            report nothing on the resource pool's logger.
+        """
+
+        async def body():
+            # Arrange
+            caplog.clear()
+            scenario = default_scenario(pool_mode=PoolMode.NESTED_RETIRED_IN_EPHEMERAL)
+
+            # Act
+            with caplog.at_level(logging.WARNING, logger=_RESOURCEPOOL_LOGGER):
+                async with build_pool_from_scenario(scenario, credentials_map):
+                    at_entry = channel_pool_stats()
+                    assert await routines.add(1, 2) == 3
+                    dispatched = channel_pool_stats()
+                settled = await poll_until_channel_pool_settles()
+
+            # Assert
+            assert at_entry.referenced_entries == 0
+            assert dispatched.total_entries >= 1
+            assert settled.total_entries == 0
+            assert _resourcepool_records(caplog) == []
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_worker_channel_pool_stats_should_report_nothing_when_proxy_retires(
         self, credentials_map, retry_grpc_internal
     ):
         """Test a worker closes its nested-dispatch channel with its proxy.
@@ -430,6 +803,80 @@ class TestChannelPoolLifecycle:
             assert retired.total_entries == 0
             assert retired.referenced_entries == 0
             assert retired.pending_cleanup == 0
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_worker_channel_pool_stats_should_count_only_the_worker_loop(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a worker's channels and its client's are counted apart.
+
+        Given:
+            A single-worker pool that has dispatched a nested coroutine,
+            so the client loop holds the channel to the worker and the
+            worker's own loop holds the channel its nested dispatch
+            opened.
+        When:
+            The client's counters and the worker's are read back to
+            back.
+        Then:
+            It should report one entry on each, neither counting the
+            other's: a partition belongs to a loop, and the two loops
+            are in different processes.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario(
+                shape=RoutineShape.NESTED_COROUTINE, pool_mode=PoolMode.DEFAULT
+            )
+
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                assert await routines.nested_add(1, 2) == 3
+                client = channel_pool_stats()
+                served = await routines.worker_channel_pool_stats()
+
+            # Assert
+            assert client.total_entries == 1
+            assert served.total_entries == 1
+            await poll_until_channel_pool_settles()
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_worker_channel_pool_stats_should_report_one_channel_per_fanout(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test a worker's nested dispatches share one pooled channel.
+
+        Given:
+            A single-worker pool dispatched a routine that fans out
+            three nested dispatches of its own.
+        When:
+            The worker's channel pool counters are read afterwards.
+        Then:
+            It should report one channel rather than three: the
+            partition belongs to the worker's loop, not to the task
+            that opened the channel.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario(
+                shape=RoutineShape.NESTED_COROUTINE, pool_mode=PoolMode.DEFAULT
+            )
+
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                _, inner_pids = await routines.nested_pid_fanout(3)
+                served = await routines.worker_channel_pool_stats()
+
+            # Assert
+            assert len(inner_pids) == 3
+            assert served.total_entries == 1
+            await poll_until_channel_pool_settles()
 
         await retry_grpc_internal(body)
 
@@ -507,6 +954,63 @@ class TestChannelPoolLifecycle:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
+    async def test_channel_pool_stats_should_keep_a_parked_stream_referenced(
+        self, started_worker, retry_grpc_internal, caplog
+    ):
+        """Test a stream parked mid-dispatch survives another loop's sweep.
+
+        Given:
+            An async-generator dispatch parked after one value on this
+            loop under a live `wool.WorkerProxy`, and a whole channel
+            lifecycle — open, use, close — run to completion against the
+            same worker on another thread's loop, which then stops.
+        When:
+            That lifecycle completes and this loop reads the pool,
+            sweeping the stopped loop's partition.
+        Then:
+            It should leave this loop's channel referenced by the
+            parked stream, let the stream drain to exhaustion, and
+            report nothing.
+        """
+        # Arrange
+        worker = await started_worker(LocalWorker())
+
+        async def lifecycle():
+            # A pool or a proxy cannot be entered here: the chain this
+            # loop arms to hold the parked stream travels with the
+            # context `run_on_foreign_loop` copies onto its thread, and
+            # arming it a second time off-thread is contention by
+            # design. A connection opened and closed is the whole
+            # channel lifecycle this file is about either way.
+            async with WorkerConnection(worker.address) as connection:
+                assert await connection.idle() >= 0
+            settled = await poll_until_channel_pool_settles()
+            return settled.total_entries
+
+        async def body():
+            # Arrange
+            async with WorkerProxy(workers=[worker.metadata]):
+                stream = routines.gen_range(3)
+                collected = [await stream.__anext__()]
+
+                # Act: the trigger is a read — a clear would force-close
+                # the channel the parked stream is still using.
+                stranded, records = await _records_after_stranding(
+                    caplog, lifecycle, trigger=channel_pool_stats
+                )
+                parked = channel_pool_stats()
+                collected.extend([value async for value in stream])
+
+            # Assert
+            assert stranded == 0
+            assert parked.referenced_entries == 1
+            assert collected == [0, 1, 2]
+            assert records == []
+            await poll_until_channel_pool_settles()
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
     async def test_channel_pool_stats_should_isolate_loops_when_two_run_concurrently(
         self, credentials_map, retry_grpc_internal
     ):
@@ -530,17 +1034,57 @@ class TestChannelPoolLifecycle:
             barrier = threading.Barrier(2)
 
             # Act
-            first, second = await asyncio.gather(
-                run_on_foreign_loop(
-                    _concurrent_lifecycle_probe(scenario, credentials_map, barrier)
-                ),
-                run_on_foreign_loop(
-                    _concurrent_lifecycle_probe(scenario, credentials_map, barrier)
-                ),
+            first, second = await _gather_probes(
+                barrier,
+                _concurrent_lifecycle_probe(scenario, credentials_map, barrier),
+                _concurrent_lifecycle_probe(scenario, credentials_map, barrier),
             )
 
             # Assert
             assert first == (1, 0)
             assert second == (1, 0)
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_channel_pool_stats_should_isolate_loops_when_both_dial_one_worker(
+        self, started_worker, retry_grpc_internal
+    ):
+        """Test two loops dialing one worker each cache their own channel.
+
+        Given:
+            One worker started outside any pool, and two loops running
+            concurrently on separate threads, each entering a
+            `wool.WorkerProxy` over that worker's metadata and
+            synchronized so both hold their channel at the same moment.
+        When:
+            Each loop reads the totals and dispatches `get_pid`, and the
+            worker's own counters are read afterwards.
+        Then:
+            It should report one entry per loop — the same key on two
+            partitions, not one shared entry — the same pid from both,
+            and an empty partition on the worker, which dialed nobody.
+        """
+        # Arrange
+        worker = await started_worker(LocalWorker())
+
+        async def body():
+            # Arrange
+            barrier = threading.Barrier(2)
+
+            # Act
+            first, second = await _gather_probes(
+                barrier,
+                _concurrent_proxy_probe(worker.metadata, barrier),
+                _concurrent_proxy_probe(worker.metadata, barrier),
+            )
+            async with WorkerProxy(workers=[worker.metadata]):
+                served = await routines.worker_channel_pool_stats()
+
+            # Assert
+            assert first == (worker.metadata.pid, 1, 0)
+            assert second == (worker.metadata.pid, 1, 0)
+            assert served.total_entries == 0
+            await poll_until_channel_pool_settles()
 
         await retry_grpc_internal(body)

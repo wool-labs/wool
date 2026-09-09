@@ -1,7 +1,10 @@
 """Tests for pool composition via build_pool_from_scenario."""
 
 import asyncio
+import multiprocessing
 import uuid
+from dataclasses import fields
+from dataclasses import replace
 from functools import partial
 
 import pytest
@@ -12,6 +15,7 @@ from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.connection import channel_pool_stats
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
 
@@ -33,6 +37,17 @@ from .conftest import _DirectDiscovery
 from .conftest import build_pool_from_scenario
 from .conftest import default_scenario
 from .conftest import invoke_routine
+from .conftest import poll_until
+
+#: Every dimension the builder's completeness check requires. The
+#: optional documentation dimension is excluded: a scenario that
+#: leaves it unset is still complete.
+_REQUIRED_DIMENSIONS = [f.name for f in fields(Scenario) if f.name != "strict_warnings"]
+
+
+def _child_pids():
+    """Return the pids of this process's live multiprocessing children."""
+    return {child.pid for child in multiprocessing.active_children()}
 
 
 @pytest.mark.integration
@@ -595,18 +610,24 @@ class TestPoolComposition:
         When:
             A pool is built and a coroutine routine is dispatched.
         Then:
-            It should return the correct result.
+            It should leave both pools' workers running, serve the
+            dispatch from one of them, and return the correct result.
         """
 
         async def body():
             # Arrange
             scenario = default_scenario(pool_mode=PoolMode.NESTED_DEFAULT_IN_EPHEMERAL)
+            before = _child_pids()
 
             # Act
             async with build_pool_from_scenario(scenario, credentials_map):
+                spawned = _child_pids() - before
                 result = await invoke_routine(scenario)
+                executor = await routines.get_pid()
 
             # Assert
+            assert len(spawned) == 2
+            assert executor in spawned
             assert result == 3
 
         await retry_grpc_internal(body)
@@ -622,20 +643,41 @@ class TestPoolComposition:
             builder's outer pool, with the inner pool still entered
             while the routine is dispatched.
         When:
-            A pool is built and a coroutine routine is dispatched.
+            A pool is built, a coroutine routine is dispatched, and
+            ``get_pid`` is dispatched until two workers have answered.
         Then:
-            It should return the correct result.
+            It should leave three workers running, serve the dispatches
+            from exactly the two the inner pool owns, and return the
+            correct result.
         """
 
         async def body():
             # Arrange
             scenario = default_scenario(pool_mode=PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL)
+            before = _child_pids()
+            executors = set()
+
+            async def dispatch_pid():
+                executors.add(await routines.get_pid())
+                return executors
 
             # Act
             async with build_pool_from_scenario(scenario, credentials_map):
+                spawned = _child_pids() - before
                 result = await invoke_routine(scenario)
+                # The inner pool round-robins, so the second worker
+                # answers on a later dispatch rather than the next one.
+                await poll_until(
+                    dispatch_pid,
+                    lambda seen: len(seen) == 2,
+                    description="dispatches never reached two workers",
+                    timeout=15.0,
+                )
 
             # Assert
+            assert len(spawned) == 3
+            assert executors <= spawned
+            assert len(spawned - executors) == 1
             assert result == 3
 
         await retry_grpc_internal(body)
@@ -653,19 +695,145 @@ class TestPoolComposition:
         When:
             A pool is built and a coroutine routine is dispatched.
         Then:
-            It should return the correct result.
+            It should leave only the outer pool's worker running with
+            nothing cached on the loop's channel partition, then cache
+            one channel for its own dispatch and return the correct
+            result.
         """
 
         async def body():
             # Arrange
             scenario = default_scenario(pool_mode=PoolMode.NESTED_RETIRED_IN_EPHEMERAL)
+            before = _child_pids()
 
             # Act
             async with build_pool_from_scenario(scenario, credentials_map):
+                spawned = _child_pids() - before
+                retired = channel_pool_stats().total_entries
                 result = await invoke_routine(scenario)
+                dispatched = channel_pool_stats().total_entries
 
             # Assert
+            assert len(spawned) == 1
+            assert retired == 0
+            assert dispatched == 1
             assert result == 3
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("proxy_pool_ttl", [0, -1.0])
+    async def test_build_pool_from_scenario_should_raise_when_ttl_not_positive(
+        self, proxy_pool_ttl, credentials_map
+    ):
+        """Test the builder rejects a non-positive proxy pool TTL.
+
+        Given:
+            A complete DEFAULT scenario and a proxy pool TTL of zero or
+            a negative number of seconds.
+        When:
+            The builder is entered.
+        Then:
+            It should raise ValueError before spawning any worker.
+        """
+        # Arrange
+        scenario = default_scenario()
+        before = _child_pids()
+
+        # Act & assert
+        with pytest.raises(ValueError, match="must be positive"):
+            async with build_pool_from_scenario(
+                scenario, credentials_map, proxy_pool_ttl=proxy_pool_ttl
+            ):
+                pass
+        assert _child_pids() == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("pool_mode", "discovery"),
+        [
+            (PoolMode.DURABLE, DiscoveryFactory.NONE),
+            (PoolMode.DURABLE_SHARED, DiscoveryFactory.NONE),
+            (PoolMode.DURABLE_JOINED, DiscoveryFactory.LOCAL_CALLABLE),
+        ],
+        ids=str,
+    )
+    async def test_build_pool_from_scenario_should_raise_when_mode_spawns_no_workers(
+        self, pool_mode, discovery, credentials_map
+    ):
+        """Test the builder rejects a proxy pool TTL a durable mode cannot use.
+
+        Given:
+            A complete scenario in a durable pool mode, which discovers
+            externally started workers rather than spawning its own,
+            and a positive proxy pool TTL.
+        When:
+            The builder is entered.
+        Then:
+            It should raise ValueError naming the spawning requirement.
+        """
+        # Arrange
+        scenario = replace(default_scenario(pool_mode=pool_mode), discovery=discovery)
+
+        # Act & assert
+        with pytest.raises(
+            ValueError, match="applies only to pools that spawn LAN workers"
+        ):
+            async with build_pool_from_scenario(
+                scenario, credentials_map, proxy_pool_ttl=1.0
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dimension", _REQUIRED_DIMENSIONS)
+    async def test_build_pool_from_scenario_should_raise_when_dimension_unset(
+        self, dimension, credentials_map
+    ):
+        """Test the builder rejects a scenario missing a required dimension.
+
+        Given:
+            A complete scenario with exactly one required dimension
+            cleared back to ``None``.
+        When:
+            The builder is entered.
+        Then:
+            It should raise ValueError naming that dimension.
+        """
+        # Arrange
+        scenario = replace(default_scenario(), **{dimension: None})
+
+        # Act & assert
+        with pytest.raises(
+            ValueError, match=rf"missing required dimensions: \['{dimension}'\]"
+        ):
+            async with build_pool_from_scenario(scenario, credentials_map):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_build_pool_from_scenario_should_build_when_warnings_unset(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test the builder accepts a scenario with the optional dimension unset.
+
+        Given:
+            A complete DEFAULT scenario whose optional
+            ``strict_warnings`` dimension is left at ``None``, which
+            ``Scenario.is_complete`` excludes from its check.
+        When:
+            The builder is entered.
+        Then:
+            It should yield an entered pool rather than raising.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario()
+            assert scenario.strict_warnings is None
+            assert scenario.is_complete
+
+            # Act & assert
+            async with build_pool_from_scenario(scenario, credentials_map) as pool:
+                assert pool is not None
 
         await retry_grpc_internal(body)
 
