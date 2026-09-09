@@ -588,7 +588,11 @@ class TestSharedSubscription:
 
         # Retrieve and clean up the fanout
         pool = __subscriber_pool__.get()
-        subscriber = pool._cache["test-key"].obj
+        # The suspended iterator holds its own reference, so this hold
+        # never drops the count to zero and the zero-TTL pool keeps the
+        # subscriber cached when the block exits.
+        async with pool.get("test-key") as subscriber:
+            pass
         fanout = _SharedSubscription._fanouts.get(subscriber)
         await fanout.cleanup()
 

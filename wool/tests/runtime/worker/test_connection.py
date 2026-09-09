@@ -3,6 +3,7 @@ import logging
 import pickle
 import threading
 from contextlib import AsyncExitStack
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -24,6 +25,7 @@ from wool.runtime.context.exceptions import SerializationWarning
 from wool.runtime.context.var import ContextVar
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker import connection as connection_module
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
@@ -103,6 +105,38 @@ def _secure_provider(peers=None) -> WorkerCredentialsProvider:
         ca_cert=b"ca", worker_key=b"key", worker_cert=b"cert"
     )
     return WorkerCredentialsProvider(lambda: credentials, peers=peers)
+
+
+@asynccontextmanager
+async def _channel_pool_lock():
+    """Hold the calling loop's channel-pool lock for the duration of the block.
+
+    The one place these tests reach past the public API, and deliberately
+    so: a test that needs a pool operation to suspend mid-flight has no
+    public lever for it. The channel factory is synchronous, so no factory
+    call can be made to block, and every public entry point acquires and
+    releases the lock within a single await — leaving the partition's own
+    lock as the only way to park a release where a test can observe it.
+
+    Yields a ``release`` callable so a test can free the lock at a chosen
+    point in the block; the block's exit releases it if the test did not,
+    so a failed assertion cannot leave the pool wedged for the rest of the
+    session.
+    """
+    lock = connection_module._channel_pool._partition()._lock
+    await lock.acquire()
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            lock.release()
+
+    try:
+        yield release
+    finally:
+        release()
 
 
 class _MockRpcError(grpc.RpcError):
@@ -2476,8 +2510,6 @@ class TestWorkerConnection:
             despite the caller's pending cancellation.
         """
         # Arrange
-        from wool.runtime.worker import connection as connection_module
-
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
@@ -2490,12 +2522,9 @@ class TestWorkerConnection:
             "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
         )
         stream = await connection.dispatch(sample_task)
-        pool = connection_module._channel_pool
 
         # Act
-        await pool._lock.acquire()
-        lock_released = False
-        try:
+        async with _channel_pool_lock() as release_lock:
 
             async def consume():
                 async for _ in stream:
@@ -2505,13 +2534,9 @@ class TestWorkerConnection:
             for _ in range(5):
                 await asyncio.sleep(0)
             task.cancel()
-            pool._lock.release()
-            lock_released = True
+            release_lock()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        finally:
-            if not lock_released:
-                pool._lock.release()
 
         # Assert
         assert connection_module.channel_pool_stats().referenced_entries == 0
@@ -2536,8 +2561,6 @@ class TestWorkerConnection:
             despite the worker-induced pending cancellation.
         """
         # Arrange
-        from wool.runtime.worker import connection as connection_module
-
         cancellation = asyncio.CancelledError("worker self-raised cancel")
         responses = (
             protocol.Response(ack=protocol.Ack()),
@@ -2553,12 +2576,9 @@ class TestWorkerConnection:
             "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
         )
         stream = await connection.dispatch(sample_task)
-        pool = connection_module._channel_pool
 
         # Act
-        await pool._lock.acquire()
-        lock_released = False
-        try:
+        async with _channel_pool_lock() as release_lock:
 
             async def consume():
                 async for _ in stream:
@@ -2567,13 +2587,9 @@ class TestWorkerConnection:
             task = asyncio.ensure_future(consume())
             for _ in range(5):
                 await asyncio.sleep(0)
-            pool._lock.release()
-            lock_released = True
+            release_lock()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        finally:
-            if not lock_released:
-                pool._lock.release()
 
         # Assert
         assert connection_module.channel_pool_stats().referenced_entries == 0
@@ -2597,8 +2613,6 @@ class TestWorkerConnection:
             re-raised without leaking the pooled reference.
         """
         # Arrange
-        from wool.runtime.worker import connection as connection_module
-
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
@@ -2640,8 +2654,6 @@ class TestWorkerConnection:
             task, and a timeout warning should be logged.
         """
         # Arrange
-        from wool.runtime.worker import connection as connection_module
-
         # Contend the pool lock on a fresh instance, and shorten the
         # teardown budget so the wedge resolves quickly.
         mocker.patch.object(connection_module, "_TEARDOWN_TIMEOUT", 0.1)
@@ -2657,12 +2669,10 @@ class TestWorkerConnection:
             "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
         )
         stream = await connection.dispatch(sample_task)
-        pool = connection_module._channel_pool
 
         # Act — hold the pool lock so the release wedges; the caller must
         # unblock at the timeout instead of hanging.
-        await pool._lock.acquire()
-        try:
+        async with _channel_pool_lock():
 
             async def consume():
                 async for _ in stream:
@@ -2672,11 +2682,9 @@ class TestWorkerConnection:
                 logging.WARNING, logger="wool.runtime.worker.connection"
             ):
                 await asyncio.wait_for(consume(), timeout=5)
-        finally:
-            pool._lock.release()
-            # Let the detached teardown task finish now the lock is free.
-            for _ in range(5):
-                await asyncio.sleep(0)
+        # Let the detached teardown task finish now the lock is free.
+        for _ in range(5):
+            await asyncio.sleep(0)
 
         # Assert — the caller unblocked and the timeout was reported.
         assert any("teardown exceeded" in r.getMessage() for r in caplog.records)
@@ -3430,6 +3438,7 @@ class TestWorkerConnection:
             dangling pool references prevented finalization.
         """
         # Arrange
+
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
@@ -3475,6 +3484,7 @@ class TestWorkerConnection:
             pool reference was released despite the error.
         """
         # Arrange
+
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(
@@ -3521,6 +3531,7 @@ class TestWorkerConnection:
             finalizer.
         """
         # Arrange
+
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
@@ -5259,6 +5270,7 @@ async def test_clear_channel_pool_should_close_cached_channels(
         would build a fresh channel.
     """
     # Arrange
+
     responses = (
         protocol.Response(ack=protocol.Ack()),
         protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
@@ -5284,7 +5296,7 @@ async def test_clear_channel_pool_should_close_cached_channels(
 
 
 def test_dispatch_should_open_fresh_channel_when_run_on_a_later_loop(
-    mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    mocker: MockerFixture, sample_task, async_stream, mock_grpc_call, caplog
 ):
     """Test the channel pool hands a later loop a channel of its own.
 
@@ -5296,9 +5308,11 @@ def test_dispatch_should_open_fresh_channel_when_run_on_a_later_loop(
         A dispatch to the same target runs on a fresh event loop.
     Then:
         It should open a new channel rather than reuse the one the closed
-        loop left -- that entry is dropped, and its ``close`` is never
-        awaited, since a grpc.aio channel cannot be closed from another
-        loop -- leaving the pool with exactly one cached entry.
+        loop left -- that partition is swept, reported in a single warning
+        naming the channel factory and the one idle entry it dropped, and
+        its ``close`` is never awaited, since a grpc.aio channel cannot be
+        closed from another loop -- leaving the new loop with exactly one
+        cached entry.
     """
     # Arrange
     channel_a, channel_b = mocker.AsyncMock(), mocker.AsyncMock()
@@ -5321,36 +5335,25 @@ def test_dispatch_should_open_fresh_channel_when_run_on_a_later_loop(
         )
         async for _ in await connection.dispatch(sample_task):
             pass
+        return channel_pool_stats().total_entries
 
     # Act
-    asyncio.run(dispatch_once())
-    entries_after_first = channel_pool_stats().total_entries
-    asyncio.run(dispatch_once())
+    entries_after_first = asyncio.run(dispatch_once())
+    with caplog.at_level(logging.WARNING, logger="wool.runtime.resourcepool"):
+        entries_after_second = asyncio.run(dispatch_once())
 
     # Assert
     assert entries_after_first == 1
     assert insecure_channel.call_count == 2
     channel_a.close.assert_not_awaited()
-    assert channel_pool_stats().total_entries == 1
-
-
-@pytest.mark.asyncio
-async def test_clear_channel_pool_should_not_raise_when_pool_empty():
-    """Test `clear_channel_pool` is a no-op when the pool is empty.
-
-    Given:
-        A module-wide channel pool with no cached entries (the
-        autouse ``_clear_channel_pool`` fixture clears the pool
-        between tests, so this test starts from an empty pool).
-    When:
-        `clear_channel_pool` is awaited.
-    Then:
-        It should return without raising — clearing an empty pool
-        is a legitimate operation and must not surface a
-        ``KeyError`` or similar.
-    """
-    # Act & assert — must not raise
-    await clear_channel_pool()
+    assert entries_after_second == 1
+    swept = [
+        record.getMessage()
+        for record in caplog.records
+        if "_channel_factory" in record.getMessage()
+    ]
+    assert len(swept) == 1
+    assert "0 referenced and 1 idle" in swept[0]
 
 
 @pytest.mark.asyncio
@@ -5401,17 +5404,18 @@ async def test_channel_pool_hold_should_close_channels_when_last_hold_released(
     dispatching_stub,
     pooled_channel,
 ):
-    """Test the loop's idle channels close once its last hold is released.
+    """Test a loop's idle channels close once its last channel-pool hold is released.
 
     Given:
-        Two nested holds on the channel pool and an idle channel the
-        pool cached for a dispatch made while both were open.
+        Two nested holds on the calling loop's channel pool and an idle
+        channel the pool cached for a dispatch made while both were open.
     When:
         The inner hold is released, then the outer one.
     Then:
         It should leave the channel open after the inner release and
-        close it exactly once after the outer, emptying the pool: a
-        hold nested inside another retires nothing on its own.
+        close it exactly once after the outer, emptying the loop's
+        partition, so a proxy nested inside another never closes
+        channels the outer one still uses.
     """
     # Arrange
     connection = WorkerConnection(
@@ -5478,17 +5482,16 @@ async def test_channel_pool_hold_should_defer_close_when_dispatch_holds_channel(
     """Test a hold released mid-dispatch leaves the in-flight channel open.
 
     Given:
-        A single hold on the channel pool and a dispatch started under
-        it whose result stream is primed but not yet drained, so the
-        dispatch still references the pooled channel.
+        A single hold on the calling loop's channel pool and a dispatch
+        started under it whose result stream is primed but not yet
+        drained, so the dispatch still references the pooled channel.
     When:
         The hold is released and the dispatch is then drained to
         completion.
     Then:
-        It should leave the channel open at the release — the
-        dispatch's own reference outlives the hold — and close it
-        exactly once when that last reference is dropped, leaving the
-        pool empty.
+        It should leave the channel open at the release — the dispatch's
+        own reference outlives the hold — and close it exactly once when
+        that last reference is dropped, leaving the partition empty.
     """
     # Arrange
     connection = WorkerConnection(
@@ -5575,3 +5578,22 @@ async def test_channel_pool_hold_should_propagate_cancellation_when_close_cancel
     # Assert
     pooled_channel.close.assert_awaited_once()
     assert channel_pool_stats().total_entries == 0
+
+
+@pytest.mark.asyncio
+async def test_clear_channel_pool_should_not_raise_when_pool_empty():
+    """Test `clear_channel_pool` is a no-op when the pool is empty.
+
+    Given:
+        A module-wide channel pool with no cached entries (the
+        autouse ``_clear_channel_pool`` fixture clears the pool
+        between tests, so this test starts from an empty pool).
+    When:
+        `clear_channel_pool` is awaited.
+    Then:
+        It should return without raising — clearing an empty pool
+        is a legitimate operation and must not surface a
+        ``KeyError`` or similar.
+    """
+    # Act & assert — must not raise
+    await clear_channel_pool()

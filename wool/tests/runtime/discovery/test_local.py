@@ -8,6 +8,7 @@ import sys
 import threading
 import uuid
 from collections import Counter
+from contextlib import AsyncExitStack
 from contextlib import ExitStack
 from contextlib import asynccontextmanager
 from contextlib import contextmanager
@@ -2138,6 +2139,79 @@ class TestLocalDiscoveryPublisher:
                 block_registered = registered[baseline:]
                 assert block_registered == unregistered
                 assert len(block_registered) == 2
+
+    @pytest.mark.asyncio
+    async def test_publish_should_finalize_every_block_when_the_publisher_exits(
+        self, namespace, atexit_recorder
+    ):
+        """Test exiting the publisher releases every block still published.
+
+        Given:
+            A Publisher in an owner discovery context with two workers
+            published and never dropped, with atexit registration
+            wrapped in recording pass-throughs
+        When:
+            The publisher's context exits
+        Then:
+            It should unregister both blocks' fallbacks, pairing each
+            registration with its unregistration.
+        """
+        # Arrange
+        registered, unregistered = atexit_recorder
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:5005{i}",
+                pid=100 + i,
+                version="1.0",
+            )
+            for i in range(2)
+        ]
+
+        with LocalDiscovery(namespace):
+            baseline = len(registered)
+            publisher = LocalDiscovery.Publisher(namespace)
+            stack = AsyncExitStack()
+            await stack.enter_async_context(publisher)
+            for worker in workers:
+                await publisher.publish("worker-added", worker)
+            unregistered_before = list(unregistered)
+
+            # Act
+            await stack.aclose()
+
+            # Assert
+            block_registered = registered[baseline:]
+            assert len(block_registered) == 2
+            assert unregistered_before == []
+            assert sorted(map(id, block_registered)) == sorted(map(id, unregistered))
+
+    @pytest.mark.asyncio
+    async def test_publish_should_ignore_a_drop_for_a_worker_never_added(
+        self, namespace, metadata, atexit_recorder
+    ):
+        """Test dropping an unknown worker is a no-op.
+
+        Given:
+            A Publisher in an owner discovery context that never
+            published the worker
+        When:
+            worker-dropped is published for it
+        Then:
+            It should return without raising and touch no atexit
+            registration.
+        """
+        # Arrange
+        registered, unregistered = atexit_recorder
+        with LocalDiscovery(namespace):
+            baseline = (len(registered), len(unregistered))
+            publisher = LocalDiscovery.Publisher(namespace)
+            async with publisher:
+                # Act
+                await publisher.publish("worker-dropped", metadata)
+
+                # Assert
+                assert (len(registered), len(unregistered)) == baseline
 
     @pytest.mark.asyncio
     async def test_publish_should_complete_drop_when_block_already_unlinked(
