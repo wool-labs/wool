@@ -9,6 +9,7 @@ express.
 
 import asyncio
 import logging
+import threading
 import uuid
 
 import pytest
@@ -44,6 +45,11 @@ _RESOURCEPOOL_LOGGER = "wool.runtime.resourcepool"
 #: probe still finds the proxy alive.
 _PROXY_POOL_TTL = 1.0
 
+#: Seconds to wait for a barrier the other thread may never reach, so a
+#: failure in one concurrent loop surfaces as a broken barrier rather
+#: than a hung test.
+_BARRIER_TIMEOUT = 60.0
+
 
 #: The name a `~wool.runtime.resourcepool.ResourcePool` reports the
 #: channel pool under: its factory's. The hold pool shares the logger, so
@@ -62,20 +68,44 @@ def _resourcepool_records(caplog, *, pool=_CHANNEL_POOL):
 
 
 async def _records_after_stranding(caplog, factory):
-    """Run ``factory()`` on a foreign loop and report what its rebind drops.
+    """Run ``factory()`` on a foreign loop and report what its sweep drops.
 
     Returns the coroutine's result and the resource pool's records from
-    this loop's first channel-pool operation afterwards, which is what
-    rebinds the pool and drops whatever the stopped loop left (see
+    this loop's next channel-pool operation afterwards, which is what
+    sweeps the stopped loop's partition and drops whatever it left (see
     `wool.runtime.resourcepool.ResourcePool`).
     """
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger=_RESOURCEPOOL_LOGGER):
         result = await run_on_foreign_loop(factory)
-        # Deliberately this loop's first channel-pool operation — that
-        # is when the rebind runs.
+        # Deliberately this loop's next channel-pool operation — that
+        # is when the sweep runs.
         await clear_channel_pool()
     return result, _resourcepool_records(caplog)
+
+
+def _concurrent_lifecycle_probe(scenario, credentials_map, barrier):
+    """Build a coroutine factory that runs one pool lifecycle and reports.
+
+    The returned factory is meant for `run_on_foreign_loop`. Its
+    coroutine dispatches through a pool, waits on *barrier* so both
+    loops hold their channels at the same instant, reads the channel
+    pool's total while still inside the pool, exits, and reports
+    ``(live_total, settled_total)``.
+    """
+
+    async def probe():
+        async with build_pool_from_scenario(scenario, credentials_map):
+            assert await routines.add(1, 2) == 3
+            # Block on the barrier off-loop: both lifecycles must be
+            # holding their channels when the live total is read, or
+            # the isolation claim is untested.
+            await asyncio.to_thread(barrier.wait, _BARRIER_TIMEOUT)
+            live = channel_pool_stats().total_entries
+        settled = await poll_until_channel_pool_settles()
+        return live, settled.total_entries
+
+    return probe
 
 
 @pytest.mark.integration
@@ -176,9 +206,8 @@ class TestChannelPoolLifecycle:
             completion under ``asyncio.run`` on another thread, whose
             loop then stops.
         When:
-            This test's loop makes its first channel-pool operation,
-            which is what rebinds the pool and drops what the stopped
-            loop left.
+            This test's loop makes its next channel-pool operation,
+            which is what sweeps the stopped loop's partition.
         Then:
             It should drop nothing, reporting no record at all on the
             resource pool's logger.
@@ -216,8 +245,8 @@ class TestChannelPoolLifecycle:
             thread's loop that is never entered and never closed before
             that loop stops.
         When:
-            This test's loop makes its first channel-pool operation,
-            rebinding the pool off the stopped loop.
+            This test's loop makes its next channel-pool operation,
+            sweeping the stopped loop's partition.
         Then:
             It should report exactly one warning naming the one idle
             entry it dropped without finalizing.
@@ -251,8 +280,8 @@ class TestChannelPoolLifecycle:
             an async context manager on another thread's loop, which
             stops once the block exits.
         When:
-            This test's loop makes its first channel-pool operation,
-            rebinding the pool off the stopped loop.
+            This test's loop makes its next channel-pool operation,
+            sweeping the stopped loop's partition.
         Then:
             It should report nothing on the resource pool's logger,
             since exiting the connection retired the channel it opened.
@@ -281,8 +310,8 @@ class TestChannelPoolLifecycle:
             `wool.WorkerProxy` entered on another thread's loop, which
             stops the instant the proxy's context exits.
         When:
-            This test's loop makes its first channel-pool operation,
-            rebinding the pool off the stopped loop.
+            This test's loop makes its next channel-pool operation,
+            sweeping the stopped loop's partition.
         Then:
             It should drop nothing, and the stats read inside the proxy
             should show the completed dispatch's channel idle rather
@@ -474,5 +503,44 @@ class TestChannelPoolLifecycle:
             assert sentinel.read_text() == "cleaned_up"
             assert settled.total_entries == 0
             assert _resourcepool_records(caplog) == []
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_channel_pool_stats_should_isolate_loops_when_two_run_concurrently(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test concurrent loops each see only their own pooled channels.
+
+        Given:
+            Two one-worker pools dispatching on two loops running
+            concurrently on separate threads, synchronized so both hold
+            their channel at the same moment.
+        When:
+            Each loop reads the channel pool's totals while both are
+            live and again after its own pool exits.
+        Then:
+            It should report one entry each — never the other loop's —
+            and each loop should empty its own partition.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario(pool_mode=PoolMode.DEFAULT)
+            barrier = threading.Barrier(2)
+
+            # Act
+            first, second = await asyncio.gather(
+                run_on_foreign_loop(
+                    _concurrent_lifecycle_probe(scenario, credentials_map, barrier)
+                ),
+                run_on_foreign_loop(
+                    _concurrent_lifecycle_probe(scenario, credentials_map, barrier)
+                ),
+            )
+
+            # Assert
+            assert first == (1, 0)
+            assert second == (1, 0)
 
         await retry_grpc_internal(body)

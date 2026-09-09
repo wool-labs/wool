@@ -35,6 +35,7 @@ from wool.runtime.context.runtime import dispatch_timeout
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.runtime.worker import connection
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
@@ -117,10 +118,11 @@ async def run_on_foreign_loop(factory):
 
     Returns whatever the coroutine returns. ``asyncio.run`` closes its
     loop the moment the coroutine finishes, so whatever the coroutine
-    left in the channel pool is stranded exactly as it would be in a
-    program whose loop stops — which is the condition a stranded-channel
-    test needs. The factory is called on the worker thread so the
-    coroutine is never created on the calling loop's thread.
+    left in a loop-partitioned `~wool.runtime.resourcepool.ResourcePool`
+    is stranded exactly as it would be in a program whose loop stops —
+    which is the condition these tests are about. The factory is called
+    on the worker thread so the coroutine is never created on the
+    calling loop's thread.
     """
     return await asyncio.to_thread(lambda: asyncio.run(factory()))
 
@@ -186,6 +188,7 @@ class PoolMode(Enum):
     HYBRID = auto()
     NESTED_DEFAULT_IN_EPHEMERAL = auto()
     NESTED_EPHEMERAL_IN_EPHEMERAL = auto()
+    NESTED_RETIRED_IN_EPHEMERAL = auto()
 
 
 #: The pool modes that spawn LAN `LocalWorker` processes themselves.
@@ -196,6 +199,7 @@ _SPAWNING_MODES = frozenset(
         PoolMode.HYBRID,
         PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
         PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
+        PoolMode.NESTED_RETIRED_IN_EPHEMERAL,
     }
 )
 
@@ -465,8 +469,8 @@ async def build_pool_from_scenario(
         builder spawns itself, so a durable mode, which spawns none,
         rejects it.
     :raises ValueError:
-        If the scenario is incomplete, or ``proxy_pool_ttl`` is given
-        for a pool mode that spawns no workers.
+        If the scenario is incomplete, or ``proxy_pool_ttl`` is not
+        positive or is given for a pool mode that spawns no workers.
     """
     missing = [
         f.name
@@ -475,6 +479,8 @@ async def build_pool_from_scenario(
     ]
     if missing:
         raise ValueError(f"Scenario incomplete; missing required dimensions: {missing}")
+    if proxy_pool_ttl is not None and proxy_pool_ttl <= 0:
+        raise ValueError("proxy_pool_ttl must be positive")
     if proxy_pool_ttl is not None and scenario.pool_mode not in _SPAWNING_MODES:
         raise ValueError("proxy_pool_ttl applies only to pools that spawn LAN workers")
 
@@ -656,16 +662,37 @@ async def build_pool_from_scenario(
                         pool_kwargs["size"] = 1
                     case PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL:
                         pool_kwargs["size"] = 1
+                    case PoolMode.NESTED_RETIRED_IN_EPHEMERAL:
+                        pool_kwargs["size"] = 1
 
                 pool = WorkerPool(**pool_kwargs)
                 async with pool:
-                    if scenario.pool_mode in (
+                    if scenario.pool_mode is PoolMode.NESTED_RETIRED_IN_EPHEMERAL:
+                        # The inner pool is entered, dispatched through,
+                        # and left again before the outer pool is yielded,
+                        # so the test body runs on a loop where a nested
+                        # pool has already retired. The inner dispatch is
+                        # load-bearing: a pool that never dispatches opens
+                        # no channel, and its exit would retire nothing.
+                        nested_pool = WorkerPool(
+                            spawn=1,
+                            credentials=creds,
+                            worker=partial(LocalWorker, options=options),
+                        )
+                        async with nested_pool:
+                            assert await routines.add(1, 2) == 3
+                        yield pool
+                    elif scenario.pool_mode in (
                         PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
                         PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
                     ):
                         # Nested pool modes verify that entering a second
                         # WorkerPool context doesn't break the outer pool.
-                        # Dispatch still goes through the outer pool.
+                        # The inner pool stays entered while the test body
+                        # runs, and entering a pool makes its proxy the
+                        # ambient one, so the body's dispatches route
+                        # through the inner pool — the outer pool's job
+                        # here is to still be usable on the way out.
                         nested_size = (
                             2
                             if scenario.pool_mode
@@ -1282,6 +1309,23 @@ _NESTED_ONLY_PATTERNS = (
 # aclose scripts and the single-yield shape do not, so the pattern is
 # constrained to ASYNC_GEN_ANEXT.
 _MID_STREAM_FORWARD_SHAPES = (RoutineShape.ASYNC_GEN_ANEXT,)
+# The two halves of the D2/D3 constraint, hoisted so ``_pairwise_filter``
+# and ``scenarios_strategy`` read them from one place: a pool mode added
+# to one list and forgotten in the other would let the strategy generate
+# rows the pairwise array rejects (or the reverse).
+_DISCOVERY_REQUIRED_POOL_MODES = (
+    PoolMode.HYBRID,
+    PoolMode.DURABLE_JOINED,
+)
+_DISCOVERY_FORBIDDEN_POOL_MODES = (
+    PoolMode.DEFAULT,
+    PoolMode.EPHEMERAL,
+    PoolMode.DURABLE,
+    PoolMode.DURABLE_SHARED,
+    PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
+    PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
+    PoolMode.NESTED_RETIRED_IN_EPHEMERAL,
+)
 
 
 def _is_grpc_internal(exc: BaseException) -> bool:
@@ -1323,18 +1367,8 @@ def _pairwise_filter(row):
     if len(row) > 2:
         pool_mode = row[1]
         discovery = row[2]
-        needs_discovery = pool_mode in (
-            PoolMode.HYBRID,
-            PoolMode.DURABLE_JOINED,
-        )
-        forbids_discovery = pool_mode in (
-            PoolMode.DEFAULT,
-            PoolMode.EPHEMERAL,
-            PoolMode.DURABLE,
-            PoolMode.DURABLE_SHARED,
-            PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
-            PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
-        )
+        needs_discovery = pool_mode in _DISCOVERY_REQUIRED_POOL_MODES
+        forbids_discovery = pool_mode in _DISCOVERY_FORBIDDEN_POOL_MODES
         if needs_discovery and discovery is DiscoveryFactory.NONE:
             return False
         if forbids_discovery and discovery is not DiscoveryFactory.NONE:
@@ -1520,18 +1554,8 @@ def scenarios_strategy(draw):
     shape = draw(st.sampled_from(RoutineShape))
     pool_mode = draw(st.sampled_from(PoolMode))
 
-    needs_discovery = pool_mode in (
-        PoolMode.HYBRID,
-        PoolMode.DURABLE_JOINED,
-    )
-    forbids_discovery = pool_mode in (
-        PoolMode.DEFAULT,
-        PoolMode.EPHEMERAL,
-        PoolMode.DURABLE,
-        PoolMode.DURABLE_SHARED,
-        PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
-        PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
-    )
+    needs_discovery = pool_mode in _DISCOVERY_REQUIRED_POOL_MODES
+    forbids_discovery = pool_mode in _DISCOVERY_FORBIDDEN_POOL_MODES
 
     if pool_mode is PoolMode.DURABLE_JOINED:
         discovery = draw(st.sampled_from(list(_LOCAL_FACTORIES)))
@@ -1663,6 +1687,41 @@ def credentials_map(test_certificates):
             mutual=False,
         ),
     }
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Record each phase's report on the item so a fixture can read the outcome."""
+    outcome = yield
+    setattr(item, f"rep_{call.when}", outcome.get_result())
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clear_channel_pool(request):
+    """Fail a test that leaves a gRPC channel cached, then clear the pool.
+
+    Every construct that opens a channel — a pool, a proxy, a bare
+    `WorkerConnection` — owns closing it, so a test that ends with
+    channels still cached on its loop has stranded one: the pool sweeps
+    and reports what a stopped loop leaves behind, but never closes it.
+    The gate makes that a failure of the test that caused it rather than
+    a warning attributed to whichever test runs next, and it stands down
+    for a test that already failed, whose leftovers are a symptom rather
+    than a second finding. The clear still runs either way, so one leak
+    does not cascade into the rest of the suite; the holds pool is
+    cleared first, so a hold a test left open is not reported against
+    the next test either. The holds pool has no public teardown — a hold
+    is released only by its holder — so this is the one place the suite
+    reaches into ``connection`` for it.
+    """
+    yield
+    try:
+        call = getattr(request.node, "rep_call", None)
+        if call is None or call.passed:
+            await poll_until_channel_pool_settles()
+    finally:
+        await connection._channel_pool_holds.clear()
+        await connection.clear_channel_pool()
 
 
 # Integration tests rely on pytest-asyncio's Task-per-test scoping

@@ -31,6 +31,7 @@ from .conftest import TimeoutKind
 from .conftest import WorkerOptionsKind
 from .conftest import _DirectDiscovery
 from .conftest import build_pool_from_scenario
+from .conftest import default_scenario
 from .conftest import invoke_routine
 
 
@@ -571,6 +572,93 @@ class TestPoolComposition:
                 ctx_var_3=ContextVarPattern.NONE,
                 quorum=QuorumMode.DEFAULT,
             )
+
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_build_pool_from_scenario_should_return_result_when_nested_default(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test building a pool with NESTED_DEFAULT_IN_EPHEMERAL mode.
+
+        Given:
+            A complete scenario nesting a one-worker pool inside the
+            builder's outer pool, with the inner pool still entered
+            while the routine is dispatched.
+        When:
+            A pool is built and a coroutine routine is dispatched.
+        Then:
+            It should return the correct result.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario(pool_mode=PoolMode.NESTED_DEFAULT_IN_EPHEMERAL)
+
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_build_pool_from_scenario_should_return_result_when_nested_ephemeral(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test building a pool with NESTED_EPHEMERAL_IN_EPHEMERAL mode.
+
+        Given:
+            A complete scenario nesting a two-worker pool inside the
+            builder's outer pool, with the inner pool still entered
+            while the routine is dispatched.
+        When:
+            A pool is built and a coroutine routine is dispatched.
+        Then:
+            It should return the correct result.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario(pool_mode=PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL)
+
+            # Act
+            async with build_pool_from_scenario(scenario, credentials_map):
+                result = await invoke_routine(scenario)
+
+            # Assert
+            assert result == 3
+
+        await retry_grpc_internal(body)
+
+    @pytest.mark.asyncio
+    async def test_build_pool_from_scenario_should_return_result_when_nested_retired(
+        self, credentials_map, retry_grpc_internal
+    ):
+        """Test building a pool with NESTED_RETIRED_IN_EPHEMERAL mode.
+
+        Given:
+            A complete scenario whose inner pool has already dispatched
+            and exited before the outer pool is yielded, so the routine
+            runs on a loop where a nested pool has retired.
+        When:
+            A pool is built and a coroutine routine is dispatched.
+        Then:
+            It should return the correct result.
+        """
+
+        async def body():
+            # Arrange
+            scenario = default_scenario(pool_mode=PoolMode.NESTED_RETIRED_IN_EPHEMERAL)
 
             # Act
             async with build_pool_from_scenario(scenario, credentials_map):
