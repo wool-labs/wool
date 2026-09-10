@@ -318,6 +318,13 @@ async def test_current_task_should_track_caller_when_variable_nesting_depth(
     assert current_task() is None
 
 
+class _Outer:
+    """Holds a nested exception class whose qualified name differs from its name."""
+
+    class Inner(Exception):
+        pass
+
+
 class TestTask:
     """Tests for :py:class:`Task`."""
 
@@ -570,6 +577,37 @@ class TestTask:
         assert task.exception is not None
         assert task.exception.type == "RuntimeError"
         assert any("runtime error" in line for line in task.exception.traceback)
+
+    @pytest.mark.asyncio
+    async def test___exit___should_record_the_qualified_name_when_exception_class_is_nested(  # noqa: E501
+        self, sample_task
+    ):
+        """Test __exit__ records the exception class's qualified name.
+
+        Given:
+            A :py:class:`Task` context manager and an exception class
+            defined inside another class.
+        When:
+            That exception is raised inside the ``with`` block.
+        Then:
+            It should attach a :py:class:`TaskException` whose type is
+            the class's qualified name, not its bare name.
+        """
+        # Arrange
+        task = sample_task()
+
+        # Act
+        async def run_with_exception():
+            with pytest.raises(_Outer.Inner):
+                with task:
+                    await asyncio.sleep(0)
+                    raise _Outer.Inner("nested error")
+
+        await run_with_exception()
+
+        # Assert
+        assert task.exception is not None
+        assert task.exception.type == "_Outer.Inner"
 
     @settings(max_examples=50, deadline=None)
     @given(

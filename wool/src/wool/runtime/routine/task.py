@@ -218,9 +218,9 @@ class Task(Generic[W]):
             False to allow exceptions to propagate.
         """
         logging.debug(f"Exiting {self.__class__.__name__} with ID {self.id}")
-        if exception_value:
+        if exception_value is not None:
             self.exception = TaskException(
-                exception_type.__qualname__,
+                type(exception_value).__qualname__,
                 traceback=[
                     y
                     for x in traceback.format_exception(
