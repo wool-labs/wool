@@ -6,6 +6,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from types import MappingProxyType
+from types import SimpleNamespace
 from typing import Any
 from typing import Callable
 from typing import Coroutine
@@ -120,11 +121,16 @@ def _reap_worker_loops():
     fixtures, so a loop those fixtures already closed (e.g.,
     `worker_loop`) reads back closed and is skipped — only genuinely
     leaked worker loops are stopped. A multi-generation residual-task
-    drain — matching the production finalizer
-    `WorkerService._destroy_worker_loop`, so a cancelled task's
-    follow-up cleanup is drained rather than stranded — then a stop is
-    scheduled onto the loop, and the worker thread closes it once
-    ``run_forever`` returns.
+    drain — cancelling whatever is pending and polling until nothing
+    is, so a cancelled task's follow-up cleanup is drained rather than
+    stranded — then a stop is scheduled onto the loop, and the worker
+    thread closes it once ``run_forever`` returns. The drain cancels
+    each task once and waits with `asyncio.wait` rather than gathering,
+    because a service stop still in flight runs the production drain
+    `WorkerService._destroy_worker_loop` on the same loop, and two
+    drains that gather each other recurse without bound on any cancel;
+    re-cancelling a task on every pass would re-interrupt cleanup that
+    needs more than one.
     """
     yield
     leaked = [
@@ -143,29 +149,29 @@ def _reap_worker_loops():
             # that second generation, surfacing the intermittent
             # "Task was destroyed but it is pending!" warning.
             current = asyncio.current_task()
-            deadline = asyncio.get_running_loop().time() + 5.0
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.0
+            cancelled: set[asyncio.Task] = set()
             try:
-                while True:
-                    pending = [t for t in asyncio.all_tasks() if t is not current]
+                # Cancel once and wait, never gather -- see the fixture
+                # docstring.
+                while (remaining := deadline - loop.time()) > 0:
+                    pending = {t for t in asyncio.all_tasks() if t is not current}
                     if not pending:
                         break
-                    for task in pending:
+                    for task in pending - cancelled:
                         task.cancel()
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        break
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*pending, return_exceptions=True),
-                            timeout=remaining,
-                        )
-                    except TimeoutError:
-                        break
+                    cancelled |= pending
+                    await asyncio.wait(pending, timeout=remaining)
             finally:
-                asyncio.get_running_loop().stop()
+                loop.stop()
 
+        # Held here so the shutdown task is never collected mid-drain.
+        shutdown: list[asyncio.Task] = []
         try:
-            loop.call_soon_threadsafe(lambda loop=loop: loop.create_task(_shutdown()))
+            loop.call_soon_threadsafe(
+                lambda loop=loop: shutdown.append(loop.create_task(_shutdown()))
+            )
         except RuntimeError:
             continue
         deadline = time.monotonic() + 5.0
@@ -174,24 +180,20 @@ def _reap_worker_loops():
 
 
 @pytest.fixture
-def worker_loop():
+def worker_loop(background_loops):
     """Spin up a real worker loop on a daemon thread.
 
-    The wool task factory is installed so :func:`routine_scope` can run
-    on a separate loop. Used by DispatchSession unit tests and any
-    other test that needs to cross-loop coordinate.
+    A `background_loops` loop with the wool task factory installed, so
+    `routine_scope` can run on a separate loop. Used by DispatchSession
+    unit tests and any other test that needs to cross-loop coordinate.
     """
-    loop = asyncio.new_event_loop()
-    install_task_factory(loop)
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
-    try:
-        yield loop
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=5)
-        if not loop.is_closed():
-            loop.close()
+
+    async def install():
+        install_task_factory(asyncio.get_running_loop())
+
+    handle = background_loops()
+    handle.run(install())
+    return handle.loop
 
 
 @pytest.fixture
@@ -791,10 +793,12 @@ def wedged_channel_pool():
     await, leaving the partition's own lock as the only way to park a
     release where a test can observe it.
 
-    The context manager yields a ``release`` callable so a test can free
-    the lock at a chosen point in the block; the block's exit releases it
-    if the test did not, so a failed assertion cannot leave the pool
-    wedged for the rest of the session.
+    The context manager yields a wedge whose ``release()`` frees the
+    lock at a chosen point in the block and whose ``waiters()`` counts
+    the operations parked behind it, so a test can wait for a release to
+    park rather than count ticks; the block's exit releases the lock if
+    the test did not, so a failed assertion cannot leave the pool wedged
+    for the rest of the session.
 
     :returns:
         An async context manager factory.
@@ -812,8 +816,11 @@ def wedged_channel_pool():
                 released = True
                 lock.release()
 
+        def waiters() -> int:
+            return len(lock._waiters or ())
+
         try:
-            yield release
+            yield SimpleNamespace(release=release, waiters=waiters)
         finally:
             release()
 
