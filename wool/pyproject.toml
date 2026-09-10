@@ -44,7 +44,7 @@ dev = [
     "debugpy",
     "gitpython",
     "hypothesis",
-    "pyright",
+    "pyright==1.1.413",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
