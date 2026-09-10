@@ -11,6 +11,8 @@ so the handler can drive a real :func:`scoped` routine across loops.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextlib
 import gc
 import threading
 import weakref
@@ -104,6 +106,33 @@ async def _gen_blocks_in_step():
     yield "never"
 
 
+# Module-level Event gating the two release routines below, module-level
+# for the same reason as ``_STEP_BLOCKING``: the routine is pickled by
+# reference and resolves this global on the worker side. It holds the
+# routine at an await so a test can settle everything else — a parked
+# worker loop, a cancelled drain — before the worker task terminates.
+_RELEASE = threading.Event()
+
+
+async def _coro_returns_on_release():
+    """Coroutine that suspends until ``_RELEASE`` is set, then returns."""
+    for _ in range(500):
+        if _RELEASE.is_set():
+            break
+        await asyncio.sleep(0.01)
+    return "released"
+
+
+async def _coro_raises_on_release():
+    """Coroutine that suspends until ``_RELEASE`` is set, then raises
+    :class:`_RoutineFailure`."""
+    for _ in range(500):
+        if _RELEASE.is_set():
+            break
+        await asyncio.sleep(0.01)
+    raise _RoutineFailure("release signal")
+
+
 async def _gen_yielding_unpicklable():
     """Async generator that yields a non-cloudpickle-serializable
     object so the dispatch handler's :meth:`_Response.to_protobuf`
@@ -195,6 +224,109 @@ async def _stream(*requests):
     """Build an async iterator over *requests*."""
     for r in requests:
         yield r
+
+
+async def _record_loop_exceptions(loop) -> list[dict]:
+    """Install a recording exception handler on *loop*, returning the
+    list it appends to.
+
+    Installed from the loop's own thread, and the Event handshake makes
+    the install visible before the caller schedules anything else.
+    """
+    reported: list[dict] = []
+    installed = threading.Event()
+
+    def _install() -> None:
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        installed.set()
+
+    loop.call_soon_threadsafe(_install)
+    assert await asyncio.get_running_loop().run_in_executor(None, installed.wait, 5.0), (
+        "exception handler was never installed on the worker loop"
+    )
+    return reported
+
+
+async def _park_loop(loop) -> threading.Event:
+    """Park *loop* on a blocking callback, returning the Event that
+    releases it.
+
+    Everything queued after the returned Event is handed back waits its
+    turn behind the park, so a caller can schedule work onto the loop
+    and settle the main loop before that work runs.
+    """
+    gate = threading.Event()
+    parked = threading.Event()
+
+    def _park() -> None:
+        parked.set()
+        gate.wait(5.0)
+
+    loop.call_soon_threadsafe(_park)
+    assert await asyncio.get_running_loop().run_in_executor(None, parked.wait, 5.0), (
+        "worker loop was never parked"
+    )
+    return gate
+
+
+async def _cancel_drain(handler) -> None:
+    """Cancel a drain awaiting *handler*'s worker-completion future,
+    leaving that future cancelled.
+
+    A repeat drain re-raises only when the future itself is cancelled —
+    a worker that *died* cancelled is swallowed — so the trailing check
+    pins the arrangement rather than letting a caller pass vacuously.
+    """
+    drain_task = asyncio.create_task(handler.drain())
+    await asyncio.sleep(0.05)
+    drain_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await drain_task
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(handler.drain(), timeout=2.0)
+
+
+@contextlib.asynccontextmanager
+async def _drain_cancelled_session(handler):
+    """Enter *handler* and, on exit, swallow the teardown's own
+    cancellation.
+
+    Teardown of a session whose drain was cancelled re-raises, because
+    :meth:`drain` re-raises on a cancelled worker-completion future. A
+    plain ``contextlib.suppress`` around the ``async with`` would let
+    that teardown cancellation replace — and hide — a failure raised by
+    the body, so only the exit call is suppressed here.
+    """
+    await handler.__aenter__()
+    try:
+        yield handler
+    finally:
+        with contextlib.suppress(
+            asyncio.CancelledError, concurrent.futures.CancelledError
+        ):
+            await handler.__aexit__(None, None, None)
+
+
+async def _barrier(loop) -> None:
+    """Wait for *loop* to run every callback queued ahead of this one —
+    a completed task's done callback included, by FIFO order."""
+    settled = threading.Event()
+    loop.call_soon_threadsafe(settled.set)
+    assert await asyncio.get_running_loop().run_in_executor(None, settled.wait, 5.0), (
+        "worker loop never drained its queued callbacks"
+    )
+
+
+async def _await_worker_quiescence(loop) -> None:
+    """Wait for *loop* to have no tasks left, then for its callback
+    queue to drain."""
+    for _ in range(500):
+        if not asyncio.all_tasks(loop=loop):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("worker loop never finished its tasks")
+    await _barrier(loop)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,6 +1218,189 @@ class TestDispatchSession:
         finally:
             await handler.__aexit__(None, None, None)
 
+    @pytest.mark.asyncio
+    async def test___aiter___should_not_fault_the_loop_when_scheduling_fails_post_drain(
+        self, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test the worker scheduling-failure path tolerates a
+        worker-completion future the drain already cancelled.
+
+        Given:
+            A handler whose worker loop's
+            :meth:`asyncio.AbstractEventLoop.create_task` raises, parked
+            so a cancelled :meth:`drain` cancels the worker-completion
+            future before the scheduling callback runs
+        When:
+            The loop is released and that callback settles the creation
+            failure onto the cancelled future
+        Then:
+            The worker loop should report nothing at all.
+        """
+        # Arrange — manage the worker loop in-test so we can patch its
+        # ``create_task`` and record what it reports.
+        reported: list[dict] = []
+        loop = asyncio.new_event_loop()
+        install_task_factory(loop)
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+
+        gate: threading.Event | None = None
+        task = _make_task(_coro_returning_default)
+        stream = _stream(_request_for(task))
+        handler = DispatchSession(stream, loop)
+        try:
+            mocker.patch.object(
+                loop,
+                "create_task",
+                side_effect=RuntimeError(
+                    "simulated late-loop-closure / task-factory failure"
+                ),
+            )
+
+            async with _drain_cancelled_session(handler):
+                gate = await _park_loop(loop)
+                # Lazy scheduling queues the worker behind the park.
+                aiter(handler)
+                await _cancel_drain(handler)
+
+                # Act
+                gate.set()
+
+            # Wait for the scheduling callback to have run.
+            await _barrier(loop)
+
+            # Assert
+            assert not reported, reported
+        finally:
+            if gate is not None:
+                gate.set()
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            if not loop.is_closed():
+                loop.close()
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_raise_cancelled_when_the_worker_raises(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test a response read pending across a cancelled drain
+        surfaces cancellation rather than the worker's own failure.
+
+        Given:
+            A handler with a pending response read whose worker is
+            still unscheduled on a parked worker loop and whose
+            :meth:`drain` was cancelled, leaving the worker-completion
+            future cancelled
+        When:
+            The loop is released and the routine runs to its failure,
+            whose settle onto that future is refused
+        Then:
+            The pending read should raise
+            :class:`asyncio.CancelledError` within a bounded wait —
+            the drain's cancellation, not the routine's failure and
+            not an indefinite hang.
+        """
+        # Arrange
+        _RELEASE.clear()
+        task = _make_task(_coro_raises_on_release)
+        stream = _stream(_request_for(task))
+        handler = DispatchSession(stream, worker_loop)
+
+        async with _drain_cancelled_session(handler):
+            gate = await _park_loop(worker_loop)
+            iterator = aiter(handler)
+            pull = asyncio.ensure_future(anext(iterator))
+            try:
+                await _cancel_drain(handler)
+
+                # Act
+                gate.set()
+                _RELEASE.set()
+
+                # Assert
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(pull, timeout=5.0)
+            finally:
+                gate.set()
+                _RELEASE.set()
+                if not pull.done():
+                    pull.cancel()
+                with contextlib.suppress(
+                    asyncio.CancelledError, concurrent.futures.CancelledError
+                ):
+                    await pull
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_raise_cancelled_when_scheduling_fails(
+        self, mocker: MockerFixture, mock_worker_proxy_cache
+    ):
+        """Test a response read pending across a cancelled drain
+        surfaces cancellation when the worker never starts.
+
+        Given:
+            A handler with a pending response read, whose worker loop's
+            :meth:`asyncio.AbstractEventLoop.create_task` raises, parked
+            so a cancelled :meth:`drain` cancels the worker-completion
+            future before the scheduling callback runs
+        When:
+            The loop is released and that callback settles the creation
+            failure onto the cancelled future
+        Then:
+            The pending read should raise
+            :class:`asyncio.CancelledError` within a bounded wait, and
+            a repeat :meth:`drain` should re-raise promptly.
+        """
+        # Arrange — manage the worker loop in-test so we can patch its
+        # ``create_task``.
+        loop = asyncio.new_event_loop()
+        install_task_factory(loop)
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+
+        gate: threading.Event | None = None
+        task = _make_task(_coro_returning_default)
+        stream = _stream(_request_for(task))
+        handler = DispatchSession(stream, loop)
+        try:
+            mocker.patch.object(
+                loop,
+                "create_task",
+                side_effect=RuntimeError(
+                    "simulated late-loop-closure / task-factory failure"
+                ),
+            )
+
+            async with _drain_cancelled_session(handler):
+                gate = await _park_loop(loop)
+                iterator = aiter(handler)
+                pull = asyncio.ensure_future(anext(iterator))
+                try:
+                    await _cancel_drain(handler)
+
+                    # Act
+                    gate.set()
+
+                    # Assert
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(pull, timeout=5.0)
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(handler.drain(), timeout=2.0)
+                finally:
+                    if not pull.done():
+                        pull.cancel()
+                    with contextlib.suppress(
+                        asyncio.CancelledError, concurrent.futures.CancelledError
+                    ):
+                        await pull
+        finally:
+            if gate is not None:
+                gate.set()
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            if not loop.is_closed():
+                loop.close()
+
     # -- __aexit__ --------------------------------------------------------
 
     @pytest.mark.asyncio
@@ -1386,10 +1701,10 @@ class TestDispatchSession:
         """Test :meth:`drain` swallows a worker-side cancellation.
 
         Given:
-            A handler whose worker task was cancelled (its done
-            callback set ``worker_done`` to
-            :class:`asyncio.CancelledError`) but the awaiting task is
-            not itself being cancelled
+            A handler whose worker task was cancelled with no drain
+            cancellation preceding it, so its done callback settled
+            ``worker_done`` with :class:`asyncio.CancelledError`,
+            and whose awaiting task is not itself being cancelled
         When:
             :meth:`drain` is awaited
         Then:
@@ -1500,8 +1815,10 @@ class TestDispatchSession:
         handler. ``worker_done`` was never set, so :meth:`drain`
         awaited a future that would never resolve and hung
         indefinitely. Post-fix, ``_start`` catches creation
-        failures and settles ``worker_done`` with the exception
-        so :meth:`drain` unblocks.
+        failures and settles ``worker_done`` with the exception —
+        unless a cancelled drain settled it first, in which case
+        the future is already cancelled and :meth:`drain`
+        unblocks on that instead.
 
         Given:
             A handler whose worker loop's
@@ -1562,6 +1879,114 @@ class TestDispatchSession:
             thread.join(timeout=5)
             if not loop.is_closed():
                 loop.close()
+
+    @pytest.mark.asyncio
+    async def test_drain_should_not_fault_the_loop_when_the_worker_completes(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test a worker task that completes after a cancelled drain
+        leaves the worker loop clean.
+
+        Given:
+            A handler whose worker is still unscheduled on a parked
+            worker loop and whose :meth:`drain` was cancelled, leaving
+            the worker-completion future cancelled
+        When:
+            The loop is released and the worker driver reads the
+            end-of-stream that drain queued, completing normally
+        Then:
+            The worker loop should report nothing at all, and a repeat
+            :meth:`drain` should re-raise
+            :class:`asyncio.CancelledError` promptly.
+        """
+        # Arrange
+        reported = await _record_loop_exceptions(worker_loop)
+        _RELEASE.clear()
+        task = _make_task(_coro_returns_on_release)
+        stream = _stream(_request_for(task))
+        handler = DispatchSession(stream, worker_loop)
+
+        async with _drain_cancelled_session(handler):
+            gate = await _park_loop(worker_loop)
+            try:
+                # Lazy scheduling queues the worker behind the park.
+                aiter(handler)
+                await _cancel_drain(handler)
+
+                # Act
+                gate.set()
+            finally:
+                gate.set()
+                _RELEASE.set()
+
+        # Wait for the worker task to finish and its done callback to
+        # run.
+        await _await_worker_quiescence(worker_loop)
+
+        # Assert
+        assert not reported, reported
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(handler.drain(), timeout=2.0)
+
+    @pytest.mark.asyncio
+    async def test_drain_should_not_fault_the_loop_when_the_worker_raises(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test a worker task that fails after a cancelled drain leaves
+        the worker loop clean.
+
+        Given:
+            A handler whose worker is still unscheduled on a parked
+            worker loop and whose :meth:`drain` was cancelled, leaving
+            the worker-completion future cancelled
+        When:
+            The loop is released and the routine runs to its failure,
+            firing the done callback against that future
+        Then:
+            The worker loop should report nothing at all — neither an
+            ``InvalidStateError`` from the settle nor an unretrieved
+            task exception once the finished task is collected.
+        """
+        # Arrange
+        reported = await _record_loop_exceptions(worker_loop)
+        _RELEASE.clear()
+        task = _make_task(_coro_raises_on_release)
+        stream = _stream(_request_for(task))
+        handler = DispatchSession(stream, worker_loop)
+
+        async with _drain_cancelled_session(handler):
+            gate = await _park_loop(worker_loop)
+            iterator = aiter(handler)
+            pull = asyncio.ensure_future(anext(iterator))
+            try:
+                await _cancel_drain(handler)
+
+                # Act — release the loop so the worker task is created
+                # and driven to its routine failure against the
+                # already-cancelled future.
+                gate.set()
+                _RELEASE.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(pull, timeout=5.0)
+            finally:
+                gate.set()
+                _RELEASE.set()
+                if not pull.done():
+                    pull.cancel()
+                with contextlib.suppress(
+                    asyncio.CancelledError, concurrent.futures.CancelledError
+                ):
+                    await pull
+
+        # Wait for the worker task to finish and its done callback to
+        # run, then collect the finished task: an exception the callback
+        # never retrieved is reported from the task's finalizer.
+        await _await_worker_quiescence(worker_loop)
+        gc.collect()
+        await _barrier(worker_loop)
+
+        # Assert
+        assert not reported, reported
 
     # -- cancel -----------------------------------------------------------
 
@@ -1870,6 +2295,145 @@ class TestDispatchSession:
             finally:
                 if not pull.done():
                     pull.cancel()
+
+    @pytest.mark.asyncio
+    async def test_cancel_should_not_fault_the_worker_loop_when_drain_was_cancelled(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test :meth:`cancel` completes a worker task whose completion
+        future the drain already cancelled without faulting the worker
+        loop.
+
+        Given:
+            A handler whose routine is suspended mid-step and whose
+            :meth:`drain` was cancelled while awaiting the worker,
+            leaving the worker-completion future cancelled
+        When:
+            :meth:`cancel` completes the worker task, firing its done
+            callback against that already-cancelled future
+        Then:
+            The worker loop should report nothing at all.
+        """
+        # Arrange
+        reported = await _record_loop_exceptions(worker_loop)
+        _STEP_BLOCKING.clear()
+        task = _make_task(_gen_blocks_in_step)
+        stream = _stream(_request_for(task), _next_request())
+        handler = DispatchSession(stream, worker_loop)
+
+        async with _drain_cancelled_session(handler):
+            iterator = aiter(handler)
+            pull = asyncio.ensure_future(anext(iterator))
+            try:
+                # Suspend the routine inside the per-step await so the
+                # worker task cannot complete on its own — see
+                # ``test_cancel_should_preempt_routine_when_suspended_mid_step``.
+                entered = await asyncio.get_running_loop().run_in_executor(
+                    None, _STEP_BLOCKING.wait, 5.0
+                )
+                assert entered, "worker never entered the blocking step"
+                await _cancel_drain(handler)
+
+                # Act
+                await handler.cancel()
+            finally:
+                if not pull.done():
+                    pull.cancel()
+                with contextlib.suppress(
+                    asyncio.CancelledError, concurrent.futures.CancelledError
+                ):
+                    await pull
+
+        # Wait for the worker task to finish and its done callback to
+        # run.
+        await _await_worker_quiescence(worker_loop)
+
+        # Assert
+        assert not reported, reported
+
+    @pytest.mark.asyncio
+    async def test_cancel_should_release_the_worker_task_when_drain_cancelled(
+        self, worker_loop, mock_worker_proxy_cache
+    ):
+        """Test :meth:`cancel` still releases the worker driver task
+        when the settle onto the completion future is refused.
+
+        Given:
+            A handler whose routine is suspended mid-step, whose
+            :meth:`drain` was cancelled (leaving the worker-completion
+            future cancelled), with the session strongly retained and
+            automatic cyclic GC disabled
+        When:
+            :meth:`cancel` completes the worker driver task, whose done
+            callback finds the future already settled
+        Then:
+            It should let refcounting reclaim the worker driver task —
+            a weakref to it clears without a forced ``gc.collect()``
+            and without automatic collection — proving the refused
+            settle did not cost the callback its remaining work.
+        """
+        # Arrange
+        _STEP_BLOCKING.clear()
+        task = _make_task(_gen_blocks_in_step)
+        stream = _stream(_request_for(task), _next_request())
+        handler = DispatchSession(stream, worker_loop)
+
+        async with _drain_cancelled_session(handler):
+            iterator = aiter(handler)
+            pull = asyncio.ensure_future(anext(iterator))
+            entered = await asyncio.get_running_loop().run_in_executor(
+                None, _STEP_BLOCKING.wait, 5.0
+            )
+            assert entered, "worker never entered the blocking step"
+
+            # Capture the worker driver task as a public observable —
+            # ``asyncio.all_tasks`` exposes the scheduled worker task
+            # and the driver runs ``_run``, so its coroutine qualname
+            # distinguishes it from the in-flight per-step task.
+            driver = None
+            for _ in range(500):
+                drivers = [
+                    t
+                    for t in asyncio.all_tasks(loop=worker_loop)
+                    if "_run" in getattr(t.get_coro(), "__qualname__", "")
+                ]
+                if drivers:
+                    driver = drivers[0]
+                    break
+                await asyncio.sleep(0.01)
+            assert driver is not None, "worker driver task was never scheduled"
+            worker_task_ref = weakref.ref(driver)
+            del driver, drivers
+            await _cancel_drain(handler)
+
+            # Act — with automatic GC disabled, only refcounting can
+            # reclaim the finished task.
+            gc.disable()
+            try:
+                await handler.cancel()
+                with contextlib.suppress(
+                    asyncio.CancelledError, concurrent.futures.CancelledError
+                ):
+                    await asyncio.wait_for(pull, timeout=5.0)
+                del pull
+
+                # Assert
+                for _ in range(200):
+                    if worker_task_ref() is None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert worker_task_ref() is None, (
+                    "a refused settle must not cost the callback its "
+                    "remaining work — the completed worker driver task "
+                    "should be reclaimed by refcounting alone"
+                )
+            finally:
+                gc.enable()
+
+        # The session was strongly referenced throughout, so the
+        # reclamation above is attributable to the released reference,
+        # not to the session itself being collected.
+        assert handler is not None
 
     @pytest.mark.asyncio
     async def test___aiter___should_propagate_context_error_when_mid_stream_decode_fails(
