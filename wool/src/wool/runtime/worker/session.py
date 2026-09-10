@@ -663,9 +663,11 @@ class DispatchSession:
                 # at GC. Settle ``worker_done`` so `drain` does
                 # not await an unresolved future, and close the
                 # response queue so any pending
-                # `_ResponseQueue.get` returns immediately.
+                # `_ResponseQueue.get` returns immediately. Claim
+                # before settling — see ``_on_done``.
                 coro.close()
-                worker_done.set_exception(e)
+                if worker_done.set_running_or_notify_cancel():
+                    worker_done.set_exception(e)
                 response_queue.close()
                 return
             self._worker_task = task
@@ -679,20 +681,20 @@ class DispatchSession:
                 task.cancel()
 
             def _on_done(t: asyncio.Task):
-                # ``worker_done`` is the worker-completion future
-                # owned by this handler; this is its sole writer,
-                # so no done-state guard is needed. Surface
-                # cancellation as a ``CancelledError`` on the
-                # future (rather than cancelling the future
-                # itself) so the consumer side observes
-                # cancellation through the same exception channel
-                # as routine-time failures, instead of seeing it
-                # as a clean termination.
-                if t.cancelled():
-                    worker_done.set_exception(asyncio.CancelledError())
-                else:
-                    exc = t.exception()
-                    if exc is not None:
+                # Claim before settling: a cancelled `drain` cancels
+                # this future from the main loop (see `drain`), and a
+                # claimed future refuses that cancel, so whichever side
+                # moves first decides. The exception is retrieved even
+                # when the claim fails, so the task is never reported
+                # as unretrieved. Cancellation is surfaced as a
+                # ``CancelledError`` on the future rather than by
+                # cancelling it, so the consumer observes it through
+                # the same channel as routine-time failures.
+                exc = None if t.cancelled() else t.exception()
+                if worker_done.set_running_or_notify_cancel():
+                    if t.cancelled():
+                        worker_done.set_exception(asyncio.CancelledError())
+                    elif exc is not None:
                         worker_done.set_exception(exc)
                     else:
                         worker_done.set_result(None)
@@ -1272,7 +1274,9 @@ class _ResponseQueue:
         surfacing worker failures (pre-stream, routine-time, or
         cancellation) up to `DispatchSession.__aiter__` so they
         propagate to the dispatch handler's terminal-exception
-        clause.
+        clause. A ``worker_done`` a cancelled drain cancelled
+        (see `DispatchSession.drain`) raises
+        `asyncio.CancelledError`, not the worker's own failure.
 
         Awaitable on the main loop only.
         """
@@ -1287,6 +1291,13 @@ class _ResponseQueue:
             # finishes, in which case ``worker_done`` is still
             # pending — return ``None`` either way.
             if self._worker_done.done():
+                # A cancelled future is the drain's cancellation
+                # chain, not a routine failure — see `drain`. Ship it
+                # as asyncio cancellation; ``exception()`` would raise
+                # the ``Exception``-derived
+                # ``concurrent.futures.CancelledError`` instead.
+                if self._worker_done.cancelled():
+                    raise asyncio.CancelledError()
                 exc = self._worker_done.exception()
                 if exc is not None:
                     raise exc
