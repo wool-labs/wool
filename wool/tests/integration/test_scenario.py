@@ -13,6 +13,7 @@ from .conftest import QuorumMode
 from .conftest import RoutineBinding
 from .conftest import RoutineShape
 from .conftest import Scenario
+from .conftest import StrictWarnings
 from .conftest import TimeoutKind
 from .conftest import WorkerOptionsKind
 
@@ -153,6 +154,40 @@ class TestScenario:
         # Act & assert
         assert scenario.is_complete is False
 
+    def test_is_complete_should_return_true_when_strict_warnings_unset(self):
+        """Test that the optional dimension is excluded from completeness.
+
+        Given:
+            A scenario with all 14 required dimensions set and the
+            optional ``strict_warnings`` dimension left unset.
+        When:
+            ``is_complete`` is checked.
+        Then:
+            It should return True — the optional documentation
+            dimension is not required configuration.
+        """
+        # Arrange
+        scenario = Scenario(
+            shape=RoutineShape.COROUTINE,
+            pool_mode=PoolMode.DEFAULT,
+            discovery=DiscoveryFactory.NONE,
+            lb=LbFactory.CLASS_REF,
+            credential=CredentialType.INSECURE,
+            options=WorkerOptionsKind.DEFAULT,
+            timeout=TimeoutKind.NONE,
+            binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.LAZY,
+            backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.NONE,
+            ctx_var_2=ContextVarPattern.NONE,
+            ctx_var_3=ContextVarPattern.NONE,
+            quorum=QuorumMode.DEFAULT,
+        )
+
+        # Act & assert
+        assert scenario.strict_warnings is None
+        assert scenario.is_complete is True
+
     def test___str___with_partial_fields(self):
         """Test string representation with some fields set.
 
@@ -233,4 +268,46 @@ class TestScenario:
         assert result == (
             "COROUTINE-DEFAULT-LOCAL_DIRECT-CLASS_REF-INSECURE-DEFAULT-"
             "NONE-MODULE_FUNCTION-EAGER-NONE-ROUND_TRIP-LOCAL_RESET-PER_YIELD-DEFAULT"
+        )
+
+    def test___str___should_append_a_segment_when_strict_warnings_set(self):
+        """Test string representation when the optional dimension is set.
+
+        Given:
+            A scenario with every required dimension set plus the
+            optional ``strict_warnings`` dimension.
+        When:
+            Converted to string.
+        Then:
+            The result should carry a fifteenth segment naming the
+            optional member, appended after the required ones.
+        """
+        # Arrange
+        scenario = Scenario(
+            shape=RoutineShape.COROUTINE,
+            pool_mode=PoolMode.DEFAULT,
+            discovery=DiscoveryFactory.LOCAL_DIRECT,
+            lb=LbFactory.CLASS_REF,
+            credential=CredentialType.INSECURE,
+            options=WorkerOptionsKind.DEFAULT,
+            timeout=TimeoutKind.NONE,
+            binding=RoutineBinding.MODULE_FUNCTION,
+            lazy=LazyMode.EAGER,
+            backpressure=BackpressureMode.NONE,
+            ctx_var_1=ContextVarPattern.ROUND_TRIP,
+            ctx_var_2=ContextVarPattern.LOCAL_RESET,
+            ctx_var_3=ContextVarPattern.PER_YIELD,
+            quorum=QuorumMode.DEFAULT,
+            strict_warnings=StrictWarnings.ALL_DECODABLE,
+        )
+
+        # Act
+        result = str(scenario)
+
+        # Assert
+        assert len(result.split("-")) == 15
+        assert result == (
+            "COROUTINE-DEFAULT-LOCAL_DIRECT-CLASS_REF-INSECURE-DEFAULT-"
+            "NONE-MODULE_FUNCTION-EAGER-NONE-ROUND_TRIP-LOCAL_RESET-PER_YIELD-"
+            "DEFAULT-ALL_DECODABLE"
         )

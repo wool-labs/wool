@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import uuid
 
 import cloudpickle
@@ -63,6 +64,38 @@ def _make_shared(source, key="test-key"):
     _setup_pool()
     _subscriber_factories[key] = lambda _: source
     return _SharedSubscription(key=key, reduce_info=(type(source), (), {}))
+
+
+def _numbered_subscriber_class():
+    """Build a subscriber class whose instances number themselves.
+
+    Every instance the pool's factory builds takes the next number and
+    addresses every event it yields with it, so a consumer can tell
+    which instance served it from the events alone. The source never
+    ends, so an iterator parked on it stays parked until something
+    finalizes the subscriber behind it.
+    """
+    numbers = itertools.count()
+
+    class _Numbered(
+        metaclass=SubscriberMeta,
+        key=lambda cls, tag: (cls, tag),
+    ):
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+            self.number = next(numbers)
+
+        async def _shutdown(self) -> None:
+            pass
+
+        def __aiter__(self):
+            return self._gen()
+
+        async def _gen(self):
+            while True:
+                yield _make_event(address=f"127.0.0.1:{50051 + self.number}")
+
+    return _Numbered
 
 
 class TestSubscriberMeta:
@@ -562,36 +595,117 @@ class TestSharedSubscription:
         assert collected_b == []
 
     @pytest.mark.asyncio
-    async def test___aiter___after_cleanup(self):
-        """Test iteration raises StopAsyncIteration after cleanup.
+    async def test___aiter___should_raise_stop_async_iteration_when_fanout_cleaned_up(
+        self,
+    ):
+        """Test iteration ends once the pool finalizes the shared subscriber.
 
         Given:
-            A _SharedSubscription whose Fanout has been cleaned up.
+            A subscription whose iterator is parked on an endless
+            source, holding the pool's only reference to the subscriber
+            behind it.
         When:
-            The subscription is iterated.
+            The subscriber pool is cleared on the loop that cached it.
         Then:
-            It should raise StopAsyncIteration.
+            It should raise StopAsyncIteration on the next pull, the
+            finalized subscriber's fan-out having no events left to
+            hand out.
         """
-
         # Arrange
-        class _Source:
-            def __aiter__(self):
-                return self._gen()
-
-            async def _gen(self):
-                while True:
-                    yield _make_event()  # pragma: no cover
-
-        shared = _make_shared(_Source())
+        shared = _numbered_subscriber_class()("cleanup-key")
         it = aiter(shared)
         await anext(it)  # initialise the fanout
-
-        # Retrieve and clean up the fanout
         pool = __subscriber_pool__.get()
-        subscriber = pool._cache["test-key"].obj
-        fanout = _SharedSubscription._fanouts.get(subscriber)
-        await fanout.cleanup()
 
-        # Act & assert
+        # Act -- clear force-finalizes the cached subscriber, cleaning
+        # up its fan-out, even though the parked iterator still holds a
+        # reference to it.
+        await pool.clear()
+
+        # Assert
         with pytest.raises(StopAsyncIteration):
             await anext(it)
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_build_a_subscriber_per_loop_when_iterated_on_two(
+        self, background_loops
+    ):
+        """Test one cache key is served by one subscriber per iterating loop.
+
+        Given:
+            A subscription for a single key whose subscriber instances
+            number themselves, already iterated and still referenced on
+            the test loop.
+        When:
+            The same subscription is iterated on a background loop.
+        Then:
+            It should serve that loop from a second subscriber instance,
+            leaving the test loop's own entry cached, since the pool
+            caches per loop and not per key alone.
+        """
+        # Arrange
+        shared = _numbered_subscriber_class()("two-loop-key")
+        pool = __subscriber_pool__.get()
+        background = background_loops(teardown=lambda: pool.clear())
+        it = aiter(shared)
+        local = await anext(it)
+
+        async def first_event(pool, shared):
+            # ``run_coroutine_threadsafe`` does not carry the caller's
+            # context, so the pool is handed over and installed here.
+            __subscriber_pool__.set(pool)
+            assert __subscriber_pool__.get() is pool
+            return await anext(aiter(shared))
+
+        # Act
+        remote = background.run(first_event(pool, shared))
+
+        # Assert
+        assert remote.metadata.address != local.metadata.address
+        assert pool.stats.total_entries == 1
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_keep_yielding_when_another_loop_clears_the_pool(
+        self, background_loops
+    ):
+        """Test a clear on one loop leaves another loop's subscriber iterable.
+
+        Given:
+            One subscription iterated on both the test loop and a
+            background loop, each served by its own subscriber instance.
+        When:
+            The subscriber pool is cleared on the test loop.
+        Then:
+            It should leave the background loop's iterator yielding from
+            the subscriber it already had, the clear having reached only
+            the partition of the loop that ran it.
+        """
+        # Arrange
+        shared = _numbered_subscriber_class()("clear-key")
+        pool = __subscriber_pool__.get()
+        background = background_loops(teardown=lambda: pool.clear())
+        parked: dict = {}
+
+        async def start_iterating(pool, shared, parked):
+            # ``run_coroutine_threadsafe`` does not carry the caller's
+            # context, so the pool is handed over and installed here.
+            __subscriber_pool__.set(pool)
+            assert __subscriber_pool__.get() is pool
+            parked["iterator"] = aiter(shared)
+            return await anext(parked["iterator"])
+
+        async def next_event(pool, parked):
+            __subscriber_pool__.set(pool)
+            assert __subscriber_pool__.get() is pool
+            return await anext(parked["iterator"])
+
+        before = background.run(start_iterating(pool, shared, parked))
+        await anext(aiter(shared))
+
+        # Act
+        await pool.clear()
+
+        # Assert
+        after = background.run(next_event(pool, parked))
+        assert after.metadata.address == before.metadata.address
+        assert pool.stats.total_entries == 0

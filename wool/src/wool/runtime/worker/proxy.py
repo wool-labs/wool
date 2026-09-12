@@ -340,8 +340,8 @@ class WorkerProxy:
     closes nothing: the handle is kept when the advertised inputs to the
     channel key are unchanged, and a changed input gets a fresh handle
     while any channel the displaced handle was the last user of is left
-    to the pool's idle TTL. The pool serves one running loop at a time,
-    so a proxy is started on the loop it will dispatch from.
+    to the pool's idle TTL. The pool partitions by loop, so a proxy
+    dispatches over the channels of the loop it was started on.
 
     :param pool_uri:
         Pool identifier for discovery-based connection.
@@ -903,9 +903,7 @@ class WorkerProxy:
         rather than racing it.
 
         :raises RuntimeError:
-            If the proxy is starting, started, stopping, or stopped, or
-            the channel pool is bound to another running event loop (see
-            `wool.runtime.resourcepool.ResourcePool`).
+            If the proxy is starting, started, stopping, or stopped.
         :raises TypeError:
             If the resolved load balancer or discovery source does not
             implement its protocol.

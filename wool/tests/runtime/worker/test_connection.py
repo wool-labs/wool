@@ -24,6 +24,7 @@ from wool.runtime.context.exceptions import SerializationWarning
 from wool.runtime.context.var import ContextVar
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker import connection as connection_module
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
@@ -38,6 +39,14 @@ from wool.runtime.worker.connection import channel_pool_stats
 from wool.runtime.worker.connection import clear_channel_pool
 
 from .conftest import PicklableMock
+
+
+async def _poll_until(predicate, timeout=2.0):
+    """Wait for ``predicate`` to hold, failing rather than hanging."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        assert asyncio.get_running_loop().time() < deadline, "the condition never held"
+        await asyncio.sleep(0.005)
 
 
 def _rotating_provider(factory) -> WorkerCredentialsProvider:
@@ -2054,6 +2063,97 @@ class TestWorkerConnection:
         assert isinstance(sent, protocol.StopRequest)
         assert sent.timeout == pytest.approx(timeout)
 
+    async def _assert_rpc_opens_a_channel_on_the_calling_loop(
+        self, rpc, mocker, sample_task, dispatching_stub, channel_per_call, loop
+    ):
+        """Drive ``rpc`` on ``loop`` after a dispatch here and check both partitions."""
+        # Arrange
+        dispatching_stub.idle = mocker.AsyncMock(return_value=protocol.Idle(seconds=1.0))
+        dispatching_stub.stop = mocker.AsyncMock(return_value=protocol.Void())
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        async def rpc_then_report():
+            await getattr(connection, rpc)()
+            return channel_pool_stats().total_entries
+
+        # Act
+        entries_other = loop.run(rpc_then_report())
+
+        # Assert
+        assert entries_other == 1
+        assert channel_pool_stats().total_entries == 1
+        assert len(channel_per_call) == 2
+        first, second = (channel for _, channel in channel_per_call)
+        assert first is not second
+
+    @pytest.mark.asyncio
+    async def test_idle_should_open_a_channel_on_the_calling_loop(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        dispatching_stub,
+        channel_per_call,
+        channel_pool_loop,
+    ):
+        """Test the idle RPC opens a channel of its own on its loop.
+
+        Given:
+            A connection whose dispatch on this loop left a warm channel
+            in this loop's partition, and a second live loop that has
+            never touched the pool.
+        When:
+            That connection's ``idle`` RPC is awaited on the second loop.
+        Then:
+            It should build a second channel and leave each loop
+            reporting exactly one entry, since every acquire path is
+            served from the calling loop's partition.
+        """
+        # Arrange, act, & assert
+        await self._assert_rpc_opens_a_channel_on_the_calling_loop(
+            "idle",
+            mocker,
+            sample_task,
+            dispatching_stub,
+            channel_per_call,
+            channel_pool_loop,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_should_open_a_channel_on_the_calling_loop(
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        dispatching_stub,
+        channel_per_call,
+        channel_pool_loop,
+    ):
+        """Test the stop RPC opens a channel of its own on its loop.
+
+        Given:
+            A connection whose dispatch on this loop left a warm channel
+            in this loop's partition, and a second live loop that has
+            never touched the pool.
+        When:
+            That connection's ``stop`` RPC is awaited on the second loop.
+        Then:
+            It should build a second channel and leave each loop
+            reporting exactly one entry, since every acquire path is
+            served from the calling loop's partition.
+        """
+        # Arrange, act, & assert
+        await self._assert_rpc_opens_a_channel_on_the_calling_loop(
+            "stop",
+            mocker,
+            sample_task,
+            dispatching_stub,
+            channel_per_call,
+            channel_pool_loop,
+        )
+
     @pytest.mark.asyncio
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(timeout=st.floats(max_value=0.0, allow_nan=False, allow_infinity=False))
@@ -2459,15 +2559,21 @@ class TestWorkerConnection:
 
     @pytest.mark.asyncio
     async def test_dispatch_should_release_channel_ref_when_cancelled_during_teardown(
-        self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        mock_grpc_call,
+        async_stream,
+        wedged_channel_pool,
     ):
         """Test external cancellation during teardown releases the pooled channel.
 
         Given:
             A dispatched task whose result stream runs to exhaustion
-            into teardown, with the process-wide channel pool's lock
-            held so the release callback suspends, and the consuming
-            task cancelled while parked in that suspended release.
+            into teardown, with the calling loop's partition of the
+            channel pool locked so the release callback suspends, and
+            the consuming task cancelled while parked in that suspended
+            release.
         When:
             The lock is released and the cancelled task is awaited.
         Then:
@@ -2476,8 +2582,6 @@ class TestWorkerConnection:
             despite the caller's pending cancellation.
         """
         # Arrange
-        from wool.runtime.worker import connection as connection_module
-
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
@@ -2490,35 +2594,32 @@ class TestWorkerConnection:
             "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
         )
         stream = await connection.dispatch(sample_task)
-        pool = connection_module._channel_pool
 
         # Act
-        await pool._lock.acquire()
-        lock_released = False
-        try:
+        async with wedged_channel_pool() as wedge:
 
             async def consume():
                 async for _ in stream:
                     pass
 
             task = asyncio.ensure_future(consume())
-            for _ in range(5):
-                await asyncio.sleep(0)
+            await _poll_until(lambda: wedge.waiters() == 1)
             task.cancel()
-            pool._lock.release()
-            lock_released = True
+            wedge.release()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        finally:
-            if not lock_released:
-                pool._lock.release()
 
         # Assert
-        assert connection_module.channel_pool_stats().referenced_entries == 0
+        assert channel_pool_stats().referenced_entries == 0
 
     @pytest.mark.asyncio
     async def test_dispatch_should_release_channel_ref_when_worker_cancels(
-        self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        mock_grpc_call,
+        async_stream,
+        wedged_channel_pool,
     ):
         """Test a worker-side CancelledError releases the pooled channel reference.
 
@@ -2526,8 +2627,8 @@ class TestWorkerConnection:
             A dispatched task whose worker ships an
             ``asyncio.CancelledError`` on the response exception
             frame — which bumps the caller's pending-cancel state —
-            with the process-wide channel pool's lock held so the
-            release callback suspends.
+            with the calling loop's partition of the channel pool locked
+            so the release callback suspends.
         When:
             The lock is released and the consuming task is awaited.
         Then:
@@ -2536,8 +2637,6 @@ class TestWorkerConnection:
             despite the worker-induced pending cancellation.
         """
         # Arrange
-        from wool.runtime.worker import connection as connection_module
-
         cancellation = asyncio.CancelledError("worker self-raised cancel")
         responses = (
             protocol.Response(ack=protocol.Ack()),
@@ -2553,30 +2652,22 @@ class TestWorkerConnection:
             "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
         )
         stream = await connection.dispatch(sample_task)
-        pool = connection_module._channel_pool
 
         # Act
-        await pool._lock.acquire()
-        lock_released = False
-        try:
+        async with wedged_channel_pool() as wedge:
 
             async def consume():
                 async for _ in stream:
                     pass
 
             task = asyncio.ensure_future(consume())
-            for _ in range(5):
-                await asyncio.sleep(0)
-            pool._lock.release()
-            lock_released = True
+            await _poll_until(lambda: wedge.waiters() == 1)
+            wedge.release()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        finally:
-            if not lock_released:
-                pool._lock.release()
 
         # Assert
-        assert connection_module.channel_pool_stats().referenced_entries == 0
+        assert channel_pool_stats().referenced_entries == 0
 
     @pytest.mark.asyncio
     async def test_dispatch_should_reraise_signal_when_teardown_raises_process_signal(
@@ -2597,8 +2688,6 @@ class TestWorkerConnection:
             re-raised without leaking the pooled reference.
         """
         # Arrange
-        from wool.runtime.worker import connection as connection_module
-
         responses = (
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("done"))),
@@ -2621,11 +2710,17 @@ class TestWorkerConnection:
                 pass
 
         # The pooled reference is still released despite the signal.
-        assert connection_module.channel_pool_stats().referenced_entries == 0
+        assert channel_pool_stats().referenced_entries == 0
 
     @pytest.mark.asyncio
     async def test_dispatch_should_detach_teardown_when_release_exceeds_timeout(
-        self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream, caplog
+        self,
+        mocker: MockerFixture,
+        sample_task,
+        mock_grpc_call,
+        async_stream,
+        caplog,
+        wedged_channel_pool,
     ):
         """Test a wedged teardown unblocks the caller after the timeout.
 
@@ -2640,10 +2735,9 @@ class TestWorkerConnection:
             task, and a timeout warning should be logged.
         """
         # Arrange
-        from wool.runtime.worker import connection as connection_module
-
         # Contend the pool lock on a fresh instance, and shorten the
-        # teardown budget so the wedge resolves quickly.
+        # teardown budget so the wedge resolves quickly. ``_TEARDOWN_TIMEOUT``
+        # is a private module constant with no public knob to set it.
         mocker.patch.object(connection_module, "_TEARDOWN_TIMEOUT", 0.1)
         responses = (
             protocol.Response(ack=protocol.Ack()),
@@ -2657,12 +2751,10 @@ class TestWorkerConnection:
             "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
         )
         stream = await connection.dispatch(sample_task)
-        pool = connection_module._channel_pool
 
         # Act — hold the pool lock so the release wedges; the caller must
         # unblock at the timeout instead of hanging.
-        await pool._lock.acquire()
-        try:
+        async with wedged_channel_pool():
 
             async def consume():
                 async for _ in stream:
@@ -2672,11 +2764,8 @@ class TestWorkerConnection:
                 logging.WARNING, logger="wool.runtime.worker.connection"
             ):
                 await asyncio.wait_for(consume(), timeout=5)
-        finally:
-            pool._lock.release()
-            # Let the detached teardown task finish now the lock is free.
-            for _ in range(5):
-                await asyncio.sleep(0)
+        # Let the detached teardown task finish now the lock is free.
+        await _poll_until(lambda: channel_pool_stats().referenced_entries == 0)
 
         # Assert — the caller unblocked and the timeout was reported.
         assert any("teardown exceeded" in r.getMessage() for r in caplog.records)
@@ -3372,7 +3461,7 @@ class TestWorkerConnection:
         assert mock_call.write.call_count == 3
 
     @pytest.mark.asyncio
-    async def test_stream_should_be_consumable_when_dispatch_returns(
+    async def test_dispatch_should_return_a_consumable_stream_when_its_scope_exits(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
         """Test dispatch returns a usable stream after its scope exits.
@@ -3410,7 +3499,7 @@ class TestWorkerConnection:
         assert results == ["value"]
 
     @pytest.mark.asyncio
-    async def test_stream_should_release_pool_ref_when_fully_consumed(
+    async def test_dispatch_should_release_pool_ref_when_stream_fully_consumed(
         self,
         mocker: MockerFixture,
         sample_task,
@@ -3453,7 +3542,7 @@ class TestWorkerConnection:
         pooled_channel.close.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_error_should_release_pool_ref_when_raised_mid_stream(
+    async def test_dispatch_should_release_pool_ref_when_error_raised_mid_stream(
         self,
         mocker: MockerFixture,
         sample_task,
@@ -3501,6 +3590,106 @@ class TestWorkerConnection:
         pooled_channel.close.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_dispatch_should_release_its_reference_on_its_own_partition(
+        self, sample_task, dispatching_stub, channel_per_call, channel_pool_loop
+    ):
+        """Test draining a stream releases the reference on its own loop.
+
+        Given:
+            An undrained dispatch stream holding a channel reference on
+            this loop, and a second live loop that dispatched to a
+            target of its own and drained it.
+        When:
+            This loop drains its stream.
+        Then:
+            It should drop this loop's referenced count to zero and
+            leave the second loop's entry exactly as it was, since a
+            reference is held by the partition that took it.
+        """
+        # Arrange
+        options = ChannelOptions(max_concurrent_streams=10)
+        connection = WorkerConnection("this-loop:50051", options=options)
+
+        async def report():
+            stats = channel_pool_stats()
+            return stats.total_entries, stats.referenced_entries
+
+        async def dispatch_and_report():
+            other = WorkerConnection("other-loop:50051", options=options)
+            async for _ in await other.dispatch(sample_task):
+                pass
+            return await report()
+
+        stream = await connection.dispatch(sample_task)
+        other_before = channel_pool_loop.run(dispatch_and_report())
+        referenced_before = channel_pool_stats().referenced_entries
+
+        # Act
+        async for _ in stream:
+            pass
+
+        # Assert
+        assert referenced_before == 1
+        assert channel_pool_stats().referenced_entries == 0
+        assert other_before == (1, 0)
+        assert channel_pool_loop.run(report()) == (1, 0)
+
+    def test_dispatch_should_open_fresh_channel_when_run_on_a_later_loop(
+        self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
+    ):
+        """Test the channel pool hands a later loop a channel of its own.
+
+        Given:
+            A dispatch on one event loop has primed that loop's
+            partition of the channel pool, and that loop has since
+            closed with the channel idle in it.
+        When:
+            A dispatch to the same target runs on a fresh event loop.
+        Then:
+            It should open a new channel rather than reuse the one the
+            closed loop left — a ``grpc.aio`` channel can only be closed
+            from its own loop, so the stranded one's ``close`` is never
+            awaited — leaving the fresh loop with exactly one entry.
+        """
+        # Arrange
+        channel_a, channel_b = mocker.AsyncMock(), mocker.AsyncMock()
+        insecure_channel = mocker.patch.object(
+            grpc.aio, "insecure_channel", side_effect=[channel_a, channel_b]
+        )
+        mock_stub = mocker.MagicMock()
+        mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
+
+        async def dispatch_once():
+            responses = (
+                protocol.Response(ack=protocol.Ack()),
+                protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
+            )
+            mock_stub.dispatch = mocker.MagicMock(
+                return_value=mock_grpc_call(async_stream(responses))
+            )
+            connection = WorkerConnection(
+                "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+            )
+            async for _ in await connection.dispatch(sample_task):
+                pass
+            return channel_pool_stats().total_entries
+
+        async def dispatch_once_then_clear():
+            entries = await dispatch_once()
+            await clear_channel_pool()
+            return entries
+
+        # Act
+        entries_after_first = asyncio.run(dispatch_once())
+        entries_after_second = asyncio.run(dispatch_once_then_clear())
+
+        # Assert
+        assert entries_after_first == 1
+        assert entries_after_second == 1
+        assert insecure_channel.call_count == 2
+        channel_a.close.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_close_should_invoke_channel_finalizer(
         self,
         mocker: MockerFixture,
@@ -3545,7 +3734,38 @@ class TestWorkerConnection:
         pooled_channel.close.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_two_dispatches_should_share_one_channel_when_target_matches(
+    async def test_close_should_leave_a_channel_cached_on_another_loop(
+        self, sample_task, dispatching_stub, channel_per_call, channel_pool_loop
+    ):
+        """Test close retires this connection's keys on the calling loop only.
+
+        Given:
+            A connection that dispatched on this loop, leaving a channel
+            cached in this loop's partition, and a second live loop.
+        When:
+            That connection's ``close`` is awaited on the second loop.
+        Then:
+            It should leave this loop's channel cached and unclosed,
+            since the keys it retires are looked up in the calling
+            loop's partition and nowhere else.
+        """
+        # Arrange
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+        # Act
+        channel_pool_loop.run(connection.close())
+
+        # Assert
+        assert channel_pool_stats().total_entries == 1
+        assert len(channel_per_call) == 1
+        channel_per_call[0][1].close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_share_one_channel_when_target_matches(
         self, mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
     ):
         """Test two dispatches to the same target share one channel.
@@ -4141,7 +4361,6 @@ class TestWorkerConnection:
               caller via the apply-back leg of the wire.
         """
         # Arrange
-
         var = ContextVar("conn_set_back_var", namespace="conn_set_back")
 
         async def routine() -> None:
@@ -4225,7 +4444,6 @@ class TestWorkerConnection:
               chain id and the var holds the final yield's value.
         """
         # Arrange
-
         var = ContextVar("conn_set_back_agen_var", namespace="conn_set_back_agen")
 
         async def streaming_routine():
@@ -4684,7 +4902,7 @@ class TestWorkerConnection:
         Then:
             It should decode to a value equal to the original.
         """
-        # Arrange — the channel pool and var_registry are process-wide
+        # Arrange — var_registry is process-wide; the channel pool is per loop
         # and not reset between Hypothesis examples; a uuid-unique
         # target keeps each example on its own pool key (so a cached
         # channel from a prior example cannot serve an exhausted mock
@@ -5236,6 +5454,366 @@ class TestWorkerConnection:
         pooled_channel.close.assert_awaited_once()
         assert channel_pool_stats().total_entries == 0
 
+    @pytest.mark.asyncio
+    async def test___aexit___should_close_only_the_entering_loops_channel(
+        self, sample_task, dispatching_stub, channel_per_call, channel_pool_loop
+    ):
+        """Test the block's exit retires nothing on another loop.
+
+        Given:
+            A connection entered as an async context manager on this
+            loop and dispatched inside the block, and a second live loop
+            that never touches the connection.
+        When:
+            The second loop reads the channel-pool stats during the
+            block, and the block then exits.
+        Then:
+            It should report zero on the second loop both during the
+            block and after it, and close this loop's channel exactly
+            once on exit.
+        """
+        # Arrange
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        async def report():
+            return channel_pool_stats().total_entries
+
+        # Act
+        async with connection:
+            async for _ in await connection.dispatch(sample_task):
+                pass
+            other_during = channel_pool_loop.run(report())
+            closed_inside = channel_per_call[0][1].close.await_count
+        other_after = channel_pool_loop.run(report())
+
+        # Assert
+        assert other_during == 0
+        assert other_after == 0
+        assert closed_inside == 0
+        assert len(channel_per_call) == 1
+        channel_per_call[0][1].close.assert_awaited_once()
+        assert channel_pool_stats().total_entries == 0
+
+
+@pytest.mark.asyncio
+async def test_channel_pool_stats_should_report_zero_when_the_loop_is_untouched():
+    """Test a loop that never used the pool reports an empty partition.
+
+    Given:
+        A running event loop that has made no channel-pool call of any
+        kind, so the pool holds no partition for it.
+    When:
+        `channel_pool_stats` is called on that loop.
+    Then:
+        It should report zero entries, zero referenced, and nothing
+        pending cleanup, creating the loop's partition on first touch
+        rather than raising.
+    """
+    # Act
+    stats = channel_pool_stats()
+
+    # Assert
+    assert stats.total_entries == 0
+    assert stats.referenced_entries == 0
+    assert stats.pending_cleanup == 0
+
+
+def test_channel_pool_stats_should_raise_when_no_running_loop():
+    """Test the stats call refuses to answer off a loop.
+
+    Given:
+        No running event loop, so there is no partition the counters
+        could describe.
+    When:
+        `channel_pool_stats` is called.
+    Then:
+        It should raise `RuntimeError`, since the counters are a
+        property of a loop's partition and not of the process.
+    """
+    # Act & assert
+    with pytest.raises(RuntimeError, match="no running event loop"):
+        channel_pool_stats()
+
+
+def test_channel_pool_stats_should_count_only_the_calling_loops_channels(
+    background_loops, sample_task, dispatching_stub, channel_per_call
+):
+    """Test two live loops dialing one worker each see one channel.
+
+    Given:
+        Two event loops running concurrently on their own threads, each
+        having dispatched once to the same target.
+    When:
+        Each loop reads `channel_pool_stats`.
+    Then:
+        It should report exactly one entry to each loop and account for
+        two distinct channels, since a pooled channel belongs to the
+        loop that built it.
+    """
+    # Arrange
+    handles = [background_loops(teardown=clear_channel_pool) for _ in range(2)]
+
+    async def dispatch_once():
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+    async def report():
+        return channel_pool_stats().total_entries
+
+    for handle in handles:
+        handle.run(dispatch_once())
+
+    # Act
+    entries = [handle.run(report()) for handle in handles]
+
+    # Assert
+    assert entries == [1, 1]
+    assert len(channel_per_call) == 2
+    first, second = (channel for _, channel in channel_per_call)
+    assert first is not second
+
+
+@given(loop_count=st.integers(min_value=1, max_value=4))
+@settings(
+    max_examples=10,
+    deadline=None,
+    suppress_health_check=[
+        HealthCheck.function_scoped_fixture,
+        HealthCheck.too_slow,
+    ],
+)
+def test_channel_pool_stats_should_report_one_entry_per_loop_when_loops_dispatch(
+    background_loops, sample_task, dispatching_stub, channel_per_call, loop_count
+):
+    """Test partition isolation holds for any number of concurrent loops.
+
+    Given:
+        Any number of event loops between one and four, running
+        concurrently on their own threads, all dialing one target.
+    When:
+        Each loop dispatches once and reads `channel_pool_stats`.
+    Then:
+        It should report exactly one entry to every loop and build
+        exactly one channel per loop, whatever the loop count.
+    """
+    # Arrange
+    target = f"localhost-{uuid4().hex}:50051"
+    handles = [background_loops(teardown=clear_channel_pool) for _ in range(loop_count)]
+
+    async def dispatch_and_report():
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+        return channel_pool_stats().total_entries
+
+    # Act
+    try:
+        futures = [handle.submit(dispatch_and_report()) for handle in handles]
+        entries = [future.result(timeout=5) for future in futures]
+    finally:
+        for handle in handles:
+            handle.close()
+
+    # Assert
+    assert entries == [1] * loop_count
+    assert len([1 for built, _ in channel_per_call if built == target]) == loop_count
+
+
+@pytest.mark.asyncio
+async def test_clear_channel_pool_should_warn_when_a_stopped_loop_stranded_a_channel(
+    caplog, background_loops, sample_task, dispatching_stub, channel_per_call
+):
+    """Test a channel left behind by a stopped loop is reported as a leak.
+
+    Given:
+        A loop that dispatched once and then stopped without clearing
+        its partition, leaving the channel idle in it.
+    When:
+        `clear_channel_pool` runs on a live loop, sweeping the
+        stranded partition.
+    Then:
+        It should log one WARNING naming the channel factory and the
+        one idle entry it dropped, and never await that channel's
+        ``close``, which only its own loop could run.
+    """
+    # Arrange
+    stranding = background_loops()
+
+    async def dispatch_once():
+        connection = WorkerConnection(
+            "stranded:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+    stranding.run(dispatch_once())
+    stranding.close()
+
+    # Act
+    with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+        await clear_channel_pool()
+        stats = channel_pool_stats()
+
+    # Assert
+    records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
+    assert [record.levelno for record in records] == [logging.WARNING]
+    assert records[0].getMessage().startswith("ResourcePool(_channel_factory)")
+    assert "0 referenced and 1 idle" in records[0].getMessage()
+    assert stats.total_entries == 0
+    channel_per_call[0][1].close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clear_channel_pool_should_not_warn_when_a_loop_cleared_before_stopping(
+    caplog, background_loops, sample_task, dispatching_stub, channel_per_call
+):
+    """Test a partition its own loop cleared is swept in silence.
+
+    Given:
+        A loop that dispatched once, awaited `clear_channel_pool`, and
+        only then stopped, leaving an empty partition behind.
+    When:
+        `clear_channel_pool` runs on a live loop, sweeping that
+        partition.
+    Then:
+        It should log nothing at all, since a loop that clears before
+        it stops strands no resource to report.
+    """
+    # Arrange
+    stranding = background_loops()
+
+    async def dispatch_and_clear():
+        connection = WorkerConnection(
+            "cleared:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+        await clear_channel_pool()
+
+    stranding.run(dispatch_and_clear())
+    stranding.close()
+
+    # Act
+    with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+        await clear_channel_pool()
+        stats = channel_pool_stats()
+
+    # Assert
+    assert [r for r in caplog.records if r.name == "wool.runtime.resourcepool"] == []
+    assert stats.total_entries == 0
+    channel_per_call[0][1].close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_channel_pool_stats_should_not_sweep_a_stranded_partition(
+    caplog, background_loops, sample_task, dispatching_stub, channel_per_call
+):
+    """Test a stats read leaves a stranded channel for the next clear to report.
+
+    Given:
+        A loop that dispatched once and then closed without clearing
+        its partition, leaving the channel idle in it.
+    When:
+        `channel_pool_stats` is read on a live loop, and that loop then
+        clears its channel pool.
+    Then:
+        It should log nothing for the read and one WARNING for the
+        clear, naming the channel factory and the one idle entry it
+        dropped.
+    """
+    # Arrange
+    stranding = background_loops()
+
+    async def dispatch_once():
+        connection = WorkerConnection(
+            "stranded:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+    stranding.run(dispatch_once())
+    stranding.close()
+
+    # Act
+    with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+        channel_pool_stats()
+        after_read = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
+        await clear_channel_pool()
+
+    # Assert
+    assert after_read == []
+    records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
+    assert [record.levelno for record in records] == [logging.WARNING]
+    assert "0 referenced and 1 idle" in records[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_clear_channel_pool_should_report_a_stranded_hold(
+    caplog, background_loops
+):
+    """Test the teardown primitive reaches the holds pool.
+
+    Given:
+        A loop that entered a `channel_pool_hold` on an exit stack it
+        never closed and then closed without releasing it.
+    When:
+        `clear_channel_pool` runs on a live loop.
+    Then:
+        It should log one WARNING naming the hold factory and the one
+        referenced entry it dropped, so a stranded hold is reported by
+        the same teardown that reports stranded channels.
+    """
+    # Arrange
+    stranding = background_loops()
+
+    async def strand_a_hold():
+        stack = AsyncExitStack()
+        await stack.enter_async_context(channel_pool_hold())
+
+    stranding.run(strand_a_hold())
+    stranding.close()
+
+    # Act
+    with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+        await clear_channel_pool()
+
+    # Assert
+    records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
+    assert [record.levelno for record in records] == [logging.WARNING]
+    message = records[0].getMessage()
+    assert message.startswith("ResourcePool(_channel_pool_hold_factory)")
+    assert "1 referenced and 0 idle" in message
+
+
+@pytest.mark.asyncio
+async def test_clear_channel_pool_should_not_raise_when_pool_empty():
+    """Test `clear_channel_pool` is a no-op when the pool is empty.
+
+    Given:
+        The calling loop's partition of the channel pool with no
+        cached entries (the autouse ``_clear_channel_pool`` fixture
+        clears the pool between tests, so this test starts from an
+        empty partition).
+    When:
+        `clear_channel_pool` is awaited.
+    Then:
+        It should return without raising and leave the partition empty
+        — clearing an empty partition is a legitimate operation and
+        must not surface a ``KeyError`` or similar.
+    """
+    # Act
+    await clear_channel_pool()
+
+    # Assert
+    assert channel_pool_stats().total_entries == 0
+
 
 @pytest.mark.asyncio
 async def test_clear_channel_pool_should_close_cached_channels(
@@ -5248,9 +5826,9 @@ async def test_clear_channel_pool_should_close_cached_channels(
     """Test `clear_channel_pool` closes every cached gRPC channel.
 
     Given:
-        A populated module-wide channel pool — a successful
-        dispatch through a `WorkerConnection` has primed the
-        cache for a particular key.
+        A populated channel pool — a successful dispatch through a
+        `WorkerConnection` has primed the calling loop's partition for
+        a particular key.
     When:
         `clear_channel_pool` is awaited.
     Then:
@@ -5283,83 +5861,13 @@ async def test_clear_channel_pool_should_close_cached_channels(
     pooled_channel.close.assert_called_once()
 
 
-def test_dispatch_should_open_fresh_channel_when_run_on_a_later_loop(
-    mocker: MockerFixture, sample_task, async_stream, mock_grpc_call
-):
-    """Test the channel pool hands a later loop a channel of its own.
-
-    Given:
-        A dispatch on one event loop has primed the module-level channel
-        pool, and that loop has since closed with the channel idle in
-        the pool.
-    When:
-        A dispatch to the same target runs on a fresh event loop.
-    Then:
-        It should open a new channel rather than reuse the one the closed
-        loop left -- that entry is dropped, and its ``close`` is never
-        awaited, since a grpc.aio channel cannot be closed from another
-        loop -- leaving the pool with exactly one cached entry.
-    """
-    # Arrange
-    channel_a, channel_b = mocker.AsyncMock(), mocker.AsyncMock()
-    insecure_channel = mocker.patch.object(
-        grpc.aio, "insecure_channel", side_effect=[channel_a, channel_b]
-    )
-    mock_stub = mocker.MagicMock()
-    mocker.patch.object(protocol, "WorkerStub", return_value=mock_stub)
-
-    async def dispatch_once():
-        responses = (
-            protocol.Response(ack=protocol.Ack()),
-            protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
-        )
-        mock_stub.dispatch = mocker.MagicMock(
-            return_value=mock_grpc_call(async_stream(responses))
-        )
-        connection = WorkerConnection(
-            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
-        )
-        async for _ in await connection.dispatch(sample_task):
-            pass
-
-    # Act
-    asyncio.run(dispatch_once())
-    entries_after_first = channel_pool_stats().total_entries
-    asyncio.run(dispatch_once())
-
-    # Assert
-    assert entries_after_first == 1
-    assert insecure_channel.call_count == 2
-    channel_a.close.assert_not_awaited()
-    assert channel_pool_stats().total_entries == 1
-
-
 @pytest.mark.asyncio
-async def test_clear_channel_pool_should_not_raise_when_pool_empty():
-    """Test `clear_channel_pool` is a no-op when the pool is empty.
-
-    Given:
-        A module-wide channel pool with no cached entries (the
-        autouse ``_clear_channel_pool`` fixture clears the pool
-        between tests, so this test starts from an empty pool).
-    When:
-        `clear_channel_pool` is awaited.
-    Then:
-        It should return without raising — clearing an empty pool
-        is a legitimate operation and must not surface a
-        ``KeyError`` or similar.
-    """
-    # Act & assert — must not raise
-    await clear_channel_pool()
-
-
-@pytest.mark.asyncio
-async def test_clear_channel_pool_should_not_disturb_a_live_hold(
+async def test_clear_channel_pool_should_not_let_a_dropped_hold_touch_a_later_hold(
     sample_task,
     dispatching_stub,
     pooled_channel,
 ):
-    """Test a teardown under a live hold leaves that hold's count intact.
+    """Test a teardown under a live hold cannot corrupt the next hold.
 
     Given:
         A hold taken before `clear_channel_pool` ran and a second hold
@@ -5368,9 +5876,9 @@ async def test_clear_channel_pool_should_not_disturb_a_live_hold(
         The first hold is released while the second is open, then the
         second.
     Then:
-        It should leave the channel open after the first release and
-        close it exactly once after the second: a teardown does not
-        detach a holder from its count.
+        It should leave the channel open after the first release, whose
+        hold the teardown dropped and which therefore lands on nothing,
+        and close it exactly once after the second.
     """
     # Arrange
     connection = WorkerConnection(
@@ -5401,17 +5909,17 @@ async def test_channel_pool_hold_should_close_channels_when_last_hold_released(
     dispatching_stub,
     pooled_channel,
 ):
-    """Test the loop's idle channels close once its last hold is released.
+    """Test a loop's idle channels close once its last channel-pool hold is released.
 
     Given:
-        Two nested holds on the channel pool and an idle channel the
-        pool cached for a dispatch made while both were open.
+        Two nested holds on the calling loop's channel pool and an idle
+        channel the pool cached for a dispatch made while both were open.
     When:
         The inner hold is released, then the outer one.
     Then:
         It should leave the channel open after the inner release and
-        close it exactly once after the outer, emptying the pool: a
-        hold nested inside another retires nothing on its own.
+        close it exactly once after the outer, emptying the loop's
+        partition.
     """
     # Arrange
     connection = WorkerConnection(
@@ -5478,17 +5986,16 @@ async def test_channel_pool_hold_should_defer_close_when_dispatch_holds_channel(
     """Test a hold released mid-dispatch leaves the in-flight channel open.
 
     Given:
-        A single hold on the channel pool and a dispatch started under
-        it whose result stream is primed but not yet drained, so the
-        dispatch still references the pooled channel.
+        A single hold on the calling loop's channel pool and a dispatch
+        started under it whose result stream is primed but not yet
+        drained, so the dispatch still references the pooled channel.
     When:
         The hold is released and the dispatch is then drained to
         completion.
     Then:
-        It should leave the channel open at the release — the
-        dispatch's own reference outlives the hold — and close it
-        exactly once when that last reference is dropped, leaving the
-        pool empty.
+        It should leave the channel open at the release — the dispatch's
+        own reference outlives the hold — and close it exactly once when
+        that last reference is dropped, leaving the partition empty.
     """
     # Arrange
     connection = WorkerConnection(
@@ -5575,3 +6082,182 @@ async def test_channel_pool_hold_should_propagate_cancellation_when_close_cancel
     # Assert
     pooled_channel.close.assert_awaited_once()
     assert channel_pool_stats().total_entries == 0
+
+
+def test_channel_pool_hold_should_retire_only_the_releasing_loops_channel(
+    background_loops, sample_task, dispatching_stub, channel_per_call
+):
+    """Test one loop's last release leaves another loop's hold standing.
+
+    Given:
+        Two event loops running concurrently on their own threads, each
+        holding an open `channel_pool_hold` and an idle channel cached
+        under it for a target of its own.
+    When:
+        The first loop releases its hold while the second keeps its own
+        open.
+    Then:
+        It should close the first loop's channel exactly once and empty
+        that loop's partition, leaving the second loop's channel cached
+        and unclosed, since the hold count is per loop.
+    """
+    # Arrange
+    stacks: dict[str, AsyncExitStack] = {}
+
+    def retiring(name):
+        async def teardown():
+            stack = stacks.pop(name, None)
+            if stack is not None:
+                await stack.aclose()
+            await clear_channel_pool()
+
+        return teardown
+
+    async def hold_and_dispatch(name, target):
+        stack = AsyncExitStack()
+        await stack.enter_async_context(channel_pool_hold())
+        stacks[name] = stack
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+        return channel_pool_stats().total_entries
+
+    async def release(name):
+        await stacks.pop(name).aclose()
+        return channel_pool_stats().total_entries
+
+    async def report():
+        return channel_pool_stats().total_entries
+
+    first = background_loops(teardown=retiring("first"))
+    second = background_loops(teardown=retiring("second"))
+    assert first.run(hold_and_dispatch("first", "first:50051")) == 1
+    assert second.run(hold_and_dispatch("second", "second:50051")) == 1
+
+    # Act
+    entries_first = first.run(release("first"))
+
+    # Assert
+    channels = dict(channel_per_call)
+    assert entries_first == 0
+    channels["first:50051"].close.assert_awaited_once()
+    assert second.run(report()) == 1
+    channels["second:50051"].close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_channel_pool_hold_should_warn_when_a_stopped_loop_stranded_a_hold(
+    caplog, background_loops
+):
+    """Test a hold left open by a stopped loop is reported as a leak.
+
+    Given:
+        A loop that entered a `channel_pool_hold` on an exit stack it
+        never closed, cached no channel, and then stopped.
+    When:
+        A hold is taken and released on a live loop, reaching the holds
+        pool and sweeping the stranded partition.
+    Then:
+        It should log one WARNING naming the hold factory and the one
+        referenced entry it dropped, and none for the channel factory,
+        whose partitions the stopped loop never populated.
+    """
+    # Arrange
+    stranding = background_loops()
+
+    async def strand_a_hold():
+        stack = AsyncExitStack()
+        await stack.enter_async_context(channel_pool_hold())
+
+    stranding.run(strand_a_hold())
+    stranding.close()
+
+    # Act
+    with caplog.at_level(logging.DEBUG, logger="wool.runtime.resourcepool"):
+        async with channel_pool_hold():
+            pass
+
+    # Assert
+    records = [r for r in caplog.records if r.name == "wool.runtime.resourcepool"]
+    assert [record.levelno for record in records] == [logging.WARNING]
+    message = records[0].getMessage()
+    assert message.startswith("ResourcePool(_channel_pool_hold_factory)")
+    assert "1 referenced and 0 idle" in message
+
+
+@given(data=st.data())
+@settings(
+    max_examples=10,
+    deadline=None,
+    suppress_health_check=[
+        HealthCheck.function_scoped_fixture,
+        HealthCheck.too_slow,
+    ],
+)
+def test_clear_channel_pool_should_retire_only_the_calling_loops_channel(
+    background_loops, sample_task, dispatching_stub, channel_per_call, data
+):
+    """Test a retirement reaches the loop that runs it and no other.
+
+    Given:
+        Any number of event loops between two and four, each holding an
+        idle channel for a target of its own, any non-empty subset of
+        them, and a retirement drawn from `clear_channel_pool` or the
+        release of the loop's last `channel_pool_hold`.
+    When:
+        That retirement runs on every loop in the subset.
+    Then:
+        It should close exactly the subset's channels, once each, and
+        empty exactly those partitions, leaving every other loop with
+        its one entry and its channel unclosed.
+    """
+    # Arrange
+    loop_count = data.draw(st.integers(min_value=2, max_value=4), label="loops")
+    retired = data.draw(
+        st.sets(st.integers(min_value=0, max_value=loop_count - 1), min_size=1),
+        label="retired",
+    )
+    by_hold = data.draw(st.booleans(), label="by_hold")
+    nonce = uuid4().hex
+    targets = [f"localhost-{nonce}-{index}:50051" for index in range(loop_count)]
+    handles = [background_loops(teardown=clear_channel_pool) for _ in range(loop_count)]
+
+    async def dispatch_once(target):
+        connection = WorkerConnection(
+            target, options=ChannelOptions(max_concurrent_streams=10)
+        )
+        async for _ in await connection.dispatch(sample_task):
+            pass
+
+    async def report():
+        return channel_pool_stats().total_entries
+
+    async def retire():
+        if by_hold:
+            async with channel_pool_hold():
+                pass
+        else:
+            await clear_channel_pool()
+        return channel_pool_stats().total_entries
+
+    # Act
+    entries: dict[int, int] = {}
+    try:
+        for handle, target in zip(handles, targets):
+            handle.run(dispatch_once(target))
+        for index in sorted(retired):
+            entries[index] = handles[index].run(retire())
+        for index in set(range(loop_count)) - retired:
+            entries[index] = handles[index].run(report())
+        channels = dict(channel_per_call)
+        closed = [channels[target].close.await_count for target in targets]
+    finally:
+        for handle in handles:
+            handle.close()
+
+    # Assert
+    for index in range(loop_count):
+        expected = (0, 1) if index in retired else (1, 0)
+        assert (entries[index], closed[index]) == expected

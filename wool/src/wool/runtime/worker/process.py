@@ -794,4 +794,6 @@ async def _proxy_finalizer(
     try:
         await proxy.exit()
     except Exception:
-        pass
+        logger.warning(
+            "Failed to exit a pooled proxy during its finalization", exc_info=True
+        )

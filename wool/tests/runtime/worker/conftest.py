@@ -4,7 +4,9 @@ import multiprocessing.shared_memory
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from types import MappingProxyType
+from types import SimpleNamespace
 from typing import Any
 from typing import Callable
 from typing import Coroutine
@@ -28,11 +30,15 @@ from tests.helpers import scoped_context
 from wool import protocol
 from wool.runtime.context.factory import _loops_with_factory
 from wool.runtime.context.factory import install_task_factory
+from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.discovery.base import DiscoveryEvent
+from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker import connection as connection_module
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.connection import WorkerConnection
+from wool.runtime.worker.connection import clear_channel_pool
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.proxy import WorkerProxy
 
@@ -115,11 +121,16 @@ def _reap_worker_loops():
     fixtures, so a loop those fixtures already closed (e.g.,
     `worker_loop`) reads back closed and is skipped — only genuinely
     leaked worker loops are stopped. A multi-generation residual-task
-    drain — matching the production finalizer
-    `WorkerService._destroy_worker_loop`, so a cancelled task's
-    follow-up cleanup is drained rather than stranded — then a stop is
-    scheduled onto the loop, and the worker thread closes it once
-    ``run_forever`` returns.
+    drain — cancelling whatever is pending and polling until nothing
+    is, so a cancelled task's follow-up cleanup is drained rather than
+    stranded — then a stop is scheduled onto the loop, and the worker
+    thread closes it once ``run_forever`` returns. The drain cancels
+    each task once and waits with `asyncio.wait` rather than gathering,
+    because a service stop still in flight runs the production drain
+    `WorkerService._destroy_worker_loop` on the same loop, and two
+    drains that gather each other recurse without bound on any cancel;
+    re-cancelling a task on every pass would re-interrupt cleanup that
+    needs more than one.
     """
     yield
     leaked = [
@@ -138,29 +149,29 @@ def _reap_worker_loops():
             # that second generation, surfacing the intermittent
             # "Task was destroyed but it is pending!" warning.
             current = asyncio.current_task()
-            deadline = asyncio.get_running_loop().time() + 5.0
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.0
+            cancelled: set[asyncio.Task] = set()
             try:
-                while True:
-                    pending = [t for t in asyncio.all_tasks() if t is not current]
+                # Cancel once and wait, never gather -- see the fixture
+                # docstring.
+                while (remaining := deadline - loop.time()) > 0:
+                    pending = {t for t in asyncio.all_tasks() if t is not current}
                     if not pending:
                         break
-                    for task in pending:
+                    for task in pending - cancelled:
                         task.cancel()
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        break
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*pending, return_exceptions=True),
-                            timeout=remaining,
-                        )
-                    except TimeoutError:
-                        break
+                    cancelled |= pending
+                    await asyncio.wait(pending, timeout=remaining)
             finally:
-                asyncio.get_running_loop().stop()
+                loop.stop()
 
+        # Held here so the shutdown task is never collected mid-drain.
+        shutdown: list[asyncio.Task] = []
         try:
-            loop.call_soon_threadsafe(lambda loop=loop: loop.create_task(_shutdown()))
+            loop.call_soon_threadsafe(
+                lambda loop=loop: shutdown.append(loop.create_task(_shutdown()))
+            )
         except RuntimeError:
             continue
         deadline = time.monotonic() + 5.0
@@ -169,24 +180,20 @@ def _reap_worker_loops():
 
 
 @pytest.fixture
-def worker_loop():
+def worker_loop(background_loops):
     """Spin up a real worker loop on a daemon thread.
 
-    The wool task factory is installed so :func:`routine_scope` can run
-    on a separate loop. Used by DispatchSession unit tests and any
-    other test that needs to cross-loop coordinate.
+    A `background_loops` loop with the wool task factory installed, so
+    `routine_scope` can run on a separate loop. Used by DispatchSession
+    unit tests and any other test that needs to cross-loop coordinate.
     """
-    loop = asyncio.new_event_loop()
-    install_task_factory(loop)
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
-    try:
-        yield loop
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=5)
-        if not loop.is_closed():
-            loop.close()
+
+    async def install():
+        install_task_factory(asyncio.get_running_loop())
+
+    handle = background_loops()
+    handle.run(install())
+    return handle.loop
 
 
 @pytest.fixture
@@ -716,6 +723,108 @@ def pooled_channel(insecure_channel):
         The `AsyncMock` channel the patched factory hands out.
     """
     return insecure_channel.return_value
+
+
+@pytest.fixture
+def channel_per_call(mocker: MockerFixture):
+    """Patch `grpc.aio.insecure_channel` to build a fresh channel per call.
+
+    `pooled_channel` hands every dispatch one shared mock, which cannot
+    tell one loop's channel from another's. This patch records each
+    ``(target, channel)`` pair as it is built, under a lock because two
+    loops on two threads may call the factory at once.
+
+    :returns:
+        The list of ``(target, channel)`` pairs built so far.
+    """
+    built: list[tuple[str, Any]] = []
+    guard = threading.Lock()
+
+    def build(target, *args, **kwargs):
+        channel = mocker.AsyncMock()
+        with guard:
+            built.append((target, channel))
+        return channel
+
+    mocker.patch.object(grpc.aio, "insecure_channel", side_effect=build)
+    return built
+
+
+@pytest.fixture
+def channel_pool_loop(background_loops):
+    """Spawn a background loop that clears its channel-pool partition on close.
+
+    A loop that stops with channels cached strands them for the next
+    pool operation on any loop to report, which would land a warning in
+    an unrelated test's log capture. This handle runs `clear_channel_pool`
+    on the loop before stopping it.
+
+    :returns:
+        A `background_loops` handle.
+    """
+    return background_loops(teardown=clear_channel_pool)
+
+
+@pytest.fixture
+def mock_subscriber_pool(mocker: MockerFixture):
+    """Install a mock discovery subscriber pool for the test's duration.
+
+    :returns:
+        A `ResourcePool`-shaped mock whose ``clear`` is an `AsyncMock`.
+    """
+    pool = mocker.MagicMock(spec=ResourcePool)
+    pool.clear = mocker.AsyncMock()
+    token = __subscriber_pool__.set(pool)
+    try:
+        yield pool
+    finally:
+        __subscriber_pool__.reset(token)
+
+
+@pytest.fixture
+def wedged_channel_pool():
+    """Return a context manager that holds the calling loop's channel-pool lock.
+
+    The one place the worker suite reaches past `ResourcePool`'s public
+    API, and deliberately so: a test that needs a pool operation to
+    suspend mid-flight has no public lever for it. The channel factory
+    is synchronous, so no factory call can be made to block, and every
+    public entry point acquires and releases the lock within a single
+    await, leaving the partition's own lock as the only way to park a
+    release where a test can observe it.
+
+    The context manager yields a wedge whose ``release()`` frees the
+    lock at a chosen point in the block and whose ``waiters()`` counts
+    the operations parked behind it, so a test can wait for a release to
+    park rather than count ticks; the block's exit releases the lock if
+    the test did not, so a failed assertion cannot leave the pool wedged
+    for the rest of the session.
+
+    :returns:
+        An async context manager factory.
+    """
+
+    @asynccontextmanager
+    async def wedge():
+        lock = connection_module._channel_pool._partition()._lock
+        await lock.acquire()
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                lock.release()
+
+        def waiters() -> int:
+            return len(lock._waiters or ())
+
+        try:
+            yield SimpleNamespace(release=release, waiters=waiters)
+        finally:
+            release()
+
+    return wedge
 
 
 @pytest.fixture

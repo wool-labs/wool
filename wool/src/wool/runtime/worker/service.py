@@ -54,7 +54,7 @@ clears the pool immediately regardless of this value, so no daemon
 thread outlives the service. The 30s window is generous enough to span
 the gap between bursts of dispatches on a healthy worker while still
 reaping a loop that has gone quiet. Retiring the loop also finalizes
-the proxy and discovery-subscriber pools bound to it (see
+the loop's partitions of the proxy and discovery-subscriber pools (see
 `WorkerService._destroy_worker_loop`), so a cached proxy is reused only
 while the worker loop stays warm."""
 
@@ -652,22 +652,26 @@ class WorkerService(protocol.WorkerServicer):
         """Schedule worker-loop shutdown and optionally join the thread.
 
         Finalizes the proxy and discovery-subscriber pools, then the
-        channel pool, on the worker loop first: they are bound to it, and
-        a `ResourcePool` refuses use from any other running loop, so this
-        finalizer is the one place they can still be cleared. A clear
+        channel pool, on the worker loop first: a `ResourcePool`
+        partitions its entries by loop and only the owning loop can
+        finalize them, so this finalizer is the one place the worker
+        loop's share can still be cleared. A clear
         that raises or exceeds the shared `_DRAIN_TIMEOUT` budget is
-        logged and does not prevent the stop; the budget bounds when a
-        clear is cancelled, not when it returns, since a clear finishes
-        its sweep before re-raising (see `ResourcePool.clear`), a clear
-        reached with the budget already exhausted is cancelled before it
-        starts and logged the same way, and whatever a clear left cached
-        is dropped when the pool next rebinds.
-        With ``timeout=0`` the clears run best-effort on the daemon
-        thread after this returns; on that path the channel clear can
-        race a successor loop's first use of the process-wide pool, and
-        a pool partitioned per loop (#381) removes the race. An
-        interrupt raised by a clear still drains the loop before
-        propagating.
+        logged and does not prevent the stop. The budget bounds when a
+        clear is abandoned, not when it returns: a clear that overruns
+        is cancelled and left to the drain below with the loop's other
+        tasks, rather than awaited to completion, since a clear finishes
+        its sweep before re-raising a cancellation (see
+        `ResourcePool.clear`) and waiting for that would make the
+        teardown as long as every remaining finalizer. Every clear
+        starts, and one reached with the budget already exhausted is
+        cancelled in flight rather than skipped; whatever a clear left
+        cached is swept and reported by the pool once the loop has
+        closed. With ``timeout=0`` the clears run best-effort on the
+        daemon thread after this returns; each loop clears its own
+        partition, so that path cannot race a successor loop's first use
+        of the process-wide pool. An interrupt raised by a clear still
+        drains the loop before propagating.
 
         Drains successive generations of pending tasks on the
         worker loop, then signals the loop to stop. A cancelled
@@ -716,10 +720,35 @@ class WorkerService(protocol.WorkerServicer):
             try:
                 try:
                     for name, clear in clears:
-                        try:
-                            await asyncio.wait_for(
-                                clear(), timeout=max(0.0, deadline - loop.time())
+                        # One tick before the deadline is enforced, so a
+                        # clear meeting an exhausted budget is cancelled
+                        # in flight rather than before its first step —
+                        # see the docstring.
+                        pending_clear = asyncio.ensure_future(clear())
+                        await asyncio.sleep(0)
+                        # ``wait`` neither cancels nor raises on timeout,
+                        # so an overrunning clear is abandoned here and
+                        # reaped by the drain rather than awaited to
+                        # completion after its cancel — see the
+                        # docstring.
+                        done, _ = await asyncio.wait(
+                            {pending_clear},
+                            timeout=max(0.0, deadline - loop.time()),
+                        )
+                        if pending_clear not in done:
+                            pending_clear.cancel()
+                            _log.warning(
+                                f"The {name} pool clear exceeded the worker-loop "
+                                "teardown budget; cancelled it and continuing to "
+                                "drain and stop the loop."
                             )
+                            # One tick so the cancellation lands and the
+                            # pool reports the finalizer it interrupted
+                            # before the loop stops.
+                            await asyncio.sleep(0)
+                            continue
+                        try:
+                            pending_clear.result()
                         except Exception:
                             _log.warning(
                                 f"Failed to clear the {name} pool during "

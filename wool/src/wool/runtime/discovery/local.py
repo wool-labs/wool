@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import warnings
+from contextlib import AsyncExitStack
 from contextlib import asynccontextmanager
 from contextlib import contextmanager
 from multiprocessing import resource_tracker
@@ -462,6 +463,7 @@ class LocalDiscovery(Discovery):
         """
 
         _block_size: int
+        _blocks: dict[str, AsyncExitStack]
         _cleanups: dict[str, Callable]
         _lock_timeout: float | None
         _namespace: Final[str]
@@ -486,6 +488,9 @@ class LocalDiscovery(Discovery):
             self._block_size = block_size
             self._lock_timeout = lock_timeout
             self._cleanups = {}
+            # The block each published worker holds, keyed by its ref;
+            # a drop exits the handle and the exit closes the rest.
+            self._blocks = {}
             self._shared_memory_pool = ResourcePool(
                 factory=self._shared_memory_factory,
                 finalizer=self._shared_memory_finalizer,
@@ -497,7 +502,18 @@ class LocalDiscovery(Discovery):
             return self
 
         async def __aexit__(self, *args):
-            await self._shared_memory_pool.__aexit__(*args)
+            failure: BaseException | None = None
+            try:
+                for ref in list(self._blocks):
+                    try:
+                        await self._blocks.pop(ref).aclose()
+                    except BaseException as error:
+                        if failure is None:
+                            failure = error
+                if failure is not None:
+                    raise failure
+            finally:
+                await self._shared_memory_pool.__aexit__(*args)
 
         @property
         def namespace(self):
@@ -618,8 +634,11 @@ class LocalDiscovery(Discovery):
             if free_offset is None:
                 raise DiscoveryCapacityExhausted(_read_capacity(address_space.buf))
 
+            block = AsyncExitStack()
             try:
-                memory_block = await self._shared_memory_pool.acquire(str(ref))
+                memory_block = await block.enter_async_context(
+                    self._shared_memory_pool.get(str(ref))
+                )
                 assert memory_block.buf is not None
                 size = len(serialized)
                 try:
@@ -631,8 +650,9 @@ class LocalDiscovery(Discovery):
                 # Release what this method acquired rather than delegating
                 # to `_drop`, whose slot scan cannot find a ref that only
                 # lands on the last line of this block.
-                await self._shared_memory_pool.release(str(ref))
+                await block.aclose()
                 raise
+            self._blocks[str(ref)] = block
 
         async def _drop(self, metadata: WorkerMetadata, address_space: SharedMemory):
             """Unregister a worker by removing it from shared memory.
@@ -647,7 +667,9 @@ class LocalDiscovery(Discovery):
             for offset, slot in _iter_slots(address_space.buf):
                 if slot == target_ref.bytes:
                     struct.pack_into("16s", address_space.buf, offset, NULL_REF)
-                    await self._shared_memory_pool.release(str(target_ref))
+                    block = self._blocks.pop(str(target_ref), None)
+                    if block is not None:
+                        await block.aclose()
                     break
 
         async def _update(self, metadata: WorkerMetadata, address_space: SharedMemory):

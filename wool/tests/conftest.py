@@ -77,7 +77,7 @@ async def _clear_channel_pool():
 
     This loop is the only place a channel a test left cached can still
     be closed, and a hold a test left open would strand its entry for
-    the next loop to report (see
+    the pool's sweep to report (see
     `wool.runtime.resourcepool.ResourcePool`), where a record is meant
     to mean a real leak.
     """
@@ -89,8 +89,6 @@ async def _clear_channel_pool():
 def mock_worker_proxy_cache(mocker):
     mock_pool = mocker.MagicMock(spec=ResourcePool)
     mock_proxy = mocker.MagicMock()  # This will be returned by the context manager
-    mock_pool.acquire.return_value.__aenter__ = mocker.AsyncMock(return_value=mock_proxy)
-    mock_pool.acquire.return_value.__aexit__ = mocker.AsyncMock(return_value=False)
     mock_pool.get.return_value.__aenter__ = mocker.AsyncMock(return_value=mock_proxy)
     mock_pool.get.return_value.__aexit__ = mocker.AsyncMock(return_value=False)
     mock_pool.clear = mocker.AsyncMock()
@@ -228,8 +226,16 @@ def depends(request, other, scope="module"):
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_runtest_makereport(item, call):
-    """Store the test outcome if this item is marked "dependency"."""
+    """Record the setup and call reports on the item, and the dependency outcome.
+
+    A fixture that reads ``item.rep_setup`` and ``item.rep_call`` can
+    tell a test that passed from one whose leftovers are a symptom of an
+    earlier failure. The dependency outcome is stored only for an item
+    marked "dependency".
+    """
     outcome = yield
+    if call.when != "teardown":
+        setattr(item, f"rep_{call.when}", outcome.get_result())
     marker = item.get_closest_marker("dependency")
     if marker is not None or _automark:
         rep = outcome.get_result()

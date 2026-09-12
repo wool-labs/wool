@@ -13,6 +13,8 @@ import logging
 import pickle
 import uuid
 import warnings
+from contextlib import AsyncExitStack
+from contextlib import contextmanager
 from dataclasses import replace
 from types import MappingProxyType
 
@@ -766,6 +768,48 @@ def _discovery_context(*, on_enter=None, on_exit=None):
     return Discovery
 
 
+async def _channel_pool_snapshot():
+    """Report the running loop's partition of the channel pool."""
+    return channel_pool_stats()
+
+
+async def _warm_channel(task):
+    """Cache one idle channel in the running loop's partition.
+
+    Dispatches *task* through a throwaway `WorkerConnection` and drains
+    the stream, so the channel the dispatch opened is left idle in the
+    calling loop's partition of the channel pool. The task is copied
+    under a fresh id, so the same fixture task can warm several loops.
+    """
+    connection = WorkerConnection(
+        "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+    )
+    async for _ in await connection.dispatch(replace(task, id=uuid.uuid4())):
+        pass
+
+
+@contextmanager
+def _held_channel(handle, task):
+    """Hold *handle*'s loop warm with one channel for the block.
+
+    Enters `channel_pool_hold` and warms one channel on the handle's
+    loop, yielding that loop's counters, and releases the hold on that
+    same loop when the block exits — the only loop that may release it,
+    and the release that retires the channel it kept warm.
+    """
+    stack = AsyncExitStack()
+
+    async def take():
+        await stack.enter_async_context(channel_pool_hold())
+        await _warm_channel(task)
+        return channel_pool_stats()
+
+    try:
+        yield handle.run(take())
+    finally:
+        handle.run(stack.aclose())
+
+
 class TestWorkerProxy:
     """Comprehensive test suite for WorkerProxy."""
 
@@ -1411,6 +1455,297 @@ class TestWorkerProxy:
         # Assert
         pooled_channel.close.assert_awaited_once()
         assert channel_pool_stats().total_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_start_should_start_when_another_loop_holds_a_warm_channel(
+        self,
+        mock_discovery_service,
+        mock_proxy_session,
+        sample_task,
+        dispatching_stub,
+        pooled_channel,
+        channel_pool_loop,
+        proxy_factory,
+    ):
+        """Test a proxy starts while another loop holds the channel pool.
+
+        Given:
+            A background loop holding a channel-pool hold and one warm
+            channel of its own
+        When:
+            A proxy is started on the test loop
+        Then:
+            It should start and report ``started``, leaving the other
+            loop's counters exactly as they were -- a hold taken
+            elsewhere is no longer grounds to refuse the start
+        """
+        # Arrange
+        with _held_channel(channel_pool_loop, sample_task) as background:
+            assert background.total_entries == 1
+            proxy = proxy_factory(discovery=mock_discovery_service, lazy=False, quorum=0)
+
+            # Act
+            await proxy.start()
+
+            # Assert
+            assert proxy.started
+            assert channel_pool_loop.run(_channel_pool_snapshot()) == background
+            assert channel_pool_stats().total_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_stop_should_leave_another_loops_channel_open_when_it_still_holds(
+        self,
+        mock_discovery_service,
+        mock_proxy_session,
+        sample_task,
+        dispatching_stub,
+        channel_per_call,
+        channel_pool_loop,
+    ):
+        """Test stopping a proxy retires only the stopping loop's channels.
+
+        Given:
+            A started proxy and one warm channel on a background loop,
+            and a started proxy and its own warm channel on the test loop
+        When:
+            The test loop's proxy is stopped
+        Then:
+            It should close only the test loop's channel and empty that
+            loop's partition, leaving the background loop still reporting
+            one cached, unclosed channel
+        """
+        # Arrange
+        started: dict[str, WorkerProxy] = {}
+
+        async def start_on_background():
+            proxy = WorkerProxy(discovery=MockDiscoveryService(), lazy=False, quorum=0)
+            await proxy.start()
+            await _warm_channel(sample_task)
+            started["proxy"] = proxy
+            return channel_pool_stats()
+
+        async def stop_on_background():
+            await started["proxy"].stop()
+
+        assert channel_pool_loop.run(start_on_background()).total_entries == 1
+        background_channel = channel_per_call[-1][1]
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False, quorum=0)
+        await proxy.start()
+        await _warm_channel(sample_task)
+        local_channel = channel_per_call[-1][1]
+        assert local_channel is not background_channel
+        assert channel_pool_stats().total_entries == 1
+
+        try:
+            # Act
+            await proxy.stop()
+
+            # Assert
+            assert channel_pool_stats().total_entries == 0
+            local_channel.close.assert_awaited_once()
+            background_channel.close.assert_not_awaited()
+            assert channel_pool_loop.run(_channel_pool_snapshot()).total_entries == 1
+        finally:
+            channel_pool_loop.run(stop_on_background())
+
+    @pytest.mark.asyncio
+    async def test_stop_should_empty_its_own_loop_when_the_whole_lifecycle_runs_there(
+        self,
+        mock_proxy_session,
+        sample_task,
+        dispatching_stub,
+        pooled_channel,
+        channel_pool_loop,
+    ):
+        """Test a proxy's whole lifecycle stays inside one background loop.
+
+        Given:
+            A proxy started, dispatched through, and stopped entirely on
+            a background loop
+        When:
+            That lifecycle completes
+        Then:
+            It should report one cached channel on that loop while
+            started and none after the stop, with the test loop's own
+            partition empty throughout
+        """
+        # Arrange
+        assert channel_pool_stats().total_entries == 0
+
+        async def lifecycle():
+            proxy = WorkerProxy(discovery=MockDiscoveryService(), lazy=False, quorum=0)
+            await proxy.start()
+            await _warm_channel(sample_task)
+            while_started = channel_pool_stats()
+            await proxy.stop()
+            return while_started, channel_pool_stats(), proxy.started
+
+        # Act
+        while_started, after_stop, still_started = channel_pool_loop.run(lifecycle())
+
+        # Assert
+        assert while_started.total_entries == 1
+        assert after_stop.total_entries == 0
+        assert not still_started
+        assert channel_pool_stats().total_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_stop_should_raise_when_awaited_on_another_loop(
+        self,
+        mock_proxy_session,
+        sample_task,
+        dispatching_stub,
+        pooled_channel,
+        channel_pool_loop,
+    ):
+        """Test stopping a proxy from a foreign loop is refused loudly.
+
+        Given:
+            A proxy started on a background loop, with one warm channel
+            in that loop's partition
+        When:
+            ``stop`` is awaited on the test loop instead
+        Then:
+            It should raise `RuntimeError` from the cross-loop release of
+            the proxy's channel-pool hold, hand that release to the
+            background loop, whose last hold then retires its channel,
+            and leave the proxy stopped
+        """
+        # Arrange
+        started: dict[str, WorkerProxy] = {}
+
+        async def start_on_background():
+            proxy = WorkerProxy(discovery=MockDiscoveryService(), lazy=False, quorum=0)
+            await proxy.start()
+            await _warm_channel(sample_task)
+            started["proxy"] = proxy
+            return channel_pool_stats()
+
+        async def settled():
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while channel_pool_stats().total_entries:
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+            return channel_pool_stats()
+
+        assert channel_pool_loop.run(start_on_background()).total_entries == 1
+
+        # Act & assert
+        with pytest.raises(
+            RuntimeError, match="on a loop other than the one that acquired it"
+        ):
+            await started["proxy"].stop()
+
+        assert channel_pool_loop.run(settled()).total_entries == 0
+        with pytest.raises(RuntimeError, match="stopped"):
+            await started["proxy"].stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_should_close_one_channel_per_loop_when_both_dial_one_target(
+        self,
+        mock_discovery_service,
+        mock_proxy_session,
+        sample_task,
+        dispatching_stub,
+        channel_per_call,
+        channel_pool_loop,
+    ):
+        """Test two loops dialing one worker each retire their own channel.
+
+        Given:
+            A started proxy and a warm channel on a background loop and
+            on the test loop, both dialing the same target
+        When:
+            Both proxies are stopped, each on its own loop
+        Then:
+            It should have built two distinct channels for the one
+            target and closed each exactly once, so a channel is shared
+            per loop rather than per worker
+        """
+        # Arrange
+        started: dict[str, WorkerProxy] = {}
+
+        async def start_on_background():
+            proxy = WorkerProxy(discovery=MockDiscoveryService(), lazy=False, quorum=0)
+            await proxy.start()
+            await _warm_channel(sample_task)
+            started["proxy"] = proxy
+
+        async def stop_on_background():
+            await started["proxy"].stop()
+
+        channel_pool_loop.run(start_on_background())
+        background_channel = channel_per_call[-1][1]
+        proxy = WorkerProxy(discovery=mock_discovery_service, lazy=False, quorum=0)
+        await proxy.start()
+        await _warm_channel(sample_task)
+        local_channel = channel_per_call[-1][1]
+
+        # Act
+        await proxy.stop()
+        channel_pool_loop.run(stop_on_background())
+
+        # Assert
+        assert [target for target, _ in channel_per_call] == [
+            "localhost:50051",
+            "localhost:50051",
+        ]
+        assert local_channel is not background_channel
+        local_channel.close.assert_awaited_once()
+        background_channel.close.assert_awaited_once()
+
+    @given(count=st.integers(min_value=1, max_value=4))
+    @settings(
+        max_examples=25,
+        deadline=None,
+        suppress_health_check=[
+            HealthCheck.function_scoped_fixture,
+            HealthCheck.too_slow,
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_stop_should_leave_another_loop_untouched_for_any_proxy_count(
+        self,
+        count,
+        mock_proxy_session,
+        sample_task,
+        dispatching_stub,
+        channel_per_call,
+        channel_pool_loop,
+    ):
+        """Test hold isolation does not depend on how many proxies hold.
+
+        Given:
+            A background loop holding a channel-pool hold and one warm
+            channel throughout, and any one to four proxies started,
+            dispatched through, and stopped on the test loop
+        When:
+            Every one of those proxies has been stopped
+        Then:
+            It should leave the background loop's counters and its
+            channel's close count exactly as they were before, and end
+            with the test loop's own partition empty
+        """
+        # Arrange
+        with _held_channel(channel_pool_loop, sample_task) as before:
+            background_channel = channel_per_call[-1][1]
+            closes_before = background_channel.close.await_count
+            proxies = [
+                WorkerProxy(discovery=MockDiscoveryService(), lazy=False, quorum=0)
+                for _ in range(count)
+            ]
+            for proxy in proxies:
+                await proxy.start()
+            await _warm_channel(sample_task)
+
+            # Act
+            for proxy in proxies:
+                await proxy.stop()
+
+            # Assert
+            assert channel_pool_stats().total_entries == 0
+            assert channel_pool_loop.run(_channel_pool_snapshot()) == before
+            assert background_channel.close.await_count == closes_before
 
     @pytest.mark.asyncio
     async def test_start_should_close_connection_when_worker_dropped(

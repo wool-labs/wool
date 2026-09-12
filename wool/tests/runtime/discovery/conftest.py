@@ -11,9 +11,9 @@ async def _clear_subscriber_pool():
     """Finalize the discovery subscriber pool on the loop that used it,
     then reset the pool and factory registry.
 
-    The clear is for prompt finalization on the owning loop, not
-    correctness: the pool would rebind and drop its entries on the next
-    loop regardless.
+    The clear runs on the owning loop, the only place the pool's
+    finalizers can run; anything a test left cached would otherwise be
+    swept and reported once this loop has stopped.
     """
     yield
     if pool := __subscriber_pool__.get():
