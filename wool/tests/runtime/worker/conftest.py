@@ -56,7 +56,7 @@ def _isolate_wool_context():
     Each test runs under its own unarmed context so var values set
     in one test do not leak into subsequent tests via the chain
     context. The process-wide var_registry is not reset; tests
-    SHOULD use unique key namespaces (e.g. via uuid suffix) to avoid
+    SHOULD use unique key namespaces (e.g., via uuid suffix) to avoid
     cross-test collisions on shared keys.
     """
     with scoped_context():

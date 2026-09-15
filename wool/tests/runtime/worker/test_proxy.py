@@ -81,7 +81,7 @@ async def _run_hook(hook, *arguments):
 
     A hook may be ``None`` (a no-op), a plain callable, or a callable
     returning an awaitable — the awaitable form lets a hook suspend the
-    generator (e.g. to simulate slow success bookkeeping under
+    generator (e.g., to simulate slow success bookkeeping under
     cancellation).
     """
     if hook is None:
@@ -7860,7 +7860,7 @@ async def _make_proxy_with_workers(
     fixture to leave the stop to teardown), starts it, and waits until
     all workers are visible on ``proxy.workers``.
 
-    A custom ``discovery`` stream (e.g. `_GatedDiscovery`) and matching
+    A custom ``discovery`` stream (e.g., `_GatedDiscovery`) and matching
     ``metadata_list`` may be supplied; the drain then waits only for the
     ``metadata_list`` workers, and ``connections`` must cover every
     event the stream will ever emit.

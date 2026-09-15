@@ -784,7 +784,7 @@ async def test_install_task_factory_should_monitor_displacement_when_direct_inst
         wool.ContextVar.set in a fresh unarmed context.
     Then:
         It should raise TaskFactoryDisplaced — a direct install
-        also records the loop, so direct-install (e.g. worker)
+        also records the loop, so direct-install (e.g., worker)
         loops are displacement-monitored like self-installed ones.
     """
     # Arrange
