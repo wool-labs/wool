@@ -18,13 +18,37 @@ from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.worker.connection import TransientRpcError
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
+from wool.runtime.worker.process import _REAP_GRACE
 from wool.runtime.worker.process import WorkerProcess
+from wool.runtime.worker.proxy import WorkerProxy
 
 from . import routines
 from .conftest import PoolMode
 from .conftest import _DirectDiscovery
+from .conftest import _ensure_killed
+from .conftest import _pid_alive
 from .conftest import build_pool_from_scenario
 from .conftest import default_scenario
+from .conftest import poll_until
+
+#: The grace the worker under test is built with, in place of the
+#: minute `wool.runtime.worker.process.WorkerProcess` defaults to. A
+#: stop that asks for no drain still waits on the worker's own
+#: ``server.stop(grace=...)``, and on `WorkerProcess.reap`'s join, both
+#: of which read this; a bound worth asserting has to be derived from
+#: what the code reads rather than chosen against the default.
+_WORKER_GRACE = 5.0
+
+#: Bound, in seconds, on a stop that asks the worker for no drain at
+#: all: the worker's own grace for the server stop, then `_REAP_GRACE`
+#: for the escalation the reap allows itself, plus room on a loaded
+#: machine. The reap's grace is read from the module that enforces it,
+#: private though it is, so the bound tracks the code rather than a
+#: number that would silently stop matching it. Well under the
+#: sixty-five seconds the default grace would make legitimate, and far
+#: under the minute a teardown wedged on an in-flight dispatch would
+#: spend.
+_STOP_BOUND = _WORKER_GRACE + _REAP_GRACE + 5.0
 
 #: Hang the ``worker-dropped`` announcement rather than failing it,
 #: modelling a discovery service that has stopped responding rather
@@ -78,10 +102,9 @@ asyncio.run(main())
 class TestWorkerLoopDrain:
     @pytest.mark.asyncio
     async def test___aexit___should_drain_every_generation_of_orphaned_cleanup_chain(
-        self, tmp_path, credentials_map, retry_grpc_internal
+        self, tmp_path, credentials_map, retry_grpc_internal, worker_log
     ):
-        """Test that worker-loop teardown drains every generation of
-        pending cleanup tasks.
+        """Test worker-loop teardown drains every generation of cleanup tasks.
 
         Given:
             A routine whose finally clause schedules an orphaned cleanup
@@ -91,7 +114,10 @@ class TestWorkerLoopDrain:
             A worker pool is dispatched the routine and then torn down.
         Then:
             It should drain every generation, so the deepest cleanup
-            task observes its cancellation and writes its sentinel file.
+            task observes its cancellation and writes its sentinel file,
+            and it should clear the worker loop's pools without a
+            failure — the clears and the drain share one budget, and a
+            drain this deep must not spend the clears' share of it.
         """
         # Arrange
         sentinel = tmp_path / "drain-sentinel.txt"
@@ -107,6 +133,145 @@ class TestWorkerLoopDrain:
 
         # Assert
         assert sentinel.read_text() == "drained"
+        if not worker_log.capturing:
+            pytest.skip("requires fd capture")
+        log = worker_log()
+        assert "WORKER[" in log
+        assert "Failed to clear the" not in log
+
+
+@pytest.mark.integration
+class TestWorkerLoopTeardownClears:
+    @pytest.mark.asyncio
+    async def test_stop_should_reap_without_a_failed_clear_or_a_stranded_partition(
+        self, worker_log
+    ):
+        """Test a stop with a grace reaps a worker that pooled resources.
+
+        Given:
+            A started `wool.LocalWorker` that served a nested dispatch,
+            so its worker loop holds a cached proxy, the subscriber pool
+            behind it, and the channel that dispatch opened.
+        When:
+            The worker is stopped with a five-second grace.
+        Then:
+            It should reap the process without reporting a failed clear
+            or a partition dropped unfinalized, whose absence is what
+            distinguishes a teardown that ran from one that raised on
+            the way.
+        """
+        # Arrange
+        worker = LocalWorker()
+        await worker.start(timeout=30)
+        assert worker.metadata is not None
+        pid = worker.metadata.pid
+
+        try:
+            async with WorkerProxy(workers=[worker.metadata]):
+                assert await routines.nested_add(1, 2) == 3
+                # Guards the assertions below against passing vacuously
+                # on a worker loop that pooled nothing to clear.
+                served = await routines.worker_channel_pool_stats()
+                assert served.total_entries == 1
+
+            # Act
+            await worker.stop(grace=5.0)
+
+            # Assert
+            assert not _pid_alive(pid)
+            if not worker_log.capturing:
+                pytest.skip("requires fd capture")
+            log = worker_log(pid)
+            assert f"WORKER[{pid}]" in log
+            assert "Failed to clear the" not in log
+            assert "ResourcePool(" not in log
+        finally:
+            _ensure_killed(pid)
+
+    @pytest.mark.asyncio
+    async def test_stop_should_return_when_a_nested_dispatch_is_in_flight(
+        self, tmp_path, worker_log
+    ):
+        """Test a stop lands cleanly on a worker mid nested dispatch.
+
+        Given:
+            A started `wool.LocalWorker` running a routine that has
+            dispatched a sleep of its own back through the worker and
+            is parked in it, so a nested proxy, an outbound channel and
+            a live stream are all in use on the worker loop.
+        When:
+            The worker is stopped with its default grace, which asks
+            the worker for no drain at all.
+        Then:
+            It should return within the stop's own bound, reap the
+            process, and strand no partition on the worker: the
+            teardown clears are best-effort under a live dispatch, so a
+            clear the stop cancels is reported and tolerated, while a
+            partition dropped unfinalized is neither.
+        """
+        # Arrange
+        sentinel = tmp_path / "nested-sleep.txt"
+        worker = LocalWorker(shutdown_grace_period=_WORKER_GRACE)
+        await worker.start(timeout=30)
+        assert worker.metadata is not None
+        pid = worker.metadata.pid
+
+        try:
+            async with WorkerProxy(workers=[worker.metadata]):
+                dispatch = asyncio.create_task(
+                    routines.nested_cancellable_sleep(str(sentinel))
+                )
+                # The inner routine writes its marker as it suspends, so
+                # the stop lands on a dispatch that is genuinely parked
+                # rather than one still being routed.
+                await poll_until(
+                    lambda: sentinel.exists() and sentinel.read_text() == "started",
+                    bool,
+                    description="nested sleep never started",
+                    timeout=30.0,
+                    interval=0.1,
+                )
+
+                # Act
+                started = time.monotonic()
+                await worker.stop()
+                elapsed = time.monotonic() - started
+
+                dispatch.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await dispatch
+
+            # Assert
+            assert elapsed < _STOP_BOUND
+            await poll_until(
+                lambda: _pid_alive(pid),
+                lambda alive: not alive,
+                description="worker process never exited",
+                timeout=15.0,
+                interval=0.1,
+            )
+            # Scoped to the teardown's own records rather than the
+            # whole log: a stop landing here also races
+            # `wool.runtime.worker.session.DispatchSession`'s
+            # completion callback, which logs an ``InvalidStateError``
+            # when the future it settles was already cancelled. That is
+            # a defect of the session, not of the clears this test is
+            # about, so it is reported rather than pinned here.
+            # Under ``-s`` the fixture reads nothing, and an anchor on
+            # an empty read says nothing about the worker either way.
+            if not worker_log.capturing:
+                pytest.skip("requires fd capture")
+            log = worker_log(pid)
+            assert f"WORKER[{pid}]" in log
+            # Not every ``ResourcePool`` record, and not the failed
+            # clear: this stop is the condition under which a clear is
+            # cancelled, and `WorkerService` reports a cancelled clear
+            # and carries on. What is forbidden is a partition dropped
+            # unfinalized, the record the discard emits for a loop that
+            # closed on top of its entries.
+            assert "dropping" not in log
+        finally:
+            _ensure_killed(pid)
 
     @pytest.mark.asyncio
     async def test___aexit___should_drain_later_generations_when_peer_cancels_drain(
@@ -670,21 +835,3 @@ class _BrokenDropPublisher:
                 await asyncio.Event().wait()
             raise self._error
         return await self._publisher.publish(type, metadata)
-
-
-def _pid_alive(pid: int) -> bool:
-    """Return whether a process with the given pid currently exists."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _ensure_killed(pid: int | None) -> None:
-    """Best-effort SIGKILL so a failing run cannot leak the orphan under test."""
-    if pid is not None and _pid_alive(pid):
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)

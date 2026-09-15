@@ -22,6 +22,7 @@ import pytest
 import wool
 from wool.runtime.worker.connection import RpcError
 from wool.runtime.worker.connection import UnexpectedResponse
+from wool.runtime.worker.connection import channel_pool_stats
 
 from . import routines
 from .conftest import BackpressureMode
@@ -732,11 +733,10 @@ class TestUnifiedDriverShape:
         await retry_grpc_internal(body)
 
     @pytest.mark.asyncio
-    async def test_async_gen_caller_cancel_midstream_releases_channel_pool_ref(
+    async def test_dispatch_should_release_the_channel_reference_when_cancelled(
         self, credentials_map, retry_grpc_internal, tmp_path
     ):
-        """Test caller cancellation mid-stream releases the pooled
-        channel reference.
+        """Test caller cancellation mid-stream releases the channel reference.
 
         Given:
             An async-generator routine yielding ``"alive"`` forever
@@ -754,8 +754,6 @@ class TestUnifiedDriverShape:
 
         async def body():
             # Arrange
-            from wool.runtime.worker import connection
-
             scenario = default_scenario(
                 shape=RoutineShape.ASYNC_GEN_ACLOSE,
                 pool_mode=PoolMode.EPHEMERAL,
@@ -764,7 +762,7 @@ class TestUnifiedDriverShape:
 
             # Act
             async with build_pool_from_scenario(scenario, credentials_map):
-                baseline = connection._channel_pool.stats.referenced_entries
+                baseline = channel_pool_stats().referenced_entries
                 collected = []
                 started = asyncio.Event()
 
@@ -793,7 +791,7 @@ class TestUnifiedDriverShape:
                 # Assert
                 assert collected == ["alive"]
                 assert sentinel.read_text() == "cleaned_up"
-                assert connection._channel_pool.stats.referenced_entries == baseline
+                assert channel_pool_stats().referenced_entries == baseline
 
         await retry_grpc_internal(body)
 
