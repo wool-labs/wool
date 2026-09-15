@@ -1,7 +1,9 @@
 import asyncio
+import gc
 import logging
 import pickle
 import threading
+import warnings
 from contextlib import AsyncExitStack
 from datetime import timedelta
 from pathlib import Path
@@ -18,12 +20,15 @@ from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 import wool
+from tests.helpers import await_new_task
+from tests.helpers import drain_loop_tasks
 from tests.helpers import write_certificate_files
 from wool import protocol
 from wool.runtime.context.exceptions import SerializationWarning
 from wool.runtime.context.var import ContextVar
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker import connection as connection_module
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
@@ -2579,6 +2584,280 @@ class TestWorkerConnection:
         assert connection_module.channel_pool_stats().referenced_entries == 0
 
     @pytest.mark.asyncio
+    async def test_dispatch_should_release_channel_ref_when_loop_drain_cancels_teardown(
+        self, sample_task, dispatching_stub
+    ):
+        """Test a drain landing before teardown's first step releases the channel.
+
+        Given:
+            A dispatched task consumed to exhaustion inside its own task,
+            suspended in the shielded teardown with the teardown's child
+            task created but not yet stepped.
+        When:
+            A loop-wide drain cancels every task on the loop, the
+            unstarted teardown child among them, and awaits them.
+        Then:
+            It should leave the channel pool holding one entry with zero
+            references, i.e., the teardown runs to completion however
+            early the cancellation reaches the child.
+        """
+        # Arrange
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        async def consume():
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        consumer = asyncio.ensure_future(consume())
+        (child,) = await await_new_task(exclude=(consumer,))
+
+        # Act
+        await drain_loop_tasks()
+
+        # Assert
+        assert channel_pool_stats().total_entries == 1
+        assert channel_pool_stats().referenced_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_not_warn_unawaited_when_loop_drain_cancels_teardown(
+        self, sample_task, dispatching_stub
+    ):
+        """Test a drain before teardown's first step leaves no unawaited teardown.
+
+        Given:
+            A dispatched task consumed to exhaustion into teardown with
+            the teardown child not yet stepped, under recorded warnings.
+        When:
+            A loop-wide drain cancels every task on the loop, awaits
+            them, and the collector is forced.
+        Then:
+            It should record no `RuntimeWarning` naming an un-awaited
+            `AsyncExitStack.aclose` coroutine, i.e., the teardown is
+            always awaited, never closed unstarted.
+        """
+        # Arrange
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        async def consume():
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            consumer = asyncio.ensure_future(consume())
+            (child,) = await await_new_task(exclude=(consumer,))
+
+            # Act
+            await drain_loop_tasks()
+            gc.collect()
+
+        # Assert
+        unawaited = [
+            w
+            for w in caught
+            if issubclass(w.category, RuntimeWarning)
+            and "never awaited" in str(w.message)
+            and "aclose" in str(w.message)
+        ]
+        assert not unawaited
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_cancel_call_when_loop_drain_cancels_teardown(
+        self, sample_task, dispatching_stub
+    ):
+        """Test a drain landing before teardown's first step cancels the call.
+
+        Given:
+            A dispatched task consumed to exhaustion into teardown, with
+            the gRPC call's cancel record cleared once the teardown child
+            exists unstepped, so only teardown-driven cancels are observed.
+        When:
+            A loop-wide drain cancels every task on the loop and awaits
+            them.
+        Then:
+            It should cancel the in-flight gRPC call from the teardown
+            stack's release callback.
+        """
+        # Arrange
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        async def consume():
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        consumer = asyncio.ensure_future(consume())
+        (child,) = await await_new_task(exclude=(consumer,))
+        # Clear the call's cancel record so the assertion isolates the exit
+        # stack's ``_safe_cancel`` from ``_read_next``'s own cleanup.
+        (mock_call,) = dispatching_stub.calls
+        mock_call.cancel.reset_mock()
+
+        # Act
+        await drain_loop_tasks()
+
+        # Assert
+        assert mock_call.cancel.called
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_release_permit_when_loop_drain_cancels_teardown(
+        self, sample_task, dispatching_stub
+    ):
+        """Test a drain landing before teardown's first step returns the permit.
+
+        Given:
+            A connection limited to a single concurrent stream whose only
+            dispatch was in teardown, with the child unstarted, when a
+            loop-wide drain cancelled every task.
+        When:
+            A second task is dispatched on the same connection under a
+            short timeout.
+        Then:
+            It should admit the second dispatch and stream its result
+            rather than raise a deadline error, i.e., every release
+            callback ran, not merely the first on the LIFO stack.
+        """
+        # Arrange
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=1)
+        )
+
+        async def consume():
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        consumer = asyncio.ensure_future(consume())
+        (child,) = await await_new_task(exclude=(consumer,))
+        await drain_loop_tasks()
+
+        # Act
+        async with asyncio.timeout(5):
+            results = [
+                result
+                async for result in await connection.dispatch(sample_task, timeout=1.0)
+            ]
+
+        # Assert
+        assert results == ["ok"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_defer_child_cancel_until_teardown_completes(
+        self, sample_task, dispatching_stub
+    ):
+        """Test a cancel delivered only to the teardown child waits for teardown.
+
+        Given:
+            A dispatched task consumed to exhaustion into teardown, with a
+            consuming task that is never itself cancelled and a teardown
+            child not yet stepped.
+        When:
+            Only the teardown child task is cancelled, then the consuming
+            task is awaited.
+        Then:
+            It should raise `asyncio.CancelledError` to the consumer only
+            after teardown has left one pooled entry with zero references,
+            i.e., the child's cancellation is deferred, not swallowed.
+        """
+        # Arrange
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        released_before_raise: list[bool] = []
+
+        async def consume():
+            try:
+                async for _ in await connection.dispatch(sample_task):
+                    pass
+            except asyncio.CancelledError:
+                stats = channel_pool_stats()
+                released_before_raise.append(
+                    stats.total_entries == 1 and stats.referenced_entries == 0
+                )
+                raise
+
+        consumer = asyncio.ensure_future(consume())
+        (child,) = await await_new_task(exclude=(consumer,))
+
+        # Act
+        await drain_loop_tasks(exclude=(consumer,))
+        async with asyncio.timeout(5):
+            await asyncio.gather(consumer, return_exceptions=True)
+
+        # Assert
+        assert consumer.cancelled()
+        assert released_before_raise == [True]
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=30,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        generations=st.integers(
+            min_value=0, max_value=connection_module._TEARDOWN_RESPAWN_LIMIT
+        ),
+        drain_caller=st.booleans(),
+    )
+    async def test_dispatch_should_release_channel_ref_when_drain_follows_respawns(
+        self,
+        sample_task,
+        dispatching_stub,
+        generations: int,
+        drain_caller: bool,
+    ):
+        """Test the channel is released however many pre-step cancels precede a drain.
+
+        Given:
+            A dispatched task consumed into teardown, whose teardown child
+            has already been cancelled before its first step any number of
+            times up to the re-spawn budget, and a final loop-wide drain
+            that lands before the latest child steps and may or may not
+            include the consuming task in its cancel set.
+        When:
+            The drain cancels its task set and awaits them, and the
+            consuming task is awaited under a bound.
+        Then:
+            It should settle the consuming task cancelled and leave the
+            channel pool holding one entry with zero references.
+        """
+        # Arrange — the module pool persists across Hypothesis examples on
+        # one loop, so evict anything a prior example cached.
+        await clear_channel_pool()
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        async def consume():
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        consumer = asyncio.ensure_future(consume())
+        (child,) = await await_new_task(exclude=(consumer,))
+        for _ in range(generations):
+            baseline = asyncio.all_tasks()
+            child.cancel()
+            await asyncio.wait({child}, timeout=5)
+            (child,) = await await_new_task(since=baseline, exclude=(consumer,))
+
+        # Act
+        await drain_loop_tasks(exclude=() if drain_caller else (consumer,))
+        async with asyncio.timeout(5):
+            await asyncio.gather(consumer, return_exceptions=True)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # Assert
+        assert consumer.cancelled()
+        assert channel_pool_stats().total_entries == 1
+        assert channel_pool_stats().referenced_entries == 0
+
+    @pytest.mark.asyncio
     async def test_dispatch_should_reraise_signal_when_teardown_raises_process_signal(
         self, mocker: MockerFixture, sample_task, mock_grpc_call, async_stream
     ):
@@ -2680,6 +2959,226 @@ class TestWorkerConnection:
 
         # Assert — the caller unblocked and the timeout was reported.
         assert any("teardown exceeded" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_not_extend_teardown_budget_when_cancelled_repeatedly(
+        self, mocker: MockerFixture, sample_task, dispatching_stub, caplog
+    ):
+        """Test repeated cancellation does not renew the teardown budget.
+
+        Given:
+            A dispatch whose pooled-resource release is wedged on the
+            channel pool's lock, under a shortened teardown budget.
+        When:
+            The consuming task is cancelled repeatedly, faster than the
+            budget elapses, and the lock is then freed.
+        Then:
+            It should unblock within a small multiple of one budget rather
+            than have the budget renewed per cancellation, log the detach
+            warning, and let the detached child return the pooled
+            reference once the lock is freed.
+        """
+        # Arrange
+        budget = 0.2
+        mocker.patch.object(connection_module, "_TEARDOWN_TIMEOUT", budget)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        stream = await connection.dispatch(sample_task)
+        pool = connection_module._channel_pool
+
+        async def consume():
+            async for _ in stream:
+                pass
+
+        await pool._lock.acquire()
+        try:
+            consumer = asyncio.ensure_future(consume())
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+            # Act
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            with caplog.at_level(
+                logging.WARNING, logger="wool.runtime.worker.connection"
+            ):
+                while not consumer.done() and loop.time() - start < 5:
+                    consumer.cancel()
+                    await asyncio.sleep(0.02)
+            elapsed = loop.time() - start
+            # With the caller gone, only the detached-task registry keeps the
+            # wedged child reachable from outside the pool.
+            gc.collect()
+        finally:
+            pool._lock.release()
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        # Assert
+        assert consumer.done()
+        assert elapsed < 5 * budget
+        assert any("teardown exceeded" in r.getMessage() for r in caplog.records)
+        assert channel_pool_stats().referenced_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_release_channel_ref_when_deadline_expires_pre_step(
+        self, mocker: MockerFixture, sample_task, dispatching_stub, caplog
+    ):
+        """Test an expired budget still runs a teardown cancelled before its step.
+
+        Given:
+            A dispatch under a teardown budget that has already expired,
+            consumed to exhaustion into teardown with the teardown child
+            created but not yet stepped, under recorded warnings.
+        When:
+            Only the teardown child is cancelled, so the expiring budget
+            converts that cancellation into a timeout, and the loop is
+            then allowed to run.
+        Then:
+            It should log the detach, release the pooled channel from the
+            detached child, still surface `asyncio.CancelledError` to the
+            consumer, and emit no un-awaited `AsyncExitStack.aclose`
+            warning.
+        """
+        # Arrange
+        mocker.patch.object(connection_module, "_TEARDOWN_TIMEOUT", 0.0)
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        async def consume():
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with caplog.at_level(
+                logging.WARNING, logger="wool.runtime.worker.connection"
+            ):
+                consumer = asyncio.ensure_future(consume())
+                (child,) = await await_new_task(exclude=(consumer,))
+
+                # Act
+                await drain_loop_tasks(exclude=(consumer,))
+                async with asyncio.timeout(5):
+                    await asyncio.gather(consumer, return_exceptions=True)
+                for _ in range(5):
+                    await asyncio.sleep(0)
+            gc.collect()
+
+        # Assert
+        assert any("teardown exceeded" in r.getMessage() for r in caplog.records)
+        assert channel_pool_stats().total_entries == 1
+        assert channel_pool_stats().referenced_entries == 0
+        assert consumer.cancelled()
+        unawaited = [
+            w
+            for w in caught
+            if issubclass(w.category, RuntimeWarning)
+            and "never awaited" in str(w.message)
+            and "aclose" in str(w.message)
+        ]
+        assert not unawaited
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_detach_teardown_when_child_cancelled_repeatedly(
+        self, sample_task, dispatching_stub, caplog
+    ):
+        """Test repeated pre-step child cancellation detaches after the budget.
+
+        Given:
+            A dispatched task consumed to exhaustion into teardown, with a
+            consuming task that is never itself cancelled.
+        When:
+            Every fresh teardown child is cancelled before its first step,
+            generation after generation, until the consumer settles.
+        Then:
+            It should log the detach after exactly one cancellation more
+            than the re-spawn budget and leave the release to a detached
+            child that returns the pooled reference.
+        """
+        # Arrange
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+
+        async def consume():
+            async for _ in await connection.dispatch(sample_task):
+                pass
+
+        consumer = asyncio.ensure_future(consume())
+        (child,) = await await_new_task(exclude=(consumer,))
+        cancellations = connection_module._TEARDOWN_RESPAWN_LIMIT + 1
+
+        # Act — the shield wakes the caller, which re-spawns, before ``wait``
+        # wakes this task, so each fresh child is read back still unstepped.
+        with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.connection"):
+            for _ in range(cancellations):
+                baseline = asyncio.all_tasks()
+                child.cancel()
+                await asyncio.wait({child}, timeout=5)
+                (child,) = await await_new_task(since=baseline, exclude=(consumer,))
+            async with asyncio.timeout(5):
+                await asyncio.gather(consumer, return_exceptions=True)
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        # Assert
+        assert any(
+            f"cancelled unstarted {cancellations} times" in r.getMessage()
+            for r in caplog.records
+        )
+        assert channel_pool_stats().referenced_entries == 0
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_warn_when_teardown_child_cancelled_mid_release(
+        self, sample_task, dispatching_stub, caplog
+    ):
+        """Test a cancel delivered to a teardown child mid-release is logged.
+
+        Given:
+            A dispatched task consumed into teardown whose child has
+            entered the unwind and is suspended on the channel pool's lock.
+        When:
+            Only that teardown child is cancelled, then the consuming task
+            is awaited.
+        Then:
+            It should raise `asyncio.CancelledError` to the consumer and
+            log that the teardown was cancelled mid-release.
+        """
+        # Arrange
+        connection = WorkerConnection(
+            "localhost:50051", options=ChannelOptions(max_concurrent_streams=10)
+        )
+        stream = await connection.dispatch(sample_task)
+        pool = connection_module._channel_pool
+
+        async def consume():
+            async for _ in stream:
+                pass
+
+        await pool._lock.acquire()
+        try:
+            consumer = asyncio.ensure_future(consume())
+            (child,) = await await_new_task(exclude=(consumer,))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert not child.done(), "the teardown child never parked on the lock"
+
+            # Act
+            with caplog.at_level(
+                logging.WARNING, logger="wool.runtime.worker.connection"
+            ):
+                child.cancel()
+                async with asyncio.timeout(5):
+                    await asyncio.gather(consumer, return_exceptions=True)
+        finally:
+            pool._lock.release()
+
+        # Assert
+        assert consumer.cancelled()
+        assert any("cancelled mid-release" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_close_should_be_idempotent(self, mocker: MockerFixture):

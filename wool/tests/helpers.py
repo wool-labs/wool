@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import ipaddress
 import uuid
@@ -211,3 +212,60 @@ def generate_certificate_files(
     return write_certificate_files(
         directory, material.ca_pem, material.key_pem, material.cert_pem
     )
+
+
+#: Loop iterations `await_new_task` steps before it gives up.
+_NEW_TASK_TICKS = 200
+
+
+async def await_new_task(*, exclude=(), since=None):
+    """Step the running loop until a task outside a snapshot appears.
+
+    Returns the set of tasks that were not pending in the snapshot and
+    are not in *exclude*, observed before any of them has taken its first
+    step. The snapshot is taken on entry unless *since* supplies one
+    taken earlier, in which case the loop is checked before it is first
+    stepped, so a task created between the snapshot and the call is
+    still caught unstepped. Raises `AssertionError` if nothing appears
+    within `_NEW_TASK_TICKS` iterations, so an arrangement that stopped
+    spawning the task it waits for cannot pass vacuously.
+
+    .. rubric:: Implementation notes
+
+    A task's first ``__step`` is queued behind the callbacks already
+    ready when it is created, so the tick on which it first shows up in
+    `asyncio.all_tasks` is the tick before its body runs under CPython's
+    asyncio ready queue.
+    """
+    current = asyncio.current_task()
+    excluded = set(exclude) | {current}
+    baseline = asyncio.all_tasks() if since is None else since
+    for tick in range(_NEW_TASK_TICKS):
+        if tick or since is None:
+            await asyncio.sleep(0)
+        spawned = asyncio.all_tasks() - baseline - excluded
+        if spawned:
+            return spawned
+    raise AssertionError(f"no new task appeared within {_NEW_TASK_TICKS} loop ticks")
+
+
+async def drain_loop_tasks(*, exclude=(), timeout=5.0):
+    """Cancel and await every pending task on the running loop.
+
+    Spares the caller's own task and those in *exclude*. Performs one
+    generation of the cancel-every-task shape that
+    `WorkerService._destroy_worker_loop` repeats until the loop is quiet.
+    Raises `AssertionError` if any cancelled task is still pending after
+    *timeout* seconds, so a task that swallows its cancellation fails the
+    test rather than hanging it.
+    """
+    current = asyncio.current_task()
+    excluded = set(exclude) | {current}
+    victims = [task for task in asyncio.all_tasks() if task not in excluded]
+    if not victims:
+        return
+    for task in victims:
+        task.cancel()
+    _, pending = await asyncio.wait(victims, timeout=timeout)
+    if pending:
+        raise AssertionError(f"{len(pending)} task(s) still pending after the drain")

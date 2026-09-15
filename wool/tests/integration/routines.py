@@ -17,8 +17,10 @@ import inspect
 import os
 from enum import Enum
 from enum import auto
+from typing import NamedTuple
 
 import wool
+from tests.helpers import await_new_task
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import current_credentials
 from wool.runtime.worker.connection import channel_pool_stats
@@ -537,6 +539,77 @@ async def _drain_probe_second_gen(sentinel_path: str) -> None:
     finally:
         with open(sentinel_path, "w") as f:
             f.write("drained")
+
+
+class TeardownProbe(NamedTuple):
+    """Worker-side channel-pool counters and a follow-up dispatch result.
+
+    :param referenced_entries:
+        Pooled channels still referenced after the drain; ``0`` means
+        the cancelled dispatch's pooled-channel release ran.
+    :param total_entries:
+        Channels cached in the worker's pool; at least ``1`` once a
+        nested dispatch has run, so a zero reference count is not the
+        count of an empty pool.
+    :param follow_up:
+        The result of a nested dispatch issued after the drain, showing
+        the worker can still dispatch.
+    """
+
+    referenced_entries: int
+    total_entries: int
+    follow_up: int
+
+
+@wool.routine
+async def drain_nested_teardown_before_first_step(sentinel_path: str) -> TeardownProbe:
+    """Cancel a nested dispatch together with its unstarted teardown child.
+
+    Models the shutdown race behind issue #422 on a real worker loop: the
+    consuming task of a live nested dispatch and the shielded teardown
+    child it spawns are cancelled together before that child's first
+    step, the way a loop-wide drain would cancel them. The victim set is
+    scoped by identity, so the worker's own dispatch session and proxy
+    tasks are spared and the routine can still return. Were the teardown
+    closed unstarted, the reported reference count would stay pinned.
+
+    :param sentinel_path:
+        Path the nested `cancellable_sleep` writes its ``"started"``
+        marker to, confirming the nested dispatch is live.
+    :returns:
+        The worker's channel-pool counters after the drain and the
+        result of a follow-up nested dispatch.
+    """
+
+    async def consume():
+        await cancellable_sleep(sentinel_path, 30.0)
+
+    consumer = asyncio.ensure_future(consume())
+    for _ in range(500):
+        await asyncio.sleep(0.01)
+        try:
+            with open(sentinel_path) as f:
+                if f.read() == "started":
+                    break
+        except FileNotFoundError:
+            pass
+    else:
+        raise AssertionError("nested dispatch never reported started")
+
+    consumer.cancel()
+    (child,) = await await_new_task(exclude=(consumer,))
+    for task in (consumer, child):
+        task.cancel()
+    _, pending = await asyncio.wait((consumer, child), timeout=5.0)
+    if pending:
+        raise AssertionError(f"{len(pending)} task(s) still pending after the drain")
+
+    stats = channel_pool_stats()
+    return TeardownProbe(
+        referenced_entries=stats.referenced_entries,
+        total_entries=stats.total_entries,
+        follow_up=await add(1, 2),
+    )
 
 
 @wool.routine

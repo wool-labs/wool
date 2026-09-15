@@ -507,6 +507,25 @@ class WorkerConnection:
         instances as worker-health concerns, so a caller-side encode
         failure reaches the caller rather than evicting workers.
 
+        **Cancellation.**
+        Cancelling the consuming task while a dispatch is in flight
+        cancels the gRPC call and releases the pooled channel and its
+        concurrency permit before `asyncio.CancelledError` reaches the
+        consumer. The cancellation waits on that release, and the wait is
+        bounded. When sixty seconds pass from the start of the release,
+        or when the release is cancelled repeatedly before it can start,
+        the consumer observes its cancellation, a warning is logged, and
+        the release continues in the background, where it completes only
+        if the event loop outlives it and nothing cancels it. A
+        cancellation delivered to the release once it has begun aborts
+        it: the consumer observes the cancellation immediately, the
+        pooled channel can remain referenced, and a warning is logged.
+
+        A drain that cancels every task on the event loop, e.g., a worker
+        retiring its loop, cancels the release along with the consumer.
+        The consumer then observes an `asyncio.CancelledError` it never
+        requested, and the release is exposed to both limits above.
+
         :param task:
             The `Task` instance to dispatch to the worker.
         :param timeout:
@@ -535,6 +554,15 @@ class WorkerConnection:
             If the worker doesn't acknowledge the task.
         :raises ValueError:
             If the timeout value is not positive.
+
+        .. rubric:: Implementation notes
+
+        The release is the unwind of `_execute`'s exit stack, driven
+        through `_complete_teardown`. That function owns the deferral,
+        the two conditions under which it stops waiting
+        (`_TEARDOWN_TIMEOUT` and `_TEARDOWN_RESPAWN_LIMIT`), the detached
+        continuation, and what a cancellation that lands mid-release
+        costs.
         """
         if timeout is not None and timeout <= 0:
             raise ValueError("Dispatch timeout must be positive")
@@ -731,13 +759,18 @@ class WorkerConnection:
         Completes the handshake before yielding to the caller; any
         exit path — setup failure, priming-yield ``GeneratorExit``,
         mid-stream exception, natural end of stream — unwinds the
-        stack and releases every resource exactly once.
+        stack. The unwind is driven through `_complete_teardown`,
+        which owns the cancellation guarantee and its limits.
 
-        The stack unwind is driven through `_complete_teardown`
-        so the release callbacks run to completion even when the
-        caller task is mid-cancellation — otherwise a pending
-        ``CancelledError`` could pre-empt ``AsyncExitStack.__aexit__``
-        and leak a pooled channel reference.
+        .. rubric:: Implementation notes
+
+        The stack registers the pooled-channel context first, so its
+        release runs last on the LIFO unwind; the permit release and
+        the call cancel are synchronous callbacks, which makes the
+        pooled-channel release the only callback that suspends. A
+        cancellation delivered to `_complete_teardown`'s child after it
+        has entered the unwind therefore lands on that release, with no
+        callback left to run after it.
         """
         stack = AsyncExitStack()
         try:
@@ -893,7 +926,10 @@ def channel_pool_stats() -> ResourcePool.Stats:
     Counts cached channels, how many are referenced by an in-flight
     dispatch, and how many are awaiting their idle finalization. A
     referenced count that never falls to zero while nothing is
-    dispatching means a permit or a pooled reference is leaking.
+    dispatching means a permit or a pooled reference is leaking; read
+    it over a window rather than at an instant, since a cancelled
+    dispatch whose teardown was detached (see `_complete_teardown`) may
+    not release its reference until well after the cancel, if at all.
 
     :returns:
         A snapshot of the pool's counters at the moment of the call.
@@ -974,6 +1010,17 @@ def channel_pool_hold() -> AsyncContextManager[None]:
 
 
 _TEARDOWN_TIMEOUT: Final = 60.0
+"""Seconds `_complete_teardown` waits, from entry, before it unblocks the
+caller and leaves the release to a detached task."""
+
+_TEARDOWN_RESPAWN_LIMIT: Final = 3
+"""Pre-step cancellations of its child `_complete_teardown` absorbs, by
+re-awaiting the still-unstarted teardown on a fresh child, before it gives
+up waiting."""
+
+_detached_teardowns: Final[set[asyncio.Task[None]]] = set()
+"""Strong references to teardown tasks left running after their caller
+stopped waiting; the loop keeps only weak references to tasks."""
 
 
 async def _complete_teardown(teardown: Coroutine[Any, Any, None]) -> None:
@@ -982,26 +1029,70 @@ async def _complete_teardown(teardown: Coroutine[Any, Any, None]) -> None:
     Resource teardown registered on an `AsyncExitStack`
     awaits its release callbacks. When the caller task carries a
     pending cancellation — externally via ``task.cancel()`` or from
-    a worker-side ``CancelledError`` re-raised into it by
+    a worker-side `asyncio.CancelledError` re-raised into it by
     `_DispatchStream._read_next` — asyncio would pre-empt the
     next suspending teardown ``await`` and skip the remaining
     callbacks, leaking a pooled resource reference.
 
     Running *teardown* as a shielded child task gives it an
     independent cancellation state, so its ``await`` boundaries run
-    uninterrupted. A cancellation observed while waiting is deferred
-    and re-raised once teardown finishes, so the caller still
-    observes the cancel.
+    uninterrupted. *teardown* is always awaited once this coroutine
+    is entered: a cancellation that reaches the child before its
+    first step does not discard it. A cancellation delivered to the
+    caller, or to the child before its first step, is deferred and
+    re-raised once teardown finishes or the caller stops waiting on
+    it, so the caller still observes the cancel. A cancellation
+    delivered to the child after it has entered *teardown* aborts the
+    release suspended at that moment and propagates immediately; that
+    aborted release can leave a pooled reference pinned, and is
+    logged.
 
-    A teardown-side exception other than ``CancelledError`` propagates
-    and supersedes a deferred cancel, mirroring ``finally`` precedence.
-    ``KeyboardInterrupt`` and ``SystemExit`` are captured off the child
-    task — where they would otherwise escape straight to the event-loop
-    runner via ``Task.__step`` — and re-raised in the caller's context.
-    If teardown does not finish within `_TEARDOWN_TIMEOUT` the
-    caller is unblocked and the shielded task is left running detached
-    so the release still completes.
+    A teardown-side exception other than `asyncio.CancelledError`
+    propagates and supersedes a deferred cancel, mirroring
+    ``finally`` precedence. `KeyboardInterrupt` and `SystemExit` are
+    captured off the child task — where they would otherwise escape
+    straight to the event-loop runner via `asyncio.Task.__step` — and
+    re-raised in the caller's context. If teardown does not finish
+    within `_TEARDOWN_TIMEOUT` of entry, or the child is cancelled
+    before its first step more than `_TEARDOWN_RESPAWN_LIMIT` times,
+    the caller is unblocked and the release is left to a detached
+    task, which completes only while the loop outlives it and nothing
+    cancels it before its first step — a worker-loop drain such as
+    `WorkerService._destroy_worker_loop` guarantees neither past its
+    own budget.
+
+    .. rubric:: Implementation notes
+
+    `asyncio.ensure_future` only schedules the child's first step.
+    An `asyncio.Task.cancel` delivered before that step throws
+    `asyncio.CancelledError` into a coroutine that has not started,
+    which closes it without executing its body, so neither the
+    child's own ``try`` nor *teardown* is ever entered and no
+    release callback runs. ``entered`` is set as the child's first
+    statement; with no suspension point between it and ``await
+    teardown``, a child that finishes without setting it was
+    cancelled before its first step, and the still-unstarted
+    *teardown* is safe to hand to a fresh child. The flag is a
+    witness, not an assumption: a loop that starts tasks eagerly
+    sets it before any cancel can land, and the retry is simply
+    never taken.
+
+    Repeated pre-step cancellation cannot spin indefinitely: every
+    retry shares the deadline fixed at entry and counts against
+    `_TEARDOWN_RESPAWN_LIMIT`. Each give-up path leaves a real child
+    running when one is still outstanding — a fresh one when the last
+    was cancelled unstarted — held in `_detached_teardowns`.
+    `asyncio.timeout_at` converts a cancellation observed while it is
+    expiring into `TimeoutError`, which is why `_detach` tests
+    ``entered`` rather than assuming the child is running, and why
+    the timeout arm defers a cancel it finds on the child rather than
+    letting the conversion swallow it.
+
+    Once *teardown* is entered, `AsyncExitStack.__aexit__` keeps
+    driving the callbacks that remain after one raises, but the
+    release the cancel interrupted is not retried.
     """
+    entered = False
     interrupt: KeyboardInterrupt | SystemExit | None = None
 
     async def _run() -> None:
@@ -1009,39 +1100,44 @@ async def _complete_teardown(teardown: Coroutine[Any, Any, None]) -> None:
         # own frame: a ``KeyboardInterrupt``/``SystemExit`` raised by a
         # task escapes to the event-loop runner rather than to the
         # awaiter, so it must not be left to propagate out of the task.
-        nonlocal interrupt
+        nonlocal entered, interrupt
+        entered = True
         try:
             await teardown
         except (KeyboardInterrupt, SystemExit) as exc:
             interrupt = exc
 
+    def _detach(task: asyncio.Task[None], reason: str) -> asyncio.Task[None]:
+        # Pre-step cancel — see the implementation notes.
+        if task.done() and not entered:
+            task = asyncio.ensure_future(_run())
+        if task.done():
+            return task
+        _detached_teardowns.add(task)
+        task.add_done_callback(_detached_teardowns.discard)
+        _log.warning(
+            "Routine teardown %s; pooled-resource release deferred to a "
+            "detached task, which completes only while the loop outlives "
+            "it. A process-level interrupt raised by that release surfaces "
+            "with no awaiter.",
+            reason,
+        )
+        return task
+
     task = asyncio.ensure_future(_run())
+    deadline = asyncio.get_running_loop().time() + _TEARDOWN_TIMEOUT
     deferred: asyncio.CancelledError | None = None
+    respawns = 0
     while True:
         try:
-            async with asyncio.timeout(_TEARDOWN_TIMEOUT):
+            async with asyncio.timeout_at(deadline):
                 await asyncio.shield(task)
         except TimeoutError:
-            # Teardown is wedged — only reachable under pathological
-            # pool-lock contention. Stop blocking the caller; the
-            # shielded task keeps running so the release still
-            # completes, just not synchronously.
-            _log.warning(
-                "Routine teardown exceeded %.0fs; pooled-resource "
-                "release deferred to a detached task.",
-                _TEARDOWN_TIMEOUT,
-            )
-            # If the shielded task is still in flight at
-            # timeout, a captured process-level interrupt could
-            # surface from it later with no awaiter. Log so an
-            # operator can correlate. The done-with-interrupt case
-            # falls through to the post-loop ``raise interrupt``.
-            if not task.done():
-                _log.debug(
-                    "Routine teardown detached with shielded task "
-                    "still pending; a process-level interrupt may "
-                    "surface later from the detached task."
-                )
+            # See the implementation notes. Stop blocking the caller
+            # either way.
+            if task.cancelled():
+                deferred = asyncio.CancelledError()
+            task = _detach(task, f"exceeded {_TEARDOWN_TIMEOUT:.0f}s")
             break
         except asyncio.CancelledError as exc:
             if not task.done():
@@ -1049,6 +1145,22 @@ async def _complete_teardown(teardown: Coroutine[Any, Any, None]) -> None:
                 # task running and re-await it on the next iteration.
                 deferred = exc
                 continue
+            if not entered:
+                deferred = exc
+                if respawns < _TEARDOWN_RESPAWN_LIMIT:
+                    respawns += 1
+                    task = asyncio.ensure_future(_run())
+                    continue
+                task = _detach(task, f"was cancelled unstarted {respawns + 1} times")
+                break
+            if task.cancelled():
+                # Cancelled after entering *teardown* — see the
+                # implementation notes.
+                _log.warning(
+                    "Routine teardown was cancelled mid-release; a "
+                    "pooled-resource reference may remain pinned until "
+                    "the pool rebinds."
+                )
             raise
         break
     if interrupt is not None:

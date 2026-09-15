@@ -672,7 +672,12 @@ def dispatching_stub(mocker: MockerFixture, async_stream, mock_grpc_call):
 
     Every call builds a fresh ack-then-result stream, so a test may
     dispatch any number of times without exhausting a shared generator.
-    Returns the stub, for tests that assert on the dispatch calls.
+    Each call is kept on ``stub.calls`` for the life of the test: were an
+    exhausted response generator collected mid-test, asyncio's
+    async-generator finalizer hook would schedule a stray ``aclose`` task
+    in the same tick a teardown child is created, perturbing any test
+    that waits for a new task to appear. Returns the stub, for tests that
+    assert on the dispatch calls or read the call objects back.
     """
 
     def fresh_call(*args, **kwargs):
@@ -680,9 +685,12 @@ def dispatching_stub(mocker: MockerFixture, async_stream, mock_grpc_call):
             protocol.Response(ack=protocol.Ack()),
             protocol.Response(result=protocol.Message(dump=cloudpickle.dumps("ok"))),
         )
-        return mock_grpc_call(async_stream(responses))
+        call = mock_grpc_call(async_stream(responses))
+        stub.calls.append(call)
+        return call
 
     stub = mocker.MagicMock()
+    stub.calls = []
     stub.dispatch = mocker.MagicMock(side_effect=fresh_call)
     mocker.patch.object(protocol, "WorkerStub", return_value=stub)
     return stub
