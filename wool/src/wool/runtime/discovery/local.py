@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import warnings
+from contextlib import AsyncExitStack
 from contextlib import asynccontextmanager
 from contextlib import contextmanager
 from multiprocessing import resource_tracker
@@ -462,6 +463,7 @@ class LocalDiscovery(Discovery):
         """
 
         _block_size: int
+        _blocks: dict[str, AsyncExitStack]
         _cleanups: dict[str, Callable]
         _lock_timeout: float | None
         _namespace: Final[str]
@@ -486,6 +488,9 @@ class LocalDiscovery(Discovery):
             self._block_size = block_size
             self._lock_timeout = lock_timeout
             self._cleanups = {}
+            # The block each published worker holds, keyed by its ref;
+            # a drop exits the handle and the exit closes the rest.
+            self._blocks = {}
             self._shared_memory_pool = ResourcePool(
                 factory=self._shared_memory_factory,
                 finalizer=self._shared_memory_finalizer,
@@ -497,7 +502,30 @@ class LocalDiscovery(Discovery):
             return self
 
         async def __aexit__(self, *args):
-            await self._shared_memory_pool.__aexit__(*args)
+            """Close every block this publisher holds, then exit the pool.
+
+            The first close that fails is the one that propagates; a
+            later block's failure is discarded, so one bad handle cannot
+            hide the others or stop them being released. The
+            shared-memory pool is exited regardless, and its own failure
+            supersedes.
+
+            :param args:
+                The exception info the block is exiting with, forwarded
+                to the pool.
+            """
+            failure: BaseException | None = None
+            try:
+                for ref in list(self._blocks):
+                    try:
+                        await self._blocks.pop(ref).aclose()
+                    except BaseException as error:
+                        if failure is None:
+                            failure = error
+                if failure is not None:
+                    raise failure
+            finally:
+                await self._shared_memory_pool.__aexit__(*args)
 
         @property
         def namespace(self):
@@ -581,6 +609,11 @@ class LocalDiscovery(Discovery):
             pool, so it holds no pool reference and reaches blocks created
             by another publisher's pool.
 
+            The ledger holds at most one handle per ref, and a
+            registration that displaces one closes it first: overwriting
+            it would strand a pool reference nothing can drop until the
+            publisher exits.
+
             :param metadata:
                 The worker to publish to the namespace's shared memory.
             :raises DiscoveryCapacityExhausted:
@@ -618,8 +651,11 @@ class LocalDiscovery(Discovery):
             if free_offset is None:
                 raise DiscoveryCapacityExhausted(_read_capacity(address_space.buf))
 
+            block = AsyncExitStack()
             try:
-                memory_block = await self._shared_memory_pool.acquire(str(ref))
+                memory_block = await block.enter_async_context(
+                    self._shared_memory_pool.get(str(ref))
+                )
                 assert memory_block.buf is not None
                 size = len(serialized)
                 try:
@@ -631,11 +667,20 @@ class LocalDiscovery(Discovery):
                 # Release what this method acquired rather than delegating
                 # to `_drop`, whose slot scan cannot find a ref that only
                 # lands on the last line of this block.
-                await self._shared_memory_pool.release(str(ref))
+                await block.aclose()
                 raise
+            # One handle per ref — see the docstring.
+            if (stale := self._blocks.pop(str(ref), None)) is not None:
+                await stale.aclose()
+            self._blocks[str(ref)] = block
 
         async def _drop(self, metadata: WorkerMetadata, address_space: SharedMemory):
             """Unregister a worker by removing it from shared memory.
+
+            The handle this publisher holds is released whether or not
+            the slot scan matched, since a peer that dropped the same
+            worker first leaves nothing to match and the block is this
+            publisher's to release either way.
 
             :param metadata:
                 The worker to unpublish from the namespace's shared memory.
@@ -647,8 +692,11 @@ class LocalDiscovery(Discovery):
             for offset, slot in _iter_slots(address_space.buf):
                 if slot == target_ref.bytes:
                     struct.pack_into("16s", address_space.buf, offset, NULL_REF)
-                    await self._shared_memory_pool.release(str(target_ref))
                     break
+            # Released outside the scan — see the docstring.
+            block = self._blocks.pop(str(target_ref), None)
+            if block is not None:
+                await block.aclose()
 
         async def _update(self, metadata: WorkerMetadata, address_space: SharedMemory):
             """Update a registered worker's metadata in shared memory.
@@ -1060,7 +1108,7 @@ def _attach(name: str) -> SharedMemory:
 
     Python 3.13 says this directly with ``track=False``. Below it there is
     no such parameter, so the registration is suppressed at its source for
-    as long as the constructor runs. Undoing it afterwards, i.e. registering
+    as long as the constructor runs. Undoing it afterwards, i.e., registering
     and then unregistering, is *not* equivalent: the tracker's cache is a
     set shared by every process in the tree, so the first attach's
     unregister discards the entry the creator made, and the creator's own
