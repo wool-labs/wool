@@ -34,12 +34,10 @@ from wool.runtime.worker.session import Rejected
 _log = logging.getLogger(__name__)
 
 _DRAIN_TIMEOUT: Final[float] = 5.0
-"""Wall-clock budget in seconds for `WorkerService._destroy_worker_loop`
-to finalize the pools bound to the worker loop and drain its
-multi-generation task chain. Generous enough for a normal chain of
-``finally``-scheduled cleanup tasks to unwind, short enough not to
-stall worker-loop teardown; past this budget the drain gives up, with
-the daemon-thread reap as the backstop."""
+"""Wall-clock budget in seconds for worker-loop teardown, measured from
+when its drain is scheduled. Sized for a normal chain of
+``finally``-scheduled cleanup to unwind without stalling teardown; see
+`WorkerService._destroy_worker_loop` for what happens once it is spent."""
 
 _WORKER_LOOP_TTL: Final[float] = 30.0
 """Idle time-to-live in seconds for the worker event-loop held by
@@ -571,12 +569,22 @@ class WorkerService(protocol.WorkerServicer):
         to stop accepting new requests. This method is idempotent and
         can be called multiple times safely.
 
+        ``request.timeout`` bounds two waits: the grace period in-flight
+        tasks get before they are cancelled, and the wait for the worker
+        thread to exit. Worker-loop teardown runs on a separate
+        five-second budget that ``request.timeout`` does not extend, so
+        the call can return before the loop has closed.
+
         :param request:
             The protobuf stop request containing the wait timeout.
         :param context:
             The `grpc.aio.ServicerContext` for this request.
         :returns:
             An empty protobuf response indicating completion.
+
+        .. rubric:: Implementation notes
+
+        Teardown is `_destroy_worker_loop`, bounded by `_DRAIN_TIMEOUT`.
         """
         if self._stopping.is_set():
             return protocol.Void()
@@ -590,15 +598,16 @@ class WorkerService(protocol.WorkerServicer):
     ) -> protocol.Idle:
         """Report how long the worker has been continuously idle.
 
-        Idle is the number of seconds since the in-flight task set
-        (`_docket`) last became empty, with worker startup counting as
-        the initial empty state. While any task is in flight the
-        reported idle time is zero, and the count resets whenever work
-        resumes. Measured against a monotonic clock so a wall-clock
-        adjustment cannot distort it.
+        Idle is the number of seconds since the worker's last in-flight
+        task finished, with worker startup counting as the initial idle
+        state. While any task is in flight the reported idle time is
+        zero, and the count resets whenever work resumes. Measured
+        against a monotonic clock so a wall-clock adjustment cannot
+        distort it.
 
-        Polling this RPC creates no `DispatchSession` and never touches
-        the docket, so a caller cannot disturb the measurement it reads.
+        Polling this RPC creates no `DispatchSession` and never counts as
+        in-flight work, so a caller cannot disturb the measurement it
+        reads.
 
         :param request:
             The empty protobuf request.
@@ -649,52 +658,82 @@ class WorkerService(protocol.WorkerServicer):
         self,
         loop_thread: tuple[asyncio.AbstractEventLoop, threading.Thread],
     ) -> None:
-        """Schedule worker-loop shutdown and optionally join the thread.
+        """Clear, drain, and stop a worker loop, then join its thread.
 
-        Finalizes the proxy and discovery-subscriber pools, then the
-        channel pool, on the worker loop first: they are bound to it, and
-        a `ResourcePool` refuses use from any other running loop, so this
-        finalizer is the one place they can still be cleared. A clear
-        that raises or exceeds the shared `_DRAIN_TIMEOUT` budget is
-        logged and does not prevent the stop; the budget bounds when a
-        clear is cancelled, not when it returns, since a clear finishes
-        its sweep before re-raising (see `ResourcePool.clear`), a clear
-        reached with the budget already exhausted is cancelled before it
-        starts and logged the same way, and whatever a clear left cached
-        is dropped when the pool next rebinds.
-        With ``timeout=0`` the clears run best-effort on the daemon
-        thread after this returns; on that path the channel clear can
-        race a successor loop's first use of the process-wide pool, and
-        a pool partitioned per loop (#381) removes the race. An
-        interrupt raised by a clear still drains the loop before
-        propagating.
+        Clears the proxy, discovery-subscriber, and channel pools on the
+        worker loop first, in that order, since a `ResourcePool` bound to
+        the loop can be cleared from no other; exiting the proxies first
+        releases their channel-pool hold before the channels are swept. A
+        clear that raises, times out, or is cancelled does not prevent the
+        stop: a cancelled clear is retried while `_DRAIN_TIMEOUT` remains, a
+        clear reached with the budget spent is cancelled before it starts,
+        and whatever a clear leaves cached is dropped when the pool next
+        rebinds. The budget bounds when a clear is cancelled, not when it
+        returns, since `ResourcePool.clear` finishes its sweep before
+        re-raising. An interrupt a clear raises propagates only after the
+        drain.
 
-        Drains successive generations of pending tasks on the
-        worker loop, then signals the loop to stop. A cancelled
-        task's ``finally`` clause can schedule a second generation
-        of tasks (e.g., follow-up cleanup, fire-and-forget logging,
-        further cancellations, etc.); the drain cancels and awaits
-        successive generations until none remain or
-        `_DRAIN_TIMEOUT` elapses, so the loop closes without
-        leaking ``Task was destroyed but it is pending!`` warnings.
-        If a routine schedules cleanup-of-cleanup past the budget,
-        the drain stops anyway and the daemon-thread reap remains
-        the backstop. The loop is closed by the worker
-        thread itself (see `_create_worker_loop`'s
-        ``_run_then_close`` target), not from this caller's thread —
-        eliminating the close-while-running race.
+        Then cancels and awaits the loop's pending tasks generation by
+        generation, since a cancelled task's ``finally`` can spawn more,
+        until none remain or `_DRAIN_TIMEOUT` elapses, and stops the loop,
+        which the worker thread itself closes. Within the budget the loop
+        closes without ``Task was destroyed but it is pending!`` warnings;
+        past it, the daemon-thread reap at process exit is the backstop.
 
-        Joins the worker thread for up to `_stop_timeout`
-        seconds (set by `_stop` from the StopRequest's
-        ``timeout``). ``timeout=0`` means "do not wait"; positive
-        values bound the synchronous wait; ``None`` means "wait
-        indefinitely" (caller asked for unlimited graceful shutdown).
-        If the join times out, the daemon thread is reaped at
-        process exit — the loop will still close itself once
-        ``run_forever`` returns.
+        Finally joins the worker thread for up to `_stop_timeout` seconds.
+        ``0`` does not wait and ``None`` waits indefinitely; a thread still
+        running at the bound is reaped at process exit. With ``0``, the
+        clears and the drain run on the worker thread after this returns,
+        where the channel clear can race a successor loop's first use of
+        the process-wide channel pool.
+
+        The drain tolerates a peer on the loop, i.e., another task that
+        cancels or awaits the loop's tasks. A peer's cancel neither raises
+        out of the drain nor cuts a generation short, and the loop stops
+        within `_DRAIN_TIMEOUT` provided it keeps servicing callbacks and
+        the pools' finalizers honor cancellation. That holds even when the
+        peer cancels the drain before it runs, in which case the pools stay
+        uncleared and the pending tasks are left as they are. A peer that
+        awaits the drain waits out the budget.
+
+        Each degradation is logged at warning level: a pool clear that
+        raised, with its traceback and any peer cancellations counted, or
+        that timed out uncancelled; a pool clear a peer cancelled, at the
+        first cancellation and again if no retry completes in time; a drain
+        that timed out, with the count of tasks still pending; and a drain
+        that never ran before the deadline stopped the loop.
 
         :param loop_thread:
             A tuple of the event loop and the thread running it.
+
+        .. rubric:: Implementation notes
+
+        Each generation is awaited through a private future that a done
+        callback on each task settles, not through `asyncio.gather`. A
+        gathering future forwards a cancel to every child, and
+        `asyncio.Task.cancel` cancels the future its task is blocked on,
+        so two tasks blocked on gathers that contain each other recurse
+        until `RecursionError` and both stay pending. A cancel that
+        reaches a private future stops there. The callback also retrieves
+        each task's exception, as ``return_exceptions`` would.
+
+        The drain swallows its own cancellation and calls
+        `asyncio.Task.uncancel`, because a peer that cancels every task
+        but itself would otherwise stop the loop with later generations
+        stranded; the deadline bounds the drain however many cancels it
+        absorbs. After one, it keeps waiting on the same generation, so it
+        cancels each generation exactly once and recomputes only after
+        every task it cancelled has finished. By then anything those tasks
+        spawned from a ``finally`` has taken its first step, whereas
+        recomputing sooner could cancel that cleanup before it runs.
+        Cleanup spawned by a task the peer cancelled has no such
+        guarantee.
+
+        A peer can also cancel the drain before its first step, so a
+        timer armed at the drain's deadline stops the loop unless the
+        drain disarms it on entry, and a drain that starts after the timer
+        fired stands down. Timer and drain share one deadline, fixed when
+        the drain is scheduled.
         """
         loop, thread = loop_thread
         proxy_pool = wool.__proxy_pool__.get()
@@ -708,63 +747,130 @@ class WorkerService(protocol.WorkerServicer):
             if pool is not None
         ]
         clears.append(("channel", clear_channel_pool))
+        timer_fired = False
 
-        async def _shutdown():
-            current = asyncio.current_task()
-            deadline = loop.time() + _DRAIN_TIMEOUT
-            leaked: list[asyncio.Task] = []
+        async def _shutdown(stop_timer: asyncio.TimerHandle, deadline: float):
             try:
+                if timer_fired:
+                    return
+                # The drain is running, so it owns the stop from here —
+                # see the implementation notes of `_destroy_worker_loop`.
+                stop_timer.cancel()
+                current = asyncio.current_task()
+                assert current is not None, "the drain runs as a task on the worker loop"
                 try:
                     for name, clear in clears:
-                        try:
-                            await asyncio.wait_for(
-                                clear(), timeout=max(0.0, deadline - loop.time())
-                            )
-                        except Exception:
+                        cancels = 0
+                        while True:
+                            try:
+                                await asyncio.wait_for(
+                                    clear(), timeout=max(0.0, deadline - loop.time())
+                                )
+                            except asyncio.CancelledError:
+                                # Cancelled by a peer — see the implementation
+                                # notes of `_destroy_worker_loop`.
+                                current.uncancel()
+                                cancels += 1
+                                if cancels == 1:
+                                    _log.warning(
+                                        f"Clearing the {name} pool was cancelled "
+                                        "during worker-loop teardown; retrying while "
+                                        "budget remains."
+                                    )
+                                if loop.time() < deadline:
+                                    continue
+                            except Exception as exc:
+                                if not (cancels and isinstance(exc, TimeoutError)):
+                                    cancelled = (
+                                        f" after being cancelled {cancels} time(s)"
+                                        if cancels
+                                        else ""
+                                    )
+                                    _log.warning(
+                                        f"Failed to clear the {name} pool during "
+                                        f"worker-loop teardown{cancelled}; continuing "
+                                        "to drain and stop the loop.",
+                                        exc_info=True,
+                                    )
+                                    break
+                            else:
+                                break
                             _log.warning(
-                                f"Failed to clear the {name} pool during "
-                                "worker-loop teardown; continuing to drain and "
-                                "stop the loop.",
-                                exc_info=True,
+                                f"Clearing the {name} pool was cancelled {cancels} "
+                                "time(s) during worker-loop teardown and did not "
+                                "complete within the budget; continuing to drain "
+                                "and stop the loop."
                             )
+                            break
                 finally:
                     # The drain runs whatever a clear raised — see the
                     # docstring.
-                    while True:
-                        pending = [
+                    timed_out = False
+                    while not timed_out:
+                        pending = {
                             task for task in asyncio.all_tasks() if task is not current
-                        ]
+                        }
                         if not pending:
                             break
+                        drained = loop.create_future()
+
+                        def _on_done(task, pending=pending, drained=drained):
+                            if not task.cancelled() and task.exception() is not None:
+                                _log.debug(
+                                    "A task raised while the worker-loop teardown "
+                                    "drain cancelled it.",
+                                    exc_info=task.exception(),
+                                )
+                            pending.discard(task)
+                            if not pending and not drained.done():
+                                drained.set_result(None)
+
                         for task in pending:
                             task.cancel()
-                        remaining = deadline - loop.time()
-                        if remaining <= 0:
-                            leaked = pending
-                            break
-                        try:
-                            await asyncio.wait_for(
-                                asyncio.gather(*pending, return_exceptions=True),
-                                timeout=remaining,
-                            )
-                        except TimeoutError:
-                            leaked = pending
-                            break
-                    if leaked:
+                            task.add_done_callback(_on_done)
+                        while not drained.done():
+                            remaining = deadline - loop.time()
+                            if remaining <= 0:
+                                timed_out = True
+                                break
+                            try:
+                                # A private future, not ``gather`` — see the
+                                # implementation notes of `_destroy_worker_loop`.
+                                await asyncio.wait({drained}, timeout=remaining)
+                            except asyncio.CancelledError:
+                                # Cancelled by a peer — see the implementation
+                                # notes of `_destroy_worker_loop`.
+                                current.uncancel()
+                    if timed_out:
+                        leaked = [
+                            task for task in asyncio.all_tasks() if task is not current
+                        ]
                         _log.warning(
                             f"Worker-loop teardown drain timed out after "
-                            f"{_DRAIN_TIMEOUT}s; {len(leaked)} task(s) still "
-                            "pending."
+                            f"{_DRAIN_TIMEOUT}s; {len(leaked)} task(s) still pending."
                         )
             finally:
                 loop.stop()
 
+        def _fire_stop_timer():
+            nonlocal timer_fired
+            timer_fired = True
+            _log.warning(
+                f"Worker-loop teardown drain did not run within {_DRAIN_TIMEOUT}s; "
+                "stopping the loop with its pools uncleared and its tasks pending."
+            )
+            loop.stop()
+
+        def _schedule():
+            deadline = loop.time() + _DRAIN_TIMEOUT
+            stop_timer = loop.call_at(deadline, _fire_stop_timer)
+            loop.create_task(_shutdown(stop_timer, deadline))
+
         try:
-            loop.call_soon_threadsafe(lambda: loop.create_task(_shutdown()))
+            loop.call_soon_threadsafe(_schedule)
         except RuntimeError:
-            # Loop is already closed (e.g., this finalizer was
-            # invoked twice, or some external party closed it).
-            # Nothing to schedule; the thread has already exited
+            # Loop is already closed (e.g., some external party closed
+            # it). Nothing to schedule; the thread has already exited
             # via the ``_run_then_close`` finally clause.
             return
 

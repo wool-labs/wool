@@ -77,7 +77,7 @@ asyncio.run(main())
 @pytest.mark.integration
 class TestWorkerLoopDrain:
     @pytest.mark.asyncio
-    async def test_graceful_shutdown_drains_second_generation_cleanup_tasks(
+    async def test___aexit___should_drain_every_generation_of_orphaned_cleanup_chain(
         self, tmp_path, credentials_map, retry_grpc_internal
     ):
         """Test that worker-loop teardown drains every generation of
@@ -91,7 +91,7 @@ class TestWorkerLoopDrain:
             A worker pool is dispatched the routine and then torn down.
         Then:
             It should drain every generation, so the deepest cleanup
-            task runs its finally clause and writes its sentinel file.
+            task observes its cancellation and writes its sentinel file.
         """
         # Arrange
         sentinel = tmp_path / "drain-sentinel.txt"
@@ -102,6 +102,43 @@ class TestWorkerLoopDrain:
             async with build_pool_from_scenario(scenario, credentials_map):
                 result = await routines.add_then_schedule_cleanup(1, 2, str(sentinel))
                 assert result == 3
+
+        await retry_grpc_internal(body)
+
+        # Assert
+        assert sentinel.read_text() == "drained"
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_drain_later_generations_when_peer_cancels_drain(
+        self, tmp_path, credentials_map, retry_grpc_internal
+    ):
+        """Test that worker-loop teardown keeps draining after a peer
+        task on the worker loop cancels the teardown drain.
+
+        Given:
+            A routine whose orphaned cleanup task, when cancelled during
+            teardown, plants a peer that leaves a two-generation cleanup
+            chain behind, spared from its sweep, and cancels every other
+            task on the worker loop once, the teardown drain among them.
+        When:
+            A worker pool is dispatched the routine and then torn down.
+        Then:
+            It should still cancel the chain's deepest generation, so it
+            observes its cancellation and writes its sentinel file.
+        """
+        # Arrange
+        sentinel = tmp_path / "peer-drain-sentinel.txt"
+        scenario = default_scenario()
+
+        # Act
+        async def body():
+            # A hang guard only; the sentinel is what this test checks.
+            async with asyncio.timeout(30):
+                async with build_pool_from_scenario(scenario, credentials_map):
+                    result = await routines.add_then_schedule_cleanup(
+                        1, 2, str(sentinel), peer=True
+                    )
+                    assert result == 3
 
         await retry_grpc_internal(body)
 
