@@ -21,6 +21,7 @@ from wool.runtime.worker.pool import WorkerPool
 from wool.runtime.worker.process import WorkerProcess
 
 from . import routines
+from .conftest import PoolMode
 from .conftest import _DirectDiscovery
 from .conftest import build_pool_from_scenario
 from .conftest import default_scenario
@@ -76,7 +77,7 @@ asyncio.run(main())
 @pytest.mark.integration
 class TestWorkerLoopDrain:
     @pytest.mark.asyncio
-    async def test_graceful_shutdown_drains_second_generation_cleanup_tasks(
+    async def test___aexit___should_drain_every_generation_of_orphaned_cleanup_chain(
         self, tmp_path, credentials_map, retry_grpc_internal
     ):
         """Test that worker-loop teardown drains every generation of
@@ -90,7 +91,7 @@ class TestWorkerLoopDrain:
             A worker pool is dispatched the routine and then torn down.
         Then:
             It should drain every generation, so the deepest cleanup
-            task runs its finally clause and writes its sentinel file.
+            task observes its cancellation and writes its sentinel file.
         """
         # Arrange
         sentinel = tmp_path / "drain-sentinel.txt"
@@ -106,6 +107,86 @@ class TestWorkerLoopDrain:
 
         # Assert
         assert sentinel.read_text() == "drained"
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_drain_later_generations_when_peer_cancels_drain(
+        self, tmp_path, credentials_map, retry_grpc_internal
+    ):
+        """Test that worker-loop teardown keeps draining after a peer
+        task on the worker loop cancels the teardown drain.
+
+        Given:
+            A routine whose orphaned cleanup task, when cancelled during
+            teardown, plants a peer that leaves a two-generation cleanup
+            chain behind, spared from its sweep, and cancels every other
+            task on the worker loop once, the teardown drain among them.
+        When:
+            A worker pool is dispatched the routine and then torn down.
+        Then:
+            It should still cancel the chain's deepest generation, so it
+            observes its cancellation and writes its sentinel file.
+        """
+        # Arrange
+        sentinel = tmp_path / "peer-drain-sentinel.txt"
+        scenario = default_scenario()
+
+        # Act
+        async def body():
+            # A hang guard only; the sentinel is what this test checks.
+            async with asyncio.timeout(30):
+                async with build_pool_from_scenario(scenario, credentials_map):
+                    result = await routines.add_then_schedule_cleanup(
+                        1, 2, str(sentinel), peer=True
+                    )
+                    assert result == 3
+
+        await retry_grpc_internal(body)
+
+        # Assert
+        assert sentinel.read_text() == "drained"
+
+    @pytest.mark.asyncio
+    # DEFAULT runs one worker, so the nested dispatch self-dispatches over
+    # UDS; EPHEMERAL runs two, so it may cross a real channel.
+    @pytest.mark.parametrize(
+        "pool_mode", [PoolMode.DEFAULT, PoolMode.EPHEMERAL], ids=lambda m: m.name
+    )
+    async def test_dispatch_should_release_worker_channel_ref_when_drain_lands_early(
+        self, pool_mode, tmp_path, credentials_map, retry_grpc_internal
+    ):
+        """Test a real worker releases its pooled channel under an early drain.
+
+        Given:
+            A worker pool running a routine that starts a nested dispatch
+            and cancels it into its dispatch teardown.
+        When:
+            The consuming task and the unstarted teardown child are
+            cancelled together, the way a loop-wide drain would cancel
+            them, and the routine then reads its channel-pool counters
+            and runs a follow-up nested dispatch.
+        Then:
+            It should report a cached pooled entry with zero references
+            and a completed follow-up dispatch, i.e., the pooled-channel
+            release ran on a real worker loop.
+        """
+        # Arrange
+        scenario = default_scenario(pool_mode=pool_mode)
+        sentinel = tmp_path / "early-drain-sentinel.txt"
+
+        # Act
+        async def body():
+            sentinel.unlink(missing_ok=True)
+            async with build_pool_from_scenario(scenario, credentials_map):
+                return await routines.drain_nested_teardown_before_first_step(
+                    str(sentinel)
+                )
+
+        probe = await retry_grpc_internal(body)
+
+        # Assert
+        assert probe.referenced_entries == 0
+        assert probe.total_entries >= 1
+        assert probe.follow_up == 3
 
 
 @pytest.mark.integration

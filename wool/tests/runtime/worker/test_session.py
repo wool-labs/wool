@@ -22,6 +22,8 @@ import pytest
 from pytest_mock import MockerFixture
 
 import wool
+from tests.helpers import await_new_task
+from tests.helpers import drain_loop_tasks
 from tests.runtime.worker.conftest import PicklableMock
 from wool import protocol
 from wool.protocol import WorkerStub
@@ -1603,6 +1605,54 @@ class TestDispatchSession:
             "is cancelled mid-teardown"
         )
         assert any(isinstance(e, asyncio.CancelledError) for e in observed)
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_run_drain_when_loop_drain_cancels_teardown(
+        self, worker_loop, mock_worker_proxy_cache, mocker: MockerFixture
+    ):
+        """Test `__aexit__` runs `drain` when a drain cancels teardown early.
+
+        Given:
+            A `DispatchSession` past `__aenter__` whose routine has been
+            driven to completion, with `__aexit__` awaited in its own
+            task and the teardown's shielded child created but not yet
+            stepped.
+        When:
+            A loop-wide drain cancels every task on the loop, the
+            unstarted teardown child among them, and awaits them.
+        Then:
+            It should run the registered `drain` callback to completion
+            exactly once, i.e., the exit-stack unwind is never discarded
+            unstarted.
+        """
+        # Arrange — the substitution delegates to the real drain and records
+        # that it returned, so the assertion witnesses completion rather than
+        # entry.
+        original_drain = DispatchSession.drain
+        completed: list[DispatchSession] = []
+
+        async def recording_drain(self):
+            await original_drain(self)
+            completed.append(self)
+
+        mocker.patch.object(DispatchSession, "drain", recording_drain)
+        task = _make_task(_coro_returning_default)
+        stream = _stream(_request_for(task))
+        handler = DispatchSession(stream, worker_loop)
+        await handler.__aenter__()
+        async for _ in handler:
+            pass
+        # Direct dunder calls: the exit must run in its own task so the drain
+        # can land between its teardown child's creation and first step,
+        # which ``async with`` cannot express.
+        aexit_task = asyncio.ensure_future(handler.__aexit__(None, None, None))
+        (child,) = await await_new_task(exclude=(aexit_task,))
+
+        # Act
+        await drain_loop_tasks()
+
+        # Assert
+        assert completed == [handler]
 
     # -- drain ------------------------------------------------------------
 

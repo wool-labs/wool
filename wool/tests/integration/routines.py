@@ -17,8 +17,14 @@ import inspect
 import os
 from enum import Enum
 from enum import auto
+from functools import partial
+from typing import NamedTuple
 
 import wool
+from tests.helpers import await_new_task
+from tests.helpers import cancelling_peer
+from tests.helpers import park_then_plant
+from tests.helpers import plant
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import current_credentials
 from wool.runtime.worker.connection import channel_pool_stats
@@ -482,61 +488,125 @@ async def self_cancel_coroutine():
 
 
 @wool.routine
-async def add_then_schedule_cleanup(a: int, b: int, sentinel_path: str) -> int:
-    """Coroutine that returns the sum and schedules an orphaned cleanup
-    task on the worker loop from its ``finally`` clause.
+async def add_then_schedule_cleanup(
+    a: int, b: int, sentinel_path: str, *, peer: bool = False
+) -> int:
+    """Return the sum and plant an orphaned cleanup chain on the worker
+    loop from the ``finally`` clause.
 
-    Models the fire-and-forget cleanup pattern behind issue #202: a
-    routine whose ``finally`` schedules further work on the worker
-    loop. The scheduled task (:func:`_drain_probe_first_gen`) outlives
-    the dispatch and is left for worker-loop teardown to drain.
+    The chain outlives the dispatch and is left for worker-loop teardown
+    to drain; its deepest generation is `_drain_probe_second_gen`. With
+    ``peer`` set, the chain hangs instead off a peer that the first
+    orphan plants when cancelled: the peer spares the chain and cancels
+    every other task on the worker loop once, the teardown drain among
+    them, so only the drain can cancel the chain.
 
     :param a:
         First addend.
     :param b:
         Second addend.
     :param sentinel_path:
-        Filesystem path threaded through the cleanup chain; the
-        deepest generation writes to it so the caller can verify the
-        teardown drain reached every generation.
+        Filesystem path the chain's deepest generation writes to.
+    :param peer:
+        Whether the chain hangs off a cancelling peer.
     :returns:
         The sum ``a + b``.
     """
     try:
         return a + b
     finally:
-        asyncio.get_running_loop().create_task(_drain_probe_first_gen(sentinel_path))
-
-
-async def _drain_probe_first_gen(sentinel_path: str) -> None:
-    """First-generation orphan task scheduled by
-    :func:`add_then_schedule_cleanup`.
-
-    Awaits indefinitely until worker-loop teardown cancels it, then
-    schedules the second generation from its own ``finally`` clause —
-    the generation a single-pass shutdown drain never observes.
-    """
-    try:
-        await asyncio.Event().wait()
-    finally:
-        asyncio.get_running_loop().create_task(_drain_probe_second_gen(sentinel_path))
+        chain = partial(park_then_plant, partial(_drain_probe_second_gen, sentinel_path))
+        if peer:
+            plant(park_then_plant(partial(cancelling_peer, orphan=chain)))
+        else:
+            plant(chain())
 
 
 async def _drain_probe_second_gen(sentinel_path: str) -> None:
-    """Second-generation orphan task scheduled by
-    :func:`_drain_probe_first_gen`.
+    """Write ``"drained"`` to ``sentinel_path`` once cancelled, then
+    re-raise.
 
-    Writes ``"drained"`` to *sentinel_path* from its ``finally``
-    clause. The file appears only if the worker-loop teardown drain
-    cancels and awaits this generation; a single-pass drain leaves it
-    pending and unstarted, so the absence of the file flags the
-    issue #202 regression.
+    Observes cancellation rather than running a ``finally`` clause, for
+    the reason given by `tests.helpers.park_then_plant`, so the file
+    appears only if the teardown drain cancelled this generation.
     """
     try:
         await asyncio.Event().wait()
-    finally:
+    except asyncio.CancelledError:
         with open(sentinel_path, "w") as f:
             f.write("drained")
+        raise
+
+
+class TeardownProbe(NamedTuple):
+    """Worker-side channel-pool counters and a follow-up dispatch result.
+
+    :param referenced_entries:
+        Pooled channels still referenced after the drain; ``0`` means
+        the cancelled dispatch's pooled-channel release ran.
+    :param total_entries:
+        Channels cached in the worker's pool; at least ``1`` once a
+        nested dispatch has run, so a zero reference count is not the
+        count of an empty pool.
+    :param follow_up:
+        The result of a nested dispatch issued after the drain, showing
+        the worker can still dispatch.
+    """
+
+    referenced_entries: int
+    total_entries: int
+    follow_up: int
+
+
+@wool.routine
+async def drain_nested_teardown_before_first_step(sentinel_path: str) -> TeardownProbe:
+    """Cancel a nested dispatch together with its unstarted teardown child.
+
+    Models the shutdown race behind issue #422 on a real worker loop: the
+    consuming task of a live nested dispatch and the shielded teardown
+    child it spawns are cancelled together before that child's first
+    step, the way a loop-wide drain would cancel them. The victim set is
+    scoped by identity, so the worker's own dispatch session and proxy
+    tasks are spared and the routine can still return. Were the teardown
+    closed unstarted, the reported reference count would stay pinned.
+
+    :param sentinel_path:
+        Path the nested `cancellable_sleep` writes its ``"started"``
+        marker to, confirming the nested dispatch is live.
+    :returns:
+        The worker's channel-pool counters after the drain and the
+        result of a follow-up nested dispatch.
+    """
+
+    async def consume():
+        await cancellable_sleep(sentinel_path, 30.0)
+
+    consumer = asyncio.ensure_future(consume())
+    for _ in range(500):
+        await asyncio.sleep(0.01)
+        try:
+            with open(sentinel_path) as f:
+                if f.read() == "started":
+                    break
+        except FileNotFoundError:
+            pass
+    else:
+        raise AssertionError("nested dispatch never reported started")
+
+    consumer.cancel()
+    (child,) = await await_new_task(exclude=(consumer,))
+    for task in (consumer, child):
+        task.cancel()
+    _, pending = await asyncio.wait((consumer, child), timeout=5.0)
+    if pending:
+        raise AssertionError(f"{len(pending)} task(s) still pending after the drain")
+
+    stats = channel_pool_stats()
+    return TeardownProbe(
+        referenced_entries=stats.referenced_entries,
+        total_entries=stats.total_entries,
+        follow_up=await add(1, 2),
+    )
 
 
 @wool.routine

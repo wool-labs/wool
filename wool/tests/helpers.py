@@ -1,8 +1,12 @@
+import asyncio
 import datetime
 import ipaddress
 import uuid
+from collections.abc import Callable
+from collections.abc import Coroutine
 from collections.abc import Generator
 from contextlib import contextmanager
+from typing import Any
 from typing import NamedTuple
 
 from cryptography import x509
@@ -13,6 +17,12 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 import wool
+
+#: Tasks scheduled through `plant`, which owns their retention.
+planted_tasks: list[asyncio.Task] = []
+
+#: The running loop `record_peer_loop` last published.
+peer_loop: asyncio.AbstractEventLoop | None = None
 
 #: SANs covering the loopback addresses test workers bind to.
 LOOPBACK_SANS = (
@@ -46,6 +56,79 @@ class CertificateFiles(NamedTuple):
     ca_pem: bytes
     key_pem: bytes
     cert_pem: bytes
+
+
+def plant(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
+    """Schedule ``coro`` on the running loop and hold a strong reference.
+
+    ``asyncio`` references tasks only weakly, so a fire-and-forget task
+    can be collected while still pending. The reference lives in
+    `planted_tasks` until the task has finished and a later call prunes
+    it, so the registry stays bounded in a long-lived process.
+    """
+    planted_tasks[:] = [task for task in planted_tasks if not task.done()]
+    task = asyncio.get_running_loop().create_task(coro)
+    planted_tasks.append(task)
+    return task
+
+
+def record_peer_loop() -> asyncio.AbstractEventLoop:
+    """Publish the running loop through `peer_loop` and return it."""
+    global peer_loop
+
+    peer_loop = asyncio.get_running_loop()
+    return peer_loop
+
+
+async def park_then_plant(*factories: Callable[[], Coroutine[Any, Any, Any]]) -> None:
+    """Await until cancelled, then plant each factory's coroutine in
+    order and re-raise.
+
+    The coroutine plants on cancellation rather than from a ``finally``
+    clause, because a ``finally`` clause also runs when garbage
+    collection closes a coroutine that was never cancelled, e.g., one
+    stranded on a loop that has since shut down: planting there would
+    schedule onto a closed loop, and observing there would report a
+    cancellation that never happened.
+    """
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        for factory in factories:
+            plant(factory())
+        raise
+
+
+async def cancelling_peer(
+    sweeps: int | None = 1,
+    *,
+    orphan: Callable[[], Coroutine[Any, Any, Any]] | None = None,
+) -> None:
+    """Cancel every other task on the loop for ``sweeps`` iterations, or
+    on every iteration until the loop stops when ``sweeps`` is ``None``.
+
+    Publishes the running loop through `record_peer_loop` and survives
+    its own cancellation between sweeps. With ``orphan`` set it first
+    plants that factory's coroutine and spares it from every sweep, so
+    only another task on the loop can cancel the orphan.
+    """
+    current = asyncio.current_task()
+    assert current is not None
+    record_peer_loop()
+    spared = {current}
+    if orphan is not None:
+        spared.add(plant(orphan()))
+    remaining = sweeps
+    while remaining is None or remaining > 0:
+        for task in asyncio.all_tasks():
+            if task not in spared:
+                task.cancel()
+        if remaining is not None:
+            remaining -= 1
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            current.uncancel()
 
 
 def _unique(stem: str) -> str:
@@ -211,3 +294,60 @@ def generate_certificate_files(
     return write_certificate_files(
         directory, material.ca_pem, material.key_pem, material.cert_pem
     )
+
+
+#: Loop iterations `await_new_task` steps before it gives up.
+_NEW_TASK_TICKS = 200
+
+
+async def await_new_task(*, exclude=(), since=None):
+    """Step the running loop until a task outside a snapshot appears.
+
+    Returns the set of tasks that were not pending in the snapshot and
+    are not in *exclude*, observed before any of them has taken its first
+    step. The snapshot is taken on entry unless *since* supplies one
+    taken earlier, in which case the loop is checked before it is first
+    stepped, so a task created between the snapshot and the call is
+    still caught unstepped. Raises `AssertionError` if nothing appears
+    within `_NEW_TASK_TICKS` iterations, so an arrangement that stopped
+    spawning the task it waits for cannot pass vacuously.
+
+    .. rubric:: Implementation notes
+
+    A task's first ``__step`` is queued behind the callbacks already
+    ready when it is created, so the tick on which it first shows up in
+    `asyncio.all_tasks` is the tick before its body runs under CPython's
+    asyncio ready queue.
+    """
+    current = asyncio.current_task()
+    excluded = set(exclude) | {current}
+    baseline = asyncio.all_tasks() if since is None else since
+    for tick in range(_NEW_TASK_TICKS):
+        if tick or since is None:
+            await asyncio.sleep(0)
+        spawned = asyncio.all_tasks() - baseline - excluded
+        if spawned:
+            return spawned
+    raise AssertionError(f"no new task appeared within {_NEW_TASK_TICKS} loop ticks")
+
+
+async def drain_loop_tasks(*, exclude=(), timeout=5.0):
+    """Cancel and await every pending task on the running loop.
+
+    Spares the caller's own task and those in *exclude*. Performs one
+    generation of the cancel-every-task shape that
+    `WorkerService._destroy_worker_loop` repeats until the loop is quiet.
+    Raises `AssertionError` if any cancelled task is still pending after
+    *timeout* seconds, so a task that swallows its cancellation fails the
+    test rather than hanging it.
+    """
+    current = asyncio.current_task()
+    excluded = set(exclude) | {current}
+    victims = [task for task in asyncio.all_tasks() if task not in excluded]
+    if not victims:
+        return
+    for task in victims:
+        task.cancel()
+    _, pending = await asyncio.wait(victims, timeout=timeout)
+    if pending:
+        raise AssertionError(f"{len(pending)} task(s) still pending after the drain")
