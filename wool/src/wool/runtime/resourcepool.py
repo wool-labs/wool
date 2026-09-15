@@ -359,7 +359,11 @@ class ResourcePool(Generic[T]):
 
         A pending entry holds either an unfired TTL timer or a
         cleanup task that has not finished, the one currently inside
-        the entry's finalizer included. A read, as `stats` is.
+        the entry's finalizer included. A cleanup task cancelled by
+        anything but the pool, e.g., a loop-wide drain, does not end
+        the entry's cleanup: its TTL is armed again once the task
+        settles, and the entry is finalized when that elapses. A read,
+        as `stats` is.
 
         :returns:
             Dictionary mapping each such key to its pending TTL timer
@@ -906,12 +910,17 @@ class _Partition(Generic[T]):
             return
         entry.timer = None
         entry.cleanup = asyncio.get_running_loop().create_task(self._finalize(key))
-        entry.cleanup.add_done_callback(functools.partial(self._report_cleanup, key))
+        entry.cleanup.add_done_callback(functools.partial(self._settle_cleanup, key))
 
-    def _report_cleanup(self, key: Any, cleanup: asyncio.Task[None]) -> None:
-        """Log a cleanup task that ended in a failure.
+    def _settle_cleanup(self, key: Any, cleanup: asyncio.Task[None]) -> None:
+        """Re-arm an entry its cleanup did not reach, and log a cleanup that failed.
 
-        A `BaseException` a finalizer raises inside a spawned cleanup has
+        A cleanup that ends with its entry still cached, unreferenced,
+        and untimed did not finalize it: it was cancelled from outside
+        the pool, before its first step or while waiting for the lock.
+        The entry's TTL is armed again so it is finalized when that
+        elapses, rather than left cached with no cleanup pending. A
+        `BaseException` a finalizer raises inside a spawned cleanup has
         no caller to propagate to, so it is retrieved and reported here
         rather than left for the loop's unretrieved-exception hook.
 
@@ -919,7 +928,28 @@ class _Partition(Generic[T]):
             The cache key the cleanup was for.
         :param cleanup:
             The finished cleanup task.
+
+        .. rubric:: Implementation notes
+
+        A loop-wide drain that cancels every pending task, the shape
+        `asyncio.run` and a worker loop's teardown both take, cancels
+        the pool's cleanup tasks with the rest; a cancellation of the
+        pool's own making runs through `_cancel_cleanup`, which
+        unrecords the task first, so an entry still naming this task
+        as its cleanup was cancelled by someone else. Re-arming on the
+        entry's state rather than on `asyncio.Task.cancelled` also
+        covers a cancellation `_finalize` absorbed after its first
+        step, which ends the task normally with the entry untouched.
         """
+        entry = self._cache.get(key)
+        if (
+            entry is not None
+            and entry.cleanup is cleanup
+            and entry.timer is None
+            and entry.reference_count == 0
+        ):
+            entry.cleanup = None
+            self._arm_timer(key, entry)
         if cleanup.cancelled():
             return
         error = cleanup.exception()

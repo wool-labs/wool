@@ -2478,6 +2478,43 @@ class TestResourcePool:
         mock_finalizer.assert_called_once_with(mock_resource)
 
     @pytest.mark.asyncio
+    async def test___aexit___should_finalize_the_entry_when_its_fired_cleanup_is_cancelled(  # noqa: E501
+        self, mocker
+    ):
+        """Test a cleanup cancelled from outside the pool does not orphan its entry.
+
+        Given:
+            A short-TTL pool holding one idle entry, and a caller
+            spinning on the ready queue so that it sees the cleanup task
+            the fired timer spawned before that task takes its first
+            step.
+        When:
+            The caller cancels that cleanup task, as a loop-wide drain
+            that cancels every pending task would.
+        Then:
+            It should finalize and evict the entry once its TTL elapses
+            again, rather than leave it cached with no cleanup pending.
+        """
+        # Arrange
+        finalizer = mocker.AsyncMock()
+        pool = ResourcePool(factory=make_resource, finalizer=finalizer, ttl=0.01)
+        await _cache_idle_entry(pool, "key")
+        # Spinning keeps this task at the head of the ready queue, ahead
+        # of the cleanup task the timer callback appends behind it.
+        deadline = time.monotonic() + 2.0
+        while not isinstance(pool.pending_cleanup.get("key"), asyncio.Task):
+            assert time.monotonic() < deadline, "the TTL timer never fired"
+            await asyncio.sleep(0)
+
+        # Act
+        pool.pending_cleanup["key"].cancel()
+        await asyncio.sleep(0.1)
+
+        # Assert
+        finalizer.assert_awaited_once_with("obj-key")
+        assert pool.stats.total_entries == 0
+
+    @pytest.mark.asyncio
     async def test___aexit___should_clear_the_pools_entries_on_exit(self):
         """Test ResourcePool as async context manager clears all on exit.
 
