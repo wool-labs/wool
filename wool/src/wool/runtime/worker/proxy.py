@@ -340,8 +340,8 @@ class WorkerProxy:
     closes nothing: the handle is kept when the advertised inputs to the
     channel key are unchanged, and a changed input gets a fresh handle
     while any channel the displaced handle was the last user of is left
-    to the pool's idle TTL. The pool serves one running loop at a time,
-    so a proxy is started on the loop it will dispatch from.
+    to the pool's idle TTL. The pool partitions by loop, so a proxy
+    dispatches over the channels of the loop it was started on.
 
     :param pool_uri:
         Pool identifier for discovery-based connection.
@@ -604,6 +604,7 @@ class WorkerProxy:
 
         self._id: uuid.UUID = uuid.uuid4()
         self._state = _Lifecycle.NEW
+        self._start_loop: asyncio.AbstractEventLoop | None = None
         self._dispatching_deprecation_warned = False
         self._delegating = False
         self._lazy = lazy
@@ -903,9 +904,7 @@ class WorkerProxy:
         rather than racing it.
 
         :raises RuntimeError:
-            If the proxy is starting, started, stopping, or stopped, or
-            the channel pool is bound to another running event loop (see
-            `wool.runtime.resourcepool.ResourcePool`).
+            If the proxy is starting, started, stopping, or stopped.
         :raises TypeError:
             If the resolved load balancer or discovery source does not
             implement its protocol.
@@ -925,6 +924,7 @@ class WorkerProxy:
             raise RuntimeError(self._state.value)
 
         self._state = _Lifecycle.STARTING
+        self._start_loop = asyncio.get_running_loop()
         stack = AsyncExitStack()
         try:
             # Pushed first so it unwinds last, after every context has
@@ -1003,7 +1003,11 @@ class WorkerProxy:
             Its traceback, else ``None``.
         :raises RuntimeError:
             If the proxy is not started, or was stopped, and ``lazy``
-            is ``False``.
+            is ``False``; or if a started proxy is exited on a loop
+            other than the one that started it, which `stop` refuses.
+            The proxy context token is reset before the refusal, so the
+            proxy is left started but no longer installed, and the
+            owning loop's `stop` is what completes the teardown.
         """
         if self._proxy_token is not None:
             try:
@@ -1033,8 +1037,10 @@ class WorkerProxy:
         ``start``, raises rather than racing the unwind.
 
         :raises RuntimeError:
-            If the proxy is not started, or is already stopping or
-            stopped.
+            If the proxy is not started, is already stopping or stopped,
+            or is stopped on a loop other than the one that started it,
+            in which case nothing is unwound and the proxy stays
+            started.
         :raises BaseException:
             An uncontained failure from retiring the loop's channels when
             this was the last hold — see
@@ -1390,9 +1396,24 @@ class WorkerProxy:
 
         Each context `start` entered receives it — see `stop` for the
         order and the state contract.
+
+        .. rubric:: Implementation notes
+
+        The loop is checked before the stack is touched. Everything
+        `start` entered belongs to the loop that entered it, and an exit
+        stack unwound from another loop runs each of those exits on the
+        wrong loop and keeps going past the first that fails, so the
+        innermost context's refusal survives only as a ``__context__``
+        while the outer ones have already torn foreign state down.
+        Refusing up front leaves the proxy started and every resource
+        intact, to be stopped from the loop that owns it.
         """
         if self._state is not _Lifecycle.STARTED:
             raise RuntimeError(self._state.value)
+        if self._start_loop is not asyncio.get_running_loop():
+            raise RuntimeError(
+                "Proxy cannot be stopped on a loop other than the one that started it"
+            )
         self._state = _Lifecycle.STOPPING
         stack, self._start_stack = self._start_stack, None
         assert stack is not None, "a started proxy holds its start stack"
@@ -1403,6 +1424,7 @@ class WorkerProxy:
 
     def _reset_state(self) -> None:
         """Null the per-start collaborator references."""
+        self._start_loop = None
         self._loadbalancer_context = None
         self._handshake_throttle = None
         self._loadbalancer_service = None
