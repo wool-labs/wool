@@ -31,6 +31,7 @@ from wool.runtime.context.factory import install_task_factory
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import WorkerProxyLike
+from wool.runtime.worker import service as service_module
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -120,6 +121,12 @@ def _reap_worker_loops():
     follow-up cleanup is drained rather than stranded — then a stop is
     scheduled onto the loop, and the worker thread closes it once
     ``run_forever`` returns.
+
+    A service stop that returned without joining its thread may still
+    be draining the loop when this runs. That drain absorbs this one's
+    cancel and, because this drain awaits it, runs to its own budget,
+    so the wait for the loop to stop outlasts the service's drain budget
+    rather than giving up while the loop is still running.
     """
     yield
     leaked = [
@@ -163,7 +170,8 @@ def _reap_worker_loops():
             loop.call_soon_threadsafe(lambda loop=loop: loop.create_task(_shutdown()))
         except RuntimeError:
             continue
-        deadline = time.monotonic() + 5.0
+        # Outlast a service drain this one may overlap — see the docstring.
+        deadline = time.monotonic() + service_module._DRAIN_TIMEOUT + 1.0
         while loop.is_running() and time.monotonic() < deadline:
             time.sleep(0.005)
 
