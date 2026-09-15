@@ -1,7 +1,9 @@
 import asyncio
+import gc
 import logging
 import threading
 from contextlib import asynccontextmanager
+from functools import partial
 from uuid import uuid4
 
 import cloudpickle
@@ -10,12 +12,14 @@ import pytest
 from grpc import StatusCode
 from hypothesis import HealthCheck
 from hypothesis import assume
+from hypothesis import example
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 from pytest_mock import MockerFixture
 
 import wool
+from tests import helpers
 from wool import protocol
 from wool.protocol import WorkerStub
 from wool.protocol import add_WorkerServicer_to_server
@@ -163,55 +167,128 @@ _stop_cancellation_observed: threading.Event | None = None
 # suspended in its long sleep.
 _stop_routine_started: threading.Event | None = None
 
-# Cross-loop side-channel for the issue #202 worker-loop drain test
-# (``test_stop_should_drain_every_generation_of_orphaned_cleanup_chain``).
-# The second-generation cleanup task runs on the worker loop and sets this
-# `threading.Event`; the test asserts on it from the main loop.
-# The probe routine schedules a two-generation cleanup chain whose
-# second generation is observed only when worker-loop teardown drains
-# every generation, not just the first.
+# Cross-loop side-channel for the worker-loop drain probes; see
+# `drain_probes`, which owns its lifetime.
 _drain_cleanup_observed: threading.Event | None = None
 
 
-async def _drain_probe_routine():
-    """Routine that schedules an orphaned cleanup chain on the worker
-    loop from its ``finally`` clause.
+async def _probe_routine(planter):
+    """Plant ``planter``'s coroutine on the worker loop from a ``finally``
+    clause.
 
-    Models the issue #202 teardown scenario: the ``finally`` schedules
-    a first-generation cleanup task that, once cancelled by worker-loop
-    teardown, schedules a second generation. A single-pass drain never
-    observes that second generation.
+    The planted task outlives the dispatch and is left for worker-loop
+    teardown to meet.
     """
     try:
-        return "drain-probe-done"
+        return "probe-done"
     finally:
-        asyncio.get_running_loop().create_task(_drain_probe_first_gen())
+        helpers.plant(planter())
 
 
-async def _drain_probe_first_gen():
-    """First-generation orphan scheduled by `_drain_probe_routine`.
-
-    Awaits indefinitely until worker-loop teardown cancels it, then
-    schedules the second generation from its own ``finally`` clause.
-    """
-    try:
-        await asyncio.Event().wait()
-    finally:
-        asyncio.get_running_loop().create_task(_drain_probe_second_gen())
+async def _record_loop():
+    """Publish the worker loop through `tests.helpers.record_peer_loop`."""
+    helpers.record_peer_loop()
 
 
 async def _drain_probe_second_gen():
-    """Second-generation orphan scheduled by `_drain_probe_first_gen`.
+    """Set `_drain_cleanup_observed` one loop step after being cancelled,
+    then re-raise.
 
-    Sets `_drain_cleanup_observed` from its ``finally`` clause.
-    The event is set only when worker-loop teardown drains every
-    generation, not just the first.
+    Observes cancellation rather than running a ``finally`` clause, for
+    the reason given by `tests.helpers.park_then_plant`. The step it
+    awaits first means a second cancel delivered during its cleanup
+    prevents the observation.
     """
     try:
         await asyncio.Event().wait()
-    finally:
+    except asyncio.CancelledError:
+        await asyncio.sleep(0)
         if _drain_cleanup_observed is not None:
             _drain_cleanup_observed.set()
+        raise
+
+
+async def _raising_orphan():
+    """Set `_drain_cleanup_observed` once cancelled, then raise from the
+    cleanup."""
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        if _drain_cleanup_observed is not None:
+            _drain_cleanup_observed.set()
+        raise RuntimeError("cleanup failed while being drained")
+
+
+async def _gathering_peer():
+    """Await every other task on the loop, indefinitely.
+
+    Publishes the running loop through `tests.helpers.record_peer_loop`,
+    then repeatedly gathers every other task, idling briefly whenever
+    there is none, and survives its own cancellation, so whenever the
+    teardown drain arrives the peer is awaiting it. The first time it is
+    cancelled it also plants a parked task, which it then awaits with
+    the rest, so two tasks are left pending on the loop rather than one.
+    """
+    current = asyncio.current_task()
+    assert current is not None
+    helpers.record_peer_loop()
+    planted = False
+    while True:
+        others = [task for task in asyncio.all_tasks() if task is not current]
+        try:
+            if others:
+                await asyncio.gather(*others, return_exceptions=True)
+            else:
+                await asyncio.sleep(0.005)
+        except asyncio.CancelledError:
+            current.uncancel()
+            if not planted:
+                planted = True
+                helpers.plant(asyncio.Event().wait())
+
+
+def _clear_awaiting_peer(peer_factory):
+    """Return a proxy-pool ``clear`` stand-in that plants a peer once and
+    awaits it on every call.
+
+    The first call plants ``peer_factory``'s coroutine; every call then
+    waits for that task to finish, so each clear the peer cancels is
+    retried until the peer has finished, however `asyncio.wait_for`
+    wraps the clear.
+    """
+    peer = None
+
+    async def clear():
+        nonlocal peer
+        if peer is None:
+            peer = helpers.plant(peer_factory())
+        await asyncio.wait({peer})
+
+    return clear
+
+
+@pytest.fixture
+def drain_probes():
+    """Reset the drain probes' side channels around a test.
+
+    Provides a fresh observation event, forgets the recorded peer loop,
+    and empties the planted-task registry before the test; afterwards
+    resets all of it again and collects the tasks the test left behind,
+    so their pending-task warnings are logged within the test that
+    caused them. Yields the observation event.
+    """
+    global _drain_cleanup_observed
+
+    _drain_cleanup_observed = threading.Event()
+    helpers.peer_loop = None
+    helpers.planted_tasks.clear()
+    try:
+        yield _drain_cleanup_observed
+    finally:
+        _drain_cleanup_observed = None
+        helpers.peer_loop = None
+        helpers.planted_tasks.clear()
+        gc.collect()
 
 
 class _AttributeRejectingRoutineError(Exception):
@@ -2145,46 +2222,6 @@ class TestWorkerService:
             assert service.stopped.is_set()
 
     @pytest.mark.asyncio
-    async def test_stop_should_drain_every_generation_of_orphaned_cleanup_chain(
-        self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache
-    ):
-        """Test `WorkerService` stop drains every generation of
-        orphaned worker-loop tasks.
-
-        Given:
-            A dispatched routine whose finally clause schedules an
-            orphaned cleanup task that, when cancelled during teardown,
-            schedules a further cleanup task
-        When:
-            The stop RPC tears down the worker loop
-        Then:
-            It should drain every generation, so the second-generation
-            cleanup task runs its finally clause
-        """
-        global _drain_cleanup_observed
-
-        # Arrange
-        _drain_cleanup_observed = threading.Event()
-        try:
-            wool_task = make_task(_drain_probe_routine)
-            request = protocol.Request(task=wool_task.to_protobuf())
-
-            # Act
-            async with grpc_aio_stub() as stub:
-                stream = stub.dispatch()
-                await stream.write(request)
-                await stream.done_writing()
-                ack, response = [r async for r in stream]
-                assert ack.HasField("ack")
-                assert response.HasField("result")
-                await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 5)
-
-            # Assert
-            assert _drain_cleanup_observed.wait(timeout=5)
-        finally:
-            _drain_cleanup_observed = None
-
-    @pytest.mark.asyncio
     async def test_dispatch_should_reuse_worker_loop_across_sequential_dispatches(
         self, grpc_aio_stub, mock_worker_proxy_cache
     ):
@@ -2472,6 +2509,511 @@ class TestWorkerService:
             subscriber_pool.clear.assert_called_once()
         finally:
             __subscriber_pool__.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_stop_should_drain_every_generation_of_orphaned_cleanup_chain(
+        self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache, drain_probes
+    ):
+        """Test `WorkerService` stop drains every generation of
+        orphaned worker-loop tasks.
+
+        Given:
+            A dispatched routine whose finally clause schedules an
+            orphaned cleanup task that, when cancelled during teardown,
+            schedules a further cleanup task
+        When:
+            The stop RPC tears down the worker loop
+        Then:
+            It should drain every generation, so the second-generation
+            cleanup task observes its cancellation
+        """
+        # Arrange
+        planter = partial(helpers.park_then_plant, _drain_probe_second_gen)
+        wool_task = make_task(_probe_routine, args=(planter,))
+        request = protocol.Request(task=wool_task.to_protobuf())
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            ack, response = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert response.HasField("result")
+
+            # Act
+            await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 15)
+
+        # Assert
+        assert drain_probes.wait(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_stop_should_retrieve_exception_when_drained_cleanup_raises(
+        self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache, drain_probes, caplog
+    ):
+        """Test `WorkerService` stop retrieves the exception of a drained
+        task whose cleanup raises.
+
+        Given:
+            A dispatched routine whose orphaned cleanup task, when
+            cancelled during teardown, raises from its cleanup
+        When:
+            The stop RPC tears down the worker loop and the task is
+            collected
+        Then:
+            It should run the raising cleanup and not report its
+            exception as never retrieved
+        """
+        # Arrange
+        gc.collect()
+        planter = partial(helpers.park_then_plant, _raising_orphan)
+        wool_task = make_task(_probe_routine, args=(planter,))
+        request = protocol.Request(task=wool_task.to_protobuf())
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            ack, response = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert response.HasField("result")
+
+            # Act
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 15)
+                helpers.planted_tasks.clear()
+                gc.collect()
+
+        # Assert
+        assert drain_probes.wait(timeout=5)
+        assert not [
+            record
+            for record in caplog.records
+            if "never retrieved" in record.getMessage()
+            and "cleanup failed while being drained"
+            in record.getMessage() + str(record.exc_info and record.exc_info[1])
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stop_should_close_worker_loop_when_peer_gathers_teardown_drain(
+        self, grpc_aio_stub, grpc_servicer, mock_worker_proxy_cache, drain_probes, caplog
+    ):
+        """Test `WorkerService` stop closes the worker loop when a peer
+        task awaits the teardown drain.
+
+        Given:
+            A dispatched routine whose finally clause leaves a task on
+            the worker loop that gathers every other task on the loop,
+            the teardown drain among them once teardown starts, and
+            that leaves a parked task behind when first cancelled
+        When:
+            The stop RPC tears down the worker loop
+        Then:
+            It should close the loop before the stop RPC returns, log
+            both tasks left pending, and raise no `RecursionError`
+        """
+        # Arrange
+        wool_task = make_task(_probe_routine, args=(_gathering_peer,))
+        request = protocol.Request(task=wool_task.to_protobuf())
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            ack, response = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert response.HasField("result")
+
+            # Act
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 15)
+
+        # Assert
+        assert helpers.peer_loop is not None and helpers.peer_loop.is_closed()
+        assert grpc_servicer.stopped.is_set()
+        assert [
+            record
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and "teardown drain timed out" in record.getMessage()
+            and "2 task(s) still pending" in record.getMessage()
+        ]
+        assert not [
+            record
+            for record in caplog.records
+            if record.exc_info and record.exc_info[0] is RecursionError
+        ]
+
+    @pytest.mark.asyncio
+    @settings(
+        max_examples=25,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(sweeps=st.integers(min_value=1, max_value=16))
+    @example(sweeps=1)
+    @example(sweeps=2)
+    async def test_stop_should_drain_later_generations_when_peer_cancels_drain(
+        self, grpc_aio_stub, mock_worker_proxy_cache, drain_probes, caplog, sweeps
+    ):
+        """Test `WorkerService` stop keeps draining however many times a
+        peer task cancels the teardown drain.
+
+        Given:
+            A dispatched routine whose orphaned cleanup task, when
+            cancelled during teardown, plants a peer that leaves a
+            suspended orphan behind and then cancels every other task on
+            the loop, the teardown drain among them, on each of any
+            number of successive iterations
+        When:
+            The stop RPC tears down the worker loop
+        Then:
+            It should close the loop without the drain timing out and
+            cancel the orphan exactly once, so it observes its
+            cancellation
+        """
+        # Arrange
+        drain_probes.clear()
+        helpers.peer_loop = None
+        helpers.planted_tasks.clear()
+        caplog.clear()
+        peer = partial(helpers.cancelling_peer, sweeps, orphan=_drain_probe_second_gen)
+        planter = partial(helpers.park_then_plant, peer)
+        wool_task = make_task(_probe_routine, args=(planter,))
+        request = protocol.Request(task=wool_task.to_protobuf())
+        async with grpc_aio_stub(servicer=WorkerService()) as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            ack, response = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert response.HasField("result")
+
+            # Act
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 15)
+
+        # Assert
+        assert helpers.peer_loop is not None and helpers.peer_loop.is_closed()
+        assert drain_probes.wait(timeout=5)
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and "teardown drain timed out" in record.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stop_should_retry_proxy_pool_clear_when_peer_cancels_it(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        drain_probes,
+        caplog,
+    ):
+        """Test `WorkerService` stop retries the proxy-pool clear after a
+        peer task cancels the teardown drain during it.
+
+        Given:
+            A `WorkerService` that has serviced one dispatch, leaving a
+            warm worker loop, while the proxy-pool ``clear`` coroutine
+            plants a peer that cancels every other task, the clearing
+            drain among them, on each of three successive iterations,
+            and waits for that peer on every call
+        When:
+            The stop RPC tears down the worker loop
+        Then:
+            It should call ``clear`` again after the peer's cancellation
+            until a call completes within the budget
+        """
+        # Arrange
+        clear = mocker.AsyncMock(
+            side_effect=_clear_awaiting_peer(partial(helpers.cancelling_peer, 3))
+        )
+        mock_worker_proxy_cache.clear = clear
+
+        async def sample_task():
+            return "ok"
+
+        wool_task = make_task(sample_task)
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+
+            # Act
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 15)
+
+        # Assert
+        assert clear.call_count >= 2
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and "did not complete within the budget" in record.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stop_should_warn_once_when_peer_cancels_proxy_pool_clear_repeatedly(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        drain_probes,
+        caplog,
+    ):
+        """Test `WorkerService` stop reports a repeatedly cancelled
+        proxy-pool clear only once.
+
+        Given:
+            A `WorkerService` that has serviced one dispatch, leaving a
+            warm worker loop, while the proxy-pool ``clear`` coroutine
+            plants a peer that cancels every other task, the clearing
+            drain among them, on each of three successive iterations,
+            and waits for that peer on every call
+        When:
+            The stop RPC tears down the worker loop
+        Then:
+            It should log the cancelled clear at WARNING exactly once,
+            noting that it is retrying while budget remains
+        """
+        # Arrange
+        mock_worker_proxy_cache.clear = mocker.AsyncMock(
+            side_effect=_clear_awaiting_peer(partial(helpers.cancelling_peer, 3))
+        )
+
+        async def sample_task():
+            return "ok"
+
+        wool_task = make_task(sample_task)
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+
+            # Act
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 15)
+
+        # Assert
+        cancelled_clear_records = [
+            record
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and "Clearing the proxy pool was cancelled" in record.getMessage()
+        ]
+        assert len(cancelled_clear_records) == 1
+        assert "retrying while budget remains" in cancelled_clear_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_stop_should_log_traceback_when_cancelled_proxy_pool_clear_raises(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        drain_probes,
+        caplog,
+    ):
+        """Test `WorkerService` stop reports the failure of a proxy-pool
+        clear that raises after a peer task cancelled it.
+
+        Given:
+            A `WorkerService` that has serviced one dispatch, leaving a
+            warm worker loop, while the proxy-pool ``clear`` coroutine
+            plants a peer that cancels every other task once, the
+            clearing drain among them, and raises on its retry
+        When:
+            The stop RPC tears down the worker loop
+        Then:
+            It should log the failed clear at WARNING with its traceback
+            and its cancellation count
+        """
+        # Arrange
+        peer = None
+
+        async def raising_clear():
+            nonlocal peer
+            if peer is None:
+                peer = helpers.plant(helpers.cancelling_peer(1))
+                await asyncio.wait({peer})
+                return
+            await asyncio.wait({peer})
+            raise RuntimeError("synthetic proxy-pool clear failure")
+
+        mock_worker_proxy_cache.clear = mocker.AsyncMock(side_effect=raising_clear)
+
+        async def sample_task():
+            return "ok"
+
+        wool_task = make_task(sample_task)
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+
+            # Act
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 15)
+
+        # Assert
+        failed = [
+            record
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and "Failed to clear the proxy pool" in record.getMessage()
+        ]
+        assert len(failed) == 1
+        assert "after being cancelled 1 time(s)" in failed[0].getMessage()
+        assert failed[0].exc_info is not None
+        assert failed[0].exc_info[0] is RuntimeError
+
+    @pytest.mark.asyncio
+    async def test_stop_should_abandon_proxy_pool_clear_when_peer_cancels_past_budget(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        drain_probes,
+        caplog,
+    ):
+        """Test `WorkerService` stop abandons a proxy-pool clear that a
+        peer task keeps cancelling until the drain budget is spent.
+
+        Given:
+            A `WorkerService` that has serviced one dispatch, leaving a
+            warm worker loop, while the proxy-pool ``clear`` coroutine
+            plants a peer that cancels every other task, the clearing
+            drain among them, on every iteration, and waits for that
+            peer on every call
+        When:
+            The stop RPC tears down the worker loop
+        Then:
+            It should close the loop, report the cancelled clear once
+            while retrying and once more with its cancellation count
+            when the budget is spent, and report the drain as timed out
+        """
+        # Arrange
+        mock_worker_proxy_cache.clear = mocker.AsyncMock(
+            side_effect=_clear_awaiting_peer(partial(helpers.cancelling_peer, None))
+        )
+
+        async def sample_task():
+            return "ok"
+
+        wool_task = make_task(sample_task)
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(protocol.Request(task=wool_task.to_protobuf()))
+            await stream.done_writing()
+            ack, result = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert result.HasField("result")
+
+            # Act
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 15)
+
+        # Assert
+        assert helpers.peer_loop is not None and helpers.peer_loop.is_closed()
+        assert grpc_servicer.stopped.is_set()
+        retrying = [
+            record
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and "retrying while budget remains" in record.getMessage()
+        ]
+        abandoned = [
+            record
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and "did not complete within the budget" in record.getMessage()
+        ]
+        timed_out = [
+            record
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and "teardown drain timed out" in record.getMessage()
+        ]
+        assert (len(retrying), len(abandoned), len(timed_out)) == (1, 1, 1)
+
+    @pytest.mark.asyncio
+    async def test_stop_should_stop_worker_loop_when_drain_cancelled_before_first_step(
+        self,
+        grpc_aio_stub,
+        grpc_servicer,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        drain_probes,
+        caplog,
+    ):
+        """Test `WorkerService` stop stops the worker loop when the
+        teardown drain is cancelled before it first runs.
+
+        Given:
+            A `WorkerService` that has serviced one dispatch, leaving a
+            warm worker loop on which every task created from now on is
+            cancelled before its first step
+        When:
+            The stop RPC tears down the worker loop
+        Then:
+            It should stop and close the loop before the stop RPC
+            returns, log that the drain never ran rather than that it
+            timed out, and leave the proxy pool uncleared
+        """
+        # Arrange
+        wool_task = make_task(_probe_routine, args=(_record_loop,))
+        request = protocol.Request(task=wool_task.to_protobuf())
+        async with grpc_aio_stub() as stub:
+            stream = stub.dispatch()
+            await stream.write(request)
+            await stream.done_writing()
+            ack, response = [r async for r in stream]
+            assert ack.HasField("ack")
+            assert response.HasField("result")
+            loop = helpers.peer_loop
+            assert loop is not None
+            create_task = loop.create_task
+
+            def cancel_on_create(coro, **kwargs):
+                task = create_task(coro, **kwargs)
+                task.cancel()
+                return task
+
+            # Cancelling every task the loop creates from here is the one
+            # deterministic way to cancel the drain before its first step.
+            mocker.patch.object(loop, "create_task", cancel_on_create)
+
+            # Act
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(stub.stop(protocol.StopRequest(timeout=10)), 15)
+
+        # Assert
+        assert loop.is_closed()
+        assert grpc_servicer.stopped.is_set()
+        assert mock_worker_proxy_cache.clear.await_count == 0
+        assert [
+            record
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and "teardown drain did not run" in record.getMessage()
+        ]
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == "wool.runtime.worker.service"
+            and "teardown drain timed out" in record.getMessage()
+        ]
 
     @pytest.mark.asyncio
     async def test_dispatch_should_yield_results_in_order_when_async_generator(
