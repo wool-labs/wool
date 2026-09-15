@@ -597,15 +597,16 @@ class WorkerService(protocol.WorkerServicer):
     ) -> protocol.Idle:
         """Report how long the worker has been continuously idle.
 
-        Idle is the number of seconds since the in-flight task set
-        (`_docket`) last became empty, with worker startup counting as
-        the initial empty state. While any task is in flight the
-        reported idle time is zero, and the count resets whenever work
-        resumes. Measured against a monotonic clock so a wall-clock
-        adjustment cannot distort it.
+        Idle is the number of seconds since the worker's last in-flight
+        task finished, with worker startup counting as the initial idle
+        state. While any task is in flight the reported idle time is
+        zero, and the count resets whenever work resumes. Measured
+        against a monotonic clock so a wall-clock adjustment cannot
+        distort it.
 
-        Polling this RPC creates no `DispatchSession` and never touches
-        the docket, so a caller cannot disturb the measurement it reads.
+        Polling this RPC creates no `DispatchSession` and never counts as
+        in-flight work, so a caller cannot disturb the measurement it
+        reads.
 
         :param request:
             The empty protobuf request.
