@@ -41,6 +41,7 @@ from wool.runtime.loadbalancer.base import LoadBalancerContextView
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.runtime.resourcepool import Resource
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
@@ -154,6 +155,8 @@ __all__ = [
     "NoWorkersAvailable",
     "PredicateFunction",
     "Refreshing",
+    "Resource",
+    "ResourcePool",
     "RoundRobinLoadBalancer",
     "RpcError",
     "RuntimeContext",

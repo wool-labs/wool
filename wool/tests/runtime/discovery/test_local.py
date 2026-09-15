@@ -8,6 +8,7 @@ import sys
 import threading
 import uuid
 from collections import Counter
+from contextlib import AsyncExitStack
 from contextlib import ExitStack
 from contextlib import asynccontextmanager
 from contextlib import contextmanager
@@ -31,6 +32,7 @@ from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
 from wool.runtime.discovery.exceptions import DiscoveryWorkerNotFound
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
 
@@ -2138,6 +2140,266 @@ class TestLocalDiscoveryPublisher:
                 block_registered = registered[baseline:]
                 assert block_registered == unregistered
                 assert len(block_registered) == 2
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_finalize_every_block_when_workers_are_published(
+        self, namespace, atexit_recorder, mocker
+    ):
+        """Test the publisher closes its own blocks before exiting the pool.
+
+        Given:
+            A Publisher in an owner discovery context with two workers
+            published and never dropped, with atexit registration
+            wrapped in recording pass-throughs and the shared-memory
+            pool's exit wrapped to record what had been unregistered by
+            the time it began
+        When:
+            The publisher's context exits
+        Then:
+            It should have unregistered both blocks' fallbacks already
+            when the pool exit starts, the ledger owning the close
+            rather than leaving it to the pool that would otherwise
+            finalize the same entries anyway.
+        """
+        # Arrange
+        registered, unregistered = atexit_recorder
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:5005{i}",
+                pid=100 + i,
+                version="1.0",
+            )
+            for i in range(2)
+        ]
+
+        with LocalDiscovery(namespace):
+            baseline = len(registered)
+            publisher = LocalDiscovery.Publisher(namespace)
+            stack = AsyncExitStack()
+            await stack.enter_async_context(publisher)
+            for worker in workers:
+                await publisher.publish("worker-added", worker)
+            unregistered_before = list(unregistered)
+            at_pool_exit = []
+            pool_exit = ResourcePool.__aexit__
+
+            async def record_then_exit(self, *args):
+                at_pool_exit.append(list(unregistered))
+                return await pool_exit(self, *args)
+
+            mocker.patch.object(ResourcePool, "__aexit__", record_then_exit)
+
+            # Act
+            await stack.aclose()
+
+            # Assert
+            block_registered = registered[baseline:]
+            assert len(block_registered) == 2
+            assert unregistered_before == []
+            assert sorted(map(id, block_registered)) == sorted(map(id, unregistered))
+            # The ordering oracle: every unregistration is already in
+            # hand when the pool exit begins, so removing the ledger's
+            # own loop fails here rather than passing on the pool's
+            # finalization of the same entries.
+            assert len(at_pool_exit) == 1
+            assert sorted(map(id, at_pool_exit[0])) == sorted(map(id, unregistered))
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_release_every_other_block_when_one_close_raises(
+        self, namespace, atexit_recorder, mocker
+    ):
+        """Test one block's failure does not abandon the blocks after it.
+
+        Given:
+            A Publisher in an owner discovery context with two workers
+            published, the close of the first block the exit reaches
+            patched to raise, and atexit registration wrapped in
+            recording pass-throughs
+        When:
+            The publisher's context exits
+        Then:
+            It should raise that first failure, having still closed the
+            other block before the pool exit began, so a bad handle
+            costs its own block and no more — and not merely left the
+            rest for the pool to finalize.
+        """
+        # Arrange
+        registered, unregistered = atexit_recorder
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"localhost:5006{i}",
+                pid=200 + i,
+                version="1.0",
+            )
+            for i in range(2)
+        ]
+        real_aclose = AsyncExitStack.aclose
+        failed = []
+        at_pool_exit = []
+        pool_exit = ResourcePool.__aexit__
+
+        async def fail_first(self):
+            if not failed:
+                failed.append(self)
+                await real_aclose(self)
+                raise RuntimeError("block close failed")
+            return await real_aclose(self)
+
+        async def record_then_exit(self, *args):
+            at_pool_exit.append(list(unregistered))
+            return await pool_exit(self, *args)
+
+        with LocalDiscovery(namespace):
+            baseline = len(registered)
+            publisher = LocalDiscovery.Publisher(namespace)
+            stack = AsyncExitStack()
+            await stack.enter_async_context(publisher)
+            for worker in workers:
+                await publisher.publish("worker-added", worker)
+            mocker.patch.object(AsyncExitStack, "aclose", fail_first)
+            mocker.patch.object(ResourcePool, "__aexit__", record_then_exit)
+
+            # Act & assert
+            with pytest.raises(RuntimeError, match="block close failed"):
+                await publisher.__aexit__(None, None, None)
+
+            block_registered = registered[baseline:]
+            assert len(block_registered) == 2
+            assert sorted(map(id, block_registered)) == sorted(map(id, unregistered))
+            # Both blocks are already released when the pool exit
+            # starts: abandoning the loop at the first failure would
+            # leave the second for the pool to finalize instead.
+            assert len(at_pool_exit) == 1
+            assert sorted(map(id, at_pool_exit[0])) == sorted(map(id, unregistered))
+
+    @pytest.mark.asyncio
+    async def test_publish_should_ignore_a_drop_for_a_worker_never_added(
+        self, namespace, metadata, atexit_recorder
+    ):
+        """Test dropping an unknown worker is a no-op.
+
+        Given:
+            A Publisher in an owner discovery context that never
+            published the worker
+        When:
+            worker-dropped is published for it
+        Then:
+            It should return without raising and touch no atexit
+            registration.
+        """
+        # Arrange
+        registered, unregistered = atexit_recorder
+        with LocalDiscovery(namespace):
+            baseline = (len(registered), len(unregistered))
+            publisher = LocalDiscovery.Publisher(namespace)
+            async with publisher:
+                # Act
+                await publisher.publish("worker-dropped", metadata)
+
+                # Assert
+                assert (len(registered), len(unregistered)) == baseline
+
+    @pytest.mark.asyncio
+    async def test_publish_should_release_the_old_block_when_a_re_add_reclaims_a_slot(
+        self, namespace, metadata, atexit_recorder, mocker
+    ):
+        """Test reclaiming a slot releases the block the publisher still held.
+
+        Given:
+            A published worker whose per-worker block a dead peer
+            unlinked out from under this publisher, so re-publishing it
+            reclaims the stale slot and registers a fresh block, with
+            atexit registration wrapped in recording pass-throughs
+        When:
+            The worker is published again and then dropped
+        Then:
+            It should pair the block's fallback registration with its
+            unregistration before the publisher exits, the reference
+            the reclaim took having been dropped when the re-add
+            displaced the handle holding it rather than at the end of
+            the publisher's life.
+        """
+        # Arrange
+        registered, unregistered = atexit_recorder
+        created: list[str] = []
+        real_shared_memory = SharedMemory
+
+        def record_created(*args, **kwargs):
+            block = real_shared_memory(*args, **kwargs)
+            if kwargs.get("create"):
+                created.append(block.name)
+            return block
+
+        mocker.patch.object(local, "SharedMemory", record_created)
+        with LocalDiscovery(namespace):
+            baseline = len(registered)
+            publisher = LocalDiscovery.Publisher(namespace)
+            stack = AsyncExitStack()
+            await stack.enter_async_context(publisher)
+            created.clear()
+            await publisher.publish("worker-added", metadata)
+            # A dead peer's teardown unlinks blocks without nulling the
+            # slots that name them -- the case the reclaim branch exists
+            # for. The segment is named by the publisher rather than
+            # rebuilt here, so the test unlinks what it actually made.
+            [block_name] = created
+            vanishing = SharedMemory(name=block_name)
+            vanishing.unlink()
+            vanishing.close()
+
+            # Act
+            await publisher.publish("worker-added", metadata)
+            await publisher.publish("worker-dropped", metadata)
+            at_drop = list(unregistered)
+            await stack.aclose()
+
+            # Assert
+            block_registered = registered[baseline:]
+            assert len(block_registered) == 1
+            assert block_registered == at_drop
+            assert unregistered == at_drop
+
+    @pytest.mark.asyncio
+    async def test_publish_should_release_its_block_when_a_peer_nulled_the_slot(
+        self, namespace, metadata, atexit_recorder
+    ):
+        """Test a drop releases this publisher's block with no slot to match.
+
+        Given:
+            A published worker whose slot a peer publisher on the same
+            namespace has already nulled by dropping it, with atexit
+            registration wrapped in recording pass-throughs
+        When:
+            The publisher that owns the block drops the worker too
+        Then:
+            It should pair the block's fallback registration with its
+            unregistration, the slot scan finding nothing being no
+            reason to keep holding the block.
+        """
+        # Arrange
+        registered, unregistered = atexit_recorder
+        with LocalDiscovery(namespace):
+            baseline = len(registered)
+            owner = LocalDiscovery.Publisher(namespace)
+            peer = LocalDiscovery.Publisher(namespace)
+            stack = AsyncExitStack()
+            await stack.enter_async_context(owner)
+            await stack.enter_async_context(peer)
+            await owner.publish("worker-added", metadata)
+            await peer.publish("worker-dropped", metadata)
+
+            # Act
+            await owner.publish("worker-dropped", metadata)
+            at_drop = list(unregistered)
+            await stack.aclose()
+
+            # Assert
+            block_registered = registered[baseline:]
+            assert len(block_registered) == 1
+            assert block_registered == at_drop
+            assert unregistered == at_drop
 
     @pytest.mark.asyncio
     async def test_publish_should_complete_drop_when_block_already_unlinked(

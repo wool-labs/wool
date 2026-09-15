@@ -43,6 +43,8 @@ def test_public_api_completeness_should_match_expected_surface():
         "SlowCredentialResolutionWarning",
         "UnparsableVersionWarning",
         "WorkerConnection",
+        "Resource",
+        "ResourcePool",
         "ChainContention",
         "ChainSerializationError",
         "TaskFactoryDisplaced",

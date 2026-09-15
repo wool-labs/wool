@@ -13,12 +13,37 @@ from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.fanout import Fanout
 
 _subscriber_factories: dict[Any, Callable[[Any], Any]] = {}
-"""Per-key factory registry populated by :class:`SubscriberMeta`."""
+"""Per-key factory registry populated by `SubscriberMeta`."""
 
 
 def _pool_factory(key: Any) -> Any:
     """Dispatch to the registered factory for *key*."""
     return _subscriber_factories[key](key)
+
+
+def install_subscriber_pool() -> ResourcePool[Any]:
+    """Return the context's discovery subscriber pool, installing one if needed.
+
+    The pool is the one `__subscriber_pool__` holds, created and set on
+    the first call in a context that has none. Installing it in a
+    context every task in the process inherits is what makes the pool
+    clearable by a task other than the one that first needed it.
+
+    :returns:
+        The subscriber pool for the calling context.
+
+    .. rubric:: Implementation notes
+
+    A `contextvars.ContextVar` first set inside a dispatch task is
+    invisible to the servicer task that later has to clear it, and a
+    subscriber pool a worker's teardown cannot see is a partition
+    dropped unfinalized when its loop closes.
+    """
+    pool = __subscriber_pool__.get()
+    if pool is None:
+        pool = ResourcePool(factory=_pool_factory, finalizer=_pool_finalizer, ttl=0)
+        __subscriber_pool__.set(pool)
+    return pool
 
 
 def _reconstruct(cls: type, args: tuple, kwargs: dict) -> Any:
@@ -27,13 +52,13 @@ def _reconstruct(cls: type, args: tuple, kwargs: dict) -> Any:
 
 
 class _SharedSubscription:
-    """Adapter bridging a discovery subscriber and a :class:`Fanout`.
+    """Adapter bridging a discovery subscriber and a `Fanout`.
 
     Each ``__aiter__`` call returns an independent async generator
-    that enters a :class:`~wool.runtime.resourcepool.Resource` from
+    that enters a `~wool.runtime.resourcepool.Resource` from
     the pool, wraps the raw subscriber in a shared
-    :class:`~wool.utilities.fanout.Fanout`, and iterates a
-    :class:`~wool.utilities.fanout.FanoutConsumer`.  The ``async
+    `~wool.utilities.fanout.Fanout`, and iterates a
+    `~wool.utilities.fanout.FanoutConsumer`.  The ``async
     with`` context naturally releases the pool reference on
     exhaustion or ``aclose()``.
 
@@ -42,9 +67,9 @@ class _SharedSubscription:
     so they start with a consistent view of the current state.
 
     :param key:
-        Cache key for the :class:`ResourcePool`.
+        Cache key for the `ResourcePool`.
     :param reduce_info:
-        ``(cls, args, kwargs)`` tuple used by :meth:`__reduce__` for
+        ``(cls, args, kwargs)`` tuple used by `__reduce__` for
         pickle support.
     """
 
@@ -104,8 +129,8 @@ class SubscriberMeta(type):
     Intercepts class creation via ``__new__`` and injects a custom
     ``__new__`` onto the subscriber class.  The injected method
     registers a factory that creates raw subscribers, then returns a
-    :class:`_SharedSubscription` whose pool
-    :class:`~wool.runtime.resourcepool.Resource` is entered lazily
+    `_SharedSubscription` whose pool
+    `~wool.runtime.resourcepool.Resource` is entered lazily
     on first iteration.
 
     Subscriber classes pass a ``key`` keyword argument at class
@@ -133,14 +158,7 @@ class SubscriberMeta(type):
 
         def _subscriber_new(cls_arg: type, *args: Any, **kwargs: Any) -> Any:
             key = cls_arg._cache_key_fn(cls_arg, *args, **kwargs)  # type: ignore[attr-defined]
-            pool = __subscriber_pool__.get()
-            if pool is None:
-                pool = ResourcePool(
-                    factory=_pool_factory,
-                    finalizer=_pool_finalizer,
-                    ttl=0,
-                )
-                __subscriber_pool__.set(pool)
+            install_subscriber_pool()
 
             def factory(_: Any) -> Any:
                 instance = object.__new__(cls_arg)

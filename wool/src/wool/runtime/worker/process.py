@@ -27,6 +27,7 @@ import grpc.aio
 import wool
 from wool import protocol
 from wool.runtime.context.factory import install_task_factory
+from wool.runtime.discovery.pool import install_subscriber_pool
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
@@ -367,6 +368,9 @@ class WorkerProcess(Process):
                 ttl=self._proxy_pool_ttl,
             )
         )
+        # In the process's own context, not a dispatch task's — see
+        # `install_subscriber_pool`.
+        install_subscriber_pool()
         try:
             asyncio.run(self._serve())
         except Exception as e:
@@ -794,4 +798,6 @@ async def _proxy_finalizer(
     try:
         await proxy.exit()
     except Exception:
-        pass
+        logger.warning(
+            "Failed to exit a pooled proxy during its finalization", exc_info=True
+        )

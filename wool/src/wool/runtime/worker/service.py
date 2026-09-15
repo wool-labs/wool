@@ -39,6 +39,15 @@ when its drain is scheduled. Sized for a normal chain of
 ``finally``-scheduled cleanup to unwind without stalling teardown; see
 `WorkerService._destroy_worker_loop` for what happens once it is spent."""
 
+_CLEAR_FLOOR: Final[float] = 0.5
+"""Least time in seconds any one worker-loop teardown clear is given,
+however little of `_DRAIN_TIMEOUT` the clears before it left. The clears
+share one budget and run in a fixed order, so without a floor a proxy
+clear that spends it hands the channel clear — the one closing sockets
+and completion queues — a deadline that has already passed, and the
+channels are dropped unclosed instead. It bounds the teardown's worst
+case at the budget plus one floor per starved clear."""
+
 _WORKER_LOOP_TTL: Final[float] = 30.0
 """Idle time-to-live in seconds for the worker event-loop held by
 `WorkerService._loop_pool`. The loop pool is keyed by a single
@@ -52,7 +61,7 @@ clears the pool immediately regardless of this value, so no daemon
 thread outlives the service. The 30s window is generous enough to span
 the gap between bursts of dispatches on a healthy worker while still
 reaping a loop that has gone quiet. Retiring the loop also finalizes
-the proxy and discovery-subscriber pools bound to it (see
+the loop's partitions of the proxy and discovery-subscriber pools (see
 `WorkerService._destroy_worker_loop`), so a cached proxy is reused only
 while the worker loop stays warm."""
 
@@ -661,17 +670,21 @@ class WorkerService(protocol.WorkerServicer):
         """Clear, drain, and stop a worker loop, then join its thread.
 
         Clears the proxy, discovery-subscriber, and channel pools on the
-        worker loop first, in that order, since a `ResourcePool` bound to
-        the loop can be cleared from no other; exiting the proxies first
-        releases their channel-pool hold before the channels are swept. A
-        clear that raises, times out, or is cancelled does not prevent the
-        stop: a cancelled clear is retried while `_DRAIN_TIMEOUT` remains, a
-        clear reached with the budget spent is cancelled before it starts,
-        and whatever a clear leaves cached is dropped when the pool next
-        rebinds. The budget bounds when a clear is cancelled, not when it
-        returns, since `ResourcePool.clear` finishes its sweep before
-        re-raising. An interrupt a clear raises propagates only after the
-        drain.
+        worker loop first, in that order: a `ResourcePool` partitions its
+        entries by loop and only the owning loop can finalize them, so
+        this finalizer is the one place the worker loop's share can still
+        be cleared, and exiting the proxies first releases their
+        channel-pool hold before the channels are cleared. The clears run
+        one after another on this task, each handed a deadline off the
+        shared `_DRAIN_TIMEOUT` budget but never less than `_CLEAR_FLOOR`
+        — see that constant for why a floor exists and what it costs, and
+        `ResourcePool.clear` for what the deadline bounds. Every clear
+        starts, including one reached with the budget already gone. A
+        clear that raises, exceeds its deadline, or is cancelled does not
+        prevent the stop: a cancelled clear is retried while its deadline
+        remains, and whatever a clear leaves cached stays in the loop's
+        partition for the pool to report when it discards it. An
+        interrupt a clear raises propagates only after the drain.
 
         Then cancels and awaits the loop's pending tasks generation by
         generation, since a cancelled task's ``finally`` can spawn more,
@@ -683,9 +696,9 @@ class WorkerService(protocol.WorkerServicer):
         Finally joins the worker thread for up to `_stop_timeout` seconds.
         ``0`` does not wait and ``None`` waits indefinitely; a thread still
         running at the bound is reaped at process exit. With ``0``, the
-        clears and the drain run on the worker thread after this returns,
-        where the channel clear can race a successor loop's first use of
-        the process-wide channel pool.
+        clears and the drain run on the worker thread after this returns;
+        each loop clears its own partition, so that path cannot race a
+        successor loop's first use of the process-wide channel pool.
 
         The drain tolerates a peer on the loop, i.e., another task that
         cancels or awaits the loop's tasks. A peer's cancel neither raises
@@ -698,7 +711,7 @@ class WorkerService(protocol.WorkerServicer):
 
         Each degradation is logged at warning level: a pool clear that
         raised, with its traceback and any peer cancellations counted, or
-        that timed out uncancelled; a pool clear a peer cancelled, at the
+        that exceeded its deadline uncancelled; a pool clear a peer cancelled, at the
         first cancellation and again if no retry completes in time; a drain
         that timed out, with the count of tasks still pending; and a drain
         that never ran before the deadline stopped the loop.
@@ -716,6 +729,13 @@ class WorkerService(protocol.WorkerServicer):
         until `RecursionError` and both stay pending. A cancel that
         reaches a private future stops there. The callback also retrieves
         each task's exception, as ``return_exceptions`` would.
+
+        A clear re-raises a cancellation it absorbed only after finishing
+        its sweep (see `ResourcePool.clear`), so retrying it finds the
+        partition empty and returns at once; the retry loop therefore
+        serves a peer's cancel and an absorbed one alike, and a clear the
+        pool bounded at its deadline reaches the same loop as
+        `TimeoutError` rather than as a cancellation.
 
         The drain swallows its own cancellation and calls
         `asyncio.Task.uncancel`, because a peer that cancels every task
@@ -760,15 +780,20 @@ class WorkerService(protocol.WorkerServicer):
                 assert current is not None, "the drain runs as a task on the worker loop"
                 try:
                     for name, clear in clears:
+                        # The per-clear floor — see `_CLEAR_FLOOR`.
+                        bound = max(deadline, loop.time() + _CLEAR_FLOOR)
                         cancels = 0
                         while True:
                             try:
-                                await asyncio.wait_for(
-                                    clear(), timeout=max(0.0, deadline - loop.time())
-                                )
+                                # On this task, not its own: a clear spawned
+                                # here would be one more task racing
+                                # ``loop.stop()`` below.
+                                async with asyncio.timeout_at(bound):
+                                    await clear(deadline=bound)
                             except asyncio.CancelledError:
-                                # Cancelled by a peer — see the implementation
-                                # notes of `_destroy_worker_loop`.
+                                # Cancelled by a peer, or a cancellation the
+                                # clear absorbed and re-raised — see the
+                                # implementation notes of `_destroy_worker_loop`.
                                 current.uncancel()
                                 cancels += 1
                                 if cancels == 1:
@@ -777,22 +802,30 @@ class WorkerService(protocol.WorkerServicer):
                                         "during worker-loop teardown; retrying while "
                                         "budget remains."
                                     )
-                                if loop.time() < deadline:
+                                if loop.time() < bound:
                                     continue
-                            except Exception as exc:
-                                if not (cancels and isinstance(exc, TimeoutError)):
-                                    cancelled = (
-                                        f" after being cancelled {cancels} time(s)"
-                                        if cancels
-                                        else ""
-                                    )
+                            except TimeoutError:
+                                if not cancels:
                                     _log.warning(
-                                        f"Failed to clear the {name} pool during "
-                                        f"worker-loop teardown{cancelled}; continuing "
-                                        "to drain and stop the loop.",
-                                        exc_info=True,
+                                        f"The {name} pool clear exceeded the "
+                                        "worker-loop teardown budget; whatever it "
+                                        "did not reach is left cached for the pool "
+                                        "to report."
                                     )
                                     break
+                            except Exception:
+                                cancelled = (
+                                    f" after being cancelled {cancels} time(s)"
+                                    if cancels
+                                    else ""
+                                )
+                                _log.warning(
+                                    f"Failed to clear the {name} pool during "
+                                    f"worker-loop teardown{cancelled}; continuing "
+                                    "to drain and stop the loop.",
+                                    exc_info=True,
+                                )
+                                break
                             else:
                                 break
                             _log.warning(
@@ -939,8 +972,8 @@ class WorkerService(protocol.WorkerServicer):
         self._stopping.set()
         await self._preempt(timeout=timeout)
         try:
-            # The proxy and subscriber pools are bound to the worker loop
-            # and are cleared by its finalizer — see `_destroy_worker_loop`.
+            # The worker loop's partitions of the proxy and subscriber
+            # pools go with it — see `_destroy_worker_loop`.
             await self._loop_pool.clear()
         finally:
             self._stopped.set()

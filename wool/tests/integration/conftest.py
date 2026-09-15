@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -38,6 +39,7 @@ from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.connection import channel_pool_hold_stats
 from wool.runtime.worker.connection import channel_pool_stats
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
@@ -63,7 +65,7 @@ async def poll_until(
     satisfies ``predicate`` within the deadline, naming ``description``
     and the last value, or tolerated exception, seen.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while True:
         try:
@@ -117,10 +119,11 @@ async def run_on_foreign_loop(factory):
 
     Returns whatever the coroutine returns. ``asyncio.run`` closes its
     loop the moment the coroutine finishes, so whatever the coroutine
-    left in the channel pool is stranded exactly as it would be in a
-    program whose loop stops — which is the condition a stranded-channel
-    test needs. The factory is called on the worker thread so the
-    coroutine is never created on the calling loop's thread.
+    left in a loop-partitioned `~wool.runtime.resourcepool.ResourcePool`
+    is stranded exactly as it would be in a program whose loop closes —
+    which is the condition these tests are about. The factory is called
+    on the worker thread so the coroutine is never created on the
+    calling loop's thread.
     """
     return await asyncio.to_thread(lambda: asyncio.run(factory()))
 
@@ -186,6 +189,7 @@ class PoolMode(Enum):
     HYBRID = auto()
     NESTED_DEFAULT_IN_EPHEMERAL = auto()
     NESTED_EPHEMERAL_IN_EPHEMERAL = auto()
+    NESTED_RETIRED_IN_EPHEMERAL = auto()
 
 
 #: The pool modes that spawn LAN `LocalWorker` processes themselves.
@@ -196,6 +200,7 @@ _SPAWNING_MODES = frozenset(
         PoolMode.HYBRID,
         PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
         PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
+        PoolMode.NESTED_RETIRED_IN_EPHEMERAL,
     }
 )
 
@@ -278,7 +283,7 @@ class StrictWarnings(Enum):
 # Optional Scenario dimension — defaulted to ``None`` and excluded
 # from :attr:`Scenario.is_complete` so the existing pairwise covering
 # array (which leaves it unset) remains valid. It is populated only
-# on explicitly-enumerated scenarios (e.g. ``test_unified_driver``)
+# on explicitly-enumerated scenarios (e.g., ``test_unified_driver``)
 # to document observable annotations.
 _OPTIONAL_DIMENSIONS: frozenset[str] = frozenset({"strict_warnings"})
 
@@ -465,8 +470,8 @@ async def build_pool_from_scenario(
         builder spawns itself, so a durable mode, which spawns none,
         rejects it.
     :raises ValueError:
-        If the scenario is incomplete, or ``proxy_pool_ttl`` is given
-        for a pool mode that spawns no workers.
+        If the scenario is incomplete, or ``proxy_pool_ttl`` is not
+        positive or is given for a pool mode that spawns no workers.
     """
     missing = [
         f.name
@@ -475,6 +480,8 @@ async def build_pool_from_scenario(
     ]
     if missing:
         raise ValueError(f"Scenario incomplete; missing required dimensions: {missing}")
+    if proxy_pool_ttl is not None and proxy_pool_ttl <= 0:
+        raise ValueError("proxy_pool_ttl must be positive")
     if proxy_pool_ttl is not None and scenario.pool_mode not in _SPAWNING_MODES:
         raise ValueError("proxy_pool_ttl applies only to pools that spawn LAN workers")
 
@@ -646,26 +653,47 @@ async def build_pool_from_scenario(
                 }
                 match scenario.pool_mode:
                     case PoolMode.DEFAULT:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
                     case PoolMode.EPHEMERAL:
-                        pool_kwargs["size"] = 2
+                        pool_kwargs["spawn"] = 2
                     case PoolMode.HYBRID:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
                         pool_kwargs["discovery"] = discovery_obj
                     case PoolMode.NESTED_DEFAULT_IN_EPHEMERAL:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
                     case PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
+                    case PoolMode.NESTED_RETIRED_IN_EPHEMERAL:
+                        pool_kwargs["spawn"] = 1
 
                 pool = WorkerPool(**pool_kwargs)
                 async with pool:
-                    if scenario.pool_mode in (
+                    if scenario.pool_mode is PoolMode.NESTED_RETIRED_IN_EPHEMERAL:
+                        # The inner pool is entered, dispatched through,
+                        # and left again before the outer pool is yielded,
+                        # so the test body runs on a loop where a nested
+                        # pool has already retired. The inner dispatch is
+                        # load-bearing: a pool that never dispatches opens
+                        # no channel, and its exit would retire nothing.
+                        nested_pool = WorkerPool(
+                            spawn=1,
+                            credentials=creds,
+                            worker=partial(LocalWorker, options=options),
+                        )
+                        async with nested_pool:
+                            assert await routines.add(1, 2) == 3
+                        yield pool
+                    elif scenario.pool_mode in (
                         PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
                         PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
                     ):
                         # Nested pool modes verify that entering a second
                         # WorkerPool context doesn't break the outer pool.
-                        # Dispatch still goes through the outer pool.
+                        # The inner pool stays entered while the test body
+                        # runs, and entering a pool makes its proxy the
+                        # ambient one, so the body's dispatches route
+                        # through the inner pool — the outer pool's job
+                        # here is to still be usable on the way out.
                         nested_size = (
                             2
                             if scenario.pool_mode
@@ -673,7 +701,7 @@ async def build_pool_from_scenario(
                             else 1
                         )
                         nested_pool = WorkerPool(
-                            size=nested_size,
+                            spawn=nested_size,
                             credentials=creds,
                             worker=partial(LocalWorker, options=options),
                         )
@@ -1282,6 +1310,23 @@ _NESTED_ONLY_PATTERNS = (
 # aclose scripts and the single-yield shape do not, so the pattern is
 # constrained to ASYNC_GEN_ANEXT.
 _MID_STREAM_FORWARD_SHAPES = (RoutineShape.ASYNC_GEN_ANEXT,)
+# The two halves of the D2/D3 constraint, hoisted so ``_pairwise_filter``
+# and ``scenarios_strategy`` read them from one place: a pool mode added
+# to one list and forgotten in the other would let the strategy generate
+# rows the pairwise array rejects (or the reverse).
+_DISCOVERY_REQUIRED_POOL_MODES = (
+    PoolMode.HYBRID,
+    PoolMode.DURABLE_JOINED,
+)
+_DISCOVERY_FORBIDDEN_POOL_MODES = (
+    PoolMode.DEFAULT,
+    PoolMode.EPHEMERAL,
+    PoolMode.DURABLE,
+    PoolMode.DURABLE_SHARED,
+    PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
+    PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
+    PoolMode.NESTED_RETIRED_IN_EPHEMERAL,
+)
 
 
 def _is_grpc_internal(exc: BaseException) -> bool:
@@ -1323,18 +1368,8 @@ def _pairwise_filter(row):
     if len(row) > 2:
         pool_mode = row[1]
         discovery = row[2]
-        needs_discovery = pool_mode in (
-            PoolMode.HYBRID,
-            PoolMode.DURABLE_JOINED,
-        )
-        forbids_discovery = pool_mode in (
-            PoolMode.DEFAULT,
-            PoolMode.EPHEMERAL,
-            PoolMode.DURABLE,
-            PoolMode.DURABLE_SHARED,
-            PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
-            PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
-        )
+        needs_discovery = pool_mode in _DISCOVERY_REQUIRED_POOL_MODES
+        forbids_discovery = pool_mode in _DISCOVERY_FORBIDDEN_POOL_MODES
         if needs_discovery and discovery is DiscoveryFactory.NONE:
             return False
         if forbids_discovery and discovery is not DiscoveryFactory.NONE:
@@ -1520,18 +1555,8 @@ def scenarios_strategy(draw):
     shape = draw(st.sampled_from(RoutineShape))
     pool_mode = draw(st.sampled_from(PoolMode))
 
-    needs_discovery = pool_mode in (
-        PoolMode.HYBRID,
-        PoolMode.DURABLE_JOINED,
-    )
-    forbids_discovery = pool_mode in (
-        PoolMode.DEFAULT,
-        PoolMode.EPHEMERAL,
-        PoolMode.DURABLE,
-        PoolMode.DURABLE_SHARED,
-        PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
-        PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
-    )
+    needs_discovery = pool_mode in _DISCOVERY_REQUIRED_POOL_MODES
+    forbids_discovery = pool_mode in _DISCOVERY_FORBIDDEN_POOL_MODES
 
     if pool_mode is PoolMode.DURABLE_JOINED:
         discovery = draw(st.sampled_from(list(_LOCAL_FACTORIES)))
@@ -1665,6 +1690,38 @@ def credentials_map(test_certificates):
     }
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _channel_pool_gate(request):
+    """Fail a test that leaves a gRPC channel cached on its loop.
+
+    Every construct that opens a channel — a pool, a proxy, a bare
+    `WorkerConnection` — owns closing it, so a test that ends with
+    channels still cached on its loop has stranded one, for a later
+    test's pool operation to report (see
+    `~wool.runtime.resourcepool.ResourcePool`). The gate makes that a
+    failure of the test that caused it rather than a warning attributed
+    to whichever test runs next, and it stands down for a test that
+    already failed in setup or in its body, whose leftovers are a
+    symptom rather than a second finding. Both pools are read: a hold
+    outlives the channels it kept warm, so a test that strands one
+    passes a channel-only check. The clearing itself belongs to the root
+    ``_clear_channel_pool`` fixture, whose teardown runs after this one
+    and covers holds as well as channels, so one leak does not cascade
+    into the rest of the suite.
+    """
+    yield
+    reports = [
+        getattr(request.node, f"rep_{phase}", None) for phase in ("setup", "call")
+    ]
+    if all(report is not None and report.passed for report in reports):
+        await poll_until_channel_pool_settles()
+        # The holds too: a test that strands a hold with no channel
+        # behind it leaves counters the channel read cannot show, and
+        # the discard would report it against whichever test closed the
+        # loop next.
+        await poll_until_channel_pool_settles(get=channel_pool_hold_stats)
+
+
 # Integration tests rely on pytest-asyncio's Task-per-test scoping
 # for ContextVar isolation: each async test runs inside an
 # asyncio.Task whose ``contextvars.Context`` is a copy, so
@@ -1675,6 +1732,35 @@ def credentials_map(test_certificates):
 # autouse cleanup. (The previous sync ``_clear_proxy_context``
 # autouse fixture mutated the pytest main Chain, which async test
 # tasks never observe; it was load-bearing in appearance only.)
+
+
+async def _stop_all(workers) -> None:
+    """Stop every worker, kill what will not stop, and re-raise the first failure.
+
+    Shared by the fixtures that own worker processes. Every worker is
+    given its stop even when an earlier one raised: a raise that ends
+    the loop would leave the rest running for the remainder of the
+    session. A worker that was never started is the one expected
+    refusal and is passed over; any other failure is recorded after its
+    process has been killed, so a teardown that fails cannot leak a
+    worker either, and the first one is re-raised once every worker has
+    been dealt with — the shape `background_loops` uses in the unit
+    suite.
+    """
+    failures: list[BaseException] = []
+    for worker in workers:
+        pid = worker.metadata.pid if worker.metadata is not None else None
+        try:
+            await worker.stop()
+        except RuntimeError as error:
+            if "has not been started" not in str(error):
+                failures.append(error)
+                _ensure_killed(pid)
+        except Exception as error:
+            failures.append(error)
+            _ensure_killed(pid)
+    if failures:
+        raise failures[0]
 
 
 @pytest_asyncio.fixture
@@ -1695,8 +1781,7 @@ async def started_worker():
         return worker
 
     yield start
-    for worker in workers:
-        await worker.stop()
+    await _stop_all(workers)
 
 
 @pytest_asyncio.fixture
@@ -1742,12 +1827,8 @@ async def worker_update_pool(request) -> AsyncIterator[tuple]:
                     with suppress(KeyError):
                         await publisher.publish("worker-dropped", worker_a.metadata)
     finally:
-        # ``LocalWorker.stop`` raises on an already-stopped worker, so
-        # the teardown absorbs that here rather than making every test
-        # carry a "did I stop it?" flag.
-        for worker in (worker_b, worker_a):
-            with suppress(RuntimeError):
-                await worker.stop()
+        # Stopping a worker a test already stopped -- see `_stop_all`.
+        await _stop_all((worker_b, worker_a))
 
 
 @pytest.fixture
@@ -1764,6 +1845,28 @@ def retry_grpc_internal():
     PollerCompletionQueue thundering-herd race. All other exceptions
     propagate immediately. If retries are exhausted the last
     exception propagates as a real test failure.
+
+    .. rubric:: Implementation notes
+
+    This stands in for the Python Test Guide's ``_KnownBug`` dataclass
+    and ``xfail_known_bugs`` fixture, deliberately and with two
+    departures: it carries no ``match`` predicate, so it applies to
+    every scenario rather than the ones a bug is known to reach, and it
+    re-raises on exhaustion instead of calling ``pytest.xfail``, so an
+    exhausted retry is a failure rather than an expected one. Both
+    follow from the bug it absorbs — the grpcio PollerCompletionQueue
+    thundering-herd race is scenario-independent, and a run that cannot
+    get past it in three attempts is worth failing on. Reshaping this
+    into the structured form is a larger change than the suite that
+    uses it.
+
+    One pairwise failure remains uncharacterised: a single
+    ``LOCAL_CAPACITY_BOUNDED`` combination failed once in five full runs
+    and reproduced on none of them. Only ``StatusCode.INTERNAL`` is
+    absorbed here, so a transient ``UNAVAILABLE`` or a
+    `DiscoveryCapacityExhausted` from the tightest-capacity scenario
+    would fail outright. It wants a traceback off CI before it becomes
+    a structured entry rather than a guess.
     """
 
     async def run(body):
@@ -1786,6 +1889,51 @@ def retry_grpc_internal():
                 raise
 
     return run
+
+
+#: The prefix a worker's log record opens with -- see
+#: `wool.runtime.worker.process.WorkerProcess.run` for the format.
+_WORKER_RECORD = re.compile(r"^\S+ \S+ - WORKER\[(\d+)\] - ")
+
+
+@pytest.fixture
+def worker_log(capfd, request):
+    """Read what the spawned worker processes wrote to stderr.
+
+    Returns a callable ``read(pid=None)`` that drains pytest's
+    file-descriptor capture and returns it as text, narrowed to the
+    records one worker emitted when a pid is given: a worker configures
+    logging with a ``WORKER[<pid>]`` prefix on the stderr it inherits
+    (see `wool.runtime.worker.process.WorkerProcess.run`), so a record's
+    continuation lines — a traceback's, say — are kept with the prefixed
+    line that opened them, and a line that opens another worker's record
+    ends the one being kept. Only fd capture sees that stream: ``caplog``
+    never does, and under ``-s`` there is no capture at all and every
+    read returns the empty string. A read drains what has accumulated so
+    far, so a caller reads once — after the worker has exited or after
+    awaiting the RPC whose log it is asserting on — and keeps the text.
+    """
+
+    def read(pid=None):
+        captured = capfd.readouterr().err
+        if pid is None:
+            return captured
+        lines = []
+        keeping = False
+        for line in captured.splitlines(keepends=True):
+            record = _WORKER_RECORD.match(line)
+            if record is not None:
+                keeping = int(record.group(1)) == pid
+            if keeping:
+                lines.append(line)
+        return "".join(lines)
+
+    # Under ``-s`` there is no capture and every read is empty, which
+    # would fail an assertion anchored on a worker's output for a reason
+    # that has nothing to do with the behaviour under test -- and ``-s``
+    # is what someone reaches for to debug these very tests.
+    read.capturing = request.config.getoption("capture") != "no"
+    return read
 
 
 def _pid_alive(pid: int) -> bool:

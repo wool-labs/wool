@@ -216,7 +216,7 @@ class TestVersionInterceptor:
         Given:
             A :class:`VersionInterceptor` and a first request whose
             ``TaskEnvelope.version`` is a non-empty unparseable
-            string (e.g. ``"not-a-version"``)
+            string (e.g., ``"not-a-version"``)
         When:
             The caller writes the first request
         Then:
@@ -253,7 +253,7 @@ class TestVersionInterceptor:
         Given:
             A :class:`VersionInterceptor` and a first request whose
             ``TaskEnvelope.version`` is parseable but on a different
-            major (e.g. ``"99.0.0"`` against the worker's
+            major (e.g., ``"99.0.0"`` against the worker's
             ``protocol.__version__``)
         When:
             The caller writes the first request

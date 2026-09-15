@@ -277,7 +277,7 @@ class WorkerConnection:
     belongs to the pool, which reaps a channel by refcount and TTL once
     no handle is using it, or sooner when the loop's last
     `channel_pool_hold` is released. Discarding a connection therefore
-    does not close its channel, and a loop that stops before the pool
+    does not close its channel, and a loop that closes before the pool
     reaps it strands the channel, which `ResourcePool` reports; entering
     the connection as an async context manager, or calling `close`,
     retires this connection's keys first — see `close` — and leaves the
@@ -291,6 +291,16 @@ class WorkerConnection:
     is swallowed at `Exception` (not `BaseException`) —
     cleanup-during-cleanup should let ``KeyboardInterrupt`` propagate
     rather than silently drop a process-level signal.
+
+    **Loop scope.** A connection may be used from any number of event
+    loops. Each loop that dispatches through it opens a channel of its
+    own in its own partition of the channel pool (see
+    `~wool.runtime.resourcepool.ResourcePool`), and `close` retires the
+    calling loop's keys alone, so a connection used on several loops is
+    closed on each of them. The keys themselves are recorded per
+    connection, not per loop: a rotation observed on one loop retires
+    the superseded key's channel on that loop, and another loop's
+    channel for it idles out on the pool's TTL.
 
     :param target:
         Worker URI. Supports multiple formats:
@@ -610,7 +620,8 @@ class WorkerConnection:
         multiple times or on connections that were never used. Channels
         for credentials superseded by rotation are already expired by
         the dispatch that observed the new material, so only the retained
-        keys need retiring here.
+        keys need retiring here. The keys are retired on the calling
+        loop — see the class docstring for the loop scope.
         """
         if self._key is not None:
             await _channel_pool.expire(self._key)
@@ -912,16 +923,17 @@ async def _channel_finalizer(channel: _Channel):
     await channel.close()
 
 
-# One pool for the whole process, so every handle to the same worker
-# shares a channel. Retirement: see `channel_pool_hold` and
-# `WorkerConnection.close`. What a stopped loop strands: see `ResourcePool`.
+# One pool for the whole process, partitioned by event loop, so every
+# handle to the same worker on a loop shares a channel. Retirement: see
+# `channel_pool_hold` and `WorkerConnection.close`. What a closed loop
+# strands: see `ResourcePool`.
 _channel_pool: ResourcePool[_Channel] = ResourcePool(
     factory=_channel_factory, finalizer=_channel_finalizer, ttl=60
 )
 
 
 def channel_pool_stats() -> ResourcePool.Stats:
-    """Report what the process-wide channel pool currently holds.
+    """Report what the channel pool holds for the calling event loop.
 
     Counts cached channels, how many are referenced by an in-flight
     dispatch, and how many are awaiting their idle finalization. A
@@ -931,13 +943,18 @@ def channel_pool_stats() -> ResourcePool.Stats:
     dispatch whose teardown was detached (see `_complete_teardown`) may
     not release its reference until well after the cancel, if at all.
 
+    A read: it reports zeros for a loop that has cached nothing,
+    discards no partition, and logs nothing — see `ResourcePool.stats`.
+
     :returns:
-        A snapshot of the pool's counters at the moment of the call.
+        A snapshot of the loop's counters at the moment of the call.
+    :raises RuntimeError:
+        If there is no running event loop; see `ResourcePool.stats`.
     """
     return _channel_pool.stats
 
 
-# A def rather than a lambda so a stranded hold's rebind record names this
+# A def rather than a lambda so a stranded hold's discard record names this
 # pool by qualname — see ResourcePool.
 def _channel_pool_hold_factory(key: Any) -> None:
     """Return the inert entry behind a hold."""
@@ -953,18 +970,59 @@ _channel_pool_holds: ResourcePool[None] = ResourcePool(
 )
 
 
-async def clear_channel_pool() -> None:
-    """Close and clear every gRPC channel in the process-wide pool.
+async def clear_channel_pool(*, deadline: float | None = None) -> None:
+    """Close and clear every gRPC channel the calling event loop cached.
 
-    The teardown primitive: runs `ResourcePool.clear` over the channel
-    pool, across every pool key, including UDS targets. Holds are not
-    dropped: each is released by its holder, and a hold a loop strands
-    is reported by `ResourcePool` at the next rebind. To retire while
-    the loop keeps dispatching, exit or close a `WorkerConnection` for
-    its own keys, or let the last `channel_pool_hold` release retire the
+    The teardown primitive: drops every `channel_pool_hold` the calling
+    loop still has open, then runs `ResourcePool.clear` over the calling
+    loop's partition of the channel pool, across every pool key,
+    including UDS targets; holds and channels another loop cached are
+    left to that loop. The holds go first so a hold a component left
+    open retires the loop's channels drain-first, as its own release
+    would have, before the clear force-closes whatever remains; the
+    clear runs even if dropping the holds raises. A holder whose hold
+    the clear dropped releases nothing when it exits, and a hold taken
+    after the clear counts on its own (see
+    `~wool.runtime.resourcepool.Resource`). To retire while the
+    loop keeps dispatching, exit or close a `WorkerConnection` for its
+    own keys, or let the last `channel_pool_hold` release retire the
     loop's channels drain-first.
+
+    :param deadline:
+        When the teardown must be done, on the running loop's clock —
+        see `ResourcePool.clear`. Both pools are held to the same one,
+        the holds having little to do beyond retiring what the channel
+        clear then closes. ``None``, the default, is unbounded.
+    :raises TimeoutError:
+        As `ResourcePool.clear`, from either pool.
+    :raises BaseException:
+        As `ResourcePool.clear`, from either pool.
     """
-    await _channel_pool.clear()
+    try:
+        await _channel_pool_holds.clear(deadline=deadline)
+    finally:
+        await _channel_pool.clear(deadline=deadline)
+
+
+def channel_pool_hold_stats() -> ResourcePool.Stats:
+    """Report what the calling loop's holds on the channel pool amount to.
+
+    The counterpart to `channel_pool_stats` for the pool behind
+    `channel_pool_hold`: ``referenced_entries`` is one while any hold is
+    open on the loop and zero otherwise, so a caller, e.g., a test
+    asserting a loop settled, can tell a loop that has released its
+    holds from one that stranded a holder, which the channel counters
+    alone
+    cannot show once the channels themselves are gone.
+
+    A read, as `channel_pool_stats` is.
+
+    :returns:
+        A snapshot of the loop's hold counters at the moment of the call.
+    :raises RuntimeError:
+        If there is no running event loop; see `ResourcePool.stats`.
+    """
+    return _channel_pool_holds.stats
 
 
 def channel_pool_hold() -> AsyncContextManager[None]:
@@ -991,8 +1049,8 @@ def channel_pool_hold() -> AsyncContextManager[None]:
     retires the channel pool: a reference count that finalizes on the
     last release is exactly what `ResourcePool` already is, so composing
     it avoids a second counter that would have to reproduce the same
-    rules — and, because both pools bind by loop the same way, a hold
-    can never outlive the channels it governs. ``ttl=0`` makes the final
+    per-loop rules — and, because both pools partition by loop the same
+    way, a hold can never outlive the channels it governs. ``ttl=0`` makes the final
     release retire the channels inline rather than after a grace period.
     Retirement is `ResourcePool.expire_all` rather than
     `ResourcePool.clear` because the loop keeps running: a dispatch whose
