@@ -22,11 +22,13 @@ Wool ships with two discovery protocols — `LocalDiscovery` and `LanDiscovery`.
 
 `LocalDiscovery`
 
-Shared-memory IPC for single-machine pools. This is the default when you create an ephemeral `WorkerPool` without specifying a discovery protocol. No network, no configuration — workers and subscribers communicate through a shared memory region identified by a namespace string. File-based locking ensures consistency across processes.
+Shared-memory IPC for single-machine pools, and the default for a `WorkerPool` created without a discovery protocol. Processes on one host share a registry of workers identified by a namespace string, with no network and no configuration.
+
+A namespace has exactly one **owner**, the entered `LocalDiscovery` instance that created its registry. `LocalDiscovery.Publisher` and `LocalDiscovery.Subscriber` **borrow** that registry, and a borrower that outlives its owner is **orphaned**. The `LocalDiscovery` docstring defines the three roles and the errors each one raises.
 
 `LanDiscovery`
 
-Zeroconf DNS-SD (`_wool._tcp.local.`) for network-wide discovery. Workers are advertised as DNS-SD service records on the local network. Subscribers browse for these services and receive events as workers come and go. No central coordinator required.
+Zeroconf DNS-SD (`_wool._tcp.local.`) for network-wide discovery. Workers are advertised as DNS-SD service records on the local network, and subscribers browse for these services and receive events as workers come and go. A service type has no owner, so any number of pools publish and subscribe on it concurrently.
 
 Both protocols optionally accept a filter predicate for targeted subscriptions.
 
@@ -34,7 +36,7 @@ Both protocols optionally accept a filter predicate for targeted subscriptions.
 
 Wool supports custom discovery protocols via structural subtyping.
 
-`WorkerPool` accepts a `DiscoveryLike` instance or any `Factory` form for its `discovery` parameter — see `Factory` for the forms and `resolved` for how one is entered. This means you can pass a discovery instance directly, wrap it in a context manager for lifecycle management, or provide a factory callable — `WorkerPool` will manage it appropriately.
+`WorkerPool` accepts any `DiscoveryLike`, and a durable pool also accepts a bare `DiscoverySubscriberLike`, as an instance or any `Factory` form; see `WorkerPool`'s `discovery` parameter and `resolved`.
 
 ### `DiscoveryLike` protocol
 
@@ -57,6 +59,7 @@ class DiscoveryLike(Protocol):
 
 ```python
 bind_host: str
+
 
 async def publish(self, type: DiscoveryEventType, metadata: WorkerMetadata) -> None: ...
 ```
@@ -111,13 +114,13 @@ async def redis_discovery():
 
 ### Durable pool
 
-Connect to workers that are already running. No workers are spawned by the pool itself:
+Connect to workers that are already running. The pool spawns no workers and publishes nothing, so it accepts a bare subscriber. With `LocalDiscovery`, this is how a process borrows a namespace another process owns:
 
 ```python
 import wool
 
-# Local
-async with wool.WorkerPool(discovery=wool.LocalDiscovery("my-namespace")):
+# Local: borrow the registry of whichever instance owns "my-namespace"
+async with wool.WorkerPool(discovery=wool.LocalDiscovery.Subscriber("my-namespace")):
     result = await my_routine()
 
 # LAN
@@ -127,13 +130,12 @@ async with wool.WorkerPool(discovery=wool.LanDiscovery()):
 
 ### Hybrid pool
 
-Spawn local workers **and** discover existing workers through the same
-protocol. Spawned workers are published and made available to other clients:
+Spawn local workers and admit workers that other processes publish through the same protocol. The pool publishes its workers, so it needs a full `DiscoveryLike`. With `LocalDiscovery`, the pool owns the namespace and other processes borrow it:
 
 ```python
 import wool
 
-# Local
+# Local: owns "my-namespace" for the life of the block
 async with wool.WorkerPool(spawn=4, discovery=wool.LocalDiscovery("my-namespace")):
     result = await my_routine()
 
