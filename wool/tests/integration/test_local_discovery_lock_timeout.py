@@ -11,13 +11,12 @@ attempt and ``lock_timeout`` never fires — is already exercised through
 every HYBRID pairwise row with the default ``lock_timeout=30.0``, so a new
 `DiscoveryFactory` member would add no observable coverage.
 
-Genuine cross-process contention also requires a distinct interpreter: on
-POSIX, `fcntl`/`portalocker` advisory locks are per-process, so a second
-acquisition inside this process would not conflict. The `_HOLDER_SCRIPT`
+The lock holder runs in a distinct interpreter, so the contention these
+tests exercise crosses a process boundary. The `_HOLDER_SCRIPT`
 subprocess acquires the lock through the production `_lock` context manager
 itself, guaranteeing the same lock-file path (`_short_hash`) and mechanism
 (``portalocker.LOCK_EX | LOCK_NB``) the publisher waits on. Driving the
-private `_lock` this way is a deliberate exception to Test Guide §2's
+private `_lock` this way is a deliberate exception to the Test Guide's
 "no private references" rule: it is a cross-process harness to establish a
 genuinely held lock — no public API holds the discovery lock open across a
 wait — while every assertion targets public behavior, and reconstructing
@@ -46,10 +45,9 @@ from .conftest import _pid_alive
 from .conftest import release_subprocess
 from .conftest import spawn_script_subprocess
 
-# Acquire the namespace's discovery lock in a separate interpreter and hold
-# it until released via stdin. Uses the production `_lock` so the held lock
-# is byte-for-byte the one a publisher contends — a same-process holder
-# cannot conflict on POSIX advisory locks.
+# Hold the namespace's discovery lock in a separate interpreter until
+# released via stdin, through the production `_lock` so the held lock is
+# the one a publisher contends.
 _HOLDER_SCRIPT = """
 import asyncio
 import sys
@@ -75,8 +73,10 @@ class TestCrossProcessLockTimeout:
         """Test a cross-process lock holder surfaces as a bounded TimeoutError.
 
         Given:
-            An independent subprocess holding the namespace's discovery
-            lock, and a Publisher with a one-second lock_timeout
+            An owner holding the namespace's registry, an independent
+            subprocess holding that namespace's discovery lock, and a
+            Publisher borrowing the registry with a one-second
+            lock_timeout
         When:
             The publisher publishes a worker while the holder still holds
             the lock
@@ -96,17 +96,19 @@ class TestCrossProcessLockTimeout:
         lock_timeout = 1.0
         holder = spawn_script_subprocess(_HOLDER_SCRIPT, namespace, ready_line="locked")
 
-        # Act & assert
+        # Act & assert — an owner holds the registry the publisher
+        # borrows, so what the publish contends is the lock alone.
         try:
             publisher = LocalDiscovery.Publisher(namespace, lock_timeout=lock_timeout)
-            async with publisher:
-                start = time.monotonic()
-                with pytest.raises(TimeoutError):
-                    await asyncio.wait_for(
-                        publisher.publish("worker-added", metadata),
-                        timeout=lock_timeout + 5,
-                    )
-                elapsed = time.monotonic() - start
+            with LocalDiscovery(namespace):
+                async with publisher:
+                    start = time.monotonic()
+                    with pytest.raises(TimeoutError):
+                        await asyncio.wait_for(
+                            publisher.publish("worker-added", metadata),
+                            timeout=lock_timeout + 5,
+                        )
+                    elapsed = time.monotonic() - start
 
             # Bounded, not instant and not forever: it genuinely waited on
             # the contended lock (≥ half the timeout) and returned well
@@ -127,15 +129,17 @@ class TestPoolTeardownLockTimeout:
 
         Given:
             A hybrid WorkerPool with a one-second discovery lock_timeout and
-            shutdown_timeout=None that has entered and dispatched a routine,
-            then an independent subprocess that wedges the discovery lock
+            shutdown_timeout=None, so teardown runs against no deadline
+            and nothing is cancelled, that has entered and dispatched a
+            routine, then an independent subprocess that wedges the
+            discovery lock
         When:
             The pool exits so its worker-dropped announcement contends the
             wedged lock
         Then:
-            It should bound teardown by the lock timeout instead of hanging
-            forever, log that it could not announce the worker, and still
-            reap the worker process.
+            It should bound teardown by the lock timeout, log that it
+            could not announce the worker with a TimeoutError and without
+            logging a stop timeout, and still reap the worker process.
         """
         # Arrange
         namespace = f"lock-teardown-{uuid.uuid4().hex[:12]}"
@@ -175,10 +179,21 @@ class TestPoolTeardownLockTimeout:
             assert spawned
             for pid in spawned:
                 assert not _pid_alive(pid)
-            # Vacuity guard — the drop genuinely failed against the wedged
-            # lock, so the reap is not satisfied by a drop that succeeded.
-            assert any(
-                "could not announce" in record.getMessage() for record in caplog.records
+            # Vacuity guard — the drop failed against the wedged lock, so
+            # the reap is not satisfied by a drop that succeeded.
+            announce_failures = [
+                record
+                for record in caplog.records
+                if "could not announce" in record.getMessage()
+            ]
+            assert announce_failures
+            for record in announce_failures:
+                assert record.exc_info is not None
+                assert isinstance(record.exc_info[1], TimeoutError)
+            # The publish TimeoutError is logged as an announcement failure
+            # and never as a worker that would not stop.
+            assert not any(
+                "stopped waiting" in record.getMessage() for record in caplog.records
             )
         finally:
             release_subprocess(holder)

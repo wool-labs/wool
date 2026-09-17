@@ -20,21 +20,21 @@ These tests are behavioral evidence, not coverage.
 import subprocess
 import sys
 import uuid
-from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.discovery.local import _attach
 from wool.runtime.discovery.local import _short_hash
 
 from .conftest import _TIMEOUT
 
-#: Announce, re-announce, update, and drop workers on a namespace this
-#: interpreter owns, so the same segments are attached repeatedly and
-#: then unlinked by their creator — the sequence that faults. ``mode``
-#: selects the attach path; "legacy" forces the branch interpreters
-#: below 3.13 take, which is otherwise unreachable on 3.13.
-_PUBLISH_SCRIPT = """
+#: Shared prelude for the interpreter scripts below. ``mode`` selects the
+#: attach path; "legacy" forces the branch interpreters below 3.13 take,
+#: which is otherwise unreachable on 3.13. The path that ran is reported
+#: from the constructor's arguments, since only the native path passes
+#: ``track``.
+_SCRIPT_PRELUDE = """
 import asyncio
 import sys
 import uuid
@@ -48,9 +48,6 @@ mode, namespace = sys.argv[1:3]
 if mode == "legacy":
     local.sys = SimpleNamespace(version_info=(3, 12, 0, "final", 0))
 
-# Report the path that actually ran, observed from the constructor's
-# arguments rather than by re-reading the version the override set:
-# only the modern path passes ``track``.
 _mapping = local.SharedMemory
 _paths = set()
 
@@ -62,7 +59,14 @@ def _observing(*args, **kwargs):
 
 
 local.SharedMemory = _observing
+"""
 
+#: Announce, re-announce, update, and drop workers on a namespace this
+#: interpreter owns, so the same segments are attached repeatedly and
+#: then unlinked by their creator — the sequence that faults.
+_PUBLISH_SCRIPT = (
+    _SCRIPT_PRELUDE
+    + """
 
 async def main():
     workers = [
@@ -89,29 +93,56 @@ asyncio.run(main())
 print("path=" + ",".join(sorted(_paths)), flush=True)
 print("done", flush=True)
 """
+)
 
-#: Attach to a namespace this interpreter does not own, then exit. The
+#: Bind a borrowing publisher to a namespace this interpreter does not
+#: own, then exit. The
 #: creating process must still find its segment afterwards: only a creator
 #: may unlink, and a tracked attach would have this process's tracker do it
 #: on the way out (bpo-38119).
-_ATTACHER_SCRIPT = """
-import sys
-from types import SimpleNamespace
+_ATTACHER_SCRIPT = (
+    _SCRIPT_PRELUDE
+    + """
 
-import wool.runtime.discovery.local as local
-from wool.runtime.discovery.local import LocalDiscovery
+async def main():
+    async with LocalDiscovery.Publisher(namespace):
+        print("attached", flush=True)
 
-mode, namespace = sys.argv[1:3]
-if mode == "legacy":
-    local.sys = SimpleNamespace(version_info=(3, 12, 0, "final", 0))
 
-with LocalDiscovery(namespace):
-    print("attached", flush=True)
+asyncio.run(main())
+print("path=" + ",".join(sorted(_paths)), flush=True)
 print("done", flush=True)
 """
+)
 
-#: The superseded pattern, in pure standard library: attach to a segment
-#: this interpreter created, undo the attach's registration, then unlink.
+#: Publish through a borrowing publisher, then read it back through a
+#: borrowing subscriber, which holds the owner's registry mapped for the
+#: whole iteration — the mapping that must stay untracked in a process
+#: that did not create it.
+_SUBSCRIBER_SCRIPT = (
+    _SCRIPT_PRELUDE
+    + """
+
+async def main():
+    worker = WorkerMetadata(
+        uid=uuid.uuid4(), address="localhost:50051", pid=1, version="1.0"
+    )
+    async with LocalDiscovery.Publisher(namespace) as publisher:
+        await publisher.publish("worker-added", worker)
+        async for event in LocalDiscovery.Subscriber(namespace, poll_interval=0.05):
+            print("discovered %s" % event.type, flush=True)
+            break
+        await publisher.publish("worker-dropped", worker)
+
+
+asyncio.run(main())
+print("path=" + ",".join(sorted(_paths)), flush=True)
+print("done", flush=True)
+"""
+)
+
+#: In pure standard library, attach to a segment this interpreter
+#: created, undo the attach's registration, then unlink.
 #: Deliberately independent of `wool`, so it keeps reproducing the fault
 #: however ``local.py`` is later refactored.
 _SUPERSEDED_SCRIPT = """
@@ -165,9 +196,7 @@ class TestCrossProcessTracker:
             It announces, re-announces, updates, and drops three workers,
             then exits so its resource tracker drains.
         Then:
-            It should exit 0 with no tracker traceback on stderr — the
-            failure no exit code reflects. Below 3.13 the unforced case
-            exercises the reported conditions with nothing simulated.
+            It should exit 0 with no tracker traceback on stderr.
         """
         # Act
         result = _run(_PUBLISH_SCRIPT, mode, f"tracker-{uuid.uuid4().hex[:12]}")
@@ -182,19 +211,19 @@ class TestCrossProcessTracker:
         assert "resource_tracker" not in result.stderr, result.stderr
 
     @pytest.mark.parametrize("mode", ["legacy", "native"])
-    def test___enter___should_keep_the_segment_when_an_attacher_exits(self, mode):
-        """Test a non-owner's exit leaves the owner's segment mapped.
+    def test___aexit___should_keep_the_segment_when_a_borrower_exits(self, mode):
+        """Test a borrower's exit leaves the owner's segment mapped.
 
         Given:
-            A namespace this process created, and an independent
-            interpreter that enters and leaves it as a non-owner on either
-            attach path.
+            A namespace this process owns, and an independent
+            interpreter that binds and releases a borrowing publisher on
+            it via either attach path.
         When:
             That interpreter exits and its resource tracker drains.
         Then:
             It should leave the segment mapped and warn about no leak —
             only the process that created a segment may unlink it, and a
-            tracked attach would have the attacher reclaim it instead
+            tracked attach would have the borrower reclaim it instead
             (bpo-38119).
         """
         # Arrange
@@ -210,15 +239,48 @@ class TestCrossProcessTracker:
             assert "attached" in result.stdout, result.stdout
             assert "leaked shared_memory" not in result.stderr, result.stderr
             assert "KeyError" not in result.stderr, result.stderr
-            SharedMemory(name=_short_hash(namespace)).close()
+            # Probe through `_attach` so this assertion leaves the
+            # tracker untouched.
+            _attach(_short_hash(namespace)).close()
 
-    def test_unregister_should_emit_tracker_output_when_an_attach_undoes_it(self):
-        """Test the superseded pattern still faults, so silence means something.
+    @pytest.mark.parametrize("mode", ["legacy", "native"])
+    def test___aiter___should_keep_the_segment_when_a_subscriber_exits(self, mode):
+        """Test a borrowing subscriber's exit leaves the owner's segment.
 
         Given:
-            An independent interpreter reproducing the pattern this fix
-            replaced — attach, undo the attach's registration, unlink —
-            against a segment it created itself.
+            A namespace this process owns, and an independent
+            interpreter that publishes a worker through a borrowing
+            Publisher and iterates a borrowing Subscriber to its first
+            event via either attach path.
+        When:
+            That interpreter exits and its resource tracker drains.
+        Then:
+            It should leave the owner's segment in place with no
+            tracker complaint.
+        """
+        # Arrange
+        namespace = f"tracker-sub-{uuid.uuid4().hex[:12]}"
+
+        # Act
+        with LocalDiscovery(namespace):
+            result = _run(_SUBSCRIBER_SCRIPT, mode, namespace)
+
+            # Assert — the owner is still inside its context, so the
+            # segment must still be there for it to map.
+            assert result.returncode == 0, result.stderr
+            assert "discovered" in result.stdout, result.stdout
+            if mode == "legacy":
+                assert "path=legacy" in result.stdout, result.stdout
+            assert "leaked shared_memory" not in result.stderr, result.stderr
+            assert "KeyError" not in result.stderr, result.stderr
+            _attach(_short_hash(namespace)).close()
+
+    def test_unregister_should_emit_tracker_output_when_an_attach_undoes_it(self):
+        """Test an attach that undoes its registration faults the tracker.
+
+        Given:
+            An independent interpreter that attaches to a segment it
+            created, undoes the attach's registration, and unlinks it.
         When:
             It runs to completion and its resource tracker drains.
         Then:

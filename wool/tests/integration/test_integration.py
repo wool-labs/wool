@@ -3,6 +3,7 @@
 import asyncio
 import contextvars
 import os
+from dataclasses import replace
 
 import pytest
 from hypothesis import HealthCheck
@@ -126,20 +127,25 @@ def test_pairwise_scenarios_should_partition_pool_modes_by_discovery():
         HealthCheck.too_slow,
     ],
 )
+@example(
+    scenario=replace(
+        default_scenario(pool_mode=PoolMode.DURABLE_BORROWED),
+        discovery=DiscoveryFactory.LOCAL_SYNC_CM,
+    )
+)
 @given(scenario=scenarios_strategy())
 def test_scenarios_strategy_should_agree_with_the_covering_array(scenario):
-    """Test drawn scenarios match the covering array's discovery partition.
+    """Test drawn scenarios match the covering array's discovery coverage.
 
     Given:
         Any scenario drawn from the Hypothesis strategy.
     When:
-        Its completeness and its discovery value are compared against
-        the pool mode's classification in the covering array.
+        Its completeness and its (pool mode, discovery) pair are checked
+        against the covering array.
     Then:
-        It should be complete, and it should use NONE discovery for
-        exactly the pool modes the array pairs with NONE — the
-        strategy and the array encode the same constraint and must not
-        drift apart.
+        It should be complete, use NONE discovery for exactly the pool
+        modes the array pairs with NONE, and draw only pairs the array
+        contains.
     """
     # Arrange
     classified = _discovery_by_pool_mode()
@@ -152,6 +158,7 @@ def test_scenarios_strategy_should_agree_with_the_covering_array(scenario):
     assert discovery_is_none == (
         classified[scenario.pool_mode] == {DiscoveryFactory.NONE}
     )
+    assert scenario.discovery in classified[scenario.pool_mode]
 
 
 @pytest.mark.integration
