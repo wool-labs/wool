@@ -5,7 +5,7 @@ Rapid same-namespace teardown and respawn with overlapping pool
 lifecycles cannot be expressed through ``build_pool_from_scenario``'s
 single-yield nested-context contract, and the cross-process cases need
 an independent interpreter to claim a namespace, or to remove the
-shared segment out from under a live owner. Unit-level simulations of
+registry out from under a live owner. Unit-level simulations of
 the same contracts live in ``tests/runtime/discovery/test_local.py``.
 """
 
@@ -14,16 +14,17 @@ import contextlib
 import logging
 import multiprocessing
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import time
 import uuid
-from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 
 import pytest
 
+from tests.helpers import namespace_directory
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.local import LocalDiscovery
@@ -55,17 +56,13 @@ print("clean-exit", flush=True)
 """
 
 _ATTACHER_SCRIPT = """
+import os
 import sys
 
-from multiprocessing.shared_memory import SharedMemory
-
-from wool.runtime.discovery.local import _short_hash
-
-# Remove the owner's segment out from under it. The tests need only
-# that the segment vanishes externally.
-segment = SharedMemory(name=_short_hash(sys.argv[1]), create=False)
-segment.close()
-segment.unlink()
+# Remove the owner's registry out from under it. The tests need only
+# that it vanishes externally, so the path is passed in rather than
+# derived here.
+os.unlink(sys.argv[1])
 print("unlinked", flush=True)
 """
 
@@ -117,7 +114,35 @@ try:
     with LocalDiscovery(namespace):
         print("claimed", flush=True)
 except DiscoveryNamespaceInUse as error:
-    print(f"rejected {error.segment} {error}", flush=True)
+    print(f"rejected {error}", flush=True)
+"""
+
+#: Bind and release a borrowing publisher on a namespace this process
+#: does not own, publishing a worker through it.
+_BORROWER_SCRIPT = """
+import asyncio
+import sys
+import uuid
+
+from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.worker.metadata import WorkerMetadata
+
+
+async def main():
+    namespace = sys.argv[1]
+    metadata = WorkerMetadata(
+        uid=uuid.uuid4(), address="localhost:50051", pid=1, version="1.0"
+    )
+    async with LocalDiscovery.Publisher(namespace) as publisher:
+        await publisher.publish("worker-added", metadata)
+        print("published", flush=True)
+        async for event in LocalDiscovery.Subscriber(namespace, poll_interval=0.05):
+            print("discovered", flush=True)
+            break
+        await publisher.publish("worker-dropped", metadata)
+
+
+asyncio.run(main())
 """
 
 _LEAKED_OWNER_SCRIPT = """
@@ -374,7 +399,12 @@ class TestDiscoveryFailureIsolation:
                     # cannot stall the workers' connections.
                     attacher = await asyncio.to_thread(
                         subprocess.run,
-                        [sys.executable, "-c", _ATTACHER_SCRIPT, namespace],
+                        [
+                            sys.executable,
+                            "-c",
+                            _ATTACHER_SCRIPT,
+                            str(namespace_directory(namespace) / "registry"),
+                        ],
                         capture_output=True,
                         text=True,
                         timeout=_TIMEOUT,
@@ -499,7 +529,8 @@ class TestCrossProcessOwnership:
             A fresh interpreter claims the same namespace afterwards
         Then:
             It should admit the successor in both cases; after a kill,
-            the owner's resource tracker reclaims the registry.
+            the claim dies with the process and the successor replaces
+            the registry the kill stranded.
         """
         # Arrange
         namespace = f"handoff-{uuid.uuid4().hex[:12]}"
@@ -543,7 +574,7 @@ class TestCrossProcessOwnership:
             The deadline passes and all four claim the namespace at once
         Then:
             It should admit exactly one and reject the other three with
-            DiscoveryNamespaceInUse naming a segment.
+            DiscoveryNamespaceInUse naming the namespace.
         """
         # Arrange
         namespace = f"race-{uuid.uuid4().hex[:12]}"
@@ -581,24 +612,23 @@ class TestCrossProcessOwnership:
         assert sum(line == "claimed" for line in stdouts) == 1
         rejections = [line for line in stdouts if line.startswith("rejected ")]
         assert len(rejections) == 3
-        # The segment is the operator's handle on a stranded registry;
-        # a rejection that named none would be unactionable.
-        assert all(line.split()[1] not in ("", "None") for line in rejections)
+        # A rejection that named no namespace would be unactionable.
+        assert all(repr(namespace) in line for line in rejections)
 
-    def test___enter___should_raise_when_a_killed_owner_leaves_its_tracker_alive(self):
-        """Test a registry is stranded while its owner's tracker outlives it.
+    def test___enter___should_claim_the_namespace_when_a_child_owner_is_killed(self):
+        """Test a killed child owner's claim dies with its process.
 
         Given:
             An owner LocalDiscovery entered in a multiprocessing child of
-            this process — which shares this process's resource tracker —
-            and then killed outright with SIGKILL
+            this process and then killed outright with SIGKILL, so
+            neither its context exit nor its atexit fallback runs
         When:
             This process claims the same namespace
         Then:
-            It should raise DiscoveryNamespaceInUse naming the segment —
-            the tracker that would reclaim the registry is still alive,
-            so nothing has reclaimed it, and the segment is the
-            operator's only handle on it.
+            It should claim it and leave the namespace fully working —
+            the claim is held by the dead process's descriptor, which the
+            kernel released, and the registry the kill stranded is
+            replaced rather than adopted.
         """
         # Arrange
         namespace = f"stranded-{uuid.uuid4().hex[:12]}"
@@ -606,27 +636,32 @@ class TestCrossProcessOwnership:
         ready = context.Event()
         owner = context.Process(target=_hold_namespace, args=(namespace, ready))
         owner.start()
-        segment = None
+        directory = namespace_directory(namespace)
         try:
             assert ready.wait(_TIMEOUT), "the child never claimed the namespace"
             owner.kill()
             owner.join(_TIMEOUT)
+            # Vacuity guard — the kill left the registry behind, so the
+            # claim below is made against residue rather than a clean
+            # namespace.
+            assert (directory / "registry").exists()
 
             # Act & assert
-            with pytest.raises(DiscoveryNamespaceInUse) as excinfo:
-                with LocalDiscovery(namespace):
-                    pass
+            with LocalDiscovery(namespace) as successor:
+                assert successor.namespace == namespace
+                claimant = subprocess.run(
+                    [sys.executable, "-c", _CLAIMANT_SCRIPT, namespace],
+                    capture_output=True,
+                    text=True,
+                    timeout=_TIMEOUT,
+                )
+                # Assert — the successor now holds the namespace itself
+                assert "claimed" not in claimant.stdout, claimant.stdout
 
-            segment = excinfo.value.segment
-            assert excinfo.value.namespace == namespace
-            assert segment
+            # Assert — and its exit reclaimed everything
+            assert not directory.exists()
         finally:
             _ensure_killed(owner.pid)
-            if segment is not None:
-                # The remedy the message prescribes, applied by the process
-                # whose tracker holds the entry.
-                with contextlib.suppress(FileNotFoundError):
-                    SharedMemory(name=segment).unlink()
 
 
 @pytest.mark.integration
@@ -777,7 +812,11 @@ class TestCrossProcessBorrowing:
                             child.pid for child in multiprocessing.active_children()
                         }
             finally:
+                # The harness kills the owner, which by contract leaves
+                # its namespace behind for a successor to reclaim; no
+                # successor follows here, so clear it.
                 release_subprocess(owner)
+                shutil.rmtree(namespace_directory(namespace), ignore_errors=True)
 
         try:
             await retry_grpc_internal(body)
@@ -786,26 +825,126 @@ class TestCrossProcessBorrowing:
                 if child.pid not in before:
                     _ensure_killed(child.pid)
 
+    def test___aexit___should_keep_the_registry_when_a_borrower_exits(self):
+        """Test a borrowing publisher's exit leaves the owner's registry.
+
+        Given:
+            A namespace this process owns, and an independent
+            interpreter that binds a borrowing publisher on it,
+            publishes a worker, and releases it
+        When:
+            That interpreter exits
+        Then:
+            It should leave the registry in place for the owner — only
+            the owner reclaims a registry, so a borrower's exit must not
+            take the namespace down with it.
+        """
+        # Arrange
+        namespace = f"borrower-{uuid.uuid4().hex[:12]}"
+
+        # Act
+        with LocalDiscovery(namespace):
+            borrower = subprocess.run(
+                [sys.executable, "-c", _BORROWER_SCRIPT, namespace],
+                capture_output=True,
+                text=True,
+                timeout=_TIMEOUT,
+            )
+
+            # Assert
+            assert borrower.returncode == 0, borrower.stderr
+            assert "published" in borrower.stdout, borrower.stdout
+            assert "Traceback" not in borrower.stderr, borrower.stderr
+            # The owner is still inside its context, so a fresh
+            # borrower must still be able to bind.
+            assert asyncio.run(_binds(namespace))
+
+    def test___aiter___should_keep_the_registry_when_a_subscriber_exits(self):
+        """Test a borrowing subscriber's exit leaves the owner's registry.
+
+        Given:
+            A namespace this process owns, and an independent
+            interpreter that publishes a worker through a borrowing
+            publisher and iterates a borrowing subscriber to its first
+            event
+        When:
+            That interpreter exits
+        Then:
+            It should leave the registry in place for the owner, a
+            read-side borrow claiming no more of the namespace than a
+            write-side one.
+        """
+        # Arrange
+        namespace = f"borrower-sub-{uuid.uuid4().hex[:12]}"
+
+        # Act
+        with LocalDiscovery(namespace):
+            borrower = subprocess.run(
+                [sys.executable, "-c", _BORROWER_SCRIPT, namespace],
+                capture_output=True,
+                text=True,
+                timeout=_TIMEOUT,
+            )
+
+            # Assert
+            assert borrower.returncode == 0, borrower.stderr
+            assert "discovered" in borrower.stdout, borrower.stdout
+            assert "Traceback" not in borrower.stderr, borrower.stderr
+            assert asyncio.run(_binds(namespace))
+
+
+@pytest.mark.integration
+class TestNamespaceResidue:
+    @pytest.mark.asyncio
+    async def test___aexit___should_leave_no_residue_when_pools_cycle(self):
+        """Test repeated default-namespace pools accumulate nothing.
+
+        Given:
+            The root directory LocalDiscovery keeps namespaces in, and a
+            default namespace per pool — a fresh uuid, so no lifecycle
+            reuses another's files
+        When:
+            Three WorkerPools each enter, dispatch, and exit
+        Then:
+            It should leave neither a namespace directory nor a lock
+            file behind, which is what accumulated an inode per
+            lifecycle for the life of the host.
+        """
+        # Arrange
+        root = namespace_directory("probe").parent
+        namespaces = set(root.glob("wool-workerpool-*"))
+        locks = set(root.glob("wool-lock-*"))
+
+        # Act
+        for _ in range(3):
+            async with asyncio.timeout(_TIMEOUT):
+                async with WorkerPool(spawn=1):
+                    assert await routines.add(1, 2) == 3
+
+        # Assert
+        assert set(root.glob("wool-workerpool-*")) - namespaces == set()
+        assert set(root.glob("wool-lock-*")) - locks == set()
+
 
 @pytest.mark.integration
 class TestCrossProcessTeardown:
-    def test___exit___should_unwind_cleanly_when_segment_unlinked_externally(self):
-        """Test owner teardown after an external unlink.
+    def test___exit___should_unwind_cleanly_when_registry_removed_externally(self):
+        """Test owner teardown after an external removal.
 
         Given:
             An owner LocalDiscovery entered in its own interpreter,
-            and an independent interpreter that removed the shared
-            segment out from under it
+            and an independent interpreter that removed its registry
+            out from under it
         When:
             The owner is released, exits its context, and its
             interpreter shuts down
         Then:
             It should exit with status 0 and no traceback — the
-            vanished segment aborts neither the context exit nor the
+            vanished registry aborts neither the context exit nor the
             atexit fallback at interpreter shutdown.
         """
         # Arrange
-        namespace = f"tracker-{uuid.uuid4().hex[:12]}"
+        namespace = f"external-{uuid.uuid4().hex[:12]}"
         owner = subprocess.Popen(
             [sys.executable, "-c", _OWNER_SCRIPT, namespace],
             stdin=subprocess.PIPE,
@@ -818,15 +957,20 @@ class TestCrossProcessTeardown:
             assert owner.stdout.readline().strip() == "ready"
 
             attacher = subprocess.run(
-                [sys.executable, "-c", _ATTACHER_SCRIPT, namespace],
+                [
+                    sys.executable,
+                    "-c",
+                    _ATTACHER_SCRIPT,
+                    str(namespace_directory(namespace) / "registry"),
+                ],
                 capture_output=True,
                 text=True,
                 timeout=_TIMEOUT,
             )
             assert attacher.returncode == 0
-            # Vacuity guard — the segment vanished before the owner
+            # Vacuity guard — the registry vanished before the owner
             # exits, so the owner's teardown runs against a missing
-            # segment.
+            # registry.
             assert "unlinked" in attacher.stdout
 
             # Act — release the owner to exit its context and shut
@@ -845,18 +989,18 @@ class TestCrossProcessTeardown:
                 owner.wait(timeout=10)
 
     def test___enter___should_arm_fallback_that_survives_shutdown_when_leaked(self):
-        """Test the shutdown fallback tolerates a vanished segment.
+        """Test the shutdown fallback tolerates a vanished registry.
 
         Given:
             An owner LocalDiscovery entered in its own interpreter and
             never exited, and an independent interpreter that removed
-            the shared segment out from under it
+            its registry out from under it
         When:
             The owner interpreter shuts down with the fallback still
             armed
         Then:
             It should exit with status 0 and no traceback — the armed
-            fallback suppresses the missing segment instead of
+            fallback suppresses the missing registry instead of
             crashing interpreter shutdown.
         """
         # Arrange
@@ -873,27 +1017,29 @@ class TestCrossProcessTeardown:
             assert owner.stdout.readline().strip() == "ready"
 
             attacher = subprocess.run(
-                [sys.executable, "-c", _ATTACHER_SCRIPT, namespace],
+                [
+                    sys.executable,
+                    "-c",
+                    _ATTACHER_SCRIPT,
+                    str(namespace_directory(namespace) / "registry"),
+                ],
                 capture_output=True,
                 text=True,
                 timeout=_TIMEOUT,
             )
             assert attacher.returncode == 0
-            # Vacuity guard — the segment vanished before the owner
+            # Vacuity guard — the registry vanished before the owner
             # shuts down.
             assert "unlinked" in attacher.stdout
 
             # Act — the owner returns from its script with the
             # context still open, so atexit fires the armed fallback
-            # against the vanished segment
+            # against the vanished registry
             owner.stdin.write("\n")
             owner.stdin.flush()
             stdout, stderr = owner.communicate(timeout=_TIMEOUT)
 
-            # Assert — the owner's own tracker warns about its stale
-            # registration on stderr (its unlink raised before the
-            # tracker unregistration), so assert traceback absence
-            # rather than a clean stderr
+            # Assert
             assert owner.returncode == 0
             assert "leaking-context" in stdout
             assert "Traceback" not in stderr
@@ -901,6 +1047,15 @@ class TestCrossProcessTeardown:
             if owner.poll() is None:
                 owner.kill()
                 owner.wait(timeout=10)
+
+
+async def _binds(namespace: str) -> bool:
+    """Return whether a fresh borrowing publisher can bind ``namespace``."""
+    try:
+        async with LocalDiscovery.Publisher(namespace):
+            return True
+    except DiscoveryNamespaceNotFound:
+        return False
 
 
 def _hold_namespace(namespace: str, ready) -> None:

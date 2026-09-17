@@ -141,8 +141,8 @@ class TestCrossProcessReadd:
             A subscriber in the test process then iterates the namespace
         Then:
             It should discover the worker at the bumped version — the
-            exited re-announcer's resource tracker must not have
-            unlinked the live metadata block.
+            exited re-announcer must not have removed the live metadata
+            block it only refreshed.
         """
         # Arrange
         namespace = f"readd-exit-{uuid.uuid4().hex[:12]}"
@@ -170,7 +170,8 @@ class TestCrossProcessReadd:
                     await publisher.publish("worker-added", worker)
 
                     # Act — the re-announcer exits while the worker is
-                    # still registered; its resource tracker runs at exit.
+                    # still registered, so its teardown runs against a
+                    # block another publisher owns.
                     proc = spawn_script_subprocess(
                         _READD_SCRIPT,
                         namespace,

@@ -2,7 +2,7 @@
 
 These are targeted standalone tests rather than pairwise scenarios:
 capacity **exhaustion** deliberately under-provisions the discovery
-segment so a worker announcement fails, aborting pool entry. That is a
+registry so a worker announcement fails, aborting pool entry. That is a
 dispatch *failure*, which would break the pairwise array's single
 dispatch-**success** oracle (`test_dispatch_pairwise`). The
 capacity-bounded happy path — where capacity comfortably admits the

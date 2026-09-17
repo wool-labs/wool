@@ -5,7 +5,7 @@ scenario matrix's dimensions are static composition axes resolved once
 at build time, and worker metadata never changes mid-scenario there —
 the update flow is a temporal lifecycle behavior against one live pool.
 The full pipeline is proved with real components: a ``LocalDiscovery``
-publish flows through the shared-memory rescan, the subscriber diff,
+publish flows through the registry rescan, the subscriber diff,
 the proxy's worker sentinel, and the uid-keyed load-balancer context
 into real gRPC dispatch. LAN discovery is deliberately not exercised:
 its updates never re-resolve the advertised address, so a connection

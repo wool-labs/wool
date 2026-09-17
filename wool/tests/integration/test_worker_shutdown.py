@@ -692,7 +692,7 @@ class TestWorkerOrphanPrevention:
         Given:
             A pool of two workers on a real LocalDiscovery whose
             worker-dropped announcement raises PermissionError, a
-            discovery failure unrelated to segment ownership
+            discovery failure unrelated to registry ownership
         When:
             The async-with block exits
         Then:
