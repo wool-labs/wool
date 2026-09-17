@@ -65,3 +65,55 @@ class DiscoveryWorkerNotFound(WoolError):
         self.uid = uid
         detail = "" if uid is None else f" {uid}"
         super().__init__(f"Worker{detail} not found in address space")
+
+
+# public
+class DiscoveryNamespaceInUse(WoolError):
+    """Raised when claiming a namespace whose registry already exists.
+
+    The registry belongs to a live owner or persists from a killed one;
+    see `LocalDiscovery`.
+
+    :param namespace:
+        The namespace whose claim was rejected, when known.
+    :param segment:
+        Name of the shared-memory segment backing the existing registry,
+        when known. Remove it only once no live process owns the
+        namespace; removing a live owner's segment lets a second owner
+        claim the namespace.
+    """
+
+    def __init__(self, namespace: str | None = None, segment: str | None = None):
+        self.namespace = namespace
+        self.segment = segment
+        super().__init__(namespace, segment)
+
+    def __str__(self) -> str:
+        detail = "" if self.namespace is None else f" {self.namespace!r}"
+        hint = (
+            ""
+            if self.segment is None
+            else f"; if no live process owns it, remove shared memory {self.segment!r}"
+        )
+        return f"Discovery namespace{detail} is already in use{hint}"
+
+
+# public
+class DiscoveryNamespaceNotFound(WoolError):
+    """Raised when a borrower binds a namespace that has no registry.
+
+    No owner has created the registry yet, or its owner has exited and
+    reclaimed it. See `LocalDiscovery` for the borrowing and orphaning
+    contract.
+
+    :param namespace:
+        The namespace whose registry was not found, when known.
+    """
+
+    def __init__(self, namespace: str | None = None):
+        self.namespace = namespace
+        super().__init__(namespace)
+
+    def __str__(self) -> str:
+        detail = "" if self.namespace is None else f" {self.namespace!r}"
+        return f"No discovery registry for namespace{detail}"

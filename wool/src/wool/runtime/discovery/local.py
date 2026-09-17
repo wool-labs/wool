@@ -38,6 +38,8 @@ from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
 from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.exceptions import DiscoveryWorkerNotFound
 from wool.runtime.discovery.pool import SubscriberMeta
 from wool.runtime.resourcepool import ResourcePool
@@ -50,9 +52,9 @@ NULL_REF: Final = b"\x00" * REF_WIDTH
 DEFAULT_LOCK_TIMEOUT: Final[float] = 30.0
 _HEADER_MAGIC: Final = b"WLD1"
 _HEADER_SIZE: Final = REF_WIDTH
-# Serialises the resource-tracker rebind window; see `_attach`. Held only
-# across one `SharedMemory` constructor, never across a `_shared_memory` body,
-# which would deadlock the nested attach `_add` performs.
+# Serializes the resource-tracker rebind; see `_attach`. Never hold it across
+# a registry mapping's body: slot reads and writes attach worker blocks there,
+# and the nested attach would deadlock.
 _attach_lock: threading.Lock = threading.Lock()
 
 # The tracker's own hooks, captured before anything can rebind them, so a
@@ -195,7 +197,7 @@ class _WorkerReference:
 
     @property
     def bytes(self) -> bytes:
-        """The 16-byte representation for address space storage.
+        """The 16-byte representation stored in a registry slot.
 
         :returns:
             The UUID as 16 bytes.
@@ -207,62 +209,64 @@ class _WorkerReference:
 class LocalDiscovery(Discovery):
     """Shared-memory discovery for single-machine worker pools.
 
-    The default when a `~wool.runtime.worker.pool.WorkerPool` is created
-    without an explicit discovery protocol. Workers and subscribers
-    communicate through a shared-memory segment identified by a namespace
-    string, so unrelated processes on the same host discover each other by
-    agreeing on a namespace alone. File-based locking keeps the segment
-    consistent across those processes.
+    The default discovery protocol of a
+    `~wool.runtime.worker.pool.WorkerPool` created without one. Processes
+    on one host share a registry of workers identified by a namespace
+    string, and a cross-process file lock serializes writes to it.
 
-    **Ownership.** Entering a context creates the namespace's segment, or
-    attaches to it when it already exists. The first entrant across all
-    processes wins the create race and *owns* the segment; every later
-    entrant on that namespace merely attaches. Ownership falls out of that
-    race — it is not something the caller selects.
+    **Ownership.** A namespace's registry has exactly one owner: the
+    instance whose entry created it. Entering creates the registry, and
+    exiting reclaims it. Entering a namespace whose registry already
+    exists raises `DiscoveryNamespaceInUse`. An owner that never exits,
+    e.g., one abandoned when the interpreter shuts down, reclaims the
+    registry at shutdown. A killed owner's registry persists until the
+    owner's `multiprocessing` resource tracker exits; for a child
+    process, that is when its parent's tracker exits. Until then every
+    entry on the namespace raises `DiscoveryNamespaceInUse` naming the
+    segment to remove.
 
-    **Lifecycle.** An instance is single-use: it may be entered once, and a
-    second entry raises `RuntimeError` whether or not the first has exited.
-    Use a fresh instance per ``with`` block. The guard binds to the instance,
-    so distinct instances sharing a namespace — which compare equal — are
-    unaffected by each other.
+    **Borrowing.** `LocalDiscovery.Publisher` and
+    `LocalDiscovery.Subscriber`, including those `publisher`,
+    `subscriber` and `subscribe` return, borrow a namespace's registry
+    and never create one. A borrower *binds* when it opens the registry:
+    a publisher on entry and on each publish, a subscriber when its
+    subscription starts. A bind where the namespace has no registry
+    raises `DiscoveryNamespaceNotFound`.
 
-    The owner's exit unlinks the segment out from under every still-attached
-    peer, while a non-owner's exit only closes its own mapping; a non-owner
-    can therefore outlive the segment it is mapped to. An owner that never
-    exits at all — an abandoned context, an interpreter killed mid-block —
-    still reclaims the segment at interpreter shutdown rather than leaking
-    the namespace, via a fallback armed on owner entry and disarmed on owner
-    exit.
+    **Orphaning.** A borrower that outlives its owner is orphaned. A
+    mapping it already holds stays readable. Its next bind raises
+    `DiscoveryNamespaceNotFound`, unless a successor owner has entered
+    the namespace, in which case the bind reaches the successor's
+    registry. Orphaning is defined behavior: a borrower holds no claim on
+    the registry, so it has no registry to reclaim. See
+    `LocalDiscovery.Subscriber` for which subscriber iterations bind.
 
-    Teardown never raises: unlinking goes through `_unlink_quietly`, which
-    owns the failure semantics. So `__exit__` cannot replace an exception a
-    caller is already unwinding, and a genuine leak stays observable.
+    **Lifecycle.** An instance is single-use: any entry attempt spends
+    it, so a second entry raises `RuntimeError`. Retrying a rejected
+    claim requires a new instance. Exiting never raises; a failed unlink
+    surfaces as a `ResourceWarning`.
 
     :param namespace:
-        Unique identifier for the shared-memory segment. Publishers
-        and subscribers using the same namespace will see each
-        other's workers.
+        Identifier of the registry. Defaults to a unique
+        ``workerpool-<uuid>`` name.
     :param filter:
         Optional default predicate function to filter workers.
         Used by `subscriber` and as the default for `subscribe` when no
         explicit filter is provided.
     :param capacity:
-        Maximum number of workers registrable — and discoverable —
-        simultaneously. The owner stamps it into the segment on entry, so
-        every publisher and subscriber enforces the same bound without
-        re-declaring it. Publishing a new worker once ``capacity`` are
-        registered raises `DiscoveryCapacityExhausted`; see
-        `LocalDiscovery.Publisher.publish` for the full contract.
-        Defaults to 128.
+        Maximum number of workers registered at once. The owner stamps
+        it on entry and a borrower binds at the owner's capacity, so this
+        value applies only when this instance is entered. See
+        `LocalDiscovery.Publisher.publish` for exhaustion. Defaults to
+        128.
     :param block_size:
         Size in bytes for each worker's serialized data block. Each
         block spends 4 bytes on a length prefix, leaving
         ``block_size - 4`` for the serialized metadata. Defaults to
         1024.
     :param lock_timeout:
-        Maximum seconds a publisher waits to acquire the cross-process
-        file lock; see `LocalDiscovery.Publisher` for the acquisition
-        contract. Plumbed through to each `Publisher`. Defaults to
+        Maximum seconds each publisher waits for the cross-process file
+        lock; see `LocalDiscovery.Publisher`. Defaults to
         `DEFAULT_LOCK_TIMEOUT`.
     :raises ValueError:
         If ``capacity`` or ``block_size`` is less than 1, or
@@ -284,12 +288,32 @@ class LocalDiscovery(Discovery):
             async for event in discovery.subscriber:
                 print(f"Discovered worker: {event.metadata}")
 
+    Example — borrow a namespace another process owns:
+
+    .. code-block:: python
+
+        async for event in LocalDiscovery.Subscriber("my-worker-pool"):
+            print(f"Discovered worker: {event.metadata}")
+
     .. rubric:: Implementation notes
 
-    The shutdown fallback is an `atexit` handler registered on owner entry
-    and unregistered on owner exit, before the unlink runs — a failed unlink
-    must not leave the handler armed to fire a second time at interpreter
-    shutdown.
+    Every teardown path unlinks through `_unlink_quietly`, so `__exit__`
+    cannot replace an exception its caller is already unwinding. The
+    shutdown fallback is an `atexit` handler registered on entry and
+    unregistered on exit before the unlink runs, so a failed unlink
+    leaves no handler armed to fire again at interpreter shutdown.
+
+    The `multiprocessing` resource tracker reclaims a killed owner's
+    registry: creating the registry registers its segment with the
+    tracker, which unlinks the segment when it exits. One tracker serves
+    a whole process tree, which is why a killed child's registry outlives
+    it until the parent's tracker exits.
+
+    No entry adopts a stranded registry. A liveness check and the
+    adoption that follows it cannot be made atomic against an owner that
+    is slow to respond, so adoption would hand one namespace to two
+    owners. The caller, who knows which processes should exist, removes
+    the segment.
     """
 
     _filter: Final[PredicateFunction | None]
@@ -317,52 +341,50 @@ class LocalDiscovery(Discovery):
 
     @noreentry
     def __enter__(self) -> Self:
-        """Create or attach to the namespace's shared-memory segment.
+        """Create the namespace's registry and claim its ownership.
 
         See `LocalDiscovery` for the ownership and teardown contract.
 
         :returns:
             This instance.
         :raises RuntimeError:
-            If this instance has already been entered.
+            If entry has already been attempted on this instance.
+        :raises DiscoveryNamespaceInUse:
+            If the namespace's registry already exists; see
+            `LocalDiscovery`.
         """
         size = _HEADER_SIZE + self._capacity * REF_WIDTH
+        segment = _short_hash(self._namespace)
         try:
             self._address_space = SharedMemory(
-                name=_short_hash(self._namespace),
+                name=segment,
                 create=True,
                 size=size,
             )
-            self._owner = True
-        except FileExistsError:
-            self._address_space = _attach(_short_hash(self._namespace))
-            self._owner = False
+        except FileExistsError as error:
+            raise DiscoveryNamespaceInUse(self._namespace, segment=segment) from error
 
         assert self._address_space.buf
-        if self._owner:
 
-            def cleanup():  # pragma: no cover
-                _unlink_quietly(self._address_space)
+        def cleanup():  # pragma: no cover
+            _unlink_quietly(self._address_space)
 
-            self._cleanup = atexit.register(cleanup)
-            for i in range(size):
-                self._address_space.buf[i] = 0
-            struct.pack_into(
-                "<4sI", self._address_space.buf, 0, _HEADER_MAGIC, self._capacity
-            )
+        self._cleanup = atexit.register(cleanup)
+        # A segment created exclusively starts zeroed, so every slot already
+        # reads as `NULL_REF`.
+        struct.pack_into(
+            "<4sI", self._address_space.buf, 0, _HEADER_MAGIC, self._capacity
+        )
         return self
 
     def __exit__(self, *_):
-        """Release this instance's hold on the namespace's segment.
+        """Reclaim the namespace's registry.
 
         See `LocalDiscovery` for the ownership and teardown contract.
         """
-        if self._owner:
-            atexit.unregister(self._cleanup)
-            self._address_space.close()
-            _unlink_quietly(self._address_space)
-        else:
-            self._address_space.close()
+        atexit.unregister(self._cleanup)
+        self._address_space.close()
+        _unlink_quietly(self._address_space)
 
     def __hash__(self) -> int:
         return hash((type(self), self._namespace))
@@ -410,7 +432,7 @@ class LocalDiscovery(Discovery):
         *,
         poll_interval: float | None = None,
     ) -> DiscoverySubscriberLike:
-        """Create a new subscriber with optional filtering.
+        """Return a subscriber to this namespace with optional filtering.
 
         :param filter:
             Optional predicate function to filter workers. Only workers
@@ -418,9 +440,7 @@ class LocalDiscovery(Discovery):
             events. Falls back to the constructor's filter if not
             provided.
         :param poll_interval:
-            Optional interval in seconds between shared memory polls.
-            If not specified, uses filesystem notifications for
-            efficient updates.
+            See `LocalDiscovery.Subscriber`.
         :returns:
             A subscriber instance that receives filtered worker
             discovery events.
@@ -438,15 +458,13 @@ class LocalDiscovery(Discovery):
         """Publisher for broadcasting worker discovery events.
 
         Publishes worker discovery events (see `~wool.DiscoveryEvent`) to
-        a shared memory region where subscribers can discover them.
-        Multiple publishers in different processes can safely write to the
-        same namespace using cross-platform file locking for
-        synchronization. The capacity bound is read from the segment the
-        owning `LocalDiscovery` stamped, so a publisher never re-declares
-        it.
+        a namespace's registry, where subscribers discover them.
+        Publishers in different processes write to one namespace under a
+        cross-process file lock. A publisher borrows the registry; see
+        `LocalDiscovery` for the borrowing and orphaning contract.
 
         :param namespace:
-            The namespace identifier for the shared memory region.
+            The namespace identifier for the registry to borrow.
         :param block_size:
             Size in bytes for worker metadata storage blocks. Each
             block spends 4 bytes on a length prefix, leaving
@@ -498,6 +516,18 @@ class LocalDiscovery(Discovery):
             )
 
         async def __aenter__(self) -> Self:
+            """Verify the namespace's registry exists, then enter the block pool.
+
+            See `LocalDiscovery` for the borrowing contract.
+
+            :returns:
+                This instance.
+            :raises DiscoveryNamespaceNotFound:
+                If the namespace has no registry.
+            """
+            # Bind first, so a bind that raises leaves no pool entered.
+            with _registry(self._namespace):
+                pass
             await self._shared_memory_pool.__aenter__()
             return self
 
@@ -562,13 +592,12 @@ class LocalDiscovery(Discovery):
             :param metadata:
                 Worker metadata to publish.
             :raises RuntimeError:
-                If an unexpected event type is provided, or the segment is
-                not yet initialized (a peer attached before the owner
-                stamped the header); the pool's startup aborts and retries
-                in that case.
+                If an unexpected event type is provided, or the registry's
+                header is not yet stamped, i.e., this publisher bound
+                between the owner's creation of the registry and its stamp.
             :raises DiscoveryCapacityExhausted:
-                For ``worker-added``, if the segment is already at capacity
-                and the worker is not already registered.
+                For ``worker-added``, if the registry is already at
+                capacity and the worker is not already registered.
             :raises DiscoveryWorkerNotFound:
                 For ``worker-updated``, if the worker is not registered.
             :raises DiscoveryBlockExhausted:
@@ -578,9 +607,11 @@ class LocalDiscovery(Discovery):
             :raises TimeoutError:
                 If the cross-process file lock is not acquired within this
                 publisher's ``lock_timeout``.
+            :raises DiscoveryNamespaceNotFound:
+                If the namespace has no registry; see `LocalDiscovery`.
             """
             async with _lock(self._namespace, timeout=self._lock_timeout):
-                with _shared_memory(_short_hash(self._namespace)) as address_space:
+                with _registry(self._namespace) as address_space:
                     if (
                         address_space.buf is None
                         or _read_capacity(address_space.buf) is None
@@ -636,14 +667,12 @@ class LocalDiscovery(Discovery):
 
             if match_offset is not None:
                 try:
-                    with _shared_memory(str(ref)) as memory_block:
+                    with _mapped(_attach(str(ref))) as memory_block:
                         assert memory_block.buf is not None
                         _rewrite_block(memory_block.buf, serialized)
                     return
                 except FileNotFoundError:
-                    # The block vanished out from under its slot — a dead
-                    # publisher's teardown unlinks blocks without nulling
-                    # slots — so reclaim the stale slot and register fresh.
+                    # Stale slot; see the re-add contract in `publish`.
                     struct.pack_into("16s", address_space.buf, match_offset, NULL_REF)
                     if free_offset is None:
                         free_offset = match_offset
@@ -708,7 +737,7 @@ class LocalDiscovery(Discovery):
             :param metadata:
                 The updated worker to publish to the namespace's shared memory.
             :raises DiscoveryWorkerNotFound:
-                If the worker is not found in the address space.
+                If the worker is not registered.
             """
             assert address_space.buf is not None
 
@@ -717,7 +746,7 @@ class LocalDiscovery(Discovery):
 
             for _, slot in _iter_slots(address_space.buf):
                 if slot == target_ref.bytes:
-                    with _shared_memory(str(target_ref)) as memory_block:
+                    with _mapped(_attach(str(target_ref))) as memory_block:
                         assert memory_block.buf is not None
                         _rewrite_block(memory_block.buf, serialized)
                     return
@@ -774,31 +803,30 @@ class LocalDiscovery(Discovery):
     ):
         """Subscriber for receiving worker discovery events.
 
-        Subscribes to worker discovery events (see `~wool.DiscoveryEvent`)
-        from a shared memory region, monitoring for changes via filesystem
-        notifications and yielding events as workers are added, updated, or
-        dropped. Multiple subscribers in different processes can read from
-        the same namespace independently.
+        Yields worker discovery events (see `~wool.DiscoveryEvent`) from a
+        namespace's registry as workers are added, updated, or dropped,
+        rescanning the registry whenever a publisher writes to it. A
+        subscriber borrows the registry; see `LocalDiscovery` for the
+        borrowing and orphaning contract.
 
-        Uses watchdog to monitor a notification file that publishers touch
-        when modifying the shared memory, providing near-instant notification
-        of changes. Falls back to periodic polling if notifications are
-        delayed or missed.
-
-        Instances are cached as singletons — two calls with the same
-        ``namespace`` and ``poll_interval`` return the same object.
-
-        Each call to ``__aiter__`` creates an isolated consumer fed from a
-        shared-memory watch shared across consumers of the same namespace.
-        The shared watch fans out, i.e., every concurrent iteration
-        receives the full event stream, and the iterations are otherwise
-        independent.
+        Constructions sharing a ``namespace`` and ``poll_interval``
+        within one `contextvars.Context` are served from one
+        subscription; see `SubscriberMeta`. Only the iteration that
+        starts a subscription binds, so only that iteration raises
+        `DiscoveryNamespaceNotFound`. An iteration that joins a live
+        subscription over an orphaned mapping keeps reading it and never
+        observes a successor owner, and an iteration that joins a failing
+        bind ends without events.
 
         :param namespace:
-            The namespace identifier for the shared memory region.
+            The namespace identifier for the registry to borrow.
         :param poll_interval:
-            Maximum polling interval in seconds for when filesystem
-            notifications are delayed or missed.
+            Seconds between rescans in addition to the rescans publisher
+            writes trigger. ``None`` rescans only when a publisher writes.
+            Part of the subscription key.
+        :raises ValueError:
+            If ``poll_interval`` is negative, from the iteration that
+            starts the subscription.
         """
 
         _namespace: Final[str]
@@ -815,30 +843,16 @@ class LocalDiscovery(Discovery):
                 raise ValueError(f"Expected positive poll interval, got {poll_interval}")
             self._poll_interval = poll_interval
 
-        async def _shutdown(self) -> None:
-            """Clean up shared subscription state for this subscriber."""
-
-        def __reduce__(self):
-            return type(self), (self._namespace,)
-
         def __aiter__(self) -> AsyncIterator[DiscoveryEvent]:
             return self._event_stream()
 
-        @property
-        def namespace(self):
-            """The namespace identifier for this subscriber."""
-            return self._namespace
-
         async def _event_stream(self) -> AsyncGenerator[DiscoveryEvent, None]:
-            """Monitor shared memory for worker changes via filesystem
-            notifications.
+            """Bind the registry and yield events from each rescan of it.
 
-            Sets up a watchdog filesystem observer to monitor the
-            notification file for modifications. When publishers touch
-            the file (after updating shared memory), the observer
-            triggers scanning of the shared memory address space. Falls
-            back to periodic polling in case notifications are delayed
-            or missed.
+            A watchdog observer watches the notification file publishers
+            touch after each write, and each notification triggers a
+            rescan of the registry. A ``poll_interval`` adds a rescan
+            whenever that many seconds pass without a notification.
 
             :yields:
                 Discovery events as changes are detected in shared
@@ -848,17 +862,19 @@ class LocalDiscovery(Discovery):
             notification = asyncio.Event()
             lock = asyncio.Lock()
             loop = asyncio.get_running_loop()
-            if not (watchdog := _watchdog_path(self._namespace)).exists():
-                watchdog.touch()
-            handler = _Watchdog(notification, watchdog, lock, loop)
-            observer = Observer()
-            observer.schedule(handler, path=str(watchdog.parent), recursive=False)
-            observer.start()
 
-            try:
-                with _shared_memory(_short_hash(self._namespace)) as address_space:
-                    assert address_space.buf is not None
+            # Bind first, so a bind that raises creates no notify file and
+            # starts no observer.
+            with _registry(self._namespace) as address_space:
+                assert address_space.buf is not None
 
+                if not (watchdog := _watchdog_path(self._namespace)).exists():
+                    watchdog.touch()
+                handler = _Watchdog(notification, watchdog, lock, loop)
+                observer = Observer()
+                observer.schedule(handler, path=str(watchdog.parent), recursive=False)
+                observer.start()
+                try:
                     while True:
                         async with lock:
                             notification.clear()
@@ -878,9 +894,12 @@ class LocalDiscovery(Discovery):
                             )
                         except asyncio.TimeoutError:
                             pass
-            finally:
-                observer.stop()
-                observer.join()
+                finally:
+                    observer.stop()
+                    observer.join()
+
+        async def _shutdown(self) -> None:
+            """Clean up shared subscription state for this subscriber."""
 
         def _deserialize_metadata(self, ref: str):
             """Load and deserialize worker metadata from shared memory.
@@ -895,7 +914,7 @@ class LocalDiscovery(Discovery):
             :returns:
                 The deserialized WorkerMetadata instance.
             """
-            with _shared_memory(ref) as memory_block:
+            with _mapped(_attach(ref)) as memory_block:
                 assert memory_block.buf is not None
                 size = struct.unpack_from("I", memory_block.buf, 0)[0]
                 serialized = struct.unpack_from(f"{size}s", memory_block.buf, 4)[0]
@@ -959,12 +978,12 @@ def _validate_block_size(block_size: int) -> None:
 def _read_capacity(buf: memoryview) -> int | None:
     """Return the owner-stamped capacity, or ``None`` when unstamped.
 
-    The owner writes `_HEADER_MAGIC` and the capacity into the segment
-    header on entry. An attacher that raced that write — or any segment
-    not created by this module — reads a mismatched magic and is reported
-    as not-yet-ready (`None`) rather than trusting a zero-filled header. A
-    subscriber re-reads on its next scan; a publisher instead raises, and
-    the pool's startup aborts and retries.
+    The owner writes `_HEADER_MAGIC` and the capacity into the registry's
+    header on entry. A borrower that bound before that write, or any
+    segment this module did not create, reads a mismatched magic and is
+    reported as unstamped (``None``), so a zero-filled header is never
+    trusted. A subscriber re-reads on its next scan; a publisher raises
+    `RuntimeError` (see `LocalDiscovery.Publisher.publish`).
 
     :param buf:
         The mapped address-space buffer.
@@ -983,7 +1002,7 @@ def _iter_slots(buf: memoryview) -> Iterator[tuple[int, bytes]]:
     Reads the owner-stamped capacity from the header and walks exactly
     that many slots, so ``capacity`` — not the page-rounded mapping — is
     the enforced ceiling. Yields nothing for a segment whose header is not
-    yet stamped, so a subscriber simply re-reads on its next scan. The
+    yet stamped, so a subscriber re-reads on its next scan. The
     capacity is re-read on every call, so a scan always reflects the
     current header.
 
@@ -1131,7 +1150,7 @@ def _attach(name: str) -> SharedMemory:
     on POSIX while callers pass them bare, so both sides are stripped
     before matching.
 
-    The lock serialises the rebind. Without it two overlapping attaches
+    The lock serializes the rebind. Without it two overlapping attaches
     would each capture the other's shim: the second attach's registration
     would reach a shim whose thread does not match, be forwarded to the
     real tracker, and be tracked after all — reinstating bpo-38119. That a
@@ -1179,24 +1198,20 @@ def _attach(name: str) -> SharedMemory:
 
 
 @contextmanager
-def _shared_memory(name):
-    """Open an existing shared memory region by name.
+def _mapped(shared_memory: SharedMemory) -> Iterator[SharedMemory]:
+    """Yield an open mapping and close it on exit.
 
-    Context manager that opens a shared memory region for reading or writing
-    and ensures it is properly closed on exit. Does not create new memory
-    regions (use `SharedMemory` with ``create=True`` for that). The mapping
-    is untracked — see `_attach` for why, and for what that forbids.
-
-    :param name:
-        The name of the shared memory region to open.
+    :param shared_memory:
+        The mapping to close once the body completes.
     :yields:
-        An open SharedMemory instance.
+        The mapping, unchanged.
 
     .. note::
-        Close errors are silently ignored to handle cases where the memory
-        region has been unlinked by another process.
+        A close that fails is suppressed, so it cannot replace an
+        exception already unwinding through the body. The realistic
+        failure is `BufferError`, raised where a memoryview over the
+        mapping is still exported when the close runs.
     """
-    shared_memory = _attach(name)
     try:
         yield shared_memory
     finally:
@@ -1206,21 +1221,49 @@ def _shared_memory(name):
             pass  # pragma: no cover
 
 
+@contextmanager
+def _registry(namespace: str) -> Iterator[SharedMemory]:
+    """Open the namespace's registry for a borrower's bind.
+
+    Every borrower binds through here. It never creates a registry, and
+    reports a missing one as `DiscoveryNamespaceNotFound` naming the
+    namespace the caller asked for; the hashed segment name stays
+    internal.
+
+    Only the mapping is translated. A `FileNotFoundError` raised inside
+    the body (e.g., a worker's own metadata block vanishing mid-scan) is
+    a different failure and propagates untouched.
+
+    :param namespace:
+        The namespace whose registry to open.
+    :yields:
+        The open registry mapping.
+    :raises DiscoveryNamespaceNotFound:
+        If the namespace has no registry.
+    """
+    try:
+        address_space = _attach(_short_hash(namespace))
+    except FileNotFoundError as error:
+        raise DiscoveryNamespaceNotFound(namespace) from error
+    with _mapped(address_space):
+        yield address_space
+
+
 @asynccontextmanager
 async def _lock(namespace: str, *, timeout: float | None = DEFAULT_LOCK_TIMEOUT):
-    """Acquire an exclusive lock for the address space identified by namespace.
+    """Acquire an exclusive lock on the registry identified by namespace.
 
     Uses cross-platform file locking (via portalocker) to synchronize access
-    across unrelated processes that may be publishing to the same shared
-    memory region. Works on Windows, Linux, and macOS, and does not block the
-    event loop while waiting for acquisition.
+    across unrelated processes that may be publishing to the same registry.
+    Works on Windows, Linux, and macOS, and does not block the event loop
+    while waiting for acquisition.
 
     ``timeout`` bounds **acquisition only, never the held section**. Once the
     lock is held the ``with`` body runs to completion regardless of how long
     it takes.
 
     :param namespace:
-        The namespace identifying the shared memory region to lock.
+        The namespace identifying the registry to lock.
     :param timeout:
         Maximum seconds to wait for acquisition. ``None`` waits forever.
         Defaults to `DEFAULT_LOCK_TIMEOUT`.
@@ -1267,10 +1310,10 @@ def _watchdog_path(namespace: str) -> Path:
     """Get the path to the notification file for a namespace.
 
     Returns the path to a temporary file that publishers touch when modifying
-    the shared memory region, signaling subscribers to scan for changes.
+    the registry, signaling subscribers to scan for changes.
 
     :param namespace:
-        The namespace identifying the shared memory region.
+        The namespace identifying the registry.
     :returns:
         Path to the notification file for this namespace.
     """

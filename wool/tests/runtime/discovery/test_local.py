@@ -4,7 +4,9 @@ import contextlib
 import errno
 import mmap
 import pickle
+import re
 import sys
+import tempfile
 import threading
 import uuid
 from collections import Counter
@@ -14,11 +16,13 @@ from contextlib import asynccontextmanager
 from contextlib import contextmanager
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
 from types import MappingProxyType
 from types import SimpleNamespace
 
 import portalocker
 import pytest
+import pytest_asyncio
 from hypothesis import HealthCheck
 from hypothesis import assume
 from hypothesis import example
@@ -30,6 +34,8 @@ from wool.runtime.discovery import local
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.exceptions import DiscoveryWorkerNotFound
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.resourcepool import ResourcePool
@@ -80,12 +86,25 @@ def namespace():
 
 
 @pytest.fixture
-def atexit_recorder(mocker):
+def teardown_log():
+    """An ordered log of owner-teardown events.
+
+    `atexit_recorder` appends ``"unregister"`` and `unlink_schedule`
+    appends ``"unlink"`` as each call passes through, so a test holding
+    both fixtures can assert their relative order — asserting that each
+    happened cannot distinguish disarm-then-unlink from unlink-then-disarm.
+    """
+    return []
+
+
+@pytest.fixture
+def atexit_recorder(mocker, teardown_log):
     """Wraps atexit registration in recording pass-throughs.
 
     Returns a (registered, unregistered) tuple of lists capturing every
     callable that flows through atexit.register and atexit.unregister
-    while the real registry stays consistent.
+    while the real registry stays consistent, and logs each
+    unregistration to `teardown_log`.
 
     Tests built on this fixture deliberately pin the atexit mechanism
     rather than an observable outcome: the disarm-before-unlink ordering
@@ -106,6 +125,7 @@ def atexit_recorder(mocker):
 
     def unregister(func):
         unregistered.append(func)
+        teardown_log.append("unregister")
         return real_unregister(func)
 
     mocker.patch.object(atexit, "register", register)
@@ -113,10 +133,49 @@ def atexit_recorder(mocker):
     return registered, unregistered
 
 
+@pytest_asyncio.fixture
+async def borrowed_publisher(namespace, metadata, atexit_recorder):
+    """Yield an owner and a borrowing Publisher with independent releases.
+
+    Yields a `SimpleNamespace` carrying the live ``owner`` and
+    ``publisher`` alongside ``release_owner`` and ``release_publisher``.
+    The owner is entered into an `ExitStack` of its own and the borrowing
+    publisher into an `AsyncExitStack` of its own, which lets a test
+    close one while the other is still bound; a nested ``with`` releases
+    the publisher first. One worker is published through the borrower
+    before the yield, so the registry a test inspects is never empty.
+
+    Requests `atexit_recorder` so the recorder is in place before either
+    participant arms a fallback: a test that reads the recorded lists
+    would otherwise depend on the order pytest happens to build two
+    independent fixtures in.
+
+    Both releases are idempotent and teardown runs them again in order,
+    so a test may drive either, both, or neither.
+    """
+    owner_stack = ExitStack()
+    borrower_stack = AsyncExitStack()
+    try:
+        owner = owner_stack.enter_context(LocalDiscovery(namespace))
+        publisher = await borrower_stack.enter_async_context(
+            LocalDiscovery.Publisher(namespace)
+        )
+        await publisher.publish("worker-added", metadata)
+        yield SimpleNamespace(
+            owner=owner,
+            publisher=publisher,
+            release_owner=owner_stack.close,
+            release_publisher=borrower_stack.aclose,
+        )
+    finally:
+        await borrower_stack.aclose()
+        owner_stack.close()
+
+
 @pytest.fixture
-def unlink_schedule(mocker):
+def unlink_schedule(mocker, teardown_log):
     """Patches SharedMemory.unlink with a schedule-driven wrapper and
-    returns the schedule list.
+    returns the schedule list. Each unlink is logged to `teardown_log`.
 
     Each unlink call performs the real unlink — so no segment leaks —
     then consumes one schedule entry and raises it when the entry is an
@@ -131,6 +190,7 @@ def unlink_schedule(mocker):
     real_unlink = SharedMemory.unlink
 
     def unlink(shm):
+        teardown_log.append("unlink")
         real_unlink(shm)
         if schedule and (error := schedule.pop(0)) is not None:
             raise error
@@ -299,16 +359,31 @@ async def _collecting(subscriber, collector):
             pass
 
 
-#: Same-namespace lifecycle forests: each node is one LocalDiscovery
-#: context; nesting models concurrently overlapping instances and
-#: siblings model teardown+respawn generations reusing the namespace.
-#: Referenced by ``@given`` at class-definition time, so it must precede
-#: the test classes.
+#: Same-namespace lifecycle forests: each node is one claim on the
+#: namespace; siblings model teardown+respawn generations reusing it and
+#: nesting models a claim made against a live owner, which that owner
+#: rejects. Referenced by ``@given`` at class-definition time, so it must
+#: precede the test classes.
 _LIFECYCLE_FORESTS = st.recursive(
     st.just([]),
     lambda children: st.lists(children, max_size=3),
     max_leaves=6,
 )
+
+
+def _rejected_claim(namespace):
+    """Return the `DiscoveryNamespaceInUse` a claim against a live owner raises.
+
+    The exception's ``segment`` exposes the segment name a namespace
+    resolves to without the module's private hashing helper.
+    """
+    with LocalDiscovery(namespace):
+        try:
+            with LocalDiscovery(namespace):
+                pass
+        except DiscoveryNamespaceInUse as error:
+            return error
+    raise AssertionError(f"second claim on {namespace!r} was not rejected")
 
 
 @contextmanager
@@ -1039,36 +1114,41 @@ class TestLocalDiscovery:
         with discovery as ctx:
             assert ctx is discovery
 
-    def test___enter___with_existing_namespace(self, namespace):
-        """Test LocalDiscovery joins an existing namespace without error.
+    def test___enter___should_raise_when_namespace_already_owned(self, namespace):
+        """Test a second claim on a live namespace is rejected.
 
         Given:
             A LocalDiscovery that owns a namespace
         When:
             A second LocalDiscovery enters the same namespace via with
         Then:
-            It should succeed without raising FileExistsError.
+            It should raise DiscoveryNamespaceInUse naming the
+            namespace.
         """
         # Arrange
         with LocalDiscovery(namespace):
             # Act & assert
-            with LocalDiscovery(namespace) as joiner:
-                assert joiner is not None
+            with pytest.raises(DiscoveryNamespaceInUse) as excinfo:
+                with LocalDiscovery(namespace):
+                    pass
+
+            assert excinfo.value.namespace == namespace
 
     @pytest.mark.asyncio
-    async def test___enter___should_preserve_workers_when_joining_existing_namespace(
+    async def test___enter___should_preserve_registry_when_second_claim_rejected(
         self, namespace, metadata
     ):
-        """Test joining an existing namespace preserves its contents.
+        """Test a rejected claim leaves the incumbent's registry intact.
 
         Given:
             An owner's namespace already containing a published worker
         When:
-            A second LocalDiscovery enters the same namespace and a
-            subscriber obtained from the joiner iterates
+            A second LocalDiscovery is entered on the same namespace
+            and rejected, and the owner's subscriber then iterates
         Then:
-            It should yield the pre-join worker-added event, proving
-            attaching did not reinitialize the segment.
+            It should yield the worker-added event published before the
+            rejected claim, proving the rejection neither reinitialized
+            nor reclaimed the incumbent's registry.
         """
         # Arrange
         events = []
@@ -1080,25 +1160,28 @@ class TestLocalDiscovery:
                 event_received.set()
                 break
 
-        with LocalDiscovery(namespace):
+        with LocalDiscovery(namespace) as owner:
             publisher = LocalDiscovery.Publisher(namespace)
             async with publisher:
                 await publisher.publish("worker-added", metadata)
 
                 # Act
-                with LocalDiscovery(namespace) as joiner:
-                    subscriber = joiner.subscribe(poll_interval=0.05)
-                    task = asyncio.create_task(collect(subscriber))
+                with pytest.raises(DiscoveryNamespaceInUse):
+                    with LocalDiscovery(namespace):
+                        pass
+
+                subscriber = owner.subscribe(poll_interval=0.05)
+                task = asyncio.create_task(collect(subscriber))
+                try:
+                    await asyncio.wait_for(event_received.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("Worker not discovered after the rejected claim")
+                finally:
+                    task.cancel()
                     try:
-                        await asyncio.wait_for(event_received.wait(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        pytest.fail("Pre-join worker not discovered within timeout")
-                    finally:
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
         # Assert
         assert len(events) == 1
@@ -1126,14 +1209,14 @@ class TestLocalDiscovery:
             with LocalDiscovery(namespace):
                 pass
 
-        # Arrange — the last teardown really freed the name: with no
-        # owner holding it, a publish finds no segment to attach to.
+        # Arrange — the last teardown freed the name: with no owner
+        # holding it, a publisher's bind raises DiscoveryNamespaceNotFound.
         # Without this probe a stale surviving segment would satisfy the
         # roundtrip below just as well as a recreated one.
         probe = LocalDiscovery.Publisher(namespace)
-        async with probe:
-            with pytest.raises(FileNotFoundError):
-                await probe.publish("worker-added", metadata)
+        with pytest.raises(DiscoveryNamespaceNotFound):
+            async with probe:
+                pass
 
         events = []
         event_received = asyncio.Event()
@@ -1168,20 +1251,20 @@ class TestLocalDiscovery:
         assert events[0].type == "worker-added"
         assert events[0].metadata.uid == metadata.uid
 
-    def test___enter___should_not_register_atexit_fallback_when_namespace_already_owned(
+    def test___enter___should_not_register_atexit_fallback_when_claim_rejected(
         self, namespace, atexit_recorder
     ):
-        """Test the non-owner branch performs no atexit traffic.
+        """Test a rejected claim performs no atexit traffic.
 
         Given:
             An owner already holding a namespace, with atexit
             registration wrapped in recording pass-throughs
         When:
-            A second LocalDiscovery enters and exits the same
-            namespace via with
+            A second LocalDiscovery is entered on the same namespace
+            and rejected
         Then:
             It should neither register nor unregister any atexit
-            fallback.
+            fallback — a rejected claim owns nothing to reclaim.
         """
         # Arrange
         registered, unregistered = atexit_recorder
@@ -1190,8 +1273,9 @@ class TestLocalDiscovery:
             registrations = len(registered)
 
             # Act
-            with LocalDiscovery(namespace):
-                pass
+            with pytest.raises(DiscoveryNamespaceInUse):
+                with LocalDiscovery(namespace):
+                    pass
 
             # Assert
             assert len(registered) == registrations
@@ -1241,6 +1325,179 @@ class TestLocalDiscovery:
         with second as entered:
             assert entered is second
 
+    def test___enter___should_name_the_segment_when_the_claim_is_rejected(
+        self, namespace
+    ):
+        """Test a rejected claim names the segment holding the namespace.
+
+        Given:
+            Two distinct namespaces, each claimable by a fresh owner
+        When:
+            A claim against a live owner is rejected twice on the first
+            namespace and once on the second
+        Then:
+            It should report the same segment for both rejections on one
+            namespace and a different segment for the other, and say in
+            its message which segment to remove — the only handle an
+            operator has on a registry whose owner died.
+        """
+        # Arrange
+        other = f"{namespace}-other"
+
+        # Act
+        first = _rejected_claim(namespace)
+        again = _rejected_claim(namespace)
+        separate = _rejected_claim(other)
+
+        # Assert — the segment depends only on the namespace
+        assert first.segment == again.segment
+        assert first.segment != separate.segment
+
+        # Assert — the message names the segment to remove
+        assert first.segment in str(first)
+        assert "remove shared memory" in str(first)
+
+    def test___enter___should_raise_when_a_rejected_instance_is_reentered(
+        self, namespace
+    ):
+        """Test a rejected claim still spends the instance's single use.
+
+        Given:
+            A LocalDiscovery whose claim was rejected while an incumbent
+            held the namespace, and an incumbent that has since exited
+        When:
+            That same instance is entered again on the now-free
+            namespace, and then a fresh instance is entered
+        Then:
+            It should raise RuntimeError for the rejected instance, since
+            any entry attempt spends it, and a fresh instance should
+            claim the namespace.
+        """
+        # Arrange
+        rejected = LocalDiscovery(namespace)
+        with LocalDiscovery(namespace):
+            with pytest.raises(DiscoveryNamespaceInUse):
+                with rejected:
+                    pass
+
+        # Act & assert — the namespace is free, but the instance is not
+        with pytest.raises(RuntimeError, match="cannot be invoked more than once"):
+            with rejected:
+                pass
+
+        # Act & assert — a fresh instance claims it
+        with LocalDiscovery(namespace) as claimed:
+            assert claimed.namespace == namespace
+
+    def test___enter___should_raise_when_a_rejected_instance_retries_under_owner(
+        self, namespace
+    ):
+        """Test a rejected instance is refused while the incumbent still holds.
+
+        Given:
+            A LocalDiscovery whose claim was rejected, and the incumbent
+            that rejected it still holding the namespace
+        When:
+            That same instance is entered again, before the incumbent
+            has exited
+        Then:
+            It should raise RuntimeError: the rejected entry already
+            spent the instance.
+        """
+        # Arrange
+        with LocalDiscovery(namespace):
+            rejected = LocalDiscovery(namespace)
+            with pytest.raises(DiscoveryNamespaceInUse):
+                with rejected:
+                    pass
+
+            # Act & assert — the incumbent is still live, and the guard
+            # is still what refuses
+            with pytest.raises(RuntimeError, match="cannot be invoked more than once"):
+                with rejected:
+                    pass
+
+    def test___enter___should_raise_when_an_exited_instance_is_reentered(
+        self, namespace
+    ):
+        """Test a spent instance is refused even once its namespace is free.
+
+        Given:
+            A LocalDiscovery that has been entered and exited, leaving
+            its namespace claimable
+        When:
+            The same instance is entered a second time
+        Then:
+            It should raise RuntimeError: the guard binds to the
+            instance.
+        """
+        # Arrange
+        discovery = LocalDiscovery(namespace)
+        with discovery:
+            pass
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="cannot be invoked more than once"):
+            with discovery:
+                pass
+
+    @given(ops=st.lists(st.sampled_from(["claim", "release", "borrow"]), max_size=12))
+    @settings(
+        max_examples=50,
+        deadline=5000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @pytest.mark.asyncio
+    async def test___enter___should_admit_one_owner_across_operation_sequences(
+        self, namespace, ops
+    ):
+        """Test the single-owner invariant over arbitrary operation orders.
+
+        Given:
+            Any sequence of claim, release and borrow operations against
+            one namespace
+        When:
+            The sequence is executed against a model tracking whether an
+            owner is currently live
+        Then:
+            A claim should succeed exactly when no owner is live and
+            raise DiscoveryNamespaceInUse otherwise, and a Publisher
+            borrower should bind exactly when an owner is live and raise
+            DiscoveryNamespaceNotFound otherwise.
+        """
+        # Arrange — a per-example namespace, so a segment stranded by
+        # one example cannot decide the next. Borrowing goes through
+        # `Publisher`, which binds on every entry; an iteration of a
+        # pooled `Subscriber` binds only when it starts the shared
+        # subscription (see `LocalDiscovery.Subscriber`).
+        example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
+        generation = ExitStack()
+        owned = False
+
+        # Act & assert
+        try:
+            for op in ops:
+                if op == "claim" and owned:
+                    with pytest.raises(DiscoveryNamespaceInUse):
+                        with LocalDiscovery(example_ns):
+                            pass
+                elif op == "claim":
+                    generation.enter_context(LocalDiscovery(example_ns))
+                    owned = True
+                elif op == "release":
+                    generation.close()
+                    generation = ExitStack()
+                    owned = False
+                elif owned:
+                    async with LocalDiscovery.Publisher(example_ns):
+                        pass
+                else:
+                    with pytest.raises(DiscoveryNamespaceNotFound):
+                        async with LocalDiscovery.Publisher(example_ns):
+                            pass
+        finally:
+            generation.close()
+
     def test___exit___should_disarm_atexit_fallback_when_reentry_is_rejected(
         self, namespace, atexit_recorder
     ):
@@ -1269,39 +1526,7 @@ class TestLocalDiscovery:
         assert registered == unregistered
 
     @pytest.mark.asyncio
-    async def test___exit___as_non_owner(self, namespace):
-        """Test non-owner exit leaves shared memory accessible to owner.
-
-        Given:
-            An owner and a non-owner sharing a namespace
-        When:
-            The non-owner exits via with
-        Then:
-            It should close without unlinking, leaving the shared
-            memory accessible to the owner.
-        """
-        # Arrange
-        worker = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="localhost:50051",
-            pid=123,
-            version="1.0",
-        )
-
-        with LocalDiscovery(namespace):
-            with LocalDiscovery(namespace):
-                pass  # non-owner enters and exits
-
-            # Act & assert — publishing succeeds, proving shared
-            # memory was not unlinked by the non-owner
-            publisher = LocalDiscovery.Publisher(namespace)
-            async with publisher:
-                await publisher.publish("worker-added", worker)
-
-    @pytest.mark.asyncio
-    async def test___exit___should_unlink_segment_when_owner_exits(
-        self, namespace, metadata
-    ):
+    async def test___exit___should_unlink_segment_when_owner_exits(self, namespace):
         """Test owner exit removes the shared-memory segment.
 
         Given:
@@ -1310,8 +1535,8 @@ class TestLocalDiscovery:
             The owner exits via with and a Publisher then publishes
             to that namespace
         Then:
-            It should raise FileNotFoundError from the publish — the
-            segment no longer exists.
+            It should raise DiscoveryNamespaceNotFound from the
+            publisher's bind — the registry no longer exists.
         """
         # Arrange
         with LocalDiscovery(namespace):
@@ -1319,9 +1544,9 @@ class TestLocalDiscovery:
         publisher = LocalDiscovery.Publisher(namespace)
 
         # Act & assert
-        async with publisher:
-            with pytest.raises(FileNotFoundError):
-                await publisher.publish("worker-added", metadata)
+        with pytest.raises(DiscoveryNamespaceNotFound):
+            async with publisher:
+                pass
 
     def test___exit___should_disarm_atexit_fallback_when_exit_is_clean(
         self, namespace, atexit_recorder
@@ -1349,9 +1574,7 @@ class TestLocalDiscovery:
         assert len(registered) == 1
 
     @pytest.mark.asyncio
-    async def test___exit___should_unlink_segment_when_body_raises(
-        self, namespace, metadata
-    ):
+    async def test___exit___should_unlink_segment_when_body_raises(self, namespace):
         """Test exceptional exit still tears the segment down.
 
         Given:
@@ -1360,8 +1583,8 @@ class TestLocalDiscovery:
             The exception unwinds the with statement
         Then:
             It should propagate the ValueError unsuppressed while
-            still unlinking the segment, so a subsequent publish
-            raises FileNotFoundError.
+            still unlinking the segment, so a subsequent borrower's
+            bind raises DiscoveryNamespaceNotFound.
         """
         # Arrange
         publisher = LocalDiscovery.Publisher(namespace)
@@ -1372,53 +1595,62 @@ class TestLocalDiscovery:
                 raise ValueError("boom")
 
         # Assert — teardown still removed the segment
-        async with publisher:
-            with pytest.raises(FileNotFoundError):
-                await publisher.publish("worker-added", metadata)
+        with pytest.raises(DiscoveryNamespaceNotFound):
+            async with publisher:
+                pass
 
-    def test___exit___should_unwind_cleanly_when_owner_exits_before_non_owner(
-        self, namespace
+    @pytest.mark.asyncio
+    async def test___exit___should_free_the_namespace_when_a_borrower_outlives_it(
+        self, namespace, borrowed_publisher
     ):
-        """Test a non-owner outliving the owner still exits cleanly.
+        """Test a live borrower does not hold the namespace open.
 
         Given:
-            An owner and an attached non-owner sharing a namespace
+            An owner holding a namespace and a Publisher that borrowed
+            its registry and published through it
         When:
-            The owner exits first, unlinking the segment name, and
-            the non-owner exits afterwards
+            The owner exits while that borrower is still bound
         Then:
-            It should raise nothing from either exit and leave the
-            namespace re-creatable.
+            It should reclaim the registry regardless — a fresh owner
+            claims the namespace immediately — and the orphaned
+            borrower should still exit without raising.
         """
-        # Arrange — the ExitStack holds the non-owner open past the
-        # owner's exit and closes it afterwards
-        attached = ExitStack()
+        # Act — the borrower stays bound (see `borrowed_publisher`)
+        borrowed_publisher.release_owner()
 
-        # Act
-        with attached:
-            with LocalDiscovery(namespace):
-                attached.enter_context(LocalDiscovery(namespace))
-
-        # Assert
+        # Assert — a live borrower blocks neither the reclaim nor
+        # the next claim
         with LocalDiscovery(namespace) as respawned:
             assert respawned.namespace == namespace
 
+        # Act & assert — the orphaned borrower unwinds without raising
+        await borrowed_publisher.release_publisher()
+
     @pytest.mark.asyncio
     async def test___exit___should_unwind_cleanly_when_overlapping_lifecycles_interleave(
-        self, namespace, metadata
+        self, namespace, metadata, borrowed_publisher
     ):
         """Test overlapping same-namespace generations unwind cleanly.
 
         Given:
-            Owner A and attached non-owner B sharing a namespace
+            Owner A holding a namespace, and a Publisher B that
+            borrowed A's registry and published a worker
         When:
-            A exits, C enters the freed namespace, B exits inside
-            C's epoch, and a worker is published in C's epoch
+            A exits, orphaning B, B publishes again, C enters the freed
+            namespace, a second worker is published in C's epoch, and
+            C and then B exit
         Then:
-            It should raise nothing at any step and the worker should
-            be discoverable through C's fresh segment.
+            It should reject B's publish with DiscoveryNamespaceNotFound,
+            make the second worker discoverable through C's fresh
+            registry, and raise nothing else.
         """
         # Arrange
+        successor_worker = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="localhost:50052",
+            pid=12346,
+            version="1.0.0",
+        )
         events = []
         event_received = asyncio.Event()
 
@@ -1428,35 +1660,37 @@ class TestLocalDiscovery:
                 event_received.set()
                 break
 
-        attached = ExitStack()
+        # Act — A-exit/B-rejected/C-enter/publish/C-exit/B-exit, with B
+        # bound throughout (see `borrowed_publisher`)
+        borrowed_publisher.release_owner()
 
-        # Act — A-enter/B-enter/A-exit/C-enter/B-exit/publish/C-exit
-        with attached:
-            with LocalDiscovery(namespace):
-                attached.enter_context(LocalDiscovery(namespace))
-            with LocalDiscovery(namespace) as c:
-                attached.close()
-                publisher = LocalDiscovery.Publisher(namespace)
-                async with publisher:
-                    await publisher.publish("worker-added", metadata)
+        with pytest.raises(DiscoveryNamespaceNotFound):
+            await borrowed_publisher.publisher.publish("worker-added", metadata)
 
-                    subscriber = c.subscribe(poll_interval=0.05)
-                    task = asyncio.create_task(collect(subscriber))
+        with LocalDiscovery(namespace) as c:
+            publisher = LocalDiscovery.Publisher(namespace)
+            async with publisher:
+                await publisher.publish("worker-added", successor_worker)
+
+                subscriber = c.subscribe(poll_interval=0.05)
+                task = asyncio.create_task(collect(subscriber))
+                try:
+                    await asyncio.wait_for(event_received.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("Worker not discovered in C's epoch")
+                finally:
+                    task.cancel()
                     try:
-                        await asyncio.wait_for(event_received.wait(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        pytest.fail("Worker not discovered in C's epoch")
-                    finally:
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        await borrowed_publisher.release_publisher()
 
         # Assert
         assert len(events) == 1
         assert events[0].type == "worker-added"
-        assert events[0].metadata.uid == metadata.uid
+        assert events[0].metadata.uid == successor_worker.uid
 
     def test___exit___should_not_raise_when_segment_already_unlinked(
         self, namespace, unlink_schedule
@@ -1479,47 +1713,20 @@ class TestLocalDiscovery:
         with LocalDiscovery(namespace):
             pass
 
-    def test___exit___should_disarm_atexit_fallback_when_unlink_raises(
-        self, namespace, atexit_recorder, unlink_schedule
-    ):
-        """Test owner exit disarms the atexit fallback when unlink raises.
-
-        Given:
-            An owner LocalDiscovery whose shared-memory segment is
-            unlinked out from under it, as by another process's
-            resource tracker
-        When:
-            The owner exits via with
-        Then:
-            It should unregister the atexit-registered fallback so it
-            cannot fire a second unlink at interpreter shutdown.
-        """
-        # Arrange
-        registered, unregistered = atexit_recorder
-        unlink_schedule.append(FileNotFoundError(2, "No such file or directory"))
-
-        # Act
-        with LocalDiscovery(namespace):
-            pass
-
-        # Assert
-        assert registered == unregistered
-        assert len(registered) == 1
-
     def test___exit___should_disarm_atexit_fallback_when_unlink_raises_permission_error(
-        self, namespace, atexit_recorder, unlink_schedule
+        self, namespace, atexit_recorder, unlink_schedule, teardown_log
     ):
-        """Test the fallback is disarmed before the unlink can fail.
+        """Test the fallback is disarmed before the unlink is attempted.
 
         Given:
             An owner LocalDiscovery whose segment unlink raises
-            PermissionError, with atexit registration wrapped in
-            recording pass-throughs
+            PermissionError, with atexit unregistration and the unlink
+            recorded into one ordered log
         When:
             The owner exits via with
         Then:
-            It should have unregistered the fallback, proving the
-            disarm precedes the unlink.
+            It should record the unregistration strictly before the
+            unlink — a failing unlink cannot strand an armed fallback.
         """
         # Arrange
         registered, unregistered = atexit_recorder
@@ -1530,9 +1737,11 @@ class TestLocalDiscovery:
             with LocalDiscovery(namespace):
                 pass
 
-        # Assert
+        # Assert — one log for both events, so their relative order is
+        # observable (see `teardown_log`)
         assert registered == unregistered
         assert len(registered) == 1
+        assert teardown_log == ["unregister", "unlink"]
 
     def test___exit___should_warn_when_unlink_fails_unexpectedly(
         self, namespace, unlink_schedule
@@ -1546,13 +1755,17 @@ class TestLocalDiscovery:
             The owner exits via with
         Then:
             It should emit a ResourceWarning naming the segment it
-            could not reclaim.
+            could not reclaim, so an operator can find the leak.
         """
-        # Arrange
+        # Arrange — the segment name is the warning's actionable
+        # payload, so match on it rather than on the prefix alone.
+        # Resolve it before scheduling the fault: doing so claims and
+        # releases the namespace, which would consume a schedule entry.
+        segment = _rejected_claim(namespace).segment
         unlink_schedule.append(PermissionError(13, "Permission denied"))
 
         # Act & assert
-        with pytest.warns(ResourceWarning, match="failed to unlink shared memory"):
+        with pytest.warns(ResourceWarning, match=re.escape(repr(segment))):
             with LocalDiscovery(namespace):
                 pass
 
@@ -1591,18 +1804,20 @@ class TestLocalDiscovery:
         """Test arbitrary same-namespace lifecycles unwind cleanly.
 
         Given:
-            An arbitrary forest of same-namespace LocalDiscovery
-            contexts, where nesting models overlapping instances and
-            siblings model teardown+respawn generations
+            An arbitrary forest of same-namespace claims, where
+            siblings model teardown+respawn generations and nesting
+            models a claim against a live owner
         When:
-            Every context is entered and exited via nested with
-            statements and a final fresh context enters the namespace
+            Every claim is entered via nested with statements, a claim
+            made against a live owner being rejected, and a final
+            fresh owner enters the namespace
         Then:
-            It should raise nothing for any interleaving and leave
-            the namespace re-creatable.
+            It should reject exactly the nested claims with
+            DiscoveryNamespaceInUse, raise nothing else, and leave the
+            namespace re-creatable.
         """
         # Arrange — per-example namespace so a leaked segment in one
-        # example cannot demote the next example's first context
+        # example cannot reject the next example's first claim
         example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
 
         # Act
@@ -1624,18 +1839,19 @@ class TestLocalDiscovery:
         """Test vanishing segments never break lifecycle unwinding.
 
         Given:
-            An arbitrary forest of same-namespace LocalDiscovery
-            contexts and an arbitrary subset of unlink calls that
-            observe the segment already removed by an external
-            unlinker, with atexit registration wrapped in recording
-            pass-throughs
+            An arbitrary forest of same-namespace claims and an
+            arbitrary subset of unlink calls that observe the segment
+            already removed by an external unlinker, with atexit
+            registration wrapped in recording pass-throughs
         When:
-            Every context is entered and exited via nested with
-            statements
+            Every claim is entered via nested with statements, a claim
+            made against a live owner being rejected
         Then:
-            It should raise nothing for any forest and mask
-            combination, pair every registered fallback with exactly
-            one unregistration, and leave the namespace re-creatable.
+            It should reject exactly the nested claims with
+            DiscoveryNamespaceInUse and raise nothing else for any
+            forest and mask combination, pair every registered
+            fallback with exactly one unregistration, and leave the
+            namespace re-creatable.
         """
         # Arrange
         registered, unregistered = atexit_recorder
@@ -1657,25 +1873,22 @@ class TestLocalDiscovery:
             pass
 
     @pytest.mark.asyncio
-    async def test_subscribe_with_non_owner_discovery(self, namespace):
-        """Test non-owner can discover workers published by the owner.
+    async def test_subscribe_should_keep_streaming_when_owner_exits(
+        self, metadata, borrowed_publisher
+    ):
+        """Test an iteration already under way outlives the owner.
 
         Given:
-            An owner and a non-owner sharing a namespace
+            An owner's namespace, a Publisher still bound that
+            published a worker, and a subscriber already iterating it
         When:
-            A worker is published by the owner and discovered through
-            the non-owner's subscriber
+            The owner exits, reclaiming the registry out from under
+            the running iteration
         Then:
-            It should yield the worker-added event with matching
-            metadata.
+            It should keep yielding the worker's registration.
         """
-        # Arrange
-        worker = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="localhost:50051",
-            pid=123,
-            version="1.0",
-        )
+        # Arrange — the borrower keeps the worker's block alive past the
+        # owner's release (see `borrowed_publisher`).
         events = []
         event_received = asyncio.Event()
 
@@ -1683,33 +1896,43 @@ class TestLocalDiscovery:
             async for event in subscriber:
                 events.append(event)
                 event_received.set()
-                break
 
-        with LocalDiscovery(namespace):
-            with LocalDiscovery(namespace) as joiner:
-                publisher = LocalDiscovery.Publisher(namespace)
-                subscriber = joiner.subscribe(poll_interval=0.05)
+        subscriber = borrowed_publisher.owner.subscribe(poll_interval=0.05)
+        task = asyncio.create_task(collect(subscriber))
+        try:
+            await asyncio.wait_for(event_received.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pytest.fail("Worker not discovered within timeout")
 
-                # Act
-                async with publisher:
-                    await publisher.publish("worker-added", worker)
+        # Act — the owner exits out from under the live iteration
+        observed = len(events)
+        event_received.clear()
+        borrowed_publisher.release_owner()
 
-                    task = asyncio.create_task(collect(subscriber))
-                    try:
-                        await asyncio.wait_for(event_received.wait(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        pytest.fail("Worker not discovered via non-owner within timeout")
-                    finally:
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+        try:
+            # Assert — the stream kept yielding after the reclaim. The
+            # subscriber re-reports the unchanged worker as
+            # worker-updated on each scan, so a further event arrives
+            # only if scanning continued.
+            await asyncio.wait_for(event_received.wait(), timeout=2.0)
+            assert len(events) > observed
 
-        # Assert
-        assert len(events) == 1
-        assert events[0].type == "worker-added"
-        assert events[0].metadata.uid == worker.uid
+            # Assert — and kept reading the same registration: a
+            # registry it could no longer read would surface the
+            # worker as dropped.
+            assert not task.done()
+            assert events[0].type == "worker-added"
+            assert events[0].metadata.uid == metadata.uid
+            assert {event.type for event in events[1:]} <= {"worker-updated"}
+            assert all(event.metadata.uid == metadata.uid for event in events)
+        except asyncio.TimeoutError:
+            pytest.fail("Orphaned iteration stopped yielding after the reclaim")
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     @pytest.mark.asyncio
     async def test___enter___should_restamp_capacity_when_recreated_by_new_owner(
@@ -1840,6 +2063,22 @@ class TestLocalDiscoveryPublisher:
         with pytest.raises(ValueError, match="Lock timeout must be non-negative"):
             LocalDiscovery.Publisher(namespace, lock_timeout=-1)
 
+    def test___init___should_raise_when_capacity_is_declared(self, namespace):
+        """Test a borrower is offered no capacity of its own.
+
+        Given:
+            A namespace whose capacity is the owner's to stamp
+        When:
+            A Publisher is constructed with a capacity argument
+        Then:
+            It should raise TypeError naming the rejected argument —
+            capacity is read from the registry the owner stamped, and a
+            borrower has no way to declare or override it.
+        """
+        # Act & assert
+        with pytest.raises(TypeError, match="capacity"):
+            LocalDiscovery.Publisher(namespace, capacity=128)  # type: ignore[call-arg]
+
     @given(
         lock_timeout=st.one_of(
             st.none(),
@@ -1916,7 +2155,7 @@ class TestLocalDiscoveryPublisher:
         """Test Publisher async context manager lifecycle.
 
         Given:
-            A Publisher instance
+            A Publisher instance on a namespace an owner holds
         When:
             Used as an async context manager via async with
         Then:
@@ -1927,8 +2166,169 @@ class TestLocalDiscoveryPublisher:
         publisher = LocalDiscovery.Publisher(namespace)
 
         # Act & assert
-        async with publisher as ctx:
-            assert ctx is publisher
+        with LocalDiscovery(namespace):
+            async with publisher as ctx:
+                assert ctx is publisher
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_raise_when_namespace_has_no_owner(self, namespace):
+        """Test a publisher never creates the registry it borrows.
+
+        Given:
+            A Publisher on a namespace no LocalDiscovery has entered
+        When:
+            The publisher is entered via async with
+        Then:
+            It should raise DiscoveryNamespaceNotFound naming the
+            namespace, having created no registry of its own.
+        """
+        # Arrange
+        publisher = LocalDiscovery.Publisher(namespace)
+
+        # Act & assert
+        with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+            async with publisher:
+                pass
+
+        assert excinfo.value.namespace == namespace
+
+        # Assert — the rejected bind left no registry behind, so the
+        # namespace is still free for an owner to claim.
+        with LocalDiscovery(namespace) as owner:
+            assert owner.namespace == namespace
+
+    @pytest.mark.parametrize("event", ["worker-added", "worker-dropped"])
+    @pytest.mark.asyncio
+    async def test_publish_should_raise_when_the_owner_has_exited(
+        self, namespace, metadata, event, borrowed_publisher
+    ):
+        """Test publishing through an orphaned publisher is rejected.
+
+        Given:
+            A Publisher bound while its owner was live, with a worker
+            already published, whose owner has since exited and
+            reclaimed the registry
+        When:
+            The still-bound publisher publishes again
+        Then:
+            It should raise DiscoveryNamespaceNotFound naming the
+            namespace, chained from the underlying FileNotFoundError,
+            for either event kind.
+        """
+        # Arrange — orphan the still-bound publisher (see
+        # `borrowed_publisher`)
+        borrowed_publisher.release_owner()
+
+        # Act & assert
+        with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+            await borrowed_publisher.publisher.publish(event, metadata)
+
+        assert excinfo.value.namespace == namespace
+        assert isinstance(excinfo.value.__cause__, FileNotFoundError)
+
+    @pytest.mark.asyncio
+    async def test_publish_should_reach_successor_registry_when_orphaned(
+        self, namespace, metadata, borrowed_publisher
+    ):
+        """Test an orphaned publisher publishes to a successor's registry.
+
+        Given:
+            A Publisher bound while its owner was live, whose owner has
+            since exited, and a successor LocalDiscovery that has
+            entered the same namespace
+        When:
+            The orphaned publisher publishes worker-added
+        Then:
+            It should raise nothing, and a subscriber on the successor
+            should observe the worker.
+        """
+        # Arrange — orphan the still-bound publisher (see
+        # `borrowed_publisher`)
+        borrowed_publisher.release_owner()
+        events = []
+        event_received = asyncio.Event()
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                events.append(event)
+                event_received.set()
+                break
+
+        with LocalDiscovery(namespace) as successor:
+            # Act
+            await borrowed_publisher.publisher.publish("worker-added", metadata)
+
+            # Assert
+            subscriber = successor.subscribe(poll_interval=0.05)
+            task = asyncio.create_task(collect(subscriber))
+            try:
+                await asyncio.wait_for(event_received.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pytest.fail("Worker not discovered in the successor's registry")
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            assert len(events) == 1
+            assert events[0].type == "worker-added"
+            assert events[0].metadata.uid == metadata.uid
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_reclaim_its_blocks_when_the_owner_has_exited(
+        self, atexit_recorder, borrowed_publisher
+    ):
+        """Test an orphaned publisher still reclaims its own blocks.
+
+        Given:
+            A Publisher that published a worker while its owner was
+            live, with atexit registration wrapped in recording
+            pass-throughs, whose owner has since reclaimed the registry
+        When:
+            The orphaned publisher exits
+        Then:
+            It should exit without raising and unregister every block
+            fallback it registered — a borrower owns its worker blocks
+            even once the registry it borrowed is gone.
+        """
+        # Arrange — orphan the still-bound publisher (see
+        # `borrowed_publisher`)
+        registered, unregistered = atexit_recorder
+        borrowed_publisher.release_owner()
+
+        # Act
+        await borrowed_publisher.release_publisher()
+
+        # Assert — every fallback the publisher armed was disarmed
+        assert registered == unregistered
+        assert len(registered) >= 1
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_leave_the_registry_to_its_owner(
+        self, namespace, metadata
+    ):
+        """Test a publisher's exit leaves the registry to its owner.
+
+        Given:
+            An owner holding a namespace and a Publisher borrowing its
+            registry
+        When:
+            The publisher exits while the owner is still live
+        Then:
+            It should leave the registry intact, so a fresh borrower
+            binds and publishes to it afterwards.
+        """
+        # Arrange
+        with LocalDiscovery(namespace):
+            # Act
+            async with LocalDiscovery.Publisher(namespace):
+                pass
+
+            # Assert — a fresh borrower still binds and publishes
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", metadata)
 
     @pytest.mark.asyncio
     async def test_publish_worker_added(self, namespace, metadata):
@@ -4128,21 +4528,21 @@ class TestLocalDiscoveryPublisher:
         assert discovered[target.uid].version == "2.0"
 
     @pytest.mark.asyncio
-    async def test_publish_should_enforce_owner_capacity_when_non_owner_declares_larger(
+    async def test_publish_should_enforce_the_owner_capacity_for_a_borrower(
         self, namespace
     ):
-        """Test a non-owner's publisher enforces the owner's stamped capacity.
+        """Test a borrowing publisher enforces the owner's stamped capacity.
 
         Given:
-            An owner LocalDiscovery holding the segment at capacity 1 and a
-            non-owner attached to the same namespace declaring capacity 100
+            An owner LocalDiscovery holding the registry at capacity 1
+            and a Publisher borrowing that registry
         When:
-            The non-owner's publisher publishes a first worker, then a
-            second
+            The borrower publishes a first worker, then a second
         Then:
-            It should admit the first and raise DiscoveryCapacityExhausted on
-            the second — the owner's stamped cap of 1 governs, and the
-            non-owner's declared 100 is ignored.
+            It should admit the first and raise DiscoveryCapacityExhausted
+            on the second — the owner's stamped cap of 1 governs, and a
+            borrower takes no capacity of its own with which to override
+            it.
         """
         # Arrange
         worker_a = WorkerMetadata(
@@ -4154,38 +4554,33 @@ class TestLocalDiscoveryPublisher:
 
         # Act & assert
         with LocalDiscovery(namespace, capacity=1):
-            with LocalDiscovery(namespace, capacity=100) as non_owner:
-                async with non_owner.publisher as publisher:
-                    await publisher.publish("worker-added", worker_a)
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", worker_a)
 
-                    with pytest.raises(DiscoveryCapacityExhausted):
-                        await publisher.publish("worker-added", worker_b)
+                with pytest.raises(DiscoveryCapacityExhausted):
+                    await publisher.publish("worker-added", worker_b)
 
-    @given(
-        owner_cap=st.integers(min_value=1, max_value=8),
-        peer_cap=st.integers(min_value=1, max_value=8),
-    )
+    @given(owner_cap=st.integers(min_value=1, max_value=8))
     @settings(
         max_examples=15,
         deadline=5000,
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
-    async def test_publish_should_bound_non_owner_registrations_by_owner_capacity(
-        self, namespace, owner_cap, peer_cap
+    async def test_publish_should_bound_borrower_registrations_by_owner_capacity(
+        self, namespace, owner_cap
     ):
-        """Test the owner's stamped capacity bounds a non-owner's publisher.
+        """Test the owner's stamped capacity bounds a borrowing publisher.
 
         Given:
-            An owner declaring an arbitrary capacity and a non-owner
-            attached to the same namespace declaring an unrelated capacity
+            An owner declaring an arbitrary capacity and a Publisher
+            borrowing the registry it stamped
         When:
-            The non-owner's publisher publishes owner-capacity workers,
-            then one more
+            The borrower publishes owner-capacity workers, then one more
         Then:
             It should admit exactly the owner's capacity and raise "No
-            available slots" on the next — the segment header is the single
-            source of truth regardless of the non-owner's declared value.
+            available slots" on the next — the registry header is the
+            single source of truth for every borrower of it.
         """
         # Arrange — a per-example namespace so shared-memory state does not
         # carry across Hypothesis examples.
@@ -4202,13 +4597,12 @@ class TestLocalDiscoveryPublisher:
 
         # Act & assert
         with LocalDiscovery(example_ns, capacity=owner_cap):
-            with LocalDiscovery(example_ns, capacity=peer_cap) as non_owner:
-                async with non_owner.publisher as publisher:
-                    for worker in workers[:owner_cap]:
-                        await publisher.publish("worker-added", worker)
+            async with LocalDiscovery.Publisher(example_ns) as publisher:
+                for worker in workers[:owner_cap]:
+                    await publisher.publish("worker-added", worker)
 
-                    with pytest.raises(DiscoveryCapacityExhausted):
-                        await publisher.publish("worker-added", workers[owner_cap])
+                with pytest.raises(DiscoveryCapacityExhausted):
+                    await publisher.publish("worker-added", workers[owner_cap])
 
     @given(
         capacity=st.integers(min_value=1, max_value=4),
@@ -4596,6 +4990,42 @@ class TestLocalDiscoverySubscriber:
     wool.runtime.discovery.local.LocalDiscovery.Subscriber
     """
 
+    def test___init___should_raise_when_capacity_is_declared(self, namespace):
+        """Test a borrower is offered no capacity of its own.
+
+        Given:
+            A namespace whose capacity is the owner's to stamp
+        When:
+            A Subscriber is constructed with a capacity argument
+        Then:
+            It should raise TypeError naming the rejected argument —
+            capacity is read from the registry the owner stamped, and a
+            borrower has no way to declare or override it.
+        """
+        # Act & assert
+        with pytest.raises(TypeError, match="capacity"):
+            LocalDiscovery.Subscriber(namespace, capacity=128)  # type: ignore[call-arg]
+
+    def test___new___should_return_a_subscriber_protocol_not_the_class(self, namespace):
+        """Test constructing a Subscriber yields a DiscoverySubscriberLike.
+
+        Given:
+            A namespace and a poll interval.
+        When:
+            A LocalDiscovery.Subscriber is constructed.
+        Then:
+            It should return an object satisfying DiscoverySubscriberLike
+            that is not a LocalDiscovery.Subscriber and exposes no
+            namespace attribute.
+        """
+        # Act
+        subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+
+        # Assert
+        assert isinstance(subscriber, DiscoverySubscriberLike)
+        assert not isinstance(subscriber, LocalDiscovery.Subscriber)
+        assert not hasattr(subscriber, "namespace")
+
     @pytest.mark.asyncio
     async def test___aiter___with_negative_poll_interval(self, namespace):
         """Test iteration rejects negative poll_interval.
@@ -4616,6 +5046,127 @@ class TestLocalDiscoverySubscriber:
             # Act & assert
             with pytest.raises(ValueError, match=r"positive poll interval.*-0\.1"):
                 await anext(aiter(subscriber))
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_raise_when_namespace_has_no_owner(self, namespace):
+        """Test a subscriber never creates the registry it borrows.
+
+        Given:
+            A Subscriber on a namespace no LocalDiscovery has entered
+        When:
+            The subscriber is iterated
+        Then:
+            It should raise DiscoveryNamespaceNotFound naming the
+            namespace, having created neither a registry nor the
+            notification directory a bound subscriber watches.
+        """
+        # Arrange
+        subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+
+        # Act & assert
+        with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+            async for _ in subscriber:
+                pytest.fail("Subscriber yielded an event without an owner")
+
+        assert excinfo.value.namespace == namespace
+
+        # Assert — the rejected bind created nothing: no notification
+        # directory for a namespace that never had an owner, and no
+        # registry, so the namespace is still free for an owner to claim.
+        assert not (Path(tempfile.gettempdir()).resolve() / f"wool-{namespace}").exists()
+        with LocalDiscovery(namespace) as owner:
+            assert owner.namespace == namespace
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_raise_when_the_owner_has_exited(self, namespace):
+        """Test a borrower binding after the reclaim is rejected.
+
+        Given:
+            A namespace whose owner has entered and exited, with no
+            iteration on it outstanding
+        When:
+            A Subscriber on that namespace is iterated
+        Then:
+            It should raise DiscoveryNamespaceNotFound naming the
+            namespace.
+        """
+        # Arrange — no iteration is left live, so this iteration binds
+        # (see `LocalDiscovery.Subscriber`).
+        with LocalDiscovery(namespace):
+            pass
+
+        # Act & assert
+        with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+            async for _ in LocalDiscovery.Subscriber(namespace, poll_interval=0.05):
+                pytest.fail("Subscriber yielded an event after the reclaim")
+
+        assert excinfo.value.namespace == namespace
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_bind_when_a_new_owner_claims_the_namespace(
+        self, namespace, metadata
+    ):
+        """Test a rejected borrower recovers under a new owner.
+
+        Given:
+            A Subscriber whose iteration was rejected because no owner
+            held its namespace
+        When:
+            A new owner claims that namespace, publishes a worker, and
+            the same subscriber is iterated again
+        Then:
+            It should discover the worker.
+        """
+        # Arrange
+        subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+        with pytest.raises(DiscoveryNamespaceNotFound):
+            async for _ in subscriber:
+                pytest.fail("Subscriber yielded an event with no owner")
+
+        # Act & assert — the same handle, under a new owner
+        with LocalDiscovery(namespace):
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", metadata)
+
+                discovered = None
+                async for event in subscriber:
+                    discovered = event
+                    break
+
+        assert discovered is not None
+        assert discovered.type == "worker-added"
+        assert discovered.metadata.uid == metadata.uid
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_raise_file_not_found_when_a_block_vanished(
+        self, namespace
+    ):
+        """Test a vanished worker block is not reported as a lost registry.
+
+        Given:
+            A live owner whose registry holds a slot for a worker whose
+            metadata block was unlinked by the publisher that created it
+        When:
+            A Subscriber on that namespace scans
+        Then:
+            It should raise FileNotFoundError — the registry is intact
+            and only one worker's block is gone, so reporting the
+            namespace as missing would misdiagnose it.
+        """
+        # Arrange — the exiting publisher unlinks its blocks but leaves
+        # the address-space slot populated.
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+
+        with LocalDiscovery(namespace):
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", worker)
+
+            # Act & assert
+            with pytest.raises(FileNotFoundError):
+                async for _ in LocalDiscovery.Subscriber(namespace, poll_interval=0.05):
+                    pytest.fail("Subscriber yielded an event for a vanished block")
 
     @pytest.mark.asyncio
     async def test___aiter___discovers_added_worker(self, namespace, metadata):
@@ -5183,21 +5734,20 @@ class TestLocalDiscoverySubscriber:
         assert seen == expected
 
     @pytest.mark.asyncio
-    async def test___aiter___should_bound_non_owner_subscriber_by_owner_capacity(
+    async def test___aiter___should_bound_a_borrowing_subscriber_by_owner_capacity(
         self, namespace
     ):
-        """Test a non-owner's subscriber reads the owner's stamped capacity.
+        """Test a borrowing subscriber reads the owner's stamped capacity.
 
         Given:
             An owner LocalDiscovery at capacity 4 with four workers
-            published, and a non-owner attached to the same namespace
-            declaring capacity 1
+            published, and a Subscriber borrowing that registry
         When:
-            A subscriber obtained from the non-owner iterates
+            The borrowing subscriber iterates
         Then:
             It should discover all four workers — the scan is bounded by
-            the owner's stamped capacity, and the non-owner's declared 1 is
-            ignored.
+            the capacity the owner stamped, which every borrower of the
+            registry reads rather than declaring its own.
         """
         # Arrange
         workers = [
@@ -5227,19 +5777,18 @@ class TestLocalDiscoverySubscriber:
                 for worker in workers:
                     await publisher.publish("worker-added", worker)
 
-                with LocalDiscovery(namespace, capacity=1) as non_owner:
-                    subscriber = non_owner.subscribe(poll_interval=0.05)
-                    task = asyncio.create_task(collect(subscriber))
+                subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+                task = asyncio.create_task(collect(subscriber))
+                try:
+                    await asyncio.wait_for(all_seen.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("Borrowing subscriber did not discover all workers")
+                finally:
+                    task.cancel()
                     try:
-                        await asyncio.wait_for(all_seen.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        pytest.fail("Non-owner subscriber did not discover all workers")
-                    finally:
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
         # Assert
         assert seen == expected
@@ -5442,6 +5991,73 @@ class TestLocalDiscoverySubscriber:
         assert len(events) == 1
         assert events[0].metadata.uid == metadata.uid
 
+    def test___reduce___should_carry_the_poll_interval(self, namespace):
+        """Test a reduced subscriber keeps the interval that keys its subscription.
+
+        Given:
+            A Subscriber constructed on a namespace at a non-default
+            poll interval.
+        When:
+            It is pickled and unpickled.
+        Then:
+            It should reduce to the same configuration, poll interval
+            included, since the interval is part of the subscription key.
+        """
+        # Arrange
+        subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=2.5)
+
+        # Act
+        restored = pickle.loads(pickle.dumps(subscriber))
+
+        # Assert — the restored copy and a fresh construction at the
+        # same interval reduce to the same bytes, and one at a different
+        # interval does not
+        assert pickle.dumps(restored) == pickle.dumps(subscriber)
+        assert pickle.dumps(subscriber) == pickle.dumps(
+            LocalDiscovery.Subscriber(namespace, poll_interval=2.5)
+        )
+        assert pickle.dumps(subscriber) != pickle.dumps(
+            LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+        )
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_raise_only_on_the_iteration_that_binds(
+        self, namespace
+    ):
+        """Test only the binding iteration of an unowned namespace raises.
+
+        Given:
+            A subscriber for a namespace no owner holds, iterated by
+            several consumers started together.
+        When:
+            All of the iterations are driven to completion.
+        Then:
+            It should raise DiscoveryNamespaceNotFound on the iteration
+            that performs the bind and end the others without events.
+        """
+
+        # Arrange
+        async def drain(subscriber):
+            try:
+                async for _ in subscriber:
+                    pass
+            except DiscoveryNamespaceNotFound:
+                return "raised"
+            return "ended"
+
+        subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+
+        # Act
+        outcomes = await asyncio.gather(
+            drain(subscriber),
+            drain(subscriber),
+            drain(LocalDiscovery.Subscriber(namespace, poll_interval=0.05)),
+        )
+
+        # Assert
+        assert outcomes.count("raised") == 1
+        assert outcomes.count("ended") == 2
+
     @pytest.mark.asyncio
     async def test___aiter___should_leave_the_tracker_balanced_when_polling(
         self, namespace, attach_fallback, attach_calls, tracker_ledger
@@ -5496,8 +6112,24 @@ class TestLocalDiscoverySubscriber:
         assert tracker_ledger.residual == set()
 
 
-def _enter_lifecycle_forest(namespace, forest):
-    """Enter one same-namespace context per node, nesting children."""
+def _enter_lifecycle_forest(namespace, forest, owned=False):
+    """Enter one claim on the namespace per node, nesting children.
+
+    A node entered while the namespace is free becomes its owner and
+    holds it for the duration of its children; a node entered while a
+    generation is live is a claim that generation's owner must reject,
+    and its children run on under the incumbent.
+
+    Each outcome is asserted rather than suppressed, so forest *depth*
+    discriminates: every nested node is a live rejection, which is what
+    ties these forests to the single-owner model rather than to teardown
+    hygiene alone.
+    """
     for children in forest:
-        with LocalDiscovery(namespace):
-            _enter_lifecycle_forest(namespace, children)
+        with ExitStack() as generation:
+            if owned:
+                with pytest.raises(DiscoveryNamespaceInUse):
+                    generation.enter_context(LocalDiscovery(namespace))
+            else:
+                generation.enter_context(LocalDiscovery(namespace))
+            _enter_lifecycle_forest(namespace, children, owned=True)
