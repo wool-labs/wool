@@ -48,7 +48,7 @@ class DiscoveryCapacityExhausted(WoolError):
 class DiscoveryBlockExhausted(WoolError):
     """Raised when serialized worker metadata exceeds its block.
 
-    A worker's metadata lives in a fixed-size shared-memory block created
+    A worker's metadata lives in a fixed-size block file created
     at its first registration (`LocalDiscovery`'s ``block_size``). A
     publish whose serialized metadata does not fit that block raises this,
     leaving the prior registration intact.
@@ -92,33 +92,22 @@ class DiscoveryWorkerNotFound(WoolError):
 
 # public
 class DiscoveryNamespaceInUse(WoolError):
-    """Raised when claiming a namespace whose registry already exists.
+    """Raised when claiming a namespace a live owner already holds.
 
-    The registry belongs to a live owner or persists from a killed one;
-    see `LocalDiscovery`.
+    A namespace is only ever in use while its owner lives; see
+    `LocalDiscovery`.
 
     :param namespace:
         The namespace whose claim was rejected, when known.
-    :param segment:
-        Name of the shared-memory segment backing the existing registry,
-        when known. Remove it only once no live process owns the
-        namespace; removing a live owner's segment lets a second owner
-        claim the namespace.
     """
 
-    def __init__(self, namespace: str | None = None, segment: str | None = None):
+    def __init__(self, namespace: str | None = None):
         self.namespace = namespace
-        self.segment = segment
-        super().__init__(namespace, segment)
+        super().__init__(namespace)
 
     def __str__(self) -> str:
         detail = "" if self.namespace is None else f" {self.namespace!r}"
-        hint = (
-            ""
-            if self.segment is None
-            else f"; if no live process owns it, remove shared memory {self.segment!r}"
-        )
-        return f"Discovery namespace{detail} is already in use{hint}"
+        return f"Discovery namespace{detail} is already in use"
 
 
 # public
