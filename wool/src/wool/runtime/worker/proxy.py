@@ -61,6 +61,7 @@ from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.connection import channel_pool_hold
 from wool.runtime.worker.exceptions import UnparsableVersionWarning
 from wool.runtime.worker.metadata import WorkerMetadata
+from wool.utilities.afilter import afilter
 from wool.utilities.noreentry import noreentry
 from wool.utilities.throttle import Throttle
 
@@ -185,7 +186,7 @@ def _restore_proxy(
     major protocol version.
 
     :param discovery:
-        Discovery subscriber or factory carried through the reduce tuple.
+        Discovery subscriber carried through the reduce tuple.
     :param loadbalancer:
         Load balancer instance or factory carried through the reduce tuple.
     :param proxy_id:
@@ -290,12 +291,12 @@ class WorkerProxy:
     routing. The bridge between `wool.routine`-decorated functions and
     the worker pool.
 
-    Connects to workers through discovery services, pool URIs, or static
-    worker lists. Handles connection lifecycle and fault tolerance
+    Connects to workers through a discovery subscriber, a pool URI, or a
+    static worker list. Handles connection lifecycle and fault tolerance
     automatically. A proxy is single-use: it is started once and stopped
     once, and a start that fails leaves it un-started and free to retry.
 
-    Every worker on every construction path — discovery stream, pool
+    Every worker on every construction path — discovery subscriber, pool
     URI, or static list — passes an admission gate before joining the
     pool. Each arm compares one advertised property against this
     proxy's own posture: the worker's ``secure`` flag against the
@@ -344,12 +345,16 @@ class WorkerProxy:
     dispatches over the channels of the loop it was started on.
 
     :param pool_uri:
-        Pool identifier for discovery-based connection.
+        Pool identifier. The proxy borrows the `~wool.LocalDiscovery`
+        namespace of that name and admits workers tagged with the URI or
+        any of ``tags``. Proxies naming one pool URI in one context share
+        a subscription; see `~wool.LocalDiscovery.Subscriber`.
     :param tags:
         Additional tags for filtering discovered workers.
     :param discovery:
-        Discovery service or event stream. Workers it surfaces are
-        admitted only after passing the admission gate described above.
+        A `~wool.DiscoverySubscriberLike`, consumed as given; see that
+        protocol for entry and picklability. Workers it surfaces pass the
+        admission gate described above.
     :param workers:
         Static worker list for direct connection.
     :param loadbalancer:
@@ -399,17 +404,26 @@ class WorkerProxy:
         count when constructed with a static ``workers`` list, or
         ``quorum_timeout`` is non-positive or supplied without a
         positive ``quorum``.
+    :raises TypeError:
+        If ``discovery`` does not implement
+        `~wool.DiscoverySubscriberLike`, e.g., a factory that returns one.
     :raises asyncio.TimeoutError:
         Raised at context entry (``lazy=False``) or first
         `dispatch` (``lazy=True``) if ``quorum`` workers are not
-        admitted within ``quorum_timeout`` seconds.
+        admitted within ``quorum_timeout`` seconds from a discovery
+        subscriber that iterates without error.
+    :raises ~wool.DiscoveryNamespaceNotFound:
+        If the discovery subscriber binds a `~wool.LocalDiscovery`
+        namespace that has no registry. The error surfaces where the
+        quorum wait would otherwise raise `asyncio.TimeoutError`, or from
+        `stop` when no quorum is set.
 
     .. caution::
 
-       Pre-called context manager instances passed as ``loadbalancer``
-       or ``discovery`` are not picklable and will cause nested routine
-       dispatch to fail.  Pass a callable returning the context manager
-       instead.  See `Factory`.
+       A pre-called context manager instance passed as ``loadbalancer``
+       is not picklable and will cause nested routine dispatch to fail.
+       Pass a callable returning the context manager instead.  See
+       `Factory`.
 
     **Connect via pool URI:**
 
@@ -480,10 +494,13 @@ class WorkerProxy:
     wire-protocol guarantee the worker interceptor also enforces
     server-side, and an uncredentialed proxy cannot complete a TLS
     handshake with a ``secure`` worker.
+
+    A pool-URI proxy builds its subscriber without a ``poll_interval``,
+    which is part of the subscription key, so it rescans only when a
+    publisher writes.
     """
 
-    _discovery: DiscoverySubscriberLike | Factory[DiscoverySubscriberLike]
-    _discovery_stream: DiscoverySubscriberLike | None
+    _discovery: DiscoverySubscriberLike
     _loadbalancer: LoadBalancerLike | Factory[LoadBalancerLike]
     _loadbalancer_service: LoadBalancerLike | DispatchingLoadBalancerLike | None
     _provider: WorkerCredentialsProvider | None
@@ -505,7 +522,7 @@ class WorkerProxy:
     def __init__(
         self,
         *,
-        discovery: DiscoverySubscriberLike | Factory[DiscoverySubscriberLike],
+        discovery: DiscoverySubscriberLike,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
@@ -556,9 +573,7 @@ class WorkerProxy:
         self,
         pool_uri: str | None = None,
         *tags: str,
-        discovery: (
-            DiscoverySubscriberLike | Factory[DiscoverySubscriberLike] | None
-        ) = None,
+        discovery: DiscoverySubscriberLike | None = None,
         workers: Sequence[WorkerMetadata] | None = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
@@ -629,15 +644,6 @@ class WorkerProxy:
                 UserWarning,
                 stacklevel=2,
             )
-        if isinstance(discovery, (ContextManager, AsyncContextManager)):
-            warnings.warn(
-                "Passing a context manager instance as 'discovery' is "
-                "not picklable and will fail during nested routine "
-                "dispatch. Wrap it in a callable instead "
-                "(e.g., discovery=my_cm instead of discovery=my_cm()).",
-                UserWarning,
-                stacklevel=2,
-            )
 
         # Warn here, where the caller's construction frame is reachable, when a
         # balancer that implements *only* the deprecated dispatch protocol is
@@ -679,8 +685,22 @@ class WorkerProxy:
                 def tag_filter(w):
                     return bool(match_tags & w.tags)
 
-                self._discovery = LocalDiscovery(pool_uri).subscribe(filter=tag_filter)
+                # Borrows, never owns; see the ``pool_uri`` parameter.
+                self._discovery = afilter(
+                    tag_filter, LocalDiscovery.Subscriber(pool_uri)
+                )
             case (None, discovery, None) if discovery is not None:
+                if not isinstance(discovery, DiscoverySubscriberLike):
+                    if callable(discovery):
+                        raise TypeError(
+                            "'discovery' takes no callable form; pass the "
+                            "subscriber itself, got: "
+                            f"{type(discovery)}"
+                        )
+                    raise TypeError(
+                        f"Expected {DiscoverySubscriberLike.__name__}, got: "
+                        f"{type(discovery)}"
+                    )
                 self._discovery = discovery
             case (None, None, workers) if workers is not None:
                 compatible_workers = [
@@ -763,21 +783,26 @@ class WorkerProxy:
         :returns:
             Tuple of (callable, args) for unpickling.
         :raises TypeError:
-            If ``loadbalancer`` or ``discovery`` is a context manager
-            instance, which cannot be pickled.
+            If ``loadbalancer`` is a context manager instance, which
+            cannot be pickled, or ``discovery`` is a context manager; see
+            `~wool.DiscoverySubscriberLike`.
         """
-        for name, value in (
-            ("loadbalancer", self._loadbalancer),
-            ("discovery", self._discovery),
-        ):
-            if isinstance(value, (ContextManager, AsyncContextManager)):
-                raise TypeError(
-                    f"Cannot pickle WorkerProxy: the '{name}' parameter "
-                    f"is a context manager instance ({type(value).__name__}), "
-                    f"which is not picklable. Wrap it in a callable "
-                    f"instead (e.g., {name}=my_cm instead of "
-                    f"{name}=my_cm())."
-                )
+        if isinstance(self._loadbalancer, (ContextManager, AsyncContextManager)):
+            raise TypeError(
+                "Cannot pickle WorkerProxy: the 'loadbalancer' parameter is a "
+                "context manager instance "
+                f"({type(self._loadbalancer).__name__}), which is not "
+                "picklable. Wrap it in a callable instead (e.g., "
+                "loadbalancer=my_cm instead of loadbalancer=my_cm())."
+            )
+        if isinstance(self._discovery, (ContextManager, AsyncContextManager)):
+            raise TypeError(
+                "Cannot pickle WorkerProxy: the 'discovery' subscriber is a "
+                f"context manager ({type(self._discovery).__name__}), which "
+                "cannot travel with the proxy. Its owner, a WorkerPool or the "
+                "application, must enter it and pass on a picklable "
+                "subscriber; see DiscoverySubscriberLike."
+            )
 
         return (
             _restore_proxy,
@@ -890,27 +915,30 @@ class WorkerProxy:
         """Start the proxy by initiating discovery and load balancing.
 
         Takes a hold on the loop's channel pool (see `channel_pool_hold`),
-        enters the load balancer, then the discovery stream, and launches
-        the worker sentinel, handing all of it to `stop` to unwind in
-        reverse. A start that fails at any step, the quorum wait
-        included, releases what it had acquired in reverse order and
-        leaves the proxy un-started, so a later `start` may retry. A
-        load balancer or discovery source configured as a context
-        manager is exited with the failure and its suppression verdict
-        ignored — see `wool.runtime.typing.resolved` — so a failed start
-        is never reported as a started proxy. The proxy is starting for
-        the whole of a failed start's unwind and new only once it
-        returns, so a concurrent start, or a lazy dispatch, raises
-        rather than racing it.
+        enters the load balancer, adopts the discovery subscriber, and
+        launches the worker sentinel, handing all of it to `stop` to
+        unwind in reverse. A start that fails at any step, the quorum
+        wait included, releases what it had acquired in reverse order
+        and leaves the proxy un-started, so a later `start` may retry. A
+        load balancer configured as a context manager is exited with the
+        failure and its suppression verdict ignored — see
+        `wool.runtime.typing.resolved` — so a failed start is never
+        reported as a started proxy. The proxy is starting for the whole
+        of a failed start's unwind and new only once it returns, so a
+        concurrent start, or a lazy dispatch, raises rather than racing
+        it.
 
         :raises RuntimeError:
             If the proxy is starting, started, stopping, or stopped.
         :raises TypeError:
-            If the resolved load balancer or discovery source does not
-            implement its protocol.
+            If the resolved load balancer does not implement its
+            protocol.
         :raises asyncio.TimeoutError:
             If the quorum wait does not complete within
             ``quorum_timeout``.
+        :raises ~wool.DiscoveryNamespaceNotFound:
+            In place of the quorum wait's `asyncio.TimeoutError`; see
+            `WorkerProxy`.
 
         .. rubric:: Implementation notes
 
@@ -951,10 +979,6 @@ class WorkerProxy:
                     stacklevel=2,
                 )
                 self._dispatching_deprecation_warned = True
-
-            self._discovery_stream = await stack.enter_async_context(
-                resolved(self._discovery, expect=DiscoverySubscriberLike)
-            )
 
             self._loadbalancer_context = LoadBalancerContext()
             # Built here, not in __init__, so its keys cannot outlive the
@@ -1029,10 +1053,10 @@ class WorkerProxy:
         """Stop the proxy, terminating discovery and clearing connections.
 
         Unwinds what `start` acquired in reverse order: sentinel first
-        (so it stops reading from the discovery stream), then discovery,
-        then load balancer, and last the proxy's hold on the channel pool
-        (see `channel_pool_hold`).  Every step runs even if an earlier one
-        raises, and the proxy is stopping from the moment the unwind
+        (so it stops reading from the discovery subscriber), then the load
+        balancer, and last the proxy's hold on the channel pool (see
+        `channel_pool_hold`).  Every step runs even if an
+        earlier one raises, and the proxy is stopping from the moment the unwind
         begins and stopped once it returns, so a second ``stop``, or a
         ``start``, raises rather than racing the unwind.
 
@@ -1041,6 +1065,9 @@ class WorkerProxy:
             or is stopped on a loop other than the one that started it,
             in which case nothing is unwound and the proxy stays
             started.
+        :raises ~wool.DiscoveryNamespaceNotFound:
+            If the sentinel's discovery subscriber raised it; see
+            `WorkerProxy`.
         :raises BaseException:
             An uncontained failure from retiring the loop's channels when
             this was the last hold — see
@@ -1428,7 +1455,6 @@ class WorkerProxy:
         self._loadbalancer_context = None
         self._handshake_throttle = None
         self._loadbalancer_service = None
-        self._discovery_stream = None
         self._workers_changed = None
 
     async def _evict(
@@ -1484,7 +1510,7 @@ class WorkerProxy:
     async def _worker_sentinel(self):
         """Reconcile discovery events against the load-balancer context.
 
-        The single admission gate for every discovery source.
+        The single admission gate for every discovery subscriber.
         ``worker-added`` and ``worker-updated`` are handled
         identically — each reconciles the worker's membership to its
         current eligibility, regardless of how the proxy was
@@ -1502,7 +1528,6 @@ class WorkerProxy:
         """
         assert self._loadbalancer_context is not None
         assert self._handshake_throttle is not None
-        assert self._discovery_stream is not None
         assert self._workers_changed is not None
         context = self._loadbalancer_context
         throttle = self._handshake_throttle
@@ -1537,7 +1562,7 @@ class WorkerProxy:
                 b.identity,
             )
 
-        async for event in self._discovery_stream:
+        async for event in self._discovery:
             match event.type:
                 case "worker-added" | "worker-updated":
                     uid = event.metadata.uid
