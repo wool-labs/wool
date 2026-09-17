@@ -247,7 +247,7 @@ class WorkerPool:
         the mode's protocol.
     :raises ~wool.DiscoveryNamespaceInUse:
         At context entry, if ``discovery`` is a `~wool.LocalDiscovery`
-        whose namespace's registry already exists.
+        whose namespace a live owner already holds.
     :raises asyncio.TimeoutError:
         If the quorum wait does not complete within ``quorum_timeout``
         — raised by the underlying `WorkerProxy` at context entry
