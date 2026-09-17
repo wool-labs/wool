@@ -15,9 +15,13 @@ from typing import TypeAlias
 from typing import TypeVar
 from typing import cast
 from typing import final
+from typing import overload
 
 F = TypeVar("F", bound=Callable)
 W = TypeVar("W", bound=Callable)
+T_CO: Final = TypeVar("T_CO", covariant=True)
+T = TypeVar("T")
+U = TypeVar("U")
 Wrapper = Callable[[F], W]
 PassthroughWrapper = Callable[[F], F]
 
@@ -32,9 +36,6 @@ class UndefinedType(Enum):
 
 Undefined: Final = UndefinedType.Undefined
 
-
-T_CO: Final = TypeVar("T_CO", covariant=True)
-T = TypeVar("T")
 
 # public
 Factory: TypeAlias = (
@@ -51,6 +52,18 @@ or any of those — see `resolved` for how one is entered.
 """
 
 
+@overload
+def resolved(
+    dependency: T | Factory[T], *, expect: type[U]
+) -> AsyncContextManager[U]: ...
+
+
+@overload
+def resolved(
+    dependency: T | Factory[T], *, expect: tuple[type, ...] | None = None
+) -> AsyncContextManager[T]: ...
+
+
 @asynccontextmanager
 async def resolved(
     dependency: T | Factory[T], *, expect: type | tuple[type, ...] | None = None
@@ -60,18 +73,23 @@ async def resolved(
     Accepts a bare instance or any `Factory` form. Forms are tried in a
     fixed order, i.e., sync context manager, async context manager,
     callable, awaitable, bare instance, and the first that matches wins,
-    so an
-    instance that is also a context manager is entered here and exited
-    when the block ends. A context manager's exit receives the block's
+    so an instance that is also a context manager is entered here and
+    exited when the block ends. A context manager's exit receives the block's
     exception info, and its return value is ignored, so a manager that
     suppresses cannot swallow the block's failure.
+
+    A single-type ``expect`` narrows the yielded object's static type to
+    that type; a tuple ``expect``, or none, leaves it typed as
+    ``dependency``'s.
 
     :param dependency:
         The instance, or the `Factory` producing it.
     :param expect:
         A type, or tuple of types, the resolved object must be an
         instance of. Checked once the object is in hand, so a factory
-        that produces the wrong thing is exited with the failure.
+        that produces the wrong thing is exited with the failure. Against
+        a `typing.runtime_checkable` protocol, the check confirms only
+        that the protocol's members exist.
     :yields:
         The resolved object, for the duration of the block.
     :raises TypeError:
