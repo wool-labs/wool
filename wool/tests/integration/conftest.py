@@ -17,9 +17,11 @@ import threading
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import fields
+from dataclasses import replace
 from enum import Enum
 from enum import auto
 from functools import partial
@@ -33,9 +35,14 @@ from hypothesis import strategies as st
 from tests.helpers import LOOPBACK_SANS
 from tests.helpers import generate_ca_and_leaf
 from wool.runtime.context.runtime import dispatch_timeout
+from wool.runtime.discovery import __subscriber_pool__
+from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.discovery.pool import _subscriber_factories
+from wool.runtime.discovery.pool import install_subscriber_pool
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.runtime.typing import resolved
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
@@ -184,7 +191,7 @@ class PoolMode(Enum):
     DEFAULT = auto()
     EPHEMERAL = auto()
     DURABLE = auto()
-    DURABLE_JOINED = auto()
+    DURABLE_BORROWED = auto()
     DURABLE_SHARED = auto()
     HYBRID = auto()
     NESTED_DEFAULT_IN_EPHEMERAL = auto()
@@ -527,7 +534,7 @@ async def build_pool_from_scenario(
 
     if (
         scenario.discovery is not DiscoveryFactory.NONE
-        and scenario.pool_mode is not PoolMode.DURABLE_JOINED
+        and scenario.pool_mode is not PoolMode.DURABLE_BORROWED
     ):
         namespace = f"integration-{uuid.uuid4().hex[:12]}"
 
@@ -618,8 +625,8 @@ async def build_pool_from_scenario(
                     lb, creds, options, lazy, quorum, backpressure=bp_hook
                 ) as pool:
                     yield pool
-            elif scenario.pool_mode is PoolMode.DURABLE_JOINED:
-                async with _durable_joined_pool_context(
+            elif scenario.pool_mode is PoolMode.DURABLE_BORROWED:
+                async with _durable_borrowed_pool_context(
                     scenario.discovery,
                     lb,
                     creds,
@@ -760,11 +767,10 @@ async def _durable_shared_pool_context(
 ):
     """Create two pools sharing the same LocalDiscovery subscriber.
 
-    Exercises ``SubscriberMeta`` singleton caching and
-    ``_SharedSubscription`` fan-out: both pools call
-    ``Subscriber(namespace)`` through the metaclass, the second
-    hits the cache and gets a separate ``_SharedSubscription``
-    backed by the same raw subscriber and source iterator.
+    Exercises `SubscriberMeta` subscription sharing: both pools
+    construct `LocalDiscovery.Subscriber` on one namespace in one
+    context, so each gets its own `_SharedSubscription` backed by one
+    underlying subscriber.
     """
     namespace = f"shared-{uuid.uuid4().hex[:12]}"
     with LocalDiscovery(namespace) as discovery:
@@ -801,70 +807,101 @@ async def _durable_shared_pool_context(
             await worker.stop()
 
 
-_LOCAL_FACTORIES = (
+#: The D3 members that supply a borrowed subscriber under
+#: DURABLE_BORROWED. A borrower declares no capacity, so the capacity
+#: members differ only in what the owner stamps; LOCAL_CAPACITY_BOUNDED
+#: covers that variation, and LOCAL_CAPACITY_EXACT is excluded because
+#: it adds rows without adding a code path.
+_BORROWED_SUPPLY_FORMS = (
     DiscoveryFactory.LOCAL_DIRECT,
     DiscoveryFactory.LOCAL_CALLABLE,
     DiscoveryFactory.LOCAL_SYNC_CM,
     DiscoveryFactory.LOCAL_ASYNC_CM,
+    DiscoveryFactory.LOCAL_CAPACITY_BOUNDED,
 )
 
 
-def _resolve_joiner(namespace, factory):
-    """Resolve a DiscoveryFactory into a joiner discovery object.
+def _resolve_borrower(namespace, factory):
+    """Resolve a D3 member into a borrowed subscriber for ``namespace``.
 
-    Uses the given namespace (same as the owner), triggering the non-owner
-    fallback path in ``LocalDiscovery.__enter__``.
-
-    Returns ``(discovery_obj, entered_cm_or_None)``. The caller must
-    exit the CM (if non-None) when done.
+    The subscriber borrows the registry the namespace's owner created
+    (see `LocalDiscovery`). Each member picks the form the subscriber is
+    supplied in: bare, callable, sync context manager, or async context
+    manager. LOCAL_CAPACITY_BOUNDED supplies the bare form (see
+    `_BORROWED_SUPPLY_FORMS`). A durable pool accepts any of these forms
+    (see `WorkerPool`).
     """
     match factory:
-        case DiscoveryFactory.LOCAL_DIRECT:
-            cm = LocalDiscovery(namespace)
-            cm.__enter__()
-            return _DirectDiscovery(cm), cm
+        case DiscoveryFactory.LOCAL_DIRECT | DiscoveryFactory.LOCAL_CAPACITY_BOUNDED:
+            # See `_BORROWED_SUPPLY_FORMS`.
+            return LocalDiscovery.Subscriber(namespace)
         case DiscoveryFactory.LOCAL_CALLABLE:
-            return (lambda: LocalDiscovery(namespace)), None  # noqa: E731
+            return lambda: LocalDiscovery.Subscriber(namespace)  # noqa: E731
         case DiscoveryFactory.LOCAL_SYNC_CM:
-            return LocalDiscovery(namespace), None
+
+            @contextmanager
+            def _cm():
+                yield LocalDiscovery.Subscriber(namespace)
+
+            return _cm()
         case DiscoveryFactory.LOCAL_ASYNC_CM:
 
             @asynccontextmanager
             async def _acm():
-                with LocalDiscovery(namespace) as d:
-                    yield d
+                yield LocalDiscovery.Subscriber(namespace)
 
-            return _acm(), None
+            return _acm()
         case _:
-            raise ValueError(f"Unsupported factory for joiner: {factory}")
+            raise ValueError(f"Unsupported factory for borrower: {factory}")
 
 
 @asynccontextmanager
-async def _durable_joined_pool_context(
+async def _durable_borrowed_pool_context(
     discovery_factory, lb, creds, options, lazy, quorum, *, backpressure=None
 ):
-    """Create a DURABLE pool that joins an externally owned namespace.
+    """Yield a DURABLE pool that borrows an externally owned namespace.
 
-    Sets up an owner ``LocalDiscovery`` that creates workers and publishes
-    them, then resolves a joiner discovery from the D3 factory form. The
-    joiner reuses the owner's namespace, exercising the non-owner fallback
-    path in ``LocalDiscovery.__enter__``.
+    Start one worker, publish it through an owning `LocalDiscovery`, and
+    build the pool on the subscriber `_resolve_borrower` supplies for the
+    D3 member. LOCAL_CAPACITY_BOUNDED stamps the owner with a capacity of
+    four; every other D3 member leaves the owner at its default.
+
+    .. rubric:: Implementation notes
+
+    The mode rests on the pool receiving a bare subscriber, which the
+    guard asserts for every supply form: it resolves a throwaway
+    borrower with `resolved`, as the pool does, so the callable form is
+    called and the context-manager forms are entered before the check.
     """
-    namespace = f"joined-{uuid.uuid4().hex[:12]}"
+    namespace = f"borrowed-{uuid.uuid4().hex[:12]}"
 
     worker = LocalWorker(credentials=creds, options=options, backpressure=backpressure)
     await worker.start()
     try:
-        owner = LocalDiscovery(namespace)
+        # A sub-page cap of four admits the single worker published below
+        # and gives the borrower a stamped registry to read.
+        if discovery_factory is DiscoveryFactory.LOCAL_CAPACITY_BOUNDED:
+            owner = LocalDiscovery(namespace, capacity=4)
+        else:
+            owner = LocalDiscovery(namespace)
         owner.__enter__()
         try:
             publisher = owner.publisher
             async with publisher:
                 await publisher.publish("worker-added", worker.metadata)
-                joiner, _joiner_cm = _resolve_joiner(namespace, discovery_factory)
+                borrower = _resolve_borrower(namespace, discovery_factory)
+                # Vacuity guard — see this builder's docstring. The probe is
+                # a throwaway resolution because the context-manager forms
+                # are single-use.
+                probe = _resolve_borrower(namespace, discovery_factory)
+                async with resolved(probe) as supplied:
+                    assert not isinstance(supplied, DiscoveryLike), (
+                        "DURABLE_BORROWED must supply a bare subscriber, "
+                        f"got a DiscoveryLike: {type(supplied)}"
+                    )
                 try:
                     pool = WorkerPool(
-                        discovery=joiner,
+                        discovery=borrower,
                         loadbalancer=lb,
                         credentials=creds,
                         lazy=lazy,
@@ -873,8 +910,6 @@ async def _durable_joined_pool_context(
                     async with pool:
                         yield pool
                 finally:
-                    if _joiner_cm is not None:
-                        _joiner_cm.__exit__(None, None, None)
                     await publisher.publish("worker-dropped", worker.metadata)
         finally:
             owner.__exit__(None, None, None)
@@ -1316,7 +1351,7 @@ _MID_STREAM_FORWARD_SHAPES = (RoutineShape.ASYNC_GEN_ANEXT,)
 # rows the pairwise array rejects (or the reverse).
 _DISCOVERY_REQUIRED_POOL_MODES = (
     PoolMode.HYBRID,
-    PoolMode.DURABLE_JOINED,
+    PoolMode.DURABLE_BORROWED,
 )
 _DISCOVERY_FORBIDDEN_POOL_MODES = (
     PoolMode.DEFAULT,
@@ -1342,10 +1377,15 @@ def _pairwise_filter(row):
 
     - D3 must be NONE when D2 is DEFAULT, EPHEMERAL, DURABLE, or NESTED_*
       (DURABLE manages its own LocalDiscovery internally)
-    - D3 must NOT be NONE when D2 is HYBRID or DURABLE_JOINED
-    - D3 must be a LOCAL_* variant when D2 is DURABLE_JOINED
-      (DURABLE_JOINED exercises LocalDiscovery's owner/non-owner join
-      semantics, which LanDiscovery has no analogue for)
+    - D3 must NOT be NONE when D2 is HYBRID or DURABLE_BORROWED
+    - D3 must be one of _BORROWED_SUPPLY_FORMS when D2 is
+      DURABLE_BORROWED (that mode exercises LocalDiscovery's
+      owner/borrower semantics, which LanDiscovery has no analogue for;
+      the tuple is narrower than "every LOCAL_* member" — see its own
+      comment). Note the dual reading of D3: under DURABLE_BORROWED its
+      members denote supply forms of a *borrowed subscriber*, while
+      under HYBRID they denote supply forms of an *owning*
+      LocalDiscovery.
     - D4 must not be ASYNC_CM (pre-called async CM instances are not
       picklable inside WorkerProxy.__wool_reduce__; documented limitation,
       see #61)
@@ -1374,7 +1414,10 @@ def _pairwise_filter(row):
             return False
         if forbids_discovery and discovery is not DiscoveryFactory.NONE:
             return False
-        if pool_mode is PoolMode.DURABLE_JOINED and discovery not in _LOCAL_FACTORIES:
+        if (
+            pool_mode is PoolMode.DURABLE_BORROWED
+            and discovery not in _BORROWED_SUPPLY_FORMS
+        ):
             return False
     if len(row) > 3:
         lb = row[3]
@@ -1476,76 +1519,32 @@ PAIRWISE_SCENARIOS = [
     )
 ]
 
-# allpairspy's greedy placement never selects LAN_ASYNC_CM under the
-# current filter constraints (LAN factories pair only with HYBRID), so
-# the generated array leaves the member entirely unexercised. Pin one
-# canonical scenario to guarantee deterministic coverage; the guard
-# test in test_integration.py fails loudly if another DiscoveryFactory
-# member ever drops out of the array.
-PAIRWISE_SCENARIOS.append(
-    Scenario(
-        shape=RoutineShape.COROUTINE,
-        pool_mode=PoolMode.HYBRID,
-        discovery=DiscoveryFactory.LAN_ASYNC_CM,
-        lb=LbFactory.CLASS_REF,
-        credential=CredentialType.INSECURE,
-        options=WorkerOptionsKind.DEFAULT,
-        timeout=TimeoutKind.NONE,
-        binding=RoutineBinding.MODULE_FUNCTION,
-        lazy=LazyMode.LAZY,
-        backpressure=BackpressureMode.NONE,
-        ctx_var_1=ContextVarPattern.NONE,
-        ctx_var_2=ContextVarPattern.NONE,
-        ctx_var_3=ContextVarPattern.NONE,
-        quorum=QuorumMode.DEFAULT,
-    )
+#: The (pool mode, discovery) pairs allpairspy's greedy placement
+#: starves out of the generated array under the current filter
+#: constraints. Every one is legal — `scenarios_strategy` draws them and
+#: `_pairwise_filter` admits them — so leaving them to the generator
+#: means exercising them only by chance. Pinning one canonical scenario
+#: per pair makes the coverage deterministic; the agreement test in
+#: ``test_integration.py`` fails when Hypothesis draws a legal pair
+#: missing from both.
+_STARVED_PAIRS = (
+    # Two owning supply forms and both capacity members, which the
+    # generated array omits under HYBRID. The two capacity members size
+    # the segment the owner stamps: a sub-page cap, and a cap exactly
+    # equal to the single spawned worker, which leaves it completely
+    # full yet dispatching.
+    (PoolMode.HYBRID, DiscoveryFactory.LOCAL_DIRECT),
+    (PoolMode.HYBRID, DiscoveryFactory.LOCAL_ASYNC_CM),
+    (PoolMode.HYBRID, DiscoveryFactory.LOCAL_CAPACITY_BOUNDED),
+    (PoolMode.HYBRID, DiscoveryFactory.LOCAL_CAPACITY_EXACT),
+    # The borrowed supply forms, which the same members denote under
+    # DURABLE_BORROWED. Only the sync-CM form is starved.
+    (PoolMode.DURABLE_BORROWED, DiscoveryFactory.LOCAL_SYNC_CM),
 )
 
-# LOCAL_CAPACITY_BOUNDED pairs only with HYBRID (like the LAN factories),
-# so allpairspy's greedy placement can drop it from the generated array.
-# Pin one canonical scenario to guarantee the cover-all guard stays green
-# and the capacity-bounded LocalDiscovery gets a deterministic
-# dispatch-success case.
-PAIRWISE_SCENARIOS.append(
-    Scenario(
-        shape=RoutineShape.COROUTINE,
-        pool_mode=PoolMode.HYBRID,
-        discovery=DiscoveryFactory.LOCAL_CAPACITY_BOUNDED,
-        lb=LbFactory.CLASS_REF,
-        credential=CredentialType.INSECURE,
-        options=WorkerOptionsKind.DEFAULT,
-        timeout=TimeoutKind.NONE,
-        binding=RoutineBinding.MODULE_FUNCTION,
-        lazy=LazyMode.LAZY,
-        backpressure=BackpressureMode.NONE,
-        ctx_var_1=ContextVarPattern.NONE,
-        ctx_var_2=ContextVarPattern.NONE,
-        ctx_var_3=ContextVarPattern.NONE,
-        quorum=QuorumMode.DEFAULT,
-    )
-)
-
-
-# LOCAL_CAPACITY_EXACT is likewise HYBRID-only, so pin one canonical
-# scenario: capacity == the single spawned worker exercises a completely
-# full self-describing segment end-to-end while still dispatching.
-PAIRWISE_SCENARIOS.append(
-    Scenario(
-        shape=RoutineShape.COROUTINE,
-        pool_mode=PoolMode.HYBRID,
-        discovery=DiscoveryFactory.LOCAL_CAPACITY_EXACT,
-        lb=LbFactory.CLASS_REF,
-        credential=CredentialType.INSECURE,
-        options=WorkerOptionsKind.DEFAULT,
-        timeout=TimeoutKind.NONE,
-        binding=RoutineBinding.MODULE_FUNCTION,
-        lazy=LazyMode.LAZY,
-        backpressure=BackpressureMode.NONE,
-        ctx_var_1=ContextVarPattern.NONE,
-        ctx_var_2=ContextVarPattern.NONE,
-        ctx_var_3=ContextVarPattern.NONE,
-        quorum=QuorumMode.DEFAULT,
-    )
+PAIRWISE_SCENARIOS.extend(
+    replace(default_scenario(pool_mode=pool_mode), discovery=discovery)
+    for pool_mode, discovery in _STARVED_PAIRS
 )
 
 
@@ -1558,8 +1557,8 @@ def scenarios_strategy(draw):
     needs_discovery = pool_mode in _DISCOVERY_REQUIRED_POOL_MODES
     forbids_discovery = pool_mode in _DISCOVERY_FORBIDDEN_POOL_MODES
 
-    if pool_mode is PoolMode.DURABLE_JOINED:
-        discovery = draw(st.sampled_from(list(_LOCAL_FACTORIES)))
+    if pool_mode is PoolMode.DURABLE_BORROWED:
+        discovery = draw(st.sampled_from(list(_BORROWED_SUPPLY_FORMS)))
     elif needs_discovery:
         discovery = draw(
             st.sampled_from(
@@ -1722,16 +1721,49 @@ async def _channel_pool_gate(request):
         await poll_until_channel_pool_settles(get=channel_pool_hold_stats)
 
 
+@pytest.fixture(autouse=True)
+def subscriber_pool():
+    """Install a subscriber pool for the test and yield it.
+
+    Mirrors the discovery unit tests' fixture of the same name (see
+    ``tests/runtime/discovery/conftest.py``), whose docstring gives the
+    reason it is synchronous. Constructing a `LocalDiscovery.Subscriber`
+    installs a pool in the calling context and registers a factory in a
+    module-level registry, and this fixture scopes both to one test.
+    """
+    token = __subscriber_pool__.set(None)
+    try:
+        yield install_subscriber_pool()
+    finally:
+        __subscriber_pool__.reset(token)
+        _subscriber_factories.clear()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clear_subscriber_pool(subscriber_pool):
+    """Finalize the subscriber pool on the loop that used it.
+
+    The clear runs on the owning loop, the only place the pool's
+    finalizers can run; anything a test left cached would otherwise be
+    discarded and reported once this loop has closed. It clears the
+    object `subscriber_pool` yielded rather than whatever
+    ``__subscriber_pool__`` reads back here: an async fixture's teardown
+    runs in a task with a context copy of its own, where the test's own
+    assignments are not visible.
+    """
+    yield
+    await subscriber_pool.clear()
+
+
 # Integration tests rely on pytest-asyncio's Task-per-test scoping
-# for ContextVar isolation: each async test runs inside an
+# for wool.ContextVar isolation: each async test runs inside an
 # asyncio.Task whose ``contextvars.Context`` is a copy, so
 # wool.ContextVar mutations stay scoped to that copy and don't leak
 # to the next test. Sync integration helpers run in the pytest main
-# Chain — if they ever mutate routine-level vars, add an explicit
-# per-test teardown at that site rather than reviving a global
-# autouse cleanup. (The previous sync ``_clear_proxy_context``
-# autouse fixture mutated the pytest main Chain, which async test
-# tasks never observe; it was load-bearing in appearance only.)
+# Chain — if they ever mutate routine-level wool.ContextVar values,
+# add an explicit per-test teardown at that site. A stdlib context var
+# set in a sync fixture remains visible to the test task (see
+# `subscriber_pool`).
 
 
 async def _stop_all(workers) -> None:

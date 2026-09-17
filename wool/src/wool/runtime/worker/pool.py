@@ -78,7 +78,7 @@ class IneffectiveIdentityWarning(WoolWarning):
     Warned rather than raised because a hybrid pool may legitimately
     contribute capacity it does not itself dial, because a factory
     owning its identity is a valid configuration, and because an inert
-    parameter is not an invalid one. Users who want strict behaviour can
+    parameter is not an invalid one. Users who want strict behavior can
     elevate the category to an error via `warnings.filterwarnings`.
 
     Never emitted for a factory that *can* receive the value — see
@@ -92,7 +92,7 @@ class IneffectiveLeaseWarning(WoolWarning):
 
     The pool's worker count is bounded by ``spawn`` alone in those
     modes — ``lease`` is recorded but never consulted, so the supplied
-    value has no effect at runtime.  Users who want strict behaviour
+    value has no effect at runtime.  Users who want strict behavior
     can elevate the category to an error via
     `warnings.filterwarnings`.
     """
@@ -132,18 +132,19 @@ class WorkerPool:
         has not already pre-supplied it. See `WorkerFactoryLike`.
         Defaults to `LocalWorker`, which takes all three.
     :param discovery:
-        Discovery service to attach — a `~wool.DiscoveryLike` instance
-        or any `Factory` form resolving to one. The resolved object is
-        validated against the protocol at context entry. Workers it
-        surfaces are additionally subject to the underlying
-        `WorkerProxy`'s admission gate.
+        Discovery protocol, as an instance or any `Factory` form
+        resolving to one. A hybrid pool publishes the workers it spawns
+        and so requires a full `~wool.DiscoveryLike`; a durable pool also
+        accepts a bare `~wool.DiscoverySubscriberLike`. The pool resolves
+        and enters ``discovery`` for the duration of its own context and
+        validates it against the mode's protocol at context entry.
+        Workers it surfaces pass the `WorkerProxy` admission gate.
 
-        .. caution::
-
-           A pre-called context-manager instance passed as
-           ``discovery`` is not picklable and breaks nested routine
-           dispatch. Pass a callable returning it instead (see
-           `Factory`).
+        ``discovery=LocalDiscovery(ns)`` therefore owns the namespace,
+        and ``discovery=LocalDiscovery.Subscriber(ns)`` borrows one
+        another process owns; see `~wool.LocalDiscovery`. See
+        `~wool.DiscoverySubscriberLike` for what a subscriber must
+        provide.
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
 
@@ -241,10 +242,19 @@ class WorkerPool:
         pool spawns workers its own ``peers`` policy would refuse and
         has no ``discovery`` service to supply others (see
         `IneffectiveIdentityWarning`, which covers the hybrid case).
+    :raises TypeError:
+        At context entry, if the resolved ``discovery`` does not satisfy
+        the mode's protocol.
+    :raises ~wool.DiscoveryNamespaceInUse:
+        At context entry, if ``discovery`` is a `~wool.LocalDiscovery`
+        whose namespace's registry already exists.
     :raises asyncio.TimeoutError:
         If the quorum wait does not complete within ``quorum_timeout``
         — raised by the underlying `WorkerProxy` at context entry
         (``lazy=False``) or first dispatch (``lazy=True``).
+    :raises ~wool.DiscoveryNamespaceNotFound:
+        If ``discovery`` borrows a `~wool.LocalDiscovery` namespace that
+        has no registry; see `WorkerProxy`.
 
     **Basic ephemeral pool:**
 
@@ -335,6 +345,7 @@ class WorkerPool:
         async def custom_discovery():
             svc = await DatabaseDiscovery.connect()
             try:
+                # See DiscoverySubscriberLike for what a subscriber provides.
                 yield svc.subscribe()
             finally:
                 await svc.close()
@@ -366,6 +377,14 @@ class WorkerPool:
     the deadline and logged there; either way the stop runs on the
     deadline's remainder. `_worker_context` owns the rationale for
     that cancellation handling.
+
+    The proxy receives ``discovery`` already resolved and never enters
+    it: a hybrid pool passes the service's ``subscribe`` filtered to the
+    pool's tags, and a durable pool passes a `~wool.DiscoveryLike`
+    service's ``subscriber`` or a bare subscriber as given. No hybrid
+    pool borrows a local namespace, because spawning needs a publisher
+    and a subscriber that both borrow, which `~wool.LocalDiscovery` does
+    not provide as one `~wool.DiscoveryLike`.
     """
 
     _workers: Final[dict[WorkerLike, Coroutine]]
@@ -403,7 +422,11 @@ class WorkerPool:
         self,
         *,
         lease: int | None = None,
-        discovery: DiscoveryLike | Factory[DiscoveryLike],
+        discovery: (
+            DiscoveryLike
+            | DiscoverySubscriberLike
+            | Factory[DiscoveryLike | DiscoverySubscriberLike]
+        ),
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
@@ -483,7 +506,12 @@ class WorkerPool:
         size: int | None = None,
         lease: int | None = None,
         worker: WorkerFactoryLike | None = None,
-        discovery: DiscoveryLike | Factory[DiscoveryLike] | None = None,
+        discovery: (
+            DiscoveryLike
+            | DiscoverySubscriberLike
+            | Factory[DiscoveryLike | DiscoverySubscriberLike]
+            | None
+        ) = None,
         loadbalancer: (
             LoadBalancerLike | Factory[LoadBalancerLike]
         ) = RoundRobinLoadBalancer,
@@ -739,11 +767,26 @@ class WorkerPool:
 
                 @asynccontextmanager
                 async def create_proxy():
-                    async with resolved(
-                        discovery, expect=DiscoveryLike
-                    ) as discovery_svc:
+                    async with resolved(discovery) as discovery_svc:
+                        # Protocol by mode; see the ``discovery`` parameter.
+                        # `DiscoveryLike` is tested first: `DiscoverySubscriberLike`
+                        # needs only `__aiter__`, which a full service may also
+                        # define. Classified here instead of through `resolved`'s
+                        # ``expect``, which would repeat the check: on Python 3.11
+                        # each runtime protocol check evaluates the service's
+                        # properties.
+                        if isinstance(discovery_svc, DiscoveryLike):
+                            subscriber = discovery_svc.subscriber
+                        elif isinstance(discovery_svc, DiscoverySubscriberLike):
+                            subscriber = discovery_svc
+                        else:
+                            raise TypeError(
+                                f"Expected {DiscoveryLike.__name__} | "
+                                f"{DiscoverySubscriberLike.__name__}, got: "
+                                f"{type(discovery_svc)}"
+                            )
                         async with self._make_proxy(
-                            discovery=discovery_svc.subscriber,
+                            discovery=subscriber,
                             loadbalancer=loadbalancer,
                             lease=lease,
                             quorum=quorum,

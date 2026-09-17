@@ -11,6 +11,7 @@ import copy
 import inspect
 import logging
 import pickle
+import threading
 import uuid
 import warnings
 from contextlib import AsyncExitStack
@@ -34,6 +35,7 @@ import wool.utilities.throttle as wt
 from tests.helpers import _unique
 from wool import protocol
 from wool.runtime.discovery.base import DiscoveryEvent
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
@@ -52,7 +54,6 @@ from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.proxy import WorkerProxy
 from wool.runtime.worker.proxy import is_version_compatible
 from wool.runtime.worker.proxy import parse_version
-from wool.utilities.afilter import afilter
 
 from .conftest import MockDiscoveryService
 
@@ -752,20 +753,29 @@ def _recording_loadbalancer(mocker, *, suppress=False):
     return Recording, exits
 
 
-def _discovery_context(*, on_enter=None, on_exit=None):
-    """Build a discovery context manager whose enter and exit await the hooks."""
+def _loadbalancer_context(*, on_enter=None, on_exit=None):
+    """Build a load balancer context manager whose enter and exit await the hooks.
 
-    class Discovery:
+    The proxy enters its load balancer but never its discovery
+    subscriber, so the balancer is the dependency whose entry and exit
+    a test can park on or fail.
+    """
+
+    class LoadBalancer:
         async def __aenter__(self):
             if on_enter is not None:
                 await on_enter()
-            return MockDiscoveryService()
+            return self
 
         async def __aexit__(self, *args):
             if on_exit is not None:
                 await on_exit()
 
-    return Discovery
+        async def delegate(self, task, *, context):
+            for uid in context.workers:
+                yield uid
+
+    return LoadBalancer
 
 
 async def _channel_pool_snapshot():
@@ -855,21 +865,19 @@ class TestWorkerProxy:
         assert not proxy.started
 
     def test___init___uri_only(self, mocker: MockerFixture):
-        """Test create LocalDiscovery and use RoundRobinLoadBalancer.
+        """Test a pool-URI proxy borrows its namespace through a subscriber.
 
         Given:
             A pool URI string
         When:
             WorkerProxy is initialized
         Then:
-            It should create LocalDiscovery and use RoundRobinLoadBalancer
+            It should construct unstarted, with a LocalDiscovery.Subscriber
+            built for the pool URI
         """
         # Arrange
-        mock_subscriber = mocker.MagicMock()
-        mock_local_discovery_service = mocker.MagicMock()
-        mock_local_discovery_service.subscribe.return_value = mock_subscriber
-        mocker.patch.object(
-            wp, "LocalDiscovery", return_value=mock_local_discovery_service
+        subscriber = mocker.patch.object(
+            wp.LocalDiscovery, "Subscriber", return_value=mocker.MagicMock()
         )
 
         # Act
@@ -878,6 +886,7 @@ class TestWorkerProxy:
         # Assert
         assert isinstance(proxy, WorkerProxy)
         assert not proxy.started
+        subscriber.assert_called_once_with("pool-1")
 
     def test___init___invalid_arguments(self):
         """Test raise ValueError.
@@ -987,6 +996,41 @@ class TestWorkerProxy:
         with pytest.raises(ValueError, match="Must specify either a workerpool URI"):
             WorkerProxy()
 
+    def test___init___should_raise_when_discovery_is_a_callable(self):
+        """Test a callable discovery is rejected at construction.
+
+        Given:
+            A zero-argument callable returning a discovery subscriber.
+        When:
+            WorkerProxy is initialized with it as discovery.
+        Then:
+            It should raise TypeError saying discovery takes no callable
+            form.
+        """
+        # Arrange
+        subscriber = wp.ReducibleAsyncIterator([])
+
+        # Act & assert
+        with pytest.raises(TypeError, match="no callable form"):
+            WorkerProxy(discovery=lambda: subscriber, lazy=False)
+
+    def test___init___should_raise_when_discovery_is_not_a_subscriber(self):
+        """Test a non-subscriber discovery is rejected at construction.
+
+        Given:
+            A discovery value that is neither callable nor iterable.
+        When:
+            WorkerProxy is initialized with it as discovery.
+        Then:
+            It should raise TypeError naming DiscoverySubscriberLike.
+        """
+        # Arrange
+        invalid_discovery = object()
+
+        # Act & assert
+        with pytest.raises(TypeError, match="Expected DiscoverySubscriberLike"):
+            WorkerProxy(discovery=invalid_discovery)  # pyright: ignore[reportArgumentType]
+
     def test___init___with_sync_cm_loadbalancer_warns(self, mock_discovery_service):
         """Test UserWarning for sync CM loadbalancer.
 
@@ -1032,52 +1076,6 @@ class TestWorkerProxy:
         # Act & assert
         with pytest.warns(UserWarning, match="loadbalancer"):
             WorkerProxy(discovery=mock_discovery_service, loadbalancer=AsyncCM())
-
-    def test___init___with_sync_cm_discovery_warns(self):
-        """Test UserWarning for sync CM discovery.
-
-        Given:
-            A sync context manager instance as discovery.
-        When:
-            WorkerProxy is instantiated.
-        Then:
-            It should emit a UserWarning mentioning 'discovery'.
-        """
-
-        # Arrange
-        class SyncCM:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                pass
-
-        # Act & assert
-        with pytest.warns(UserWarning, match="discovery"):
-            WorkerProxy(discovery=SyncCM())
-
-    def test___init___with_async_cm_discovery_warns(self):
-        """Test UserWarning for async CM discovery.
-
-        Given:
-            An async context manager instance as discovery.
-        When:
-            WorkerProxy is instantiated.
-        Then:
-            It should emit a UserWarning mentioning 'discovery'.
-        """
-
-        # Arrange
-        class AsyncCM:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        # Act & assert
-        with pytest.warns(UserWarning, match="discovery"):
-            WorkerProxy(discovery=AsyncCM())
 
     def test___init___with_callable_loadbalancer_no_warning(
         self, mock_discovery_service
@@ -1424,8 +1422,8 @@ class TestWorkerProxy:
 
         Given:
             A started proxy holding the loop's only channel-pool hold,
-            with one idle cached channel and a discovery context manager
-            whose exit raises.
+            with one idle cached channel and a load balancer context
+            manager whose exit raises.
         When:
             The proxy is stopped and the error observed.
         Then:
@@ -1439,7 +1437,10 @@ class TestWorkerProxy:
             raise RuntimeError("teardown failed")
 
         proxy = WorkerProxy(
-            discovery=_discovery_context(on_exit=fail), lazy=False, quorum=0
+            discovery=MockDiscoveryService(),
+            loadbalancer=_loadbalancer_context(on_exit=fail),
+            lazy=False,
+            quorum=0,
         )
         await proxy.start()
         connection = WorkerConnection(
@@ -2120,8 +2121,8 @@ class TestWorkerProxy:
 
         Given:
             A proxy whose load balancer is an async context manager that
-            returns True from its exit, and whose discovery object is not
-            a subscriber, so start raises after entering the balancer.
+            returns True from its exit, and a start step after the
+            balancer's entry that fails.
         When:
             The proxy is started.
         Then:
@@ -2130,15 +2131,18 @@ class TestWorkerProxy:
         """
         # Arrange
         manager, exits = _recording_loadbalancer(mocker, suppress=True)
+        mocker.patch.object(
+            wp, "LoadBalancerContext", side_effect=RuntimeError("start failed")
+        )
         proxy = WorkerProxy(
-            discovery=object(),  # type: ignore[arg-type]
+            discovery=MockDiscoveryService(),
             loadbalancer=manager,
             lazy=False,
             quorum=0,
         )
 
         # Act
-        with pytest.raises(TypeError) as excinfo:
+        with pytest.raises(RuntimeError, match="start failed") as excinfo:
             await proxy.start()
 
         # Assert
@@ -2153,8 +2157,8 @@ class TestWorkerProxy:
         """Test a second stop during an unwind raises the documented error.
 
         Given:
-            A started proxy whose discovery context blocks on exit, so
-            a stop stays suspended inside its unwind.
+            A started proxy whose load balancer context blocks on
+            exit, so a stop stays suspended inside its unwind.
         When:
             A second stop is called while the first is suspended.
         Then:
@@ -2170,7 +2174,10 @@ class TestWorkerProxy:
             await gate.wait()
 
         proxy = WorkerProxy(
-            discovery=_discovery_context(on_exit=on_exit), lazy=False, quorum=0
+            discovery=MockDiscoveryService(),
+            loadbalancer=_loadbalancer_context(on_exit=on_exit),
+            lazy=False,
+            quorum=0,
         )
         await proxy.start()
         first = asyncio.create_task(proxy.stop())
@@ -2190,8 +2197,8 @@ class TestWorkerProxy:
         """Test a start during an unwind raises rather than racing it.
 
         Given:
-            A started proxy whose discovery context blocks on exit, so
-            a stop stays suspended inside its unwind.
+            A started proxy whose load balancer context blocks on
+            exit, so a stop stays suspended inside its unwind.
         When:
             Start is called while the stop is suspended.
         Then:
@@ -2208,7 +2215,10 @@ class TestWorkerProxy:
             await gate.wait()
 
         proxy = WorkerProxy(
-            discovery=_discovery_context(on_exit=on_exit), lazy=False, quorum=0
+            discovery=MockDiscoveryService(),
+            loadbalancer=_loadbalancer_context(on_exit=on_exit),
+            lazy=False,
+            quorum=0,
         )
         await proxy.start()
         first = asyncio.create_task(proxy.stop())
@@ -2228,10 +2238,10 @@ class TestWorkerProxy:
         """Test a start during a failed start's unwind raises rather than racing it.
 
         Given:
-            A proxy whose discovery context reports no worker on its
-            first entry and blocks on its first exit, so a failed start
-            stays suspended inside its rollback, and reports one worker
-            on its second entry.
+            A proxy whose subscriber reports no worker on its first
+            iteration and one on its second, and whose load balancer
+            context blocks on its first exit, so a failed start stays
+            suspended inside its rollback.
         When:
             Start is called while the rollback is suspended, and again
             once the failed start has returned.
@@ -2251,26 +2261,30 @@ class TestWorkerProxy:
             version=protocol.__version__,
         )
         closable_connection()
-        entries = 0
+        iterations = 0
 
         class Discovery:
-            async def __aenter__(self):
-                nonlocal entries
-                entries += 1
+            def __aiter__(self):
+                nonlocal iterations
+                iterations += 1
                 events = (
                     []
-                    if entries == 1
+                    if iterations == 1
                     else [DiscoveryEvent("worker-added", metadata=metadata)]
                 )
-                return wp.ReducibleAsyncIterator(events)
+                return wp.ReducibleAsyncIterator(events).__aiter__()
 
-            async def __aexit__(self, *args):
-                if entries == 1:
-                    parked.set()
-                    await gate.wait()
+        async def on_exit():
+            if iterations == 1:
+                parked.set()
+                await gate.wait()
 
         proxy = WorkerProxy(
-            discovery=Discovery(), lazy=False, quorum=1, quorum_timeout=0.2
+            discovery=Discovery(),
+            loadbalancer=_loadbalancer_context(on_exit=on_exit),
+            lazy=False,
+            quorum=1,
+            quorum_timeout=0.2,
         )
         first = asyncio.create_task(proxy.start())
         await asyncio.wait_for(parked.wait(), timeout=2.0)
@@ -2367,8 +2381,8 @@ class TestWorkerProxy:
         """Test a lazy dispatch during an explicit start raises rather than racing it.
 
         Given:
-            A lazy proxy whose discovery context blocks on entry, so an
-            explicit start stays suspended inside it.
+            A lazy proxy whose load balancer context blocks on entry,
+            so an explicit start stays suspended inside it.
         When:
             A task is dispatched through the proxy while the start is
             suspended.
@@ -2386,7 +2400,10 @@ class TestWorkerProxy:
             await gate.wait()
 
         proxy = proxy_factory(
-            discovery=_discovery_context(on_enter=on_enter), lazy=True, quorum=0
+            discovery=MockDiscoveryService(),
+            loadbalancer=_loadbalancer_context(on_enter=on_enter),
+            lazy=True,
+            quorum=0,
         )
         first = asyncio.create_task(proxy.start())
         await asyncio.wait_for(parked.wait(), timeout=2.0)
@@ -2405,8 +2422,8 @@ class TestWorkerProxy:
         """Test a second start during a start in progress raises.
 
         Given:
-            A proxy whose discovery context blocks on entry, so a start
-            stays suspended inside it.
+            A proxy whose load balancer context blocks on entry, so a
+            start stays suspended inside it.
         When:
             Start is called again while the first is suspended.
         Then:
@@ -2422,7 +2439,10 @@ class TestWorkerProxy:
             await gate.wait()
 
         proxy = proxy_factory(
-            discovery=_discovery_context(on_enter=on_enter), lazy=False, quorum=0
+            discovery=MockDiscoveryService(),
+            loadbalancer=_loadbalancer_context(on_enter=on_enter),
+            lazy=False,
+            quorum=0,
         )
         first = asyncio.create_task(proxy.start())
         await asyncio.wait_for(parked.wait(), timeout=2.0)
@@ -2732,8 +2752,7 @@ class TestWorkerProxy:
         Given:
             A proxy whose load balancer is an async context manager
             recording the exception info its ``__aexit__`` receives, and
-            a discovery object that is not a subscriber, so ``start``
-            raises after the load balancer has been entered.
+            a ``start`` step after the load balancer's entry that fails.
         When:
             The proxy is started.
         Then:
@@ -2742,21 +2761,24 @@ class TestWorkerProxy:
         """
         # Arrange
         manager, exits = _recording_loadbalancer(mocker)
+        mocker.patch.object(
+            wp, "LoadBalancerContext", side_effect=RuntimeError("start failed")
+        )
         proxy = WorkerProxy(
-            discovery=object(),  # type: ignore[arg-type]
+            discovery=MockDiscoveryService(),
             loadbalancer=manager,
             lazy=False,
             quorum=0,
         )
 
         # Act
-        with pytest.raises(TypeError) as excinfo:
+        with pytest.raises(RuntimeError, match="start failed") as excinfo:
             await proxy.start()
 
         # Assert
         assert not proxy.started
         assert len(exits) == 1
-        assert exits[0][:2] == (TypeError, excinfo.value)
+        assert exits[0][:2] == (RuntimeError, excinfo.value)
 
     @pytest.mark.asyncio
     async def test_start_with_awaitable_loadbalancer(
@@ -4568,9 +4590,11 @@ class TestWorkerProxy:
             DiscoveryEvent("worker-added", metadata=incompatible_worker),
             DiscoveryEvent("worker-added", metadata=compatible_worker),
         ]
-        mock_local_discovery = mocker.MagicMock()
-        mock_local_discovery.subscribe.return_value = wp.ReducibleAsyncIterator(events)
-        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local_discovery)
+        mocker.patch.object(
+            wp.LocalDiscovery,
+            "Subscriber",
+            return_value=wp.ReducibleAsyncIterator(events),
+        )
         proxy = WorkerProxy("pool-1", quorum=None, lazy=False)
 
         # Act
@@ -4640,11 +4664,7 @@ class TestWorkerProxy:
 
                 return gen()
 
-        mock_local = mocker.MagicMock()
-        mock_local.subscribe.side_effect = lambda filter=None, **_: afilter(
-            filter, _Inner()
-        )
-        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local)
+        mocker.patch.object(wp.LocalDiscovery, "Subscriber", return_value=_Inner())
         proxy = WorkerProxy("pool-1", credentials=None, quorum=None, lazy=False)
 
         try:
@@ -4717,11 +4737,7 @@ class TestWorkerProxy:
 
                 return gen()
 
-        mock_local = mocker.MagicMock()
-        mock_local.subscribe.side_effect = lambda filter=None, **_: afilter(
-            filter, _Inner()
-        )
-        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local)
+        mocker.patch.object(wp.LocalDiscovery, "Subscriber", return_value=_Inner())
         proxy = WorkerProxy("pool-1", credentials=None, quorum=None, lazy=False)
 
         try:
@@ -6874,26 +6890,66 @@ class TestWorkerProxy:
             assert len(proxy.workers) >= 2
 
     @pytest.mark.asyncio
-    async def test_proxy_with_pool_uri(self):
-        """Test it starts and stops correctly.
+    async def test___aenter___should_start_and_stop_when_pool_uri_supplied(self):
+        """Test a pool-URI proxy starts and stops over a live registry.
 
         Given:
-            A non-lazy WorkerProxy configured with a pool URI
+            A namespace held by a LocalDiscovery owner, and a non-lazy
+            WorkerProxy configured with that namespace as its pool URI.
         When:
-            The proxy is used as a context manager
+            The proxy is entered, yields once, and the context exits.
         Then:
-            It starts and stops correctly
+            It should report started inside the block and stopped
+            after.
         """
         # Arrange
-        proxy = WorkerProxy("test://pool", lazy=False, quorum=0)
+        namespace = f"proxy-uri-{uuid.uuid4().hex[:12]}"
+
+        with LocalDiscovery(namespace):
+            proxy = WorkerProxy(namespace, lazy=False, quorum=0)
+
+            # Act & assert
+            async with proxy as p:
+                # Start the sentinel task so exit cancels a running
+                # coroutine, which Python otherwise warns was never
+                # awaited.
+                await asyncio.sleep(0)
+                assert p is not None
+                assert p.started
+
+            assert not proxy.started
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_raise_when_pool_uri_has_no_owner(self):
+        """Test a pool-URI proxy surfaces a failed bind at exit.
+
+        Given:
+            A namespace no LocalDiscovery has entered, and a non-lazy
+            WorkerProxy with no quorum configured with that namespace
+            as its pool URI.
+        When:
+            The proxy is entered, its sentinel runs, and the context
+            exits.
+        Then:
+            It should raise DiscoveryNamespaceNotFound naming the
+            namespace.
+        """
+        # Arrange
+        namespace = f"proxy-uri-{uuid.uuid4().hex[:12]}"
+        proxy = WorkerProxy(namespace, lazy=False, quorum=None)
 
         # Act & assert
-        async with proxy as p:
-            assert p is not None
-            assert p.started
+        with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+            async with proxy:
+                # Wait for the sentinel to end at its bind; exit
+                # otherwise cancels it first.
+                sentinel = proxy._sentinel_task
+                assert sentinel is not None
+                async with asyncio.timeout(5):
+                    while not sentinel.done():
+                        await asyncio.sleep(0.01)
 
-        # After exit, proxy should be stopped
-        assert not proxy.started
+        assert excinfo.value.namespace == namespace
 
     @pytest.mark.asyncio
     async def test_workers_property_returns_workers_list(
@@ -7078,7 +7134,7 @@ class TestWorkerProxy:
             It should serialize and deserialize successfully with deserialized
             proxy in an unstarted state and preserved ID
         """
-        # Arrange - Use real objects - this creates a LocalDiscovery internally
+        # Arrange
         proxy = WorkerProxy("pool-1", lazy=False, quorum=0)
 
         # Act & assert
@@ -7469,7 +7525,8 @@ class TestWorkerProxy:
         When:
             cloudpickle serialization is attempted.
         Then:
-            It should raise TypeError mentioning 'discovery'.
+            It should raise TypeError mentioning 'discovery', since a
+            context manager cannot ride the reduction into a worker.
         """
 
         # Arrange
@@ -7480,8 +7537,10 @@ class TestWorkerProxy:
             def __exit__(self, *args):
                 pass
 
-        with pytest.warns(UserWarning):
-            proxy = WorkerProxy(discovery=SyncCM())
+            def __aiter__(self):
+                return wp.ReducibleAsyncIterator([]).__aiter__()
+
+        proxy = WorkerProxy(discovery=SyncCM())
 
         # Act & assert
         with pytest.raises(TypeError, match="discovery"):
@@ -7496,7 +7555,8 @@ class TestWorkerProxy:
         When:
             cloudpickle serialization is attempted.
         Then:
-            It should raise TypeError mentioning 'discovery'.
+            It should raise TypeError mentioning 'discovery', since a
+            context manager cannot ride the reduction into a worker.
         """
 
         # Arrange
@@ -7507,12 +7567,208 @@ class TestWorkerProxy:
             async def __aexit__(self, *args):
                 pass
 
-        with pytest.warns(UserWarning):
-            proxy = WorkerProxy(discovery=AsyncCM())
+            def __aiter__(self):
+                return wp.ReducibleAsyncIterator([]).__aiter__()
+
+        proxy = WorkerProxy(discovery=AsyncCM())
 
         # Act & assert
         with pytest.raises(TypeError, match="discovery"):
             wool.__serializer__.dumps(proxy)
+
+    def test___wool_reduce___should_round_trip_a_pool_uri_proxy(self):
+        """Test a pool-URI proxy survives reduction through its subscriber.
+
+        Given:
+            A proxy built from a pool URI, whose discovery is a filtered
+            borrower of that namespace.
+        When:
+            It is serialized with wool's pickler and restored.
+        Then:
+            It should restore as an unstarted proxy keeping its id.
+        """
+        # Arrange
+        proxy = WorkerProxy(_unique("pool"))
+
+        # Act
+        restored = cloudpickle.loads(wool.__serializer__.dumps(proxy))
+
+        # Assert
+        assert isinstance(restored, WorkerProxy)
+        assert restored.id == proxy.id
+        assert restored.started is False
+
+    def test___wool_reduce___should_round_trip_a_borrowed_subscriber_proxy(self):
+        """Test a proxy holding a bare borrower survives reduction.
+
+        Given:
+            A proxy whose discovery is a LocalDiscovery borrower handed
+            out without the instance being entered.
+        When:
+            It is serialized with wool's pickler and restored.
+        Then:
+            It should restore as an unstarted proxy keeping its id.
+        """
+        # Arrange
+        proxy = WorkerProxy(discovery=LocalDiscovery(_unique("pool")).subscriber)
+
+        # Act
+        restored = cloudpickle.loads(wool.__serializer__.dumps(proxy))
+
+        # Assert
+        assert isinstance(restored, WorkerProxy)
+        assert restored.id == proxy.id
+        assert restored.started is False
+
+    def test___wool_reduce___should_round_trip_a_static_workers_proxy(self):
+        """Test a static-workers proxy survives reduction.
+
+        Given:
+            A proxy built from a static worker list, whose discovery is
+            the reducible iterator that replays it.
+        When:
+            It is serialized with wool's pickler and restored.
+        Then:
+            It should restore as an unstarted proxy keeping its id.
+        """
+        # Arrange
+        metadata = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50100",
+            pid=9000,
+            version=protocol.__version__,
+        )
+        proxy = WorkerProxy(workers=[metadata], quorum=0)
+
+        # Act
+        restored = cloudpickle.loads(wool.__serializer__.dumps(proxy))
+
+        # Assert
+        assert isinstance(restored, WorkerProxy)
+        assert restored.id == proxy.id
+        assert restored.started is False
+
+    @given(
+        quorum=st.integers(min_value=1, max_value=3),
+        quorum_timeout=st.one_of(
+            st.none(), st.floats(min_value=0.1, max_value=60, allow_nan=False)
+        ),
+        lease=st.one_of(st.none(), st.integers(min_value=3, max_value=10)),
+        lazy=st.booleans(),
+    )
+    @settings(max_examples=25)
+    def test___wool_reduce___should_preserve_its_settings_across_the_domain(
+        self, quorum, quorum_timeout, lease, lazy
+    ):
+        """Test reduction carries the proxy's settings, not just its identity.
+
+        Given:
+            A static-workers proxy over three compatible workers, built
+            with any quorum its worker count and lease can satisfy, any
+            quorum timeout, and either laziness.
+        When:
+            It is serialized with wool's pickler and restored.
+        Then:
+            It should restore unstarted, keeping its id, quorum, quorum
+            timeout and laziness.
+        """
+        # Arrange — the lease has no public accessor, so it is varied
+        # and left unasserted. The quorum domain excludes falsy values,
+        # whose restored settings differ by design (see
+        # `_restore_proxy`).
+        workers = [
+            WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"127.0.0.1:{50100 + offset}",
+                pid=9000 + offset,
+                version=protocol.__version__,
+            )
+            for offset in range(3)
+        ]
+        proxy = WorkerProxy(
+            workers=workers,
+            quorum=quorum,
+            quorum_timeout=quorum_timeout,
+            lease=lease,
+            lazy=lazy,
+        )
+
+        # Act
+        restored = cloudpickle.loads(wool.__serializer__.dumps(proxy))
+
+        # Assert
+        assert isinstance(restored, WorkerProxy)
+        assert restored.id == proxy.id
+        assert restored.started is False
+        assert restored.quorum == proxy.quorum
+        assert restored.quorum_timeout == proxy.quorum_timeout
+        assert restored.lazy == proxy.lazy
+
+    def test___wool_reduce___should_raise_when_the_subscriber_is_unpicklable(self):
+        """Test an unpicklable subscriber fails the proxy's reduction.
+
+        Given:
+            A proxy whose discovery is a subscriber carrying unpicklable
+            state and defining no __reduce__ of its own.
+        When:
+            Serialization with wool's pickler is attempted.
+        Then:
+            It should raise TypeError.
+        """
+
+        # Arrange
+        class UnpicklableSubscriber:
+            def __init__(self):
+                self._lock = threading.Lock()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        proxy = WorkerProxy(discovery=UnpicklableSubscriber())
+
+        # Act & assert
+        with pytest.raises(TypeError):
+            wool.__serializer__.dumps(proxy)
+
+    def test___wool_reduce___should_raise_when_the_subscriber_is_a_context_manager(
+        self,
+    ):
+        """Test a context-manager subscriber fails the proxy's reduction.
+
+        Given:
+            A proxy whose discovery is a picklable subscriber that is
+            also an async context manager.
+        When:
+            Serialization with wool's pickler is attempted.
+        Then:
+            It should raise TypeError whose message names ``'discovery'``
+            and mentions no callable form.
+        """
+
+        # Arrange
+        class ContextManagerSubscriber:
+            def __aiter__(self):
+                return wp.ReducibleAsyncIterator([])
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+        proxy = WorkerProxy(discovery=ContextManagerSubscriber())
+
+        # Act
+        with pytest.raises(TypeError) as excinfo:
+            wool.__serializer__.dumps(proxy)
+
+        # Assert
+        message = str(excinfo.value)
+        assert "'discovery'" in message
+        assert "callable" not in message
 
     def test___reduce_ex___with_vanilla_pickle_and_copy(self, mock_discovery_service):
         """Test the guard fires for vanilla pickle, cloudpickle, and copy paths.
@@ -7870,29 +8126,6 @@ class TestWorkerProxy:
             await proxy.start()
 
     @pytest.mark.asyncio
-    async def test_start_invalid_discovery_type_raises_error(
-        self, mocker: MockerFixture
-    ):
-        """Test raise TypeError.
-
-        Given:
-            A non-lazy WorkerProxy with a discovery that doesn't
-            implement AsyncIterator
-        When:
-            Start() is called
-        Then:
-            It should raise TypeError
-        """
-        # Arrange - use a simple string which is definitely not an AsyncIterator
-        invalid_discovery = "not_an_async_iterator"
-
-        proxy = WorkerProxy(discovery=lambda: invalid_discovery, lazy=False)
-
-        # Act & assert
-        with pytest.raises(TypeError):
-            await proxy.start()
-
-    @pytest.mark.asyncio
     async def test_security_filter_with_credentials(
         self, mock_proxy_session, worker_credentials, mocker: MockerFixture
     ):
@@ -7940,88 +8173,71 @@ class TestWorkerProxy:
         # Cleanup
         await proxy.stop()
 
-    def test___init___should_build_tag_only_filter_when_pool_uri_supplied(
-        self, mocker: MockerFixture
+    @pytest.mark.asyncio
+    async def test_start_should_admit_only_tag_matching_workers_when_pool_uri(
+        self, mock_proxy_session, mocker: MockerFixture
     ):
-        """Test pool URI subscription filter applies tag semantics only.
+        """Test a pool-URI proxy admits workers by tag intersection alone.
 
         Given:
-            A WorkerProxy instantiated with a pool URI and extra tags.
+            A proxy built from a pool URI plus an extra tag, whose real
+            afilter-wrapped subscription surfaces three compatible
+            workers in order — one tagged with neither of its tags, one
+            tagged with the pool URI, and one tagged with the extra tag.
         When:
-            The discovery subscription filter is evaluated against
-            workers.
+            The proxy is started and the events are drained.
         Then:
-            It should admit workers by tag intersection alone —
-            security and version compatibility are enforced at sentinel
-            admission, not in the subscription filter.
+            It should admit exactly the two whose tags intersect its own.
         """
         # Arrange
         mocker.patch.object(protocol, "__version__", "1.0.0")
-        mock_subscriber = mocker.MagicMock()
-        mock_local_discovery = mocker.MagicMock()
-        mock_local_discovery.subscribe.return_value = mock_subscriber
-        mocker.patch.object(wp, "LocalDiscovery", return_value=mock_local_discovery)
 
-        WorkerProxy("pool-1", "extra-tag")
+        def _worker(port, tag):
+            return WorkerMetadata(
+                uid=uuid.uuid4(),
+                address=f"127.0.0.1:{port}",
+                pid=port,
+                version="1.0.0",
+                secure=False,
+                tags=frozenset([tag]),
+            )
 
-        # Capture the filter passed to subscribe()
-        filter_fn = mock_local_discovery.subscribe.call_args.kwargs["filter"]
+        # Ordered so the two admissible workers come last: the
+        # subscription yields in order, so admitting the last one proves
+        # the filter already dropped the unrelated worker.
+        unrelated = _worker(50051, "other")
+        by_pool_uri = _worker(50052, "pool-1")
+        by_extra_tag = _worker(50053, "extra-tag")
 
-        # Act & assert — matching tags pass
-        matching = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="127.0.0.1:50051",
-            pid=1,
-            version="1.0.0",
-            tags=frozenset(["pool-1"]),
-            secure=False,
+        class _Inner:
+            def __aiter__(self):
+                async def gen():
+                    for worker in (unrelated, by_pool_uri, by_extra_tag):
+                        yield DiscoveryEvent("worker-added", metadata=worker)
+                    await asyncio.Event().wait()
+
+                return gen()
+
+        mocker.patch.object(wp.LocalDiscovery, "Subscriber", return_value=_Inner())
+        proxy = WorkerProxy(
+            "pool-1", "extra-tag", credentials=None, quorum=None, lazy=False
         )
-        assert filter_fn(matching) is True
 
-        # Act & assert — no matching tags fail
-        non_matching = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="127.0.0.1:50052",
-            pid=2,
-            version="1.0.0",
-            tags=frozenset(["other"]),
-            secure=False,
-        )
-        assert filter_fn(non_matching) is False
+        try:
+            # Act
+            await proxy.start()
+            await _drain_until(
+                lambda: by_extra_tag.uid in {w.uid for w in proxy.workers}
+            )
 
-        # Act & assert — matching tags pass despite a security mismatch;
-        # the sentinel admission gate owns compatibility rejection
-        secure_matching = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="127.0.0.1:50053",
-            pid=3,
-            version="1.0.0",
-            tags=frozenset(["pool-1"]),
-            secure=True,
-        )
-        assert filter_fn(secure_matching) is True
-
-        # Act & assert — matching tags pass despite a version mismatch
-        version_mismatched = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="127.0.0.1:50054",
-            pid=4,
-            version="2.0.0",
-            tags=frozenset(["pool-1"]),
-            secure=False,
-        )
-        assert filter_fn(version_mismatched) is True
-
-        # Act & assert — the extra-tag member of the union matches alone
-        extra_tag_only = WorkerMetadata(
-            uid=uuid.uuid4(),
-            address="127.0.0.1:50055",
-            pid=5,
-            version="1.0.0",
-            tags=frozenset(["extra-tag"]),
-            secure=False,
-        )
-        assert filter_fn(extra_tag_only) is True
+            # Assert
+            assert {w.uid for w in proxy.workers} == {
+                by_pool_uri.uid,
+                by_extra_tag.uid,
+            }
+        finally:
+            # Cleanup
+            await proxy.stop()
 
     @given(num_proxies=st.integers(min_value=2, max_value=20))
     @settings(

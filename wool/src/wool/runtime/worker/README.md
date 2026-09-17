@@ -13,7 +13,9 @@ Workers are the execution layer where `@wool.routine` calls actually run. Each w
 | Durable | omitted | set | No workers spawned; connects to existing workers via discovery. |
 | Hybrid | set | set | Spawns local workers and discovers remote workers through the same protocol. |
 
-Which mode a call resolves to follows from two questions; what the pool then passes the factory follows from two more, answered by inspecting the factory's signature rather than by which overload matched:
+With `LocalDiscovery`, a Durable pool borrows a namespace through `LocalDiscovery.Subscriber`, and a Hybrid pool owns its namespace; see [Worker discovery](../discovery/README.md#usage-examples).
+
+Which mode a call resolves to follows from two questions; what the pool then passes the factory follows from two more, answered by inspecting the factory's signature:
 
 ```mermaid
 flowchart TD
@@ -38,7 +40,7 @@ flowchart TD
     named -- no --> unused["the factory owns the identity<br/>a configured value is unused and warns"]
 ```
 
-Both signature questions are orthogonal to the mode and to each other — the four combinations are the four shapes `WorkerFactoryLike` admits; see [Custom workers](#custom-workers). `worker` takes the same alias whatever the spawning mode — Durable declares no `worker` at all — so the deprecated `size` overloads mirror the `spawn` ones exactly.
+Both signature questions are orthogonal to the mode and to each other — the four combinations are the four shapes `WorkerFactoryLike` admits; see [Custom workers](#custom-workers).
 
 **Default** — no arguments needed:
 
@@ -297,8 +299,8 @@ Because the fast path is out of reach on macOS, treat the forking path as the on
 
 | Mode | Parameter | Description |
 | ---- | --------- | ----------- |
-| Pool URI | `pool_uri` | Subscribes to `LocalDiscovery` with the URI as namespace and tag filter. |
-| Discovery | `discovery` | Accepts any `DiscoverySubscriberLike` or `Factory` thereof. |
+| Pool URI | `pool_uri` | Borrows the `LocalDiscovery` namespace named by the URI, admitting workers tagged with the URI or any of `tags`. |
+| Discovery | `discovery` | Takes a `DiscoverySubscriberLike`; see `WorkerProxy`. |
 | Static | `workers` | Takes a sequence of `WorkerMetadata` directly — no discovery needed. |
 
 ### Lazy startup
@@ -310,7 +312,7 @@ Because the fast path is out of reach on macOS, treat the forking path as the on
 | `True` | Sets context var only | Calls `start()` on first call (retrying on a later call if it failed), then dispatches; raises `RuntimeError` once the proxy has been stopped | No-op (safe to call) |
 | `False` | Sets context var, calls `start()` | Raises `RuntimeError` if not started | Raises `RuntimeError` |
 
-When `lazy=True`, concurrent `dispatch()` calls use a double-checked lock to ensure the proxy starts exactly once. The `lazy` flag is preserved through `cloudpickle` serialization, so proxies sent to worker subprocesses as part of a task retain their laziness setting.
+When `lazy=True`, concurrent `dispatch()` calls use a double-checked lock to ensure the proxy starts exactly once. The `lazy` flag rides the proxy's reduction through Wool's serializer (see `WorkerProxy.__wool_reduce__`), so proxies sent to worker subprocesses as part of a task retain their laziness setting.
 
 ### Context lifecycle
 

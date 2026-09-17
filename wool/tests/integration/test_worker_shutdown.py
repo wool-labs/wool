@@ -749,7 +749,9 @@ class TestWorkerOrphanPrevention:
                 _ensure_killed(pid)
 
     @pytest.mark.asyncio
-    async def test___aexit___should_reap_worker_when_drop_announcement_hangs(self):
+    async def test___aexit___should_reap_worker_when_drop_announcement_hangs(
+        self, caplog
+    ):
         """Test a pool reaps its worker despite a wedged publisher.
 
         Given:
@@ -760,31 +762,37 @@ class TestWorkerOrphanPrevention:
             The async-with block exits and the shutdown deadline
             cancels the pending announcement
         Then:
-            It should leave no worker subprocess alive, rather than
-            abandoning the stop inside the cancelled announcement
+            It should leave no worker subprocess alive, log the
+            announcement as cancelled at the shutdown deadline, and
+            finish the pool's lifetime within one and a half shutdown
+            deadlines.
         """
         # Arrange
         namespace = f"drop-hangs-{uuid.uuid4().hex[:12]}"
         before = {child.pid for child in multiprocessing.active_children()}
         pids: list[int] = []
+        shutdown_timeout = 2.0
 
         try:
             # Act
             with LocalDiscovery(namespace) as discovery:
-                async with asyncio.timeout(30):
-                    async with WorkerPool(
-                        spawn=1,
-                        shutdown_timeout=5.0,
-                        discovery=_DirectDiscovery(
-                            discovery,
-                            _BrokenDropPublisher(discovery.publisher, _HANG),
-                        ),
-                    ):
-                        pids.extend(
-                            child.pid
-                            for child in multiprocessing.active_children()
-                            if child.pid not in before
-                        )
+                with caplog.at_level(logging.ERROR, "wool.runtime.worker.pool"):
+                    started = time.monotonic()
+                    async with asyncio.timeout(30):
+                        async with WorkerPool(
+                            spawn=1,
+                            shutdown_timeout=shutdown_timeout,
+                            discovery=_DirectDiscovery(
+                                discovery,
+                                _BrokenDropPublisher(discovery.publisher, _HANG),
+                            ),
+                        ):
+                            pids.extend(
+                                child.pid
+                                for child in multiprocessing.active_children()
+                                if child.pid not in before
+                            )
+                        elapsed = time.monotonic() - started
 
             # Assert — join any finished children first so an
             # exited-but-unreaped worker cannot masquerade as alive
@@ -793,6 +801,19 @@ class TestWorkerOrphanPrevention:
             assert len(pids) == 1
             for pid in pids:
                 assert not _pid_alive(pid)
+
+            # The deadline cancelled the announcement; a publisher that
+            # stops wedging would otherwise pass without exercising it.
+            # Only the CancelledError arm's message names the deadline.
+            assert any(
+                "within the shutdown deadline" in record.getMessage()
+                for record in caplog.records
+                if record.levelno == logging.ERROR
+            )
+
+            # Pool entry and teardown fit within one deadline plus
+            # margin, so the stop ran on the deadline's remainder.
+            assert elapsed < shutdown_timeout * 1.5
         finally:
             # The Act belongs inside this `try`: if the fix regresses and
             # the hang wedges teardown until `asyncio.timeout(30)` fires,

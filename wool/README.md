@@ -274,6 +274,8 @@ async with wool.WorkerPool(discovery=wool.LanDiscovery()):
     result = await my_routine()
 ```
 
+A durable pool borrows a local namespace through `wool.LocalDiscovery.Subscriber(namespace)`.
+
 **Hybrid** — spawn local workers and discover remote ones:
 
 ```python
@@ -321,11 +323,11 @@ A `DiscoveryEvent` pairs a type — one of `worker-added`, `worker-dropped`, or 
 
 Wool ships with two discovery protocols:
 
-- **`LocalDiscovery`** — shared-memory IPC for single-machine pools. Publishers write worker metadata into a named shared memory region (`multiprocessing.SharedMemory`), using cross-process file locking (`portalocker`) for synchronization. Subscribers attach to the same region, diff its contents against a local cache, and emit discovery events for changes. A notification file touched by publishers after each write wakes subscribers via `watchdog` filesystem monitoring, with optional fallback polling. This is the default when no discovery is specified.
+- **`LocalDiscovery`** — shared-memory IPC for single-machine pools, and the default when no discovery is specified. A namespace's registry has exactly one owner, the entered `LocalDiscovery` instance that created it, and publishers and subscribers borrow it. See [Worker discovery](src/wool/runtime/discovery/README.md) and the `LocalDiscovery` docstring for ownership, borrowing and orphaning.
 
 - **`LanDiscovery`** — Zeroconf DNS-SD (`_wool._tcp.local.`) for network-wide discovery. Publishers register, update, and unregister `ServiceInfo` records via `AsyncZeroconf`. Subscribers use `AsyncServiceBrowser` to listen for service changes and convert Zeroconf callbacks into Wool `DiscoveryEvent`s. No central coordinator or shared state is required.
 
-Custom discovery protocols are supported via structural subtyping — implement the `DiscoveryLike` protocol and pass it to `WorkerPool`.
+Custom discovery protocols are supported via structural subtyping: implement `DiscoveryLike`, or `DiscoverySubscriberLike` alone for a durable pool, and pass it to `WorkerPool`; see [Worker discovery](src/wool/runtime/discovery/README.md).
 
 ### Discovery is an untrusted hint
 
@@ -560,7 +562,7 @@ sequenceDiagram
 
         Pool ->> Proxy: create proxy (discovery subscriber, loadbalancer, lazy)
         opt Eager proxy now, lazy proxy on its first dispatch
-            Proxy ->> Proxy: start — take a hold on the loop's channel pool, enter the load balancer, subscribe to discovery, launch the worker sentinel
+            Proxy ->> Proxy: start — take a hold on the loop's channel pool, enter the load balancer, adopt the pool's discovery subscriber, launch the worker sentinel
         end
         Pool -->> Client: pool ready
         deactivate Client
@@ -658,7 +660,7 @@ sequenceDiagram
         activate Client
 
         Pool ->> Proxy: stop proxy
-        Proxy ->> Proxy: cancel the sentinel, exit discovery and the load balancer, release the hold
+        Proxy ->> Proxy: cancel the sentinel, exit the load balancer, release the hold
         opt Last hold on the loop
             Proxy ->> Proxy: retire every channel cached on the loop, drain-first (a channel a stream still uses closes when that stream drains)
         end

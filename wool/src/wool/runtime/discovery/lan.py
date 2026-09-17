@@ -8,6 +8,7 @@ import socket
 import warnings
 from asyncio import Queue
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Callable
@@ -471,20 +472,20 @@ class LanDiscovery(Discovery):
         register and unregister their services, the subscriber yields
         corresponding events.
 
-        Instances are cached as singletons — two calls with the same
-        ``service_type`` return the same object.
-
-        Each call to ``__aiter__`` creates an isolated consumer fed from a
-        Zeroconf browser shared across consumers of the same service type.
-        The shared browser fans out, i.e., every concurrent iteration
-        receives the full event stream, and the iterations are otherwise
-        independent.
+        Constructions sharing a ``service_type`` within one
+        `contextvars.Context` are served from one subscription, backed by
+        one Zeroconf browser; see
+        `~wool.runtime.discovery.pool.SubscriberMeta`.
 
         :param service_type:
             The DNS-SD service type string for this namespace.
         """
 
         service_type: str
+
+        if TYPE_CHECKING:
+
+            def __new__(cls, service_type: str) -> DiscoverySubscriberLike: ...
 
         def __init__(self, service_type: str) -> None:
             self.service_type = service_type
