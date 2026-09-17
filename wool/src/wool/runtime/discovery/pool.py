@@ -124,23 +124,47 @@ class _SharedSubscription:
 
 
 class SubscriberMeta(type):
-    """Metaclass that caches discovery subscriber singletons.
+    """Share one underlying subscriber among constructions with equal keys.
 
-    Intercepts class creation via ``__new__`` and injects a custom
-    ``__new__`` onto the subscriber class.  The injected method
-    registers a factory that creates raw subscribers, then returns a
-    `_SharedSubscription` whose pool
-    `~wool.runtime.resourcepool.Resource` is entered lazily
-    on first iteration.
+    A subscriber class passes a ``key`` callable at class definition. The
+    callable receives the constructor's ``(cls, *args, **kwargs)`` and
+    returns a hashable key, which must determine every constructor
+    argument: the first construction under a key fixes the arguments of
+    the subscriber every later construction under that key shares.
 
-    Subscriber classes pass a ``key`` keyword argument at class
-    definition time.  The callable receives ``(cls, *args, **kwargs)``
-    and must return a hashable cache key.
+    Constructing a subscriber class yields a
+    `~wool.DiscoverySubscriberLike` that provides iteration and a
+    reduction replaying the construction arguments. Attributes declared
+    on the subscriber class are unreachable through it. Constructions
+    with equal keys in one `contextvars.Context` share one underlying
+    subscriber. Each iteration is an independent consumer of it, and an
+    iteration that joins a live subscriber first receives
+    ``worker-added`` for each worker the subscription currently holds.
 
-    Example::
+    A type checker cannot see the construction this metaclass injects, so
+    each subscriber class declares a checker-only ``__new__`` under
+    ``TYPE_CHECKING`` with its constructor's parameters and the protocol
+    return type.
+
+    .. code-block:: python
 
         class Sub(metaclass=SubscriberMeta, key=lambda cls, ns: (cls, ns)):
+            if TYPE_CHECKING:
+
+                def __new__(cls, ns: str) -> DiscoverySubscriberLike: ...
+
             def __init__(self, ns: str) -> None: ...
+
+            def __aiter__(self) -> AsyncIterator[DiscoveryEvent]: ...
+
+    .. rubric:: Implementation notes
+
+    Class creation injects a ``__new__`` onto the subscriber class. Each
+    construction registers a factory for its key, installs the context's
+    subscriber pool, and returns a `_SharedSubscription`. Each iteration
+    of that subscription enters the pool's resource for the key, which
+    creates the underlying subscriber on first use, and consumes it
+    through a shared `~wool.utilities.fanout.Fanout`.
     """
 
     def __new__(

@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Callable
@@ -831,6 +832,12 @@ class LocalDiscovery(Discovery):
 
         _namespace: Final[str]
         _poll_interval: Final[float | None]
+
+        if TYPE_CHECKING:
+
+            def __new__(
+                cls, namespace: str, *, poll_interval: float | None = None
+            ) -> DiscoverySubscriberLike: ...
 
         def __init__(
             self,
