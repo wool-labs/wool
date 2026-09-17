@@ -33,15 +33,8 @@ _RECONSTRUCTION_CASES = [
         DiscoveryWorkerNotFound, (uuid.UUID(int=7),), ("uid",), id="worker-not-found"
     ),
     pytest.param(DiscoveryWorkerNotFound, (None,), ("uid",), id="worker-unknown"),
-    pytest.param(
-        DiscoveryNamespaceInUse, ("ns", "seg"), ("namespace", "segment"), id="in-use"
-    ),
-    pytest.param(
-        DiscoveryNamespaceInUse,
-        (None, None),
-        ("namespace", "segment"),
-        id="in-use-unknown",
-    ),
+    pytest.param(DiscoveryNamespaceInUse, ("ns",), ("namespace",), id="in-use"),
+    pytest.param(DiscoveryNamespaceInUse, (None,), ("namespace",), id="in-use-unknown"),
     pytest.param(DiscoveryNamespaceNotFound, ("ns",), ("namespace",), id="not-found"),
     pytest.param(
         DiscoveryNamespaceNotFound, (None,), ("namespace",), id="not-found-unknown"
@@ -293,91 +286,74 @@ class TestDiscoveryWorkerNotFound:
 
 
 class TestDiscoveryNamespaceInUse:
-    @given(
-        namespace=st.one_of(st.none(), st.text()),
-        segment=st.one_of(st.none(), st.text()),
-    )
+    @given(namespace=st.one_of(st.none(), st.text()))
     @settings(max_examples=100)
-    def test___init___should_expose_its_fields_across_the_argument_domain(
-        self, namespace, segment
+    def test___init___should_expose_its_namespace_across_the_argument_domain(
+        self, namespace
     ):
-        """Test field exposure and message content over both arguments.
+        """Test field exposure and message content over the argument.
 
         Given:
-            Any optional namespace and any optional segment.
+            Any optional namespace.
         When:
-            A DiscoveryNamespaceInUse is constructed from them.
+            A DiscoveryNamespaceInUse is constructed from it.
         Then:
-            It should expose both unchanged, quote each supplied field
-            in its message, and omit the corresponding clause entirely
-            where a field is None.
+            It should expose the namespace unchanged and quote it in
+            the message, omitting the clause entirely where it is None.
         """
         # Act
-        error = DiscoveryNamespaceInUse(namespace, segment=segment)
+        error = DiscoveryNamespaceInUse(namespace)
 
         # Assert
         assert error.namespace == namespace
-        assert error.segment == segment
 
         message = str(error)
+        assert "is already in use" in message
         if namespace is None:
-            assert "already in use" in message
+            assert message == "Discovery namespace is already in use"
         else:
             assert repr(namespace) in message
-        if segment is None:
-            assert "remove shared memory" not in message
-        else:
-            assert repr(segment) in message
 
-    @given(
-        namespace=st.one_of(st.none(), st.text()),
-        segment=st.one_of(st.none(), st.text()),
-    )
+    @given(namespace=st.one_of(st.none(), st.text()))
     @settings(max_examples=50)
-    def test___reduce___should_preserve_its_fields_across_a_process_boundary(
-        self, namespace, segment
+    def test___reduce___should_preserve_its_namespace_across_a_process_boundary(
+        self, namespace
     ):
         """Test reconstruction survives pickling.
 
         Given:
-            Any optional namespace and any optional segment.
+            Any optional namespace.
         When:
             A DiscoveryNamespaceInUse is pickled and unpickled.
         Then:
-            It should restore both fields and its args.
+            It should restore the namespace and its args.
         """
         # Arrange
-        error = DiscoveryNamespaceInUse(namespace, segment=segment)
+        error = DiscoveryNamespaceInUse(namespace)
 
         # Act
         restored = pickle.loads(pickle.dumps(error))
 
         # Assert
         assert restored.namespace == namespace
-        assert restored.segment == segment
         assert restored.args == error.args
 
-    @given(
-        namespace=st.one_of(st.none(), st.text()),
-        segment=st.one_of(st.none(), st.text()),
-    )
+    @given(namespace=st.one_of(st.none(), st.text()))
     @settings(max_examples=25)
-    def test___init___should_survive_the_worker_exception_serializer(
-        self, namespace, segment
-    ):
+    def test___init___should_survive_the_worker_exception_serializer(self, namespace):
         """Test the exception survives the worker exception serializer.
 
         Given:
-            Any optional namespace and any optional segment.
+            Any optional namespace.
         When:
             A DiscoveryNamespaceInUse is encoded in an exception
             response frame and decoded.
         Then:
-            It should arrive as the same class with both fields and the
-            same message.
+            It should arrive as the same class with its namespace and
+            the same message.
         """
         # Arrange
-        error = DiscoveryNamespaceInUse(namespace, segment=segment)
+        error = DiscoveryNamespaceInUse(namespace)
 
         # Act
         restored = _marshalled(error)
@@ -385,7 +361,6 @@ class TestDiscoveryNamespaceInUse:
         # Assert
         assert isinstance(restored, DiscoveryNamespaceInUse)
         assert restored.namespace == namespace
-        assert restored.segment == segment
         assert str(restored) == str(error)
 
 

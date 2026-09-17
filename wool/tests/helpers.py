@@ -1,11 +1,15 @@
 import asyncio
 import datetime
 import ipaddress
+import os
+import sys
+import tempfile
 import uuid
 from collections.abc import Callable
 from collections.abc import Coroutine
 from collections.abc import Generator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 from typing import NamedTuple
 
@@ -56,6 +60,19 @@ class CertificateFiles(NamedTuple):
     ca_pem: bytes
     key_pem: bytes
     cert_pem: bytes
+
+
+def namespace_directory(namespace: str) -> Path:
+    """Return the directory a `wool.LocalDiscovery` namespace's files live in.
+
+    Mirrors the module's own choice between the two candidate roots —
+    ``/dev/shm`` where Linux provides it, the temporary directory
+    otherwise — rather than reaching into the module to ask.
+    """
+    shm = Path("/dev/shm")
+    if sys.platform.startswith("linux") and os.access(shm, os.W_OK | os.X_OK):
+        return shm.resolve() / f"wool-{namespace}"
+    return Path(tempfile.gettempdir()).resolve() / f"wool-{namespace}"
 
 
 def plant(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:

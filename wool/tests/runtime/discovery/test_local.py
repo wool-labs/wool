@@ -1,21 +1,15 @@
 import asyncio
 import atexit
-import contextlib
-import errno
-import mmap
+import os
 import pickle
 import re
-import sys
+import shutil
 import tempfile
-import threading
 import uuid
 from collections import Counter
 from contextlib import AsyncExitStack
 from contextlib import ExitStack
 from contextlib import asynccontextmanager
-from contextlib import contextmanager
-from multiprocessing import resource_tracker
-from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from types import MappingProxyType
 from types import SimpleNamespace
@@ -24,13 +18,12 @@ import portalocker
 import pytest
 import pytest_asyncio
 from hypothesis import HealthCheck
-from hypothesis import assume
 from hypothesis import example
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
-from wool.runtime.discovery import local
+from tests.helpers import namespace_directory
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
@@ -79,8 +72,8 @@ def oversized_metadata():
 def namespace():
     """Provides unique namespace for test isolation.
 
-    Creates a unique namespace string for each test to ensure shared
-    memory regions don't interfere with each other.
+    Creates a unique namespace string for each test to ensure
+    namespaces don't interfere with each other.
     """
     return f"test-namespace-{uuid.uuid4()}"
 
@@ -173,134 +166,35 @@ async def borrowed_publisher(namespace, metadata, atexit_recorder):
 
 
 @pytest.fixture
-def unlink_schedule(mocker, teardown_log):
-    """Patches SharedMemory.unlink with a schedule-driven wrapper and
-    returns the schedule list. Each unlink is logged to `teardown_log`.
+def unlink_schedule(mocker, namespace, teardown_log):
+    """Patches file removal with a schedule-driven wrapper and returns
+    the schedule list. Each removal is logged to `teardown_log`.
 
-    Each unlink call performs the real unlink — so no segment leaks —
-    then consumes one schedule entry and raises it when the entry is an
-    exception, simulating an external unlinker or a hostile filesystem.
-    An empty or exhausted schedule means the unlink passes through
-    untouched. A one-shot failure is therefore a one-entry schedule, and
-    a generated failure pattern is a longer one. Patching once per test
-    (rather than per failure or per Hypothesis example) avoids stacking
-    wrappers.
+    Only removals inside this test's namespace directory are wrapped, so
+    unrelated removals anywhere in the interpreter pass straight
+    through. Each wrapped call performs the real removal — so no file
+    leaks — then consumes one schedule entry and raises it when the entry
+    is an exception, simulating an external remover or a hostile
+    filesystem. An empty or exhausted schedule means the removal passes
+    through untouched. A one-shot failure is therefore a one-entry
+    schedule, and a generated failure pattern is a longer one. Patching
+    once per test (rather than per failure or per Hypothesis example)
+    avoids stacking wrappers.
     """
     schedule: list[Exception | None] = []
-    real_unlink = SharedMemory.unlink
+    real_unlink = os.unlink
+    directory = namespace_directory(namespace)
 
-    def unlink(shm):
+    def unlink(path, **kwargs):
+        if Path(path).parent != directory:
+            return real_unlink(path, **kwargs)
         teardown_log.append("unlink")
-        real_unlink(shm)
+        real_unlink(path, **kwargs)
         if schedule and (error := schedule.pop(0)) is not None:
             raise error
 
-    mocker.patch.object(SharedMemory, "unlink", unlink)
+    mocker.patch.object(os, "unlink", unlink)
     return schedule
-
-
-@pytest.fixture
-def tracker_ledger(mocker):
-    """Mirror the resource tracker's cache in-process, recording violations.
-
-    Wraps `resource_tracker.register` and `resource_tracker.unregister`,
-    replaying the tracker's own bookkeeping locally: a per-type **set**,
-    added to on register and removed from on unregister.
-
-    The set is the whole point. Registrations of one name collapse to a
-    single entry while every unregister attempts its own removal, so
-    counting calls does not detect the fault `_attach` documents — the
-    counts stay perfectly balanced while the tracker raises. What raises is
-    a removal of a name the cache no longer holds; here it lands in
-    ``violations`` instead of a traceback no test can observe.
-
-    A violating unregister is recorded and *not* forwarded. Forwarding it
-    would corrupt the real tracker's session-global cache and reproduce
-    that traceback inside this suite, misattributed to whichever test ran
-    last. Every other call passes through, so real segments stay tracked.
-
-    Only names first registered inside this fixture's window can be
-    recorded as violations, so a segment that outlived an earlier test
-    cannot produce a false one.
-    """
-    ledger = SimpleNamespace(registered=[], violations=[])
-    cache: set[tuple[str, str]] = set()
-    seen: set[tuple[str, str]] = set()
-    real_register = resource_tracker.register
-    real_unregister = resource_tracker.unregister
-
-    def register(name, rtype):
-        key = (rtype, name.lstrip("/"))
-        ledger.registered.append(key)
-        cache.add(key)
-        seen.add(key)
-        return real_register(name, rtype)
-
-    def unregister(name, rtype):
-        key = (rtype, name.lstrip("/"))
-        if key in cache:
-            cache.discard(key)
-        elif key in seen:
-            ledger.violations.append(key)
-            return None
-        return real_unregister(name, rtype)
-
-    def reset():
-        ledger.registered.clear()
-        ledger.violations.clear()
-        cache.clear()
-        seen.clear()
-
-    mocker.patch.object(resource_tracker, "register", register)
-    mocker.patch.object(resource_tracker, "unregister", unregister)
-    ledger.residual = cache
-    ledger.reset = reset
-    return ledger
-
-
-@pytest.fixture
-def attach_fallback(mocker):
-    """Force the attach path taken where `SharedMemory` has no ``track``.
-
-    The package supports 3.11 and up, so most supported interpreters take
-    that path — but the development interpreter is 3.13, where it is
-    unreachable. The branch is measured rather than pragma-excluded, so
-    forcing it is what covers it there; where the interpreter is already
-    below 3.13 the override is a no-op against the natural branch.
-
-    The module reads `sys` at exactly one place, so replacing its own
-    reference is narrower than patching the real `sys.version_info`, which
-    every module in the interpreter would see. Should another `sys`
-    attribute ever be used there, this raises `AttributeError` rather than
-    silently steering nothing.
-
-    Forcing *down* is always safe. Forcing up is not: ``track=False`` does
-    not exist below 3.13, so a test wanting the modern path must skip
-    rather than override.
-    """
-    mocker.patch.object(
-        local, "sys", SimpleNamespace(version_info=(3, 12, 0, "final", 0))
-    )
-
-
-@pytest.fixture
-def attach_calls(mocker):
-    """Record the keyword arguments of every `SharedMemory` construction.
-
-    Observes which attach path ran, rather than trusting the version the
-    `attach_fallback` fixture reports: only the modern path passes
-    ``track``. Without this, inverting the version predicate leaves the
-    suite green while every test silently exercises the other branch.
-    """
-    calls = []
-    mapping = local.SharedMemory
-
-    def constructing(*args, **kwargs):
-        calls.append(kwargs)
-        return mapping(*args, **kwargs)
-
-    mocker.patch.object(local, "SharedMemory", constructing)
-    return calls
 
 
 @pytest.fixture
@@ -371,12 +265,24 @@ _LIFECYCLE_FORESTS = st.recursive(
 )
 
 
-def _rejected_claim(namespace):
-    """Return the `DiscoveryNamespaceInUse` a claim against a live owner raises.
+def _worker():
+    """Return WorkerMetadata for a distinct worker."""
+    return WorkerMetadata(
+        uid=uuid.uuid4(), address="localhost:50051", pid=12345, version="1.0.0"
+    )
 
-    The exception's ``segment`` exposes the segment name a namespace
-    resolves to without the module's private hashing helper.
-    """
+
+def _rejected_claim_is_raised(namespace):
+    """Return whether a claim against the live owner of ``namespace`` is rejected."""
+    try:
+        with LocalDiscovery(namespace):
+            return False
+    except DiscoveryNamespaceInUse:
+        return True
+
+
+def _rejected_claim(namespace):
+    """Return the `DiscoveryNamespaceInUse` a claim against a live owner raises."""
     with LocalDiscovery(namespace):
         try:
             with LocalDiscovery(namespace):
@@ -384,263 +290,6 @@ def _rejected_claim(namespace):
         except DiscoveryNamespaceInUse as error:
             return error
     raise AssertionError(f"second claim on {namespace!r} was not rejected")
-
-
-@contextmanager
-def _segment(name):
-    """Create a shared memory segment by name, unlinking it on exit."""
-    created = SharedMemory(name=name, create=True, size=64)
-    try:
-        yield created
-    finally:
-        created.close()
-        created.unlink()
-
-
-def _segment_name():
-    """Return a fresh segment name short enough for macOS's 31-char limit."""
-    return f"wool-336-{uuid.uuid4().hex[:16]}"
-
-
-@pytest.fixture(params=["fallback", "native"])
-def attach_path(request, mocker):
-    """Select an attach path, skipping the modern one where it cannot run.
-
-    Forcing the fallback is safe on every interpreter. Forcing the modern
-    path is not — ``track=False`` does not exist below 3.13 — so that case
-    skips rather than overrides.
-    """
-    if request.param == "fallback":
-        mocker.patch.object(
-            local, "sys", SimpleNamespace(version_info=(3, 12, 0, "final", 0))
-        )
-    elif sys.version_info < (3, 13):
-        pytest.skip("track=False requires Python 3.13")
-    return request.param
-
-
-def test__attach_should_not_register_the_segment(
-    attach_path, attach_calls, tracker_ledger
-):
-    """Test attaching to a segment leaves the resource tracker untouched.
-
-    Given:
-        An existing shared memory segment, on either attach path.
-    When:
-        The segment is attached by name.
-    Then:
-        It should register nothing further for that segment, leaving the
-        creator's registration to answer the creator's own unlink — the
-        same observable on both paths.
-    """
-    # Arrange
-    name = _segment_name()
-
-    # Act
-    with _segment(name):
-        before = tracker_ledger.registered.count(("shared_memory", name))
-        attached = local._attach(name)
-        attached.close()
-
-    # Assert
-    assert tracker_ledger.registered.count(("shared_memory", name)) == before
-    assert tracker_ledger.violations == []
-    # Pin which path ran: only the modern one passes track.
-    assert ("track" in attach_calls[-1]) == (attach_path == "native")
-
-
-def test__attach_should_register_other_resources_when_track_unsupported(
-    mocker, attach_fallback, tracker_ledger
-):
-    """Test the fallback suppresses only this segment and this resource type.
-
-    Given:
-        An interpreter reporting a version below 3.13, and a mapping that
-        registers an unrelated segment and a semaphore of the very name
-        being attached while the constructor runs.
-    When:
-        The segment is attached by name.
-    Then:
-        It should pass both registrations through — narrowing the
-        suppression to one segment and one resource type, not to the name
-        alone.
-    """
-    # Arrange
-    name = _segment_name()
-    other = _segment_name()
-    mapping = local.SharedMemory
-
-    def constructing(*args, **kwargs):
-        resource_tracker.register(f"/{other}", "shared_memory")
-        resource_tracker.register(f"/{name}", "semaphore")
-        return mapping(*args, **kwargs)
-
-    mocker.patch.object(local, "SharedMemory", constructing)
-
-    # Act
-    with _segment(name):
-        before = tracker_ledger.registered.count(("shared_memory", name))
-        try:
-            attached = local._attach(name)
-            attached.close()
-        finally:
-            resource_tracker.unregister(f"/{other}", "shared_memory")
-            resource_tracker.unregister(f"/{name}", "semaphore")
-
-    # Assert
-    assert ("shared_memory", other) in tracker_ledger.registered
-    assert ("semaphore", name) in tracker_ledger.registered
-    assert tracker_ledger.registered.count(("shared_memory", name)) == before
-
-
-def test__attach_should_register_the_segment_when_another_thread_registers_it(
-    mocker, attach_fallback, tracker_ledger
-):
-    """Test the fallback suppresses only its own thread's registration.
-
-    Given:
-        An interpreter reporting a version below 3.13, and a second thread
-        registering the very segment being attached from inside the window
-        in which the attach has the tracker's hooks rebound.
-    When:
-        The segment is attached by name.
-    Then:
-        It should let that thread's registration reach the tracker.
-    """
-    # Arrange
-    name = _segment_name()
-    mapping = local.SharedMemory
-
-    def constructing(*args, **kwargs):
-        registrar = threading.Thread(
-            target=resource_tracker.register, args=(f"/{name}", "shared_memory")
-        )
-        registrar.start()
-        registrar.join(timeout=5)
-        assert not registrar.is_alive()
-        return mapping(*args, **kwargs)
-
-    mocker.patch.object(local, "SharedMemory", constructing)
-
-    # Act
-    with _segment(name):
-        before = tracker_ledger.registered.count(("shared_memory", name))
-        attached = local._attach(name)
-        attached.close()
-
-    # Assert
-    assert tracker_ledger.registered.count(("shared_memory", name)) == before + 1
-
-
-def test__attach_should_serialise_overlapping_attaches(
-    mocker, attach_fallback, tracker_ledger
-):
-    """Test one attach's rebind window excludes another thread's.
-
-    Given:
-        An interpreter reporting a version below 3.13, and a second thread
-        attaching a different segment while the first attach holds the
-        window open.
-    When:
-        The first attach is in its constructor.
-    Then:
-        It should keep the second thread waiting until the window closes —
-        two overlapping rebinds would capture each other's shim, letting an
-        attach's own registration escape suppression.
-    """
-    # Arrange
-    first = _segment_name()
-    second = _segment_name()
-    mapping = local.SharedMemory
-    contender_ran = threading.Event()
-
-    def constructing(*args, **kwargs):
-        if kwargs.get("name") == first:
-
-            def contend():
-                local._attach(second).close()
-                contender_ran.set()
-
-            contender = threading.Thread(target=contend, daemon=True)
-            contender.start()
-            # The contender cannot enter its own window while this one is
-            # open, so it is still blocked here.
-            assert not contender_ran.wait(timeout=0.5)
-        return mapping(*args, **kwargs)
-
-    mocker.patch.object(local, "SharedMemory", constructing)
-
-    # Act
-    with _segment(first), _segment(second):
-        local._attach(first).close()
-
-        # Assert
-        assert contender_ran.wait(timeout=5)
-        assert tracker_ledger.violations == []
-
-
-def test__attach_should_suppress_the_unregister_when_the_mapping_fails(
-    mocker, attach_fallback, tracker_ledger
-):
-    """Test a mapping that fails mid-construction issues no unregister.
-
-    Given:
-        An interpreter reporting a version below 3.13, where the memory
-        mapping raises after the segment is opened — the path on which
-        `SharedMemory` unlinks what it opened before returning.
-    When:
-        The segment is attached by name.
-    Then:
-        It should propagate the error without unregistering a name it
-        never registered, which would discard the creator's entry exactly
-        as the superseded pattern did.
-    """
-    # Arrange — create first, then break the mapping, so only the attach
-    # takes the constructor's failure path.
-    name = _segment_name()
-    created = SharedMemory(name=name, create=True, size=64)
-    mocker.patch.object(mmap, "mmap", side_effect=OSError(errno.ENOMEM, "no memory"))
-
-    # Act & assert
-    try:
-        with pytest.raises(OSError):
-            local._attach(name)
-
-        assert tracker_ledger.violations == []
-    finally:
-        created.close()
-        # The failed attach unlinks what it opened, so the segment may
-        # already be gone; that part is CPython's and not ours to prevent.
-        with contextlib.suppress(FileNotFoundError):
-            created.unlink()
-
-
-def test__attach_should_restore_the_tracker_hooks_when_the_segment_is_gone(
-    attach_fallback, tracker_ledger
-):
-    """Test a failed attach still unwinds the tracker suppression.
-
-    Given:
-        An interpreter reporting a version below 3.13 and a segment name
-        that does not exist.
-    When:
-        The segment is attached by name and the mapping fails.
-    Then:
-        It should propagate FileNotFoundError and leave a later, unrelated
-        segment tracked normally — suppression left installed would
-        silently stop tracking that name for the rest of the process.
-    """
-    # Arrange
-    missing = _segment_name()
-    later = _segment_name()
-
-    # Act
-    with pytest.raises(FileNotFoundError):
-        local._attach(missing)
-
-    # Assert — the observable consequence, not the hook's identity.
-    with _segment(later):
-        assert ("shared_memory", later) in tracker_ledger.registered
 
 
 class TestLocalDiscovery:
@@ -691,7 +340,7 @@ class TestLocalDiscovery:
         When:
             LocalDiscovery is instantiated
         Then:
-            It should raise ValueError, since a segment with fewer than one
+            It should raise ValueError, since a registry with fewer than one
             slot can never admit a worker.
         """
         # Act & assert
@@ -1189,20 +838,20 @@ class TestLocalDiscovery:
         assert events[0].metadata.uid == metadata.uid
 
     @pytest.mark.asyncio
-    async def test___enter___should_recreate_segment_when_namespace_reused(
+    async def test___enter___should_recreate_registry_when_namespace_reused(
         self, namespace, metadata
     ):
         """Test a namespace remains fully usable after rapid teardowns.
 
         Given:
             A namespace already cycled through several rapid owner
-            enter/exit lifecycles, leaving no segment behind
+            enter/exit lifecycles, leaving no registry behind
         When:
             A fresh LocalDiscovery enters the namespace and a worker
             is published and subscribed to
         Then:
             It should yield the worker-added event, proving each
-            teardown freed the segment name for a functional respawn.
+            teardown freed the namespace for a functional respawn.
         """
         # Arrange
         for _ in range(3):
@@ -1211,7 +860,7 @@ class TestLocalDiscovery:
 
         # Arrange — the last teardown freed the name: with no owner
         # holding it, a publisher's bind raises DiscoveryNamespaceNotFound.
-        # Without this probe a stale surviving segment would satisfy the
+        # Without this probe a stale surviving registry would satisfy the
         # roundtrip below just as well as a recreated one.
         probe = LocalDiscovery.Publisher(namespace)
         with pytest.raises(DiscoveryNamespaceNotFound):
@@ -1325,37 +974,333 @@ class TestLocalDiscovery:
         with second as entered:
             assert entered is second
 
-    def test___enter___should_name_the_segment_when_the_claim_is_rejected(
+    def test___enter___should_name_the_namespace_when_the_claim_is_rejected(
         self, namespace
     ):
-        """Test a rejected claim names the segment holding the namespace.
+        """Test a rejected claim reports the namespace it was rejected on.
 
         Given:
             Two distinct namespaces, each claimable by a fresh owner
         When:
-            A claim against a live owner is rejected twice on the first
-            namespace and once on the second
+            A claim against a live owner is rejected on each namespace
         Then:
-            It should report the same segment for both rejections on one
-            namespace and a different segment for the other, and say in
-            its message which segment to remove — the only handle an
-            operator has on a registry whose owner died.
+            It should name the namespace claimed in both the field and
+            the message, and carry no instruction to remove anything —
+            a namespace is in use only while its owner lives, so there
+            is nothing for an operator to reclaim by hand.
         """
         # Arrange
         other = f"{namespace}-other"
 
         # Act
-        first = _rejected_claim(namespace)
-        again = _rejected_claim(namespace)
+        rejected = _rejected_claim(namespace)
         separate = _rejected_claim(other)
 
-        # Assert — the segment depends only on the namespace
-        assert first.segment == again.segment
-        assert first.segment != separate.segment
+        # Assert
+        assert rejected.namespace == namespace
+        assert separate.namespace == other
+        assert namespace in str(rejected)
+        assert "remove" not in str(rejected)
 
-        # Assert — the message names the segment to remove
-        assert first.segment in str(first)
-        assert "remove shared memory" in str(first)
+    @pytest.mark.asyncio
+    async def test___enter___should_claim_the_namespace_when_its_owner_is_gone(
+        self, namespace, metadata
+    ):
+        """Test a claim replaces the residue an owner that is gone left.
+
+        Given:
+            A namespace whose registry, notification file and worker
+            block are left in place with no live process holding the
+            namespace, as a killed owner leaves them
+        When:
+            A fresh owner claims the namespace at a capacity of one and
+            publishes a worker of its own
+        Then:
+            It should claim it and serve a registry of its own capacity,
+            a second publish exhausting it — the stranded registration
+            is replaced rather than adopted, so it occupies no slot.
+        """
+        # Arrange — a namespace snapshotted while live and restored once
+        # its owner has exited, which is the residue a kill leaves.
+        directory = namespace_directory(namespace)
+        snapshot = directory.with_name(f"{directory.name}-snapshot")
+        with LocalDiscovery(namespace):
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", metadata)
+                shutil.copytree(directory, snapshot)
+        shutil.copytree(snapshot, directory)
+        shutil.rmtree(snapshot)
+
+        # Act & assert
+        try:
+            with LocalDiscovery(namespace, capacity=1) as successor:
+                assert successor.namespace == namespace
+                async with LocalDiscovery.Publisher(namespace) as publisher:
+                    await publisher.publish("worker-added", _worker())
+                    with pytest.raises(DiscoveryCapacityExhausted):
+                        await publisher.publish("worker-added", _worker())
+        finally:
+            # The restored residue holds a block no live publisher owns,
+            # which outlives the successor and keeps its directory.
+            shutil.rmtree(directory, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test___exit___should_remove_thenamespace_directory(
+        self, namespace, metadata
+    ):
+        """Test a fully torn down namespace leaves nothing behind.
+
+        Given:
+            An owner whose borrowing publisher published a worker, so
+            the namespace holds a registry, a notification file and the
+            worker's metadata block
+        When:
+            The publisher and then the owner exit
+        Then:
+            It should leave no namespace directory, so a host that
+            creates many short-lived namespaces accumulates no residue.
+        """
+        # Arrange
+        directory = namespace_directory(namespace)
+
+        # Act
+        with LocalDiscovery(namespace):
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", metadata)
+            assert directory.exists()
+
+        # Assert
+        assert not directory.exists()
+
+    @pytest.mark.asyncio
+    async def test___exit___should_leave_the_directory_to_an_orphaned_publisher(
+        self, namespace, borrowed_publisher
+    ):
+        """Test the last orphaned publisher removes the namespace directory.
+
+        Given:
+            An owner and a borrowing publisher holding a worker's block
+        When:
+            The owner exits while the borrower still holds that block,
+            and the orphaned borrower then exits
+        Then:
+            It should leave the directory in place while the block lives
+            in it, and remove it with that block — the borrower, not the
+            owner, reclaims what it created last.
+        """
+        # Arrange
+        directory = namespace_directory(borrowed_publisher.owner.namespace)
+
+        # Act
+        borrowed_publisher.release_owner()
+
+        # Assert — the block outlives the owner, so its home does too
+        assert directory.exists()
+
+        # Act
+        await borrowed_publisher.release_publisher()
+
+        # Assert
+        assert not directory.exists()
+
+    @pytest.mark.asyncio
+    async def test_publish_should_not_recreate_thenamespace_directory(
+        self, namespace, metadata
+    ):
+        """Test a publish against a reclaimed namespace creates nothing.
+
+        Given:
+            A publisher bound to a namespace whose owner has since
+            exited and removed it
+        When:
+            The publisher publishes a worker
+        Then:
+            It should raise DiscoveryNamespaceNotFound and leave no
+            namespace directory — a borrower recreating one would
+            resurrect the residue the owner's exit just reclaimed.
+        """
+        # Arrange
+        directory = namespace_directory(namespace)
+        async with AsyncExitStack() as stack:
+            with LocalDiscovery(namespace):
+                publisher = await stack.enter_async_context(
+                    LocalDiscovery.Publisher(namespace)
+                )
+
+            # Act & assert
+            with pytest.raises(DiscoveryNamespaceNotFound):
+                await publisher.publish("worker-added", metadata)
+            assert not directory.exists()
+
+    def test___enter___should_retry_when_the_directory_is_replaced_mid_claim(
+        self, namespace, mocker
+    ):
+        """Test a claim on a replaced directory is retried, not accepted.
+
+        Given:
+            A namespace whose directory is replaced between being opened
+            and being locked, as a departing owner's reclaim does, so
+            the claim is held on a directory the namespace no longer
+            resolves to
+        When:
+            A fresh owner claims the namespace
+        Then:
+            It should discard that claim and retry until it holds the
+            directory the namespace names — a claim on an unlinked
+            directory would let a second owner claim its replacement.
+        """
+        # Arrange — report the first claim as holding a stale directory
+        real_samestat = os.path.samestat
+        checks = []
+
+        def samestat(claimed, named):
+            checks.append(None)
+            if len(checks) == 1:
+                return False
+            return real_samestat(claimed, named)
+
+        mocker.patch.object(os.path, "samestat", samestat)
+
+        # Act
+        with LocalDiscovery(namespace) as discovery:
+            # Assert
+            assert discovery.namespace == namespace
+            assert len(checks) > 1
+            assert _rejected_claim_is_raised(namespace)
+
+    @pytest.mark.parametrize("vanishing", ["directory", "registry.tmp"])
+    def test___enter___should_retry_when_the_directory_vanishes_mid_claim(
+        self, namespace, mocker, vanishing
+    ):
+        """Test a directory removed mid-claim is recreated and reclaimed.
+
+        Given:
+            A namespace whose directory is removed just as the claim
+            opens it, or just as the claim writes the registry into it,
+            as a departing owner's reclaim does
+        When:
+            A fresh owner claims the namespace
+        Then:
+            It should recreate the directory and claim the namespace in
+            both cases, rather than failing a claim on a transient race.
+        """
+        # Arrange
+        directory = namespace_directory(namespace)
+        target = directory if vanishing == "directory" else directory / vanishing
+        real_open = os.open
+        vanished = []
+
+        def flaky_open(path, flags, *args, **kwargs):
+            if Path(path) == target and not vanished:
+                vanished.append(None)
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        mocker.patch.object(os, "open", flaky_open)
+
+        # Act
+        with LocalDiscovery(namespace) as discovery:
+            # Assert
+            assert discovery.namespace == namespace
+            assert vanished
+
+    def test___enter___should_release_the_claim_when_the_registry_cannot_be_written(
+        self, namespace, mocker
+    ):
+        """Test a claim that cannot create its registry is released.
+
+        Given:
+            A namespace whose registry cannot be written, as an
+            exhausted filesystem leaves it
+        When:
+            An owner claims the namespace
+        Then:
+            It should propagate the failure, leave no namespace
+            directory, and hold no claim — a claim retained after a
+            failed entry would lock the namespace out for the life of
+            the process.
+        """
+        # Arrange
+        directory = namespace_directory(namespace)
+        mocker.patch.object(os, "pwrite", side_effect=OSError(28, "No space left"))
+
+        # Act & assert
+        with pytest.raises(OSError, match="No space left"):
+            with LocalDiscovery(namespace):
+                pass
+
+        # Assert — nothing of the namespace survives the failed claim.
+        # The fault is lifted first: it would break the successor's own
+        # staging rather than the claim under test.
+        assert not directory.exists()
+        mocker.stopall()
+        with LocalDiscovery(namespace) as successor:
+            assert successor.namespace == namespace
+
+    def test___exit___should_warn_when_the_directory_cannot_be_removed(
+        self, namespace, mocker
+    ):
+        """Test an unexpected directory-removal failure surfaces as a warning.
+
+        Given:
+            An owner whose namespace directory cannot be removed, a
+            failure with no benign explanation
+        When:
+            The owner exits via with
+        Then:
+            It should emit a ResourceWarning naming the directory it
+            could not remove, so an operator can find the leak, rather
+            than raising out of a teardown.
+        """
+        # Arrange
+        directory = namespace_directory(namespace)
+        mocker.patch.object(os, "rmdir", side_effect=OSError(13, "Permission denied"))
+
+        # Act & assert
+        try:
+            with pytest.warns(ResourceWarning, match=re.escape(str(directory))):
+                with LocalDiscovery(namespace):
+                    pass
+        finally:
+            # The failure this arranges is what left the directory.
+            mocker.stopall()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_publish_should_complete_when_the_notification_file_vanished(
+        self, namespace, metadata
+    ):
+        """Test a publish whose notification file is gone still registers.
+
+        Given:
+            An owner, a borrowing publisher bound to its registry, and a
+            notification file removed out from under them — the window
+            in which an owner reclaims a namespace mid-publish
+        When:
+            The publisher publishes a worker
+        Then:
+            It should register the worker and leave the notification
+            file absent, a publisher that recreated it resurrecting
+            residue its owner had reclaimed.
+        """
+        # Arrange
+        directory = namespace_directory(namespace)
+        with LocalDiscovery(namespace) as discovery:
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                notification = directory / "notify"
+                assert notification.exists()
+                notification.unlink()
+
+                # Act
+                await publisher.publish("worker-added", metadata)
+
+                # Assert
+                assert not notification.exists()
+                events = []
+                async for event in discovery.subscribe(poll_interval=0.05):
+                    events.append(event)
+                    break
+                assert [event.metadata.uid for event in events] == [metadata.uid]
 
     def test___enter___should_raise_when_a_rejected_instance_is_reentered(
         self, namespace
@@ -1465,7 +1410,7 @@ class TestLocalDiscovery:
             borrower should bind exactly when an owner is live and raise
             DiscoveryNamespaceNotFound otherwise.
         """
-        # Arrange — a per-example namespace, so a segment stranded by
+        # Arrange — a per-example namespace, so a registry stranded by
         # one example cannot decide the next. Borrowing goes through
         # `Publisher`, which binds on every entry; an iteration of a
         # pooled `Subscriber` binds only when it starts the shared
@@ -1526,8 +1471,8 @@ class TestLocalDiscovery:
         assert registered == unregistered
 
     @pytest.mark.asyncio
-    async def test___exit___should_unlink_segment_when_owner_exits(self, namespace):
-        """Test owner exit removes the shared-memory segment.
+    async def test___exit___should_remove_registry_when_owner_exits(self, namespace):
+        """Test owner exit removes the registry file.
 
         Given:
             An owner LocalDiscovery that entered a namespace
@@ -1574,8 +1519,8 @@ class TestLocalDiscovery:
         assert len(registered) == 1
 
     @pytest.mark.asyncio
-    async def test___exit___should_unlink_segment_when_body_raises(self, namespace):
-        """Test exceptional exit still tears the segment down.
+    async def test___exit___should_remove_registry_when_body_raises(self, namespace):
+        """Test exceptional exit still tears the registry down.
 
         Given:
             An owner LocalDiscovery whose with body raises ValueError
@@ -1583,7 +1528,7 @@ class TestLocalDiscovery:
             The exception unwinds the with statement
         Then:
             It should propagate the ValueError unsuppressed while
-            still unlinking the segment, so a subsequent borrower's
+            still removing the registry, so a subsequent borrower's
             bind raises DiscoveryNamespaceNotFound.
         """
         # Arrange
@@ -1594,7 +1539,7 @@ class TestLocalDiscovery:
             with LocalDiscovery(namespace):
                 raise ValueError("boom")
 
-        # Assert — teardown still removed the segment
+        # Assert — teardown still removed the registry
         with pytest.raises(DiscoveryNamespaceNotFound):
             async with publisher:
                 pass
@@ -1692,15 +1637,14 @@ class TestLocalDiscovery:
         assert events[0].type == "worker-added"
         assert events[0].metadata.uid == successor_worker.uid
 
-    def test___exit___should_not_raise_when_segment_already_unlinked(
+    def test___exit___should_not_raise_when_registry_already_removed(
         self, namespace, unlink_schedule
     ):
-        """Test owner exit tolerates an externally unlinked segment.
+        """Test owner exit tolerates an externally removed registry.
 
         Given:
-            An owner LocalDiscovery whose shared-memory segment is
-            unlinked out from under it, as by another process's
-            resource tracker
+            An owner LocalDiscovery whose registry file is removed
+            out from under it, as by an operator clearing residue
         When:
             The owner exits via with
         Then:
@@ -1709,7 +1653,7 @@ class TestLocalDiscovery:
         # Arrange
         unlink_schedule.append(FileNotFoundError(2, "No such file or directory"))
 
-        # Act & assert — exits cleanly despite the vanished segment
+        # Act & assert — exits cleanly despite the vanished registry
         with LocalDiscovery(namespace):
             pass
 
@@ -1719,8 +1663,8 @@ class TestLocalDiscovery:
         """Test the fallback is disarmed before the unlink is attempted.
 
         Given:
-            An owner LocalDiscovery whose segment unlink raises
-            PermissionError, with atexit unregistration and the unlink
+            An owner LocalDiscovery whose registry removal raises
+            PermissionError, with atexit unregistration and the removal
             recorded into one ordered log
         When:
             The owner exits via with
@@ -1741,7 +1685,8 @@ class TestLocalDiscovery:
         # observable (see `teardown_log`)
         assert registered == unregistered
         assert len(registered) == 1
-        assert teardown_log == ["unregister", "unlink"]
+        assert teardown_log[0] == "unregister"
+        assert set(teardown_log[1:]) == {"unlink"}
 
     def test___exit___should_warn_when_unlink_fails_unexpectedly(
         self, namespace, unlink_schedule
@@ -1749,23 +1694,21 @@ class TestLocalDiscovery:
         """Test an unexpected unlink failure surfaces as a warning.
 
         Given:
-            An owner LocalDiscovery whose segment unlink raises
+            An owner LocalDiscovery whose registry removal raises
             PermissionError, a failure with no benign explanation
         When:
             The owner exits via with
         Then:
-            It should emit a ResourceWarning naming the segment it
-            could not reclaim, so an operator can find the leak.
+            It should emit a ResourceWarning naming the file it could
+            not remove, so an operator can find the leak.
         """
-        # Arrange — the segment name is the warning's actionable
-        # payload, so match on it rather than on the prefix alone.
-        # Resolve it before scheduling the fault: doing so claims and
-        # releases the namespace, which would consume a schedule entry.
-        segment = _rejected_claim(namespace).segment
+        # Arrange — the path is the warning's actionable payload, so
+        # match on it rather than on the prefix alone.
+        directory = namespace_directory(namespace)
         unlink_schedule.append(PermissionError(13, "Permission denied"))
 
         # Act & assert
-        with pytest.warns(ResourceWarning, match=re.escape(repr(segment))):
+        with pytest.warns(ResourceWarning, match=re.escape(str(directory))):
             with LocalDiscovery(namespace):
                 pass
 
@@ -1775,7 +1718,7 @@ class TestLocalDiscovery:
         """Test a failing teardown does not mask the caller's exception.
 
         Given:
-            An owner LocalDiscovery whose segment unlink raises
+            An owner LocalDiscovery whose registry removal raises
             PermissionError
         When:
             The body raises ValueError and the owner exits via with
@@ -1816,7 +1759,7 @@ class TestLocalDiscovery:
             DiscoveryNamespaceInUse, raise nothing else, and leave the
             namespace re-creatable.
         """
-        # Arrange — per-example namespace so a leaked segment in one
+        # Arrange — per-example namespace so a leaked registry in one
         # example cannot reject the next example's first claim
         example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
 
@@ -1833,14 +1776,14 @@ class TestLocalDiscovery:
         deadline=5000,
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
-    def test___exit___should_unwind_interleavings_when_segments_vanish(
+    def test___exit___should_unwind_interleavings_when_files_vanish(
         self, namespace, atexit_recorder, unlink_schedule, forest, mask
     ):
-        """Test vanishing segments never break lifecycle unwinding.
+        """Test vanishing files never break lifecycle unwinding.
 
         Given:
             An arbitrary forest of same-namespace claims and an
-            arbitrary subset of unlink calls that observe the segment
+            arbitrary subset of removals that observe the file
             already removed by an external unlinker, with atexit
             registration wrapped in recording pass-throughs
         When:
@@ -1938,11 +1881,11 @@ class TestLocalDiscovery:
     async def test___enter___should_restamp_capacity_when_recreated_by_new_owner(
         self, namespace
     ):
-        """Test a new owner generation re-stamps the segment's capacity.
+        """Test a new owner generation re-stamps the registry's capacity.
 
         Given:
             A namespace previously owned at capacity 1 whose owner has
-            entered and exited, unlinking the segment
+            entered and exited, removing the registry
         When:
             A new owner enters the same namespace at capacity 3 and its
             publisher registers three workers, then a fourth
@@ -2125,7 +2068,7 @@ class TestLocalDiscoveryPublisher:
         When:
             The bind_host attribute is accessed
         Then:
-            It should be "127.0.0.1" since shared-memory announcements
+            It should be "127.0.0.1" since registry announcements
             are only discoverable same-host.
         """
         # Act
@@ -2385,7 +2328,7 @@ class TestLocalDiscoveryPublisher:
         When:
             publish("worker-dropped", metadata) is called
         Then:
-            It should remove the worker from shared memory.
+            It should remove the worker from the registry.
         """
         # Arrange
         events = []
@@ -2521,7 +2464,7 @@ class TestLocalDiscoveryPublisher:
         Then:
             It should record two registrations paired one-to-one in
             order with two unregistrations, the second add succeeding
-            because the drop unlinked the block's segment name.
+            because the drop removed the block's file.
         """
         # Arrange
         registered, unregistered = atexit_recorder
@@ -2550,7 +2493,7 @@ class TestLocalDiscoveryPublisher:
         Given:
             A Publisher in an owner discovery context with two workers
             published and never dropped, with atexit registration
-            wrapped in recording pass-throughs and the shared-memory
+            wrapped in recording pass-throughs and the block's
             pool's exit wrapped to record what had been unregistered by
             the time it began
         When:
@@ -2703,7 +2646,7 @@ class TestLocalDiscoveryPublisher:
 
     @pytest.mark.asyncio
     async def test_publish_should_release_the_old_block_when_a_re_add_reclaims_a_slot(
-        self, namespace, metadata, atexit_recorder, mocker
+        self, namespace, metadata, atexit_recorder
     ):
         """Test reclaiming a slot releases the block the publisher still held.
 
@@ -2723,31 +2666,20 @@ class TestLocalDiscoveryPublisher:
         """
         # Arrange
         registered, unregistered = atexit_recorder
-        created: list[str] = []
-        real_shared_memory = SharedMemory
-
-        def record_created(*args, **kwargs):
-            block = real_shared_memory(*args, **kwargs)
-            if kwargs.get("create"):
-                created.append(block.name)
-            return block
-
-        mocker.patch.object(local, "SharedMemory", record_created)
+        directory = namespace_directory(namespace)
         with LocalDiscovery(namespace):
             baseline = len(registered)
             publisher = LocalDiscovery.Publisher(namespace)
             stack = AsyncExitStack()
             await stack.enter_async_context(publisher)
-            created.clear()
+            before = set(directory.iterdir())
             await publisher.publish("worker-added", metadata)
-            # A dead peer's teardown unlinks blocks without nulling the
+            # A dead peer's teardown removes blocks without nulling the
             # slots that name them -- the case the reclaim branch exists
-            # for. The segment is named by the publisher rather than
-            # rebuilt here, so the test unlinks what it actually made.
-            [block_name] = created
-            vanishing = SharedMemory(name=block_name)
-            vanishing.unlink()
-            vanishing.close()
+            # for. The block is the file the publish created rather than
+            # a path rebuilt here, so the test removes what it made.
+            [block] = set(directory.iterdir()) - before
+            block.unlink()
 
             # Act
             await publisher.publish("worker-added", metadata)
@@ -2808,7 +2740,7 @@ class TestLocalDiscoveryPublisher:
         """Test drop tolerates an externally unlinked worker block.
 
         Given:
-            A published worker whose per-block segment is unlinked
+            A published worker whose per-worker block is removed
             out from under the publisher, with atexit registration
             wrapped in recording pass-throughs
         When:
@@ -2881,7 +2813,7 @@ class TestLocalDiscoveryPublisher:
         When:
             publish("worker-updated", updated_metadata) is called
         Then:
-            It should update the worker metadata in shared memory.
+            It should update the worker's metadata block.
         """
         # Arrange
         updated_worker = WorkerMetadata(
@@ -3566,14 +3498,14 @@ class TestLocalDiscoveryPublisher:
             assert Counter(block_registered) == Counter(unregistered)
 
     @pytest.mark.asyncio
-    async def test___aexit___should_exit_cleanly_when_worker_segments_already_unlinked(
+    async def test___aexit___should_exit_cleanly_when_worker_blocks_already_removed(
         self, namespace, metadata, atexit_recorder, unlink_schedule
     ):
         """Test publisher exit tolerates vanished worker blocks.
 
         Given:
             A Publisher with a published worker whose per-block
-            segment is unlinked out from under it, with atexit
+            block is removed out from under it, with atexit
             registration wrapped in recording pass-throughs
         When:
             The publisher's async with block exits
@@ -3689,7 +3621,7 @@ class TestLocalDiscoveryPublisher:
             It should accept all C and raise DiscoveryCapacityExhausted on the
             (C+1)th.
         """
-        # Arrange — a per-example namespace so shared-memory state does
+        # Arrange — a per-example namespace so registry state does
         # not carry across Hypothesis examples.
         example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
         workers = [
@@ -3715,7 +3647,7 @@ class TestLocalDiscoveryPublisher:
     async def test_publish_should_reject_second_worker_when_capacity_is_one(
         self, namespace
     ):
-        """Test a capacity-one segment admits exactly one worker.
+        """Test a capacity-one registry admits exactly one worker.
 
         Given:
             A LocalDiscovery(capacity=1) — a single 16-byte slot in a
@@ -4582,7 +4514,7 @@ class TestLocalDiscoveryPublisher:
             available slots" on the next — the registry header is the
             single source of truth for every borrower of it.
         """
-        # Arrange — a per-example namespace so shared-memory state does not
+        # Arrange — a per-example namespace so registry state does not
         # carry across Hypothesis examples.
         example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
         workers = [
@@ -4632,13 +4564,13 @@ class TestLocalDiscoveryPublisher:
             workers
         When:
             The sequence is published and fresh distinct workers are
-            then published until the segment is exhausted
+            then published until the registry is exhausted
         Then:
             It should admit exactly C minus the live count of fresh
             workers before raising DiscoveryCapacityExhausted — re-adds
             consumed no slots and every drop reclaimed exactly one.
         """
-        # Arrange — a per-example namespace so shared-memory state does
+        # Arrange — a per-example namespace so registry state does
         # not carry across Hypothesis examples.
         example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
         roster = [
@@ -4718,7 +4650,7 @@ class TestLocalDiscoveryPublisher:
             the metadata of the last fitting write — failed refreshes
             never corrupt or regress the registration.
         """
-        # Arrange — a per-example namespace so shared-memory state does
+        # Arrange — a per-example namespace so registry state does
         # not carry across Hypothesis examples.
         example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
         uid = uuid.uuid4()
@@ -4818,7 +4750,7 @@ class TestLocalDiscoveryPublisher:
             publisher identity never affects whether an add refreshes
             or registers.
         """
-        # Arrange — a per-example namespace so shared-memory state does
+        # Arrange — a per-example namespace so registry state does
         # not carry across Hypothesis examples.
         capacity = 3
         example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
@@ -4856,108 +4788,6 @@ class TestLocalDiscoveryPublisher:
                     elif index in registrar:
                         publisher = registrar.pop(index)
                         await publisher.publish("worker-dropped", roster[index])
-
-    @pytest.mark.asyncio
-    async def test_publish_should_leave_the_tracker_balanced_when_worker_readded(
-        self, namespace, attach_fallback, tracker_ledger
-    ):
-        """Test a re-announced worker never unregisters an untracked name.
-
-        Given:
-            An owned namespace on an interpreter reporting a version
-            below 3.13, and a worker announced more than once, which
-            attaches a live block on every announcement.
-        When:
-            The worker is added, re-added, updated, and dropped, and the
-            namespace's owner exits.
-        Then:
-            It should never unregister a name the tracker is not holding,
-            and should leave nothing registered — every attach preserved
-            the registration its creator's unlink depends on.
-        """
-        # Arrange
-        worker = WorkerMetadata(
-            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
-        )
-
-        # Act
-        with LocalDiscovery(namespace):
-            async with LocalDiscovery.Publisher(namespace) as publisher:
-                await publisher.publish("worker-added", worker)
-                await publisher.publish("worker-added", worker)
-                await publisher.publish("worker-updated", worker)
-                await publisher.publish("worker-dropped", worker)
-
-        # Assert
-        assert tracker_ledger.violations == []
-        assert tracker_ledger.residual == set()
-
-    @given(
-        ops=st.lists(
-            st.tuples(
-                st.sampled_from(["add", "update", "drop"]),
-                st.integers(min_value=0, max_value=2),
-            ),
-            min_size=1,
-            max_size=12,
-        )
-    )
-    @settings(
-        max_examples=15,
-        deadline=5000,
-        suppress_health_check=[HealthCheck.function_scoped_fixture],
-    )
-    @pytest.mark.asyncio
-    async def test_publish_should_leave_the_tracker_balanced_across_event_sequences(
-        self, namespace, attach_fallback, tracker_ledger, ops
-    ):
-        """Test the tracker stays consistent however segments are reattached.
-
-        Given:
-            An owned namespace on an interpreter reporting a version
-            below 3.13, a three-worker roster, and an arbitrary sequence
-            of add, update, and drop events over it.
-        When:
-            The sequence is published serially and the owner exits.
-        Then:
-            It should never unregister a name the tracker is not holding,
-            whatever the order and however many times one segment is
-            attached.
-        """
-        # Arrange — a per-example namespace and ledger, so neither
-        # shared-memory state nor one example's imbalance carries into the
-        # next; the fixture itself is function-scoped, not example-scoped.
-        example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
-        tracker_ledger.reset()
-        assume(any(action == "add" for action, _ in ops))
-        roster = [
-            WorkerMetadata(
-                uid=uuid.uuid4(),
-                address=f"localhost:{50051 + i}",
-                pid=100 + i,
-                version="1.0",
-            )
-            for i in range(3)
-        ]
-        live: set[int] = set()
-
-        # Act
-        with LocalDiscovery(example_ns):
-            async with LocalDiscovery.Publisher(example_ns) as publisher:
-                for action, index in ops:
-                    if action == "add":
-                        await publisher.publish("worker-added", roster[index])
-                        live.add(index)
-                    elif index in live:
-                        if action == "update":
-                            await publisher.publish("worker-updated", roster[index])
-                        else:
-                            await publisher.publish("worker-dropped", roster[index])
-                            live.discard(index)
-
-        # Assert
-        assert tracker_ledger.violations == []
-        assert tracker_ledger.residual == set()
 
 
 class TestWorkerReference:
@@ -5674,7 +5504,7 @@ class TestLocalDiscoverySubscriber:
     async def test___aiter___should_discover_workers_up_to_capacity(
         self, namespace, capacity
     ):
-        """Test a subscriber discovers every worker the segment admits.
+        """Test a subscriber discovers every worker the registry admits.
 
         Given:
             A LocalDiscovery declaring an arbitrary small capacity C with
@@ -5685,9 +5515,9 @@ class TestLocalDiscoverySubscriber:
         Then:
             It should discover exactly the C published worker uids, its
             scan bounded by the capacity the owner stamped into the
-            segment.
+            registry.
         """
-        # Arrange — a per-example namespace so shared-memory state does
+        # Arrange — a per-example namespace so registry state does
         # not carry across Hypothesis examples.
         example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
         workers = [
@@ -6057,59 +5887,6 @@ class TestLocalDiscoverySubscriber:
         # Assert
         assert outcomes.count("raised") == 1
         assert outcomes.count("ended") == 2
-
-    @pytest.mark.asyncio
-    async def test___aiter___should_leave_the_tracker_balanced_when_polling(
-        self, namespace, attach_fallback, attach_calls, tracker_ledger
-    ):
-        """Test repeated read-side attaches leave the tracker consistent.
-
-        Given:
-            An owned namespace holding one worker, on an interpreter
-            reporting a version below 3.13, and a subscriber polling it —
-            the most frequent attach in the system, since every poll
-            reattaches the address space and each worker's block.
-        When:
-            The subscriber discovers the worker, the poll loop reattaches
-            those segments several times, and the worker is dropped.
-        Then:
-            It should never unregister a name the tracker is not holding
-            and should leave nothing registered — a reader must not consume
-            the registration the writer's unlink depends on.
-        """
-        # Arrange — a unique uid, so a segment left by a concurrent run of
-        # this test cannot collide on the name derived from it.
-        worker = WorkerMetadata(
-            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
-        )
-        received = asyncio.Event()
-
-        async def collect(subscriber):
-            async for event in subscriber:
-                if event.metadata.uid == worker.uid:
-                    received.set()
-
-        # Act
-        with LocalDiscovery(namespace) as discovery:
-            async with LocalDiscovery.Publisher(namespace) as publisher:
-                await publisher.publish("worker-added", worker)
-                subscriber = discovery.subscribe(poll_interval=0.02)
-                async with _collecting(subscriber, collect):
-                    await asyncio.wait_for(received.wait(), timeout=5.0)
-                    attaches = len(attach_calls)
-                    # Count reattachments rather than trusting elapsed time:
-                    # the poll loop remaps the same segments every cycle.
-                    deadline = asyncio.get_running_loop().time() + 5.0
-                    while len(attach_calls) < attaches + 4:
-                        assert asyncio.get_running_loop().time() < deadline, (
-                            "poll loop stopped reattaching"
-                        )
-                        await asyncio.sleep(0.02)
-                await publisher.publish("worker-dropped", worker)
-
-        # Assert
-        assert tracker_ledger.violations == []
-        assert tracker_ledger.residual == set()
 
 
 def _enter_lifecycle_forest(namespace, forest, owned=False):
