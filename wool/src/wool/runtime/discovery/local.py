@@ -67,20 +67,20 @@ class _Watchdog(FileSystemEventHandler):
     """Filesystem event handler for worker discovery notifications.
 
     Monitors the notification file for modifications and sets an asyncio
-    Event to wake subscribers when publishers write to the registry.
-    Thread-safe for use with watchdog's observer thread.
+    Event to wake subscribers when publishers write to the registry. Runs
+    on watchdog's observer thread, so the set is handed to the loop the
+    notification belongs to.
 
-    Acquires the scan lock before setting the notification event to ensure
-    that notifications are properly synchronized with ongoing scans. This
-    prevents race conditions where a notification arrives while a scan is
-    in progress.
+    Setting takes no lock. A scan clears the notification before it reads
+    the registry, so a set arriving at any point during that scan is
+    preserved and wakes the next one. Coalescing in the event itself also
+    keeps a burst of publishes from queueing one task per notification
+    behind the scan, where each would only set an event already set.
 
     :param notification:
         asyncio.Event to set when the notification file is modified.
     :param watchdog:
         Path to the notification file to monitor.
-    :param lock:
-        asyncio.Lock to acquire before setting the notification event.
     :param loop:
         Event loop where the notification lives.
     """
@@ -89,12 +89,10 @@ class _Watchdog(FileSystemEventHandler):
         self,
         notification: asyncio.Event,
         watchdog: Path,
-        lock: asyncio.Lock,
         loop: asyncio.AbstractEventLoop,
     ):
         self._notification = notification
         self._watchdog = watchdog
-        self._lock = lock
         self._loop = loop
 
     def on_modified(self, event: FileSystemEvent):
@@ -105,23 +103,8 @@ class _Watchdog(FileSystemEventHandler):
         """
         event_path = Path(str(event.src_path))
         if event_path == self._watchdog:
-            # Schedule the event.set() in the event loop with lock acquired
-            # (thread-safe)
-            self._loop.call_soon_threadsafe(self._set_event_with_lock)
-
-    def _set_event_with_lock(self):
-        """Set the notification event after acquiring the scan lock.
-
-        This ensures that the event is only set when the lock is available,
-        preventing the notification from being lost if a scan is in progress.
-        Must be called from the event loop thread.
-        """
-        asyncio.create_task(self._async_set_event())
-
-    async def _async_set_event(self):
-        """Async helper to acquire lock and set event."""
-        async with self._lock:
-            self._notification.set()
+            # Called on the observer thread; the set belongs to the loop.
+            self._loop.call_soon_threadsafe(self._notification.set)
 
 
 class _WorkerReference:
@@ -1144,13 +1127,12 @@ class LocalDiscovery(Discovery):
             cached_workers: dict[str, WorkerMetadata] = {}
             carried: dict[str, int] = {}
             notification = asyncio.Event()
-            lock = asyncio.Lock()
             loop = asyncio.get_running_loop()
 
             # Bind first, so a bind that raises starts no observer.
             with closing(_open_registry(self._namespace)) as registry:
                 watchdog = _directory(self._namespace) / _NOTIFY
-                handler = _Watchdog(notification, watchdog, lock, loop)
+                handler = _Watchdog(notification, watchdog, loop)
                 observer = Observer()
                 observer.schedule(handler, path=str(watchdog.parent), recursive=False)
                 try:
@@ -1160,34 +1142,36 @@ class LocalDiscovery(Discovery):
                     raise DiscoveryNamespaceNotFound(self._namespace) from error
                 try:
                     while True:
-                        async with lock:
-                            notification.clear()
-                            discovered_workers: dict[str, WorkerMetadata] = {}
-                            for _, slot in _iter_slots(registry):
-                                if slot == _NULL_REF:
-                                    continue
-                                try:
-                                    ref = _WorkerReference.from_bytes(slot)
-                                    metadata = self._deserialize_metadata(ref)
-                                except Exception:
-                                    self._carry_forward(
-                                        slot,
-                                        cached_workers,
-                                        discovered_workers,
-                                        carried,
-                                    )
-                                    continue
-                                uid = str(metadata.uid)
-                                carried.pop(uid, None)
-                                discovered_workers[uid] = metadata
-                            carried = {
-                                uid: scans
-                                for uid, scans in carried.items()
-                                if uid in discovered_workers
-                            }
+                        # Cleared before the read, so a notification
+                        # arriving at any point during this scan is
+                        # preserved and wakes the next one.
+                        notification.clear()
+                        discovered_workers: dict[str, WorkerMetadata] = {}
+                        for _, slot in _iter_slots(registry):
+                            if slot == _NULL_REF:
+                                continue
+                            try:
+                                ref = _WorkerReference.from_bytes(slot)
+                                metadata = self._deserialize_metadata(ref)
+                            except Exception:
+                                self._carry_forward(
+                                    slot,
+                                    cached_workers,
+                                    discovered_workers,
+                                    carried,
+                                )
+                                continue
+                            uid = str(metadata.uid)
+                            carried.pop(uid, None)
+                            discovered_workers[uid] = metadata
+                        carried = {
+                            uid: scans
+                            for uid, scans in carried.items()
+                            if uid in discovered_workers
+                        }
 
-                            for event in self._diff(cached_workers, discovered_workers):
-                                yield event
+                        for event in self._diff(cached_workers, discovered_workers):
+                            yield event
                         try:
                             await asyncio.wait_for(
                                 notification.wait(),
