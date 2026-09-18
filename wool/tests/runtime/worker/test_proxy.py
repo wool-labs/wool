@@ -6952,6 +6952,90 @@ class TestWorkerProxy:
         assert excinfo.value.namespace == namespace
 
     @pytest.mark.asyncio
+    async def test___aenter___should_raise_the_bind_failure_without_awaiting_quorum(
+        self,
+    ):
+        """Test a failed bind ends the quorum wait rather than timing out.
+
+        Given:
+            A namespace no LocalDiscovery has entered, and a non-lazy
+            WorkerProxy on it whose quorum can never be met, configured
+            with a quorum timeout far longer than the bind takes to fail
+        When:
+            The proxy is entered
+        Then:
+            It should raise DiscoveryNamespaceNotFound well inside that
+            timeout — the sentinel's death is why the quorum will never
+            arrive, so waiting the timeout out would report the symptom
+            and discard the cause.
+        """
+        # Arrange
+        namespace = f"proxy-quorum-{uuid.uuid4().hex[:12]}"
+        timeout = 30.0
+        proxy = WorkerProxy(namespace, lazy=False, quorum=1, quorum_timeout=timeout)
+        loop = asyncio.get_running_loop()
+
+        # Act
+        started = loop.time()
+        with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+            async with proxy:
+                pass  # pragma: no cover — entry raises
+        elapsed = loop.time() - started
+
+        # Assert
+        assert excinfo.value.namespace == namespace
+        # The oracle for this test: passing by waiting out the timeout
+        # is the behaviour it exists to rule out.
+        assert elapsed < timeout / 2, elapsed
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_the_sentinel_failure_when_it_died(
+        self, mock_proxy_session, mock_wool_task
+    ):
+        """Test dispatch reports why the sentinel died, not its symptom.
+
+        Given:
+            A started proxy whose discovery subscription has since
+            raised, leaving it with no membership it can trust
+        When:
+            A task is dispatched
+        Then:
+            It should raise that failure rather than
+            NoWorkersAvailable, which would name the consequence and
+            leave the caller to guess the cause.
+        """
+
+        # Arrange
+        class _FailingDiscovery:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                await asyncio.sleep(0)
+                raise DiscoveryNamespaceNotFound("gone")
+                yield  # pragma: no cover — makes this an async generator
+
+        proxy = WorkerProxy(discovery=_FailingDiscovery(), lazy=False, quorum=0)
+        await proxy.start()
+        try:
+            sentinel = proxy._sentinel_task
+            assert sentinel is not None
+            async with asyncio.timeout(5):
+                while not sentinel.done():
+                    await asyncio.sleep(0.01)
+
+            # Act & assert
+            with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+                await proxy.dispatch(mock_wool_task)
+            assert excinfo.value.namespace == "gone"
+        finally:
+            # Teardown re-raises the same failure — the long-standing
+            # path this change did not alter, and not what is under
+            # test here.
+            with pytest.raises(DiscoveryNamespaceNotFound):
+                await proxy.stop()
+
+    @pytest.mark.asyncio
     async def test_workers_property_returns_workers_list(
         self, mock_discovery_service, mock_proxy_session
     ):

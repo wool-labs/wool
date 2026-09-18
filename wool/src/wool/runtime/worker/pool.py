@@ -266,8 +266,10 @@ class WorkerPool:
         — raised by the underlying `WorkerProxy` at context entry
         (``lazy=False``) or first dispatch (``lazy=True``).
     :raises ~wool.DiscoveryNamespaceNotFound:
-        If ``discovery`` borrows a `~wool.LocalDiscovery` namespace that
-        has no registry; see `WorkerProxy`.
+        If ``discovery`` borrows a `~wool.LocalDiscovery` namespace with
+        no live owner, or its owner goes away while the pool is running.
+        At context entry, at dispatch, or at teardown, whichever needs
+        the membership first; see `WorkerProxy`.
     :raises ~wool.DiscoveryCapacityExhausted:
         At context entry, if publishing a spawned worker finds no free
         slot. Only reachable when the caller supplies ``discovery``: a
