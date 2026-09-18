@@ -333,8 +333,9 @@ class LocalDiscovery(Discovery):
 
     **Lifecycle.** An instance is single-use: any entry attempt spends
     it, so a second entry raises `RuntimeError`. Retrying a rejected
-    claim requires a new instance. Exiting never raises; a failed
-    removal surfaces as a `ResourceWarning`. Once the owner and every
+    claim requires a new instance. Exiting never raises, and exiting an
+    instance never entered, or already exited, does nothing at all; a
+    failed removal surfaces as a `ResourceWarning`. Once the owner and every
     publisher have exited, the namespace leaves nothing on the
     filesystem.
 
@@ -456,6 +457,8 @@ class LocalDiscovery(Discovery):
     shutdown.
     """
 
+    _claim: int
+    _cleanup: Callable[[], None] | None
     _filter: Final[PredicateFunction | None]
     _namespace: Final[str]
     _poll_interval: Final[float | None]
@@ -486,6 +489,8 @@ class LocalDiscovery(Discovery):
         self._capacity = capacity
         self._block_size = block_size
         self._lock_timeout = lock_timeout
+        self._claim = -1
+        self._cleanup = None
 
     @noreentry
     def __enter__(self) -> Self:
@@ -533,9 +538,13 @@ class LocalDiscovery(Discovery):
     def __exit__(self, *_):
         """Reclaim the namespace's registry and release the claim.
 
-        See `LocalDiscovery` for the ownership and teardown contract.
+        Exiting an instance that was never entered, or one that has
+        already exited, removes nothing and raises nothing. See
+        `LocalDiscovery` for the ownership and teardown contract.
         """
-        atexit.unregister(self._cleanup)
+        if self._cleanup is not None:
+            atexit.unregister(self._cleanup)
+            self._cleanup = None
         self._release()
 
     def __hash__(self) -> int:
@@ -636,6 +645,14 @@ class LocalDiscovery(Discovery):
     def _release(self) -> None:
         """Remove the namespace's files and directory, then release the claim.
 
+        Releasing is idempotent and final. The claim is exchanged for a
+        sentinel before anything acts on it, so a release that follows
+        another removes nothing and closes nothing. Without that, a
+        repeat release would resolve its removals against a descriptor
+        already closed, and the number may by then have been reissued —
+        so the removals would land in an unrelated directory and the
+        close would strip the claim of whatever now holds it.
+
         The directory is removed while the claim is still held; see the
         directory re-check in `LocalDiscovery`'s implementation notes.
 
@@ -647,21 +664,26 @@ class LocalDiscovery(Discovery):
         without that, this owner's ordinary exit would go on to delete
         the successor's registry.
         """
-        directory = _directory(self._namespace)
-        _unlink_quietly(directory, _STAGING, dir_fd=self._claim)
-        _unlink_quietly(directory, _REGISTRY, dir_fd=self._claim)
-        _unlink_quietly(directory, _NOTIFY, dir_fd=self._claim)
-        # The name is all `rmdir` has, so it is removed only while the
-        # path still resolves to the claimed directory.
+        claim, self._claim = self._claim, -1
+        if claim < 0:
+            return
         try:
-            claimed = _same_file(self._claim, directory)
-        except OSError:
-            # Exiting never raises, and a directory this claim may no
-            # longer hold is not this owner's to remove.
-            claimed = False
-        if claimed:
-            _rmdir_quietly(directory)
-        os.close(self._claim)
+            directory = _directory(self._namespace)
+            _unlink_quietly(directory, _STAGING, dir_fd=claim)
+            _unlink_quietly(directory, _REGISTRY, dir_fd=claim)
+            _unlink_quietly(directory, _NOTIFY, dir_fd=claim)
+            # The name is all `rmdir` has, so it is removed only while the
+            # path still resolves to the claimed directory.
+            try:
+                claimed = _same_file(claim, directory)
+            except OSError:
+                # Exiting never raises, and a directory this claim may no
+                # longer hold is not this owner's to remove.
+                claimed = False
+            if claimed:
+                _rmdir_quietly(directory)
+        finally:
+            os.close(claim)
 
     class Publisher:
         """Publisher for broadcasting worker discovery events.
