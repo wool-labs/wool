@@ -25,10 +25,12 @@ from pathlib import Path
 import pytest
 
 from tests.helpers import namespace_directory
+from tests.helpers import registry_path
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
+from wool.runtime.worker.metadata import WorkerMetadata
 from wool.runtime.worker.pool import WorkerPool
 
 from . import routines
@@ -112,6 +114,14 @@ if len(sys.argv) > 2:
         pass
 try:
     with LocalDiscovery(namespace):
+        if len(sys.argv) > 3:
+            # Hold the claim past every rival's attempt. Releasing it the
+            # instant it is taken would let a claimant scheduled late claim
+            # an unheld namespace and report itself a winner too, which is a
+            # second winner the mutual-exclusion assertion would count.
+            hold = float(sys.argv[3])
+            while time.time() < hold:
+                time.sleep(0.01)
         print("claimed", flush=True)
 except DiscoveryNamespaceInUse as error:
     print(f"rejected {error}", flush=True)
@@ -140,6 +150,62 @@ async def main():
             print("discovered", flush=True)
             break
         await publisher.publish("worker-dropped", metadata)
+
+
+asyncio.run(main())
+"""
+
+#: Iterate a borrowing subscriber to its first event on a namespace this
+#: process does not own, holding no publisher at all -- the read-side
+#: borrow, whose exit path releases no blocks and writes to no registry.
+_SUBSCRIBER_SCRIPT = """
+import asyncio
+import sys
+
+from wool.runtime.discovery.local import LocalDiscovery
+
+
+async def main():
+    namespace = sys.argv[1]
+    async for event in LocalDiscovery.Subscriber(namespace, poll_interval=0.05):
+        print("discovered", flush=True)
+        break
+
+
+asyncio.run(main())
+"""
+
+#: Bind a borrowing publisher on a namespace this process owns, then wait
+#: to be released before publishing each worker named on the command line,
+#: reporting the outcome of each. Waits again at the end so the blocks it
+#: holds outlive the reader that discovers them: an exit here would unlink
+#: a block while a subscriber was still scanning the slot naming it.
+_ORPHAN_SCRIPT = """
+import asyncio
+import sys
+import uuid
+
+from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
+from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.worker.metadata import WorkerMetadata
+
+
+async def main():
+    namespace, *uids = sys.argv[1:]
+    async with LocalDiscovery.Publisher(namespace) as publisher:
+        print("bound", flush=True)
+        await asyncio.to_thread(sys.stdin.readline)
+        for uid in uids:
+            metadata = WorkerMetadata(
+                uid=uuid.UUID(uid), address="localhost:50051", pid=1, version="1.0"
+            )
+            try:
+                await publisher.publish("worker-added", metadata)
+            except DiscoveryCapacityExhausted as error:
+                print(f"refused {error.capacity}", flush=True)
+            else:
+                print("published", flush=True)
+        await asyncio.to_thread(sys.stdin.readline)
 
 
 asyncio.run(main())
@@ -403,7 +469,7 @@ class TestDiscoveryFailureIsolation:
                             sys.executable,
                             "-c",
                             _ATTACHER_SCRIPT,
-                            str(namespace_directory(namespace) / "registry"),
+                            str(registry_path(namespace)),
                         ],
                         capture_output=True,
                         text=True,
@@ -528,9 +594,10 @@ class TestCrossProcessOwnership:
         When:
             A fresh interpreter claims the same namespace afterwards
         Then:
-            It should admit the successor in both cases; after a kill,
-            the claim dies with the process and the successor replaces
-            the registry the kill stranded.
+            It should admit the successor in both cases, from opposite
+            starting states: a clean exit reclaims the registry before
+            the successor arrives, while a kill strands one for the
+            successor to replace.
         """
         # Arrange
         namespace = f"handoff-{uuid.uuid4().hex[:12]}"
@@ -544,9 +611,18 @@ class TestCrossProcessOwnership:
                 owner.stdin.write("\n")
                 owner.stdin.flush()
                 assert owner.wait(timeout=_TIMEOUT) == 0
+                # The namespace is gone, observed across the process
+                # boundary through the public API: a borrower finds
+                # nothing to bind. Without this the two arms would
+                # assert the same thing and the parametrization would
+                # carry no information.
+                assert not asyncio.run(_binds(namespace))
             else:
                 owner.kill()
                 owner.wait(timeout=_TIMEOUT)
+                # Nothing ran to clean up, so the registry the successor
+                # is about to replace is really there to be replaced.
+                assert registry_path(namespace).exists()
         finally:
             release_subprocess(owner)
 
@@ -576,9 +652,12 @@ class TestCrossProcessOwnership:
             It should admit exactly one and reject the other three with
             DiscoveryNamespaceInUse naming the namespace.
         """
-        # Arrange
+        # Arrange — the winner holds its claim past the deadline every
+        # rival attempts at, so each loser's attempt necessarily lands
+        # while the claim is held rather than after it was released.
         namespace = f"race-{uuid.uuid4().hex[:12]}"
         deadline = time.time() + 2.0
+        hold = deadline + 2.0
         claimants = [
             subprocess.Popen(
                 [
@@ -587,6 +666,7 @@ class TestCrossProcessOwnership:
                     _CLAIMANT_SCRIPT,
                     namespace,
                     str(deadline),
+                    str(hold),
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -759,7 +839,12 @@ class TestPoolNamespaceOwnership:
 
         assert excinfo.value.namespace == namespace
 
-        # Assert — the rejected borrow created nothing
+        # Assert — the rejected borrow created nothing. Claiming the
+        # namespace afterwards cannot show that on its own, since a claim
+        # makes the directory either way; the empty directory a borrow
+        # leaves behind is the shape that accumulated an inode per
+        # rejected borrow for the life of the host.
+        assert not namespace_directory(namespace).exists()
         with LocalDiscovery(namespace) as claimed:
             assert claimed.namespace == namespace
 
@@ -768,7 +853,7 @@ class TestPoolNamespaceOwnership:
 class TestCrossProcessBorrowing:
     @pytest.mark.asyncio
     async def test___aenter___should_dispatch_when_another_process_owns_the_namespace(
-        self, retry_grpc_internal
+        self, retry_grpc_internal, namespaces
     ):
         """Test a durable pool borrows a namespace owned elsewhere.
 
@@ -786,7 +871,7 @@ class TestCrossProcessBorrowing:
         before = {child.pid for child in multiprocessing.active_children()}
 
         async def body():
-            namespace = f"xproc-{uuid.uuid4().hex[:12]}"
+            namespace = namespaces("xproc")
             owner = spawn_script_subprocess(
                 _XPROC_OWNER_SCRIPT,
                 namespace,
@@ -814,9 +899,9 @@ class TestCrossProcessBorrowing:
             finally:
                 # The harness kills the owner, which by contract leaves
                 # its namespace behind for a successor to reclaim; no
-                # successor follows here, so clear it.
+                # successor follows here, so the `namespaces` fixture
+                # clears it.
                 release_subprocess(owner)
-                shutil.rmtree(namespace_directory(namespace), ignore_errors=True)
 
         try:
             await retry_grpc_internal(body)
@@ -859,42 +944,276 @@ class TestCrossProcessBorrowing:
             # borrower must still be able to bind.
             assert asyncio.run(_binds(namespace))
 
-    def test___aiter___should_keep_the_registry_when_a_subscriber_exits(self):
+    @pytest.mark.asyncio
+    async def test_publish_should_reach_the_successor_registry_when_orphaned(
+        self, namespaces
+    ):
+        """Test an orphan across processes writes to the successor's registry.
+
+        Given:
+            A publisher in an independent interpreter bound to a
+            namespace this process owned at a capacity of eight, that
+            owner having since exited, and a successor this process has
+            entered on the same namespace
+        When:
+            The orphaned interpreter publishes a worker
+        Then:
+            It should publish without raising and the successor's own
+            subscriber should discover exactly that worker — an orphan
+            rebinds across an ownership handoff between interpreters,
+            and the successor's registry started empty rather than
+            adopting the one the previous owner left.
+        """
+        # Arrange
+        namespace = namespaces("orphan-xproc")
+        worker = uuid.uuid4()
+        orphan = None
+        successor = contextlib.ExitStack()
+        try:
+            with LocalDiscovery(namespace, capacity=8):
+                orphan = spawn_script_subprocess(
+                    _ORPHAN_SCRIPT, namespace, str(worker), ready_line="bound"
+                )
+            # The owner is gone and a live foreign borrower still holds a
+            # block in the directory, so the successor's claim also shows
+            # that a borrower alone never makes a namespace look in use.
+            discovery = successor.enter_context(LocalDiscovery(namespace, capacity=8))
+
+            # Act
+            assert orphan.stdin is not None and orphan.stdout is not None
+            orphan.stdin.write("\n")
+            orphan.stdin.flush()
+            published = await asyncio.to_thread(orphan.stdout.readline)
+
+            # Assert
+            assert published.strip() == "published", published
+            assert await _discovers(discovery, worker)
+        finally:
+            release_subprocess(orphan)
+            successor.close()
+
+    @pytest.mark.asyncio
+    async def test_publish_should_bind_the_successor_capacity_when_orphaned(
+        self, namespaces
+    ):
+        """Test an orphan is bound by the capacity it is writing under.
+
+        Given:
+            A publisher in an independent interpreter bound to a
+            namespace this process owned at a capacity of eight, that
+            owner having since exited, and a successor entered on the
+            same namespace at a capacity of one
+        When:
+            The orphaned interpreter publishes two distinct workers
+        Then:
+            It should admit the first and refuse the second reporting a
+            capacity of one — a borrower is bound by the capacity of the
+            registry it is writing now, not the one it bound under.
+        """
+        # Arrange
+        namespace = namespaces("orphan-cap")
+        first, second = uuid.uuid4(), uuid.uuid4()
+        orphan = None
+        successor = contextlib.ExitStack()
+        try:
+            with LocalDiscovery(namespace, capacity=8):
+                orphan = spawn_script_subprocess(
+                    _ORPHAN_SCRIPT,
+                    namespace,
+                    str(first),
+                    str(second),
+                    ready_line="bound",
+                )
+            successor.enter_context(LocalDiscovery(namespace, capacity=1))
+
+            # Act
+            assert orphan.stdin is not None and orphan.stdout is not None
+            orphan.stdin.write("\n")
+            orphan.stdin.flush()
+            outcomes = [
+                (await asyncio.to_thread(orphan.stdout.readline)).strip()
+                for _ in range(2)
+            ]
+
+            # Assert — one, the successor's stamp, and not the eight it
+            # bound under, which would have admitted both.
+            assert outcomes == ["published", "refused 1"], outcomes
+        finally:
+            release_subprocess(orphan)
+            successor.close()
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_yield_when_another_process_publishes(
+        self, namespaces
+    ):
+        """Test a write in one process wakes a watcher in another.
+
+        Given:
+            A namespace this process owns holding one announced worker,
+            a subscriber with no poll interval iterated past that first
+            event so it is bound and watching, and an independent
+            interpreter holding a borrowing publisher open
+        When:
+            That interpreter publishes a second worker
+        Then:
+            It should yield a worker-added event for the second worker,
+            the notification carrying a write across a process boundary
+            with no rescan interval to fall back on.
+        """
+        # Arrange — the already-announced worker is the handshake that
+        # proves the subscriber is watching before the remote publish, so
+        # nothing here waits on a clock. With no poll interval the only
+        # path to the second worker is the notification itself.
+        namespace = namespaces("notify-xproc")
+        local = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=1, version="1.0"
+        )
+        remote = uuid.uuid4()
+        discovered: set = set()
+        seen = asyncio.Event()
+        orphan = None
+
+        async def collect(subscriber):
+            async for event in subscriber:
+                discovered.add(event.metadata.uid)
+                seen.set()
+
+        try:
+            with LocalDiscovery(namespace) as discovery:
+                async with LocalDiscovery.Publisher(namespace) as publisher:
+                    await publisher.publish("worker-added", local)
+                    subscriber = discovery.subscribe()
+                    task = asyncio.create_task(collect(subscriber))
+                    try:
+                        async with asyncio.timeout(_TIMEOUT):
+                            await seen.wait()
+                        assert discovered == {local.uid}
+
+                        orphan = spawn_script_subprocess(
+                            _ORPHAN_SCRIPT, namespace, str(remote), ready_line="bound"
+                        )
+
+                        # Act
+                        assert orphan.stdin is not None
+                        assert orphan.stdout is not None
+                        orphan.stdin.write("\n")
+                        orphan.stdin.flush()
+                        published = await asyncio.to_thread(orphan.stdout.readline)
+                        assert published.strip() == "published", published
+
+                        # Assert — drained rather than read one event at a
+                        # time, because a rescan re-reports workers it
+                        # already knows alongside the new one.
+                        async with asyncio.timeout(_TIMEOUT):
+                            while remote not in discovered:
+                                seen.clear()
+                                await seen.wait()
+                    finally:
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+        finally:
+            release_subprocess(orphan)
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_keep_the_registry_when_a_subscriber_exits(self):
         """Test a borrowing subscriber's exit leaves the owner's registry.
 
         Given:
-            A namespace this process owns, and an independent
-            interpreter that publishes a worker through a borrowing
-            publisher and iterates a borrowing subscriber to its first
-            event
+            A namespace this process owns holding an announced worker,
+            and an independent interpreter that iterates a borrowing
+            subscriber to its first event while holding no publisher
         When:
             That interpreter exits
         Then:
-            It should leave the registry in place for the owner, a
+            It should leave the worker discoverable to the owner, a
             read-side borrow claiming no more of the namespace than a
             write-side one.
         """
-        # Arrange
+        # Arrange — the worker is announced from this process, so the
+        # child borrows only to read. A child that also published would
+        # exercise the write-side exit path and could not distinguish
+        # this contract from the publisher case above.
         namespace = f"borrower-sub-{uuid.uuid4().hex[:12]}"
+        worker = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=1, version="1.0"
+        )
 
-        # Act
-        with LocalDiscovery(namespace):
-            borrower = subprocess.run(
-                [sys.executable, "-c", _BORROWER_SCRIPT, namespace],
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
-            )
+        async with asyncio.timeout(_TIMEOUT):
+            with LocalDiscovery(namespace) as discovery:
+                async with LocalDiscovery.Publisher(namespace) as publisher:
+                    await publisher.publish("worker-added", worker)
 
-            # Assert
-            assert borrower.returncode == 0, borrower.stderr
-            assert "discovered" in borrower.stdout, borrower.stdout
-            assert "Traceback" not in borrower.stderr, borrower.stderr
-            assert asyncio.run(_binds(namespace))
+                    # Act
+                    borrower = await asyncio.to_thread(
+                        subprocess.run,
+                        [sys.executable, "-c", _SUBSCRIBER_SCRIPT, namespace],
+                        capture_output=True,
+                        text=True,
+                        timeout=_TIMEOUT,
+                    )
+
+                    # Assert
+                    assert borrower.returncode == 0, borrower.stderr
+                    assert "discovered" in borrower.stdout, borrower.stdout
+                    assert "Traceback" not in borrower.stderr, borrower.stderr
+                    # Stronger than a bind: the owner's own subscriber
+                    # still reaches the worker's block, so the departed
+                    # reader took neither the registry nor what it names.
+                    discovered = await _discovers(discovery, worker.uid)
+                    assert discovered
 
 
 @pytest.mark.integration
 class TestNamespaceResidue:
+    @pytest.mark.asyncio
+    async def test___exit___should_leave_the_directory_when_a_borrower_is_killed(
+        self, namespaces
+    ):
+        """Test the one residue no live process remains to reclaim.
+
+        Given:
+            A namespace this process owns, and an independent
+            interpreter that binds a borrowing publisher, publishes a
+            worker, and is then killed with SIGKILL so its own block
+            cleanup never runs
+        When:
+            The owner exits its context
+        Then:
+            It should reclaim the registry, leaving a fresh borrower
+            nothing to bind, yet leave the namespace directory standing
+            — the orphan reclaim runs in the publisher's own shutdown
+            handler, which a kill skips.
+        """
+        # Arrange — pinned deliberately rather than treated as a leak to
+        # fix here: the reclaim path a killed borrower skips has no other
+        # process to fall to, and this is the boundary of #345. A future
+        # fix, such as an owner sweeping blocks whose publishers are
+        # gone, is a deliberate edit to this assertion.
+        namespace = namespaces("killed-borrower")
+        worker = uuid.uuid4()
+        borrower = None
+        try:
+            with LocalDiscovery(namespace):
+                borrower = spawn_script_subprocess(
+                    _ORPHAN_SCRIPT, namespace, str(worker), ready_line="bound"
+                )
+                assert borrower.stdin is not None and borrower.stdout is not None
+                borrower.stdin.write("\n")
+                borrower.stdin.flush()
+                published = await asyncio.to_thread(borrower.stdout.readline)
+                assert published.strip() == "published", published
+
+                # Act
+                borrower.kill()
+                borrower.wait(timeout=_TIMEOUT)
+
+            # Assert
+            assert not await _binds(namespace)
+            assert namespace_directory(namespace).exists()
+        finally:
+            release_subprocess(borrower)
+
     @pytest.mark.asyncio
     async def test___aexit___should_leave_no_residue_when_pools_cycle(self):
         """Test repeated default-namespace pools accumulate nothing.
@@ -906,28 +1225,104 @@ class TestNamespaceResidue:
         When:
             Three WorkerPools each enter, dispatch, and exit
         Then:
-            It should leave neither a namespace directory nor a lock
-            file behind, which is what accumulated an inode per
-            lifecycle for the life of the host.
+            It should create exactly one namespace directory per
+            lifecycle, under a name no other lifecycle uses, and remove
+            each one on the way out, leaving nothing behind — the inode
+            per lifecycle that accumulated for the life of the host.
         """
-        # Arrange
+        # Arrange — a pool's default namespace is `pool-<uuid>`, so its
+        # directory is `wool-pool-*`. Matching the directory each
+        # lifecycle actually creates is what makes the removal
+        # observable: a pattern that matched nothing would report an
+        # absence of residue it never looked for.
         root = namespace_directory("probe").parent
-        namespaces = set(root.glob("wool-workerpool-*"))
-        locks = set(root.glob("wool-lock-*"))
+        pattern = "wool-pool-*"
+        before = set(root.glob(pattern))
+        # Runs from before this reclaim landed left this root holding
+        # tens of thousands of these, so only newly created ones count.
+        locks = {path for path in root.glob("wool-lock-*") if path.is_file()}
+        created = []
 
         # Act
         for _ in range(3):
             async with asyncio.timeout(_TIMEOUT):
                 async with WorkerPool(spawn=1):
                     assert await routines.add(1, 2) == 3
+                    # The lifecycle is live, so its directory is there to
+                    # be named — and named is what lets the assertion
+                    # below be about a removal rather than an absence.
+                    live = set(root.glob(pattern)) - before
+                    assert len(live) == 1, live
+                    created.append(live.pop())
 
         # Assert
-        assert set(root.glob("wool-workerpool-*")) - namespaces == set()
-        assert set(root.glob("wool-lock-*")) - locks == set()
+        assert [directory for directory in created if directory.exists()] == []
+        assert set(root.glob(pattern)) - before == set()
+        # Every lifecycle mints its own namespace, so no two share a
+        # registry and one pool's teardown cannot reclaim another's.
+        assert len(set(created)) == len(created)
+        # A pin, not coverage: nothing creates a `wool-lock-*` file any
+        # more, so this cannot fire against the current implementation.
+        # It fails if the separate per-namespace lock file ever comes
+        # back, which is what leaked the second inode per lifecycle.
+        # Directories are excluded because a namespace may be named
+        # `lock-...`, as this suite's own lock tests name theirs.
+        current = {path for path in root.glob("wool-lock-*") if path.is_file()}
+        assert current - locks == set()
 
 
 @pytest.mark.integration
 class TestCrossProcessTeardown:
+    def test___exit___should_keep_a_successors_namespace_when_its_directory_is_removed(
+        self,
+    ):
+        """Test a stale owner's exit spares the namespace it no longer holds.
+
+        Given:
+            An owner LocalDiscovery entered in its own interpreter whose
+            whole namespace directory a third party then removes, and a
+            successor in this process that claims the same namespace
+            while that first owner is still inside its context
+        When:
+            The first owner is released and exits its context
+        Then:
+            It should leave the successor's namespace intact — a fresh
+            borrowing publisher still binds it — an owner's teardown
+            reaching only what its own claim covers, never a namespace a
+            different owner now holds.
+        """
+        # Arrange
+        namespace = f"swept-{uuid.uuid4().hex[:12]}"
+        owner = spawn_script_subprocess(
+            _OWNER_SCRIPT, namespace, ready_line="ready", timeout=_TIMEOUT
+        )
+        successor = contextlib.ExitStack()
+        try:
+            # A temporary-file sweeper takes the whole directory, not
+            # just the registry: with the directory gone the claim the
+            # first owner holds no longer guards the name, so the
+            # namespace is genuinely free for a successor.
+            shutil.rmtree(namespace_directory(namespace))
+            successor.enter_context(LocalDiscovery(namespace))
+            # Vacuity guard — two owners really are live at once, which
+            # is the only state in which the first one's teardown could
+            # reach the second one's files.
+            assert asyncio.run(_binds(namespace))
+
+            # Act
+            assert owner.stdin is not None
+            owner.stdin.write("\n")
+            owner.stdin.flush()
+            assert owner.wait(timeout=_TIMEOUT) == 0
+
+            # Assert
+            assert asyncio.run(_binds(namespace))
+            assert namespace_directory(namespace).exists()
+        finally:
+            release_subprocess(owner)
+            successor.close()
+            shutil.rmtree(namespace_directory(namespace), ignore_errors=True)
+
     def test___exit___should_unwind_cleanly_when_registry_removed_externally(self):
         """Test owner teardown after an external removal.
 
@@ -961,7 +1356,7 @@ class TestCrossProcessTeardown:
                     sys.executable,
                     "-c",
                     _ATTACHER_SCRIPT,
-                    str(namespace_directory(namespace) / "registry"),
+                    str(registry_path(namespace)),
                 ],
                 capture_output=True,
                 text=True,
@@ -1021,7 +1416,7 @@ class TestCrossProcessTeardown:
                     sys.executable,
                     "-c",
                     _ATTACHER_SCRIPT,
-                    str(namespace_directory(namespace) / "registry"),
+                    str(registry_path(namespace)),
                 ],
                 capture_output=True,
                 text=True,
@@ -1056,6 +1451,24 @@ async def _binds(namespace: str) -> bool:
             return True
     except DiscoveryNamespaceNotFound:
         return False
+
+
+async def _discovers(discovery: LocalDiscovery, uid, timeout: float = 10.0) -> bool:
+    """Return whether ``discovery``'s own subscriber reaches ``uid``.
+
+    Reads the worker's metadata block as well as its registry slot, so a
+    registration naming a block nothing can open does not count as
+    discovered.
+    """
+    subscriber = discovery.subscribe(poll_interval=0.05)
+    try:
+        async with asyncio.timeout(timeout):
+            async for event in subscriber:
+                if event.metadata.uid == uid:
+                    return True
+    except TimeoutError:
+        return False
+    return False
 
 
 def _hold_namespace(namespace: str, ready) -> None:
