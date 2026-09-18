@@ -27,8 +27,8 @@ class DiscoveryCapacityExhausted(WoolError):
     are registered, publishing another raises this.
 
     The condition is transient and namespace-wide. Dropping a worker
-    frees a slot, so a retry can succeed. The capacity is fixed for the
-    registry's lifetime.
+    frees a slot, so a retry can succeed. The ceiling itself does not
+    grow.
 
     :param capacity:
         The number of worker slots the namespace's owner stamped into
@@ -54,8 +54,11 @@ class DiscoveryBlockExhausted(WoolError):
     leaving the prior registration intact.
 
     The condition is permanent and per-worker: a retry with the same
-    metadata fails. Shrink the metadata, or re-register the worker under
-    a larger ``block_size``.
+    metadata fails. Shrink the metadata. A block's size is fixed at the
+    worker's first registration and a re-registration writes into that
+    same block, so publishing again through a publisher configured with
+    a larger ``block_size`` does not enlarge it; see
+    `LocalDiscovery.Publisher.publish`.
 
     :param size:
         The attempted payload size in bytes, when known.
@@ -92,10 +95,11 @@ class DiscoveryWorkerNotFound(WoolError):
 
 # public
 class DiscoveryNamespaceInUse(WoolError):
-    """Raised when claiming a namespace a live owner already holds.
+    """Raised when claiming a namespace another process still holds.
 
-    A namespace is only ever in use while its owner lives; see
-    `LocalDiscovery`.
+    A namespace is in use while any process holding its claim lives. That
+    is the owner's process, and anything forked from it after entry; see
+    `LocalDiscovery` for the ownership contract and what ends a claim.
 
     :param namespace:
         The namespace whose claim was rejected, when known.
