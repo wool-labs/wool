@@ -424,3 +424,128 @@ class TestFanoutConsumer:
 
         # Assert — both received StopAsyncIteration
         assert all(isinstance(r, StopAsyncIteration) for r in results)
+
+    @pytest.mark.asyncio
+    async def test___anext___with_failing_source(self):
+        """Test a source's failure reaches every consumer.
+
+        Given:
+            Two consumers sharing a source that raises part way
+            through, with the first consumer having already pulled the
+            item before it
+        When:
+            Each consumer pulls again
+        Then:
+            Both should raise that failure, rather than the consumer
+            that was not pulling ending as though the source had simply
+            run out.
+        """
+
+        # Arrange
+        class _FailingSource:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                yield "a"
+                raise RuntimeError("source failed")
+
+        fanout = Fanout(_FailingSource())
+        consumer_a = fanout.consumer()
+        consumer_b = fanout.consumer()
+        assert await anext(consumer_a) == "a"
+        # Drain the item the pull above fanned out, so the next pull
+        # below reaches the source rather than this consumer's queue.
+        assert await anext(consumer_b) == "a"
+
+        # Act
+        with pytest.raises(RuntimeError, match="source failed") as first:
+            await anext(consumer_a)
+
+        # Assert — the consumer that never pulled the source gets the
+        # same failure, not a clean end.
+        with pytest.raises(RuntimeError, match="source failed") as second:
+            await anext(consumer_b)
+        assert second.value is first.value
+
+    @pytest.mark.asyncio
+    async def test___anext___with_consumer_joining_after_failure(self):
+        """Test a consumer that joins a failed fanout raises its failure.
+
+        Given:
+            A Fanout whose source has already raised
+        When:
+            A consumer created after that failure pulls
+        Then:
+            It should raise the recorded failure, rather than binding a
+            fresh iterator over a source that is already finished.
+        """
+
+        # Arrange
+        class _FailingSource:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                raise RuntimeError("source failed")
+                yield  # pragma: no cover — makes this an async generator
+
+        fanout = Fanout(_FailingSource())
+        with pytest.raises(RuntimeError, match="source failed"):
+            await anext(fanout.consumer())
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="source failed"):
+            await anext(fanout.consumer())
+
+    @pytest.mark.asyncio
+    async def test___anext___with_cancelled_consumer(self):
+        """Test one consumer's cancellation does not end the others.
+
+        Given:
+            Two consumers sharing a source that suspends before its
+            first item, and a pull by the first that is cancelled while
+            it waits
+        When:
+            The second consumer pulls
+        Then:
+            It should end cleanly and the fanout should hold no
+            failure — a cancellation belongs to the consumer that was
+            cancelled and is not the source failing, so it must not be
+            recorded as one and re-raised in every other consumer.
+
+            That the shared source does not survive a cancelled pull is
+            pre-existing and pinned here rather than changed: cancelling
+            mid-pull closes the generator, so the survivor sees the end
+            of the source rather than the item it was waiting for.
+        """
+
+        # Arrange
+        release = asyncio.Event()
+
+        class _SuspendingSource:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                await release.wait()
+                yield "a"
+
+        fanout = Fanout(_SuspendingSource())
+        consumer_a = fanout.consumer()
+        consumer_b = fanout.consumer()
+        pulling = asyncio.ensure_future(anext(consumer_a))
+        await asyncio.sleep(0)
+
+        # Act
+        pulling.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pulling
+        release.set()
+
+        # Assert — no failure was recorded, so the survivor ends
+        # cleanly rather than re-raising another consumer's
+        # cancellation.
+        assert fanout._failure is None
+        with pytest.raises(StopAsyncIteration):
+            await anext(consumer_b)

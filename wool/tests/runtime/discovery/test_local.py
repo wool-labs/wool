@@ -6635,10 +6635,10 @@ class TestLocalDiscoverySubscriber:
         )
 
     @pytest.mark.asyncio
-    async def test___aiter___should_raise_only_on_the_iteration_that_binds(
+    async def test___aiter___should_raise_on_every_iteration_that_shares_a_bind(
         self, namespace
     ):
-        """Test only the binding iteration of an unowned namespace raises.
+        """Test every iteration sharing an unowned namespace raises.
 
         Given:
             A subscriber for a namespace no owner holds, iterated by
@@ -6646,8 +6646,10 @@ class TestLocalDiscoverySubscriber:
         When:
             All of the iterations are driven to completion.
         Then:
-            It should raise DiscoveryNamespaceNotFound on the iteration
-            that performs the bind and end the others without events.
+            It should raise DiscoveryNamespaceNotFound on every one of
+            them, not only the iteration that performed the bind — a
+            shared subscription that fails fails for everyone reading
+            it, rather than ending the rest without events.
         """
 
         # Arrange
@@ -6669,8 +6671,7 @@ class TestLocalDiscoverySubscriber:
         )
 
         # Assert
-        assert outcomes.count("raised") == 1
-        assert outcomes.count("ended") == 2
+        assert outcomes == ["raised", "raised", "raised"]
 
 
 def _enter_lifecycle_forest(namespace, forest, owned=False):
@@ -6794,3 +6795,59 @@ class TestSubscriberLiveness:
         with pytest.raises(DiscoveryNamespaceNotFound):
             await asyncio.wait_for(pending, timeout=_LIVENESS_FLOOR * 3)
         assert loop.time() - started < _LIVENESS_FLOOR * 2
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_bind_a_successor_after_the_subscription_failed(
+        self, namespace, metadata
+    ):
+        """Test a failed subscription does not poison the namespace.
+
+        Given:
+            A subscription that ended because its owner exited, with no
+            iteration of it left open, and a successor owner that has
+            since claimed the same namespace and published a worker
+        When:
+            A fresh subscriber on that namespace iterates
+        Then:
+            It should discover the successor's worker rather than
+            inheriting the failure. Subscriptions sharing a namespace
+            and poll interval are shared, so a failure that outlived the
+            iterations which saw it would leave the namespace
+            permanently unbindable.
+
+            The bound is the shared subscription's own lifetime, not the
+            failure's: the pool holds no idle entry, so the last
+            iteration to end releases it and the next subscriber builds
+            afresh. An iteration left open and never pulled again holds
+            it open, and the namespace stays unbindable until that
+            iteration is closed — the pool will not finalize a resource
+            out from under a live reference.
+        """
+        # Arrange — fail a subscription the way a lost owner does
+        owner = LocalDiscovery(namespace, capacity=4).__enter__()
+        async with LocalDiscovery.Publisher(namespace) as publisher:
+            await publisher.publish("worker-added", metadata)
+        stale = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+        iterator = stale.__aiter__()
+        await asyncio.wait_for(iterator.__anext__(), timeout=5)
+        owner.__exit__(None, None, None)
+        with pytest.raises(DiscoveryNamespaceNotFound):
+            async with asyncio.timeout(10):
+                while True:
+                    await iterator.__anext__()
+
+        # Act — a successor claims the namespace and publishes
+        successor = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50099", pid=999, version="1.0"
+        )
+        with LocalDiscovery(namespace, capacity=4):
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", successor)
+
+                # Assert — a fresh subscriber on the same key binds the
+                # successor rather than inheriting the failure
+                fresh = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+                async with asyncio.timeout(10):
+                    async for event in fresh:
+                        assert event.metadata.uid == successor.uid
+                        break

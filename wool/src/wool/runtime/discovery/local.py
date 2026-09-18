@@ -1291,12 +1291,18 @@ class LocalDiscovery(Discovery):
         Constructions sharing a ``namespace`` and ``poll_interval``
         within one `contextvars.Context` are served from one
         subscription; see `SubscriberMeta`. Only the iteration that
-        starts a subscription binds, so only that iteration raises
-        `DiscoveryNamespaceNotFound` at the bind. A subscription whose
-        owner then goes away fails for the iteration pulling it; every
-        other iteration sharing it currently ends without events instead
-        of raising, and an iteration that joins a failing bind ends
-        without events too.
+        starts a subscription binds, so only that iteration can raise
+        `DiscoveryNamespaceNotFound` at the bind itself — but every
+        iteration sharing that subscription raises it, whichever one
+        was pulling when it happened. A shared subscription that fails
+        fails for everyone reading it.
+
+        A failed subscription is held only as long as the iterations
+        that share it: the last one to end releases it, and the next
+        subscriber binds afresh. An iteration left open and never pulled
+        again holds it open, and a subscriber constructed with the same
+        namespace and poll interval joins that failure rather than
+        binding a successor until it is closed.
 
         :param namespace:
             The namespace identifier for the registry to borrow. See
