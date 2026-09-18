@@ -64,6 +64,7 @@ import time
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.local import _lock
 from wool.runtime.discovery.local import _open_registry
+from wool.runtime.discovery.local import _resolve_generation
 
 
 async def main():
@@ -72,7 +73,7 @@ async def main():
     deadline = time.monotonic() + 30
     while True:
         try:
-            registry = _open_registry(namespace)
+            registry = _open_registry(namespace, _resolve_generation(namespace))
             break
         except DiscoveryNamespaceNotFound:
             if time.monotonic() >= deadline:

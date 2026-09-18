@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers import discovery_root
 from tests.helpers import namespace_directory
 from tests.helpers import registry_path
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
@@ -177,15 +178,17 @@ asyncio.run(main())
 
 #: Bind a borrowing publisher on a namespace this process owns, then wait
 #: to be released before publishing each worker named on the command line,
-#: reporting the outcome of each. Waits again at the end so the blocks it
-#: holds outlive the reader that discovers them: an exit here would unlink
-#: a block while a subscriber was still scanning the slot naming it.
+#: reporting the outcome of each. Waits again at the end so the reader
+#: that discovers a worker sees it while this publisher is still bound.
+#: A publisher whose owner has exited reports "stranded" rather than
+#: dying with a traceback at its ready line.
 _ORPHAN_SCRIPT = """
 import asyncio
 import sys
 import uuid
 
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.worker.metadata import WorkerMetadata
 
@@ -203,6 +206,8 @@ async def main():
                 await publisher.publish("worker-added", metadata)
             except DiscoveryCapacityExhausted as error:
                 print(f"refused {error.capacity}", flush=True)
+            except DiscoveryNamespaceNotFound:
+                print("stranded", flush=True)
             else:
                 print("published", flush=True)
         await asyncio.to_thread(sys.stdin.readline)
@@ -721,10 +726,10 @@ class TestCrossProcessOwnership:
             assert ready.wait(_TIMEOUT), "the child never claimed the namespace"
             owner.kill()
             owner.join(_TIMEOUT)
-            # Vacuity guard — the kill left the registry behind, so the
-            # claim below is made against residue rather than a clean
-            # namespace.
-            assert (directory / "registry").exists()
+            # Vacuity guard — the kill left the whole generation behind,
+            # so the claim below is made against residue rather than a
+            # clean namespace, and its sweep has something to remove.
+            assert registry_path(namespace).exists()
 
             # Act & assert
             with LocalDiscovery(namespace) as successor:
@@ -945,10 +950,8 @@ class TestCrossProcessBorrowing:
             assert asyncio.run(_binds(namespace))
 
     @pytest.mark.asyncio
-    async def test_publish_should_reach_the_successor_registry_when_orphaned(
-        self, namespaces
-    ):
-        """Test an orphan across processes writes to the successor's registry.
+    async def test_publish_should_strand_a_borrower_across_processes(self, namespaces):
+        """Test a stranded publisher never reaches a successor's registry.
 
         Given:
             A publisher in an independent interpreter bound to a
@@ -956,13 +959,12 @@ class TestCrossProcessBorrowing:
             owner having since exited, and a successor this process has
             entered on the same namespace
         When:
-            The orphaned interpreter publishes a worker
+            The stranded interpreter publishes a worker
         Then:
-            It should publish without raising and the successor's own
-            subscriber should discover exactly that worker — an orphan
-            rebinds across an ownership handoff between interpreters,
-            and the successor's registry started empty rather than
-            adopting the one the previous owner left.
+            It should report itself stranded rather than publishing, and
+            the successor's own subscriber should discover nothing — a
+            binding ends with the owner it was made against, so a
+            successor inherits no borrowers from its predecessor.
         """
         # Arrange
         namespace = namespaces("orphan-xproc")
@@ -975,8 +977,8 @@ class TestCrossProcessBorrowing:
                     _ORPHAN_SCRIPT, namespace, str(worker), ready_line="bound"
                 )
             # The owner is gone and a live foreign borrower still holds a
-            # block in the directory, so the successor's claim also shows
-            # that a borrower alone never makes a namespace look in use.
+            # descriptor, so the successor's claim also shows that a
+            # borrower alone never makes a namespace look in use.
             discovery = successor.enter_context(LocalDiscovery(namespace, capacity=8))
 
             # Act
@@ -986,58 +988,8 @@ class TestCrossProcessBorrowing:
             published = await asyncio.to_thread(orphan.stdout.readline)
 
             # Assert
-            assert published.strip() == "published", published
-            assert await _discovers(discovery, worker)
-        finally:
-            release_subprocess(orphan)
-            successor.close()
-
-    @pytest.mark.asyncio
-    async def test_publish_should_bind_the_successor_capacity_when_orphaned(
-        self, namespaces
-    ):
-        """Test an orphan is bound by the capacity it is writing under.
-
-        Given:
-            A publisher in an independent interpreter bound to a
-            namespace this process owned at a capacity of eight, that
-            owner having since exited, and a successor entered on the
-            same namespace at a capacity of one
-        When:
-            The orphaned interpreter publishes two distinct workers
-        Then:
-            It should admit the first and refuse the second reporting a
-            capacity of one — a borrower is bound by the capacity of the
-            registry it is writing now, not the one it bound under.
-        """
-        # Arrange
-        namespace = namespaces("orphan-cap")
-        first, second = uuid.uuid4(), uuid.uuid4()
-        orphan = None
-        successor = contextlib.ExitStack()
-        try:
-            with LocalDiscovery(namespace, capacity=8):
-                orphan = spawn_script_subprocess(
-                    _ORPHAN_SCRIPT,
-                    namespace,
-                    str(first),
-                    str(second),
-                    ready_line="bound",
-                )
-            successor.enter_context(LocalDiscovery(namespace, capacity=1))
-
-            # Act
-            assert orphan.stdin is not None and orphan.stdout is not None
-            orphan.stdin.write("\n")
-            orphan.stdin.flush()
-            outcomes = [
-                (await asyncio.to_thread(orphan.stdout.readline)).strip()
-                for _ in range(2)
-            ]
-
-            # Assert — one, the successor's stamp, and not the eight it
-            # bound under, which would have admitted both.
-            assert outcomes == ["published", "refused 1"], outcomes
+            assert published.strip() == "stranded", published
+            assert not await _discovers(discovery, worker, timeout=2)
         finally:
             release_subprocess(orphan)
             successor.close()
@@ -1167,29 +1119,27 @@ class TestCrossProcessBorrowing:
 @pytest.mark.integration
 class TestNamespaceResidue:
     @pytest.mark.asyncio
-    async def test___exit___should_leave_the_directory_when_a_borrower_is_killed(
+    async def test___exit___should_reclaim_the_directory_when_a_borrower_is_killed(
         self, namespaces
     ):
-        """Test the one residue no live process remains to reclaim.
+        """Test a killed borrower leaves the owner nothing to strand.
 
         Given:
             A namespace this process owns, and an independent
             interpreter that binds a borrowing publisher, publishes a
-            worker, and is then killed with SIGKILL so its own block
-            cleanup never runs
+            worker, and is then killed with SIGKILL so nothing of its
+            own ever runs again
         When:
             The owner exits its context
         Then:
-            It should reclaim the registry, leaving a fresh borrower
-            nothing to bind, yet leave the namespace directory standing
-            — the orphan reclaim runs in the publisher's own shutdown
-            handler, which a kill skips.
+            It should reclaim the registry and the whole namespace
+            directory with it, leaving a fresh borrower nothing to bind
+            and nothing on disk — the owner owns every artifact, so no
+            reclaim depends on a borrower surviving to run it.
         """
-        # Arrange — pinned deliberately rather than treated as a leak to
-        # fix here: the reclaim path a killed borrower skips has no other
-        # process to fall to, and this is the boundary of #345. A future
-        # fix, such as an owner sweeping blocks whose publishers are
-        # gone, is a deliberate edit to this assertion.
+        # Arrange — this was the residue of #345, pinned while a killed
+        # borrower's blocks had no live process left to reclaim them.
+        # The owner reclaims them now, so the assertion is inverted.
         namespace = namespaces("killed-borrower")
         worker = uuid.uuid4()
         borrower = None
@@ -1210,7 +1160,7 @@ class TestNamespaceResidue:
 
             # Assert
             assert not await _binds(namespace)
-            assert namespace_directory(namespace).exists()
+            assert not namespace_directory(namespace).exists()
         finally:
             release_subprocess(borrower)
 
@@ -1231,16 +1181,14 @@ class TestNamespaceResidue:
             per lifecycle that accumulated for the life of the host.
         """
         # Arrange — a pool's default namespace is `pool-<uuid>`, so its
-        # directory is `wool-pool-*`. Matching the directory each
-        # lifecycle actually creates is what makes the removal
-        # observable: a pattern that matched nothing would report an
-        # absence of residue it never looked for.
-        root = namespace_directory("probe").parent
-        pattern = "wool-pool-*"
+        # directory is `<root>/wool/pool-*`. Matching the
+        # directory each lifecycle actually creates is what makes the
+        # removal observable: a pattern that matched nothing would report
+        # an absence of residue it never looked for.
+        root = discovery_root()
+        root.mkdir(parents=True, exist_ok=True)
+        pattern = "pool-*"
         before = set(root.glob(pattern))
-        # Runs from before this reclaim landed left this root holding
-        # tens of thousands of these, so only newly created ones count.
-        locks = {path for path in root.glob("wool-lock-*") if path.is_file()}
         created = []
 
         # Act
@@ -1261,14 +1209,11 @@ class TestNamespaceResidue:
         # Every lifecycle mints its own namespace, so no two share a
         # registry and one pool's teardown cannot reclaim another's.
         assert len(set(created)) == len(created)
-        # A pin, not coverage: nothing creates a `wool-lock-*` file any
-        # more, so this cannot fire against the current implementation.
-        # It fails if the separate per-namespace lock file ever comes
-        # back, which is what leaked the second inode per lifecycle.
-        # Directories are excluded because a namespace may be named
-        # `lock-...`, as this suite's own lock tests name theirs.
-        current = {path for path in root.glob("wool-lock-*") if path.is_file()}
-        assert current - locks == set()
+        # Containment: everything a lifecycle creates lives under the one
+        # fixed `wool/` entry, so the root the namespaces sit beside gains
+        # nothing per lifecycle. This is what makes `rm -rf <root>/wool`
+        # a complete reclaim rather than a partial one.
+        assert [entry for entry in root.parent.glob("wool-*")] == []
 
 
 @pytest.mark.integration
