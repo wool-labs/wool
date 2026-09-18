@@ -32,6 +32,7 @@ from watchdog.observers import Observer
 from tests.helpers import block_path
 from tests.helpers import blocks_directory
 from tests.helpers import discovery_root
+from tests.helpers import generation_directory
 from tests.helpers import namespace_directory
 from tests.helpers import notify_path
 from tests.helpers import registry_path
@@ -41,6 +42,7 @@ from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.exceptions import DiscoveryWorkerNotFound
+from wool.runtime.discovery.local import _LIVENESS_FLOOR
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.metadata import WorkerMetadata
@@ -2243,6 +2245,45 @@ class TestLocalDiscovery:
                             version="1.0",
                         ),
                     )
+
+    def test___enter___should_sweep_a_killed_predecessors_generation(
+        self, namespace, killed_owner
+    ):
+        """Test a claim reclaims whatever a killed owner left behind.
+
+        Given:
+            A namespace whose owner, in an independent interpreter, was
+            killed with SIGKILL, so none of its teardown ran and its
+            whole generation is still on disk
+        When:
+            A fresh owner claims the namespace
+        Then:
+            It should remove the predecessor's generation before staging
+            its own, leaving only its own generation and the pointer to
+            it — holding the claim proves there is no live writer, so the
+            residue is the successor's to reclaim.
+        """
+        # Arrange
+        with killed_owner():
+            stranded = generation_directory(namespace)
+            assert stranded.is_dir()
+
+        # Vacuity guard — the kill left the generation behind, so the
+        # sweep below has something to remove rather than reporting an
+        # absence it never created.
+        assert stranded.is_dir()
+
+        # Act
+        with LocalDiscovery(namespace, capacity=4):
+            # Assert
+            assert not stranded.exists()
+            live = generation_directory(namespace)
+            entries = sorted(
+                entry.name for entry in namespace_directory(namespace).iterdir()
+            )
+            assert entries == sorted(["current", live.name])
+
+        assert not namespace_directory(namespace).exists()
 
 
 class TestLocalDiscoveryPublisher:
@@ -5304,6 +5345,37 @@ class TestLocalDiscoveryPublisher:
                         publisher = registrar.pop(index)
                         await publisher.publish("worker-dropped", roster[index])
 
+    @pytest.mark.asyncio
+    async def test___aenter___should_raise_when_the_owner_was_killed(
+        self, namespace, killed_owner
+    ):
+        """Test a publisher will not bind a namespace whose owner is dead.
+
+        Given:
+            A namespace whose owner, in an independent interpreter, was
+            killed with SIGKILL, so its registry and pointer are both
+            still on disk and still readable
+        When:
+            A publisher binds that namespace
+        Then:
+            It should raise `DiscoveryNamespaceNotFound` — the files
+            surviving say nothing about their owner, so the owner's own
+            lock is what decides whether there is anything to borrow.
+        """
+        # Arrange
+        with killed_owner():
+            pass
+
+        # Vacuity guard — nothing removed the registry, so a check
+        # against the files alone would find this namespace live.
+        assert registry_path(namespace).exists()
+
+        # Act & assert
+        with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+            async with LocalDiscovery.Publisher(namespace):
+                pass
+        assert excinfo.value.namespace == namespace
+
 
 class TestLocalDiscoverySubscriber:
     """Tests for LocalDiscovery.Subscriber class.
@@ -6622,3 +6694,103 @@ def _enter_lifecycle_forest(namespace, forest, owned=False):
             else:
                 generation.enter_context(LocalDiscovery(namespace))
             _enter_lifecycle_forest(namespace, children, owned=True)
+
+
+class TestSubscriberLiveness:
+    """The subscription's own liveness contract, which no file states."""
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_raise_when_the_owner_was_killed(
+        self, namespace, metadata, killed_owner
+    ):
+        """Test a subscription ends when its owner is killed outright.
+
+        Given:
+            A subscription streaming a worker from a namespace whose
+            owner, in an independent interpreter, is then killed with
+            SIGKILL, leaving the registry on disk and still readable
+        When:
+            The subscription scans again
+        Then:
+            It should raise `DiscoveryNamespaceNotFound` rather than
+            serving the snapshot it last read, and report no worker as
+            dropped — the workers may still be running, so an owner
+            leaving is not a membership change.
+        """
+        # Arrange
+        events: list = []
+        with killed_owner():
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", metadata)
+
+            subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+            iterator = subscriber.__aiter__()
+            first = await asyncio.wait_for(iterator.__anext__(), timeout=5)
+            events.append(first)
+
+            # Act — the owner dies mid-subscription
+        # Vacuity guard — the registry outlived its owner, so nothing
+        # about the files alone marks this subscription stale.
+        assert registry_path(namespace).exists()
+
+        # Assert
+        with pytest.raises(DiscoveryNamespaceNotFound):
+            async with asyncio.timeout(10):
+                while True:
+                    events.append(await iterator.__anext__())
+
+        assert events[0].type == "worker-added"
+        assert events[0].metadata.uid == metadata.uid
+        assert "worker-dropped" not in {event.type for event in events}
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_notice_a_lost_owner_without_a_poll_interval(
+        self, namespace, metadata, killed_owner
+    ):
+        """Test a subscription with no poll interval still notices.
+
+        Given:
+            A subscription with ``poll_interval=None`` parked on a
+            notification — nothing is left to touch the notification
+            file, so no notification will ever arrive — whose owner is
+            then killed with SIGKILL
+        When:
+            The parked scan is awaited
+        Then:
+            It should raise `DiscoveryNamespaceNotFound` within the
+            liveness floor, because the floor is the only thing that can
+            wake it: without that bound the pull below never completes.
+        """
+        # Arrange
+        loop = asyncio.get_running_loop()
+        with killed_owner() as owner:
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                await publisher.publish("worker-added", metadata)
+
+            subscriber = LocalDiscovery.Subscriber(namespace)
+            iterator = subscriber.__aiter__()
+            await asyncio.wait_for(iterator.__anext__(), timeout=5)
+
+            # Park the subscription: drain whatever the first scan
+            # already produced, then hold a pull that cannot complete
+            # until something rescans.
+            pending = asyncio.ensure_future(iterator.__anext__())
+            while True:
+                try:
+                    await asyncio.wait_for(asyncio.shield(pending), timeout=0.5)
+                except asyncio.TimeoutError:
+                    break
+                pending = asyncio.ensure_future(iterator.__anext__())
+
+            # Vacuity guard — the pull really is parked with no
+            # notification coming, so only the floor can complete it.
+            assert not pending.done()
+
+            # Act
+            owner.kill()
+
+        # Assert
+        started = loop.time()
+        with pytest.raises(DiscoveryNamespaceNotFound):
+            await asyncio.wait_for(pending, timeout=_LIVENESS_FLOOR * 3)
+        assert loop.time() - started < _LIVENESS_FLOOR * 2
