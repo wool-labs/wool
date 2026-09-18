@@ -13,21 +13,28 @@ every HYBRID pairwise row with the default ``lock_timeout=30.0``, so a new
 
 The lock holder runs in a distinct interpreter, so the contention these
 tests exercise crosses a process boundary. The `_HOLDER_SCRIPT`
-subprocess acquires the lock through the production `_lock` context manager
-itself, guaranteeing the same lock-file path (`_short_hash`) and mechanism
-(``portalocker.LOCK_EX | LOCK_NB``) the publisher waits on. Driving the
-private `_lock` this way is a deliberate exception to the Test Guide's
-"no private references" rule: it is a cross-process harness to establish a
-genuinely held lock — no public API holds the discovery lock open across a
-wait — while every assertion targets public behavior, and reconstructing
-the lock-file path in the harness would duplicate more private detail and
-drift. Unit-level coverage of the timeout lives in
+subprocess acquires the lock through the production `_lock` context
+manager over the production registry handle, guaranteeing the same file
+and mechanism (``portalocker.LOCK_EX | LOCK_NB``) the publisher waits on.
+Driving the private `_lock` this way is a deliberate exception to the
+Test Guide's "no private references" rule: it is a cross-process harness
+to establish a genuinely held lock — no public API holds the discovery
+lock open across a wait — while every assertion targets public behavior,
+and rebuilding the registry's path in the harness would duplicate more
+private detail and drift. Unit-level coverage of the timeout lives in
 ``tests/runtime/discovery/test_local.py``.
+
+The lock is taken on the registry file itself, so it cannot be held
+before the namespace exists. The holder therefore reports that it is
+waiting, then polls until an owner has created the registry and takes the
+lock the moment it appears; `_locked` waits for that second handshake
+wherever the owner is in place before the holder runs.
 """
 
 import asyncio
 import logging
 import multiprocessing
+import threading
 import time
 import uuid
 
@@ -47,23 +54,62 @@ from .conftest import spawn_script_subprocess
 
 # Hold the namespace's discovery lock in a separate interpreter until
 # released via stdin, through the production `_lock` so the held lock is
-# the one a publisher contends.
+# the one a publisher contends. Reports "waiting" as soon as it is
+# running and "locked" once it holds the lock; see the module docstring.
 _HOLDER_SCRIPT = """
 import asyncio
 import sys
+import time
 
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.local import _lock
+from wool.runtime.discovery.local import _open_registry
+from wool.runtime.discovery.local import _resolve_generation
 
 
 async def main():
     namespace = sys.argv[1]
-    async with _lock(namespace, timeout=None):
+    print("waiting", flush=True)
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            registry = _open_registry(namespace, _resolve_generation(namespace))
+            break
+        except DiscoveryNamespaceNotFound:
+            if time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(0.001)
+    async with _lock(registry, namespace=namespace, timeout=None):
         print("locked", flush=True)
-        sys.stdin.readline()
+        await asyncio.to_thread(sys.stdin.readline)
 
 
 asyncio.run(main())
 """
+
+
+def _locked(holder, timeout=_TIMEOUT):
+    """Wait for a spawned `_HOLDER_SCRIPT` to report that it holds the lock.
+
+    Reads on a thread the way `spawn_script_subprocess` does, so a holder
+    that never reports fails here within ``timeout`` instead of wedging
+    the run on a blocking read that nothing bounds.
+    """
+    assert holder.stdout is not None
+    lines: list[str] = []
+
+    def read():
+        try:
+            lines.append(holder.stdout.readline().strip())
+        except (ValueError, OSError):
+            pass  # stdout closed during teardown
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    reader.join(timeout)
+    assert not reader.is_alive(), f"holder did not report a lock within {timeout}s"
+    line = lines[0] if lines else ""
+    assert line == "locked", f"holder failed to take the lock: {line!r}"
 
 
 @pytest.mark.integration
@@ -94,13 +140,17 @@ class TestCrossProcessLockTimeout:
             version="1.0",
         )
         lock_timeout = 1.0
-        holder = spawn_script_subprocess(_HOLDER_SCRIPT, namespace, ready_line="locked")
+        holder = None
 
         # Act & assert — an owner holds the registry the publisher
         # borrows, so what the publish contends is the lock alone.
         try:
             publisher = LocalDiscovery.Publisher(namespace, lock_timeout=lock_timeout)
             with LocalDiscovery(namespace):
+                holder = spawn_script_subprocess(
+                    _HOLDER_SCRIPT, namespace, ready_line="waiting"
+                )
+                _locked(holder)
                 async with publisher:
                     start = time.monotonic()
                     with pytest.raises(TimeoutError):
@@ -168,8 +218,9 @@ class TestPoolTeardownLockTimeout:
                             spawn_script_subprocess,
                             _HOLDER_SCRIPT,
                             namespace,
-                            ready_line="locked",
+                            ready_line="waiting",
                         )
+                        await asyncio.to_thread(_locked, holder)
                     # Exiting here fires the worker-dropped announcement
                     # against the wedged lock.
 
@@ -190,6 +241,11 @@ class TestPoolTeardownLockTimeout:
             for record in announce_failures:
                 assert record.exc_info is not None
                 assert isinstance(record.exc_info[1], TimeoutError)
+                # Only lock acquisition names the discovery lock and the
+                # namespace, so any other timeout reaching this same log
+                # site can no longer satisfy the oracle.
+                assert "discovery lock" in str(record.exc_info[1])
+                assert repr(namespace) in str(record.exc_info[1])
             # The publish TimeoutError is logged as an announcement failure
             # and never as a worker that would not stop.
             assert not any(
@@ -209,19 +265,25 @@ class TestPoolEntryLockTimeout:
         """Test pool entry aborts when the worker-added lock is wedged.
 
         Given:
-            An independent subprocess holding the discovery lock before pool
-            entry, and a hybrid WorkerPool with a one-second lock_timeout
+            An independent subprocess waiting to take the discovery lock,
+            and a hybrid WorkerPool with a one-second lock_timeout whose
+            own entry creates the namespace the subprocess is waiting on
         When:
-            The pool is entered so its worker-added announcement contends the
-            wedged lock
+            The pool is entered, so the subprocess takes the lock as soon
+            as the registry exists and the pool's worker-added
+            announcement contends it
         Then:
             It should abort entry with an ExceptionGroup carrying a
-            TimeoutError and leave no worker process alive.
+            TimeoutError that names the contended discovery lock, and
+            leave no worker process alive.
         """
-        # Arrange
+        # Arrange — the holder cannot take the lock before the pool
+        # creates the registry, so it is already running and polling when
+        # that happens; it wins by the length of a worker spawn. A lost
+        # race surfaces as a failure below, never as a silent pass.
         namespace = f"lock-entry-{uuid.uuid4().hex[:12]}"
         before = {child.pid for child in multiprocessing.active_children()}
-        holder = spawn_script_subprocess(_HOLDER_SCRIPT, namespace, ready_line="locked")
+        holder = spawn_script_subprocess(_HOLDER_SCRIPT, namespace, ready_line="waiting")
 
         # Act & assert
         try:
@@ -234,9 +296,21 @@ class TestPoolEntryLockTimeout:
                         pass
 
             leaves = list(_iter_leaf_exceptions(excinfo.value))
-            assert any(isinstance(leaf, TimeoutError) for leaf in leaves), (
-                f"expected a TimeoutError, got: {leaves!r}"
-            )
+            # Named, not merely typed: entry has other waits that can
+            # time out, and only the discovery lock's message carries
+            # the lock and the namespace.
+            wedged = [
+                leaf
+                for leaf in leaves
+                if isinstance(leaf, TimeoutError)
+                and "discovery lock" in str(leaf)
+                and repr(namespace) in str(leaf)
+            ]
+            assert wedged, f"expected a contended discovery lock, got: {leaves!r}"
+            # The holder won the race it had to win for this test to mean
+            # anything, so a lost race reports itself rather than looking
+            # like the regression this test is here to catch.
+            await asyncio.to_thread(_locked, holder)
 
             # Join finished children so an exited-but-unreaped worker cannot
             # masquerade as alive.

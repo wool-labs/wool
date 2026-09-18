@@ -22,6 +22,13 @@ class Fanout(Generic[T]):
     pulls one item from the shared source iterator, and distributes
     it to every other consumer's queue.
 
+    A source that fails does so for every consumer. The failure is
+    recorded here and the sentinel wakes the consumers that were not
+    pulling, which then raise it in place of `StopAsyncIteration`; see
+    `FanoutConsumer.__anext__`. Without that the failure would reach
+    only whichever consumer happened to be pulling, and the rest would
+    end as though the source had simply run out.
+
     :param source:
         The async generator to multicast.
     """
@@ -31,6 +38,10 @@ class Fanout(Generic[T]):
         self._lock = asyncio.Lock()
         self._iterator: AsyncIterator[T] | None = None
         self._consumers: weakref.WeakSet[FanoutConsumer[T]] = weakref.WeakSet()
+        #: The source's failure, once it has one. Held here rather than
+        #: queued, so a consumer that joins after the failure raises it
+        #: too, and set once — the first failure is the cause.
+        self._failure: BaseException | None = None
 
     def consumer(self) -> FanoutConsumer[T]:
         """Create a new independent consumer.
@@ -47,7 +58,10 @@ class Fanout(Generic[T]):
         """Close the shared iterator and signal remaining consumers.
 
         After cleanup, any active consumer will receive
-        :exc:`StopAsyncIteration` on its next pull.
+        :exc:`StopAsyncIteration` on its next pull — or the source's
+        failure, if it had one. A subscription that ended in a failure
+        owes its consumers that cause rather than a clean end, and
+        cleaning up is not what made it end.
         """
         self._iterator = None
         try:
@@ -88,22 +102,40 @@ class FanoutConsumer(Generic[T]):
         return self
 
     async def __anext__(self) -> T:
+        """Return this consumer's next item from the shared source.
+
+        :returns:
+            The next item.
+        :raises StopAsyncIteration:
+            When the source is exhausted, or the fanout was cleaned up.
+        :raises BaseException:
+            The source's own failure, re-raised in every consumer
+            rather than only in whichever one was pulling when it
+            happened; see `Fanout`.
+        """
+        fanout = self._fanout
         # Fast path — dequeue if available.
         if not self._queue.empty():
             value = self._queue.get_nowait()
             if value is _SENTINEL:
-                raise StopAsyncIteration
+                return self._end(fanout)
             return value  # type: ignore[return-value]
 
-        fanout = self._fanout
         async with fanout._lock:
             # Double-check after acquiring lock — another consumer
             # may have filled our queue while we waited.
             if not self._queue.empty():
                 value = self._queue.get_nowait()
                 if value is _SENTINEL:
-                    raise StopAsyncIteration
+                    return self._end(fanout)
                 return value  # type: ignore[return-value]
+
+            # A source that already failed stays failed. Checked before
+            # the pull rather than left to the iterator, which would
+            # report a generator closed by its own exception as an
+            # ordinary exhaustion and end this consumer cleanly.
+            if fanout._failure is not None:
+                raise fanout._failure
 
             # Lazily initialise the shared source iterator.
             if fanout._iterator is None:
@@ -112,9 +144,16 @@ class FanoutConsumer(Generic[T]):
             try:
                 item = await anext(fanout._iterator)
             except StopAsyncIteration:
-                for c in list(fanout._consumers):
-                    if c is not self:
-                        c._queue.put_nowait(_SENTINEL)
+                self._wake_others(fanout)
+                raise
+            except Exception as error:
+                # Recorded before the wake, so a consumer that runs the
+                # instant it is woken finds the cause already in place.
+                # `Exception` and not `BaseException`: cancelling one
+                # consumer's pull is that consumer's business, and must
+                # not end the subscription for every other one.
+                fanout._failure = error
+                self._wake_others(fanout)
                 raise
 
             # Fan out to all other registered consumers.
@@ -122,3 +161,29 @@ class FanoutConsumer(Generic[T]):
                 if c is not self:
                     c._queue.put_nowait(item)
             return item
+
+    def _end(self, fanout: Fanout[T]) -> T:
+        """Raise whatever ended this consumer, having dequeued a sentinel.
+
+        :param fanout:
+            The parent container, holding the source's failure if it
+            had one.
+        :raises StopAsyncIteration:
+            If the source ended without failing.
+        """
+        if fanout._failure is not None:
+            raise fanout._failure
+        raise StopAsyncIteration
+
+    def _wake_others(self, fanout: Fanout[T]) -> None:
+        """Wake every other consumer so it observes how the source ended.
+
+        The sentinel is only the wake-up; what it means is whether
+        `Fanout._failure` is set by the time the woken consumer looks.
+
+        :param fanout:
+            The parent container whose consumers to wake.
+        """
+        for c in list(fanout._consumers):
+            if c is not self:
+                c._queue.put_nowait(_SENTINEL)

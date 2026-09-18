@@ -414,9 +414,14 @@ class WorkerProxy:
         subscriber that iterates without error.
     :raises ~wool.DiscoveryNamespaceNotFound:
         If the discovery subscriber binds a `~wool.LocalDiscovery`
-        namespace that has no registry. The error surfaces where the
-        quorum wait would otherwise raise `asyncio.TimeoutError`, or from
-        `stop` when no quorum is set.
+        namespace with no live owner, or its owner goes away while the
+        subscription is running. The subscription is consumed by a
+        detached task, so the error is held and raised by the next
+        caller to need it: from the quorum wait in place of
+        `asyncio.TimeoutError`, from `dispatch`, and from `stop` when
+        neither has run. A lazy first dispatch is the exception — it
+        starts the subscription, so there is nothing yet to have
+        failed, and the quorum wait is what catches it.
 
     .. caution::
 
@@ -725,6 +730,10 @@ class WorkerProxy:
                     "pool_uri, discovery_event_stream, or workers"
                 )
         self._sentinel_task: asyncio.Task[None] | None = None
+        #: What killed the sentinel, once something has. The sentinel
+        #: runs detached, so its failure reaches nobody unless it is
+        #: held for the next caller to raise; see `_on_sentinel_done`.
+        self._sentinel_failure: BaseException | None = None
         self._loadbalancer_context: LoadBalancerContext | None = None
         self._handshake_throttle: _HandshakeWarningThrottle | None = None
         self._workers_changed: asyncio.Event | None = None
@@ -937,8 +946,9 @@ class WorkerProxy:
             If the quorum wait does not complete within
             ``quorum_timeout``.
         :raises ~wool.DiscoveryNamespaceNotFound:
-            In place of the quorum wait's `asyncio.TimeoutError`; see
-            `WorkerProxy`.
+            In place of the quorum wait's `asyncio.TimeoutError`, and
+            without waiting it out — the sentinel's death is why the
+            quorum can never arrive. See `WorkerProxy`.
 
         .. rubric:: Implementation notes
 
@@ -987,7 +997,9 @@ class WorkerProxy:
             # fresh one.
             self._handshake_throttle = _HandshakeWarningThrottle()
             self._workers_changed = asyncio.Event()
+            self._sentinel_failure = None
             self._sentinel_task = asyncio.create_task(self._worker_sentinel())
+            self._sentinel_task.add_done_callback(self._on_sentinel_done)
             stack.push_async_callback(self._cancel_sentinel)
 
             if self._quorum:
@@ -1066,7 +1078,8 @@ class WorkerProxy:
             in which case nothing is unwound and the proxy stays
             started.
         :raises ~wool.DiscoveryNamespaceNotFound:
-            If the sentinel's discovery subscriber raised it; see
+            If the sentinel's discovery subscriber raised it and neither
+            a quorum wait nor a dispatch has already reported it; see
             `WorkerProxy`.
         :raises BaseException:
             An uncontained failure from retiring the loop's channels when
@@ -1112,6 +1125,12 @@ class WorkerProxy:
             lazy dispatch's start waits for it.
         :raises NoWorkersAvailable:
             If every candidate the balancer yields fails to dispatch.
+        :raises ~wool.DiscoveryNamespaceNotFound:
+            If the discovery subscription this proxy's membership comes
+            from has failed, checked before the balancer sees the task.
+            Reporting no workers would name the consequence of a lost
+            namespace and leave its cause to be guessed. See
+            `WorkerProxy`.
         :raises asyncio.TimeoutError:
             If the quorum wait fires during a lazy first dispatch. An
             exceeded per-attempt ``timeout`` does not surface here; the
@@ -1130,6 +1149,16 @@ class WorkerProxy:
                     await self.start()
                 elif self._state is not _Lifecycle.STARTED:
                     raise RuntimeError(self._state.value)
+
+        # Raised before either balancer sees the task, because a proxy
+        # whose sentinel died has no membership anyone can trust: the
+        # balancer would report the workers it happens to still hold, or
+        # none, and a caller would be told there are no workers rather
+        # than why. This is the one point both balancer kinds pass
+        # through — the dispatching kind is handed the context whole and
+        # picks a worker out of this proxy's sight.
+        if self._sentinel_failure is not None:
+            raise self._sentinel_failure
 
         assert self._loadbalancer_context is not None
         # Balancer kind was resolved in start(); branch on the cached flag
@@ -1391,10 +1420,20 @@ class WorkerProxy:
         to gate this call on ``self._quorum`` being a positive
         integer; calling with ``quorum`` of ``None`` or ``0`` will
         loop forever.
+
+        A sentinel that died is what the quorum will never arrive
+        because of, so its failure is raised here rather than waited
+        out: the wait is bounded by ``quorum_timeout``, and reporting
+        that timeout would name the symptom and discard the cause.
+
+        :raises BaseException:
+            Whatever killed the sentinel, if anything did.
         """
         assert self._quorum is not None and self._quorum > 0
         assert self._workers_changed is not None
         while True:
+            if self._sentinel_failure is not None:
+                raise self._sentinel_failure
             if (
                 self._loadbalancer_context
                 and len(self._loadbalancer_context.workers) >= self._quorum
@@ -1402,6 +1441,32 @@ class WorkerProxy:
                 return
             await self._workers_changed.wait()
             self._workers_changed.clear()
+
+    def _on_sentinel_done(self, task: asyncio.Task[None]) -> None:
+        """Hold the sentinel's failure and wake whoever is waiting on it.
+
+        The sentinel is detached, so nothing observes its death on its
+        own. Holding the exception lets the next caller raise the cause
+        — a discovery subscription whose namespace lost its owner, say
+        — instead of a symptom.
+
+        Waking `_workers_changed` is the load-bearing half. Every setter
+        of that event is on a path the sentinel owns, so a caller parked
+        in `_await_workers` would otherwise wait out the whole quorum
+        timeout for an event that can no longer be set, and report that
+        timeout rather than what actually happened.
+
+        :param task:
+            The finished sentinel task.
+        """
+        if task.cancelled():
+            return
+        failure = task.exception()
+        if failure is None:
+            return
+        self._sentinel_failure = failure
+        if self._workers_changed is not None:
+            self._workers_changed.set()
 
     async def _cancel_sentinel(self) -> None:
         """Cancel the worker sentinel task, if any, and await its exit."""
@@ -1456,6 +1521,10 @@ class WorkerProxy:
         self._handshake_throttle = None
         self._loadbalancer_service = None
         self._workers_changed = None
+        # Cleared last, after `_cancel_sentinel` has had its chance to
+        # re-raise: a proxy reset to NEW can be started again, and the
+        # failure belongs to the run that is ending, not the next one.
+        self._sentinel_failure = None
 
     async def _evict(
         self,

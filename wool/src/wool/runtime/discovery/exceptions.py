@@ -27,8 +27,8 @@ class DiscoveryCapacityExhausted(WoolError):
     are registered, publishing another raises this.
 
     The condition is transient and namespace-wide. Dropping a worker
-    frees a slot, so a retry can succeed. The capacity is fixed for the
-    registry's lifetime.
+    frees a slot, so a retry can succeed. The ceiling itself does not
+    grow.
 
     :param capacity:
         The number of worker slots the namespace's owner stamped into
@@ -48,14 +48,17 @@ class DiscoveryCapacityExhausted(WoolError):
 class DiscoveryBlockExhausted(WoolError):
     """Raised when serialized worker metadata exceeds its block.
 
-    A worker's metadata lives in a fixed-size shared-memory block created
+    A worker's metadata lives in a fixed-size block file created
     at its first registration (`LocalDiscovery`'s ``block_size``). A
     publish whose serialized metadata does not fit that block raises this,
     leaving the prior registration intact.
 
     The condition is permanent and per-worker: a retry with the same
-    metadata fails. Shrink the metadata, or re-register the worker under
-    a larger ``block_size``.
+    metadata fails. Shrink the metadata. A block's size is fixed at the
+    worker's first registration and a re-registration writes into that
+    same block, so publishing again through a publisher configured with
+    a larger ``block_size`` does not enlarge it; see
+    `LocalDiscovery.Publisher.publish`.
 
     :param size:
         The attempted payload size in bytes, when known.
@@ -92,42 +95,37 @@ class DiscoveryWorkerNotFound(WoolError):
 
 # public
 class DiscoveryNamespaceInUse(WoolError):
-    """Raised when claiming a namespace whose registry already exists.
+    """Raised when claiming a namespace another process still holds.
 
-    The registry belongs to a live owner or persists from a killed one;
-    see `LocalDiscovery`.
+    A namespace is in use while any process holding its claim lives. That
+    is the owner's process, and anything forked from it after entry; see
+    `LocalDiscovery` for the ownership contract and what ends a claim.
 
     :param namespace:
         The namespace whose claim was rejected, when known.
-    :param segment:
-        Name of the shared-memory segment backing the existing registry,
-        when known. Remove it only once no live process owns the
-        namespace; removing a live owner's segment lets a second owner
-        claim the namespace.
     """
 
-    def __init__(self, namespace: str | None = None, segment: str | None = None):
+    def __init__(self, namespace: str | None = None):
         self.namespace = namespace
-        self.segment = segment
-        super().__init__(namespace, segment)
+        super().__init__(namespace)
 
     def __str__(self) -> str:
         detail = "" if self.namespace is None else f" {self.namespace!r}"
-        hint = (
-            ""
-            if self.segment is None
-            else f"; if no live process owns it, remove shared memory {self.segment!r}"
-        )
-        return f"Discovery namespace{detail} is already in use{hint}"
+        return f"Discovery namespace{detail} is already in use"
 
 
 # public
 class DiscoveryNamespaceNotFound(WoolError):
-    """Raised when a borrower binds a namespace that has no registry.
+    """Raised when a namespace has no live owner to borrow from.
 
-    No owner has created the registry yet, or its owner has exited and
-    reclaimed it. See `LocalDiscovery` for the borrowing and orphaning
-    contract.
+    Raised at a bind where no owner has created the namespace yet, and
+    again at any later operation by a borrower whose owner has since
+    gone: a binding ends with the owner it was made against, so a
+    publisher's next publish and a subscriber's next scan both fail
+    rather than reaching a successor or serving what they last read.
+    This holds whether that owner exited or was killed outright. A
+    borrower that wants to follow the namespace re-binds after this
+    error. See `LocalDiscovery` for the ownership contract.
 
     :param namespace:
         The namespace whose registry was not found, when known.

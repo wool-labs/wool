@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from hypothesis import strategies as st
 
 from tests.helpers import LOOPBACK_SANS
 from tests.helpers import generate_ca_and_leaf
+from tests.helpers import namespace_directory
 from wool.runtime.context.runtime import dispatch_timeout
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.discovery.base import DiscoveryLike
@@ -543,12 +545,12 @@ async def build_pool_from_scenario(
                 discovery_obj = LocalDiscovery(namespace)
             case DiscoveryFactory.LOCAL_CAPACITY_BOUNDED:
                 # A sub-page capacity (4 slots) that still admits the
-                # single HYBRID worker — exercises the sized segment and
+                # single HYBRID worker — exercises the sized registry and
                 # capacity-bounded publish/subscribe scans end-to-end.
                 discovery_obj = LocalDiscovery(namespace, capacity=4)
             case DiscoveryFactory.LOCAL_CAPACITY_EXACT:
                 # Capacity exactly equal to the single HYBRID-spawned
-                # worker: the segment is completely full the moment that
+                # worker: the registry is completely full the moment that
                 # worker announces, yet still admits it and dispatches —
                 # the tightest end-to-end bound satisfying the
                 # dispatch-success oracle.
@@ -1530,7 +1532,7 @@ PAIRWISE_SCENARIOS = [
 _STARVED_PAIRS = (
     # Two owning supply forms and both capacity members, which the
     # generated array omits under HYBRID. The two capacity members size
-    # the segment the owner stamps: a sub-page cap, and a cap exactly
+    # the registry the owner stamps: a small cap, and a cap exactly
     # equal to the single spawned worker, which leaves it completely
     # full yet dispatching.
     (PoolMode.HYBRID, DiscoveryFactory.LOCAL_DIRECT),
@@ -2049,3 +2051,28 @@ def release_subprocess(proc: subprocess.Popen | None) -> None:
         if stream is not None:
             with suppress(Exception):
                 stream.close()
+
+
+@pytest.fixture
+def namespaces():
+    """Mint discovery namespaces and remove their directories afterwards.
+
+    A namespace whose owner is killed keeps its directory by contract —
+    nothing survives a SIGKILL to reclaim it — so every test that kills
+    an owner leaves one behind. Minting through here keeps the
+    descriptive prefix a failure message needs while making the cleanup
+    one decision rather than one per test. It removes directories only;
+    the residue *assertions* stay in the tests that make them, since a
+    fixture asserting them would mask the leaks they pin.
+    """
+    minted: list[str] = []
+
+    def mint(prefix: str) -> str:
+        namespace = f"{prefix}-{uuid.uuid4().hex[:12]}"
+        minted.append(namespace)
+        return namespace
+
+    yield mint
+
+    for namespace in minted:
+        shutil.rmtree(namespace_directory(namespace), ignore_errors=True)

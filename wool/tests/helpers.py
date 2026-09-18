@@ -1,11 +1,15 @@
 import asyncio
 import datetime
 import ipaddress
+import os
+import sys
+import tempfile
 import uuid
 from collections.abc import Callable
 from collections.abc import Coroutine
 from collections.abc import Generator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 from typing import NamedTuple
 
@@ -56,6 +60,66 @@ class CertificateFiles(NamedTuple):
     ca_pem: bytes
     key_pem: bytes
     cert_pem: bytes
+
+
+def discovery_root() -> Path:
+    """Return the directory every `wool.LocalDiscovery` namespace lives under.
+
+    Mirrors the module's own choice between the two candidate roots —
+    ``/dev/shm`` where Linux provides it, the temporary directory
+    otherwise — rather than reaching into the module to ask.
+    """
+    shm = Path("/dev/shm")
+    if sys.platform.startswith("linux") and os.access(shm, os.W_OK | os.X_OK):
+        return shm.resolve() / "wool"
+    return Path(tempfile.gettempdir()).resolve() / "wool"
+
+
+def namespace_directory(namespace: str) -> Path:
+    """Return the directory a `wool.LocalDiscovery` namespace is claimed in.
+
+    This is the directory an owner locks, and it outlives any one owner:
+    it holds the ``current`` pointer and the generation that pointer
+    names. It is *not* where the registry lives — see
+    `generation_directory`.
+    """
+    return discovery_root() / namespace
+
+
+def generation_directory(namespace: str) -> Path:
+    """Return the directory holding the files a namespace's live owner owns.
+
+    Resolves the ``current`` pointer the way a borrower does, so a test
+    naming a registry, a notify file or a block names the one the owner
+    that is live right now published.
+    """
+    directory = namespace_directory(namespace)
+    return directory / os.readlink(directory / "current")
+
+
+def registry_path(namespace: str) -> Path:
+    """Return the path of a `wool.LocalDiscovery` namespace's registry.
+
+    Named here rather than spelled out at each call site, so a test that
+    needs the file an owner publishes and a publisher locks says which
+    file it means without spreading the name.
+    """
+    return generation_directory(namespace) / "registry"
+
+
+def notify_path(namespace: str) -> Path:
+    """Return the path of the file a namespace's subscribers watch."""
+    return generation_directory(namespace) / "notify"
+
+
+def blocks_directory(namespace: str) -> Path:
+    """Return the directory holding a namespace's worker metadata blocks."""
+    return generation_directory(namespace) / "blocks"
+
+
+def block_path(namespace: str, uid: uuid.UUID) -> Path:
+    """Return the path of the block holding a worker's metadata."""
+    return blocks_directory(namespace) / uid.hex
 
 
 def plant(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:

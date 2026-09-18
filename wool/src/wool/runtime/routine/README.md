@@ -51,8 +51,7 @@ Wool provides task lifecycle hooks in the form of events that can be intercepted
 
 ```python
 @wool.TaskEvent.handler("task-created", "task-completed")
-def on_task(event: wool.TaskEvent, timestamp: int, context=None) -> None:
-    ...
+def on_task(event: wool.TaskEvent, timestamp: int, context=None) -> None: ...
 ```
 
 `TaskEventType` defines the valid event type literals:

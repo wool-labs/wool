@@ -1,6 +1,5 @@
 import asyncio
 import datetime
-import multiprocessing.shared_memory
 import threading
 import time
 import uuid
@@ -476,19 +475,6 @@ def mock_discovery_service():
         MockDiscoveryService instance (not started)
     """
     return MockDiscoveryService()
-
-
-@pytest.fixture
-def mock_shared_memory(mocker: MockerFixture):
-    """Mock SharedMemory for isolation from multiprocessing resources."""
-    mock_memory = mocker.MagicMock()
-    mock_memory.buf = bytearray(1024)
-    mock_memory.close = mocker.MagicMock()
-    mock_memory.unlink = mocker.MagicMock()
-    mocker.patch.object(
-        multiprocessing.shared_memory, "SharedMemory", return_value=mock_memory
-    )
-    return mock_memory
 
 
 @pytest.fixture
