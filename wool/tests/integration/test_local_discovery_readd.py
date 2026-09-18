@@ -48,6 +48,9 @@ async def main():
 
 
 asyncio.run(main())
+# Printed after the publisher's teardown has run, so a test that waits
+# for this line knows the exit it is asserting about actually happened.
+print("clean-exit", flush=True)
 """
 
 
@@ -136,13 +139,14 @@ class TestCrossProcessReadd:
         Given:
             A worker published in the test process and re-announced at a
             bumped version by an independent subprocess that has since
-            exited while the worker remains registered
+            run its own teardown and exited, while the worker remains
+            registered
         When:
             A subscriber in the test process then iterates the namespace
         Then:
             It should discover the worker at the bumped version — the
-            exited re-announcer must not have removed the live metadata
-            block it only refreshed.
+            re-announcer's teardown must not have removed the live
+            metadata block it only refreshed.
         """
         # Arrange
         namespace = f"readd-exit-{uuid.uuid4().hex[:12]}"
@@ -169,9 +173,13 @@ class TestCrossProcessReadd:
                 async with publisher:
                     await publisher.publish("worker-added", worker)
 
-                    # Act — the re-announcer exits while the worker is
-                    # still registered, so its teardown runs against a
-                    # block another publisher owns.
+                    # Act — the re-announcer runs its own teardown while
+                    # the worker is still registered, so that teardown
+                    # runs against a block another publisher owns. It is
+                    # released over stdin rather than killed: a killed
+                    # interpreter runs no teardown at all, so nothing it
+                    # did could remove anything and the assertion below
+                    # would hold however the refresh path behaved.
                     proc = spawn_script_subprocess(
                         _READD_SCRIPT,
                         namespace,
@@ -179,19 +187,27 @@ class TestCrossProcessReadd:
                         "2.0",
                         ready_line="ready",
                     )
-                    release_subprocess(proc)
-                    await asyncio.sleep(0.3)
-
-                    # Assert
-                    subscriber = discovery.subscribe(poll_interval=0.05)
-                    task = asyncio.create_task(collect(subscriber))
                     try:
-                        await asyncio.wait_for(refreshed_seen.wait(), timeout=10)
-                    except asyncio.TimeoutError:
-                        pytest.fail("Worker lost after re-announcer exit")
-                    finally:
-                        task.cancel()
+                        assert proc.stdin is not None
+                        proc.stdin.write("\n")
+                        proc.stdin.flush()
+                        assert proc.stdout is not None
+                        exited = await asyncio.to_thread(proc.stdout.readline)
+                        assert exited.strip() == "clean-exit", exited
+                        assert proc.wait(timeout=_TIMEOUT) == 0
+
+                        # Assert
+                        subscriber = discovery.subscribe(poll_interval=0.05)
+                        task = asyncio.create_task(collect(subscriber))
                         try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+                            await asyncio.wait_for(refreshed_seen.wait(), timeout=10)
+                        except asyncio.TimeoutError:
+                            pytest.fail("Worker lost after re-announcer exit")
+                        finally:
+                            task.cancel()
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                pass
+                    finally:
+                        release_subprocess(proc)

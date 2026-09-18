@@ -59,9 +59,15 @@ class TestLocalDiscoveryCapacity:
                         pass
 
             leaves = list(_iter_leaf_exceptions(excinfo.value))
-            assert any(
-                isinstance(leaf, DiscoveryCapacityExhausted) for leaf in leaves
-            ), f"expected a DiscoveryCapacityExhausted, got: {leaves!r}"
+            # The reported cap is the 1 this interpreter stamped into the
+            # registry, so a separately spawned worker process is shown to
+            # have read that header rather than some default of its own.
+            refusals = [
+                leaf
+                for leaf in leaves
+                if isinstance(leaf, DiscoveryCapacityExhausted) and leaf.capacity == 1
+            ]
+            assert refusals, f"expected a DiscoveryCapacityExhausted, got: {leaves!r}"
 
             # Join finished children so an exited worker is not listed as
             # active.
@@ -154,8 +160,12 @@ class TestLocalDiscoveryCapacity:
                     # Act & assert — the sole slot is taken by the
                     # owner's own worker
                     async with LocalDiscovery.Publisher(namespace) as borrower:
-                        with pytest.raises(DiscoveryCapacityExhausted):
+                        with pytest.raises(DiscoveryCapacityExhausted) as excinfo:
                             await borrower.publish("worker-added", intruder)
+                        # The cap it reports is the owner's stamp, which
+                        # ties the rejection to that stamp rather than to
+                        # some other bound the borrower fell back on.
+                        assert excinfo.value.capacity == 1
 
         try:
             await retry_grpc_internal(body)

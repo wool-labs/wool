@@ -34,6 +34,7 @@ wherever the owner is in place before the holder runs.
 import asyncio
 import logging
 import multiprocessing
+import threading
 import time
 import uuid
 
@@ -87,9 +88,26 @@ asyncio.run(main())
 
 
 def _locked(holder, timeout=_TIMEOUT):
-    """Wait for a spawned `_HOLDER_SCRIPT` to report that it holds the lock."""
+    """Wait for a spawned `_HOLDER_SCRIPT` to report that it holds the lock.
+
+    Reads on a thread the way `spawn_script_subprocess` does, so a holder
+    that never reports fails here within ``timeout`` instead of wedging
+    the run on a blocking read that nothing bounds.
+    """
     assert holder.stdout is not None
-    line = holder.stdout.readline().strip()
+    lines: list[str] = []
+
+    def read():
+        try:
+            lines.append(holder.stdout.readline().strip())
+        except (ValueError, OSError):
+            pass  # stdout closed during teardown
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    reader.join(timeout)
+    assert not reader.is_alive(), f"holder did not report a lock within {timeout}s"
+    line = lines[0] if lines else ""
     assert line == "locked", f"holder failed to take the lock: {line!r}"
 
 
@@ -222,6 +240,11 @@ class TestPoolTeardownLockTimeout:
             for record in announce_failures:
                 assert record.exc_info is not None
                 assert isinstance(record.exc_info[1], TimeoutError)
+                # Only lock acquisition names the discovery lock and the
+                # namespace, so any other timeout reaching this same log
+                # site can no longer satisfy the oracle.
+                assert "discovery lock" in str(record.exc_info[1])
+                assert repr(namespace) in str(record.exc_info[1])
             # The publish TimeoutError is logged as an announcement failure
             # and never as a worker that would not stop.
             assert not any(
@@ -250,7 +273,8 @@ class TestPoolEntryLockTimeout:
             announcement contends it
         Then:
             It should abort entry with an ExceptionGroup carrying a
-            TimeoutError and leave no worker process alive.
+            TimeoutError that names the contended discovery lock, and
+            leave no worker process alive.
         """
         # Arrange — the holder cannot take the lock before the pool
         # creates the registry, so it is already running and polling when
@@ -271,9 +295,21 @@ class TestPoolEntryLockTimeout:
                         pass
 
             leaves = list(_iter_leaf_exceptions(excinfo.value))
-            assert any(isinstance(leaf, TimeoutError) for leaf in leaves), (
-                f"expected a TimeoutError, got: {leaves!r}"
-            )
+            # Named, not merely typed: entry has other waits that can
+            # time out, and only the discovery lock's message carries
+            # the lock and the namespace.
+            wedged = [
+                leaf
+                for leaf in leaves
+                if isinstance(leaf, TimeoutError)
+                and "discovery lock" in str(leaf)
+                and repr(namespace) in str(leaf)
+            ]
+            assert wedged, f"expected a contended discovery lock, got: {leaves!r}"
+            # The holder won the race it had to win for this test to mean
+            # anything, so a lost race reports itself rather than looking
+            # like the regression this test is here to catch.
+            await asyncio.to_thread(_locked, holder)
 
             # Join finished children so an exited-but-unreaped worker cannot
             # masquerade as alive.
