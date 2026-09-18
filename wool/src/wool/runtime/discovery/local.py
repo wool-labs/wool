@@ -254,8 +254,11 @@ class _File:
             True while the path resolves to the open file.
         """
         try:
-            return os.path.samestat(os.fstat(self.file.fileno()), os.stat(self.path))
-        except FileNotFoundError:
+            return _same_file(self.file.fileno(), self.path)
+        except OSError:
+            # Any answer the filesystem cannot give is stale enough: a
+            # path that no longer resolves, or resolves through something
+            # that is not a directory, does not name this file.
             return False
 
     def read(self, size: int, offset: int) -> bytes:
@@ -483,14 +486,18 @@ class LocalDiscovery(Discovery):
             try:
                 fcntl.flock(self._claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 # See the directory re-check in the implementation notes.
-                if os.path.samestat(os.fstat(self._claim), os.stat(directory)):
+                if _same_file(self._claim, directory):
                     self._stage(directory)
                     break
             except BlockingIOError as error:
                 os.close(self._claim)
                 raise DiscoveryNamespaceInUse(self._namespace) from error
-            except FileNotFoundError:
-                # The directory was removed after it was opened.
+            except (FileNotFoundError, NotADirectoryError):
+                # The directory was removed, or replaced by something
+                # that is not a directory, after it was opened. Both are
+                # progress by another process, so the claim is retried;
+                # every other error reaches the caller rather than
+                # spinning this loop, which has no timeout and no sleep.
                 pass
             except BaseException:
                 self._release()
@@ -619,8 +626,10 @@ class LocalDiscovery(Discovery):
         # The name is all `rmdir` has, so it is removed only while the
         # path still resolves to the claimed directory.
         try:
-            claimed = os.path.samestat(os.fstat(self._claim), os.stat(directory))
+            claimed = _same_file(self._claim, directory)
         except OSError:
+            # Exiting never raises, and a directory this claim may no
+            # longer hold is not this owner's to remove.
             claimed = False
         if claimed:
             _rmdir_quietly(directory)
@@ -1144,6 +1153,27 @@ class LocalDiscovery(Discovery):
                     "worker-updated", metadata=discovered_workers[uid]
                 )
                 yield event
+
+
+def _same_file(fd: int, path: Path) -> bool:
+    """Return whether ``path`` still names the file ``fd`` holds open.
+
+    Three call sites ask this question and each wants a different answer
+    when it cannot be asked at all — a reclaimed handle reports itself
+    stale, a claim loop retries, and teardown declines to remove what it
+    may no longer own — so this returns only the comparison and lets
+    every error reach the caller that has a policy for it.
+
+    :param fd:
+        An open descriptor on the file to compare against.
+    :param path:
+        The path whose current target to compare.
+    :returns:
+        True while ``path`` resolves to the file ``fd`` holds.
+    :raises OSError:
+        If ``path`` cannot be stated.
+    """
+    return os.path.samestat(os.fstat(fd), os.stat(path))
 
 
 def _validate_block_size(block_size: int) -> None:
