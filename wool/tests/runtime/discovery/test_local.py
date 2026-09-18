@@ -6,12 +6,15 @@ import pickle
 import re
 import shutil
 import struct
+import subprocess
+import sys
 import uuid
 import warnings
 from collections import Counter
 from contextlib import AsyncExitStack
 from contextlib import ExitStack
 from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
 from types import SimpleNamespace
@@ -26,6 +29,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from watchdog.observers import Observer
 
+from tests.helpers import discovery_root
 from tests.helpers import namespace_directory
 from tests.helpers import notify_path
 from tests.helpers import registry_path
@@ -171,6 +175,25 @@ async def borrowed_publisher(namespace, metadata, atexit_recorder):
 
 
 @pytest.fixture
+def block_releases(mocker):
+    """Records the name of every block a publisher releases, in order.
+
+    Wraps the block pool's finalizer, which is the one place a block's
+    handle is given up, so a test can say *when* a handle was released
+    rather than only that it no longer holds one.
+    """
+    released: list[str] = []
+    finalizer = LocalDiscovery.Publisher._block_finalizer
+
+    def record(self, block):
+        released.append(block.path.name)
+        return finalizer(self, block)
+
+    mocker.patch.object(LocalDiscovery.Publisher, "_block_finalizer", record)
+    return released
+
+
+@pytest.fixture
 def unlink_schedule(mocker, namespace, teardown_log):
     """Patches file removal with a schedule-driven wrapper and returns
     the schedule list. Each removal is logged to `teardown_log`.
@@ -178,10 +201,11 @@ def unlink_schedule(mocker, namespace, teardown_log):
     Only removals inside this test's namespace are wrapped, so unrelated
     removals anywhere in the interpreter pass straight through. A test
     deriving per-example namespaces from this one is covered too, since
-    the scope is every directory whose name carries the namespace.
-    Removals the owner resolves against its claim descriptor name no
-    directory at all, so that descriptor is matched against the
-    directories it could be holding.
+    the scope is every namespace directory whose name carries this one.
+    Removals the owner resolves against a descriptor name no directory at
+    all, so that descriptor is matched against every directory it could
+    be holding — the namespace's own, a generation's, or a generation's
+    block directory, since teardown descends all three.
 
     Each wrapped call performs the real removal — so no file leaks — then
     consumes one schedule entry and raises it when the entry is an
@@ -194,17 +218,40 @@ def unlink_schedule(mocker, namespace, teardown_log):
     """
     schedule: list[Exception | None] = []
     real_unlink = os.unlink
-    root = namespace_directory(namespace).parent
-    prefix = f"wool-{namespace}"
+    root = discovery_root()
+    prefix = namespace
+
+    def namespaces():
+        """Every namespace directory this test's removals may target."""
+        try:
+            return list(root.glob(f"{prefix}*"))
+        except OSError:
+            return []
+
+    def directories():
+        """Those namespaces and every directory beneath them."""
+        for candidate in namespaces():
+            yield candidate
+            try:
+                children = list(candidate.rglob("*"))
+            except OSError:
+                continue
+            for child in children:
+                if child.is_dir():
+                    yield child
 
     def scoped(path, dir_fd):
         if dir_fd is None:
-            return Path(path).parent.name.startswith(prefix)
+            try:
+                relative = Path(path).relative_to(root)
+            except ValueError:
+                return False
+            return bool(relative.parts) and relative.parts[0].startswith(prefix)
         try:
             holder = os.fstat(dir_fd)
         except OSError:
             return False
-        for candidate in root.glob(f"{prefix}*"):
+        for candidate in directories():
             try:
                 if os.path.samestat(holder, os.stat(candidate)):
                     return True
@@ -306,6 +353,59 @@ def _rejected_claim_is_raised(namespace):
             return False
     except DiscoveryNamespaceInUse:
         return True
+
+
+#: Own a namespace in an independent interpreter until killed, so a test
+#: can take an owner away without any teardown of its own running — the
+#: only way to reach the state a `SIGKILL` leaves behind.
+_KILLED_OWNER_SCRIPT = """
+import sys
+import time
+
+from wool.runtime.discovery.local import LocalDiscovery
+
+with LocalDiscovery(sys.argv[1], capacity=int(sys.argv[2])):
+    print("ready", flush=True)
+    time.sleep(300)
+"""
+
+
+@pytest.fixture
+def killed_owner(namespace):
+    """Runs an owner in an independent interpreter and kills it on exit.
+
+    A killed owner strands its generation by contract, which is the
+    state these tests need; this removes it once the test ends, so the
+    residue a killed owner leaves on purpose is not counted as a leak by
+    whatever looks at the root next.
+    """
+    stranded: set[str] = set()
+
+    @contextmanager
+    def owner(capacity=4):
+        stranded.add(namespace)
+        process = subprocess.Popen(
+            [sys.executable, "-c", _KILLED_OWNER_SCRIPT, namespace, str(capacity)],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert process.stdout is not None
+            assert process.stdout.readline().strip() == "ready", "owner never claimed"
+            yield process
+        finally:
+            process.kill()
+            process.wait(timeout=30)
+
+    yield owner
+    for name in stranded:
+        shutil.rmtree(namespace_directory(name), ignore_errors=True)
+
+
+async def _collect_into(subscriber, events):
+    """Append every event a subscriber yields to ``events``, until cancelled."""
+    async for event in subscriber:
+        events.append(event)
 
 
 def _borrower_binds(namespace):
