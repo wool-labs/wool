@@ -699,7 +699,6 @@ class LocalDiscovery(Discovery):
         _cleanups: dict[str, Callable]
         _lock_timeout: float | None
         _namespace: Final[str]
-        _registry: _File | None
 
         #: Registry announcements are only discoverable on a common
         #: host, so this publisher prescribes the loopback bind.
@@ -721,7 +720,6 @@ class LocalDiscovery(Discovery):
             self._block_size = block_size
             self._lock_timeout = lock_timeout
             self._cleanups = {}
-            self._registry = None
             # The block each published worker holds, keyed by its ref;
             # a drop exits the handle and the exit closes the rest.
             self._blocks = {}
@@ -741,8 +739,11 @@ class LocalDiscovery(Discovery):
             :raises DiscoveryNamespaceNotFound:
                 If the namespace has no registry.
             """
-            # Bind first, so a bind that raises leaves no pool entered.
-            self._bind()
+            # Probe first, so a missing registry leaves no pool entered.
+            # The handle is not retained: each publish opens its own, so
+            # the descriptor it locks is the descriptor it writes.
+            with closing(_open_registry(self._namespace)):
+                pass
             await self._block_pool.__aenter__()
             return self
 
@@ -752,8 +753,7 @@ class LocalDiscovery(Discovery):
             The first close that fails is the one that propagates; a
             later block's failure is discarded, so one bad handle cannot
             hide the others or stop them being released. The block pool
-            is exited regardless, and its own failure supersedes. The
-            registry this publisher bound is released either way.
+            is exited regardless, and its own failure supersedes.
 
             :param args:
                 The exception info the block is exiting with, forwarded
@@ -761,21 +761,16 @@ class LocalDiscovery(Discovery):
             """
             failure: BaseException | None = None
             try:
-                try:
-                    for ref in list(self._blocks):
-                        try:
-                            await self._blocks.pop(ref).aclose()
-                        except BaseException as error:
-                            if failure is None:
-                                failure = error
-                    if failure is not None:
-                        raise failure
-                finally:
-                    await self._block_pool.__aexit__(*args)
+                for ref in list(self._blocks):
+                    try:
+                        await self._blocks.pop(ref).aclose()
+                    except BaseException as error:
+                        if failure is None:
+                            failure = error
+                if failure is not None:
+                    raise failure
             finally:
-                if self._registry is not None:
-                    self._registry.close()
-                    self._registry = None
+                await self._block_pool.__aexit__(*args)
 
         @property
         def namespace(self):
@@ -830,23 +825,25 @@ class LocalDiscovery(Discovery):
             :raises DiscoveryNamespaceNotFound:
                 If the namespace has no registry; see `LocalDiscovery`.
             """
-            registry = self._bind()
-            async with _lock(
-                registry, namespace=self._namespace, timeout=self._lock_timeout
-            ):
-                if _read_capacity(registry) is None:  # pragma: no cover
-                    raise RuntimeError("Registrar service not properly initialized")
-                match type:
-                    case "worker-added":
-                        await self._add(metadata, registry)
-                    case "worker-dropped":
-                        await self._drop(metadata, registry)
-                    case "worker-updated":
-                        await self._update(metadata, registry)
-                    case _:
-                        raise RuntimeError(f"Unexpected discovery event type: {type}")
+            with closing(_open_registry(self._namespace)) as registry:
+                async with _lock(
+                    registry, namespace=self._namespace, timeout=self._lock_timeout
+                ):
+                    if _read_capacity(registry) is None:  # pragma: no cover
+                        raise RuntimeError("Registrar service not properly initialized")
+                    match type:
+                        case "worker-added":
+                            await self._add(metadata, registry)
+                        case "worker-dropped":
+                            await self._drop(metadata, registry)
+                        case "worker-updated":
+                            await self._update(metadata, registry)
+                        case _:
+                            raise RuntimeError(
+                                f"Unexpected discovery event type: {type}"
+                            )
 
-                _notify(self._namespace)
+                    _notify(self._namespace)
 
         async def _add(self, metadata: WorkerMetadata, registry: _File):
             """Register a worker, or refresh one already registered.
@@ -955,28 +952,6 @@ class LocalDiscovery(Discovery):
                     return
 
             raise DiscoveryWorkerNotFound(metadata.uid)
-
-        def _bind(self) -> _File:
-            """Return this publisher's registry, rebinding it when stale.
-
-            A publisher holds the registry it bound, so a publish costs
-            no reopen, and re-checks it on each bind: a registry its owner
-            has reclaimed is released here, and a successor owner's
-            registry is bound in its place. See `LocalDiscovery` for the
-            borrowing and orphaning contract.
-
-            :returns:
-                The open registry.
-            :raises DiscoveryNamespaceNotFound:
-                If the namespace has no registry.
-            """
-            if self._registry is not None:
-                if self._registry.current():
-                    return self._registry
-                self._registry.close()
-                self._registry = None
-            self._registry = _open_registry(self._namespace)
-            return self._registry
 
         def _block_factory(self, name: str) -> _File:
             """Create a worker's metadata block in the namespace's directory.
