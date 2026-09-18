@@ -813,7 +813,9 @@ class LocalDiscovery(Discovery):
                 For ``worker-added``, if the registry is already at
                 capacity and the worker is not already registered.
             :raises DiscoveryWorkerNotFound:
-                For ``worker-updated``, if the worker is not registered.
+                For ``worker-updated``, if the worker is not registered,
+                or if its registration names a block that has since been
+                reclaimed, which leaves nothing to update in place.
             :raises DiscoveryBlockExhausted:
                 For ``worker-added`` and ``worker-updated``, if the
                 serialized metadata exceeds the worker's block, which is
@@ -857,6 +859,12 @@ class LocalDiscovery(Discovery):
             registration that displaces one closes it first: overwriting
             it would strand a pool reference nothing can drop until the
             publisher exits.
+
+            The block the pool hands back is re-checked against its
+            name. The pool returns a cached handle on a key hit, so a
+            block reclaimed underneath this publisher would otherwise be
+            written through an unlinked inode and its slot published
+            naming a file no reader can open.
 
             :param metadata:
                 The worker to publish to the namespace's registry.
@@ -902,6 +910,20 @@ class LocalDiscovery(Discovery):
                 block_file = await block.enter_async_context(
                     self._block_pool.get(str(ref))
                 )
+                if not block_file.current():
+                    # The pool handed back a cached handle on a block
+                    # that no longer bears this name. The ledger still
+                    # holds a reference to that entry, so the pool would
+                    # return the same stale handle again; drop the
+                    # ledger's reference first so the count reaches zero
+                    # and the factory recreates the block.
+                    await block.aclose()
+                    if (gone := self._blocks.pop(str(ref), None)) is not None:
+                        await gone.aclose()
+                    block = AsyncExitStack()
+                    block_file = await block.enter_async_context(
+                        self._block_pool.get(str(ref))
+                    )
                 _write_block(block_file, serialized)
                 registry.write(ref.bytes, free_offset)
             except Exception:
@@ -944,18 +966,28 @@ class LocalDiscovery(Discovery):
             and reaching blocks created by another publisher's pool — and
             rewrites it via `_write_block`.
 
+            An update has nothing to create: a slot whose block has been
+            reclaimed names a registration that exists in name only, so
+            it is reported as an unregistered worker rather than as a
+            missing file. Re-registering with ``worker-added`` is the
+            caller's route back, and it recreates the block.
+
             :param metadata:
                 The updated worker to publish to the namespace's registry.
             :raises DiscoveryWorkerNotFound:
-                If the worker is not registered.
+                If the worker is not registered, or its registration
+                names a block that has since been reclaimed.
             """
             target_ref = _WorkerReference(metadata.uid)
             serialized = metadata.to_protobuf().SerializeToString()
 
             for _, slot in _iter_slots(registry):
                 if slot == target_ref.bytes:
-                    with closing(_block(self._namespace, target_ref)) as block_file:
-                        _write_block(block_file, serialized)
+                    try:
+                        with closing(_block(self._namespace, target_ref)) as block_file:
+                            _write_block(block_file, serialized)
+                    except FileNotFoundError as error:
+                        raise DiscoveryWorkerNotFound(metadata.uid) from error
                     return
 
             raise DiscoveryWorkerNotFound(metadata.uid)

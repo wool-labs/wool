@@ -4197,6 +4197,51 @@ class TestLocalDiscoveryPublisher:
                 assert discovered == {("worker-added", metadata.uid)}
 
     @pytest.mark.asyncio
+    async def test_publish_should_recreate_the_block_when_it_publishes_to_a_successor(
+        self, namespace, metadata
+    ):
+        """Test a reclaimed block is recreated when publishing to a successor.
+
+        Given:
+            A publisher that registered a worker under one owner, whose
+            block was then unlinked, and whose owner has exited so a
+            successor owner now holds a freshly zeroed registry
+        When:
+            That publisher publishes "worker-added" for the worker again
+        Then:
+            It should recreate the block rather than write through the
+            handle it still holds on the unlinked file, so the slot it
+            claims names a file a subscriber can open.
+        """
+        # Arrange — the successor's registry has no matching slot, so the
+        # recovery path that repairs the same-registry case never fires
+        # and the pool would otherwise hand back its cached handle on the
+        # unlinked inode. Nothing later repairs it, so the dangling slot
+        # would last the worker's lifetime.
+        directory = namespace_directory(namespace)
+        owner = LocalDiscovery(namespace)
+        owner.__enter__()
+        async with LocalDiscovery.Publisher(namespace) as publisher:
+            before = set(directory.iterdir())
+            await publisher.publish("worker-added", metadata)
+            [block] = set(directory.iterdir()) - before
+            block.unlink()
+            owner.__exit__(None, None, None)
+
+            with LocalDiscovery(namespace) as successor:
+                # Act
+                await publisher.publish("worker-added", metadata)
+
+                # Assert
+                discovered = None
+                async with asyncio.timeout(10):
+                    async for event in successor.subscribe(poll_interval=0.05):
+                        discovered = event
+                        break
+                assert discovered is not None
+                assert discovered.metadata.uid == metadata.uid
+
+    @pytest.mark.asyncio
     async def test_publish_should_register_both_when_concurrent_on_one_publisher(
         self, namespace, metadata
     ):
