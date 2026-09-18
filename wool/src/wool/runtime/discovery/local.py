@@ -348,6 +348,13 @@ class LocalDiscovery(Discovery):
         Optional default predicate function to filter workers.
         Used by `subscriber` and as the default for `subscribe` when no
         explicit filter is provided.
+    :param poll_interval:
+        Optional default seconds between fallback rescans, used by
+        `subscriber` and as the default for `subscribe` when no explicit
+        interval is provided. ``None`` is a mode rather than an absence:
+        a subscription rescans only when a publisher writes. A value set
+        here therefore cannot be overridden back to ``None`` at the call
+        site, exactly as ``filter`` cannot. Defaults to ``None``.
     :param capacity:
         Maximum number of workers registered at once. The owner stamps
         it on entry and a borrower binds at the owner's capacity, so this
@@ -369,7 +376,8 @@ class LocalDiscovery(Discovery):
     :raises ValueError:
         If ``namespace`` does not name a single path component, if
         ``capacity`` is less than 1, if ``block_size`` does not exceed
-        the 4-byte length prefix, or if ``lock_timeout`` is negative.
+        the 4-byte length prefix, if ``poll_interval`` is not positive,
+        or if ``lock_timeout`` is negative.
 
     Example — publish workers:
 
@@ -450,12 +458,14 @@ class LocalDiscovery(Discovery):
 
     _filter: Final[PredicateFunction | None]
     _namespace: Final[str]
+    _poll_interval: Final[float | None]
 
     def __init__(
         self,
         namespace: str | None = None,
         *,
         filter: PredicateFunction | None = None,
+        poll_interval: float | None = None,
         capacity: int = 128,
         block_size: int = 1024,
         lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
@@ -463,6 +473,8 @@ class LocalDiscovery(Discovery):
         if capacity < 1:
             raise ValueError(f"Expected capacity of at least 1, got {capacity}")
         _validate_block_size(block_size)
+        if poll_interval is not None and poll_interval <= 0:
+            raise ValueError(f"Expected positive poll interval, got {poll_interval}")
         if lock_timeout is not None and lock_timeout < 0:
             raise ValueError("Lock timeout must be non-negative")
         if namespace is None:
@@ -470,6 +482,7 @@ class LocalDiscovery(Discovery):
         _validate_namespace(namespace)
         self._namespace = namespace
         self._filter = filter
+        self._poll_interval = poll_interval
         self._capacity = capacity
         self._block_size = block_size
         self._lock_timeout = lock_timeout
@@ -557,7 +570,7 @@ class LocalDiscovery(Discovery):
 
     @property
     def subscriber(self) -> DiscoverySubscriberLike:
-        """A subscriber using the constructor's default filter.
+        """A subscriber using the constructor's default filter and interval.
 
         :returns:
             A subscriber instance for receiving worker discovery
@@ -579,7 +592,9 @@ class LocalDiscovery(Discovery):
             events. Falls back to the constructor's filter if not
             provided.
         :param poll_interval:
-            See `LocalDiscovery.Subscriber`.
+            Optional seconds between fallback rescans. Falls back to the
+            constructor's interval if not provided; see
+            `LocalDiscovery.Subscriber`.
         :returns:
             A subscriber instance that receives filtered worker
             discovery events.
@@ -587,7 +602,9 @@ class LocalDiscovery(Discovery):
         effective = filter if filter is not None else self._filter
         subscriber = self.Subscriber(
             self._namespace,
-            poll_interval=poll_interval,
+            poll_interval=(
+                poll_interval if poll_interval is not None else self._poll_interval
+            ),
         )
         if effective is not None:
             return afilter(effective, subscriber)
@@ -1034,9 +1051,10 @@ class LocalDiscovery(Discovery):
             Part of the subscription key.
         :raises ValueError:
             If ``namespace`` is outside the domain `LocalDiscovery`
-            documents, or ``poll_interval`` is negative. Construction is
-            deferred, so both surface from the iteration that starts the
-            subscription rather than from the constructor.
+            documents, or ``poll_interval`` is not positive.
+            Construction is deferred, so both surface from the iteration
+            that starts the subscription rather than from the
+            constructor.
         """
 
         _namespace: Final[str]
@@ -1056,7 +1074,7 @@ class LocalDiscovery(Discovery):
         ):
             _validate_namespace(namespace)
             self._namespace = namespace
-            if poll_interval is not None and poll_interval < 0:
+            if poll_interval is not None and poll_interval <= 0:
                 raise ValueError(f"Expected positive poll interval, got {poll_interval}")
             self._poll_interval = poll_interval
 
