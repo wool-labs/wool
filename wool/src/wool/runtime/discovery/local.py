@@ -48,11 +48,11 @@ from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
 from wool.utilities.noreentry import noreentry
 
-REF_WIDTH: Final = 16
-NULL_REF: Final = b"\x00" * REF_WIDTH
 DEFAULT_LOCK_TIMEOUT: Final[float] = 30.0
+_REF_WIDTH: Final = 16
+_NULL_REF: Final = b"\x00" * _REF_WIDTH
 _HEADER_MAGIC: Final = b"WLD1"
-_HEADER_SIZE: Final = REF_WIDTH
+_HEADER_SIZE: Final = _REF_WIDTH
 _REGISTRY: Final = "registry"
 _STAGING: Final = "registry.tmp"
 _NOTIFY: Final = "notify"
@@ -590,8 +590,8 @@ class LocalDiscovery(Discovery):
         staging = directory / _STAGING
         descriptor = os.open(staging, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            # Truncation zero-fills, so every slot already reads as `NULL_REF`.
-            os.ftruncate(descriptor, _HEADER_SIZE + self._capacity * REF_WIDTH)
+            # Truncation zero-fills, so every slot already reads as `_NULL_REF`.
+            os.ftruncate(descriptor, _HEADER_SIZE + self._capacity * _REF_WIDTH)
             os.pwrite(descriptor, struct.pack("<4sI", _HEADER_MAGIC, self._capacity), 0)
         finally:
             os.close(descriptor)
@@ -819,7 +819,7 @@ class LocalDiscovery(Discovery):
                 if slot == ref.bytes:
                     match_offset = offset
                     break
-                if free_offset is None and slot == NULL_REF:
+                if free_offset is None and slot == _NULL_REF:
                     free_offset = offset
 
             if match_offset is not None:
@@ -829,7 +829,7 @@ class LocalDiscovery(Discovery):
                     return
                 except FileNotFoundError:
                     # Stale slot; see the re-add contract in `publish`.
-                    registry.write(NULL_REF, match_offset)
+                    registry.write(_NULL_REF, match_offset)
                     if free_offset is None:
                         free_offset = match_offset
 
@@ -869,7 +869,7 @@ class LocalDiscovery(Discovery):
 
             for offset, slot in _iter_slots(registry):
                 if slot == target_ref.bytes:
-                    registry.write(NULL_REF, offset)
+                    registry.write(_NULL_REF, offset)
                     break
             # Released outside the scan — see the docstring.
             block = self._blocks.pop(str(target_ref), None)
@@ -1052,7 +1052,7 @@ class LocalDiscovery(Discovery):
                             notification.clear()
                             discovered_workers: dict[str, WorkerMetadata] = {}
                             for _, slot in _iter_slots(registry):
-                                if slot != NULL_REF:
+                                if slot != _NULL_REF:
                                     ref = _WorkerReference.from_bytes(slot)
                                     metadata = self._deserialize_metadata(ref)
                                     discovered_workers[str(metadata.uid)] = metadata
@@ -1186,10 +1186,10 @@ def _iter_slots(registry: _File) -> Iterator[tuple[int, bytes]]:
     capacity = _read_capacity(registry)
     if capacity is None:  # pragma: no cover
         return
-    slots = registry.read(capacity * REF_WIDTH, _HEADER_SIZE)
+    slots = registry.read(capacity * _REF_WIDTH, _HEADER_SIZE)
     for index in range(capacity):
-        start = index * REF_WIDTH
-        yield _HEADER_SIZE + start, slots[start : start + REF_WIDTH]
+        start = index * _REF_WIDTH
+        yield _HEADER_SIZE + start, slots[start : start + _REF_WIDTH]
 
 
 def _write_block(block: _File, serialized: bytes) -> None:
