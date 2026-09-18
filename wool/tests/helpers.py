@@ -62,8 +62,8 @@ class CertificateFiles(NamedTuple):
     cert_pem: bytes
 
 
-def namespace_directory(namespace: str) -> Path:
-    """Return the directory a `wool.LocalDiscovery` namespace's files live in.
+def discovery_root() -> Path:
+    """Return the directory every `wool.LocalDiscovery` namespace lives under.
 
     Mirrors the module's own choice between the two candidate roots —
     ``/dev/shm`` where Linux provides it, the temporary directory
@@ -71,8 +71,30 @@ def namespace_directory(namespace: str) -> Path:
     """
     shm = Path("/dev/shm")
     if sys.platform.startswith("linux") and os.access(shm, os.W_OK | os.X_OK):
-        return shm.resolve() / f"wool-{namespace}"
-    return Path(tempfile.gettempdir()).resolve() / f"wool-{namespace}"
+        return shm.resolve() / "wool"
+    return Path(tempfile.gettempdir()).resolve() / "wool"
+
+
+def namespace_directory(namespace: str) -> Path:
+    """Return the directory a `wool.LocalDiscovery` namespace is claimed in.
+
+    This is the directory an owner locks, and it outlives any one owner:
+    it holds the ``current`` pointer and the generation that pointer
+    names. It is *not* where the registry lives — see
+    `generation_directory`.
+    """
+    return discovery_root() / namespace
+
+
+def generation_directory(namespace: str) -> Path:
+    """Return the directory holding the files a namespace's live owner owns.
+
+    Resolves the ``current`` pointer the way a borrower does, so a test
+    naming a registry, a notify file or a block names the one the owner
+    that is live right now published.
+    """
+    directory = namespace_directory(namespace)
+    return directory / os.readlink(directory / "current")
 
 
 def registry_path(namespace: str) -> Path:
@@ -82,12 +104,22 @@ def registry_path(namespace: str) -> Path:
     needs the file an owner publishes and a publisher locks says which
     file it means without spreading the name.
     """
-    return namespace_directory(namespace) / "registry"
+    return generation_directory(namespace) / "registry"
 
 
 def notify_path(namespace: str) -> Path:
     """Return the path of the file a namespace's subscribers watch."""
-    return namespace_directory(namespace) / "notify"
+    return generation_directory(namespace) / "notify"
+
+
+def blocks_directory(namespace: str) -> Path:
+    """Return the directory holding a namespace's worker metadata blocks."""
+    return generation_directory(namespace) / "blocks"
+
+
+def block_path(namespace: str, uid: uuid.UUID) -> Path:
+    """Return the path of the block holding a worker's metadata."""
+    return blocks_directory(namespace) / uid.hex
 
 
 def plant(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
