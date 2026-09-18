@@ -822,27 +822,36 @@ class TestPoolNamespaceOwnership:
         Given:
             A namespace no LocalDiscovery has entered
         When:
-            A durable WorkerPool borrowing it is entered eagerly with a
-            short quorum timeout
+            A durable WorkerPool borrowing it is entered eagerly, with a
+            quorum timeout far longer than the bind takes to fail
         Then:
             It should raise DiscoveryNamespaceNotFound naming the
-            namespace, and leave the namespace claimable afterwards.
+            namespace, well inside that timeout, and leave the namespace
+            claimable afterwards.
         """
         # Arrange
         namespace = f"pool-unowned-{uuid.uuid4().hex[:12]}"
+        quorum_timeout = 30.0
+        loop = asyncio.get_running_loop()
 
-        # Act & assert. The failure surfaces only when the quorum wait
-        # expires (#376), so a short quorum_timeout bounds the test.
+        # Act
+        started = loop.time()
         with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
             async with asyncio.timeout(_TIMEOUT):
                 async with WorkerPool(
                     discovery=LocalDiscovery.Subscriber(namespace),
                     lazy=False,
-                    quorum_timeout=2.0,
+                    quorum_timeout=quorum_timeout,
                 ):
                     pass
+        elapsed = loop.time() - started
 
+        # Assert
         assert excinfo.value.namespace == namespace
+        # The failure used to reach the caller only once the quorum wait
+        # expired, so a long timeout here is the oracle: passing by
+        # waiting it out is what this asserts against.
+        assert elapsed < quorum_timeout / 2, elapsed
 
         # Assert — the rejected borrow created nothing. Claiming the
         # namespace afterwards cannot show that on its own, since a claim
