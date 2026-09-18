@@ -2767,17 +2767,17 @@ class TestLocalDiscoveryPublisher:
         When:
             The worker is published again and then dropped
         Then:
-            It should pair the block's fallback registration with its
-            unregistration before the publisher exits, the reference
-            the reclaim took having been dropped when the re-add
-            displaced the handle holding it rather than at the end of
-            the publisher's life.
+            It should release the handle naming the vanished block as
+            the re-add displaces it, rather than at the end of the
+            publisher's life, and pair the fresh block's own fallback
+            registration with its unregistration at the drop.
         """
         # Arrange
         registered, unregistered = atexit_recorder
         directory = namespace_directory(namespace)
         with LocalDiscovery(namespace):
             baseline = len(registered)
+            released = len(unregistered)
             publisher = LocalDiscovery.Publisher(namespace)
             stack = AsyncExitStack()
             await stack.enter_async_context(publisher)
@@ -2792,15 +2792,19 @@ class TestLocalDiscoveryPublisher:
 
             # Act
             await publisher.publish("worker-added", metadata)
+            at_readd = unregistered[released:]
             await publisher.publish("worker-dropped", metadata)
-            at_drop = list(unregistered)
+            at_drop = unregistered[released:]
             await stack.aclose()
 
-            # Assert
+            # Assert — one fallback per block, each disarmed in its turn:
+            # the vanished block's as the re-add replaces it, the fresh
+            # block's at the drop, leaving the publisher's exit nothing.
             block_registered = registered[baseline:]
-            assert len(block_registered) == 1
-            assert block_registered == at_drop
-            assert unregistered == at_drop
+            assert len(block_registered) == 2
+            assert at_readd == block_registered[:1]
+            assert at_drop == block_registered
+            assert unregistered[released:] == at_drop
 
     @pytest.mark.asyncio
     async def test_publish_should_release_its_block_when_a_peer_nulled_the_slot(
@@ -4150,6 +4154,98 @@ class TestLocalDiscoveryPublisher:
 
                 await publisher.publish("worker-dropped", first)
                 await publisher.publish("worker-added", second)
+
+    @pytest.mark.asyncio
+    async def test_publish_should_register_worker_fresh_when_its_own_block_vanished(
+        self, namespace, metadata
+    ):
+        """Test a re-add recreates a block the re-adding publisher lost.
+
+        Given:
+            A worker registered through a publisher whose metadata block
+            was then unlinked out from under it, as a dead peer's
+            teardown does, with that publisher still bound
+        When:
+            That same publisher publishes "worker-added" for the worker
+            again
+        Then:
+            It should leave the worker discoverable at the re-announced
+            metadata, the re-add having registered it fresh rather than
+            leaving a registration naming a block no reader can open.
+        """
+        # Arrange — the re-add comes from the publisher that registered
+        # the worker, so its own ledger still holds a handle naming the
+        # block that vanished. A re-add from a second publisher, which
+        # the test below covers, brings no such handle and cannot reach
+        # this path.
+        directory = namespace_directory(namespace)
+        with LocalDiscovery(namespace) as discovery:
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                before = set(directory.iterdir())
+                await publisher.publish("worker-added", metadata)
+                [block] = set(directory.iterdir()) - before
+                block.unlink()
+
+                # Act
+                await publisher.publish("worker-added", metadata)
+
+                # Assert
+                discovered = set()
+                async for event in discovery.subscribe(poll_interval=0.05):
+                    discovered.add((event.type, event.metadata.uid))
+                    break
+                assert discovered == {("worker-added", metadata.uid)}
+
+    @pytest.mark.asyncio
+    async def test_publish_should_register_both_when_concurrent_on_one_publisher(
+        self, namespace, metadata
+    ):
+        """Test two concurrent publishes on one publisher both register.
+
+        Given:
+            A publisher whose registered worker's block was unlinked out
+            from under it, so a re-add reaches the recovery path that
+            suspends inside the registry's critical section
+        When:
+            That re-add and a second worker's registration run
+            concurrently on the same publisher
+        Then:
+            It should leave both workers discoverable, since a publish
+            holds the registry lock for the whole of its own critical
+            section rather than releasing a peer's.
+        """
+        # Arrange — the re-add must be gather's first argument: it is the
+        # only one of the two that reaches a suspension point inside the
+        # held section, so the interleaving this pins does not occur with
+        # the order reversed. Capacity stays at its default, or the
+        # second publish is refused before it can race.
+        other = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=124, version="1.0"
+        )
+        directory = namespace_directory(namespace)
+
+        with LocalDiscovery(namespace) as discovery:
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                before = set(directory.iterdir())
+                await publisher.publish("worker-added", metadata)
+                [block] = set(directory.iterdir()) - before
+                block.unlink()
+
+                # Act
+                await asyncio.gather(
+                    publisher.publish("worker-added", metadata),
+                    publisher.publish("worker-added", other),
+                )
+
+                # Assert — bounded, because a lost worker leaves the
+                # survivor's stream running rather than ending it.
+                discovered = set()
+                async with asyncio.timeout(10):
+                    async for event in discovery.subscribe(poll_interval=0.05):
+                        discovered.add(event.metadata.uid)
+                        if discovered == {metadata.uid, other.uid}:
+                            break
+                assert discovered == {metadata.uid, other.uid}
 
     @pytest.mark.asyncio
     async def test_publish_should_register_worker_fresh_when_block_vanished(

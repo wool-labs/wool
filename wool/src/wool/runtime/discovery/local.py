@@ -886,6 +886,13 @@ class LocalDiscovery(Discovery):
                     registry.write(_NULL_REF, match_offset)
                     if free_offset is None:
                         free_offset = match_offset
+                    # A handle this publisher still holds names the block
+                    # that vanished. Release it so the registration below
+                    # creates the block afresh; the pool would otherwise
+                    # hand back that same unlinked handle, leaving a slot
+                    # naming a file no reader can open.
+                    if (vanished := self._blocks.pop(str(ref), None)) is not None:
+                        await vanished.aclose()
 
             if free_offset is None:
                 raise DiscoveryCapacityExhausted(_read_capacity(registry))
