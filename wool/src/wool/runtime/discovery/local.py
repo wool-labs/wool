@@ -856,9 +856,10 @@ class LocalDiscovery(Discovery):
             another publisher's pool.
 
             The ledger holds at most one handle per ref, and a
-            registration that displaces one closes it first: overwriting
-            it would strand a pool reference nothing can drop until the
-            publisher exits.
+            registration that displaces one closes it last: the new
+            handle is installed first, so no ``await`` separates the
+            pop from the install and a cancellation cannot leave the
+            ref with no handle at all.
 
             The block the pool hands back is re-checked against its
             name. The pool returns a cached handle on a key hit, so a
@@ -926,16 +927,21 @@ class LocalDiscovery(Discovery):
                     )
                 _write_block(block_file, serialized)
                 registry.write(ref.bytes, free_offset)
-            except Exception:
+            except BaseException:
                 # Release what this method acquired rather than delegating
                 # to `_drop`, whose slot scan cannot find a ref that only
-                # lands on the last line of this block.
+                # lands on the last line of this block. `BaseException`,
+                # so a cancellation cannot strand the block and its pool
+                # reference; the bare `raise` preserves its semantics.
                 await block.aclose()
                 raise
-            # One handle per ref — see the docstring.
-            if (stale := self._blocks.pop(str(ref), None)) is not None:
-                await stale.aclose()
+            # One handle per ref — see the docstring. The new handle is
+            # installed before the displaced one is released, so no
+            # `await` separates the pop from the install.
+            stale = self._blocks.pop(str(ref), None)
             self._blocks[str(ref)] = block
+            if stale is not None:
+                await stale.aclose()
 
         async def _drop(self, metadata: WorkerMetadata, registry: _File):
             """Unregister a worker by removing it from the registry.
