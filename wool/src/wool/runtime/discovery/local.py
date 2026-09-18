@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import errno
 import fcntl
+import logging
 import os
 import struct
 import sys
@@ -57,6 +58,9 @@ _REGISTRY: Final = "registry"
 _STAGING: Final = "registry.tmp"
 _NOTIFY: Final = "notify"
 _NAME_MAX: Final = 255
+_CARRY_FORWARD_LIMIT: Final = 3
+
+logger = logging.getLogger(__name__)
 
 
 class _Watchdog(FileSystemEventHandler):
@@ -1131,10 +1135,14 @@ class LocalDiscovery(Discovery):
             rescan of the registry. A ``poll_interval`` adds a rescan
             whenever that many seconds pass without a notification.
 
+            A slot this scan cannot read does not end the subscription
+            and does not drop the worker; see `_carry_forward`.
+
             :yields:
                 Discovery events as changes are detected in the registry.
             """
             cached_workers: dict[str, WorkerMetadata] = {}
+            carried: dict[str, int] = {}
             notification = asyncio.Event()
             lock = asyncio.Lock()
             loop = asyncio.get_running_loop()
@@ -1156,10 +1164,27 @@ class LocalDiscovery(Discovery):
                             notification.clear()
                             discovered_workers: dict[str, WorkerMetadata] = {}
                             for _, slot in _iter_slots(registry):
-                                if slot != _NULL_REF:
+                                if slot == _NULL_REF:
+                                    continue
+                                try:
                                     ref = _WorkerReference.from_bytes(slot)
                                     metadata = self._deserialize_metadata(ref)
-                                    discovered_workers[str(metadata.uid)] = metadata
+                                except Exception:
+                                    self._carry_forward(
+                                        slot,
+                                        cached_workers,
+                                        discovered_workers,
+                                        carried,
+                                    )
+                                    continue
+                                uid = str(metadata.uid)
+                                carried.pop(uid, None)
+                                discovered_workers[uid] = metadata
+                            carried = {
+                                uid: scans
+                                for uid, scans in carried.items()
+                                if uid in discovered_workers
+                            }
 
                             for event in self._diff(cached_workers, discovered_workers):
                                 yield event
@@ -1176,6 +1201,63 @@ class LocalDiscovery(Discovery):
 
         async def _shutdown(self) -> None:
             """Clean up shared subscription state for this subscriber."""
+
+        def _carry_forward(
+            self,
+            slot: bytes,
+            cached_workers: dict[str, WorkerMetadata],
+            discovered_workers: dict[str, WorkerMetadata],
+            carried: dict[str, int],
+        ) -> None:
+            """Report an unreadable slot's worker from the last scan that read it.
+
+            A slot can fail to read for reasons that say nothing about
+            whether its worker is live: its block may have been unlinked
+            between the slot read and the block open, a refresh may have
+            landed mid-read, or the bytes may be short or foreign.
+            Omitting the worker would make `_diff` emit
+            ``worker-dropped`` for it and ``worker-added`` again on the
+            next wake, so a transient fault becomes an eviction and
+            readmission. Carrying the last good metadata forward reports
+            the worker unchanged instead.
+
+            The carry has a floor, because boxes above would otherwise
+            turn a *persistent* fault — a corrupted registry, a foreign
+            file — into a subscription serving stale metadata forever
+            with no signal at all. After `_CARRY_FORWARD_LIMIT`
+            consecutive scans the worker is still reported, so no
+            spurious drop is emitted, but each further scan says so.
+
+            A slot whose bytes do not even yield a UUID, or whose worker
+            was never read successfully, has nothing to carry and is
+            skipped.
+
+            :param slot:
+                The raw slot bytes that could not be read.
+            :param cached_workers:
+                The workers as of the last scan that read them.
+            :param discovered_workers:
+                This scan's workers, updated in place.
+            :param carried:
+                Consecutive carried scans per worker, updated in place.
+            """
+            try:
+                uid = str(UUID(bytes=slot))
+            except (ValueError, TypeError):
+                return
+            cached = cached_workers.get(uid)
+            if cached is None:
+                return
+            scans = carried[uid] = carried.get(uid, 0) + 1
+            if scans >= _CARRY_FORWARD_LIMIT:
+                logger.warning(
+                    "Worker %s in discovery namespace %r has been unreadable for "
+                    "%d consecutive scans; still reporting its last known metadata",
+                    uid,
+                    self._namespace,
+                    scans,
+                )
+            discovered_workers[uid] = cached
 
         def _deserialize_metadata(self, ref: _WorkerReference):
             """Load and deserialize a worker's metadata from its block.
@@ -1392,14 +1474,36 @@ def _write_block(block: _File, serialized: bytes) -> None:
 def _read_block(block: _File) -> bytes:
     """Return the serialized metadata a block holds.
 
+    The prefix and the payload come from one read sized by the block, so
+    a refresh landing between them cannot pair a new size with an old
+    payload. State the guarantee honestly: one read against
+    `_write_block`'s one write narrows tearing to a page-level property
+    of the platform, and POSIX promises no atomicity between them.
+
+    Sizing the read from the block rather than from the prefix also keeps
+    a torn or foreign prefix from driving an allocation of up to 4 GiB.
+
     :param block:
         The open block to read.
     :returns:
         The serialized metadata, as written by `_write_block`.
+    :raises ValueError:
+        If the block is shorter than the length prefix, or declares a
+        payload longer than the block holds.
     """
     prefix = struct.calcsize("I")
-    size = struct.unpack("I", block.read(prefix, 0))[0]
-    return block.read(size, prefix)
+    buffer = block.read(block.size, 0)
+    if len(buffer) < prefix:
+        raise ValueError(
+            f"Block holds {len(buffer)} bytes, short of the {prefix}-byte prefix"
+        )
+    size = struct.unpack("I", buffer[:prefix])[0]
+    if prefix + size > len(buffer):
+        raise ValueError(
+            f"Block declares a {size}-byte payload but holds "
+            f"{len(buffer) - prefix} bytes after its prefix"
+        )
+    return buffer[prefix : prefix + size]
 
 
 def _unlink_quietly(directory: Path, name: str, *, dir_fd: int | None = None) -> None:

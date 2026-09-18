@@ -4,6 +4,7 @@ import os
 import pickle
 import re
 import shutil
+import struct
 import tempfile
 import uuid
 from collections import Counter
@@ -5240,35 +5241,111 @@ class TestLocalDiscoverySubscriber:
         assert discovered.metadata.uid == metadata.uid
 
     @pytest.mark.asyncio
-    async def test___aiter___should_raise_file_not_found_when_a_block_vanished(
+    async def test___aiter___should_keep_a_worker_when_its_block_turns_unreadable(
         self, namespace
     ):
-        """Test a vanished worker block is not reported as a lost registry.
+        """Test a corrupted block does not evict the worker it belongs to.
+
+        Given:
+            A live subscription that has already reported a worker, whose
+            block is then corrupted so its length prefix no longer
+            describes its payload, and a second worker published
+            afterwards
+        When:
+            The subscription rescans
+        Then:
+            It should report the second worker and never report the first
+            as dropped, carrying the metadata it last read forward rather
+            than turning a transient bad read into an eviction the next
+            scan readmits.
+        """
+        # Arrange — the corruption must land after the subscription has
+        # read the worker once, or there is nothing cached to carry and
+        # the worker is simply absent.
+        first = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        second = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=124, version="1.0"
+        )
+        directory = namespace_directory(namespace)
+        seen = []
+
+        with LocalDiscovery(namespace) as discovery:
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                before = set(directory.iterdir())
+                await publisher.publish("worker-added", first)
+                [block] = set(directory.iterdir()) - before
+
+                # Act
+                async with asyncio.timeout(10):
+                    async for event in discovery.subscribe(poll_interval=0.05):
+                        seen.append(event)
+                        if event.metadata.uid == first.uid:
+                            # Declare a payload far larger than the block.
+                            with block.open("r+b") as handle:
+                                handle.write(struct.pack("I", 4096))
+                            await publisher.publish("worker-added", second)
+                        if event.metadata.uid == second.uid:
+                            break
+
+        # Assert
+        assert any(
+            event.type == "worker-added" and event.metadata.uid == second.uid
+            for event in seen
+        )
+        assert not any(
+            event.type == "worker-dropped" and event.metadata.uid == first.uid
+            for event in seen
+        )
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_skip_the_slot_when_a_block_vanished(self, namespace):
+        """Test a vanished worker block does not end the subscription.
 
         Given:
             A live owner whose registry holds a slot for a worker whose
-            metadata block was unlinked by the publisher that created it
+            metadata block was unlinked by the publisher that created it,
+            and a second worker registered afterwards with its block
+            intact
         When:
             A Subscriber on that namespace scans
         Then:
-            It should raise FileNotFoundError — the registry is intact
-            and only one worker's block is gone, so reporting the
-            namespace as missing would misdiagnose it.
+            It should skip the unreadable slot and still report the
+            readable worker, rather than propagating FileNotFoundError
+            and permanently ending the subscription for every worker in
+            the namespace.
         """
         # Arrange — the exiting publisher unlinks its blocks but leaves
-        # the address-space slot populated.
-        worker = WorkerMetadata(
+        # the registry slot populated. The subscription starts after that,
+        # so the vanished worker has no cached metadata to carry forward
+        # and is simply absent; the live worker is the oracle.
+        vanished = WorkerMetadata(
             uid=uuid.uuid4(), address="localhost:50051", pid=123, version="1.0"
+        )
+        live = WorkerMetadata(
+            uid=uuid.uuid4(), address="localhost:50052", pid=124, version="1.0"
         )
 
         with LocalDiscovery(namespace):
             async with LocalDiscovery.Publisher(namespace) as publisher:
-                await publisher.publish("worker-added", worker)
+                await publisher.publish("worker-added", vanished)
 
-            # Act & assert
-            with pytest.raises(FileNotFoundError):
-                async for _ in LocalDiscovery.Subscriber(namespace, poll_interval=0.05):
-                    pytest.fail("Subscriber yielded an event for a vanished block")
+            async with LocalDiscovery.Publisher(namespace) as survivor:
+                await survivor.publish("worker-added", live)
+
+                # Act
+                discovered = None
+                subscriber = LocalDiscovery.Subscriber(namespace, poll_interval=0.05)
+                async with asyncio.timeout(10):
+                    async for event in subscriber:
+                        discovered = event
+                        break
+
+        # Assert
+        assert discovered is not None
+        assert discovered.type == "worker-added"
+        assert discovered.metadata.uid == live.uid
 
     @pytest.mark.asyncio
     async def test___aiter___discovers_added_worker(self, namespace, metadata):
