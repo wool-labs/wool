@@ -49,6 +49,10 @@ from wool.runtime.worker.metadata import WorkerMetadata
 from wool.utilities.afilter import afilter
 from wool.utilities.noreentry import noreentry
 
+#: Defaults shared with `wool.runtime.worker.pool`, which sizes a
+#: pool-owned registry from them. Everything below is local to this
+#: module and underscored accordingly.
+DEFAULT_CAPACITY: Final = 128
 DEFAULT_LOCK_TIMEOUT: Final[float] = 30.0
 _REF_WIDTH: Final = 16
 _NULL_REF: Final = b"\x00" * _REF_WIDTH
@@ -456,7 +460,7 @@ class LocalDiscovery(Discovery):
         *,
         filter: PredicateFunction | None = None,
         poll_interval: float | None = None,
-        capacity: int = 128,
+        capacity: int = DEFAULT_CAPACITY,
         block_size: int = 1024,
         lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
     ):

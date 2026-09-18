@@ -26,6 +26,7 @@ from wool.runtime.context.factory import install_task_factory
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
+from wool.runtime.discovery.local import DEFAULT_CAPACITY
 from wool.runtime.discovery.local import LocalDiscovery
 from wool.runtime.typing import Factory
 from wool.runtime.typing import Undefined
@@ -744,7 +745,13 @@ class WorkerPool:
 
                 @asynccontextmanager
                 async def create_proxy():
-                    with LocalDiscovery(namespace) as discovery:
+                    # The pool owns this registry and knows how many
+                    # workers will register in it, so it sizes it rather
+                    # than leaving a host with more CPUs than the default
+                    # capacity unable to start a trivial pool.
+                    with LocalDiscovery(
+                        namespace, capacity=max(DEFAULT_CAPACITY, spawn)
+                    ) as discovery:
                         async with self._worker_context(
                             *tags,
                             spawn=spawn,
@@ -811,7 +818,13 @@ class WorkerPool:
 
                 @asynccontextmanager
                 async def create_proxy():
-                    with LocalDiscovery(namespace) as discovery:
+                    # The pool owns this registry and knows how many
+                    # workers will register in it, so it sizes it rather
+                    # than leaving a host with more CPUs than the default
+                    # capacity unable to start a trivial pool.
+                    with LocalDiscovery(
+                        namespace, capacity=max(DEFAULT_CAPACITY, spawn)
+                    ) as discovery:
                         async with self._worker_context(
                             *tags,
                             spawn=spawn,

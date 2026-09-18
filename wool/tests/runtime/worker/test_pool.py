@@ -4855,6 +4855,48 @@ class TestWorkerPool:
         assert exit_called[0]
 
     @pytest.mark.asyncio
+    async def test___aenter___should_size_its_own_registry_to_the_workers_it_spawns(
+        self, mocker: MockerFixture
+    ):
+        """Test a pool owning its registry sizes it for every worker it spawns.
+
+        Given:
+            A WorkerPool spawning more workers than the discovery
+            backend's default capacity, with no discovery service of its
+            own supplied
+        When:
+            The pool is entered and constructs the LocalDiscovery it owns
+        Then:
+            It should pass a capacity of at least the spawn count, so the
+            registration of the last worker cannot be refused for want of
+            a slot on a host with more CPUs than that default.
+        """
+
+        # Arrange — a constructor spy rather than a behavioural oracle:
+        # exercising the boundary honestly would mean spawning more real
+        # worker processes than the default capacity. This is wiring
+        # coverage and patches a collaborator, with the precedent below.
+        # Entry is abandoned the moment the capacity has been observed,
+        # so no worker is ever spawned.
+        class _Abandon(Exception):
+            pass
+
+        mock_discovery = mocker.MagicMock()
+        mock_discovery.__enter__ = mocker.MagicMock(side_effect=_Abandon)
+        discovery_class = mocker.patch(
+            "wool.runtime.worker.pool.LocalDiscovery", return_value=mock_discovery
+        )
+
+        # Act
+        with pytest.raises(_Abandon):
+            async with WorkerPool(spawn=200):
+                pass
+
+        # Assert
+        assert discovery_class.call_args is not None
+        assert discovery_class.call_args.kwargs["capacity"] >= 200
+
+    @pytest.mark.asyncio
     async def test_worker_context_publisher_type_validation(
         self, mocker: MockerFixture, mock_local_worker
     ):
