@@ -116,11 +116,16 @@ class DiscoveryNamespaceInUse(WoolError):
 
 # public
 class DiscoveryNamespaceNotFound(WoolError):
-    """Raised when a borrower binds a namespace that has no registry.
+    """Raised when a namespace has no live owner to borrow from.
 
-    No owner has created the registry yet, or its owner has exited and
-    reclaimed it. See `LocalDiscovery` for the borrowing and orphaning
-    contract.
+    Raised at a bind where no owner has created the namespace yet, and
+    again at any later operation by a borrower whose owner has since
+    gone: a binding ends with the owner it was made against, so a
+    publisher's next publish and a subscriber's next scan both fail
+    rather than reaching a successor or serving what they last read.
+    This holds whether that owner exited or was killed outright. A
+    borrower that wants to follow the namespace re-binds after this
+    error. See `LocalDiscovery` for the ownership contract.
 
     :param namespace:
         The namespace whose registry was not found, when known.
