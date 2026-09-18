@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from hypothesis import strategies as st
 
 from tests.helpers import LOOPBACK_SANS
 from tests.helpers import generate_ca_and_leaf
+from tests.helpers import namespace_directory
 from wool.runtime.context.runtime import dispatch_timeout
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.discovery.base import DiscoveryLike
@@ -2049,3 +2051,28 @@ def release_subprocess(proc: subprocess.Popen | None) -> None:
         if stream is not None:
             with suppress(Exception):
                 stream.close()
+
+
+@pytest.fixture
+def namespaces():
+    """Mint discovery namespaces and remove their directories afterwards.
+
+    A namespace whose owner is killed keeps its directory by contract —
+    nothing survives a SIGKILL to reclaim it — so every test that kills
+    an owner leaves one behind. Minting through here keeps the
+    descriptive prefix a failure message needs while making the cleanup
+    one decision rather than one per test. It removes directories only;
+    the residue *assertions* stay in the tests that make them, since a
+    fixture asserting them would mask the leaks they pin.
+    """
+    minted: list[str] = []
+
+    def mint(prefix: str) -> str:
+        namespace = f"{prefix}-{uuid.uuid4().hex[:12]}"
+        minted.append(namespace)
+        return namespace
+
+    yield mint
+
+    for namespace in minted:
+        shutil.rmtree(namespace_directory(namespace), ignore_errors=True)

@@ -75,6 +75,21 @@ def namespace_directory(namespace: str) -> Path:
     return Path(tempfile.gettempdir()).resolve() / f"wool-{namespace}"
 
 
+def registry_path(namespace: str) -> Path:
+    """Return the path of a `wool.LocalDiscovery` namespace's registry.
+
+    Named here rather than spelled out at each call site, so a test that
+    needs the file an owner publishes and a publisher locks says which
+    file it means without spreading the name.
+    """
+    return namespace_directory(namespace) / "registry"
+
+
+def notify_path(namespace: str) -> Path:
+    """Return the path of the file a namespace's subscribers watch."""
+    return namespace_directory(namespace) / "notify"
+
+
 def plant(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
     """Schedule ``coro`` on the running loop and hold a strong reference.
 
