@@ -1,12 +1,13 @@
 import asyncio
 import atexit
+import errno
 import os
 import pickle
 import re
 import shutil
 import struct
-import tempfile
 import uuid
+import warnings
 from collections import Counter
 from contextlib import AsyncExitStack
 from contextlib import ExitStack
@@ -25,6 +26,7 @@ from hypothesis import settings
 from hypothesis import strategies as st
 
 from tests.helpers import namespace_directory
+from tests.helpers import notify_path
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
@@ -302,6 +304,24 @@ def _rejected_claim_is_raised(namespace):
             return False
     except DiscoveryNamespaceInUse:
         return True
+
+
+def _borrower_binds(namespace):
+    """Return whether a fresh borrowing publisher binds ``namespace``.
+
+    Runs its own loop so a synchronous test — and a probe reaching in
+    from inside a patched system call — can ask what a borrower in
+    another process would find at that moment.
+    """
+
+    async def bind():
+        try:
+            async with LocalDiscovery.Publisher(namespace):
+                return True
+        except DiscoveryNamespaceNotFound:
+            return False
+
+    return asyncio.run(bind())
 
 
 def _rejected_claim(namespace):
@@ -1128,7 +1148,7 @@ class TestLocalDiscovery:
             shutil.rmtree(directory, ignore_errors=True)
 
     @pytest.mark.asyncio
-    async def test___exit___should_remove_thenamespace_directory(
+    async def test___exit___should_remove_the_namespace_directory(
         self, namespace, metadata
     ):
         """Test a fully torn down namespace leaves nothing behind.
@@ -1140,20 +1160,37 @@ class TestLocalDiscovery:
         When:
             The publisher and then the owner exit
         Then:
-            It should leave no namespace directory, so a host that
-            creates many short-lived namespaces accumulates no residue.
+            It should leave no namespace directory, nothing beside it
+            carrying the namespace's name, and no warning, so a host
+            that creates many short-lived namespaces accumulates
+            neither residue nor noise.
         """
         # Arrange
         directory = namespace_directory(namespace)
 
         # Act
-        with LocalDiscovery(namespace):
-            async with LocalDiscovery.Publisher(namespace) as publisher:
-                await publisher.publish("worker-added", metadata)
-            assert directory.exists()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with LocalDiscovery(namespace):
+                async with LocalDiscovery.Publisher(namespace) as publisher:
+                    await publisher.publish("worker-added", metadata)
+                assert directory.exists()
 
         # Assert
         assert not directory.exists()
+        # Every clean exit removes the staging name the publication
+        # already consumed, so the benign absence arm runs on every
+        # teardown in every process: narrowing it would make ordinary
+        # exits warn about a leak that is not one.
+        assert [
+            warning
+            for warning in caught
+            if issubclass(warning.category, ResourceWarning)
+        ] == []
+        # Siblings too, not just the directory's own contents -- the
+        # per-namespace lock file this change removed sat beside it and
+        # cost an inode per lifecycle.
+        assert [entry for entry in directory.parent.glob(f"*{namespace}*")] == []
 
     @pytest.mark.asyncio
     async def test___exit___should_leave_the_directory_to_an_orphaned_publisher(
@@ -1168,52 +1205,33 @@ class TestLocalDiscovery:
             and the orphaned borrower then exits
         Then:
             It should leave the directory in place while the block lives
-            in it, and remove it with that block — the borrower, not the
-            owner, reclaims what it created last.
+            in it, warning about neither, and remove it with that block
+            — the borrower, not the owner, reclaims what it created
+            last.
         """
         # Arrange
         directory = namespace_directory(borrowed_publisher.owner.namespace)
 
         # Act
-        borrowed_publisher.release_owner()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            borrowed_publisher.release_owner()
 
-        # Assert — the block outlives the owner, so its home does too
+        # Assert — the block outlives the owner, so its home does too,
+        # and a directory an orphan still occupies is not a leak an
+        # operator should be sent to chase.
         assert directory.exists()
+        assert [
+            warning
+            for warning in caught
+            if issubclass(warning.category, ResourceWarning)
+        ] == []
 
         # Act
         await borrowed_publisher.release_publisher()
 
         # Assert
         assert not directory.exists()
-
-    @pytest.mark.asyncio
-    async def test_publish_should_not_recreate_thenamespace_directory(
-        self, namespace, metadata
-    ):
-        """Test a publish against a reclaimed namespace creates nothing.
-
-        Given:
-            A publisher bound to a namespace whose owner has since
-            exited and removed it
-        When:
-            The publisher publishes a worker
-        Then:
-            It should raise DiscoveryNamespaceNotFound and leave no
-            namespace directory — a borrower recreating one would
-            resurrect the residue the owner's exit just reclaimed.
-        """
-        # Arrange
-        directory = namespace_directory(namespace)
-        async with AsyncExitStack() as stack:
-            with LocalDiscovery(namespace):
-                publisher = await stack.enter_async_context(
-                    LocalDiscovery.Publisher(namespace)
-                )
-
-            # Act & assert
-            with pytest.raises(DiscoveryNamespaceNotFound):
-                await publisher.publish("worker-added", metadata)
-            assert not directory.exists()
 
     def test___enter___should_retry_when_the_directory_is_replaced_mid_claim(
         self, namespace, mocker
@@ -1348,42 +1366,6 @@ class TestLocalDiscovery:
             # The failure this arranges is what left the directory.
             mocker.stopall()
             shutil.rmtree(directory, ignore_errors=True)
-
-    @pytest.mark.asyncio
-    async def test_publish_should_complete_when_the_notification_file_vanished(
-        self, namespace, metadata
-    ):
-        """Test a publish whose notification file is gone still registers.
-
-        Given:
-            An owner, a borrowing publisher bound to its registry, and a
-            notification file removed out from under them — the window
-            in which an owner reclaims a namespace mid-publish
-        When:
-            The publisher publishes a worker
-        Then:
-            It should register the worker and leave the notification
-            file absent, a publisher that recreated it resurrecting
-            residue its owner had reclaimed.
-        """
-        # Arrange
-        directory = namespace_directory(namespace)
-        with LocalDiscovery(namespace) as discovery:
-            async with LocalDiscovery.Publisher(namespace) as publisher:
-                notification = directory / "notify"
-                assert notification.exists()
-                notification.unlink()
-
-                # Act
-                await publisher.publish("worker-added", metadata)
-
-                # Assert
-                assert not notification.exists()
-                events = []
-                async for event in discovery.subscribe(poll_interval=0.05):
-                    events.append(event)
-                    break
-                assert [event.metadata.uid for event in events] == [metadata.uid]
 
     def test___enter___should_raise_when_a_rejected_instance_is_reentered(
         self, namespace
@@ -1853,22 +1835,35 @@ class TestLocalDiscovery:
         with LocalDiscovery(example_ns):
             pass
 
-    @given(forest=_LIFECYCLE_FORESTS, mask=st.lists(st.booleans(), max_size=10))
+    @given(
+        forest=_LIFECYCLE_FORESTS,
+        mask=st.lists(
+            st.sampled_from(
+                [
+                    None,
+                    FileNotFoundError(errno.ENOENT, "No such file or directory"),
+                    PermissionError(errno.EPERM, "Operation not permitted"),
+                ]
+            ),
+            max_size=10,
+        ),
+    )
     @settings(
         max_examples=25,
         deadline=5000,
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
-    def test___exit___should_unwind_interleavings_when_files_vanish(
-        self, namespace, atexit_recorder, unlink_schedule, forest, mask
+    def test___exit___should_unwind_interleavings_when_removals_fail(
+        self, namespace, atexit_recorder, teardown_log, unlink_schedule, forest, mask
     ):
-        """Test vanishing files never break lifecycle unwinding.
+        """Test failing removals never break lifecycle unwinding.
 
         Given:
             An arbitrary forest of same-namespace claims and an
-            arbitrary subset of removals that observe the file
-            already removed by an external unlinker, with atexit
-            registration wrapped in recording pass-throughs
+            arbitrary pattern of removals that fail, each either
+            observing the file already gone or being refused outright,
+            with atexit registration wrapped in recording
+            pass-throughs
         When:
             Every claim is entered via nested with statements, a claim
             made against a live owner being rejected
@@ -1883,17 +1878,22 @@ class TestLocalDiscovery:
         registered, unregistered = atexit_recorder
         registered.clear()
         unregistered.clear()
+        teardown_log.clear()
         unlink_schedule.clear()
-        unlink_schedule.extend(
-            FileNotFoundError(2, "No such file or directory") if vanished else None
-            for vanished in mask
-        )
+        unlink_schedule.extend(mask)
         example_ns = f"{namespace}-{uuid.uuid4().hex[:8]}"
 
-        # Act
-        _enter_lifecycle_forest(example_ns, forest)
+        # Act — a refused removal is a leak an operator can act on, which
+        # the owner reports as a `ResourceWarning` rather than raising.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            _enter_lifecycle_forest(example_ns, forest)
 
-        # Assert
+        # Assert — any claim at all removes files on its way out, so the
+        # schedule reaching the namespace the forest runs on is checked
+        # here: a mask that stopped being injected fails rather than
+        # leaving the whole failure dimension quietly uncovered.
+        assert not forest or "unlink" in teardown_log
         assert registered == unregistered
         with LocalDiscovery(example_ns):
             pass
@@ -2250,7 +2250,73 @@ class TestLocalDiscoveryPublisher:
         with LocalDiscovery(namespace) as owner:
             assert owner.namespace == namespace
 
-    @pytest.mark.parametrize("event", ["worker-added", "worker-dropped"])
+    @pytest.mark.asyncio
+    async def test_publish_should_complete_when_the_notification_file_vanished(
+        self, namespace, metadata
+    ):
+        """Test a publish whose notification file is gone still registers.
+
+        Given:
+            An owner, a borrowing publisher bound to its registry, and a
+            notification file removed out from under them — the window
+            in which an owner reclaims a namespace mid-publish
+        When:
+            The publisher publishes a worker
+        Then:
+            It should register the worker and leave the notification
+            file absent, a publisher that recreated it resurrecting
+            residue its owner had reclaimed.
+        """
+        # Arrange
+        with LocalDiscovery(namespace) as discovery:
+            async with LocalDiscovery.Publisher(namespace) as publisher:
+                notification = notify_path(namespace)
+                assert notification.exists()
+                notification.unlink()
+
+                # Act
+                await publisher.publish("worker-added", metadata)
+
+                # Assert
+                assert not notification.exists()
+                events = []
+                async for event in discovery.subscribe(poll_interval=0.05):
+                    events.append(event)
+                    break
+                assert [event.metadata.uid for event in events] == [metadata.uid]
+
+    @pytest.mark.asyncio
+    async def test_publish_should_not_recreate_the_namespace_directory(
+        self, namespace, metadata
+    ):
+        """Test a publish against a reclaimed namespace creates nothing.
+
+        Given:
+            A publisher bound to a namespace whose owner has since
+            exited and removed it
+        When:
+            The publisher publishes a worker
+        Then:
+            It should raise DiscoveryNamespaceNotFound and leave no
+            namespace directory — a borrower recreating one would
+            resurrect the residue the owner's exit just reclaimed.
+        """
+        # Arrange
+        directory = namespace_directory(namespace)
+        async with AsyncExitStack() as stack:
+            with LocalDiscovery(namespace):
+                publisher = await stack.enter_async_context(
+                    LocalDiscovery.Publisher(namespace)
+                )
+
+            # Act & assert
+            with pytest.raises(DiscoveryNamespaceNotFound):
+                await publisher.publish("worker-added", metadata)
+            assert not directory.exists()
+
+    @pytest.mark.parametrize(
+        "event", ["worker-added", "worker-updated", "worker-dropped"]
+    )
     @pytest.mark.asyncio
     async def test_publish_should_raise_when_the_owner_has_exited(
         self, namespace, metadata, event, borrowed_publisher
@@ -2266,7 +2332,7 @@ class TestLocalDiscoveryPublisher:
         Then:
             It should raise DiscoveryNamespaceNotFound naming the
             namespace, chained from the underlying FileNotFoundError,
-            for either event kind.
+            for every event kind.
         """
         # Arrange — orphan the still-bound publisher (see
         # `borrowed_publisher`)
@@ -2308,6 +2374,12 @@ class TestLocalDiscoveryPublisher:
                 break
 
         with LocalDiscovery(namespace) as successor:
+            # A successor claims the directory but owns only the registry
+            # and the notification file in it. The live orphan's block is
+            # not the successor's to reclaim, and a sweep that took it
+            # would leave this publish naming a file no reader can open.
+            assert (namespace_directory(namespace) / metadata.uid.hex).exists()
+
             # Act
             await borrowed_publisher.publisher.publish("worker-added", metadata)
 
@@ -3108,8 +3180,8 @@ class TestLocalDiscoveryPublisher:
                     await publisher.publish("worker-updated", metadata)
 
     @pytest.mark.asyncio
-    async def test_publish_should_raise_when_address_space_full(self, namespace):
-        """Test publish to full address space raises DiscoveryCapacityExhausted.
+    async def test_publish_should_raise_when_capacity_is_exhausted(self, namespace):
+        """Test a publish beyond the stamped slot count is refused.
 
         Given:
             A LocalDiscovery whose declared capacity has been filled
@@ -3117,7 +3189,8 @@ class TestLocalDiscoveryPublisher:
         When:
             One worker beyond capacity is published
         Then:
-            It should raise DiscoveryCapacityExhausted.
+            It should raise DiscoveryCapacityExhausted reporting the
+            capacity stamped into the registry.
         """
         # Arrange
         capacity = 8
@@ -3139,8 +3212,9 @@ class TestLocalDiscoveryPublisher:
                     await publisher.publish("worker-added", worker)
 
                 # Act & assert
-                with pytest.raises(DiscoveryCapacityExhausted):
+                with pytest.raises(DiscoveryCapacityExhausted) as excinfo:
                     await publisher.publish("worker-added", workers[capacity])
+                assert excinfo.value.capacity == capacity
 
     @pytest.mark.asyncio
     async def test_publish_update_overflow_preserves_prior_state(self, namespace):
@@ -3260,9 +3334,9 @@ class TestLocalDiscoveryPublisher:
             The oversized worker is published and then the fitting
             worker is published
         Then:
-            It should raise DiscoveryBlockExhausted for the oversized worker,
-            discover only the fitting worker, and tear both contexts
-            down cleanly.
+            It should raise DiscoveryBlockExhausted reporting the
+            attempted payload's size, discover only the fitting worker,
+            and tear both contexts down cleanly.
         """
         # Arrange
         oversized = WorkerMetadata(
@@ -3291,8 +3365,13 @@ class TestLocalDiscoveryPublisher:
             publisher = LocalDiscovery.Publisher(namespace, block_size=100)
             async with publisher:
                 # Act
-                with pytest.raises(DiscoveryBlockExhausted):
+                with pytest.raises(DiscoveryBlockExhausted) as excinfo:
                     await publisher.publish("worker-added", oversized)
+                # The size it did not fit in is what tells a caller
+                # whether to shrink the metadata or widen the block.
+                assert excinfo.value.size == len(
+                    oversized.to_protobuf().SerializeToString()
+                )
                 await publisher.publish("worker-added", fitting)
 
                 # Assert — drain a bounded window rather than stopping at
@@ -4723,9 +4802,9 @@ class TestLocalDiscoveryPublisher:
             The borrower publishes a first worker, then a second
         Then:
             It should admit the first and raise DiscoveryCapacityExhausted
-            on the second — the owner's stamped cap of 1 governs, and a
-            borrower takes no capacity of its own with which to override
-            it.
+            reporting a capacity of 1 on the second — the owner's stamped
+            cap governs, and a borrower takes no capacity of its own
+            with which to override it.
         """
         # Arrange
         worker_a = WorkerMetadata(
@@ -4740,8 +4819,11 @@ class TestLocalDiscoveryPublisher:
             async with LocalDiscovery.Publisher(namespace) as publisher:
                 await publisher.publish("worker-added", worker_a)
 
-                with pytest.raises(DiscoveryCapacityExhausted):
+                with pytest.raises(DiscoveryCapacityExhausted) as excinfo:
                     await publisher.publish("worker-added", worker_b)
+                # The cap a borrower is refused at is the only way it can
+                # learn the bound it never declared.
+                assert excinfo.value.capacity == 1
 
     @given(owner_cap=st.integers(min_value=1, max_value=8))
     @settings(
@@ -5041,29 +5123,6 @@ class TestLocalDiscoveryPublisher:
                         await publisher.publish("worker-dropped", roster[index])
 
 
-class TestWorkerReference:
-    """Tests for the internal _WorkerReference value object."""
-
-    def test_is_hashable_by_its_uuid(self):
-        """Test a _WorkerReference hashes by its UUID.
-
-        Given:
-            A _WorkerReference wrapping a UUID.
-        When:
-            It is hashed.
-        Then:
-            Its hash should equal the UUID's hash — references are
-            usable as dict keys / set members keyed by worker identity.
-        """
-        # Arrange
-        from wool.runtime.discovery.local import _WorkerReference
-
-        uid = uuid.uuid4()
-
-        # Act & assert
-        assert hash(_WorkerReference(uid)) == hash(uid)
-
-
 class TestLocalDiscoverySubscriber:
     """Tests for LocalDiscovery.Subscriber class.
 
@@ -5176,7 +5235,7 @@ class TestLocalDiscoverySubscriber:
         # Assert — the rejected bind created nothing: no notification
         # directory for a namespace that never had an owner, and no
         # registry, so the namespace is still free for an owner to claim.
-        assert not (Path(tempfile.gettempdir()).resolve() / f"wool-{namespace}").exists()
+        assert not namespace_directory(namespace).exists()
         with LocalDiscovery(namespace) as owner:
             assert owner.namespace == namespace
 
