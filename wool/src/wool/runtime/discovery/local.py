@@ -56,6 +56,7 @@ _HEADER_SIZE: Final = _REF_WIDTH
 _REGISTRY: Final = "registry"
 _STAGING: Final = "registry.tmp"
 _NOTIFY: Final = "notify"
+_NAME_MAX: Final = 255
 
 
 class _Watchdog(FileSystemEventHandler):
@@ -338,8 +339,11 @@ class LocalDiscovery(Discovery):
     filesystem.
 
     :param namespace:
-        Identifier of the registry. Defaults to a unique
-        ``workerpool-<uuid>`` name.
+        Identifier of the registry. It names one directory under this
+        module's root, so it must be a single path component: not empty,
+        free of path separators and NUL, neither ``.`` nor ``..``, and
+        short enough to render within the filesystem's limit on a name.
+        Defaults to a unique ``workerpool-<uuid>`` name.
     :param filter:
         Optional default predicate function to filter workers.
         Used by `subscriber` and as the default for `subscribe` when no
@@ -353,15 +357,19 @@ class LocalDiscovery(Discovery):
     :param block_size:
         Size in bytes for each worker's serialized data block. Each
         block spends 4 bytes on a length prefix, leaving
-        ``block_size - 4`` for the serialized metadata. Defaults to
-        1024.
+        ``block_size - 4`` for the serialized metadata, so it must exceed
+        4. Note that a block only a few bytes above the prefix still
+        cannot hold the smallest serialized metadata and makes every
+        publish fail; the floor rejects what is unusable by arithmetic,
+        not what is unusable in practice. Defaults to 1024.
     :param lock_timeout:
         Maximum seconds each publisher waits for the cross-process file
         lock; see `LocalDiscovery.Publisher`. Defaults to
         `DEFAULT_LOCK_TIMEOUT`.
     :raises ValueError:
-        If ``capacity`` or ``block_size`` is less than 1, or
-        ``lock_timeout`` is negative.
+        If ``namespace`` does not name a single path component, if
+        ``capacity`` is less than 1, if ``block_size`` does not exceed
+        the 4-byte length prefix, or if ``lock_timeout`` is negative.
 
     Example — publish workers:
 
@@ -457,7 +465,10 @@ class LocalDiscovery(Discovery):
         _validate_block_size(block_size)
         if lock_timeout is not None and lock_timeout < 0:
             raise ValueError("Lock timeout must be non-negative")
-        self._namespace = namespace or f"workerpool-{uuid4()}"
+        if namespace is None:
+            namespace = f"workerpool-{uuid4()}"
+        _validate_namespace(namespace)
+        self._namespace = namespace
         self._filter = filter
         self._capacity = capacity
         self._block_size = block_size
@@ -645,20 +656,24 @@ class LocalDiscovery(Discovery):
         `LocalDiscovery` for the borrowing and orphaning contract.
 
         :param namespace:
-            The namespace identifier for the registry to borrow.
+            The namespace identifier for the registry to borrow. See
+            `LocalDiscovery` for the domain it must lie in.
         :param block_size:
             Size in bytes for worker metadata storage blocks. Each
             block spends 4 bytes on a length prefix, leaving
-            ``block_size - 4`` for the serialized metadata. Defaults
-            to 1024 bytes, which accommodates typical worker
-            metadata including tags and extra metadata.
+            ``block_size - 4`` for the serialized metadata, so it must
+            exceed 4; see `LocalDiscovery` for what that floor does and
+            does not rule out. Defaults to 1024 bytes, which
+            accommodates typical worker metadata including tags and
+            extra metadata.
         :param lock_timeout:
             Maximum seconds to wait for the cross-process file lock before
             raising `TimeoutError`. ``None`` waits forever. Defaults to
             `DEFAULT_LOCK_TIMEOUT`.
         :raises ValueError:
-            If ``block_size`` is less than 1, or ``lock_timeout`` is
-            negative.
+            If ``namespace`` is outside the domain `LocalDiscovery`
+            documents, if ``block_size`` does not exceed the 4-byte
+            length prefix, or if ``lock_timeout`` is negative.
         """
 
         _block_pool: ResourcePool[_File]
@@ -681,6 +696,7 @@ class LocalDiscovery(Discovery):
             block_size: int = 1024,
             lock_timeout: float | None = DEFAULT_LOCK_TIMEOUT,
         ):
+            _validate_namespace(namespace)
             _validate_block_size(block_size)
             if lock_timeout is not None and lock_timeout < 0:
                 raise ValueError("Lock timeout must be non-negative")
@@ -1010,14 +1026,17 @@ class LocalDiscovery(Discovery):
         bind ends without events.
 
         :param namespace:
-            The namespace identifier for the registry to borrow.
+            The namespace identifier for the registry to borrow. See
+            `LocalDiscovery` for the domain it must lie in.
         :param poll_interval:
             Seconds between rescans in addition to the rescans publisher
             writes trigger. ``None`` rescans only when a publisher writes.
             Part of the subscription key.
         :raises ValueError:
-            If ``poll_interval`` is negative, from the iteration that
-            starts the subscription.
+            If ``namespace`` is outside the domain `LocalDiscovery`
+            documents, or ``poll_interval`` is negative. Construction is
+            deferred, so both surface from the iteration that starts the
+            subscription rather than from the constructor.
         """
 
         _namespace: Final[str]
@@ -1035,6 +1054,7 @@ class LocalDiscovery(Discovery):
             *,
             poll_interval: float | None = None,
         ):
+            _validate_namespace(namespace)
             self._namespace = namespace
             if poll_interval is not None and poll_interval < 0:
                 raise ValueError(f"Expected positive poll interval, got {poll_interval}")
@@ -1176,14 +1196,66 @@ def _same_file(fd: int, path: Path) -> bool:
     return os.path.samestat(os.fstat(fd), os.stat(path))
 
 
+def _validate_namespace(namespace: str) -> None:
+    """Reject a namespace that would not name one directory under `_root`.
+
+    `_directory` interpolates the namespace into a single path component,
+    so a namespace carrying a separator or a relative-path element would
+    claim, write and unlink outside this module's root. The domain is one
+    non-empty path component that renders within the filesystem's limit
+    on a name.
+
+    :param namespace:
+        The namespace to check.
+    :raises ValueError:
+        If ``namespace`` is empty, contains a path separator or a NUL, is
+        ``.`` or ``..``, or renders a directory name exceeding
+        `_NAME_MAX` bytes.
+    """
+    if not namespace:
+        raise ValueError("Expected a non-empty namespace")
+    for separator in (os.sep, os.altsep, "/"):
+        if separator and separator in namespace:
+            raise ValueError(
+                f"Expected a namespace without {separator!r}, got {namespace!r}"
+            )
+    if "\x00" in namespace:
+        raise ValueError(f"Expected a namespace without a NUL, got {namespace!r}")
+    if namespace in (os.curdir, os.pardir):
+        raise ValueError(
+            f"Expected a namespace that is not a relative path element, "
+            f"got {namespace!r}"
+        )
+    rendered = len(f"wool-{namespace}".encode())
+    if rendered > _NAME_MAX:
+        raise ValueError(
+            f"Expected a namespace rendering within {_NAME_MAX} bytes, "
+            f"got one rendering {rendered}"
+        )
+
+
 def _validate_block_size(block_size: int) -> None:
-    """Reject a block size below one.
+    """Reject a block size that cannot hold the length prefix and a payload.
+
+    `_write_block` spends ``struct.calcsize("I")`` bytes on the length
+    prefix and bounds the payload against the block's live size, so a
+    block no larger than the prefix leaves nothing for metadata and makes
+    every publish raise `DiscoveryBlockExhausted` permanently.
+
+    This bound is necessary and not sufficient: a block a few bytes above
+    the prefix still cannot hold the smallest serialized `WorkerMetadata`,
+    and fails the same permanent way. It rejects only the sizes that are
+    unusable by arithmetic rather than by payload.
 
     :raises ValueError:
-        If ``block_size`` is less than 1.
+        If ``block_size`` does not exceed the length prefix.
     """
-    if block_size < 1:
-        raise ValueError(f"Expected block size of at least 1, got {block_size}")
+    prefix = struct.calcsize("I")
+    if block_size <= prefix:
+        raise ValueError(
+            f"Expected block size greater than the {prefix}-byte length prefix, "
+            f"got {block_size}"
+        )
 
 
 def _read_capacity(registry: _File) -> int | None:

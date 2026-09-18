@@ -369,24 +369,81 @@ class TestLocalDiscovery:
         with pytest.raises(ValueError, match="Expected capacity of at least 1"):
             LocalDiscovery("ns", capacity=capacity)
 
-    @pytest.mark.parametrize("block_size", [0, -1])
-    def test___init___should_raise_when_block_size_below_one(self, block_size):
-        """Test LocalDiscovery rejects a block size below one.
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "a/b",
+            "../escape",
+            "probeX/../victim",
+            ".",
+            "..",
+            "",
+            "nul\x00byte",
+            "x" * 256,
+        ],
+    )
+    def test___init___should_raise_when_namespace_leaves_its_root(self, bad):
+        """Test LocalDiscovery rejects a namespace that is not one path component.
 
         Given:
-            A block_size of zero or a negative block_size
+            A namespace carrying a path separator, a relative-path
+            element, a NUL, nothing at all, or more characters than a
+            directory name can hold
         When:
             LocalDiscovery is instantiated
         Then:
-            It should raise ValueError, since a block smaller than one
-            byte can never hold a worker's serialized metadata.
+            It should raise ValueError, since the namespace is
+            interpolated into a directory name and any of these would
+            claim, write and unlink outside the module's own root.
         """
         # Act & assert
-        with pytest.raises(ValueError, match="Expected block size of at least 1"):
+        with pytest.raises(ValueError, match="namespace"):
+            LocalDiscovery(bad)
+
+    def test___init___should_generate_a_namespace_only_when_none_is_given(self):
+        """Test only an omitted namespace is replaced by a generated one.
+
+        Given:
+            No namespace, and separately an empty namespace
+        When:
+            LocalDiscovery is instantiated with each
+        Then:
+            It should generate a unique name for the omitted one and
+            reject the empty one, rather than silently renaming a
+            namespace the caller did supply.
+        """
+        # Act
+        generated = LocalDiscovery()
+
+        # Assert
+        assert generated.namespace.startswith("workerpool-")
+        with pytest.raises(ValueError, match="non-empty namespace"):
+            LocalDiscovery("")
+
+    @pytest.mark.parametrize("block_size", [0, -1, 1, 4])
+    def test___init___should_raise_when_block_size_within_the_prefix(self, block_size):
+        """Test LocalDiscovery rejects a block size the prefix alone fills.
+
+        Given:
+            A block_size no larger than the 4-byte length prefix every
+            block spends before its payload
+        When:
+            LocalDiscovery is instantiated
+        Then:
+            It should raise ValueError, since such a block leaves no room
+            for metadata at all and would make every publish raise
+            permanently.
+        """
+        # Act & assert
+        with pytest.raises(
+            ValueError, match="Expected block size greater than the 4-byte"
+        ):
             LocalDiscovery("ns", block_size=block_size)
 
     @given(block_size=st.integers())
     @settings(max_examples=50)
+    @example(block_size=5)
+    @example(block_size=4)
     @example(block_size=1)
     @example(block_size=0)
     @example(block_size=-1)
@@ -399,14 +456,17 @@ class TestLocalDiscovery:
             LocalDiscovery is instantiated with it.
         Then:
             It should raise ValueError naming the offending value exactly
-            when the value is below one, and construct successfully for
-            every value of at least one.
+            when the value does not exceed the length prefix, and
+            construct successfully for every larger value.
         """
         # Act & assert
-        if block_size < 1:
+        if block_size <= 4:
             with pytest.raises(
                 ValueError,
-                match=f"Expected block size of at least 1, got {block_size}",
+                match=(
+                    f"Expected block size greater than the 4-byte length prefix, "
+                    f"got {block_size}"
+                ),
             ):
                 LocalDiscovery("ns", block_size=block_size)
         else:
@@ -1964,21 +2024,43 @@ class TestLocalDiscoveryPublisher:
     wool.runtime.discovery.local.LocalDiscovery.Publisher
     """
 
-    @pytest.mark.parametrize("block_size", [0, -1])
-    def test___init___should_raise_when_block_size_below_one(
-        self, namespace, block_size
-    ):
-        """Test Publisher rejects a block size below one.
+    @pytest.mark.parametrize("bad", ["a/b", "../escape", ".", "..", "", "x" * 256])
+    def test___init___should_raise_when_namespace_leaves_its_root(self, bad):
+        """Test Publisher rejects a namespace that is not one path component.
 
         Given:
-            A block_size of zero or a negative block_size
+            A namespace carrying a path separator, a relative-path
+            element, nothing at all, or more characters than a directory
+            name can hold
+        When:
+            Publisher is instantiated
+        Then:
+            It should raise ValueError at construction, so a borrower
+            cannot reach outside the module's root any more than an
+            owner can.
+        """
+        # Act & assert
+        with pytest.raises(ValueError, match="namespace"):
+            LocalDiscovery.Publisher(bad)
+
+    @pytest.mark.parametrize("block_size", [0, -1, 1, 4])
+    def test___init___should_raise_when_block_size_within_the_prefix(
+        self, namespace, block_size
+    ):
+        """Test Publisher rejects a block size the prefix alone fills.
+
+        Given:
+            A block_size no larger than the 4-byte length prefix every
+            block spends before its payload
         When:
             Publisher is instantiated
         Then:
             It should raise ValueError at construction.
         """
         # Act & assert
-        with pytest.raises(ValueError, match="Expected block size of at least 1"):
+        with pytest.raises(
+            ValueError, match="Expected block size greater than the 4-byte"
+        ):
             LocalDiscovery.Publisher(namespace, block_size=block_size)
 
     @given(block_size=st.integers())
@@ -1986,6 +2068,8 @@ class TestLocalDiscoveryPublisher:
         max_examples=50,
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
+    @example(block_size=5)
+    @example(block_size=4)
     @example(block_size=1)
     @example(block_size=0)
     @example(block_size=-1)
@@ -2000,14 +2084,17 @@ class TestLocalDiscoveryPublisher:
             A Publisher is instantiated with it.
         Then:
             It should raise ValueError naming the offending value exactly
-            when the value is below one, and construct successfully for
-            every value of at least one.
+            when the value does not exceed the length prefix, and
+            construct successfully for every larger value.
         """
         # Act & assert
-        if block_size < 1:
+        if block_size <= 4:
             with pytest.raises(
                 ValueError,
-                match=f"Expected block size of at least 1, got {block_size}",
+                match=(
+                    f"Expected block size greater than the 4-byte length prefix, "
+                    f"got {block_size}"
+                ),
             ):
                 LocalDiscovery.Publisher(namespace, block_size=block_size)
         else:
@@ -4898,6 +4985,28 @@ class TestLocalDiscoverySubscriber:
             # Act & assert
             with pytest.raises(ValueError, match=r"positive poll interval.*-0\.1"):
                 await anext(aiter(subscriber))
+
+    @pytest.mark.asyncio
+    async def test___aiter___should_reject_a_namespace_that_leaves_its_root(self):
+        """Test iteration rejects a namespace that is not one path component.
+
+        Given:
+            A subscriber constructed on a namespace containing a path
+            separator (the metaclass defers ``__init__`` until the
+            resource pool factory fires on first iteration)
+        When:
+            The caller starts iterating the subscriber
+        Then:
+            It should raise ValueError from the iteration rather than
+            from the constructor, since that is where construction
+            happens, and never open a path outside the module's root.
+        """
+        # Arrange
+        subscriber = LocalDiscovery.Subscriber("probeX/../victim")
+
+        # Act & assert
+        with pytest.raises(ValueError, match="namespace"):
+            await anext(aiter(subscriber))
 
     @pytest.mark.asyncio
     async def test___aiter___should_raise_when_namespace_has_no_owner(self, namespace):
