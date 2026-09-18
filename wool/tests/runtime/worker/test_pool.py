@@ -4527,8 +4527,15 @@ class TestWorkerPool:
             WorkerPool(spawn=negative_spawn)
 
     @given(spawn=st.integers(min_value=1, max_value=20))
+    # No deadline: each example enters a real pool, and the discovery
+    # publishes its workers under a cross-process lock that genuinely
+    # serializes them, so an example's wall-clock cost scales with the
+    # generated worker count and with whatever else the host is doing.
+    # A per-example timing bound measures the machine, not the property.
     @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
+        max_examples=100,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test_property_worker_count_bounded(self, mock_worker_factory, spawn):
@@ -4560,8 +4567,15 @@ class TestWorkerPool:
         assert len(started) == spawn
 
     @given(tags=st.lists(st.text(min_size=1, max_size=10), min_size=0, max_size=5))
+    # No deadline: each example enters a real pool, and the discovery
+    # publishes its workers under a cross-process lock that genuinely
+    # serializes them, so an example's wall-clock cost scales with the
+    # generated worker count and with whatever else the host is doing.
+    # A per-example timing bound measures the machine, not the property.
     @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
+        max_examples=100,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test_property_tags_preserved(self, mock_worker_factory, tags):
@@ -4594,8 +4608,15 @@ class TestWorkerPool:
         assert all(worker.tags == set(tags) for worker in started)
 
     @given(spawn=st.integers(min_value=1, max_value=10))
+    # No deadline: each example enters a real pool, and the discovery
+    # publishes its workers under a cross-process lock that genuinely
+    # serializes them, so an example's wall-clock cost scales with the
+    # generated worker count and with whatever else the host is doing.
+    # A per-example timing bound measures the machine, not the property.
     @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
+        max_examples=100,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test_property_cleanup_complete(self, mock_worker_factory, spawn):
@@ -4631,8 +4652,15 @@ class TestWorkerPool:
         spawn=st.integers(min_value=1, max_value=5),
         tags=st.lists(st.text(min_size=1, max_size=8), min_size=1, max_size=3),
     )
+    # No deadline: each example enters a real pool, and the discovery
+    # publishes its workers under a cross-process lock that genuinely
+    # serializes them, so an example's wall-clock cost scales with the
+    # generated worker count and with whatever else the host is doing.
+    # A per-example timing bound measures the machine, not the property.
     @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
+        max_examples=100,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test___aenter___should_refuse_re_entry_for_any_configuration(
@@ -4657,8 +4685,15 @@ class TestWorkerPool:
                 await pool.__aenter__()
 
     @given(exception_type=st.sampled_from([ValueError, RuntimeError, TypeError]))
+    # No deadline: each example enters a real pool, and the discovery
+    # publishes its workers under a cross-process lock that genuinely
+    # serializes them, so an example's wall-clock cost scales with the
+    # generated worker count and with whatever else the host is doing.
+    # A per-example timing bound measures the machine, not the property.
     @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
+        max_examples=100,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test_property_exception_propagation(
@@ -5916,7 +5951,11 @@ class TestWorkerPool:
         assert proxy_kwargs["quorum"] == 3
 
     @given(quorum=st.integers(min_value=-100, max_value=-1))
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    # No deadline: entry reaches the discovery publish path, whose
+    # cross-process lock genuinely serializes, so a per-example timing
+    # bound measures the host rather than the property. See the pool
+    # property tests above.
+    @settings(deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @pytest.mark.asyncio
     async def test___aenter___rejects_negative_quorum_pbt(
         self, quorum, mock_local_worker
