@@ -218,7 +218,7 @@ class _File:
             os.ftruncate(file.fileno(), size)
         except BaseException:  # pragma: no cover
             file.close()
-            _unlink_quietly(path)
+            _unlink_quietly(path.parent, path.name)
             raise
         return cls(path, file)
 
@@ -603,12 +603,27 @@ class LocalDiscovery(Discovery):
 
         The directory is removed while the claim is still held; see the
         directory re-check in `LocalDiscovery`'s implementation notes.
+
+        Every removal resolves against the claim's own descriptor rather
+        than the namespace's path, so an owner reclaims the directory it
+        holds and never one that replaced it. A directory removed from
+        under a live owner, by a temporary-file sweeper or a careless
+        hand, frees the namespace for a successor while this claim lives;
+        without that, this owner's ordinary exit would go on to delete
+        the successor's registry.
         """
         directory = _directory(self._namespace)
-        _unlink_quietly(directory / _STAGING)
-        _unlink_quietly(directory / _REGISTRY)
-        _unlink_quietly(directory / _NOTIFY)
-        _rmdir_quietly(directory)
+        _unlink_quietly(directory, _STAGING, dir_fd=self._claim)
+        _unlink_quietly(directory, _REGISTRY, dir_fd=self._claim)
+        _unlink_quietly(directory, _NOTIFY, dir_fd=self._claim)
+        # The name is all `rmdir` has, so it is removed only while the
+        # path still resolves to the claimed directory.
+        try:
+            claimed = os.path.samestat(os.fstat(self._claim), os.stat(directory))
+        except OSError:
+            claimed = False
+        if claimed:
+            _rmdir_quietly(directory)
         os.close(self._claim)
 
     class Publisher:
@@ -936,7 +951,7 @@ class LocalDiscovery(Discovery):
             block = _File.create(path, self._block_size)
 
             def cleanup():  # pragma: no cover
-                _unlink_quietly(path)
+                _unlink_quietly(path.parent, path.name)
                 _rmdir_quietly(path.parent)
 
             self._cleanups[name] = atexit.register(cleanup)
@@ -956,7 +971,7 @@ class LocalDiscovery(Discovery):
                 The block to finalize.
             """
             atexit.unregister(self._cleanups.pop(block.path.name))
-            _unlink_quietly(block.path)
+            _unlink_quietly(block.path.parent, block.path.name)
             _rmdir_quietly(block.path.parent)
             block.close()
 
@@ -1225,7 +1240,7 @@ def _read_block(block: _File) -> bytes:
     return block.read(size, prefix)
 
 
-def _unlink_quietly(path: Path) -> None:
+def _unlink_quietly(directory: Path, name: str, *, dir_fd: int | None = None) -> None:
     """Remove a file without raising, warning if it fails unexpectedly.
 
     Every teardown path in this module removes files through here, so no
@@ -1238,16 +1253,32 @@ def _unlink_quietly(path: Path) -> None:
     cannot act on but an operator can, so it surfaces as a
     `ResourceWarning` rather than being swallowed.
 
-    :param path:
-        The file to remove.
+    The directory and the name are separate so that ``dir_fd`` cannot
+    disagree with the path a warning names: with the two joined, a caller
+    could pass one namespace's path and another's descriptor, and remove
+    the second while reporting the first.
+
+    :param directory:
+        The directory holding the file. It is walked only when ``dir_fd``
+        is absent, and names the file in any warning either way.
+    :param name:
+        The file's name within ``directory``.
+    :param dir_fd:
+        A descriptor on ``directory``, which the removal resolves ``name``
+        against instead of walking the path. Pass it wherever the
+        directory may be replaced between opening it and removing from
+        it; see `LocalDiscovery._release`.
     """
     try:
-        os.unlink(path)
+        if dir_fd is None:
+            os.unlink(directory / name)
+        else:
+            os.unlink(name, dir_fd=dir_fd)
     except FileNotFoundError:
         pass
     except OSError as error:
         warnings.warn(
-            f"failed to remove {str(path)!r}: {error}",
+            f"failed to remove {str(directory / name)!r}: {error}",
             ResourceWarning,
             stacklevel=2,
         )

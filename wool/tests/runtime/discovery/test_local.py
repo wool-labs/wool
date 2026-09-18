@@ -170,26 +170,48 @@ def unlink_schedule(mocker, namespace, teardown_log):
     """Patches file removal with a schedule-driven wrapper and returns
     the schedule list. Each removal is logged to `teardown_log`.
 
-    Only removals inside this test's namespace directory are wrapped, so
-    unrelated removals anywhere in the interpreter pass straight
-    through. Each wrapped call performs the real removal — so no file
-    leaks — then consumes one schedule entry and raises it when the entry
-    is an exception, simulating an external remover or a hostile
-    filesystem. An empty or exhausted schedule means the removal passes
-    through untouched. A one-shot failure is therefore a one-entry
-    schedule, and a generated failure pattern is a longer one. Patching
-    once per test (rather than per failure or per Hypothesis example)
-    avoids stacking wrappers.
+    Only removals inside this test's namespace are wrapped, so unrelated
+    removals anywhere in the interpreter pass straight through. A test
+    deriving per-example namespaces from this one is covered too, since
+    the scope is every directory whose name carries the namespace.
+    Removals the owner resolves against its claim descriptor name no
+    directory at all, so that descriptor is matched against the
+    directories it could be holding.
+
+    Each wrapped call performs the real removal — so no file leaks — then
+    consumes one schedule entry and raises it when the entry is an
+    exception, simulating an external remover or a hostile filesystem. An
+    empty or exhausted schedule means the removal passes through
+    untouched. A one-shot failure is therefore a one-entry schedule, and
+    a generated failure pattern is a longer one. Patching once per test
+    (rather than per failure or per Hypothesis example) avoids stacking
+    wrappers.
     """
     schedule: list[Exception | None] = []
     real_unlink = os.unlink
-    directory = namespace_directory(namespace)
+    root = namespace_directory(namespace).parent
+    prefix = f"wool-{namespace}"
 
-    def unlink(path, **kwargs):
-        if Path(path).parent != directory:
-            return real_unlink(path, **kwargs)
+    def scoped(path, dir_fd):
+        if dir_fd is None:
+            return Path(path).parent.name.startswith(prefix)
+        try:
+            holder = os.fstat(dir_fd)
+        except OSError:
+            return False
+        for candidate in root.glob(f"{prefix}*"):
+            try:
+                if os.path.samestat(holder, os.stat(candidate)):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def unlink(path, *, dir_fd=None, **kwargs):
+        if not scoped(path, dir_fd):
+            return real_unlink(path, dir_fd=dir_fd, **kwargs)
         teardown_log.append("unlink")
-        real_unlink(path, **kwargs)
+        real_unlink(path, dir_fd=dir_fd, **kwargs)
         if schedule and (error := schedule.pop(0)) is not None:
             raise error
 
