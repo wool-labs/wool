@@ -153,7 +153,8 @@ class _WorkerReference:
         :returns:
             A new reference instance.
         :raises ValueError:
-            If data is not 16 bytes or is NULL.
+            If data is not 16 bytes. A NULL slot yields the nil UUID and
+            is the caller's to skip; see `LocalDiscovery.Subscriber`.
         """
         ref = object.__new__(cls)
         ref._uuid = UUID(bytes=data)
@@ -291,20 +292,32 @@ class LocalDiscovery(Discovery):
 
     **Ownership.** A namespace's registry has exactly one owner: the
     entered instance holding the namespace's claim. Entering claims the
-    namespace and creates its registry, and exiting reclaims both.
-    Entering a namespace that a live owner holds raises
-    `DiscoveryNamespaceInUse`. An owner that never exits, e.g., one
+    namespace and creates its registry, and exiting reclaims both. The
+    namespace is in use — and a further entry raises
+    `DiscoveryNamespaceInUse` — while *any* process holding the claim
+    lives. That is the owner's process, and anything forked from it
+    after entry; see **Forks**. An owner that never exits, e.g., one
     abandoned when the interpreter shuts down, reclaims the registry at
-    shutdown. A killed owner's claim ends with its process, so the next
-    entry on the namespace succeeds and replaces any registry the killed
-    owner left behind.
+    shutdown.
+
+    A killed owner that was never forked from holds the claim in no
+    surviving process, so the kernel drops it and the next entry on the
+    namespace succeeds, replacing any registry the killed owner left
+    behind. What that entry does *not* reclaim is the rest of the
+    directory; see the note on non-graceful exits in the implementation
+    notes below.
 
     **Forks.** A process forked from an entered owner inherits both the
-    claim and the owner's teardown, so the fork's own exit reclaims the
-    namespace's files while the claim itself lives until every process
-    holding it has exited. Wool starts its own workers with ``spawn``; a
-    host that forks should enter a namespace in the process that owns
-    it.
+    claim and the owner's teardown, because the claim is a descriptor
+    the fork keeps and the teardown is interpreter state the fork
+    copies. Two consequences follow, and neither is what a forking
+    caller usually wants: the fork's own ordinary exit reclaims the live
+    parent's registry and directory, and the claim itself outlives the
+    parent, so the namespace stays in use until every process holding it
+    has exited. Wool starts its own workers with ``spawn``, which is
+    ``spawn(2)`` and inherits neither. A host that forks should enter a
+    namespace in the process that owns it, and should not fork between
+    entry and exit.
 
     **Borrowing.** `LocalDiscovery.Publisher` and
     `LocalDiscovery.Subscriber`, including those `publisher`,
@@ -326,9 +339,9 @@ class LocalDiscovery(Discovery):
     it, so a second entry raises `RuntimeError`. Retrying a rejected
     claim requires a new instance. Exiting never raises, and exiting an
     instance never entered, or already exited, does nothing at all; a
-    failed removal surfaces as a `ResourceWarning`. Once the owner and every
-    publisher have exited, the namespace leaves nothing on the
-    filesystem.
+    failed removal surfaces as a `ResourceWarning`. Once the owner and
+    every publisher have exited *gracefully*, the namespace leaves
+    nothing on the filesystem.
 
     :param namespace:
         Identifier of the registry. It names one directory under this
@@ -363,8 +376,7 @@ class LocalDiscovery(Discovery):
         not what is unusable in practice. Defaults to 1024.
     :param lock_timeout:
         Maximum seconds each publisher waits for the cross-process file
-        lock; see `LocalDiscovery.Publisher`. Defaults to
-        `DEFAULT_LOCK_TIMEOUT`.
+        lock; see `LocalDiscovery.Publisher`. Defaults to 30.0.
     :raises ValueError:
         If ``namespace`` does not name a single path component, if
         ``capacity`` is less than 1, if ``block_size`` does not exceed
@@ -375,24 +387,27 @@ class LocalDiscovery(Discovery):
 
     .. code-block:: python
 
-        with LocalDiscovery("my-worker-pool") as discovery:
-            async with discovery.publisher as publisher:
-                await publisher.publish("worker-added", metadata)
+        async def publish(metadata):
+            with LocalDiscovery("my-worker-pool") as discovery:
+                async with discovery.publisher as publisher:
+                    await publisher.publish("worker-added", metadata)
 
     Example — subscribe to workers:
 
     .. code-block:: python
 
-        with LocalDiscovery("my-worker-pool") as discovery:
-            async for event in discovery.subscriber:
-                print(f"Discovered worker: {event.metadata}")
+        async def watch():
+            with LocalDiscovery("my-worker-pool") as discovery:
+                async for event in discovery.subscriber:
+                    print(f"Discovered worker: {event.metadata}")
 
     Example — borrow a namespace another process owns:
 
     .. code-block:: python
 
-        async for event in LocalDiscovery.Subscriber("my-worker-pool"):
-            print(f"Discovered worker: {event.metadata}")
+        async def watch_borrowed():
+            async for event in LocalDiscovery.Subscriber("my-worker-pool"):
+                print(f"Discovered worker: {event.metadata}")
 
     .. rubric:: Implementation notes
 
@@ -432,7 +447,24 @@ class LocalDiscovery(Discovery):
     Publishers lock the registry file itself rather than a separate lock
     file. The lock and the data it guards therefore always share an
     inode: an orphaned publisher still locking a reclaimed registry can
-    only write to that registry, never to a successor's.
+    only write to that registry, never to a successor's. A publish opens
+    its own handle and closes it on return, rather than a publisher
+    holding one for its life. A file lock is held per open file
+    description with no nesting count, so a shared handle would let a
+    second publish on the same publisher take a lock the first already
+    held and release the first's lock when it finished — leaving the
+    invariant above asserted rather than enforced. Opening per publish
+    makes it unrepresentable instead: the descriptor a publish locks is
+    the descriptor it writes.
+
+    The registry is fixed-width by design. Files can grow — `_File`
+    sizes with ``ftruncate``, ``pwrite`` extends past the end, and the
+    capacity is re-read from the header on every scan — so ``capacity``
+    is not a limitation inherited from the storage the way it was when a
+    registry was a mapped shared-memory segment. It is kept because
+    growth would need a resize protocol between unrelated processes,
+    where subscribers scan without any lock, in exchange for removing a
+    bound that callers can already set.
 
     Borrowers never create the directory or anything in it but their
     own blocks. Exiting removes the registry, the notification file and
@@ -446,6 +478,19 @@ class LocalDiscovery(Discovery):
     entry and unregistered on exit before the removal runs, so a failed
     removal leaves no handler armed to fire again at interpreter
     shutdown.
+
+    That fallback is the only reclaimer, and it is interpreter state: it
+    does not run when a process dies from a signal. A ``SIGKILL``, or a
+    ``SIGTERM`` with no handler installed — the ordinary container
+    shutdown path — therefore strands the namespace's directory and one
+    block file per registered worker. A successor entering the same
+    namespace replaces the registry and the notification file but sweeps
+    nothing else, so its own clean exit then fails to remove a directory
+    that is no longer empty, silently. The residue is bounded by the
+    filesystem rather than reclaimed by this module: ``/dev/shm`` is
+    cleared on reboot, and a temporary directory is reaped by the
+    platform's temporary-file sweeper. Because a pool mints a fresh
+    namespace per lifecycle, nothing re-claims an abandoned one.
     """
 
     _claim: int
@@ -547,7 +592,7 @@ class LocalDiscovery(Discovery):
         return NotImplemented
 
     @property
-    def namespace(self):
+    def namespace(self) -> str:
         """The namespace identifier for this discovery service.
 
         :returns:
@@ -699,7 +744,7 @@ class LocalDiscovery(Discovery):
         :param lock_timeout:
             Maximum seconds to wait for the cross-process file lock before
             raising `TimeoutError`. ``None`` waits forever. Defaults to
-            `DEFAULT_LOCK_TIMEOUT`.
+            30.0.
         :raises ValueError:
             If ``namespace`` is outside the domain `LocalDiscovery`
             documents, if ``block_size`` does not exceed the 4-byte
@@ -786,7 +831,7 @@ class LocalDiscovery(Discovery):
                 await self._block_pool.__aexit__(*args)
 
         @property
-        def namespace(self):
+        def namespace(self) -> str:
             """The namespace identifier for this publisher.
 
             :returns:
@@ -808,12 +853,16 @@ class LocalDiscovery(Discovery):
             wins — consuming no additional slot, so a single
             ``worker-dropped`` always fully unregisters the worker. Live
             subscribers observe a refresh as a ``worker-updated`` event.
-            A refresh writes into the block created at the worker's first
-            registration, so ``block_size`` governs only blocks this
-            publisher creates. If that block has vanished — e.g., its
-            publisher exited without dropping the worker — the re-add
-            reclaims the stale registration and registers the worker
-            fresh.
+            A refresh writes into the block
+            created at the worker's first registration, so ``block_size``
+            governs only blocks this publisher creates. If that block has
+            vanished — e.g., its publisher exited without dropping the
+            worker — the re-add reclaims the stale registration and
+            registers the worker fresh.
+
+            Each call opens its own registry handle and releases it on
+            return, so the descriptor it locks is the descriptor it
+            writes; see `LocalDiscovery`'s implementation notes.
 
             :param type:
                 The type of discovery event.
@@ -845,7 +894,7 @@ class LocalDiscovery(Discovery):
                     registry, namespace=self._namespace, timeout=self._lock_timeout
                 ):
                     if _read_capacity(registry) is None:  # pragma: no cover
-                        raise RuntimeError("Registrar service not properly initialized")
+                        raise RuntimeError("Discovery registry header is not stamped")
                     match type:
                         case "worker-added":
                             await self._add(metadata, registry)
@@ -1071,7 +1120,7 @@ class LocalDiscovery(Discovery):
         subscription; see `SubscriberMeta`. Only the iteration that
         starts a subscription binds, so only that iteration raises
         `DiscoveryNamespaceNotFound`. An iteration that joins a live
-        subscription over an orphaned mapping keeps reading it and never
+        subscription over an orphaned registry keeps reading it and never
         observes a successor owner, and an iteration that joins a failing
         bind ends without events.
 
@@ -1084,10 +1133,9 @@ class LocalDiscovery(Discovery):
             Part of the subscription key.
         :raises ValueError:
             If ``namespace`` is outside the domain `LocalDiscovery`
-            documents, or ``poll_interval`` is not positive.
-            Construction is deferred, so both surface from the iteration
-            that starts the subscription rather than from the
-            constructor.
+            documents, or ``poll_interval`` is not positive. Construction
+            is deferred, so both surface from the iteration that starts
+            the subscription rather than from the constructor.
         """
 
         _namespace: Final[str]
@@ -1141,7 +1189,7 @@ class LocalDiscovery(Discovery):
                 observer.schedule(handler, path=str(watchdog.parent), recursive=False)
                 try:
                     observer.start()
-                except FileNotFoundError as error:  # pragma: no cover
+                except FileNotFoundError as error:
                     # The owner exited between the bind and the watch.
                     raise DiscoveryNamespaceNotFound(self._namespace) from error
                 try:
@@ -1159,10 +1207,7 @@ class LocalDiscovery(Discovery):
                                 metadata = self._deserialize_metadata(ref)
                             except Exception:
                                 self._carry_forward(
-                                    slot,
-                                    cached_workers,
-                                    discovered_workers,
-                                    carried,
+                                    slot, cached_workers, discovered_workers, carried
                                 )
                                 continue
                             uid = str(metadata.uid)
@@ -1273,6 +1318,15 @@ class LocalDiscovery(Discovery):
             added, dropped, or updated. Updates the cache in-place and yields
             appropriate discovery events for each change.
 
+            Every still-registered worker yields ``worker-updated`` on
+            every scan, whether or not its metadata changed. That is
+            deliberate and load-bearing rather than merely wasteful: it
+            is the only route by which a consumer that refused a worker
+            — `~wool.WorkerProxy` refusing one against its lease — is
+            offered that worker again once it has room. Suppressing the
+            unchanged case would leave such a worker unadmitted until it
+            happened to change or re-register.
+
             :param cached_workers:
                 Dictionary of previously discovered workers (UID string ->
                 WorkerMetadata). Modified in-place to reflect current state.
@@ -1284,19 +1338,16 @@ class LocalDiscovery(Discovery):
                 worker-dropped, worker-updated).
             """
 
-            # Identify added workers
             for uid in set(discovered_workers) - set(cached_workers):
                 cached_workers[uid] = discovered_workers[uid]
                 event = DiscoveryEvent("worker-added", metadata=discovered_workers[uid])
                 yield event
 
-            # Identify removed workers
             for uid in set(cached_workers) - set(discovered_workers):
                 discovered_worker = cached_workers.pop(uid)
                 event = DiscoveryEvent("worker-dropped", metadata=discovered_worker)
                 yield event
 
-            # Identify updated workers
             for uid in set(cached_workers) & set(discovered_workers):
                 cached_workers[uid] = discovered_workers[uid]
                 event = DiscoveryEvent(
@@ -1564,15 +1615,15 @@ def _root() -> Path:
     """Return the directory that holds every namespace's directory.
 
     :returns:
-        ``/dev/shm`` on Linux when it is a writable directory, i.e.,
-        memory-backed, otherwise the temporary directory. Symlinks are
-        resolved, so watchdog event paths compare equal to paths built
-        from it.
+        ``/dev/shm`` on Linux when it is writable and searchable, i.e.,
+        a usable memory-backed directory, otherwise the temporary
+        directory. Symlinks are resolved, so watchdog event paths compare
+        equal to paths built from it.
     """
     shm = Path("/dev/shm")
     if sys.platform.startswith("linux") and os.access(shm, os.W_OK | os.X_OK):
         return shm.resolve()  # pragma: no cover — Linux only
-    return Path(tempfile.gettempdir()).resolve()  # pragma: no cover — not Linux
+    return Path(tempfile.gettempdir()).resolve()
 
 
 def _directory(namespace: str) -> Path:
@@ -1654,13 +1705,15 @@ async def _lock(
 
     Acquisition uses non-blocking ``portalocker`` attempts, retrying every
     1ms (``await asyncio.sleep(0.001)``) until the lock is acquired or
-    ``timeout`` elapses. The lock holder is by definition another process, so
-    a hot spin here cannot make it release sooner — it would only burn CPU
-    competing with the process being waited on — hence the 1ms poll rather
-    than a zero-second yield.
+    ``timeout`` elapses. The holder is another open file description,
+    which may belong to another process or to another publish on this
+    loop, since a publish opens its own handle. A hot spin cannot shorten
+    a cross-process hold, and it drives this loop's ``select`` timeout to
+    zero, so it burns CPU and wakeups for no gain — hence the 1ms poll
+    rather than a zero-second yield.
 
     The held section runs to completion because interrupting a holder
-    mid-write would corrupt the registry for every process mapping it.
+    mid-write would corrupt the registry for every process reading it.
     """
     loop = asyncio.get_running_loop()
     deadline = None if timeout is None else loop.time() + timeout

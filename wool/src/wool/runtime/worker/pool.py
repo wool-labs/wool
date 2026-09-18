@@ -146,6 +146,16 @@ class WorkerPool:
         another process owns; see `~wool.LocalDiscovery`. See
         `~wool.DiscoverySubscriberLike` for what a subscriber must
         provide.
+
+        An instance passed here is entered for this pool's lifetime, so
+        a single-use backend is spent by that one entry and cannot be
+        reused by a second pool — `~wool.LocalDiscovery` raises
+        `RuntimeError` on a second entry rather than the timeout a
+        retry would expect. Pass a `Factory` instead
+        (``discovery=partial(LocalDiscovery, ns)``) wherever the pool
+        may need to be reconstructed; the pool then resolves a fresh
+        instance per entry. This distinction is backend-specific:
+        `~wool.LanDiscovery` is not a context manager and is unaffected.
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
 
@@ -202,7 +212,9 @@ class WorkerPool:
         which documents the bound and when it is inert. A timeout at
         context entry (``lazy=False``) leaves the pool, never having
         entered, unusable per its single-use semantics, so construct a
-        new pool to retry.
+        new pool to retry — and, where ``discovery`` was given as a
+        single-use instance, a fresh discovery instance with it. See the
+        ``discovery`` parameter.
     :param shutdown_timeout:
         Maximum number of seconds to wait for spawned workers to stop
         during pool teardown, applied as a single deadline to the full
@@ -256,6 +268,24 @@ class WorkerPool:
     :raises ~wool.DiscoveryNamespaceNotFound:
         If ``discovery`` borrows a `~wool.LocalDiscovery` namespace that
         has no registry; see `WorkerProxy`.
+    :raises ~wool.DiscoveryCapacityExhausted:
+        At context entry, if publishing a spawned worker finds no free
+        slot. Only reachable when the caller supplies ``discovery``: a
+        pool that owns its registry sizes it to the number of workers it
+        will spawn.
+    :raises ~wool.DiscoveryBlockExhausted:
+        At context entry, if a spawned worker's serialized metadata
+        exceeds its block. Only reachable when the caller supplies
+        ``discovery``, since the block size is the backend's to
+        configure.
+    :raises TimeoutError:
+        At context entry or teardown, if a discovery publish does not
+        acquire the backend's cross-process lock in time — for
+        `~wool.LocalDiscovery`, within its ``lock_timeout``.
+    :raises ExceptionGroup:
+        At context entry, wrapping any of the above raised while workers
+        start concurrently. The failures of a concurrent start arrive
+        together rather than one at a time.
 
     **Basic ephemeral pool:**
 
