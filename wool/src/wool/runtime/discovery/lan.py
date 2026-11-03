@@ -463,7 +463,7 @@ class LanDiscovery(Discovery):
 
     class Subscriber(
         metaclass=SubscriberMeta,
-        key=lambda cls, service_type: (cls, service_type),
+        key=lambda cls, service_type: service_type,
     ):
         """Subscriber for receiving worker discovery events.
 

@@ -38,7 +38,6 @@ from wool.runtime.context.runtime import dispatch_timeout
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.local import LocalDiscovery
-from wool.runtime.discovery.pool import _subscriber_factories
 from wool.runtime.discovery.pool import install_subscriber_pool
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
@@ -1728,15 +1727,14 @@ def subscriber_pool():
     Mirrors the discovery unit tests' fixture of the same name (see
     ``tests/runtime/discovery/conftest.py``), whose docstring gives the
     reason it is synchronous. Constructing a `LocalDiscovery.Subscriber`
-    installs a pool in the calling context and registers a factory in a
-    module-level registry, and this fixture scopes both to one test.
+    installs a pool in the calling context, and this fixture scopes it
+    to one test.
     """
     token = __subscriber_pool__.set(None)
     try:
         yield install_subscriber_pool()
     finally:
         __subscriber_pool__.reset(token)
-        _subscriber_factories.clear()
 
 
 @pytest_asyncio.fixture(autouse=True)
