@@ -689,8 +689,12 @@ class WorkerConnection:
             with the retiring worker thread still running.
         :param timeout:
             gRPC call deadline in seconds for the stop call. ``None``
-            applies no deadline. The worker drains for up to ``grace``
-            before responding, so a finite deadline must exceed it.
+            applies no deadline. A finite deadline must cover a positive
+            ``grace`` twice over — it bounds the in-flight grace period
+            and the worker-thread join in turn — plus the worker-loop
+            teardown that runs between them and the call's own transport
+            overhead. The worker README's "Shutdown timeout" section
+            quantifies the teardown budgets.
         :raises TransientRpcError:
             If the worker returns a transient RPC error
             (``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, or

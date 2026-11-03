@@ -11,6 +11,7 @@ from hypothesis import strategies as st
 
 from wool import protocol
 from wool.runtime.worker import local as local_module
+from wool.runtime.worker import service as service_module
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.auth import WorkerCredentialsProvider
 from wool.runtime.worker.base import ChannelOptions
@@ -472,8 +473,9 @@ class TestLocalWorker:
             stop() is called with it
         Then:
             It should forward the grace period in the stop request,
-            bound the RPC by deadline = grace + _STOP_RPC_MARGIN, and
-            reap with the same grace period
+            bound the RPC by a deadline that budgets the grace twice
+            plus the stop margin, exceeding the worst-case idle
+            retirement, and reap with the same grace period
         """
         # Arrange
         mock_process = _make_started_process(mocker)
@@ -489,8 +491,16 @@ class TestLocalWorker:
         request = mock_stub.stop.await_args.args[0]
         assert request.timeout == grace
         deadline = mock_stub.stop.await_args.kwargs["timeout"]
-        assert deadline == grace + local_module._STOP_RPC_MARGIN
-        assert deadline > grace
+        assert deadline == 2 * grace + local_module.STOP_RPC_MARGIN
+        assert deadline > grace + (
+            service_module._DRAIN_TIMEOUT + 3 * service_module._MIN_CLEAR_TIMEOUT
+        )
+        # Draw-independent: the margin itself must exceed the worst-case
+        # idle retirement, whatever grace Hypothesis drew, which pins the
+        # transport-and-response term the inequality above can absorb.
+        assert local_module.STOP_RPC_MARGIN > (
+            service_module._DRAIN_TIMEOUT + 3 * service_module._MIN_CLEAR_TIMEOUT
+        )
         mock_process.reap.assert_called_once_with(grace)
 
     @pytest.mark.asyncio

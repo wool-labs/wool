@@ -558,6 +558,9 @@ class WorkerProcess(Process):
                 if self._backpressure is not None
                 else None
             )
+            # Teardown budgets left at the module defaults, which
+            # `~wool.runtime.worker.local.STOP_RPC_MARGIN` is sized
+            # from; forwarding one from here invalidates that margin.
             service = WorkerService(backpressure=backpressure)
             protocol.add_to_server[protocol.WorkerServicer](service, server)
 
