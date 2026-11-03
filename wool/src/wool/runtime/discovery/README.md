@@ -22,9 +22,9 @@ Wool ships with two discovery protocols — `LocalDiscovery` and `LanDiscovery`.
 
 `LocalDiscovery`
 
-Shared-memory IPC for single-machine pools, and the default for a `WorkerPool` created without a discovery protocol. Processes on one host share a registry of workers identified by a namespace string, with no network and no configuration.
+File-backed IPC for single-machine pools, and the default for a `WorkerPool` created without a discovery protocol. Processes on one host share a registry of workers identified by a namespace string, with no network and no configuration.
 
-A namespace has exactly one **owner**, the entered `LocalDiscovery` instance that created its registry. `LocalDiscovery.Publisher` and `LocalDiscovery.Subscriber` **borrow** that registry, and a borrower that outlives its owner is **orphaned**. The `LocalDiscovery` docstring defines the three roles and the errors each one raises.
+A namespace has three roles. Exactly one **owner** — an entered `LocalDiscovery` instance — holds the namespace and everything in it. `LocalDiscovery.Publisher` and `LocalDiscovery.Subscriber` **borrow** it, and a borrower does not outlive its owner: one that tries fails loudly rather than reaching a successor or serving a stale snapshot. The `LocalDiscovery` docstring owns the contract — what ends a claim, what a fork inherits, what survives a kill, and the errors each role raises.
 
 `LanDiscovery`
 
