@@ -114,6 +114,37 @@ def _pool_factory(key: Any) -> _PooledSubscriber:
     return _PooledSubscriber(subscriber=subscriber, fanout=Fanout(subscriber))
 
 
+async def _pool_finalizer(pooled: _PooledSubscriber) -> None:
+    """Close the entry's fanout and retire its subscriber.
+
+    Each step runs even if the one before it raised, so a subscriber is
+    never left un-retired because closing its fanout failed. The first
+    failure is the one that reaches the pool; a second is discarded, so
+    retiring the subscriber cannot hide why closing its fanout did not
+    work.
+
+    :param pooled:
+        The entry being retired, carrying the subscriber and the fanout
+        over it.
+    """
+    failure: BaseException | None = None
+    try:
+        await pooled.fanout.cleanup()
+    except BaseException as error:
+        failure = error
+    subscriber = pooled.subscriber
+    # `DiscoverySubscriberLike` declares no shutdown hook, so a backend
+    # that needs teardown opts in by exposing one.
+    if hasattr(subscriber, "_shutdown"):
+        try:
+            await subscriber._shutdown()
+        except BaseException as error:
+            if failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
+
+
 def install_subscriber_pool() -> ResourcePool[Any]:
     """Return the context's discovery subscriber pool, installing one if needed.
 
@@ -329,34 +360,3 @@ class SubscriberMeta(type):
 
         cls.__new__ = _subscriber_new  # type: ignore[assignment]
         return cls  # type: ignore[return-value]
-
-
-async def _pool_finalizer(pooled: _PooledSubscriber) -> None:
-    """Close the entry's fanout and retire its subscriber.
-
-    Each step runs even if the one before it raised, so a subscriber is
-    never left un-retired because closing its fanout failed. The first
-    failure is the one that reaches the pool; a second is discarded, so
-    retiring the subscriber cannot hide why closing its fanout did not
-    work.
-
-    :param pooled:
-        The entry being retired, carrying the subscriber and the fanout
-        over it.
-    """
-    failure: BaseException | None = None
-    try:
-        await pooled.fanout.cleanup()
-    except BaseException as error:
-        failure = error
-    subscriber = pooled.subscriber
-    # `DiscoverySubscriberLike` declares no shutdown hook, so a backend
-    # that needs teardown opts in by exposing one.
-    if hasattr(subscriber, "_shutdown"):
-        try:
-            await subscriber._shutdown()
-        except BaseException as error:
-            if failure is None:
-                failure = error
-    if failure is not None:
-        raise failure
