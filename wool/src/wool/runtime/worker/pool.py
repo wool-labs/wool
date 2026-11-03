@@ -806,7 +806,7 @@ class WorkerPool:
 
                 @asynccontextmanager
                 async def create_proxy():
-                    with LocalDiscovery(namespace) as discovery:
+                    with LocalDiscovery(namespace, capacity=spawn) as discovery:
                         async with self._worker_context(
                             *tags,
                             spawn=spawn,
@@ -873,7 +873,7 @@ class WorkerPool:
 
                 @asynccontextmanager
                 async def create_proxy():
-                    with LocalDiscovery(namespace) as discovery:
+                    with LocalDiscovery(namespace, capacity=spawn) as discovery:
                         async with self._worker_context(
                             *tags,
                             spawn=spawn,
