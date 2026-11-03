@@ -175,7 +175,7 @@ def _reconstruct(cls: type, args: tuple, kwargs: dict) -> Any:
     return cls(*args, **kwargs)
 
 
-class _SharedSubscription:
+class _Subscription:
     """Bridge a discovery subscriber to a shared `Fanout`.
 
     One of these exists per construction, and each ``__aiter__`` call
@@ -311,7 +311,7 @@ class SubscriberMeta(type):
 
     Class creation injects a ``__new__`` onto the subscriber class. Each
     construction installs the context's subscriber pool and returns a
-    `_SharedSubscription` whose key carries a factory of its own. Each
+    `_Subscription` whose key carries a factory of its own. Each
     iteration of that subscription enters the pool's resource for the
     key, which builds the underlying subscriber through that factory on
     first use, and consumes it through a shared
@@ -353,7 +353,7 @@ class SubscriberMeta(type):
                 original_init(instance, *args, **kwargs)
                 return instance
 
-            return _SharedSubscription(
+            return _Subscription(
                 key=_SubscriberKey(identity, factory),
                 reduce_info=(cls_arg, args, kwargs),
             )

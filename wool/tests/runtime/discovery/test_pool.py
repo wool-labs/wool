@@ -18,8 +18,8 @@ from hypothesis import strategies as st
 from wool.runtime.discovery import __subscriber_pool__
 from wool.runtime.discovery.base import DiscoveryEvent
 from wool.runtime.discovery.pool import SubscriberMeta
-from wool.runtime.discovery.pool import _SharedSubscription
 from wool.runtime.discovery.pool import _SubscriberKey
+from wool.runtime.discovery.pool import _Subscription
 from wool.runtime.discovery.pool import install_subscriber_pool
 from wool.runtime.worker.metadata import WorkerMetadata
 
@@ -67,9 +67,9 @@ def _setup_pool():
 
 
 def _make_shared(source, key="test-key"):
-    """Create a _SharedSubscription backed by a raw source via the pool."""
+    """Create a _Subscription backed by a raw source via the pool."""
     _setup_pool()
-    return _SharedSubscription(
+    return _Subscription(
         key=_SubscriberKey(key, lambda: source),
         reduce_info=(type(source), (), {}),
     )
@@ -320,21 +320,21 @@ class TestSubscriberMeta:
     """
 
     def test___new___with_shared_subscription_wrapping(self):
-        """Test SubscriberMeta returns a _SharedSubscription.
+        """Test SubscriberMeta returns a _Subscription.
 
         Given:
             A subscriber class using SubscriberMeta.
         When:
             The class is instantiated.
         Then:
-            It should return a _SharedSubscription wrapping the
+            It should return a _Subscription wrapping the
             cached raw subscriber.
         """
         # Act
         result = _StubSubscriber("wrap-key")
 
         # Assert
-        assert isinstance(result, _SharedSubscription)
+        assert isinstance(result, _Subscription)
 
     @pytest.mark.asyncio
     async def test___new___with_shared_fan_out(self, subscriber_pool):
@@ -526,7 +526,7 @@ class TestSubscriberMeta:
         When:
             The class is instantiated.
         Then:
-            It should produce a _SharedSubscription whose cache key
+            It should produce a _Subscription whose cache key
             was computed using the class itself.
         """
         # Arrange
@@ -557,7 +557,7 @@ class TestSubscriberMeta:
         result = _CaptureSub("test-val")
 
         # Assert
-        assert isinstance(result, _SharedSubscription)
+        assert isinstance(result, _Subscription)
         assert captured["cls"] is _CaptureSub
         assert captured["value"] == "test-val"
 
@@ -571,7 +571,7 @@ class TestSubscriberMeta:
             The subclass is instantiated.
         Then:
             It should inherit the parent's key callable and return
-            a _SharedSubscription.
+            a _Subscription.
         """
 
         # Arrange
@@ -598,7 +598,7 @@ class TestSubscriberMeta:
         result = _Child("child-tag")
 
         # Assert
-        assert isinstance(result, _SharedSubscription)
+        assert isinstance(result, _Subscription)
 
     def test___new___should_raise_when_the_key_is_unhashable(self):
         """Test an unhashable key is refused by the construction making it.
@@ -782,10 +782,10 @@ class TestSubscriberMeta:
         assert reference() is None
 
 
-class TestSharedSubscription:
-    """Tests for _SharedSubscription class.
+class TestSubscription:
+    """Tests for _Subscription class.
 
-    Fully qualified name: wool.runtime.discovery.pool._SharedSubscription
+    Fully qualified name: wool.runtime.discovery.pool._Subscription
     """
 
     @pytest.mark.asyncio
@@ -793,7 +793,7 @@ class TestSharedSubscription:
         """Test iteration pulls from the source.
 
         Given:
-            A _SharedSubscription backed by a source that yields
+            A _Subscription backed by a source that yields
             one event.
         When:
             The subscription is iterated.
@@ -845,8 +845,8 @@ class TestSharedSubscription:
         source = _Source()
         key = _SubscriberKey("fan-out-key", lambda: source)
 
-        sub_a = _SharedSubscription(key=key, reduce_info=(type(source), (), {}))
-        sub_b = _SharedSubscription(key=key, reduce_info=(type(source), (), {}))
+        sub_a = _Subscription(key=key, reduce_info=(type(source), (), {}))
+        sub_b = _Subscription(key=key, reduce_info=(type(source), (), {}))
         it_a = aiter(sub_a)
         it_b = aiter(sub_b)
 
@@ -867,7 +867,7 @@ class TestSharedSubscription:
         """Test each __aiter__ call returns a distinct iterator.
 
         Given:
-            A _SharedSubscription instance.
+            A _Subscription instance.
         When:
             __aiter__ is called twice.
         Then:
@@ -888,7 +888,7 @@ class TestSharedSubscription:
         """Test the pool resource is released when the source exhausts.
 
         Given:
-            A _SharedSubscription backed by a finite source.
+            A _Subscription backed by a finite source.
         When:
             The subscription is iterated to exhaustion.
         Then:
@@ -914,15 +914,15 @@ class TestSharedSubscription:
         assert pool.stats.referenced_entries == 0
 
     def test___reduce___pickle_roundtrip(self):
-        """Test _SharedSubscription pickle roundtrip via cloudpickle.
+        """Test _Subscription pickle roundtrip via cloudpickle.
 
         Given:
-            A _SharedSubscription wrapping a stub subscriber with
+            A _Subscription wrapping a stub subscriber with
             __reduce__.
         When:
             The subscription is pickled and unpickled.
         Then:
-            It should produce a _SharedSubscription wrapping a
+            It should produce a _Subscription wrapping a
             subscriber with the same key.
         """
         # Arrange
@@ -933,7 +933,7 @@ class TestSharedSubscription:
         restored = cloudpickle.loads(pickled)
 
         # Assert
-        assert isinstance(restored, _SharedSubscription)
+        assert isinstance(restored, _Subscription)
 
     @pytest.mark.asyncio
     async def test___aiter___with_late_joiner_replay(self):
@@ -964,8 +964,8 @@ class TestSharedSubscription:
         source = _Source()
         key = _SubscriberKey("replay-key", lambda: source)
 
-        sub_a = _SharedSubscription(key=key, reduce_info=(type(source), (), {}))
-        sub_b = _SharedSubscription(key=key, reduce_info=(type(source), (), {}))
+        sub_a = _Subscription(key=key, reduce_info=(type(source), (), {}))
+        sub_b = _Subscription(key=key, reduce_info=(type(source), (), {}))
 
         # A pulls both events, tracking two workers.
         it_a = aiter(sub_a)
@@ -987,7 +987,7 @@ class TestSharedSubscription:
         """Test iteration raises RuntimeError when pool is absent.
 
         Given:
-            A _SharedSubscription constructed directly with no
+            A _Subscription constructed directly with no
             subscriber pool initialised.
         When:
             The subscription is iterated.
@@ -996,7 +996,7 @@ class TestSharedSubscription:
         """
         # Arrange
         __subscriber_pool__.set(None)
-        shared = _SharedSubscription(key="no-pool", reduce_info=(object, (), {}))
+        shared = _Subscription(key="no-pool", reduce_info=(object, (), {}))
 
         # Act & assert
         with pytest.raises(RuntimeError, match="subscriber pool not initialised"):
@@ -1039,8 +1039,8 @@ class TestSharedSubscription:
         source = _Source()
         key = _SubscriberKey("drop-key", lambda: source)
 
-        sub_a = _SharedSubscription(key=key, reduce_info=(type(source), (), {}))
-        sub_b = _SharedSubscription(key=key, reduce_info=(type(source), (), {}))
+        sub_a = _Subscription(key=key, reduce_info=(type(source), (), {}))
+        sub_b = _Subscription(key=key, reduce_info=(type(source), (), {}))
 
         # A pulls both events — worker added then dropped.
         it_a = aiter(sub_a)
@@ -1321,4 +1321,4 @@ class TestSharedSubscription:
 
         # Assert
         assert cloudpickle.dumps(restored) == payload
-        assert isinstance(restored, _SharedSubscription)
+        assert isinstance(restored, _Subscription)

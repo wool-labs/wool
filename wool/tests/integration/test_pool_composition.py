@@ -479,7 +479,7 @@ class TestPoolComposition:
         Given:
             Two WorkerPool instances sharing the same LocalDiscovery
             with one externally started worker, exercising
-            SubscriberMeta caching and _SharedSubscription fan-out.
+            SubscriberMeta caching and _Subscription fan-out.
         When:
             Both pools are entered and a coroutine is dispatched
             through the primary pool.

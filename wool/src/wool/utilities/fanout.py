@@ -265,7 +265,7 @@ class FanoutConsumer(Generic[T]):
     weak set holding it — which an iteration still referencing it
     prevents. Bounding this is the caller's to decide, because what may
     be discarded depends on what the items mean: see
-    `~wool.runtime.discovery.pool._SharedSubscription` for a case where
+    `~wool.runtime.discovery.pool._Subscription` for a case where
     one kind of item cannot be dropped at all.
 
     :param fanout:

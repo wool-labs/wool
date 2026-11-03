@@ -770,7 +770,7 @@ async def _durable_shared_pool_context(
 
     Exercises `SubscriberMeta` subscription sharing: both pools
     construct `LocalDiscovery.Subscriber` on one namespace in one
-    context, so each gets its own `_SharedSubscription` backed by one
+    context, so each gets its own `_Subscription` backed by one
     underlying subscriber.
     """
     namespace = f"shared-{uuid.uuid4().hex[:12]}"
