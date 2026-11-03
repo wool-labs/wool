@@ -133,6 +133,13 @@ message Response {
 }
 
 message StopRequest {
+    // Grace period in seconds for in-flight tasks, which also bounds
+    // the worker-thread join when the stop retires the worker loop:
+    // 0 cancels immediately and does not join, a positive value bounds
+    // both waits in turn, and a negative value waits indefinitely. A
+    // stop that arrives while an idle retirement is already underway
+    // waits out that retirement's finite bound instead, whatever this
+    // value is.
     float timeout = 1;
 }
 

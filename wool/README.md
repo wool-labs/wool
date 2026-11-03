@@ -511,7 +511,7 @@ A worker that ships a non-`Exception` `BaseException` payload (other than `Cance
 
 `DispatchSession.__aexit__` calls `drain` (close the request queue, await the worker driver) before unwinding the exit stack. Worker exceptions surfacing during drain are swallowed silently: pre-stream and routine-time failures already shipped via the terminal-exception clause, and the wire is closed by the time `__aexit__` runs — a re-raise here cannot reach the caller.
 
-A worker-loop teardown driven by the service's `stop` RPC respects the timeout argument; see the worker README's _Shutdown timeout_ section.
+A worker-loop teardown driven by the service's `stop` RPC respects the timeout argument unless idle retirement is already underway; see the worker README's _Shutdown timeout_ section.
 
 ### Backpressure hooks
 
