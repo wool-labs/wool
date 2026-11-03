@@ -26,7 +26,7 @@ dependencies = [
     "shortuuid",
     "tblib",
     "typing-extensions",
-    "watchdog",
+    "watchdog<7",
     "zeroconf",
 ]
 description = "A distributed Python runtime"
