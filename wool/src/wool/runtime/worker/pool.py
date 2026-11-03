@@ -145,6 +145,16 @@ class WorkerPool:
         another process owns; see `~wool.LocalDiscovery`. See
         `~wool.DiscoverySubscriberLike` for what a subscriber must
         provide.
+
+        An instance passed here is entered for this pool's lifetime, so
+        a single-use backend is spent by that one entry and cannot be
+        reused by a second pool — `~wool.LocalDiscovery` raises
+        `RuntimeError` on a second entry rather than the timeout a
+        retry would expect. Pass a `Factory` instead
+        (``discovery=partial(LocalDiscovery, ns)``) wherever the pool
+        may need to be reconstructed; the pool then resolves a fresh
+        instance per entry. This distinction is backend-specific:
+        `~wool.LanDiscovery` is not a context manager and is unaffected.
     :param loadbalancer:
         Load balancer instance, factory, or context manager.
 
@@ -197,11 +207,13 @@ class WorkerPool:
         on.
     :param quorum_timeout:
         Seconds to wait for ``quorum`` workers before raising
-        `asyncio.TimeoutError`. Forwarded to this pool's `WorkerProxy`,
-        which documents the bound and when it is inert. A timeout at
-        context entry (``lazy=False``) leaves the pool, never having
-        entered, unusable per its single-use semantics, so construct a
-        new pool to retry.
+        `TimeoutError`. Forwarded to this pool's `WorkerProxy`, which
+        documents the bound and when it is inert. A timeout at context
+        entry (``lazy=False``) leaves the pool, never having entered,
+        unusable per its single-use semantics, so construct a new pool
+        to retry — and, where ``discovery`` was given as a single-use
+        instance, a fresh discovery instance with it. See the
+        ``discovery`` parameter.
     :param shutdown_timeout:
         Maximum number of seconds to wait for spawned workers to stop
         during pool teardown, applied as a single deadline to the full
@@ -247,14 +259,64 @@ class WorkerPool:
         the mode's protocol.
     :raises ~wool.DiscoveryNamespaceInUse:
         At context entry, if ``discovery`` is a `~wool.LocalDiscovery`
-        whose namespace's registry already exists.
-    :raises asyncio.TimeoutError:
-        If the quorum wait does not complete within ``quorum_timeout``
-        — raised by the underlying `WorkerProxy` at context entry
-        (``lazy=False``) or first dispatch (``lazy=True``).
+        whose namespace a live owner already holds.
+    :raises ~wool.DiscoveryNamespaceContended:
+        At context entry, if ``discovery`` is a `~wool.LocalDiscovery`
+        whose namespace directory is replaced faster than the entry can
+        claim it.
+    :raises TimeoutError:
+        Two waits raise it, and they differ in how they arrive. The
+        quorum wait raises it bare, from the underlying `WorkerProxy`
+        at context entry (``lazy=False``) or first dispatch
+        (``lazy=True``), when ``quorum`` workers are not admitted
+        within ``quorum_timeout``. A discovery publish raises it
+        wrapped in an ``ExceptionGroup`` when it does not acquire the
+        backend's cross-process lock in time — for
+        `~wool.LocalDiscovery`, within its ``lock_timeout``. Catching
+        both takes an ``except`` and an ``except*``. Teardown
+        announcements cannot raise it; see ``shutdown_timeout``.
+        ``asyncio.TimeoutError`` names this same class, not a second
+        one.
     :raises ~wool.DiscoveryNamespaceNotFound:
-        If ``discovery`` borrows a `~wool.LocalDiscovery` namespace that
-        has no registry; see `WorkerProxy`.
+        If ``discovery`` borrows a `~wool.LocalDiscovery` namespace with
+        no live owner, or its owner goes away while the pool is running.
+        At context entry, at dispatch, or at teardown — whichever needs
+        the membership first, and at teardown only when neither of the
+        others reported it and the body is not already failing. A pool
+        whose namespace lost its owner does not recover by retrying a
+        dispatch; leave the context and enter a new pool. See
+        `WorkerProxy`.
+    :raises ~wool.DiscoveryCapacityExhausted:
+        At context entry, **wrapped in an** ``ExceptionGroup`` — catch it
+        with ``except*``, since a bare ``except`` for this type never
+        matches. If publishing a spawned worker finds no free slot. Only
+        reachable when the caller supplies ``discovery``: a pool that
+        owns its registry sizes it to the number of workers it will
+        spawn.
+    :raises ~wool.DiscoveryBlockExhausted:
+        At context entry, **wrapped in an** ``ExceptionGroup`` — catch it
+        with ``except*``. If a spawned worker's serialized metadata
+        exceeds its block. A pool that owns its registry stamps the
+        backend's default block size rather than sizing it, and
+        ``tags`` reaches that metadata, so enough of them — or long
+        enough ones — exhaust a block on any pool. Supply ``discovery``
+        with a larger ``block_size`` to raise the ceiling.
+    :raises ExceptionGroup:
+        At context entry, wrapping every one of the above that a worker
+        start can raise. Always, not only when several fail: workers are
+        started under one `asyncio.gather` and the group is built for a
+        single failure as readily as for many, so
+        `~wool.DiscoveryCapacityExhausted` and
+        `~wool.DiscoveryBlockExhausted` are reachable this way and no
+        other.
+
+        Two types are the exception, and each needs both an ``except``
+        and an ``except*``. `~wool.DiscoveryNamespaceNotFound` arrives
+        wrapped from a publish and unwrapped from the publisher bind at
+        entry or the subscriber bind under the quorum wait.
+        `TimeoutError` arrives wrapped from a publish and unwrapped
+        from the quorum wait. Neither a bind nor the quorum wait runs
+        under the gather.
 
     **Basic ephemeral pool:**
 
