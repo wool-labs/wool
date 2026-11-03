@@ -34,22 +34,25 @@ from wool.runtime.worker.session import Rejected
 _log = logging.getLogger(__name__)
 
 _DRAIN_TIMEOUT: Final[float] = 5.0
-"""Wall-clock budget in seconds for worker-loop teardown, measured from
-when its drain is scheduled. Sized for a normal chain of
+"""Default wall-clock budget in seconds for worker-loop teardown,
+measured from when its drain is scheduled. Sized for a normal chain of
 ``finally``-scheduled cleanup to unwind without stalling teardown; see
-`WorkerService._destroy_worker_loop` for what happens once it is spent."""
+`WorkerService._destroy_worker_loop` for what happens once it is
+spent."""
 
-_CLEAR_FLOOR: Final[float] = 0.5
-"""Least time in seconds any one worker-loop teardown clear is given,
-however little of `_DRAIN_TIMEOUT` the clears before it left. The clears
-share one budget and run in a fixed order, so without a floor a proxy
-clear that spends it hands the channel clear — the one closing sockets
-and completion queues — a deadline that has already passed, and the
-channels are dropped unclosed instead. It bounds the teardown's worst
-case at the budget plus one floor per starved clear."""
+_MIN_CLEAR_TIMEOUT: Final[float] = 0.5
+"""Default least time in seconds any one worker-loop teardown clear is
+given, however little of the drain budget the clears before it left. The
+clears share one budget and run in a fixed order, so without a floor a
+proxy clear that spends it hands the channel clear — the one closing
+sockets and completion queues — a deadline that has already passed, and
+the channels are dropped unclosed instead. It is one term in the
+teardown's worst case, whose bound `WorkerService._destroy_worker_loop`
+owns."""
+
 
 _WORKER_LOOP_TTL: Final[float] = 30.0
-"""Idle time-to-live in seconds for the worker event-loop held by
+"""Default idle time-to-live in seconds for the worker event-loop held by
 `WorkerService._loop_pool`. The loop pool is keyed by a single
 constant (``"worker"``), so a positive TTL keeps one worker loop +
 daemon thread warm across dispatches instead of creating and tearing
@@ -161,17 +164,48 @@ class WorkerService(protocol.WorkerServicer):
         Optional admission control hook. See
         `BackpressureLike`. ``None`` (default) accepts all
         tasks unconditionally.
+    :param drain_timeout:
+        Wall-clock budget in seconds for one worker-loop teardown's
+        pool clears and task drain. ``None`` (default) follows a
+        module default of 5 s, resolved when the teardown runs.
+    :param min_clear_timeout:
+        Least time in seconds any single pool clear is given during
+        teardown, however little of the drain budget remains. ``None``
+        (default) follows a module default of 0.5 s, resolved when the
+        teardown runs.
+    :param worker_loop_ttl:
+        Idle time-to-live in seconds for the pooled worker loop.
+        ``None`` (default) takes a module default of 30 s, resolved
+        here because the loop pool consumes it.
+
+    .. rubric:: Implementation notes
+
+    The module defaults these parameters fall back to live on
+    `_DRAIN_TIMEOUT`, `_MIN_CLEAR_TIMEOUT` and `_WORKER_LOOP_TTL`,
+    each of which records its own sizing rationale.
     """
 
     _docket: set[DispatchSession]
     _stopped: asyncio.Event
     _stopping: asyncio.Event
     _loop_pool: ResourcePool[tuple[asyncio.AbstractEventLoop, threading.Thread]]
+    # ``None`` means "follow the module default at teardown time" — see
+    # `_destroy_worker_loop`, which resolves these per teardown.
+    _drain_timeout: float | None
+    _min_clear_timeout: float | None
+    _worker_loop_ttl: float
     # Monotonic timestamp at which the docket last became empty, or
     # ``None`` while any task is in flight.
     _idle_since: float | None
 
-    def __init__(self, *, backpressure: BackpressureLike | None = None):
+    def __init__(
+        self,
+        *,
+        backpressure: BackpressureLike | None = None,
+        drain_timeout: float | None = None,
+        min_clear_timeout: float | None = None,
+        worker_loop_ttl: float | None = None,
+    ):
         self._stopped = asyncio.Event()
         self._stopping = asyncio.Event()
         self._docket = set()
@@ -179,6 +213,11 @@ class WorkerService(protocol.WorkerServicer):
         # measured from construction.
         self._idle_since = time.monotonic()
         self._backpressure = backpressure
+        self._drain_timeout = drain_timeout
+        self._min_clear_timeout = min_clear_timeout
+        self._worker_loop_ttl = (
+            _WORKER_LOOP_TTL if worker_loop_ttl is None else worker_loop_ttl
+        )
         # Strong refs to live ``session.cancel()`` tasks scheduled
         # from ``_propagate_cancel_on_done`` (a gRPC-internal-thread
         # callback that hops the cancel onto the main loop). Without
@@ -202,7 +241,7 @@ class WorkerService(protocol.WorkerServicer):
         self._loop_pool = ResourcePool(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
-            ttl=_WORKER_LOOP_TTL,
+            ttl=self._worker_loop_ttl,
         )
 
     @property
@@ -670,25 +709,26 @@ class WorkerService(protocol.WorkerServicer):
         """Clear, drain, and stop a worker loop, then join its thread.
 
         Clears the proxy, discovery-subscriber, and channel pools on the
-        worker loop first, in that order: a `ResourcePool` partitions its
-        entries by loop and only the owning loop can finalize them, so
-        this finalizer is the one place the worker loop's share can still
-        be cleared, and exiting the proxies first releases their
+        worker loop first, in that order: a `ResourcePool` partitions
+        its entries by loop and only the owning loop can finalize them,
+        so this finalizer is the one place the worker loop's share can
+        still be cleared, and exiting the proxies first releases their
         channel-pool hold before the channels are cleared. The clears run
         one after another on this task, each handed a deadline off the
-        shared `_DRAIN_TIMEOUT` budget but never less than `_CLEAR_FLOOR`
-        — see that constant for why a floor exists and what it costs, and
-        `ResourcePool.clear` for what the deadline bounds. Every clear
-        starts, including one reached with the budget already gone. A
-        clear that raises, exceeds its deadline, or is cancelled does not
-        prevent the stop: a cancelled clear is retried while its deadline
-        remains, and whatever a clear leaves cached stays in the loop's
-        partition for the pool to report when it discards it. An
-        interrupt a clear raises propagates only after the drain.
+        shared drain budget (``drain_timeout``) but never less than the
+        per-clear floor (``min_clear_timeout``); see `_MIN_CLEAR_TIMEOUT`
+        for why a floor exists, and `ResourcePool.clear` for what the
+        deadline bounds. Every clear starts, including one reached
+        with the budget already gone. A clear that raises, exceeds its
+        deadline, or is cancelled does not prevent the stop: a cancelled
+        clear is retried while its deadline remains, and whatever a
+        clear leaves cached stays in the loop's partition for the pool
+        to report when it discards it. An interrupt a clear raises
+        propagates only after the drain.
 
         Then cancels and awaits the loop's pending tasks generation by
         generation, since a cancelled task's ``finally`` can spawn more,
-        until none remain or `_DRAIN_TIMEOUT` elapses, and stops the loop,
+        until none remain or the drain budget elapses, and stops the loop,
         which the worker thread itself closes. Within the budget the loop
         closes without ``Task was destroyed but it is pending!`` warnings;
         past it, the daemon-thread reap at process exit is the backstop.
@@ -703,7 +743,7 @@ class WorkerService(protocol.WorkerServicer):
         The drain tolerates a peer on the loop, i.e., another task that
         cancels or awaits the loop's tasks. A peer's cancel neither raises
         out of the drain nor cuts a generation short, and the loop stops
-        within `_DRAIN_TIMEOUT` provided it keeps servicing callbacks and
+        within the drain budget provided it keeps servicing callbacks and
         the pools' finalizers honor cancellation. That holds even when the
         peer cancels the drain before it runs, in which case the pools stay
         uncleared and the pending tasks are left as they are. A peer that
@@ -756,6 +796,15 @@ class WorkerService(protocol.WorkerServicer):
         the drain is scheduled.
         """
         loop, thread = loop_thread
+        # Resolved now rather than at construction — see `_DRAIN_TIMEOUT`.
+        drain_timeout = (
+            _DRAIN_TIMEOUT if self._drain_timeout is None else self._drain_timeout
+        )
+        min_clear_timeout = (
+            _MIN_CLEAR_TIMEOUT
+            if self._min_clear_timeout is None
+            else self._min_clear_timeout
+        )
         proxy_pool = wool.__proxy_pool__.get()
         subscriber_pool = __subscriber_pool__.get()
         # Proxies first: exiting them releases the loop's channel-pool
@@ -780,8 +829,8 @@ class WorkerService(protocol.WorkerServicer):
                 assert current is not None, "the drain runs as a task on the worker loop"
                 try:
                     for name, clear in clears:
-                        # The per-clear floor — see `_CLEAR_FLOOR`.
-                        bound = max(deadline, loop.time() + _CLEAR_FLOOR)
+                        # The per-clear floor — see `_MIN_CLEAR_TIMEOUT`.
+                        bound = max(deadline, loop.time() + min_clear_timeout)
                         cancels = 0
                         while True:
                             try:
@@ -880,7 +929,7 @@ class WorkerService(protocol.WorkerServicer):
                         ]
                         _log.warning(
                             f"Worker-loop teardown drain timed out after "
-                            f"{_DRAIN_TIMEOUT}s; {len(leaked)} task(s) still pending."
+                            f"{drain_timeout}s; {len(leaked)} task(s) still pending."
                         )
             finally:
                 loop.stop()
@@ -889,13 +938,13 @@ class WorkerService(protocol.WorkerServicer):
             nonlocal timer_fired
             timer_fired = True
             _log.warning(
-                f"Worker-loop teardown drain did not run within {_DRAIN_TIMEOUT}s; "
+                f"Worker-loop teardown drain did not run within {drain_timeout}s; "
                 "stopping the loop with its pools uncleared and its tasks pending."
             )
             loop.stop()
 
         def _schedule():
-            deadline = loop.time() + _DRAIN_TIMEOUT
+            deadline = loop.time() + drain_timeout
             stop_timer = loop.call_at(deadline, _fire_stop_timer)
             loop.create_task(_shutdown(stop_timer, deadline))
 

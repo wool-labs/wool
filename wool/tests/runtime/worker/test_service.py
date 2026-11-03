@@ -2485,7 +2485,7 @@ class TestWorkerService:
 
     @pytest.mark.asyncio
     async def test_dispatch_should_reap_idle_worker_loop_after_ttl_expiry(
-        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+        self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test an idle worker loop is reaped once its TTL elapses.
 
@@ -2499,11 +2499,8 @@ class TestWorkerService:
             thread so no worker-loop thread lingers past the TTL window
         """
         # Arrange — a short idle TTL so the warm loop is reaped
-        # promptly. The pool captures the TTL at construction, so patch
-        # the constant before building the service; no public knob
-        # exposes the idle TTL.
-        mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.2)
-        service = WorkerService()
+        # promptly.
+        service = WorkerService(worker_loop_ttl=0.2)
 
         # Act — one dispatch warms a worker loop on a daemon thread; the
         # probe reports the thread it runs on.
@@ -2656,7 +2653,6 @@ class TestWorkerService:
     async def test_stop_should_start_channel_pool_clear_when_budget_exhausted(
         self,
         grpc_aio_stub,
-        grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
         caplog,
@@ -2675,8 +2671,7 @@ class TestWorkerService:
             cancelling it, and log both clears as failed at WARNING from
             ``wool.runtime.worker.service``
         """
-        # Arrange — no public knob exposes the drain budget.
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
+        # Arrange
         channel_clear_started = threading.Event()
 
         async def outlive_budget(*, deadline=None):
@@ -2694,7 +2689,8 @@ class TestWorkerService:
         )
         wool_task = make_task(_worker_loop_identity_probe)
 
-        async with grpc_aio_stub() as stub:
+        service = WorkerService(drain_timeout=0.2)
+        async with grpc_aio_stub(servicer=service) as stub:
             stream = stub.dispatch()
             await stream.write(protocol.Request(task=wool_task.to_protobuf()))
             await stream.done_writing()
@@ -2710,7 +2706,7 @@ class TestWorkerService:
 
         # Assert
         assert isinstance(stop_result, protocol.Void)
-        assert grpc_servicer.stopped.is_set()
+        assert service.stopped.is_set()
         assert channel_clear_started.is_set()
         failed = [
             record.getMessage()
@@ -2726,7 +2722,7 @@ class TestWorkerService:
 
     @pytest.mark.asyncio
     async def test_dispatch_should_clear_proxy_pool_when_idle_worker_loop_expires(
-        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache
+        self, grpc_aio_stub, mock_worker_proxy_cache
     ):
         """Test retiring an idle worker loop finalizes its proxy-pool partition.
 
@@ -2740,9 +2736,8 @@ class TestWorkerService:
             the loop, so no proxy the retired loop's partition cached is
             handed to the next one
         """
-        # Arrange — no public knob exposes the idle TTL.
-        mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.2)
-        service = WorkerService()
+        # Arrange
+        service = WorkerService(worker_loop_ttl=0.2)
         wool_task = make_task(_worker_loop_identity_probe)
 
         # Act
@@ -2818,7 +2813,6 @@ class TestWorkerService:
     async def test_stop_should_start_subscriber_pool_clear_when_budget_exhausted(
         self,
         grpc_aio_stub,
-        grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
         mock_subscriber_pool,
@@ -2839,8 +2833,7 @@ class TestWorkerService:
             failed in that order, so the guarantee covers every clear
             rather than the channel clear alone
         """
-        # Arrange -- no public knob exposes the drain budget.
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
+        # Arrange
         subscriber_clear_started = threading.Event()
 
         async def outlive_budget(*, deadline=None):
@@ -2859,7 +2852,8 @@ class TestWorkerService:
         mocker.patch.object(service_module, "clear_channel_pool", mocker.AsyncMock())
         wool_task = make_task(_worker_loop_identity_probe)
 
-        async with grpc_aio_stub() as stub:
+        service = WorkerService(drain_timeout=0.2)
+        async with grpc_aio_stub(servicer=service) as stub:
             stream = stub.dispatch()
             await stream.write(protocol.Request(task=wool_task.to_protobuf()))
             await stream.done_writing()
@@ -2875,7 +2869,7 @@ class TestWorkerService:
 
         # Assert
         assert isinstance(stop_result, protocol.Void)
-        assert grpc_servicer.stopped.is_set()
+        assert service.stopped.is_set()
         assert subscriber_clear_started.is_set()
         failed = [
             record.getMessage()
@@ -2893,7 +2887,6 @@ class TestWorkerService:
     async def test_stop_should_start_every_clear_in_order_when_the_first_hangs(
         self,
         grpc_aio_stub,
-        grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
         mock_subscriber_pool,
@@ -2914,8 +2907,7 @@ class TestWorkerService:
             order, so a budget spent by the first clear cancels the rest
             in flight rather than skipping or reordering them
         """
-        # Arrange -- no public knob exposes the drain budget.
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
+        # Arrange
         started: list[str] = []
 
         def hang_after_recording(name):
@@ -2938,7 +2930,8 @@ class TestWorkerService:
         )
         wool_task = make_task(_worker_loop_identity_probe)
 
-        async with grpc_aio_stub() as stub:
+        service = WorkerService(drain_timeout=0.2)
+        async with grpc_aio_stub(servicer=service) as stub:
             stream = stub.dispatch()
             await stream.write(protocol.Request(task=wool_task.to_protobuf()))
             await stream.done_writing()
@@ -2954,7 +2947,7 @@ class TestWorkerService:
 
         # Assert
         assert isinstance(stop_result, protocol.Void)
-        assert grpc_servicer.stopped.is_set()
+        assert service.stopped.is_set()
         assert started == ["proxy", "subscriber", "channel"]
         failed = [
             record.getMessage()
@@ -2973,7 +2966,6 @@ class TestWorkerService:
     async def test_stop_should_complete_the_channel_clear_when_budget_remains(
         self,
         grpc_aio_stub,
-        grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
         caplog,
@@ -2996,13 +2988,12 @@ class TestWorkerService:
             earlier clear left is spent rather than pre-empted by the
             clear that ran before it
         """
-        # Arrange -- no public knob exposes the drain budget. The budget
-        # is set well clear of `_CLEAR_FLOOR` so the deadline asserted
-        # below can only have come from the budget. The closed ledger is
-        # process-global, so this clears it itself.
+        # Arrange -- the budget is set well clear of
+        # `_MIN_CLEAR_TIMEOUT` so the deadline asserted below can only
+        # have come from the budget. The closed ledger is process-global,
+        # so this clears it itself.
         budget = 3.0
-        assert budget > service_module._CLEAR_FLOOR
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", budget)
+        assert budget > service_module._MIN_CLEAR_TIMEOUT
         _closed.clear()
         proxy_clear_started = threading.Event()
         proceed = threading.Event()
@@ -3020,7 +3011,8 @@ class TestWorkerService:
         mocker.patch.object(service_module, "clear_channel_pool", clear_and_record)
         wool_task = make_task(_populate_closing_pool)
 
-        async with grpc_aio_stub() as stub:
+        service = WorkerService(drain_timeout=budget)
+        async with grpc_aio_stub(servicer=service) as stub:
             stream = stub.dispatch()
             await stream.write(protocol.Request(task=wool_task.to_protobuf()))
             await stream.done_writing()
@@ -3040,11 +3032,11 @@ class TestWorkerService:
 
         # Assert
         assert isinstance(stop_result, protocol.Void)
-        assert grpc_servicer.stopped.is_set()
+        assert service.stopped.is_set()
         assert _closed == ["channel"]
         # The worker loop's clock is this loop's clock, so the deadline
         # the clear was handed is comparable here. A floor-supplied
-        # bound would sit `_CLEAR_FLOOR` past the clear, not a whole
+        # bound would sit `_MIN_CLEAR_TIMEOUT` past the clear, not a whole
         # budget past the request that started the teardown.
         [deadline] = handed
         assert deadline is not None
@@ -3060,11 +3052,10 @@ class TestWorkerService:
     async def test_stop_should_give_the_channel_clear_the_floor_when_budget_spent(
         self,
         grpc_aio_stub,
-        grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
     ):
-        """Test a clear reached with nothing left still gets `_CLEAR_FLOOR`.
+        """Test a clear reached with nothing left still gets `_MIN_CLEAR_TIMEOUT`.
 
         Given:
             A `WorkerService` that has serviced a dispatch, leaving one
@@ -3073,14 +3064,13 @@ class TestWorkerService:
         When:
             The stop RPC is invoked with a positive timeout
         Then:
-            It should hand the channel clear a deadline `_CLEAR_FLOOR`
+            It should hand the channel clear a deadline `_MIN_CLEAR_TIMEOUT`
             in its own future rather than one already past, which is
             the whole of what the floor buys and what a test asserting
             only on the budget cannot see
         """
-        # Arrange -- no public knob exposes the drain budget. Zero means
-        # every clear is reached with the shared deadline behind it.
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.0)
+        # Arrange -- a zero budget means every clear is reached with the
+        # shared deadline behind it.
         handed: list[tuple[float, float]] = []
 
         async def record_deadline(*, deadline=None):
@@ -3093,7 +3083,8 @@ class TestWorkerService:
         )
         wool_task = make_task(_worker_loop_identity_probe)
 
-        async with grpc_aio_stub() as stub:
+        service = WorkerService(drain_timeout=0.0)
+        async with grpc_aio_stub(servicer=service) as stub:
             stream = stub.dispatch()
             await stream.write(protocol.Request(task=wool_task.to_protobuf()))
             await stream.done_writing()
@@ -3108,18 +3099,17 @@ class TestWorkerService:
 
         # Assert
         assert isinstance(stop_result, protocol.Void)
-        assert grpc_servicer.stopped.is_set()
+        assert service.stopped.is_set()
         [(entered, deadline)] = handed
         # The bound is taken just before the call, so the margin the
         # clear observes is the floor less the microseconds in between.
-        assert 0 < deadline - entered <= service_module._CLEAR_FLOOR
-        assert deadline - entered > service_module._CLEAR_FLOOR / 2
+        assert 0 < deadline - entered <= service_module._MIN_CLEAR_TIMEOUT
+        assert deadline - entered > service_module._MIN_CLEAR_TIMEOUT / 2
 
     @pytest.mark.asyncio
     async def test_stop_should_drain_the_worker_loop_when_channel_clear_hangs(
         self,
         grpc_aio_stub,
-        grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
         caplog,
@@ -3138,8 +3128,7 @@ class TestWorkerService:
             the worker loop's daemon thread, so a cancelled clear does
             not skip the drain
         """
-        # Arrange -- no public knob exposes the drain budget.
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
+        # Arrange
 
         async def outlive_budget(*, deadline=None):
             await asyncio.sleep(60)
@@ -3159,7 +3148,8 @@ class TestWorkerService:
             assert result.HasField("result")
             return cloudpickle.loads(result.result.dump)
 
-        async with grpc_aio_stub() as stub:
+        service = WorkerService(drain_timeout=0.2)
+        async with grpc_aio_stub(servicer=service) as stub:
             # The first dispatch names the warm loop's daemon thread;
             # the second parks a task on that same warm loop.
             _, _, worker_thread_name = await dispatch_once(
@@ -3175,7 +3165,7 @@ class TestWorkerService:
 
         # Assert
         assert isinstance(stop_result, protocol.Void)
-        assert grpc_servicer.stopped.is_set()
+        assert service.stopped.is_set()
         assert worker_thread_name not in {
             thread.name for thread in threading.enumerate() if thread.is_alive()
         }
@@ -3191,7 +3181,6 @@ class TestWorkerService:
     async def test_stop_should_return_within_the_budget_when_a_clear_outlives_it(
         self,
         grpc_aio_stub,
-        grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
         caplog,
@@ -3213,13 +3202,13 @@ class TestWorkerService:
             finalizer, log the overrun, and have the pool report the
             finalizer the cancellation interrupted
         """
-        # Arrange -- no public knob exposes the drain budget.
+        # Arrange
         budget = 0.2
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", budget)
         mocker.patch.object(service_module, "clear_channel_pool", _slow_pool.clear)
         wool_task = make_task(_populate_slow_pool)
 
-        async with grpc_aio_stub() as stub:
+        service = WorkerService(drain_timeout=budget)
+        async with grpc_aio_stub(servicer=service) as stub:
             stream = stub.dispatch()
             await stream.write(protocol.Request(task=wool_task.to_protobuf()))
             await stream.done_writing()
@@ -3237,8 +3226,8 @@ class TestWorkerService:
 
         # Assert
         assert isinstance(stop_result, protocol.Void)
-        assert grpc_servicer.stopped.is_set()
-        assert elapsed < budget + service_module._CLEAR_FLOOR + _GRPC_SLACK
+        assert service.stopped.is_set()
+        assert elapsed < budget + service_module._MIN_CLEAR_TIMEOUT + _GRPC_SLACK
         assert any(
             record.name == "wool.runtime.worker.service"
             and "The channel pool clear exceeded" in record.getMessage()
@@ -3254,7 +3243,6 @@ class TestWorkerService:
     async def test_stop_should_close_the_last_pool_when_an_earlier_clear_overruns(
         self,
         grpc_aio_stub,
-        grpc_servicer,
         mocker: MockerFixture,
         mock_worker_proxy_cache,
         caplog,
@@ -3275,17 +3263,17 @@ class TestWorkerService:
             after it rather than alongside it and is never handed a
             deadline that has already passed
         """
-        # Arrange -- no public knob exposes the drain budget. The two
-        # ledgers are process-global, so this clears them itself rather
-        # than resting on the previous test's teardown discard.
+        # Arrange -- the two ledgers are process-global, so this clears
+        # them itself rather than resting on the previous test's teardown
+        # discard.
         _closed.clear()
         _slow_handles.clear()
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
         mock_worker_proxy_cache.clear = _slow_pool.clear
         mocker.patch.object(service_module, "clear_channel_pool", _closing_pool.clear)
         wool_task = make_task(_populate_both_pools)
 
-        async with grpc_aio_stub() as stub:
+        service = WorkerService(drain_timeout=0.2)
+        async with grpc_aio_stub(servicer=service) as stub:
             stream = stub.dispatch()
             await stream.write(protocol.Request(task=wool_task.to_protobuf()))
             await stream.done_writing()
@@ -3301,7 +3289,7 @@ class TestWorkerService:
 
         # Assert
         assert isinstance(stop_result, protocol.Void)
-        assert grpc_servicer.stopped.is_set()
+        assert service.stopped.is_set()
         assert sorted(_closed) == ["a", "b", "c"]
         assert any(
             record.name == "wool.runtime.worker.service"
@@ -3326,9 +3314,7 @@ class TestWorkerService:
             expiring loop's daemon thread, so the retired loop's channels
             are closed by the only loop that can close them
         """
-        # Arrange -- no public knob exposes the idle TTL; the pool
-        # captures it at construction, so patch before building.
-        mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.2)
+        # Arrange
         cleared_on: list[str] = []
 
         async def record_thread(*, deadline=None):
@@ -3339,7 +3325,7 @@ class TestWorkerService:
             "clear_channel_pool",
             mocker.AsyncMock(side_effect=record_thread),
         )
-        service = WorkerService()
+        service = WorkerService(worker_loop_ttl=0.2)
         wool_task = make_task(_worker_loop_identity_probe)
 
         # Act
@@ -3652,8 +3638,7 @@ class TestWorkerService:
             subscriber, channel, an exhausted budget cancelling a clear
             in flight rather than before its first step
         """
-        # Arrange -- no public knob exposes the drain budget.
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", budget)
+        # Arrange
         started: list[str] = []
 
         def outlive_budget_after_recording(name):
@@ -3663,7 +3648,7 @@ class TestWorkerService:
                 # which is the floor, not the budget, at these values --
                 # and short enough that a cancelled clear cannot outlive
                 # the example.
-                await asyncio.sleep(service_module._CLEAR_FLOOR * 2)
+                await asyncio.sleep(service_module._MIN_CLEAR_TIMEOUT * 2)
 
             return clear
 
@@ -3680,7 +3665,7 @@ class TestWorkerService:
         )
         wool_task = make_task(_worker_loop_identity_probe)
 
-        async with grpc_aio_stub(servicer=WorkerService()) as stub:
+        async with grpc_aio_stub(servicer=WorkerService(drain_timeout=budget)) as stub:
             stream = stub.dispatch()
             await stream.write(protocol.Request(task=wool_task.to_protobuf()))
             await stream.done_writing()
