@@ -1028,8 +1028,58 @@ class TestWorkerProxy:
         invalid_discovery = object()
 
         # Act & assert
-        with pytest.raises(TypeError, match="Expected DiscoverySubscriberLike"):
+        with pytest.raises(TypeError, match="Expected an object with __aiter__"):
             WorkerProxy(discovery=invalid_discovery)  # pyright: ignore[reportArgumentType]
+
+    def test___init___should_raise_when_discovery_is_an_async_generator(self):
+        """Test an async generator discovery is rejected at construction.
+
+        Given:
+            The async generator a subscriber returns, rather than the
+            subscriber itself.
+        When:
+            WorkerProxy is initialized with it as discovery.
+        Then:
+            It should raise TypeError saying discovery takes a
+            subscriber, not the generator one returns.
+        """
+
+        # Arrange
+        async def events():
+            yield None
+
+        # Act & assert
+        with pytest.raises(TypeError, match="not the async generator one returns"):
+            WorkerProxy(discovery=events())  # pyright: ignore[reportArgumentType]
+
+    def test___init___should_accept_a_self_iterating_subscriber(self):
+        """Test a subscriber that is its own iterator is accepted.
+
+        Given:
+            A subscriber whose __aiter__ returns self, which is the
+            shape DiscoverySubscriberLike documents as conforming.
+        When:
+            WorkerProxy is initialized with it as discovery.
+        Then:
+            It should accept it, since rejecting every object with
+            __anext__ would reject this one too.
+        """
+
+        # Arrange
+        class SelfIterating:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        subscriber = SelfIterating()
+
+        # Act
+        proxy = WorkerProxy(discovery=subscriber)  # pyright: ignore[reportArgumentType]
+
+        # Assert
+        assert proxy is not None
 
     def test___init___with_sync_cm_loadbalancer_warns(self, mock_discovery_service):
         """Test UserWarning for sync CM loadbalancer.
@@ -8812,11 +8862,12 @@ class TestWorkerProxyIdentityAdmission:
         events = asyncio.Queue()
         events.put_nowait(DiscoveryEvent("worker-added", metadata=admitted))
 
-        async def stream():
-            while (event := await events.get()) is not None:
-                yield event
+        class Subscriber:
+            async def __aiter__(self):
+                while (event := await events.get()) is not None:
+                    yield event
 
-        proxy = WorkerProxy(discovery=stream(), credentials=provider, lazy=False)
+        proxy = WorkerProxy(discovery=Subscriber(), credentials=provider, lazy=False)
 
         # Act
         await proxy.start()
