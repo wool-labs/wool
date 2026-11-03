@@ -1,11 +1,13 @@
 import asyncio
 import datetime
 import ipaddress
+import os
 import uuid
 from collections.abc import Callable
 from collections.abc import Coroutine
 from collections.abc import Generator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 from typing import NamedTuple
 
@@ -17,6 +19,16 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 import wool
+from wool.runtime.discovery import local
+
+#: The entry every namespace's directory sits under, and the name of
+#: the pointer inside one. Taken from `wool.LocalDiscovery`'s own module
+#: rather than respelled, so the two cannot come to name different
+#: paths. A copy here survives a rename by pointing at a path nothing
+#: creates, which is worse than failing: an assertion that no residue
+#: remains then holds however much the product left behind.
+ROOT_DIRNAME = local._ROOT_DIRNAME
+CURRENT = local._CURRENT
 
 #: Tasks scheduled through `plant`, which owns their retention.
 planted_tasks: list[asyncio.Task] = []
@@ -58,6 +70,64 @@ class CertificateFiles(NamedTuple):
     cert_pem: bytes
 
 
+def discovery_root() -> Path:
+    """Return the directory every `wool.LocalDiscovery` namespace lives under.
+
+    Asks the module which root it chose rather than repeating the
+    choice, so the two cannot disagree: the module resolves its root
+    once and caches it, and a copy here would answer for a different
+    temporary directory the moment one is set after that.
+    """
+    return local._root() / ROOT_DIRNAME
+
+
+def namespace_directory(namespace: str) -> Path:
+    """Return the directory a `wool.LocalDiscovery` namespace is claimed in.
+
+    This is the directory an owner locks, and it outlives any one owner:
+    it holds the ``current`` pointer and the generation that pointer
+    names. It is *not* where the registry lives — see
+    `generation_directory`.
+    """
+    return discovery_root() / namespace
+
+
+def generation_directory(namespace: str) -> Path:
+    """Return the directory holding the files a namespace's live owner owns.
+
+    Resolves the ``current`` pointer the way a borrower does, so a test
+    naming a registry, a notify file or a block names the one the owner
+    that is live right now published.
+    """
+    directory = namespace_directory(namespace)
+    return directory / os.readlink(directory / CURRENT)
+
+
+def registry_path(namespace: str) -> Path:
+    """Return the path of a `wool.LocalDiscovery` namespace's registry.
+
+    Named here rather than spelled out at each call site, so a test that
+    needs the file an owner publishes and a publisher locks says which
+    file it means without spreading the name.
+    """
+    return generation_directory(namespace) / local._REGISTRY
+
+
+def notify_path(namespace: str) -> Path:
+    """Return the path of the file a namespace's subscribers watch."""
+    return generation_directory(namespace) / local._NOTIFY
+
+
+def blocks_directory(namespace: str) -> Path:
+    """Return the directory holding a namespace's worker metadata blocks."""
+    return generation_directory(namespace) / local._BLOCKS
+
+
+def block_path(namespace: str, uid: uuid.UUID) -> Path:
+    """Return the path of the block holding a worker's metadata."""
+    return blocks_directory(namespace) / uid.hex
+
+
 def plant(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
     """Schedule ``coro`` on the running loop and hold a strong reference.
 
@@ -78,6 +148,23 @@ def record_peer_loop() -> asyncio.AbstractEventLoop:
 
     peer_loop = asyncio.get_running_loop()
     return peer_loop
+
+
+async def borrower_binds(namespace: str) -> bool:
+    """Return whether a fresh borrowing publisher binds ``namespace``.
+
+    Answers what a borrower arriving in another process would find at
+    the moment it is called, so a test can distinguish a namespace an
+    owner still serves from one whose artifacts merely survive it.
+    Synchronous callers reach it through `asyncio.run`, which also
+    gives a probe running inside a patched system call a loop of its
+    own.
+    """
+    try:
+        async with wool.LocalDiscovery.Publisher(namespace):
+            return True
+    except wool.DiscoveryNamespaceNotFound:
+        return False
 
 
 async def park_then_plant(*factories: Callable[[], Coroutine[Any, Any, Any]]) -> None:
