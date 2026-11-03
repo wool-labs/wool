@@ -820,6 +820,60 @@ def _held_channel(handle, task):
         handle.run(stack.aclose())
 
 
+def _failing_discovery(namespace: str, *, died: asyncio.Event | None = None):
+    """Return a discovery subscriber whose stream raises straight away.
+
+    Setting ``died`` lets a caller wait for the source to have failed
+    without reaching into the proxy for the task carrying it.
+    """
+
+    class _FailingDiscovery:
+        def __aiter__(self):
+            return self._gen()
+
+        async def _gen(self):
+            await asyncio.sleep(0)
+            try:
+                raise DiscoveryNamespaceNotFound(namespace)
+            finally:
+                if died is not None:
+                    died.set()
+            yield  # pragma: no cover — makes this an async generator
+
+    return _FailingDiscovery()
+
+
+async def _reported_failure(
+    proxy, task, *, timeout: float = 5.0
+) -> DiscoveryNamespaceNotFound:
+    """Dispatch until the proxy reports its sentinel's failure.
+
+    Returns the failure the caller received. Retrying is what
+    synchronises on a sentinel that has not died yet: with no quorum
+    there is no wait for the cause to arrive in, which is the
+    configuration dependence `WorkerProxy` documents.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            await proxy.dispatch(task)
+        except DiscoveryNamespaceNotFound as error:
+            return error
+        except NoWorkersAvailable:
+            if loop.time() >= deadline:
+                raise AssertionError("sentinel never reported its failure")
+            await asyncio.sleep(0.01)
+
+
+def _traceback_depth(error: BaseException) -> int:
+    """Count the frames the exception's traceback currently pins."""
+    frames, traceback = 0, error.__traceback__
+    while traceback is not None:
+        frames, traceback = frames + 1, traceback.tb_next
+    return frames
+
+
 class TestWorkerProxy:
     """Comprehensive test suite for WorkerProxy."""
 
@@ -7000,6 +7054,275 @@ class TestWorkerProxy:
                         await asyncio.sleep(0.01)
 
         assert excinfo.value.namespace == namespace
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_raise_the_bind_failure_without_awaiting_quorum(
+        self,
+    ):
+        """Test a failed bind ends the quorum wait rather than timing out.
+
+        Given:
+            A namespace no LocalDiscovery has entered, and a non-lazy
+            WorkerProxy on it whose quorum can never be met, configured
+            with a quorum timeout far longer than the bind takes to fail
+        When:
+            The proxy is entered
+        Then:
+            It should raise DiscoveryNamespaceNotFound well inside that
+            timeout — the sentinel's death is why the quorum will never
+            arrive, so waiting the timeout out would report the symptom
+            and discard the cause.
+        """
+        # Arrange
+        namespace = f"proxy-quorum-{uuid.uuid4().hex[:12]}"
+        timeout = 30.0
+        proxy = WorkerProxy(namespace, lazy=False, quorum=1, quorum_timeout=timeout)
+        loop = asyncio.get_running_loop()
+
+        # Act
+        started = loop.time()
+        with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+            async with proxy:
+                pass  # pragma: no cover — entry raises
+        elapsed = loop.time() - started
+
+        # Assert
+        assert excinfo.value.namespace == namespace
+        # The oracle for this test: passing by waiting out the timeout
+        # is the behaviour it exists to rule out.
+        assert elapsed < timeout / 2, elapsed
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_the_sentinel_failure_when_it_died(
+        self, mock_proxy_session, mock_wool_task
+    ):
+        """Test dispatch reports why the sentinel died, not its symptom.
+
+        Given:
+            A started proxy whose discovery subscription has since
+            raised, leaving it with no membership it can trust
+        When:
+            A task is dispatched
+        Then:
+            It should raise that failure rather than
+            NoWorkersAvailable, which would name the consequence and
+            leave the caller to guess the cause.
+        """
+
+        # Arrange
+        class _FailingDiscovery:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                await asyncio.sleep(0)
+                raise DiscoveryNamespaceNotFound("gone")
+                yield  # pragma: no cover — makes this an async generator
+
+        proxy = WorkerProxy(discovery=_FailingDiscovery(), lazy=False, quorum=0)
+        await proxy.start()
+        try:
+            sentinel = proxy._sentinel_task
+            assert sentinel is not None
+            async with asyncio.timeout(5):
+                while not sentinel.done():
+                    await asyncio.sleep(0.01)
+
+            # Act & assert
+            with pytest.raises(DiscoveryNamespaceNotFound) as excinfo:
+                await proxy.dispatch(mock_wool_task)
+            assert excinfo.value.namespace == "gone"
+        finally:
+            # Teardown does not report it again; see the dedicated test.
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_serve_a_live_worker_when_the_subscription_died(
+        self, mock_proxy_session, mock_wool_task, mocker: MockerFixture
+    ):
+        """Test a dead membership feed does not fail a usable dispatch.
+
+        Given:
+            A started proxy holding one admitted worker, whose discovery
+            subscription then raises, so the membership feed is dead
+            while the worker process it already announced is not.
+        When:
+            A task is dispatched.
+        Then:
+            It should dispatch to the worker it holds, since discovery
+            is a membership feed rather than the data plane and a
+            subscription that stopped reporting does not make the
+            workers it already reported unusable.
+        """
+        # Arrange
+        #
+        # The failure is gated so the worker is admitted and the quorum
+        # satisfied first; raising straight after the yield races the
+        # start and reports the cause from there instead.
+        release, died = asyncio.Event(), asyncio.Event()
+        metadata = WorkerMetadata(
+            uid=uuid.uuid4(),
+            address="127.0.0.1:50200",
+            pid=9100,
+            version=protocol.__version__,
+        )
+
+        class _DyingDiscovery:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                yield DiscoveryEvent("worker-added", metadata=metadata)
+                await release.wait()
+                try:
+                    raise DiscoveryNamespaceNotFound("dying-namespace")
+                finally:
+                    died.set()
+
+        streams: list = []
+        proxy, _ = await _make_proxy_with_workers(
+            connections=[_make_success_connection(mocker, streams)],
+            loadbalancer=make_delegating_balancer(),
+            mocker=mocker,
+            discovery=_DyingDiscovery(),
+            metadata_list=[metadata],
+        )
+        release.set()
+        await died.wait()
+
+        # Act
+        result_stream = await proxy.dispatch(mock_wool_task)
+        results = [item async for item in result_stream]
+
+        # Assert
+        assert results == ["ok"]
+        assert metadata in proxy.workers
+
+        # Cleanup — the cause is still owed to someone, and with no
+        # dispatch having reported it teardown is who reports it.
+        with pytest.raises(DiscoveryNamespaceNotFound):
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_should_not_report_a_failure_a_dispatch_already_did(
+        self, mock_proxy_session, mock_wool_task
+    ):
+        """Test teardown stays quiet once a caller has been told.
+
+        Given:
+            A started proxy whose subscription has raised, and a
+            dispatch that has already reported that failure
+        When:
+            The proxy is stopped
+        Then:
+            It should return cleanly, the caller having already been
+            given the cause once.
+        """
+        # Arrange
+        proxy = WorkerProxy(
+            discovery=_failing_discovery("reported-once"), lazy=False, quorum=0
+        )
+        await proxy.start()
+        await _reported_failure(proxy, mock_wool_task)
+
+        # Act & assert — no exception
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test___aexit___should_preserve_a_body_failure_over_the_sentinels(
+        self, mock_proxy_session
+    ):
+        """Test teardown does not displace the caller's own exception.
+
+        Given:
+            A started proxy whose subscription has raised without any
+            caller having been told
+        When:
+            The proxy's context exits carrying an unrelated exception
+            raised by the body
+        Then:
+            It should let the body's exception reach the caller, a
+            teardown report being worth less than the failure the
+            caller is already handling.
+        """
+        # Arrange
+        died = asyncio.Event()
+
+        # Act & assert
+        with pytest.raises(ValueError, match="from the body"):
+            async with WorkerProxy(
+                discovery=_failing_discovery("unreported", died=died),
+                lazy=False,
+                quorum=0,
+            ):
+                await asyncio.wait_for(died.wait(), timeout=5)
+                raise ValueError("from the body")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_not_grow_the_failure_it_reports(
+        self, mock_proxy_session, mock_wool_task
+    ):
+        """Test repeated reports do not accumulate on the held failure.
+
+        Given:
+            A started proxy whose subscription has raised
+        When:
+            Many dispatches each report that failure
+        Then:
+            It should hand every caller a traceback of the same depth,
+            rather than one that grows with each report and pins a
+            frame from every dispatch that ever received it.
+        """
+        # Arrange
+        proxy = WorkerProxy(
+            discovery=_failing_discovery("bounded"), lazy=False, quorum=0
+        )
+        await proxy.start()
+        first = _traceback_depth(await _reported_failure(proxy, mock_wool_task))
+
+        try:
+            # Act
+            for _ in range(20):
+                last = _traceback_depth(await _reported_failure(proxy, mock_wool_task))
+
+            # Assert
+            assert last == first
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_not_blame_the_decline_it_replaced(
+        self, mock_proxy_session, mock_wool_task
+    ):
+        """Test a reported failure is not chained to the balancer's decline.
+
+        Given:
+            A started proxy whose subscription has raised, dispatched
+            against a balancer that declines with NoWorkersAvailable
+            because the membership is what is missing
+        When:
+            The proxy substitutes the subscription's failure for that
+            decline
+        Then:
+            It should not present the decline as the context of the
+            failure raised in its place -- the proxy judged that decline
+            the wrong answer, so naming it as the exception being
+            handled tells the caller the opposite of what was decided.
+        """
+        # Arrange
+        proxy = WorkerProxy(
+            discovery=_failing_discovery("unchained"), lazy=False, quorum=0
+        )
+        await proxy.start()
+
+        try:
+            # Act
+            reported = await _reported_failure(proxy, mock_wool_task)
+
+            # Assert
+            assert not isinstance(reported.__context__, NoWorkersAvailable)
+        finally:
+            await proxy.stop()
 
     @pytest.mark.asyncio
     async def test_workers_property_returns_workers_list(
