@@ -3,8 +3,10 @@ import gc
 import itertools
 import logging
 import threading
+from collections.abc import Iterator
 from contextlib import AsyncExitStack
 from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from functools import partial
 from uuid import uuid4
 
@@ -52,13 +54,14 @@ def make_task(callable, *, args=(), kwargs=None, proxy_id="test-proxy-id"):
     )
 
 
-# Registry of per-task control events for tests that need several
+# Registry of per-task control objects for tests that need several
 # independently-releasable in-flight tasks (the single global
 # `_control_event` below only drives one). Keyed by an opaque token
 # carried in the task's args so the worker-side routine can look up its
-# own event. Cross-loop/cross-thread safe (threading.Event); tests
-# populate and clear it around each use.
-_keyed_events: dict[str, threading.Event] = {}
+# own entry. Values are plain events or `_WorkerThreadBlock` bundles,
+# both cross-loop/cross-thread safe; tests populate and clear the
+# registry around each use.
+_keyed_events: dict[str, "threading.Event | _WorkerThreadBlock"] = {}
 
 
 class _KeyedTaskError(Exception):
@@ -560,6 +563,115 @@ async def _worker_loop_identity_probe():
     loop = asyncio.get_running_loop()
     thread = threading.current_thread()
     return (id(loop), thread.ident, thread.name)
+
+
+class _WorkerThreadBlock:
+    """Wedge a worker thread on demand once its dispatch has returned."""
+
+    def __init__(self) -> None:
+        self.armed = threading.Event()
+        self.entered = threading.Event()
+        self.released = threading.Event()
+        self.thread: threading.Thread | None = None
+
+
+async def _leave_worker_thread_blocker(key: str) -> str:
+    """Leave behind a task that wedges the worker thread once armed.
+
+    The task polls until the test sets ``armed``, then sets ``entered``
+    and blocks the worker thread synchronously until ``released`` is
+    set, standing in for a task a routine left behind that wedges the
+    worker loop. Reports the worker thread's name. Defined at module
+    level so cloudpickle can serialize the callable for dispatch.
+    """
+    block = _keyed_events[key]
+    assert isinstance(block, _WorkerThreadBlock)
+    thread = threading.current_thread()
+    block.thread = thread
+
+    async def wedge() -> None:
+        while not block.armed.is_set():
+            await asyncio.sleep(0.01)
+        block.entered.set()
+        block.released.wait()
+
+    helpers.plant(wedge())
+    return thread.name
+
+
+async def _wedge_worker_thread(stub, key: str, block: _WorkerThreadBlock) -> str:
+    """Dispatch the blocker task over ``stub``, arm it, and await entry.
+
+    Returns the worker thread name the blocker reported; on return the
+    worker thread is wedged inside the planted task until ``released``.
+    """
+    blocker = make_task(_leave_worker_thread_blocker, args=(key,))
+    dispatch = stub.dispatch()
+    await dispatch.write(protocol.Request(task=blocker.to_protobuf()))
+    await dispatch.done_writing()
+    _, result = [response async for response in dispatch]
+    block.armed.set()
+    loop = asyncio.get_running_loop()
+    assert await loop.run_in_executor(None, block.entered.wait, 5)
+    return cloudpickle.loads(result.result.dump)
+
+
+@contextmanager
+def _join_overrun_warning() -> Iterator[asyncio.Event]:
+    """Yield an event set when the join-overrun warning is logged.
+
+    Attaches a handler to the service logger for the scope and sets the
+    yielded event on the first WARNING-level "still running" record, so
+    a test can await the overrun report instead of sleeping out the
+    bound that produces it.
+    """
+
+    class _Signal(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.logged = asyncio.Event()
+
+        def emit(self, record: logging.LogRecord) -> None:
+            if (
+                record.levelno == logging.WARNING
+                and "still running" in record.getMessage()
+            ):
+                self.logged.set()
+
+    handler = _Signal()
+    logger = logging.getLogger("wool.runtime.worker.service")
+    logger.addHandler(handler)
+    try:
+        yield handler.logged
+    finally:
+        logger.removeHandler(handler)
+
+
+@pytest.fixture
+def worker_thread_block() -> Iterator[tuple[str, _WorkerThreadBlock]]:
+    """Register a worker-thread blocker and release it during teardown."""
+    key = uuid4().hex
+    block = _WorkerThreadBlock()
+    _keyed_events[key] = block
+    yield key, block
+    block.released.set()
+    del _keyed_events[key]
+    if block.thread is not None:
+        block.thread.join(5)
+        assert not block.thread.is_alive(), "worker thread did not exit after release"
+
+
+@pytest.fixture
+def retirement_budget() -> tuple[dict[str, float], float]:
+    """Provide teardown-budget kwargs and the retirement bound they imply.
+
+    The kwargs configure a `WorkerService` with a short drain budget
+    and per-clear floor. The bound is the drain budget plus one floor
+    for each clear the teardown runs, which is two while the
+    discovery-subscriber pool is unset.
+    """
+    kwargs = {"drain_timeout": 0.2, "min_clear_timeout": 0.05}
+    return kwargs, 0.2 + 2 * 0.05
 
 
 async def _channel_pool_probe():
@@ -2539,6 +2651,359 @@ class TestWorkerService:
             "the idle TTL elapses; it is still alive, so the positive "
             "TTL did not finalize the idle loop"
         )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_start_on_new_worker_loop_when_retired_thread_blocked(
+        self,
+        grpc_aio_stub,
+        mock_worker_proxy_cache,
+        worker_thread_block,
+        retirement_budget,
+    ):
+        """Test `WorkerService.dispatch` is not held by blocked retirement.
+
+        Given:
+            A worker loop whose daemon thread is blocked by a task a
+            routine left behind, and whose idle TTL has expired
+        When:
+            Another dispatch arrives
+        Then:
+            It should run on a new worker thread within the retirement
+            bound
+        """
+        # Arrange — a short TTL and the fixture's teardown budgets keep
+        # the retirement quick.
+        budget_kwargs, retirement_bound = retirement_budget
+        key, block = worker_thread_block
+        loop = asyncio.get_running_loop()
+        service = WorkerService(worker_loop_ttl=0.8, **budget_kwargs)
+        probe = make_task(_worker_loop_identity_probe)
+
+        async with grpc_aio_stub(servicer=service) as stub:
+            first_thread_name = await _wedge_worker_thread(stub, key, block)
+            await asyncio.sleep(0.8 + 0.1)
+
+            # Act
+            started = loop.time()
+            async with asyncio.timeout(5):
+                second = stub.dispatch()
+                await second.write(protocol.Request(task=probe.to_protobuf()))
+                await second.done_writing()
+                _, second_result = [response async for response in second]
+            elapsed = loop.time() - started
+
+        # Assert
+        _, _, second_thread_name = cloudpickle.loads(second_result.result.dump)
+        assert second_thread_name != first_thread_name
+        assert elapsed < retirement_bound + _GRPC_SLACK
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_warn_when_retired_thread_outlives_budget(
+        self,
+        grpc_aio_stub,
+        mock_worker_proxy_cache,
+        worker_thread_block,
+        retirement_budget,
+        caplog,
+    ):
+        """Test an idle retirement leaves a blocked thread to the daemon reap.
+
+        Given:
+            A worker loop whose daemon thread is blocked by a task a
+            routine left behind
+        When:
+            The loop's idle TTL expires and the retirement's join
+            outlives the retirement bound
+        Then:
+            It should report at warning level that the thread was left
+            running
+        """
+        # Arrange
+        budget_kwargs, _ = retirement_budget
+        key, block = worker_thread_block
+        service = WorkerService(worker_loop_ttl=0.3, **budget_kwargs)
+
+        async with grpc_aio_stub(servicer=service) as stub:
+            with (
+                caplog.at_level(logging.WARNING, logger="wool.runtime.worker.service"),
+                _join_overrun_warning() as overrun_logged,
+            ):
+                await _wedge_worker_thread(stub, key, block)
+
+                # Act — the TTL retirement runs on its own; await its
+                # overrun report rather than sleeping out the bound.
+                async with asyncio.timeout(5):
+                    await overrun_logged.wait()
+
+        # Assert
+        assert block.thread is not None
+        assert block.thread.daemon and block.thread.is_alive()
+        assert any(
+            record.levelno == logging.WARNING and "still running" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_should_return_within_retirement_bound_when_retirement_blocked(
+        self,
+        grpc_aio_stub,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        worker_thread_block,
+        retirement_budget,
+    ):
+        """Test `WorkerService.stop` returns within idle retirement's bound.
+
+        Given:
+            An idle worker loop being retired while a task a routine
+            left behind blocks its daemon thread
+        When:
+            The stop RPC is invoked with a negative timeout
+        Then:
+            It should return within the retirement bound with the
+            service stopped
+        """
+        # Arrange — a short TTL and the fixture's teardown budgets keep
+        # the retirement quick.
+        budget_kwargs, retirement_bound = retirement_budget
+        key, block = worker_thread_block
+        loop = asyncio.get_running_loop()
+        service = WorkerService(worker_loop_ttl=0.8, **budget_kwargs)
+
+        async with grpc_aio_stub(servicer=service) as stub:
+            await _wedge_worker_thread(stub, key, block)
+            joining = threading.Event()
+            stop_started = threading.Event()
+            assert block.thread is not None
+            join = block.thread.join
+            set_stopping = service._stopping.set
+
+            def signal_stop():
+                set_stopping()
+                stop_started.set()
+
+            def signal_join(timeout=None):
+                joining.set()
+                assert stop_started.wait(5), "stop did not start during retirement"
+                return join(timeout)
+
+            mocker.patch.object(service._stopping, "set", side_effect=signal_stop)
+            mocker.patch.object(block.thread, "join", side_effect=signal_join)
+            with _join_overrun_warning() as overrun_logged:
+                assert await loop.run_in_executor(None, joining.wait, 5)
+                assert not overrun_logged.is_set()
+
+                # Act while the retirement's join still holds the pool lock.
+                started = loop.time()
+                stop_result = await asyncio.wait_for(
+                    stub.stop(protocol.StopRequest(timeout=-1)), timeout=5
+                )
+                elapsed = loop.time() - started
+
+        # Assert
+        assert isinstance(stop_result, protocol.Void)
+        assert service.stopped.is_set()
+        assert elapsed < retirement_bound + _GRPC_SLACK
+
+    @pytest.mark.asyncio
+    async def test_stop_should_not_bound_concurrent_idle_retirement_when_draining(
+        self,
+        grpc_aio_stub,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        worker_thread_block,
+        retirement_budget,
+        caplog,
+    ):
+        """Test `WorkerService.stop` leaves an overlapping idle retirement its budget.
+
+        Given:
+            A worker loop whose idle TTL fires while a stop request with
+            a positive grace is still draining in-flight work, and whose
+            daemon thread is blocked by a task a routine left behind
+        When:
+            The TTL retirement's teardown joins the blocked thread
+        Then:
+            It should join on the idle retirement bound and report the
+            overrun at warning level, despite the concurrent stop
+        """
+        # Arrange
+        budget_kwargs, retirement_bound = retirement_budget
+        ttl = 0.3
+        key, block = worker_thread_block
+        loop = asyncio.get_running_loop()
+        service = WorkerService(worker_loop_ttl=ttl, **budget_kwargs)
+
+        async with grpc_aio_stub(servicer=service) as stub:
+            await _wedge_worker_thread(stub, key, block)
+            # The blocker dispatch has completed, so the loop-pool entry
+            # is released and the TTL is armed; a real second dispatch
+            # would re-acquire the entry and disarm the timer. The
+            # sentinel stands in for in-flight work the stop's
+            # pre-emption keeps draining — the window in which the TTL
+            # provably fires after the stop signal is latched.
+            sentinel = mocker.Mock()
+            service._docket.add(sentinel)
+            try:
+                # Act
+                with (
+                    caplog.at_level(
+                        logging.WARNING, logger="wool.runtime.worker.service"
+                    ),
+                    _join_overrun_warning() as overrun_logged,
+                ):
+                    stop = asyncio.ensure_future(
+                        stub.stop(protocol.StopRequest(timeout=30))
+                    )
+                    started = loop.time()
+                    async with asyncio.timeout(5):
+                        await overrun_logged.wait()
+                    elapsed = loop.time() - started
+            finally:
+                service._docket.discard(sentinel)
+            stop_result = await asyncio.wait_for(stop, timeout=5)
+
+        # Assert
+        assert elapsed < ttl + retirement_bound + _GRPC_SLACK
+        assert isinstance(stop_result, protocol.Void)
+        assert service.stopped.is_set()
+        assert any(
+            record.levelno == logging.WARNING and "still running" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_should_bound_each_wait_by_request_timeout_when_thread_blocked(
+        self,
+        grpc_aio_stub,
+        mock_worker_proxy_cache,
+        worker_thread_block,
+        caplog,
+    ):
+        """Test `WorkerService.stop` budgets a positive timeout once per wait.
+
+        Given:
+            A warm worker loop whose daemon thread is blocked by a task a
+            routine left behind, with no idle retirement in flight
+        When:
+            The stop RPC is invoked with a positive timeout
+        Then:
+            It should wait up to the timeout once for the pre-empt grace
+            and once for the thread join, returning within twice the
+            timeout
+        """
+        # Arrange
+        request_timeout = 0.2
+        key, block = worker_thread_block
+        loop = asyncio.get_running_loop()
+        service = WorkerService()
+
+        async with grpc_aio_stub(servicer=service) as stub:
+            await _wedge_worker_thread(stub, key, block)
+
+            # Act
+            with caplog.at_level(logging.DEBUG, logger="wool.runtime.worker.service"):
+                started = loop.time()
+                stop_result = await asyncio.wait_for(
+                    stub.stop(protocol.StopRequest(timeout=request_timeout)), timeout=10
+                )
+                elapsed = loop.time() - started
+
+        # Assert
+        assert isinstance(stop_result, protocol.Void)
+        assert service.stopped.is_set()
+        assert elapsed < 2 * request_timeout + _GRPC_SLACK
+        overruns = [
+            record for record in caplog.records if "still running" in record.getMessage()
+        ]
+        # The wedged thread outlives the bound the caller chose, so the
+        # overrun is reported at debug, never warning.
+        assert overruns
+        assert all(record.levelno == logging.DEBUG for record in overruns)
+
+    @pytest.mark.asyncio
+    async def test_stop_should_not_join_worker_thread_when_timeout_zero(
+        self,
+        grpc_aio_stub,
+        mock_worker_proxy_cache,
+        worker_thread_block,
+        caplog,
+    ):
+        """Test `WorkerService.stop` skips the join on a zero timeout.
+
+        Given:
+            A warm worker loop whose daemon thread is blocked by a task a
+            routine left behind, with no idle retirement in flight
+        When:
+            The stop RPC is invoked with a zero timeout
+        Then:
+            It should return without joining the worker thread, within
+            transport slack alone
+        """
+        # Arrange
+        key, block = worker_thread_block
+        loop = asyncio.get_running_loop()
+        service = WorkerService()
+
+        async with grpc_aio_stub(servicer=service) as stub:
+            await _wedge_worker_thread(stub, key, block)
+
+            # Act
+            with caplog.at_level(logging.DEBUG, logger="wool.runtime.worker.service"):
+                started = loop.time()
+                stop_result = await asyncio.wait_for(
+                    stub.stop(protocol.StopRequest(timeout=0)), timeout=10
+                )
+                elapsed = loop.time() - started
+
+        # Assert
+        assert isinstance(stop_result, protocol.Void)
+        assert service.stopped.is_set()
+        assert elapsed < _GRPC_SLACK
+        # A zero timeout performs no synchronous join, so there is no
+        # overrun to report.
+        assert not any(
+            "still running" in record.getMessage() for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_should_wait_for_blocked_worker_thread_when_timeout_negative(
+        self,
+        grpc_aio_stub,
+        mock_worker_proxy_cache,
+        worker_thread_block,
+        retirement_budget,
+    ):
+        """Test `WorkerService.stop` waits for a blocked worker thread.
+
+        Given:
+            A warm worker loop whose daemon thread is blocked by a task
+            a routine left behind, with no idle retirement in flight
+        When:
+            The stop RPC is invoked with a negative timeout
+        Then:
+            It should not return until the worker thread is released
+        """
+        # Arrange — the fixture's budgets keep the retirement bound
+        # short; a stop that wrongly applied it would return well
+        # within the wait below.
+        budget_kwargs, retirement_bound = retirement_budget
+        key, block = worker_thread_block
+        service = WorkerService(**budget_kwargs)
+
+        async with grpc_aio_stub(servicer=service) as stub:
+            await _wedge_worker_thread(stub, key, block)
+
+            # Act
+            stop = asyncio.ensure_future(stub.stop(protocol.StopRequest(timeout=-1)))
+            await asyncio.sleep(retirement_bound + _GRPC_SLACK)
+            pending_while_blocked = not stop.done()
+            block.released.set()
+            stop_result = await asyncio.wait_for(stop, timeout=5)
+
+        # Assert
+        assert pending_while_blocked
+        assert isinstance(stop_result, protocol.Void)
 
     @pytest.mark.asyncio
     async def test_stop_should_clear_proxy_pool_on_worker_loop_when_warm(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import pickle
 import threading
@@ -33,6 +34,17 @@ from wool.runtime.worker.session import Rejected
 
 _log = logging.getLogger(__name__)
 
+_stop_budget: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "worker_stop_budget"
+)
+"""Join budget for a stop-driven worker-loop teardown, set for the
+duration of a stop's pool clear so only the finalizers that clear
+runs inherit it: the mapped ``StopRequest.timeout``, with ``None``
+meaning an unbounded join — see `WorkerService.stop` for the mapping.
+Unset outside a stop, where idle retirement computes its own bound;
+see `WorkerService._destroy_worker_loop`. The inheritance rests on the
+``finalizer`` contract on `ResourcePool`."""
+
 _DRAIN_TIMEOUT: Final[float] = 5.0
 """Default wall-clock budget in seconds for worker-loop teardown,
 measured from when its drain is scheduled. Sized for a normal chain of
@@ -53,15 +65,18 @@ owns."""
 
 _WORKER_LOOP_TTL: Final[float] = 30.0
 """Default idle time-to-live in seconds for the worker event-loop held by
-`WorkerService._loop_pool`. The loop pool is keyed by a single
-constant (``"worker"``), so a positive TTL keeps one worker loop +
-daemon thread warm across dispatches instead of creating and tearing
-one down on every call; recreating the loop per dispatch would add its
-setup/teardown to dispatch latency and strand cleanup callbacks
-scheduled on the torn-down loop. The TTL only bounds how long an
-*idle* loop lingers before automatic teardown; an explicit `stop`
-clears the pool immediately regardless of this value, so no daemon
-thread outlives the service. The 30s window is generous enough to span
+`WorkerService._loop_pool`. The loop pool is keyed by a single constant
+(``"worker"``), so a positive TTL keeps one worker loop + daemon thread
+warm across dispatches instead of creating and tearing one down on every
+call; recreating the loop per dispatch would add its setup/teardown
+to dispatch latency and strand cleanup callbacks scheduled on the
+torn-down loop. The TTL only bounds how long an *idle* loop lingers
+before automatic teardown; an explicit `stop` retires the loop without
+waiting for this TTL; see `WorkerService._destroy_worker_loop` for
+how long that waits, what bounds a retirement, and what happens to a
+worker thread that does not exit. A dispatch arriving while an idle
+loop retires waits that retirement out; see `WorkerService.dispatch`
+for the bound it is held to. The 30s window is generous enough to span
 the gap between bursts of dispatches on a healthy worker while still
 reaping a loop that has gone quiet. Retiring the loop also finalizes
 the loop's partitions of the proxy and discovery-subscriber pools (see
@@ -226,18 +241,6 @@ class WorkerService(protocol.WorkerServicer):
         # was never retrieved" hazards. The done-callback discards
         # the task once the cancel propagation has completed.
         self._cancel_propagators: set[asyncio.Task[None]] = set()
-        # Budget for the loop-teardown join, set by `_stop`
-        # from the StopRequest's ``timeout``. ``0`` means "do not
-        # synchronously wait" (worker thread closes its own loop
-        # after ``run_forever`` returns; ``daemon=True`` reaps it
-        # at process exit if not joined); positive bounds the
-        # wait; ``None`` means "wait indefinitely" — caller asked
-        # for unlimited graceful shutdown via a negative or
-        # missing StopRequest timeout. The default below is
-        # ``None`` only because the loop pool's finalizer
-        # schedules its own ``loop.stop()``, so an unbounded join
-        # still returns once ``run_forever`` exits.
-        self._stop_timeout: float | None = None
         self._loop_pool = ResourcePool(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
@@ -274,6 +277,12 @@ class WorkerService(protocol.WorkerServicer):
         schedules it for execution. For async generators, subsequent
         ``Message`` frames are forwarded into the generator via
         ``asend()``.
+
+        **Pooled worker loop.** Tasks run on a pooled worker loop that
+        an idle TTL retires. A dispatch arriving while that retirement
+        is underway waits out at most the retirement's bound before a
+        fresh loop serves it, whatever the retired thread is doing; see
+        `_destroy_worker_loop` for what bounds a retirement.
 
         **Chain serialization failures (worker-side).**
         The chain manifest is **ancillary state** under wool's protocol
@@ -617,11 +626,16 @@ class WorkerService(protocol.WorkerServicer):
         to stop accepting new requests. This method is idempotent and
         can be called multiple times safely.
 
-        ``request.timeout`` bounds two waits: the grace period in-flight
-        tasks get before they are cancelled, and the wait for the worker
-        thread to exit. Worker-loop teardown runs on a separate
-        five-second budget that ``request.timeout`` does not extend, so
-        the call can return before the loop has closed.
+        ``request.timeout`` governs two sequential waits, the grace
+        period in-flight tasks get before they are cancelled and the wait
+        for the worker thread to exit, through one mapping: ``0`` cancels
+        in-flight work at once and performs no join, a positive value
+        bounds each wait in turn, and a negative value waits indefinitely
+        for both. When a stop arrives while an idle worker loop is
+        retiring, the join instead waits out that retirement's bound,
+        whatever ``request.timeout`` is, and can return with the retiring
+        worker thread still running; the grace still bounds the in-flight
+        drain. See `_destroy_worker_loop`.
 
         :param request:
             The protobuf stop request containing the wait timeout.
@@ -632,7 +646,8 @@ class WorkerService(protocol.WorkerServicer):
 
         .. rubric:: Implementation notes
 
-        Teardown is `_destroy_worker_loop`, bounded by `_DRAIN_TIMEOUT`.
+        Teardown is `_destroy_worker_loop`; see it for the bounds it
+        enforces.
         """
         if self._stopping.is_set():
             return protocol.Void()
@@ -733,12 +748,19 @@ class WorkerService(protocol.WorkerServicer):
         closes without ``Task was destroyed but it is pending!`` warnings;
         past it, the daemon-thread reap at process exit is the backstop.
 
-        Finally joins the worker thread for up to `_stop_timeout` seconds.
-        ``0`` does not wait and ``None`` waits indefinitely; a thread still
-        running at the bound is reaped at process exit. With ``0``, the
-        clears and the drain run on the worker thread after this returns;
-        each loop clears its own partition, so that path cannot race a
-        successor loop's first use of the process-wide channel pool.
+        Finally joins the worker thread. A teardown the stop's own pool
+        clear drives joins for the request's mapped timeout; see
+        `WorkerService.stop` for the mapping. A teardown an idle TTL
+        drives (including one that fires while a stop is draining
+        in-flight work) instead waits for the drain budget plus one
+        per-clear floor per clear it runs, the teardown's worst case. A
+        thread still running at a positive bound is left to the daemon
+        reap at process exit, reported at warning level for a TTL-driven
+        teardown and at debug for a stop-driven one, whose caller chose
+        the bound it outlived. With ``0``, the clears and the drain run
+        on the worker thread after this returns; each loop clears its
+        own partition, so that path cannot race a successor loop's first
+        use of the process-wide channel pool.
 
         The drain tolerates a peer on the loop, i.e., another task that
         cancels or awaits the loop's tasks. A peer's cancel neither raises
@@ -750,11 +772,13 @@ class WorkerService(protocol.WorkerServicer):
         awaits the drain waits out the budget.
 
         Each degradation is logged at warning level: a pool clear that
-        raised, with its traceback and any peer cancellations counted, or
-        that exceeded its deadline uncancelled; a pool clear a peer cancelled, at the
-        first cancellation and again if no retry completes in time; a drain
-        that timed out, with the count of tasks still pending; and a drain
-        that never ran before the deadline stopped the loop.
+        raised, with its traceback and any peer cancellations counted,
+        or that exceeded its deadline uncancelled; a pool clear a peer
+        cancelled, at the first cancellation and again if no retry
+        completes in time; a drain that timed out, with the count of
+        tasks still pending; a drain that never ran before the deadline
+        stopped the loop; and a worker thread that outlived its join
+        bound, as the join paragraph above describes.
 
         :param loop_thread:
             A tuple of the event loop and the thread running it.
@@ -794,6 +818,13 @@ class WorkerService(protocol.WorkerServicer):
         drain disarms it on entry, and a drain that starts after the timer
         fired stands down. Timer and drain share one deadline, fixed when
         the drain is scheduled.
+
+        The idle-retirement join allows one floor for every clear,
+        including the first, which is never starved. The drain deadline
+        runs on the worker loop while the join runs on the service loop,
+        and the floor that first clear does not spend is the handoff
+        slack between those two clocks and the loop's final stop and
+        close callbacks.
         """
         loop, thread = loop_thread
         # Resolved now rather than at construction — see `_DRAIN_TIMEOUT`.
@@ -956,11 +987,26 @@ class WorkerService(protocol.WorkerServicer):
             # via the ``_run_then_close`` finally clause.
             return
 
-        timeout = self._stop_timeout
+        try:
+            # Join bound by provenance — see the docstring's join
+            # paragraph.
+            timeout = _stop_budget.get()
+            stop_driven = True
+        except LookupError:
+            timeout = drain_timeout + len(clears) * min_clear_timeout
+            stop_driven = False
         if timeout is None or timeout > 0:
             # Offload the synchronous ``thread.join`` to a worker
             # thread so the main loop keeps pumping while we wait.
             await asyncio.get_running_loop().run_in_executor(None, thread.join, timeout)
+            if timeout is not None and thread.is_alive():
+                report = _log.debug if stop_driven else _log.warning
+                report(
+                    f"Worker-loop thread {thread.name} still running "
+                    f"{timeout:.3f}s after its teardown was scheduled; "
+                    "leaving it to exit on its own or be reaped at process "
+                    "exit."
+                )
 
     @asynccontextmanager
     async def _tracked(
@@ -1010,20 +1056,16 @@ class WorkerService(protocol.WorkerServicer):
         """Pre-empt in-flight work, then retire the worker loop and its pools."""
         if timeout is not None and timeout < 0:
             timeout = None
-        # Stash the StopRequest's timeout for the loop-teardown
-        # finalizer (read by `_destroy_worker_loop`) before
-        # any ``await`` so it is always set when ``_loop_pool.clear``
-        # later invokes the finalizer. ``timeout=0`` (the default)
-        # → don't synchronously join; positive → bound the join;
-        # ``None`` (caller sent negative or omitted) → wait
-        # indefinitely.
-        self._stop_timeout = timeout
         self._stopping.set()
         await self._preempt(timeout=timeout)
         try:
             # The worker loop's partitions of the proxy and subscriber
             # pools go with it — see `_destroy_worker_loop`.
-            await self._loop_pool.clear()
+            token = _stop_budget.set(timeout)
+            try:
+                await self._loop_pool.clear()
+            finally:
+                _stop_budget.reset(token)
         finally:
             self._stopped.set()
 
